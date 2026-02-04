@@ -505,13 +505,18 @@ enum UsersCommand {
 
 #[derive(Clone, Debug, ValueEnum)]
 enum PresenceAvailability {
-    #[value(rename = "Available", alias = "available")]
+    #[value(name = "Available", alias = "available")]
     Available,
-    #[value(rename = "Busy", alias = "busy")]
+    #[value(name = "Busy", alias = "busy")]
     Busy,
-    #[value(rename = "Away", alias = "away")]
+    #[value(name = "Away", alias = "away")]
     Away,
-    #[value(rename = "DoNotDisturb", alias = "do-not-disturb", alias = "donotdisturb", alias = "dnd")]
+    #[value(
+        name = "DoNotDisturb",
+        alias = "do-not-disturb",
+        alias = "donotdisturb",
+        alias = "dnd"
+    )]
     DoNotDisturb,
 }
 
@@ -528,20 +533,20 @@ impl PresenceAvailability {
 
 #[derive(Clone, Debug, ValueEnum)]
 enum PresenceActivity {
-    #[value(rename = "Available", alias = "available")]
+    #[value(name = "Available", alias = "available")]
     Available,
-    #[value(rename = "InACall", alias = "in-a-call", alias = "inacall", alias = "call")]
+    #[value(name = "InACall", alias = "in-a-call", alias = "inacall", alias = "call")]
     InACall,
     #[value(
-        rename = "InAConferenceCall",
+        name = "InAConferenceCall",
         alias = "in-a-conference-call",
         alias = "inaconferencecall",
         alias = "conference"
     )]
     InAConferenceCall,
-    #[value(rename = "Away", alias = "away")]
+    #[value(name = "Away", alias = "away")]
     Away,
-    #[value(rename = "Presenting", alias = "presenting")]
+    #[value(name = "Presenting", alias = "presenting")]
     Presenting,
 }
 
@@ -667,8 +672,8 @@ struct TeamsBridgeConfig {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let Some(mode) = cli.command else {
+    let mut cli = Cli::parse();
+    let Some(mode) = cli.command.take() else {
         let config = build_config(&cli)?;
         if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
             eprintln!("atlas emit: {err}");
@@ -2301,7 +2306,8 @@ fn seed_default_metadata(repo: &mut Repository<Pile<Blake3>>) -> Result<()> {
 
 fn emit_schema_to_atlas(pile_path: &PathBuf) -> Result<()> {
     let mut pile = open_pile(pile_path)?;
-    let existing = find_branch_id(&mut pile, ATLAS_BRANCH)?;
+    let existing =
+        find_branch_id(&mut pile, ATLAS_BRANCH).map_err(|err| anyhow::anyhow!(err))?;
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
 
     let branch_id = match existing {

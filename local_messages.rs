@@ -23,28 +23,20 @@ use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "local-messages";
+const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 const ATLAS_BRANCH: &str = "atlas";
 
 const KIND_MESSAGE_LABEL: &str = "local_message";
 const KIND_READ_LABEL: &str = "local_read";
-const KIND_PARTY_LABEL: &str = "local_party";
 
 const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
-const KIND_PARTY_ID: Id = id_hex!("3AA2883528D3812067DFA1CD5DE5F8B8");
 
-const PARTY_AGENT_ID: Id = id_hex!("5EBC44A9FC4C8444AA01DFA7AC315AD5");
-const PARTY_USER_ID: Id = id_hex!("7A39EB8857D1912501DACDA4DB29077B");
+const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 
-const KIND_SPECS: [(Id, &str); 3] = [
+const KIND_SPECS: [(Id, &str); 2] = [
     (KIND_MESSAGE_ID, KIND_MESSAGE_LABEL),
     (KIND_READ_ID, KIND_READ_LABEL),
-    (KIND_PARTY_ID, KIND_PARTY_LABEL),
-];
-
-const PARTY_SPECS: [(Id, &str); 2] = [
-    (PARTY_AGENT_ID, "agent"),
-    (PARTY_USER_ID, "user"),
 ];
 
 type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
@@ -67,65 +59,9 @@ mod local {
 fn normalize_label(label: &str) -> Result<String> {
     let trimmed = label.trim();
     if trimmed.is_empty() {
-        bail!("party label is empty");
+        bail!("label is empty");
     }
     Ok(trimmed.to_string())
-}
-
-fn default_party_id(label: &str) -> Option<Id> {
-    if label.eq_ignore_ascii_case("user") {
-        Some(PARTY_USER_ID)
-    } else if label.eq_ignore_ascii_case("agent") {
-        Some(PARTY_AGENT_ID)
-    } else {
-        None
-    }
-}
-
-fn resolve_party_id(space: &TribleSet, label: &str) -> Result<Option<Id>> {
-    if let Some(id) = default_party_id(label) {
-        return Ok(Some(id));
-    }
-    let label = normalize_label(label)?;
-    let mut matches = Vec::new();
-    for (party_id, shortname) in find!(
-        (party_id: Id, shortname: String),
-        pattern!(&space, [{
-            ?party_id @
-            metadata::tag: &KIND_PARTY_ID,
-            metadata::shortname: ?shortname,
-        }])
-    ) {
-        if shortname == label {
-            matches.push(party_id);
-        }
-    }
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(Some(matches[0])),
-        _ => bail!("multiple parties match label '{label}'"),
-    }
-}
-
-fn resolve_or_create_party_id(
-    space: &TribleSet,
-    change: &mut TribleSet,
-    label: &str,
-) -> Result<Id> {
-    if let Some(id) = default_party_id(label) {
-        return Ok(id);
-    }
-    if let Some(id) = resolve_party_id(space, label)? {
-        return Ok(id);
-    }
-
-    let label = normalize_label(label)?;
-    let party_id = ufoid();
-    *change += entity! { &party_id @
-        metadata::tag: &KIND_PARTY_ID,
-        metadata::shortname: label,
-    };
-    Ok(*party_id)
 }
 
 #[derive(Parser)]
@@ -137,6 +73,9 @@ struct Cli {
     /// Branch name for local messages
     #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
     branch: String,
+    /// Branch name for relations
+    #[arg(long, default_value = DEFAULT_RELATIONS_BRANCH, global = true)]
+    relations_branch: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -155,8 +94,7 @@ enum Command {
     },
     /// List recent messages (latest first)
     List {
-        /// Reader label (defaults to "user").
-        #[arg(default_value = "user")]
+        /// Reader id or label.
         reader: String,
         /// Only show messages unread by the reader
         #[arg(long)]
@@ -167,8 +105,7 @@ enum Command {
     /// Mark a message as read
     Ack {
         id: String,
-        /// Reader label (defaults to "user").
-        #[arg(default_value = "user")]
+        /// Reader id or label.
         by: String,
     },
 }
@@ -228,6 +165,65 @@ fn truncate_single_line(text: &str, max: usize) -> String {
 fn id_prefix(id: Id) -> String {
     let hex = format!("{id:x}");
     hex[..8].to_string()
+}
+
+fn load_relations_space(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    relations_branch: &str,
+) -> Result<TribleSet> {
+    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), relations_branch)? else {
+        bail!(
+            "missing relations branch '{relations_branch}' (create with relations faculty)"
+        );
+    };
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+    Ok(space)
+}
+
+fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
+    let trimmed = input.trim();
+    if let Some(id) = Id::from_hex(trimmed) {
+        return Ok(id);
+    }
+    let label = normalize_label(trimmed)?;
+    let mut matches = Vec::new();
+    for (person_id, shortname) in find!(
+        (person_id: Id, shortname: String),
+        pattern!(&relations_space, [{
+            ?person_id @
+            metadata::tag: &KIND_PERSON_ID,
+            metadata::shortname: ?shortname,
+        }])
+    ) {
+        if shortname == label {
+            matches.push(person_id);
+        }
+    }
+    match matches.len() {
+        0 => bail!("unknown person label '{label}' (use relations faculty)"),
+        1 => Ok(matches[0]),
+        _ => bail!("multiple people match label '{label}'"),
+    }
+}
+
+fn load_person_labels(relations_space: &TribleSet) -> HashMap<Id, String> {
+    let mut labels = HashMap::new();
+    for (person_id, shortname) in find!(
+        (person_id: Id, shortname: String),
+        pattern!(&relations_space, [{
+            ?person_id @
+            metadata::tag: &KIND_PERSON_ID,
+            metadata::shortname: ?shortname,
+        }])
+    ) {
+        labels.insert(person_id, shortname);
+    }
+    labels
 }
 
 fn open_repo(
@@ -319,33 +315,6 @@ fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Tri
         }
     }
 
-    let existing_parties: HashSet<Id> = find!(
-        (party: Id),
-        pattern!(&space, [{ ?party @ metadata::tag: &KIND_PARTY_ID }])
-    )
-    .into_iter()
-    .map(|(party,)| party)
-    .collect();
-
-    let party_named: HashSet<Id> = find!(
-        (party: Id),
-        pattern!(&space, [{ ?party @ metadata::shortname: _?name }])
-    )
-    .into_iter()
-    .map(|(party,)| party)
-    .collect();
-
-    for (id, label) in PARTY_SPECS {
-        if !existing_parties.contains(&id) {
-            change += entity! { ExclusiveId::force_ref(&id) @
-                metadata::tag: &KIND_PARTY_ID,
-                metadata::shortname: label,
-            };
-        } else if !party_named.contains(&id) {
-            change += entity! { ExclusiveId::force_ref(&id) @ metadata::shortname: label };
-        }
-    }
-
     Ok(change)
 }
 
@@ -386,8 +355,19 @@ fn load_text(
     Ok(view.as_ref().to_string())
 }
 
-fn cmd_send(pile: &Path, branch: &str, text: String, from: String, to: String) -> Result<()> {
+fn cmd_send(
+    pile: &Path,
+    branch: &str,
+    relations_branch: &str,
+    text: String,
+    from: String,
+    to: String,
+) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let relations_space = load_relations_space(&mut repo, relations_branch)?;
+    let from_id = resolve_person_id(&relations_space, &from)?;
+    let to_id = resolve_person_id(&relations_space, &to)?;
+
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -396,11 +376,6 @@ fn cmd_send(pile: &Path, branch: &str, text: String, from: String, to: String) -
     let now = epoch_interval(now_epoch());
     let message_id = ufoid();
     let body_handle = ws.put::<blobschemas::LongString, _>(text.clone());
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let from_id = resolve_or_create_party_id(&space, &mut change, &from)?;
-    let to_id = resolve_or_create_party_id(&space, &mut change, &to)?;
     change += entity! { &message_id @
         metadata::tag: &KIND_MESSAGE_ID,
         local::from: from_id,
@@ -416,8 +391,8 @@ fn cmd_send(pile: &Path, branch: &str, text: String, from: String, to: String) -
     println!(
         "[{}] {} -> {}: {}",
         id_prefix(*message_id),
-        from,
-        to,
+        from_id,
+        to_id,
         truncate_single_line(&text, 120)
     );
     repo.close()
@@ -425,8 +400,17 @@ fn cmd_send(pile: &Path, branch: &str, text: String, from: String, to: String) -
     Ok(())
 }
 
-fn cmd_ack(pile: &Path, branch: &str, id: String, by: String) -> Result<()> {
+fn cmd_ack(
+    pile: &Path,
+    branch: &str,
+    relations_branch: &str,
+    id: String,
+    by: String,
+) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let relations_space = load_relations_space(&mut repo, relations_branch)?;
+    let reader_id = resolve_person_id(&relations_space, &by)?;
+
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -436,7 +420,6 @@ fn cmd_ack(pile: &Path, branch: &str, id: String, by: String) -> Result<()> {
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let message_id = resolve_message_id(&space, &id)?;
-    let reader_id = resolve_or_create_party_id(&space, &mut change, &by)?;
 
     let now = epoch_interval(now_epoch());
     let read_id = ufoid();
@@ -454,33 +437,30 @@ fn cmd_ack(pile: &Path, branch: &str, id: String, by: String) -> Result<()> {
     println!(
         "Marked {} as read by {}.",
         id_prefix(message_id),
-        by
+        reader_id
     );
     repo.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(())
 }
 
-fn cmd_list(pile: &Path, branch: &str, reader: String, unread: bool, limit: usize) -> Result<()> {
+fn cmd_list(
+    pile: &Path,
+    branch: &str,
+    relations_branch: &str,
+    reader: String,
+    unread: bool,
+    limit: usize,
+) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let relations_space = load_relations_space(&mut repo, relations_branch)?;
+    let party_names = load_person_labels(&relations_space);
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
-    let mut party_names: HashMap<Id, String> = HashMap::new();
-    for (party_id, shortname) in find!(
-        (party_id: Id, shortname: String),
-        pattern!(&space, [{
-            ?party_id @
-            metadata::tag: &KIND_PARTY_ID,
-            metadata::shortname: ?shortname,
-        }])
-    ) {
-        party_names.insert(party_id, shortname);
-    }
 
     let mut messages = Vec::new();
     for (message_id, from, to, body, created_at) in find!(
@@ -542,8 +522,7 @@ fn cmd_list(pile: &Path, branch: &str, reader: String, unread: bool, limit: usiz
     messages.reverse();
 
     let now_key = interval_key(epoch_interval(now_epoch()));
-    let reader_id = resolve_party_id(&space, &reader)?
-        .ok_or_else(|| anyhow::anyhow!("unknown party label '{reader}'"))?;
+    let reader_id = resolve_person_id(&relations_space, &reader)?;
     let mut shown = 0usize;
 
     for msg in messages {
@@ -599,19 +578,39 @@ fn main() -> Result<()> {
     };
 
     match cmd {
-        Command::Send { text, from, to } => cmd_send(&cli.pile, &cli.branch, text, from, to),
+        Command::Send { text, from, to } => cmd_send(
+            &cli.pile,
+            &cli.branch,
+            &cli.relations_branch,
+            text,
+            from,
+            to,
+        ),
         Command::List {
             reader,
             unread,
             limit,
-        } => cmd_list(&cli.pile, &cli.branch, reader, unread, limit),
-        Command::Ack { id, by } => cmd_ack(&cli.pile, &cli.branch, id, by),
+        } => cmd_list(
+            &cli.pile,
+            &cli.branch,
+            &cli.relations_branch,
+            reader,
+            unread,
+            limit,
+        ),
+        Command::Ack { id, by } => cmd_ack(
+            &cli.pile,
+            &cli.branch,
+            &cli.relations_branch,
+            id,
+            by,
+        ),
     }
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
-    let mut metadata = build_local_metadata(repo.storage_mut())
+    let metadata = build_local_metadata(repo.storage_mut())
         .map_err(|e| anyhow::anyhow!("build local metadata: {e:?}"))?;
 
     let mut ws = repo
@@ -673,24 +672,6 @@ where
         &KIND_READ_ID,
         "local_read",
         "Local read receipt kind.",
-    )?);
-    metadata.union(describe_kind(
-        blobs,
-        &KIND_PARTY_ID,
-        "local_party",
-        "Local party kind.",
-    )?);
-    metadata.union(describe_kind(
-        blobs,
-        &PARTY_USER_ID,
-        "local_party_user",
-        "Local party: user.",
-    )?);
-    metadata.union(describe_kind(
-        blobs,
-        &PARTY_AGENT_ID,
-        "local_party_agent",
-        "Local party: agent.",
     )?);
 
     Ok(metadata)
