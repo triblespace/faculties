@@ -150,8 +150,8 @@ enum Command {
         /// Receiver label.
         to: String,
         /// Message text.
-        #[arg(value_name = "TEXT", num_args = 1.., trailing_var_arg = true)]
-        text: Vec<String>,
+        #[arg(value_name = "TEXT")]
+        text: String,
     },
     /// List recent messages (latest first)
     List {
@@ -386,7 +386,7 @@ fn load_text(
     Ok(view.as_ref().to_string())
 }
 
-fn cmd_send(pile: &Path, branch: &str, text: Vec<String>, from: String, to: String) -> Result<()> {
+fn cmd_send(pile: &Path, branch: &str, text: String, from: String, to: String) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let mut ws = repo
         .pull(branch_id)
@@ -395,7 +395,6 @@ fn cmd_send(pile: &Path, branch: &str, text: Vec<String>, from: String, to: Stri
 
     let now = epoch_interval(now_epoch());
     let message_id = ufoid();
-    let text = text.join(" ");
     let body_handle = ws.put::<blobschemas::LongString, _>(text.clone());
     let space = ws
         .checkout(..)
