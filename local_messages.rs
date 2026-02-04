@@ -122,7 +122,7 @@ fn resolve_or_create_party_id(
 
     let label = normalize_label(label)?;
     let party_id = ufoid();
-    change += entity! { &party_id @
+    *change += entity! { &party_id @
         metadata::tag: &KIND_PARTY_ID,
         metadata::shortname: label,
     };
