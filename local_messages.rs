@@ -453,14 +453,7 @@ fn cmd_ack(pile: &Path, branch: &str, id: String, by: Party, labels: &LabelOverr
     Ok(())
 }
 
-fn cmd_list(
-    pile: &Path,
-    branch: &str,
-    reader: Party,
-    unread: bool,
-    limit: usize,
-    labels: &LabelOverrides,
-) -> Result<()> {
+fn cmd_list(pile: &Path, branch: &str, reader: Party, unread: bool, limit: usize) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let mut ws = repo
         .pull(branch_id)
@@ -479,13 +472,6 @@ fn cmd_list(
         }])
     ) {
         party_names.insert(party_id, shortname);
-    }
-
-    if let Some(label) = explicit_label(Party::User, labels) {
-        party_names.insert(PARTY_USER_ID, label);
-    }
-    if let Some(label) = explicit_label(Party::Agent, labels) {
-        party_names.insert(PARTY_AGENT_ID, label);
     }
 
     let mut messages = Vec::new();
@@ -615,7 +601,7 @@ fn main() -> Result<()> {
             reader,
             unread,
             limit,
-        } => cmd_list(&cli.pile, &cli.branch, reader, unread, limit, &labels),
+        } => cmd_list(&cli.pile, &cli.branch, reader, unread, limit),
         Command::Ack { id, by } => cmd_ack(&cli.pile, &cli.branch, id, by, &labels),
     }
 }
