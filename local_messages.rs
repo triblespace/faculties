@@ -77,12 +77,35 @@ impl Party {
             Party::Agent => PARTY_AGENT_ID,
         }
     }
+}
 
-    fn label(self) -> &'static str {
-        match self {
-            Party::User => "user",
-            Party::Agent => "agent",
-        }
+#[derive(Debug, Clone, Default)]
+struct LabelOverrides {
+    user: Option<String>,
+    agent: Option<String>,
+}
+
+fn explicit_label(party: Party, overrides: &LabelOverrides) -> Option<String> {
+    match party {
+        Party::User => overrides.user.clone().or_else(|| env_label("LOCAL_MESSAGES_USER_LABEL")),
+        Party::Agent => overrides
+            .agent
+            .clone()
+            .or_else(|| env_label("LOCAL_MESSAGES_AGENT_LABEL")),
+    }
+}
+
+fn display_label(party: Party, overrides: &LabelOverrides) -> String {
+    explicit_label(party, overrides).unwrap_or_else(|| match party {
+        Party::User => "user".to_string(),
+        Party::Agent => "agent".to_string(),
+    })
+}
+
+fn env_label(var: &str) -> Option<String> {
+    match std::env::var(var) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
     }
 }
 
@@ -95,6 +118,12 @@ struct Cli {
     /// Branch name for local messages
     #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
     branch: String,
+    /// Override label for the user party (display only).
+    #[arg(long, global = true)]
+    user_label: Option<String>,
+    /// Override label for the agent party (display only).
+    #[arg(long, global = true)]
+    agent_label: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -252,7 +281,10 @@ fn find_branch_by_name(
     Ok(None)
 }
 
-fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
+fn ensure_metadata(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    labels: &LabelOverrides,
+) -> Result<TribleSet> {
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -289,7 +321,12 @@ fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Tri
     .map(|(party,)| party)
     .collect();
 
-    for (id, label) in PARTY_SPECS {
+    for (id, default_label) in PARTY_SPECS {
+        let label = match id {
+            PARTY_USER_ID => labels.user.as_deref().unwrap_or(default_label),
+            PARTY_AGENT_ID => labels.agent.as_deref().unwrap_or(default_label),
+            _ => default_label,
+        };
         if !existing_parties.contains(&id) {
             change += entity! { ExclusiveId::force_ref(&id) @
                 metadata::tag: &KIND_PARTY_ID,
@@ -340,12 +377,19 @@ fn load_text(
     Ok(view.as_ref().to_string())
 }
 
-fn cmd_send(pile: &Path, branch: &str, text: String, from: Party, to: Party) -> Result<()> {
+fn cmd_send(
+    pile: &Path,
+    branch: &str,
+    text: String,
+    from: Party,
+    to: Party,
+    labels: &LabelOverrides,
+) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let mut change = ensure_metadata(&mut ws)?;
+    let mut change = ensure_metadata(&mut ws, labels)?;
 
     let now = epoch_interval(now_epoch());
     let message_id = ufoid();
@@ -365,8 +409,8 @@ fn cmd_send(pile: &Path, branch: &str, text: String, from: Party, to: Party) -> 
     println!(
         "[{}] {} -> {}: {}",
         id_prefix(*message_id),
-        from.label(),
-        to.label(),
+        display_label(from, labels),
+        display_label(to, labels),
         truncate_single_line(&text, 120)
     );
     repo.close()
@@ -374,12 +418,12 @@ fn cmd_send(pile: &Path, branch: &str, text: String, from: Party, to: Party) -> 
     Ok(())
 }
 
-fn cmd_ack(pile: &Path, branch: &str, id: String, by: Party) -> Result<()> {
+fn cmd_ack(pile: &Path, branch: &str, id: String, by: Party, labels: &LabelOverrides) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let mut change = ensure_metadata(&mut ws)?;
+    let mut change = ensure_metadata(&mut ws, labels)?;
 
     let space = ws
         .checkout(..)
@@ -402,14 +446,21 @@ fn cmd_ack(pile: &Path, branch: &str, id: String, by: Party) -> Result<()> {
     println!(
         "Marked {} as read by {}.",
         id_prefix(message_id),
-        by.label()
+        display_label(by, labels)
     );
     repo.close()
         .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
     Ok(())
 }
 
-fn cmd_list(pile: &Path, branch: &str, reader: Party, unread: bool, limit: usize) -> Result<()> {
+fn cmd_list(
+    pile: &Path,
+    branch: &str,
+    reader: Party,
+    unread: bool,
+    limit: usize,
+    labels: &LabelOverrides,
+) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let mut ws = repo
         .pull(branch_id)
@@ -428,6 +479,13 @@ fn cmd_list(pile: &Path, branch: &str, reader: Party, unread: bool, limit: usize
         }])
     ) {
         party_names.insert(party_id, shortname);
+    }
+
+    if let Some(label) = explicit_label(Party::User, labels) {
+        party_names.insert(PARTY_USER_ID, label);
+    }
+    if let Some(label) = explicit_label(Party::Agent, labels) {
+        party_names.insert(PARTY_AGENT_ID, label);
     }
 
     let mut messages = Vec::new();
@@ -538,6 +596,10 @@ fn main() -> Result<()> {
     if let Err(err) = emit_schema_to_atlas(&cli.pile) {
         eprintln!("atlas emit: {err}");
     }
+    let labels = LabelOverrides {
+        user: cli.user_label.clone(),
+        agent: cli.agent_label.clone(),
+    };
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -546,13 +608,15 @@ fn main() -> Result<()> {
     };
 
     match cmd {
-        Command::Send { text, from, to } => cmd_send(&cli.pile, &cli.branch, text, from, to),
+        Command::Send { text, from, to } => {
+            cmd_send(&cli.pile, &cli.branch, text, from, to, &labels)
+        }
         Command::List {
             reader,
             unread,
             limit,
-        } => cmd_list(&cli.pile, &cli.branch, reader, unread, limit),
-        Command::Ack { id, by } => cmd_ack(&cli.pile, &cli.branch, id, by),
+        } => cmd_list(&cli.pile, &cli.branch, reader, unread, limit, &labels),
+        Command::Ack { id, by } => cmd_ack(&cli.pile, &cli.branch, id, by, &labels),
     }
 }
 
