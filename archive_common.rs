@@ -1,0 +1,588 @@
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow};
+use ed25519_dalek::SigningKey;
+use hifitime::Epoch;
+use rand_core::OsRng;
+use std::fs;
+use triblespace::core::metadata;
+use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::{Repository, Workspace};
+use triblespace::prelude::blobschemas::LongString;
+use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
+use triblespace::prelude::*;
+
+pub mod archive_schema {
+    use triblespace::core::metadata;
+    use triblespace::macros::id_hex;
+    pub use triblespace::prelude::blobschemas::FileBytes;
+    use triblespace::prelude::blobschemas::LongString;
+    use triblespace::prelude::valueschemas::{
+        Blake3, GenId, Handle, NsTAIInterval, ShortString, U256BE,
+    };
+    use triblespace::prelude::*;
+
+    /// A unified archive projection for externally sourced conversations.
+    ///
+    /// This schema is used by archive importers (ChatGPT, Codex, Copilot, Gemini, ...)
+    /// to store a common message/author/attachment graph, while keeping the raw
+    /// source artifacts separately (e.g. JSON trees, HTML, etc).
+    pub mod archive {
+        use super::*;
+
+        attributes! {
+            "5F10520477A04E5FB322C85CC78C6762" as pub kind: GenId;
+
+            "0D9195A7B1B20DE312A08ECE39168079" as pub reply_to: GenId;
+            "838CC157FFDD37C6AC7CC5A472E43ADB" as pub author: GenId;
+            "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<Blake3, LongString>;
+            "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<Blake3, LongString>;
+            "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;
+            "1F127324384335D12ECFE0CB84840925" as pub author_provider: Handle<Blake3, LongString>;
+            "ACF09FF3D62B73983A222313FF0C52D2" as pub content: Handle<Blake3, LongString>;
+            "0DA5DD275AA34F86B0297CC35F1B7395" as pub created_at: NsTAIInterval;
+
+            "D8A469EAC2518D1A85692E0BEBF20D6C" as pub content_type: ShortString;
+            "8334E282F24A4C7779C8899191B29E00" as pub attachment: GenId;
+
+            "C9132D7400892F65B637BCBE92E230FB" as pub attachment_source_id: Handle<Blake3, LongString>;
+            "A8F6CF04A9B2391A26F04BC84B77217D" as pub attachment_source_pointer: Handle<Blake3, LongString>;
+            "9ADD88D3FFD9E4F91E0DC08126D9180A" as pub attachment_name: Handle<Blake3, LongString>;
+            "EEFDB32D37B7B2834D99ACCF159B6507" as pub attachment_mime: ShortString;
+            "D233E7BE0E973B09BD51E768E528ACA5" as pub attachment_size_bytes: U256BE;
+            "5937E1072AF2F8E493321811B483C57B" as pub attachment_width_px: U256BE;
+            "B252F4F77929E54FF8472027B7603EE9" as pub attachment_height_px: U256BE;
+            "B0D18159D6035C576AE6B5D871AB4D63" as pub attachment_data: Handle<Blake3, FileBytes>;
+        }
+
+        /// Tag for message payloads.
+        #[allow(non_upper_case_globals)]
+        pub const kind_message: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
+        /// Tag for author entities.
+        #[allow(non_upper_case_globals)]
+        pub const kind_author: Id = id_hex!("4E4512EFB0BF0CD42265BD107AE7F082");
+        /// Tag for attachment entities.
+        #[allow(non_upper_case_globals)]
+        pub const kind_attachment: Id = id_hex!("B465C85DD800633F58FE211B920AF2D9");
+
+        #[allow(dead_code)]
+        pub fn describe<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+        where
+            B: BlobStore<Blake3>,
+        {
+            let mut tribles = TribleSet::new();
+
+            tribles += entity! { ExclusiveId::force_ref(&kind_message) @
+                metadata::shortname: "kind_message",
+                metadata::name: blobs.put::<LongString, _>(
+                    "Message payload kind.".to_string(),
+                )?,
+            };
+
+            tribles += entity! { ExclusiveId::force_ref(&kind_author) @
+                metadata::shortname: "kind_author",
+                metadata::name: blobs.put::<LongString, _>(
+                    "Author entity kind.".to_string(),
+                )?,
+            };
+
+            tribles += entity! { ExclusiveId::force_ref(&kind_attachment) @
+                metadata::shortname: "kind_attachment",
+                metadata::name: blobs.put::<LongString, _>(
+                    "Attachment entity kind.".to_string(),
+                )?,
+            };
+
+            Ok(tribles)
+        }
+    }
+
+    pub fn build_archive_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let mut metadata = archive::describe(blobs)?;
+
+        metadata.union(<GenId as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<ShortString as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<U256BE as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<Handle<Blake3, FileBytes> as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<FileBytes as metadata::ConstMetadata>::describe(blobs)?);
+
+        macro_rules! add_attribute {
+            ($attribute:expr, $name:expr) => {
+                metadata.union(describe_attribute(blobs, &$attribute, $name)?);
+            };
+        }
+
+        add_attribute!(archive::kind, "kind");
+        add_attribute!(archive::reply_to, "reply_to");
+        add_attribute!(archive::author, "author");
+        add_attribute!(archive::author_name, "author_name");
+        add_attribute!(archive::author_role, "author_role");
+        add_attribute!(archive::author_model, "author_model");
+        add_attribute!(archive::author_provider, "author_provider");
+        add_attribute!(archive::content, "content");
+        add_attribute!(archive::created_at, "created_at");
+
+        add_attribute!(archive::content_type, "content_type");
+        add_attribute!(archive::attachment, "attachment");
+        add_attribute!(archive::attachment_source_id, "attachment_source_id");
+        add_attribute!(
+            archive::attachment_source_pointer,
+            "attachment_source_pointer"
+        );
+        add_attribute!(archive::attachment_name, "attachment_name");
+        add_attribute!(archive::attachment_mime, "attachment_mime");
+        add_attribute!(archive::attachment_size_bytes, "attachment_size_bytes");
+        add_attribute!(archive::attachment_width_px, "attachment_width_px");
+        add_attribute!(archive::attachment_height_px, "attachment_height_px");
+        add_attribute!(archive::attachment_data, "attachment_data");
+
+        Ok(metadata)
+    }
+
+    fn describe_attribute<B, S>(
+        blobs: &mut B,
+        attribute: &Attribute<S>,
+        name: &str,
+    ) -> std::result::Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+        S: ValueSchema,
+    {
+        let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
+        let handle = blobs.put::<LongString, _>(name.to_owned())?;
+        let attribute_id = metadata::Metadata::id(attribute);
+        tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
+            metadata::shortname: name,
+            metadata::name: handle,
+        };
+        Ok(tribles)
+    }
+}
+
+pub mod import_schema {
+    use triblespace::core::metadata;
+    use triblespace::macros::id_hex;
+    use triblespace::prelude::blobschemas::LongString;
+    use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
+    use triblespace::prelude::*;
+
+    attributes! {
+        "41F6FA1633D8CB6AC7B2741BA0E140F4" as pub kind: GenId;
+        "891508CAD6E1430B221ADA937EFBD982" as pub batch: GenId;
+        "E997DCAAF43BAA04790FCB0FA0FBFE3A" as pub source_format: ShortString;
+        "8E8D4B9F29ED8306FB1057CF68FC5204" as pub source_path: Handle<Blake3, LongString>;
+        "973FB59D3452D3A8276172F8E3272324" as pub source_raw_root: GenId;
+        "87B587A3906056038FD767F4225274F9" as pub source_conversation_id: Handle<Blake3, LongString>;
+        "43586813BD6ABE2C23021410D3DC8109" as pub source_title: Handle<Blake3, LongString>;
+        "1B2A09FF44D2A5736FA320AB255026C1" as pub source_message_id: Handle<Blake3, LongString>;
+        "AA3CF220F15CCF724276F1251AFE053B" as pub source_author: Handle<Blake3, LongString>;
+        "B4C084B61FB46A932BFCA75B8BC621FA" as pub source_role: Handle<Blake3, LongString>;
+        "220DA5084D6261B5420922EADC064A5A" as pub source_parent_id: Handle<Blake3, LongString>;
+        "F672605621E56674127FD210CFFDFF2A" as pub source_created_at: NsTAIInterval;
+    }
+
+    /// Root id for describing the import metadata protocol.
+    #[allow(non_upper_case_globals)]
+    #[allow(dead_code)]
+    pub const import_metadata: Id = id_hex!("5D57DD8335FECADB173616D780965F0C");
+
+    /// Tag for import batch entities.
+    #[allow(non_upper_case_globals)]
+    pub const kind_batch: Id = id_hex!("573E4291B63CBA1B5AE090B0C25A2D34");
+
+    /// Tag for import protocol metadata.
+    #[allow(non_upper_case_globals)]
+    pub const tag_protocol: Id = id_hex!("21395C6FE7F3EB9CEAF5CF221C0B22B8");
+    /// Tag for kind constants in the import protocol.
+    #[allow(non_upper_case_globals)]
+    pub const tag_kind: Id = id_hex!("F7DC8B6E0C34FC58677E84A40580F8C2");
+    /// Tag for attribute constants in the import protocol.
+    #[allow(non_upper_case_globals)]
+    pub const tag_attribute: Id = id_hex!("0C9208CE8629DAA77721307868356F88");
+    /// Tag for tag constants in the import protocol.
+    #[allow(non_upper_case_globals)]
+    pub const tag_tag: Id = id_hex!("821901A883028FA3C9F5DEB03A7CA27E");
+
+    #[allow(dead_code)]
+    pub fn describe<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let mut tribles = TribleSet::new();
+
+        tribles += entity! { ExclusiveId::force_ref(&import_metadata) @
+            metadata::shortname: "import_metadata",
+            metadata::name: blobs.put::<LongString, _>(
+                "Root id for describing import metadata.".to_string(),
+            )?,
+            metadata::tag: tag_protocol,
+        };
+
+        tribles += entity! { ExclusiveId::force_ref(&tag_protocol) @
+            metadata::shortname: "tag_protocol",
+            metadata::name: blobs.put::<LongString, _>(
+                "Tag for import protocol metadata.".to_string(),
+            )?,
+            metadata::tag: tag_tag,
+        };
+
+        tribles += entity! { ExclusiveId::force_ref(&tag_kind) @
+            metadata::shortname: "tag_kind",
+            metadata::name: blobs.put::<LongString, _>(
+                "Tag for import protocol kind constants.".to_string(),
+            )?,
+            metadata::tag: tag_tag,
+        };
+
+        tribles += entity! { ExclusiveId::force_ref(&tag_attribute) @
+            metadata::shortname: "tag_attribute",
+            metadata::name: blobs.put::<LongString, _>(
+                "Tag for import protocol attributes.".to_string(),
+            )?,
+            metadata::tag: tag_tag,
+        };
+
+        tribles += entity! { ExclusiveId::force_ref(&tag_tag) @
+            metadata::shortname: "tag_tag",
+            metadata::name: blobs.put::<LongString, _>(
+                "Tag for import protocol tag constants.".to_string(),
+            )?,
+            metadata::tag: tag_tag,
+        };
+
+        tribles += entity! { ExclusiveId::force_ref(&kind_batch) @
+            metadata::shortname: "kind_batch",
+            metadata::name: blobs.put::<LongString, _>(
+                "Import batch entity kind.".to_string(),
+            )?,
+            metadata::tag: tag_kind,
+        };
+
+        Ok(tribles)
+    }
+
+    pub fn build_import_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+    {
+        let mut metadata = describe(blobs)?;
+
+        metadata.union(<GenId as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<ShortString as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
+
+        macro_rules! add_attribute {
+            ($attribute:expr, $name:expr) => {
+                metadata.union(describe_attribute(blobs, &$attribute, $name)?);
+            };
+        }
+
+        add_attribute!(kind, "import_kind");
+        add_attribute!(batch, "import_batch");
+        add_attribute!(source_format, "import_source_format");
+        add_attribute!(source_path, "import_source_path");
+        add_attribute!(source_raw_root, "import_source_raw_root");
+        add_attribute!(source_conversation_id, "import_source_conversation_id");
+        add_attribute!(source_title, "import_source_title");
+        add_attribute!(source_message_id, "import_source_message_id");
+        add_attribute!(source_author, "import_source_author");
+        add_attribute!(source_role, "import_source_role");
+        add_attribute!(source_parent_id, "import_source_parent_id");
+        add_attribute!(source_created_at, "import_source_created_at");
+
+        Ok(metadata)
+    }
+
+    fn describe_attribute<B, S>(
+        blobs: &mut B,
+        attribute: &Attribute<S>,
+        name: &str,
+    ) -> std::result::Result<TribleSet, B::PutError>
+    where
+        B: BlobStore<Blake3>,
+        S: ValueSchema,
+    {
+        let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
+        let handle = blobs.put::<LongString, _>(name.to_owned())?;
+        let attribute_id = metadata::Metadata::id(attribute);
+        tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
+            metadata::shortname: name,
+            metadata::name: handle,
+            metadata::tag: tag_attribute,
+        };
+        Ok(tribles)
+    }
+}
+
+pub use archive_schema::archive;
+
+pub type Repo = Repository<Pile<Blake3>>;
+pub type Ws = Workspace<Pile<Blake3>>;
+
+const ATLAS_BRANCH: &str = "atlas";
+
+pub fn default_pile_path() -> PathBuf {
+    PathBuf::from("self.pile")
+}
+
+pub fn open_repo_for_write(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)> {
+    if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
+    }
+
+    let mut pile =
+        Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+    pile.restore()
+        .map_err(|e| anyhow!("restore pile: {e:?}"))?;
+
+    let existing = find_branch_by_name(&mut pile, branch_name)?;
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut repo = Repository::new(pile, signing_key);
+    let branch_id = match existing {
+        Some(id) => id,
+        None => repo
+            .create_branch(branch_name, None)
+            .map_err(|e| anyhow!("create branch: {e:?}"))?
+            .release(),
+    };
+
+    seed_default_metadata(&mut repo)?;
+
+    Ok((repo, branch_id))
+}
+
+pub fn open_repo_for_read(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)> {
+    let mut pile =
+        Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+    pile.restore()
+        .map_err(|e| anyhow!("restore pile: {e:?}"))?;
+
+    let Some(branch_id) = find_branch_by_name(&mut pile, branch_name)? else {
+        return Err(anyhow!("unknown branch {branch_name}"));
+    };
+
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let repo = Repository::new(pile, signing_key);
+
+    Ok((repo, branch_id))
+}
+
+fn open_repo_for_atlas(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)> {
+    if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
+    }
+
+    let mut pile =
+        Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+    pile.restore()
+        .map_err(|e| anyhow!("restore pile: {e:?}"))?;
+
+    let existing = find_branch_by_name(&mut pile, branch_name)?;
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let mut repo = Repository::new(pile, signing_key);
+    let branch_id = match existing {
+        Some(id) => id,
+        None => repo
+            .create_branch(branch_name, None)
+            .map_err(|e| anyhow!("create branch: {e:?}"))?
+            .release(),
+    };
+
+    Ok((repo, branch_id))
+}
+
+fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
+    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let iter = pile.branches().map_err(|e| anyhow!("list branches: {e:?}"))?;
+
+    for branch in iter {
+        let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
+        let Some(head) = pile
+            .head(branch_id)
+            .map_err(|e| anyhow!("branch head: {e:?}"))?
+        else {
+            continue;
+        };
+        let metadata_set: TribleSet = reader
+            .get(head)
+            .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
+        let mut names = find!(
+            (shortname: String),
+            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+        )
+        .into_iter();
+        let Some(name) = names.next().map(|(name,)| name) else {
+            continue;
+        };
+        if names.next().is_some() {
+            continue;
+        }
+        if name == branch_name {
+            return Ok(Some(branch_id));
+        }
+    }
+    Ok(None)
+}
+
+pub fn seed_default_metadata(repo: &mut Repo) -> Result<()> {
+    let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
+        .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
+    metadata.union(
+        import_schema::build_import_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build import metadata: {e:?}"))?,
+    );
+    repo.set_default_metadata(metadata)
+        .map_err(|e| anyhow!("set default metadata: {e:?}"))?;
+    Ok(())
+}
+
+pub fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
+    let (mut repo, branch_id) = open_repo_for_atlas(pile_path, ATLAS_BRANCH)?;
+    let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
+        .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
+    metadata.union(
+        import_schema::build_import_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build import metadata: {e:?}"))?,
+    );
+
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
+    let delta = metadata.difference(&space);
+    if !delta.is_empty() {
+        ws.commit(delta, None, Some("atlas schema metadata"));
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+    }
+    repo.close()
+        .map_err(|e| anyhow!("close pile: {e:?}"))?;
+    Ok(())
+}
+
+pub fn push_workspace(repo: &mut Repo, ws: &mut Ws) -> Result<()> {
+    while let Some(mut conflict) = repo
+        .try_push(ws)
+        .map_err(|e| anyhow!("push workspace: {e:?}"))?
+    {
+        conflict
+            .merge(ws)
+            .map_err(|e| anyhow!("merge workspace: {e:?}"))?;
+        *ws = conflict;
+    }
+    Ok(())
+}
+
+pub fn stable_id(parts: &[&str]) -> Id {
+    use triblespace::core::id::RawId;
+    use triblespace::core::value::schemas::hash::Blake3 as Blake3Hasher;
+
+    let mut hasher = Blake3Hasher::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            hasher.update(&[0x1f]);
+        }
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut raw: RawId = [0u8; 16];
+    let bytes = digest.as_bytes();
+    let raw_len = raw.len();
+    raw.copy_from_slice(&bytes[bytes.len() - raw_len..]);
+    Id::new(raw).unwrap_or_else(|| {
+        raw[0] = 1;
+        // SAFETY: raw has been ensured non-nil.
+        unsafe { Id::force(raw) }
+    })
+}
+
+pub fn now_epoch() -> Epoch {
+    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+}
+
+pub fn epoch_from_seconds(value: f64) -> Option<Epoch> {
+    if value.is_finite() {
+        Some(Epoch::from_unix_seconds(value))
+    } else {
+        None
+    }
+}
+
+pub fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
+    (epoch, epoch).to_value()
+}
+
+pub fn ensure_author(
+    ws: &mut Ws,
+    catalog: &TribleSet,
+    name: &str,
+    role: &str,
+) -> Result<(Id, TribleSet)> {
+    if let Some(author_id) = find_author_by_name(ws, catalog, name)? {
+        let mut change = TribleSet::new();
+        if author_role_handle(catalog, author_id).is_none() && !role.is_empty() {
+            let handle = ws.put::<LongString, _>(role.to_owned());
+            change += entity! { ExclusiveId::force_ref(&author_id) @
+                archive::author_role: handle
+            };
+        }
+        return Ok((author_id, change));
+    }
+
+    let author_id = ufoid();
+    let name_handle = ws.put::<LongString, _>(name.to_owned());
+    let mut change = TribleSet::new();
+    change += entity! { &author_id @
+        archive::kind: archive::kind_author,
+        archive::author_name: name_handle,
+    };
+    if !role.is_empty() {
+        let handle = ws.put::<LongString, _>(role.to_owned());
+        change += entity! { &author_id @ archive::author_role: handle };
+    }
+    Ok((*author_id, change))
+}
+
+fn find_author_by_name(ws: &mut Ws, catalog: &TribleSet, target_name: &str) -> Result<Option<Id>> {
+    for (author_id, name_handle) in find!(
+        (author: Id, author_name: Value<Handle<Blake3, LongString>>),
+        pattern!(catalog, [{
+            ?author @
+            archive::kind: archive::kind_author,
+            archive::author_name: ?author_name,
+        }])
+    ) {
+        let existing: View<str> = ws.get(name_handle).context("load author name")?;
+        if existing.as_ref() == target_name {
+            return Ok(Some(author_id));
+        }
+    }
+    Ok(None)
+}
+
+fn author_role_handle(
+    catalog: &TribleSet,
+    author_id: Id,
+) -> Option<Value<Handle<Blake3, LongString>>> {
+    for (author, role) in find!(
+        (author: Id, role: Value<Handle<Blake3, LongString>>),
+        pattern!(catalog, [{ ?author @ archive::author_role: ?role }])
+    ) {
+        if author == author_id {
+            return Some(role);
+        }
+    }
+    None
+}
