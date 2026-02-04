@@ -108,7 +108,6 @@ fn resolve_party_id(space: &TribleSet, label: &str) -> Result<Option<Id>> {
 }
 
 fn resolve_or_create_party_id(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     space: &TribleSet,
     change: &mut TribleSet,
     label: &str,
@@ -146,13 +145,13 @@ struct Cli {
 enum Command {
     /// Send a message
     Send {
-        text: String,
-        /// Sender label (defaults to "user").
-        #[arg(default_value = "user")]
+        /// Sender label.
         from: String,
-        /// Receiver label (defaults to "agent").
-        #[arg(default_value = "agent")]
+        /// Receiver label.
         to: String,
+        /// Message text.
+        #[arg(value_name = "TEXT", num_args = 1.., trailing_var_arg = true)]
+        text: Vec<String>,
     },
     /// List recent messages (latest first)
     List {
@@ -387,7 +386,7 @@ fn load_text(
     Ok(view.as_ref().to_string())
 }
 
-fn cmd_send(pile: &Path, branch: &str, text: String, from: String, to: String) -> Result<()> {
+fn cmd_send(pile: &Path, branch: &str, text: Vec<String>, from: String, to: String) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let mut ws = repo
         .pull(branch_id)
@@ -396,12 +395,13 @@ fn cmd_send(pile: &Path, branch: &str, text: String, from: String, to: String) -
 
     let now = epoch_interval(now_epoch());
     let message_id = ufoid();
+    let text = text.join(" ");
     let body_handle = ws.put::<blobschemas::LongString, _>(text.clone());
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let from_id = resolve_or_create_party_id(&mut ws, &space, &mut change, &from)?;
-    let to_id = resolve_or_create_party_id(&mut ws, &space, &mut change, &to)?;
+    let from_id = resolve_or_create_party_id(&space, &mut change, &from)?;
+    let to_id = resolve_or_create_party_id(&space, &mut change, &to)?;
     change += entity! { &message_id @
         metadata::tag: &KIND_MESSAGE_ID,
         local::from: from_id,
@@ -437,7 +437,7 @@ fn cmd_ack(pile: &Path, branch: &str, id: String, by: String) -> Result<()> {
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let message_id = resolve_message_id(&space, &id)?;
-    let reader_id = resolve_or_create_party_id(&mut ws, &space, &mut change, &by)?;
+    let reader_id = resolve_or_create_party_id(&space, &mut change, &by)?;
 
     let now = epoch_interval(now_epoch());
     let read_id = ufoid();
