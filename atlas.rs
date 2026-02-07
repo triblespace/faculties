@@ -5,7 +5,7 @@
 //! clap = { version = "4.5.4", features = ["derive"] }
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
-//! triblespace = "0.9.0"
+//! triblespace = "0.10.0"
 //! ```
 
 use std::cmp::Ordering;
@@ -40,7 +40,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List entities that have metadata::shortname entries.
+    /// List entities that have metadata::name entries.
     List,
     /// Show metadata for a single id prefix.
     Show { id: String },
@@ -49,8 +49,9 @@ enum Command {
 #[derive(Clone)]
 struct MetaRow {
     id: Id,
-    shortname: String,
-    name: Option<String>,
+    name: String,
+    description: Option<String>,
+    source_module: Option<String>,
     tags: Vec<Id>,
 }
 
@@ -83,7 +84,7 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
         .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
 
     let mut rows = collect_rows(&mut ws, &space)?;
-    rows.sort_by(|a, b| match a.shortname.cmp(&b.shortname) {
+    rows.sort_by(|a, b| match a.name.cmp(&b.name) {
         Ordering::Equal => format!("{:x}", a.id).cmp(&format!("{:x}", b.id)),
         other => other,
     });
@@ -102,11 +103,18 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
                     .join(", ")
             )
         };
-        let name = row
-            .name
-            .map(|n| format!(" - {n}"))
+        let description = row
+            .description
+            .map(|d| format!(" - {d}"))
             .unwrap_or_default();
-        println!("{short_id} {shortname}{tags}{name}", shortname = row.shortname);
+        let source_module = row
+            .source_module
+            .map(|m| format!(" @{m}"))
+            .unwrap_or_default();
+        println!(
+            "{short_id} {name}{source_module}{tags}{description}",
+            name = row.name
+        );
     }
 
     repo.close()
@@ -126,9 +134,12 @@ fn cmd_show(pile: &Path, branch: &str, prefix: &str) -> Result<()> {
     let row = resolve_prefix(rows, prefix)?;
 
     println!("id: {:x}", row.id);
-    println!("shortname: {}", row.shortname);
-    if let Some(name) = row.name {
-        println!("name: {name}");
+    println!("name: {}", row.name);
+    if let Some(description) = row.description {
+        println!("description: {description}");
+    }
+    if let Some(source_module) = row.source_module {
+        println!("source_module: {source_module}");
     }
     if !row.tags.is_empty() {
         let tags = row
@@ -147,19 +158,33 @@ fn cmd_show(pile: &Path, branch: &str, prefix: &str) -> Result<()> {
 
 fn collect_rows(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet) -> Result<Vec<MetaRow>> {
     let mut rows = Vec::new();
-    for (id, shortname) in find!(
-        (id: Id, shortname: String),
-        pattern!(space, [{ ?id @ metadata::shortname: ?shortname }])
+    for (id, handle) in find!(
+        (id: Id, handle: Value<Handle<Blake3, LongString>>),
+        pattern!(space, [{ ?id @ metadata::name: ?handle }])
     ) {
-        let name = match find!(
+        let name: View<str> = ws.get(handle).context("read name")?;
+        let description = match find!(
             (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(space, [{ id @ metadata::name: ?handle }])
+            pattern!(space, [{ id @ metadata::description: ?handle }])
         )
         .into_iter()
         .next()
         {
             Some((handle,)) => {
-                let view: View<str> = ws.get(handle).context("read name")?;
+                let view: View<str> = ws.get(handle).context("read description")?;
+                Some(view.to_string())
+            }
+            None => None,
+        };
+        let source_module_value = match find!(
+            (handle: Value<Handle<Blake3, LongString>>),
+            pattern!(space, [{ id @ metadata::source_module: ?handle }])
+        )
+        .into_iter()
+        .next()
+        {
+            Some((handle,)) => {
+                let view: View<str> = ws.get(handle).context("read source module")?;
                 Some(view.to_string())
             }
             None => None,
@@ -175,8 +200,9 @@ fn collect_rows(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet) -> Result<V
 
         rows.push(MetaRow {
             id,
-            shortname,
-            name,
+            name: name.to_string(),
+            description,
+            source_module: source_module_value,
             tags,
         });
     }
@@ -235,6 +261,11 @@ fn open_repo(pile_path: &Path, branch_name: &str) -> Result<(Repository<Pile<Bla
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile.branches().map_err(|e| anyhow!("list branches: {e:?}"))?;
+    let expected = branch_name
+        .to_string()
+        .to_blob()
+        .get_handle::<Blake3>()
+        .to_value();
 
     for branch in iter {
         let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
@@ -248,17 +279,17 @@ fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Opt
             .get(head)
             .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
         let mut names = find!(
-            (shortname: String),
-            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+            (handle: Value<Handle<Blake3, LongString>>),
+            pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some(name) = names.next().map(|(name,)| name) else {
+        let Some((handle,)) = names.next() else {
             continue;
         };
         if names.next().is_some() {
             continue;
         }
-        if name == branch_name {
+        if handle == expected {
             return Ok(Some(branch_id));
         }
     }
