@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.9.0"
+//! triblespace = "0.10.0"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -33,6 +33,9 @@ mod relations {
     attributes! {
         "8F162B593D390E1424394DBF6883A72C" as alias: valueschemas::ShortString;
         "32B22FBA3EC2ADC3FFEB48483FE8961F" as affinity: valueschemas::ShortString;
+        "F0AD0BBFAC4C4C899637573DC965622E" as first_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "764DD765142B3F4725B614BD3B9118EC" as last_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "DC0916CB5F640984EFE359A33105CA9A" as display_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "9B3329149D54CB9A8E8075E4AA862649" as teams_user_id: valueschemas::ShortString;
         "B563A063474CBE62ED25A8D0E9A1853C" as email: valueschemas::ShortString;
     }
@@ -60,6 +63,12 @@ enum Command {
         /// Explicit person id (hex)
         #[arg(long)]
         id: Option<String>,
+        /// First name
+        #[arg(long)]
+        first_name: Option<String>,
+        /// Last name
+        #[arg(long)]
+        last_name: Option<String>,
         /// Display name
         #[arg(long)]
         display_name: Option<String>,
@@ -86,6 +95,12 @@ enum Command {
         /// New canonical short label
         #[arg(long)]
         label: Option<String>,
+        /// First name
+        #[arg(long)]
+        first_name: Option<String>,
+        /// Last name
+        #[arg(long)]
+        last_name: Option<String>,
         /// Display name
         #[arg(long)]
         display_name: Option<String>,
@@ -120,6 +135,8 @@ enum Command {
 struct PersonRecord {
     id: Id,
     label: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     display_name: Option<String>,
     affinity: Option<String>,
     note: Option<String>,
@@ -181,6 +198,10 @@ fn find_branch_by_name(
     pile: &mut Pile<valueschemas::Blake3>,
     branch_name: &str,
 ) -> Result<Option<Id>> {
+    let name_handle = branch_name
+        .to_owned()
+        .to_blob()
+        .get_handle::<valueschemas::Blake3>();
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile.branches().map_err(|e| anyhow!("list branches: {e:?}"))?;
     for branch in iter {
@@ -192,17 +213,17 @@ fn find_branch_by_name(
             .get(head)
             .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
         let mut names = find!(
-            (shortname: String),
-            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+            (handle: TextHandle),
+            pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some(name) = names.next().map(|(name,)| name) else {
+        let Some(name) = names.next().map(|(handle,)| handle) else {
             continue;
         };
         if names.next().is_some() {
             continue;
         }
-        if name == branch_name {
+        if name == name_handle {
             return Ok(Some(branch_id));
         }
     }
@@ -211,15 +232,19 @@ fn find_branch_by_name(
 
 fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-    let existing: HashMap<Id, String> = find!(
-        (kind: Id, name: String),
-        pattern!(&space, [{ ?kind @ metadata::shortname: ?name }])
+    let existing: HashMap<Id, TextHandle> = find!(
+        (kind: Id, name: TextHandle),
+        pattern!(&space, [{ ?kind @ metadata::name: ?name }])
     )
     .into_iter()
     .collect();
     let mut change = TribleSet::new();
     if !existing.contains_key(&KIND_PERSON_ID) {
-        change += entity! { ExclusiveId::force_ref(&KIND_PERSON_ID) @ metadata::shortname: "person" };
+        let name_handle = "person"
+            .to_owned()
+            .to_blob()
+            .get_handle::<valueschemas::Blake3>();
+        change += entity! { ExclusiveId::force_ref(&KIND_PERSON_ID) @ metadata::name: name_handle };
     }
     Ok(change)
 }
@@ -237,6 +262,8 @@ fn load_people(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<Per
             PersonRecord {
                 id: person_id,
                 label: None,
+                first_name: None,
+                last_name: None,
                 display_name: None,
                 affinity: None,
                 note: None,
@@ -247,23 +274,50 @@ fn load_people(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<Per
         );
     }
 
-    for (person_id, label) in find!(
-        (person_id: Id, label: String),
-        pattern!(&space, [{ ?person_id @ metadata::shortname: ?label }])
-    ) {
-        if let Some(person) = people.get_mut(&person_id) {
-            person.label = Some(label);
-        }
-    }
-
     for (person_id, handle) in find!(
         (person_id: Id, handle: TextHandle),
         pattern!(&space, [{ ?person_id @ metadata::name: ?handle }])
     ) {
         if let Some(person) = people.get_mut(&person_id) {
             let value = read_text(ws, handle)?;
+            if person.label.is_none() {
+                person.label = Some(value);
+            }
+        }
+    }
+
+    for (person_id, handle) in find!(
+        (person_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?person_id @ relations::display_name: ?handle }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            let value = read_text(ws, handle)?;
             if person.display_name.is_none() {
                 person.display_name = Some(value);
+            }
+        }
+    }
+
+    for (person_id, handle) in find!(
+        (person_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?person_id @ relations::first_name: ?handle }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            let value = read_text(ws, handle)?;
+            if person.first_name.is_none() {
+                person.first_name = Some(value);
+            }
+        }
+    }
+
+    for (person_id, handle) in find!(
+        (person_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?person_id @ relations::last_name: ?handle }])
+    ) {
+        if let Some(person) = people.get_mut(&person_id) {
+            let value = read_text(ws, handle)?;
+            if person.last_name.is_none() {
+                person.last_name = Some(value);
             }
         }
     }
@@ -328,17 +382,16 @@ fn load_people(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<Per
 fn find_person_by_label(space: &TribleSet, label: &str) -> Result<Option<Id>> {
     let label = normalize_label(label)?;
     let mut matches = Vec::new();
-    for (person_id, shortname) in find!(
-        (person_id: Id, shortname: String),
+    let label_handle = label.to_owned().to_blob().get_handle::<valueschemas::Blake3>();
+    for (person_id,) in find!(
+        (person_id: Id),
         pattern!(&space, [{
             ?person_id @
             metadata::tag: &KIND_PERSON_ID,
-            metadata::shortname: ?shortname,
+            metadata::name: label_handle,
         }])
     ) {
-        if shortname == label {
-            matches.push(person_id);
-        }
+        matches.push(person_id);
     }
     match matches.len() {
         0 => Ok(None),
@@ -352,6 +405,8 @@ fn cmd_add(
     branch: &str,
     label: String,
     id: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     display_name: Option<String>,
     affinity: Option<String>,
     note: Option<String>,
@@ -381,20 +436,29 @@ fn cmd_add(
         }
     }
 
+    let label_handle = ws.put(label.clone());
     change += entity! { ExclusiveId::force_ref(&person_id) @
         metadata::tag: &KIND_PERSON_ID,
-        metadata::shortname: label.clone(),
+        metadata::name: label_handle,
     };
 
     if let Some(display) = display_name {
-        let handle = ws.put::<blobschemas::LongString, _>(display);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::name: handle };
+        let handle = ws.put(display);
+        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
+    }
+    if let Some(value) = first_name {
+        let handle = ws.put(value);
+        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
+    }
+    if let Some(value) = last_name {
+        let handle = ws.put(value);
+        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
     }
     if let Some(value) = affinity {
         change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
     }
     if let Some(value) = note {
-        let handle = ws.put::<blobschemas::LongString, _>(value);
+        let handle = ws.put(value);
         change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
     }
     if let Some(value) = teams_user_id {
@@ -423,6 +487,8 @@ fn cmd_set(
     branch: &str,
     id: String,
     label: Option<String>,
+    first_name: Option<String>,
+    last_name: Option<String>,
     display_name: Option<String>,
     affinity: Option<String>,
     note: Option<String>,
@@ -463,17 +529,26 @@ fn cmd_set(
                 );
             }
         }
-        change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::shortname: label };
+        let handle = ws.put(label);
+        change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::name: handle };
     }
     if let Some(display) = display_name {
-        let handle = ws.put::<blobschemas::LongString, _>(display);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::name: handle };
+        let handle = ws.put(display);
+        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
+    }
+    if let Some(value) = first_name {
+        let handle = ws.put(value);
+        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
+    }
+    if let Some(value) = last_name {
+        let handle = ws.put(value);
+        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
     }
     if let Some(value) = affinity {
         change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
     }
     if let Some(value) = note {
-        let handle = ws.put::<blobschemas::LongString, _>(value);
+        let handle = ws.put(value);
         change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
     }
     if let Some(value) = teams_user_id {
@@ -516,7 +591,14 @@ fn cmd_list(pile: &Path, branch: &str, limit: usize) -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| "<unnamed>".to_string());
             let mut line = format!("[{}] {}", id_prefix(person.id), label);
-            if let Some(display) = &person.display_name {
+            let fallback_name = match (&person.first_name, &person.last_name) {
+                (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                (Some(first), None) => Some(first.clone()),
+                (None, Some(last)) => Some(last.clone()),
+                (None, None) => None,
+            };
+            let display = person.display_name.as_ref().or(fallback_name.as_ref());
+            if let Some(display) = display {
                 line.push_str(&format!(" ({display})"));
             }
             if let Some(affinity) = &person.affinity {
@@ -545,6 +627,12 @@ fn cmd_show(pile: &Path, branch: &str, id: String) -> Result<()> {
     println!("id: {:x}", person.id);
     if let Some(label) = person.label {
         println!("label: {label}");
+    }
+    if let Some(first) = person.first_name {
+        println!("first_name: {first}");
+    }
+    if let Some(last) = person.last_name {
+        println!("last_name: {last}");
     }
     if let Some(display) = person.display_name {
         println!("display_name: {display}");
@@ -596,6 +684,21 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     metadata.union(describe_attribute(repo.storage_mut(), &metadata::name, "name")?);
     metadata.union(describe_attribute(repo.storage_mut(), &relations::alias, "relations_alias")?);
     metadata.union(describe_attribute(repo.storage_mut(), &relations::affinity, "relations_affinity")?);
+    metadata.union(describe_attribute(
+        repo.storage_mut(),
+        &relations::first_name,
+        "relations_first_name",
+    )?);
+    metadata.union(describe_attribute(
+        repo.storage_mut(),
+        &relations::last_name,
+        "relations_last_name",
+    )?);
+    metadata.union(describe_attribute(
+        repo.storage_mut(),
+        &relations::display_name,
+        "relations_display_name",
+    )?);
     metadata.union(describe_attribute(repo.storage_mut(), &metadata::description, "description")?);
     metadata.union(describe_attribute(repo.storage_mut(), &relations::teams_user_id, "relations_teams_user_id")?);
     metadata.union(describe_attribute(repo.storage_mut(), &relations::email, "relations_email")?);
@@ -634,10 +737,9 @@ where
     S: ValueSchema,
 {
     let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-    let handle = blobs.put::<blobschemas::LongString, _>(name.to_owned())?;
+    let handle = blobs.put(name.to_owned())?;
     let attribute_id = metadata::Metadata::id(attribute);
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::shortname: name,
         metadata::name: handle,
     };
     Ok(tribles)
@@ -647,16 +749,17 @@ fn describe_kind<B>(
     blobs: &mut B,
     kind: &Id,
     name: &str,
-    _description: &str,
+    description: &str,
 ) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<valueschemas::Blake3>,
 {
     let mut tribles = TribleSet::new();
-    let name_handle = blobs.put::<blobschemas::LongString, _>(name.to_string())?;
+    let name_handle = blobs.put(name.to_string())?;
+
     tribles += entity! { ExclusiveId::force_ref(kind) @
-        metadata::shortname: name,
         metadata::name: name_handle,
+        metadata::description: blobs.put(description.to_string())?,
     };
     Ok(tribles)
 }
@@ -677,6 +780,8 @@ fn main() -> Result<()> {
         Command::Add {
             label,
             id,
+            first_name,
+            last_name,
             display_name,
             affinity,
             note,
@@ -688,6 +793,8 @@ fn main() -> Result<()> {
             &cli.branch,
             label,
             id,
+            first_name,
+            last_name,
             display_name,
             affinity,
             note,
@@ -698,6 +805,8 @@ fn main() -> Result<()> {
         Command::Set {
             id,
             label,
+            first_name,
+            last_name,
             display_name,
             affinity,
             note,
@@ -709,6 +818,8 @@ fn main() -> Result<()> {
             &cli.branch,
             id,
             label,
+            first_name,
+            last_name,
             display_name,
             affinity,
             note,

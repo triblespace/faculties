@@ -75,24 +75,18 @@ pub mod archive_schema {
             let mut tribles = TribleSet::new();
 
             tribles += entity! { ExclusiveId::force_ref(&kind_message) @
-                metadata::shortname: "kind_message",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Message payload kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_message".to_string())?,
+                metadata::description: blobs.put("Message payload kind.".to_string())?,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_author) @
-                metadata::shortname: "kind_author",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Author entity kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_author".to_string())?,
+                metadata::description: blobs.put("Author entity kind.".to_string())?,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_attachment) @
-                metadata::shortname: "kind_attachment",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Attachment entity kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_attachment".to_string())?,
+                metadata::description: blobs.put("Attachment entity kind.".to_string())?,
             };
 
             Ok(tribles)
@@ -156,10 +150,9 @@ pub mod archive_schema {
         S: ValueSchema,
     {
         let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put::<LongString, _>(name.to_owned())?;
+        let handle = blobs.put(name.to_owned())?;
         let attribute_id = metadata::Metadata::id(attribute);
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::shortname: name,
             metadata::name: handle,
         };
         Ok(tribles)
@@ -218,50 +211,48 @@ pub mod import_schema {
         let mut tribles = TribleSet::new();
 
         tribles += entity! { ExclusiveId::force_ref(&import_metadata) @
-            metadata::shortname: "import_metadata",
-            metadata::name: blobs.put::<LongString, _>(
+            metadata::name: blobs.put("import_metadata".to_string())?,
+            metadata::description: blobs.put(
                 "Root id for describing import metadata.".to_string(),
             )?,
             metadata::tag: tag_protocol,
         };
 
         tribles += entity! { ExclusiveId::force_ref(&tag_protocol) @
-            metadata::shortname: "tag_protocol",
-            metadata::name: blobs.put::<LongString, _>(
+            metadata::name: blobs.put("tag_protocol".to_string())?,
+            metadata::description: blobs.put(
                 "Tag for import protocol metadata.".to_string(),
             )?,
             metadata::tag: tag_tag,
         };
 
         tribles += entity! { ExclusiveId::force_ref(&tag_kind) @
-            metadata::shortname: "tag_kind",
-            metadata::name: blobs.put::<LongString, _>(
+            metadata::name: blobs.put("tag_kind".to_string())?,
+            metadata::description: blobs.put(
                 "Tag for import protocol kind constants.".to_string(),
             )?,
             metadata::tag: tag_tag,
         };
 
         tribles += entity! { ExclusiveId::force_ref(&tag_attribute) @
-            metadata::shortname: "tag_attribute",
-            metadata::name: blobs.put::<LongString, _>(
+            metadata::name: blobs.put("tag_attribute".to_string())?,
+            metadata::description: blobs.put(
                 "Tag for import protocol attributes.".to_string(),
             )?,
             metadata::tag: tag_tag,
         };
 
         tribles += entity! { ExclusiveId::force_ref(&tag_tag) @
-            metadata::shortname: "tag_tag",
-            metadata::name: blobs.put::<LongString, _>(
+            metadata::name: blobs.put("tag_tag".to_string())?,
+            metadata::description: blobs.put(
                 "Tag for import protocol tag constants.".to_string(),
             )?,
             metadata::tag: tag_tag,
         };
 
         tribles += entity! { ExclusiveId::force_ref(&kind_batch) @
-            metadata::shortname: "kind_batch",
-            metadata::name: blobs.put::<LongString, _>(
-                "Import batch entity kind.".to_string(),
-            )?,
+            metadata::name: blobs.put("kind_batch".to_string())?,
+            metadata::description: blobs.put("Import batch entity kind.".to_string())?,
             metadata::tag: tag_kind,
         };
 
@@ -311,10 +302,9 @@ pub mod import_schema {
         S: ValueSchema,
     {
         let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put::<LongString, _>(name.to_owned())?;
+        let handle = blobs.put(name.to_owned())?;
         let attribute_id = metadata::Metadata::id(attribute);
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::shortname: name,
             metadata::name: handle,
             metadata::tag: tag_attribute,
         };
@@ -404,6 +394,10 @@ fn open_repo_for_atlas(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile.branches().map_err(|e| anyhow!("list branches: {e:?}"))?;
+    let expected = LongString::from(branch_name)
+        .to_blob()
+        .get_handle::<Blake3>()
+        .to_value();
 
     for branch in iter {
         let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
@@ -417,17 +411,17 @@ fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Opt
             .get(head)
             .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
         let mut names = find!(
-            (shortname: String),
-            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+            (handle: Value<Handle<Blake3, LongString>>),
+            pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some(name) = names.next().map(|(name,)| name) else {
+        let Some((handle,)) = names.next() else {
             continue;
         };
         if names.next().is_some() {
             continue;
         }
-        if name == branch_name {
+        if handle == expected {
             return Ok(Some(branch_id));
         }
     }
@@ -533,7 +527,7 @@ pub fn ensure_author(
     if let Some(author_id) = find_author_by_name(ws, catalog, name)? {
         let mut change = TribleSet::new();
         if author_role_handle(catalog, author_id).is_none() && !role.is_empty() {
-            let handle = ws.put::<LongString, _>(role.to_owned());
+            let handle = ws.put(role.to_owned());
             change += entity! { ExclusiveId::force_ref(&author_id) @
                 archive::author_role: handle
             };
@@ -542,14 +536,14 @@ pub fn ensure_author(
     }
 
     let author_id = ufoid();
-    let name_handle = ws.put::<LongString, _>(name.to_owned());
+    let name_handle = ws.put(name.to_owned());
     let mut change = TribleSet::new();
     change += entity! { &author_id @
         archive::kind: archive::kind_author,
         archive::author_name: name_handle,
     };
     if !role.is_empty() {
-        let handle = ws.put::<LongString, _>(role.to_owned());
+        let handle = ws.put(role.to_owned());
         change += entity! { &author_id @ archive::author_role: handle };
     }
     Ok((*author_id, change))

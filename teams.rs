@@ -11,7 +11,7 @@
 //! reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.9.0"
+//! triblespace = "0.10.0"
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -101,24 +101,18 @@ mod archive_schema {
             let mut tribles = TribleSet::new();
 
             tribles += entity! { ExclusiveId::force_ref(&kind_message) @
-                metadata::shortname: "kind_message",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Message payload kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_message".to_string())?,
+                metadata::description: blobs.put("Message payload kind.".to_string())?,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_author) @
-                metadata::shortname: "kind_author",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Author entity kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_author".to_string())?,
+                metadata::description: blobs.put("Author entity kind.".to_string())?,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_attachment) @
-                metadata::shortname: "kind_attachment",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Attachment entity kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_attachment".to_string())?,
+                metadata::description: blobs.put("Attachment entity kind.".to_string())?,
             };
 
             Ok(tribles)
@@ -182,10 +176,9 @@ mod archive_schema {
         S: ValueSchema,
     {
         let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put::<LongString, _>(name.to_owned())?;
+        let handle = blobs.put(name.to_owned())?;
         let attribute_id = metadata::Metadata::id(attribute);
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::shortname: name,
             metadata::name: handle,
         };
         Ok(tribles)
@@ -261,80 +254,68 @@ mod teams_schema {
             let mut tribles = TribleSet::new();
 
             tribles += entity! { ExclusiveId::force_ref(&teams_metadata) @
-                metadata::shortname: "teams_metadata",
-                metadata::name: blobs.put::<LongString, _>(
+                metadata::name: blobs.put("teams_metadata".to_string())?,
+                metadata::description: blobs.put(
                     "Root id for describing the Teams bridge protocol.".to_string(),
                 )?,
                 metadata::tag: tag_protocol,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&tag_protocol) @
-                metadata::shortname: "tag_protocol",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Tag for Teams protocol metadata.".to_string(),
-                )?,
+                metadata::name: blobs.put("tag_protocol".to_string())?,
+                metadata::description: blobs.put("Tag for Teams protocol metadata.".to_string())?,
                 metadata::tag: tag_tag,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&tag_kind) @
-                metadata::shortname: "tag_kind",
-                metadata::name: blobs.put::<LongString, _>(
+                metadata::name: blobs.put("tag_kind".to_string())?,
+                metadata::description: blobs.put(
                     "Tag for Teams protocol kind constants.".to_string(),
                 )?,
                 metadata::tag: tag_tag,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&tag_attribute) @
-                metadata::shortname: "tag_attribute",
-                metadata::name: blobs.put::<LongString, _>(
+                metadata::name: blobs.put("tag_attribute".to_string())?,
+                metadata::description: blobs.put(
                     "Tag for Teams protocol attributes.".to_string(),
                 )?,
                 metadata::tag: tag_tag,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&tag_tag) @
-                metadata::shortname: "tag_tag",
-                metadata::name: blobs.put::<LongString, _>(
+                metadata::name: blobs.put("tag_tag".to_string())?,
+                metadata::description: blobs.put(
                     "Tag for Teams protocol tag constants.".to_string(),
                 )?,
                 metadata::tag: tag_tag,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_chat) @
-                metadata::shortname: "kind_chat",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Teams chat entity kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_chat".to_string())?,
+                metadata::description: blobs.put("Teams chat entity kind.".to_string())?,
                 metadata::tag: tag_kind,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_cursor) @
-                metadata::shortname: "kind_cursor",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Teams delta cursor kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_cursor".to_string())?,
+                metadata::description: blobs.put("Teams delta cursor kind.".to_string())?,
                 metadata::tag: tag_kind,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_token) @
-                metadata::shortname: "kind_token",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Teams token cache kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_token".to_string())?,
+                metadata::description: blobs.put("Teams token cache kind.".to_string())?,
                 metadata::tag: tag_kind,
             };
             tribles += entity! { ExclusiveId::force_ref(&kind_log) @
-                metadata::shortname: "kind_log",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Teams log entry kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_log".to_string())?,
+                metadata::description: blobs.put("Teams log entry kind.".to_string())?,
                 metadata::tag: tag_kind,
             };
             tribles += entity! { ExclusiveId::force_ref(&kind_config) @
-                metadata::shortname: "kind_config",
-                metadata::name: blobs.put::<LongString, _>(
-                    "Teams app configuration kind.".to_string(),
-                )?,
+                metadata::name: blobs.put("kind_config".to_string())?,
+                metadata::description: blobs.put("Teams app configuration kind.".to_string())?,
                 metadata::tag: tag_kind,
             };
 
@@ -386,10 +367,9 @@ mod teams_schema {
         S: ValueSchema,
     {
         let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put::<LongString, _>(name.to_owned())?;
+        let handle = blobs.put(name.to_owned())?;
         let attribute_id = metadata::Metadata::id(attribute);
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::shortname: name,
             metadata::name: handle,
             metadata::tag: teams::tag_attribute,
         };
@@ -782,7 +762,6 @@ fn main() -> Result<()> {
     }
 }
 
-
 fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let pile_path = cli
         .pile
@@ -827,7 +806,6 @@ fn default_scopes() -> String {
     .join(" ")
 }
 
-
 fn with_repo_close<T, F>(repo: Repository<Pile<Blake3>>, f: F) -> Result<T>
 where
     F: FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
@@ -847,8 +825,8 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
 
         let mut change = TribleSet::new();
         let author_id = stable_id("teams-log-author", &[]);
-        let author_name = ws.put::<LongString, _>("teams".to_string());
-        let author_role = ws.put::<LongString, _>("faculty".to_string());
+        let author_name = ws.put("teams".to_string());
+        let author_role = ws.put("faculty".to_string());
         change += entity! { ExclusiveId::force_ref(&author_id) @
             archive::kind: archive::kind_author,
             archive::author_name: author_name,
@@ -857,7 +835,7 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
 
         let log_id = ufoid();
         let content = format!("[{}] {}", level.trim(), message.trim());
-        let content_handle = ws.put::<LongString, _>(content);
+        let content_handle = ws.put(content);
         let created_at = epoch_interval(now_epoch());
         change += entity! { &log_id @
             archive::kind: teams::kind_log,
@@ -1410,11 +1388,11 @@ fn build_token_change(
 ) -> Result<TribleSet> {
     let mut change = TribleSet::new();
     let token_id = ufoid();
-    let access_handle = ws.put::<LongString, _>(token.access_token.clone());
+.access_token.clone());
     let expires_at = token.expires_at;
     let created_at = epoch_interval(now_epoch());
-    let tenant_handle = ws.put::<LongString, _>(token.tenant.clone());
-    let client_handle = ws.put::<LongString, _>(token.client_id.clone());
+    let tenant_handle = ws.put(token.tenant.clone());
+    let client_handle = ws.put(token.client_id.clone());
 
     change += entity! { &token_id @
         archive::kind: teams::kind_token,
@@ -1426,15 +1404,15 @@ fn build_token_change(
     };
 
     if let Some(refresh) = token.refresh_token.as_ref() {
-        let handle = ws.put::<LongString, _>(refresh.to_owned());
+        let handle = ws.put(refresh.to_owned());
         change += entity! { &token_id @ teams::refresh_token: handle };
     }
     if let Some(token_type) = token.token_type.as_ref() {
-        let handle = ws.put::<LongString, _>(token_type.to_owned());
+        let handle = ws.put(token_type.to_owned());
         change += entity! { &token_id @ teams::token_type: handle };
     }
     if let Some(scope) = token.scope.as_ref() {
-        let handle = ws.put::<LongString, _>(scope.to_owned());
+        let handle = ws.put(scope.to_owned());
         change += entity! { &token_id @ teams::scope: handle };
     }
 
@@ -1472,19 +1450,19 @@ fn build_config_change(
     };
 
     if let Some(tenant) = data.tenant.as_ref() {
-        let handle = ws.put::<LongString, _>(tenant.to_owned());
+        let handle = ws.put(tenant.to_owned());
         change += entity! { &config_id @ teams::tenant: handle };
     }
     if let Some(client_id) = data.client_id.as_ref() {
-        let handle = ws.put::<LongString, _>(client_id.to_owned());
+        let handle = ws.put(client_id.to_owned());
         change += entity! { &config_id @ teams::client_id: handle };
     }
     if let Some(client_secret) = data.client_secret.as_ref() {
-        let handle = ws.put::<LongString, _>(client_secret.to_owned());
+        let handle = ws.put(client_secret.to_owned());
         change += entity! { &config_id @ teams::client_secret: handle };
     }
     if let Some(user_id) = data.user_id.as_ref() {
-        let handle = ws.put::<LongString, _>(user_id.to_owned());
+        let handle = ws.put(user_id.to_owned());
         change += entity! { &config_id @ teams::user_id: handle };
     }
 
@@ -2893,6 +2871,10 @@ fn find_branch_id(pile: &mut Pile<Blake3>, name: &str) -> Result<Option<Id>, Str
     let iter = pile
         .branches()
         .map_err(|err| format!("list branches: {err:?}"))?;
+    let expected = LongString::from(name)
+        .to_blob()
+        .get_handle::<Blake3>()
+        .to_value();
 
     for branch in iter {
         let branch_id = branch.map_err(|err| format!("branch id: {err:?}"))?;
@@ -2906,17 +2888,17 @@ fn find_branch_id(pile: &mut Pile<Blake3>, name: &str) -> Result<Option<Id>, Str
             .get(head)
             .map_err(|err| format!("branch metadata: {err:?}"))?;
         let mut names = find!(
-            (shortname: String),
-            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+            (handle: Value<Handle<Blake3, LongString>>),
+            pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some((branch_name,)) = names.next() else {
+        let Some((handle,)) = names.next() else {
             continue;
         };
         if names.next().is_some() {
             continue;
         };
-        if branch_name == name {
+        if handle == expected {
             return Ok(Some(branch_id));
         }
     }
@@ -3025,7 +3007,7 @@ fn build_cursor_change(
         return Ok(None);
     }
 
-    let handle = ws.put::<LongString, _>(cursor);
+    let handle = ws.put(cursor);
     let now = epoch_interval(now_epoch());
     let cursor_id = ufoid();
     let mut change = TribleSet::new();
@@ -3444,7 +3426,7 @@ fn build_ingest_change(
                 .map(|msg| msg.chat_external_id.clone())
                 .unwrap_or_default();
             if !chat_external.is_empty() {
-                let handle = ws.put::<LongString, _>(chat_external);
+                let handle = ws.put(chat_external);
                 change += entity! { ExclusiveId::force_ref(&chat_id) @
                     teams::chat_id: handle,
                 };
@@ -3478,8 +3460,8 @@ fn build_ingest_change(
 
             if !index.messages.contains(&message.message_id) {
                 // New message entity.
-                let content_handle = ws.put::<LongString, _>(message.content);
-                let raw_handle = ws.put::<LongString, _>(message.raw_json);
+                let content_handle = ws.put(message.content);
+                let raw_handle = ws.put(message.raw_json);
                 change += entity! { ExclusiveId::force_ref(&message.message_id) @
                     archive::kind: archive::kind_message,
                     archive::author: message.author_id,
@@ -3495,7 +3477,7 @@ fn build_ingest_change(
                     change += entity! { ExclusiveId::force_ref(&message.message_id) @ archive::reply_to: predecessor.unwrap() };
                 }
 
-                let external_handle = ws.put::<LongString, _>(message.message_external_id);
+                let external_handle = ws.put(message.message_external_id);
                 change += entity! { ExclusiveId::force_ref(&message.message_id) @
                     teams::message_id: external_handle,
                 };
@@ -3508,13 +3490,13 @@ fn build_ingest_change(
                 }
                 if !index.message_external_id_set.contains(&message.message_id) {
                     let external_handle =
-                        ws.put::<LongString, _>(message.message_external_id.clone());
+                        ws.put(message.message_external_id.clone());
                     change += entity! { ExclusiveId::force_ref(&message.message_id) @
                         teams::message_id: external_handle,
                     };
                 }
                 if !index.message_raw_set.contains(&message.message_id) {
-                    let raw_handle = ws.put::<LongString, _>(message.raw_json.clone());
+                    let raw_handle = ws.put(message.raw_json.clone());
                     change += entity! { ExclusiveId::force_ref(&message.message_id) @
                         teams::message_raw: raw_handle,
                     };
@@ -3525,7 +3507,7 @@ fn build_ingest_change(
                     };
                 }
                 if !index.message_content_set.contains(&message.message_id) {
-                    let content_handle = ws.put::<LongString, _>(message.content.clone());
+                    let content_handle = ws.put(message.content.clone());
                     change += entity! { ExclusiveId::force_ref(&message.message_id) @
                         archive::content: content_handle,
                     };
@@ -3564,7 +3546,7 @@ fn ensure_author(
             .filter(|value| !value.is_empty())
             .or(author_external_id)
             .unwrap_or("unknown");
-        let handle = ws.put::<LongString, _>(name.to_string());
+        let handle = ws.put(name.to_string());
         *change += entity! { ExclusiveId::force_ref(&author_id) @
             archive::author_name: handle,
         };
@@ -3575,7 +3557,7 @@ fn ensure_author(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            let handle = ws.put::<LongString, _>(user_id.to_string());
+            let handle = ws.put(user_id.to_string());
             *change += entity! { ExclusiveId::force_ref(&author_id) @
                 teams::user_id: handle,
             };
@@ -3642,8 +3624,8 @@ fn ensure_attachments(
         };
 
         let size = bytes.len() as u64;
-        let data_handle = ws.put::<FileBytes, _>(Bytes::from_source(bytes));
-        let source_id_handle = ws.put::<LongString, _>(source_id.to_owned());
+        let data_handle = ws.put(Bytes::from_source(bytes));
+        let source_id_handle = ws.put(source_id.to_owned());
 
         *change += entity! { ExclusiveId::force_ref(&attachment_id) @
             archive::kind: archive::kind_attachment,
@@ -3653,7 +3635,7 @@ fn ensure_attachments(
         };
 
         if let Some(url) = source.source_url.as_ref() {
-            let handle = ws.put::<LongString, _>(url.to_owned());
+            let handle = ws.put(url.to_owned());
             *change += entity! { ExclusiveId::force_ref(&attachment_id) @
                 archive::attachment_source_pointer: handle,
             };
@@ -3665,7 +3647,7 @@ fn ensure_attachments(
             .map(|value| value.trim())
             .filter(|value| !value.is_empty())
         {
-            let handle = ws.put::<LongString, _>(name.to_owned());
+            let handle = ws.put(name.to_owned());
             *change += entity! { ExclusiveId::force_ref(&attachment_id) @
                 archive::attachment_name: handle,
             };

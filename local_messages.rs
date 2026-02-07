@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.9.0"
+//! triblespace = "0.10.0"
 //! ```
 
 use anyhow::{bail, Result};
@@ -192,17 +192,16 @@ fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
     }
     let label = normalize_label(trimmed)?;
     let mut matches = Vec::new();
-    for (person_id, shortname) in find!(
-        (person_id: Id, shortname: String),
+    let label_handle = label.to_owned().to_blob().get_handle::<valueschemas::Blake3>();
+    for (person_id,) in find!(
+        (person_id: Id),
         pattern!(&relations_space, [{
             ?person_id @
             metadata::tag: &KIND_PERSON_ID,
-            metadata::shortname: ?shortname,
+            metadata::name: label_handle,
         }])
     ) {
-        if shortname == label {
-            matches.push(person_id);
-        }
+        matches.push(person_id);
     }
     match matches.len() {
         0 => bail!("unknown person label '{label}' (use relations faculty)"),
@@ -211,17 +210,26 @@ fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
     }
 }
 
-fn load_person_labels(relations_space: &TribleSet) -> HashMap<Id, String> {
+fn load_person_labels(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    relations_space: &TribleSet,
+) -> HashMap<Id, String> {
     let mut labels = HashMap::new();
-    for (person_id, shortname) in find!(
-        (person_id: Id, shortname: String),
+    let Ok(reader) = repo.storage_mut().reader() else {
+        return labels;
+    };
+    for (person_id, handle) in find!(
+        (person_id: Id, handle: TextHandle),
         pattern!(&relations_space, [{
             ?person_id @
             metadata::tag: &KIND_PERSON_ID,
-            metadata::shortname: ?shortname,
+            metadata::name: ?handle,
         }])
     ) {
-        labels.insert(person_id, shortname);
+        let Ok(view) = reader.get::<View<str>, _>(handle) else {
+            continue;
+        };
+        labels.insert(person_id, view.as_ref().to_string());
     }
     labels
 }
@@ -257,6 +265,10 @@ fn find_branch_by_name(
     pile: &mut Pile<valueschemas::Blake3>,
     branch_name: &str,
 ) -> Result<Option<Id>> {
+    let name_handle = branch_name
+        .to_owned()
+        .to_blob()
+        .get_handle::<valueschemas::Blake3>();
     let reader = pile
         .reader()
         .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
@@ -276,17 +288,17 @@ fn find_branch_by_name(
             .get(head)
             .map_err(|e| anyhow::anyhow!("branch metadata: {e:?}"))?;
         let mut names = find!(
-            (shortname: String),
-            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+            (handle: TextHandle),
+            pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some(name) = names.next().map(|(name,)| name) else {
+        let Some(name) = names.next().map(|(handle,)| handle) else {
             continue;
         };
         if names.next().is_some() {
             continue;
         }
-        if name == branch_name {
+        if name == name_handle {
             return Ok(Some(branch_id));
         }
     }
@@ -302,7 +314,7 @@ fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Tri
 
     let mut existing_kinds: HashSet<Id> = find!(
         (kind: Id),
-        pattern!(&space, [{ ?kind @ metadata::shortname: _?name }])
+        pattern!(&space, [{ ?kind @ metadata::name: _?name }])
     )
     .into_iter()
     .map(|(kind,)| kind)
@@ -310,7 +322,11 @@ fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Tri
 
     for (id, label) in KIND_SPECS {
         if !existing_kinds.contains(&id) {
-            change += entity! { ExclusiveId::force_ref(&id) @ metadata::shortname: label };
+            let name_handle = label
+                .to_owned()
+                .to_blob()
+                .get_handle::<valueschemas::Blake3>();
+            change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
             existing_kinds.insert(id);
         }
     }
@@ -375,7 +391,7 @@ fn cmd_send(
 
     let now = epoch_interval(now_epoch());
     let message_id = ufoid();
-    let body_handle = ws.put::<blobschemas::LongString, _>(text.clone());
+t.clone());
     change += entity! { &message_id @
         metadata::tag: &KIND_MESSAGE_ID,
         local::from: from_id,
@@ -454,7 +470,7 @@ fn cmd_list(
 ) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let relations_space = load_relations_space(&mut repo, relations_branch)?;
-    let party_names = load_person_labels(&relations_space);
+    let party_names = load_person_labels(&mut repo, &relations_space);
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -687,10 +703,9 @@ where
     S: ValueSchema,
 {
     let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-    let handle = blobs.put::<blobschemas::LongString, _>(name.to_owned())?;
+    let handle = blobs.put(name.to_owned())?;
     let attribute_id = metadata::Metadata::id(attribute);
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::shortname: name,
         metadata::name: handle,
     };
     Ok(tribles)
@@ -699,15 +714,16 @@ where
 fn describe_kind<B>(
     blobs: &mut B,
     id: &Id,
-    shortname: &str,
+    name: &str,
     description: &str,
 ) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<valueschemas::Blake3>,
 {
-    let handle = blobs.put::<blobschemas::LongString, _>(description.to_string())?;
+    let name_handle = blobs.put(name.to_string())?;
+
     Ok(entity! { ExclusiveId::force_ref(id) @
-        metadata::shortname: shortname,
-        metadata::name: handle,
+        metadata::name: name_handle,
+        metadata::description: (blobs.put(description.to_string())?),
     })
 }

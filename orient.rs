@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.9.0"
+//! triblespace = "0.10.0"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -193,15 +193,18 @@ fn load_relations_labels(
         .checkout(..)
         .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
     let mut labels = HashMap::new();
-    for (person_id, shortname) in find!(
-        (person_id: Id, shortname: String),
+    for (person_id, handle) in find!(
+        (person_id: Id, handle: TextHandle),
         pattern!(&space, [{
             ?person_id @
             metadata::tag: &KIND_PERSON_ID,
-            metadata::shortname: ?shortname,
+            metadata::name: ?handle,
         }])
     ) {
-        labels.insert(person_id, shortname);
+        let Ok(label) = read_text(&mut ws, handle) else {
+            continue;
+        };
+        labels.insert(person_id, label);
     }
     Ok(labels)
 }
@@ -622,6 +625,10 @@ fn find_branch_by_name(
     pile: &mut Pile<valueschemas::Blake3>,
     branch_name: &str,
 ) -> Result<Option<Id>> {
+    let name_handle = branch_name
+        .to_owned()
+        .to_blob()
+        .get_handle::<valueschemas::Blake3>();
     let reader = pile
         .reader()
         .map_err(|e| anyhow!("pile reader: {e:?}"))?;
@@ -641,17 +648,17 @@ fn find_branch_by_name(
             .get(head)
             .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
         let mut names = find!(
-            (shortname: String),
-            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+            (handle: TextHandle),
+            pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some(name) = names.next().map(|(name,)| name) else {
+        let Some(name) = names.next().map(|(handle,)| handle) else {
             continue;
         };
         if names.next().is_some() {
             continue;
         }
-        if name == branch_name {
+        if name == name_handle {
             return Ok(Some(branch_id));
         }
     }

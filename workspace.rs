@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
-//! triblespace = "0.9.0"
+//! triblespace = "0.10.0"
 //! ```
 
 use std::fs;
@@ -280,10 +280,9 @@ where
     S: ValueSchema,
 {
     let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-    let handle = blobs.put::<LongString, _>(name.to_owned())?;
+    let handle = blobs.put(name.to_owned())?;
     let attribute_id = metadata::Metadata::id(attribute);
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::shortname: name,
         metadata::name: handle,
     };
     Ok(tribles)
@@ -292,16 +291,15 @@ where
 fn describe_kind<B>(
     blobs: &mut B,
     id: &Id,
-    shortname: &str,
+    name: &str,
     description: &str,
 ) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<Blake3>,
 {
-    let handle = blobs.put::<LongString, _>(description.to_string())?;
-    Ok(entity! { ExclusiveId::force_ref(id) @
-        metadata::shortname: shortname,
-        metadata::name: handle,
+
+    let (blobs.put(description.to_owned())?) = blobs.put(description     metadata::name: (blobs.put(name.to_owned())?),
+        metadata::description: description_handle,
     })
 }
 
@@ -365,6 +363,10 @@ fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
     let reader = pile.reader().context("pile reader")?;
     let iter = pile.branches().context("list branches")?;
+    let expected = LongString::from(branch_name)
+        .to_blob()
+        .get_handle::<Blake3>()
+        .to_value();
 
     for branch in iter {
         let branch_id = branch.context("branch id")?;
@@ -373,17 +375,17 @@ fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Opt
         };
         let metadata_set: TribleSet = reader.get(head).context("branch metadata")?;
         let mut names = find!(
-            (shortname: String),
-            pattern!(&metadata_set, [{ metadata::shortname: ?shortname }])
+            (handle: Value<Handle<Blake3, LongString>>),
+            pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some(name) = names.next().map(|(name,)| name) else {
+        let Some((handle,)) = names.next() else {
             continue;
         };
         if names.next().is_some() {
             continue;
         }
-        if name == branch_name {
+        if handle == expected {
             return Ok(Some(branch_id));
         }
     }
@@ -413,13 +415,11 @@ fn capture_snapshot(
         playground_workspace::kind: playground_workspace::kind_snapshot,
         playground_workspace::created_at: created_at,
     };
-
-    let root_handle = ws.put::<LongString, _>(root_path);
+t_path);
     change += entity! { &snapshot_id @ playground_workspace::root_path: root_handle };
 
     if let Some(label) = label {
-        let label_handle = ws.put::<LongString, _>(label.to_string());
-        change += entity! { &snapshot_id @ playground_workspace::label: label_handle };
+        let (ws.put(label.to_stri entity! { &snapshot_id @ playground_workspace::label: label_handle };
     }
 
     for entry in entries {
@@ -427,8 +427,8 @@ fn capture_snapshot(
         let entry_ref = *entry_id;
         change += entity! { &snapshot_id @ playground_workspace::entry: entry_ref };
 
-        let path_handle = ws.put::<LongString, _>(entry.path);
-        change += entity! { &entry_id @ playground_workspace::path: path_handle };
+        let (ws.put(entry.path)) = ws.put(entry.path);
+        change :path: path_handle };
 
         let kind_id = match entry.kind {
             EntryKind::File => playground_workspace::kind_file,
@@ -443,12 +443,12 @@ fn capture_snapshot(
         }
 
         if let Some(bytes) = entry.bytes {
-            let handle = ws.put::<FileBytes, _>(Bytes::from_source(bytes));
+            let handle = ws.put(Bytes::from_source(bytes));
             change += entity! { &entry_id @ playground_workspace::bytes: handle };
         }
 
         if let Some(target) = entry.link_target {
-            let handle = ws.put::<LongString, _>(target);
+            let handle = ws.put(target);
             change += entity! { &entry_id @ playground_workspace::link_target: handle };
         }
     }

@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
 //! time = { version = "0.3.36", features = ["formatting", "macros"] }
-//! triblespace = "0.9.0"
+//! triblespace = "0.10.0"
 //! ```
 
 use anyhow::{bail, Result};
@@ -194,6 +194,10 @@ fn find_branch_by_name(
     pile: &mut Pile<valueschemas::Blake3>,
     branch_name: &str,
 ) -> Result<Option<Id>> {
+    let name_handle = branch_name
+        .to_owned()
+        .to_blob()
+        .get_handle::<valueschemas::Blake3>();
     let reader = pile
         .reader()
         .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
@@ -209,13 +213,13 @@ fn find_branch_by_name(
             .get::<TribleSet, blobschemas::SimpleArchive>(meta_handle)
             .map_err(|e| anyhow::anyhow!("load branch metadata: {e:?}"))?;
         let name = find!(
-            (shortname: String),
-            pattern!(&meta, [{ metadata::shortname: ?shortname }])
+            (handle: TextHandle),
+            pattern!(&meta, [{ metadata::name: ?handle }])
         )
         .into_iter()
-        .map(|(shortname,)| shortname)
+        .map(|(handle,)| handle)
         .next();
-        if name.as_deref() == Some(branch_name) {
+        if name == Some(name_handle) {
             return Ok(Some(bid));
         }
     }
@@ -569,7 +573,7 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
         .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
     let existing: HashSet<Id> = find!(
         (kind: Id),
-        pattern!(&space, [{ ?kind @ metadata::shortname: _?name }])
+        pattern!(&space, [{ ?kind @ metadata::name: _?handle }])
     )
     .map(|(kind,)| kind)
     .collect();
@@ -579,7 +583,11 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
         if existing.contains(&id) {
             continue;
         }
-        change += entity! { ExclusiveId::force_ref(&id) @ metadata::shortname: label };
+        let name_handle = label
+            .to_owned()
+            .to_blob()
+            .get_handle::<valueschemas::Blake3>();
+        change += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_handle };
     }
     Ok(change)
 }
@@ -620,7 +628,7 @@ fn cmd_add(
         change += ensure_kind_entities(&mut ws)?;
         change += entity! { &task_id @
             metadata::tag: &KIND_GOAL_ID,
-            board::title: ws.put::<blobschemas::LongString, _>(title),
+            board::title: ws.put(title),
             board::created_at: now.as_str(),
         };
         if let Some(parent_id) = parent_id {
@@ -644,7 +652,7 @@ fn cmd_add(
             change += entity! { &note_id @
                 metadata::tag: &KIND_NOTE_ID,
                 board::task: &task_ref,
-                board::note: ws.put::<blobschemas::LongString, _>(note),
+                board::note: ws.put(note),
                 board::at: now.as_str(),
             };
         }
@@ -739,7 +747,7 @@ fn cmd_note(pile: &Path, branch: &str, id: String, note: String) -> Result<()> {
         change += entity! { &note_id @
             metadata::tag: &KIND_NOTE_ID,
             board::task: &task_id,
-            board::note: ws.put::<blobschemas::LongString, _>(note),
+            board::note: ws.put(note),
             board::at: now.as_str(),
         };
 
@@ -955,10 +963,9 @@ where
     S: ValueSchema,
 {
     let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-    let handle = blobs.put::<blobschemas::LongString, _>(name.to_owned())?;
+    let handle = blobs.put(name.to_owned())?;
     let attribute_id = metadata::Metadata::id(attribute);
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::shortname: name,
         metadata::name: handle,
     };
     Ok(tribles)
@@ -967,15 +974,16 @@ where
 fn describe_kind<B>(
     blobs: &mut B,
     id: &Id,
-    shortname: &str,
+    name: &str,
     description: &str,
 ) -> std::result::Result<TribleSet, B::PutError>
 where
     B: BlobStore<valueschemas::Blake3>,
 {
-    let handle = blobs.put::<blobschemas::LongString, _>(description.to_string())?;
+    let name_handle = blobs.put(name.to_string())?;
+
     Ok(entity! { ExclusiveId::force_ref(id) @
-        metadata::shortname: shortname,
-        metadata::name: handle,
+        metadata::name: name_handle,
+        metadata::description: (blobs.put(description.to_string())?),
     })
 }
