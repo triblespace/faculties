@@ -166,6 +166,48 @@ fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
     Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))
 }
 
+fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("person id is empty");
+    }
+
+    let prefix = trimmed.to_lowercase();
+    if !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("person id must be hex (got '{trimmed}')");
+    }
+
+    if prefix.len() == 32 {
+        let id = Id::from_hex(&prefix).ok_or_else(|| anyhow!("invalid person id {trimmed}"))?;
+        for (person_id,) in find!(
+            (person_id: Id),
+            pattern!(&space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
+        ) {
+            if person_id == id {
+                return Ok(id);
+            }
+        }
+        bail!("unknown person id {trimmed}");
+    }
+
+    let mut matches = Vec::new();
+    for (person_id,) in find!(
+        (person_id: Id),
+        pattern!(&space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
+    ) {
+        let hex = format!("{person_id:x}");
+        if hex.starts_with(&prefix) {
+            matches.push(person_id);
+        }
+    }
+
+    match matches.len() {
+        0 => bail!("no person id matches prefix '{trimmed}'"),
+        1 => Ok(matches[0]),
+        _ => bail!("multiple people match id prefix '{trimmed}'"),
+    }
+}
+
 fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws.get(handle).map_err(|e| anyhow!("load longstring: {e:?}"))?;
     Ok(view.to_string())
@@ -496,7 +538,6 @@ fn cmd_set(
     teams_user_id: Option<String>,
     email: Option<String>,
 ) -> Result<()> {
-    let person_id = parse_hex_id(&id, "person id")?;
     let label = label.map(|l| normalize_label(&l)).transpose()?;
 
     let (mut repo, branch_id) = open_repo(pile, branch)?;
@@ -506,19 +547,7 @@ fn cmd_set(
     let mut change = ensure_kind_entities(&mut ws)?;
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
-    let mut exists = false;
-    for (entity,) in find!(
-        (entity: Id),
-        pattern!(&space, [{ ?entity @ metadata::tag: &KIND_PERSON_ID }])
-    ) {
-        if entity == person_id {
-            exists = true;
-            break;
-        }
-    }
-    if !exists {
-        bail!("unknown person id {id}");
-    }
+    let person_id = resolve_person_id(&space, &id)?;
 
     if let Some(label) = label {
         if let Some(existing) = find_person_by_label(&space, &label)? {
@@ -614,11 +643,12 @@ fn cmd_list(pile: &Path, branch: &str, limit: usize) -> Result<()> {
 }
 
 fn cmd_show(pile: &Path, branch: &str, id: String) -> Result<()> {
-    let person_id = parse_hex_id(&id, "person id")?;
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+    let person_id = resolve_person_id(&space, &id)?;
     let people = load_people(&mut ws)?;
     let Some(person) = people.into_iter().find(|p| p.id == person_id) else {
         bail!("unknown person id {id}");

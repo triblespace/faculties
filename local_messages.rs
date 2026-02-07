@@ -391,7 +391,7 @@ fn cmd_send(
 
     let now = epoch_interval(now_epoch());
     let message_id = ufoid();
-t.clone());
+    let body_handle = ws.put(text.clone());
     change += entity! { &message_id @
         metadata::tag: &KIND_MESSAGE_ID,
         local::from: from_id,
@@ -724,6 +724,6 @@ where
 
     Ok(entity! { ExclusiveId::force_ref(id) @
         metadata::name: name_handle,
-        metadata::description: (blobs.put(description.to_string())?),
+        metadata::description: blobs.put(description.to_string())?,
     })
 }
