@@ -194,7 +194,7 @@ fn find_branch_by_name(
     pile: &mut Pile<valueschemas::Blake3>,
     branch_name: &str,
 ) -> Result<Option<Id>> {
-    let name_handle = branch_name
+    let expected_name_handle = branch_name
         .to_owned()
         .to_blob()
         .get_handle::<valueschemas::Blake3>();
@@ -204,6 +204,12 @@ fn find_branch_by_name(
     let iter = pile
         .branches()
         .map_err(|e| anyhow::anyhow!("list branches: {e:?}"))?;
+
+    // Prefer branches that actually have a commit head set. This avoids
+    // accidentally picking an empty duplicate branch when legacy metadata is
+    // present in the pile.
+    let mut best: Option<(bool, Id)> = None;
+
     for bid in iter {
         let bid = bid?;
         let Some(meta_handle) = pile.head(bid)? else {
@@ -212,18 +218,38 @@ fn find_branch_by_name(
         let meta: TribleSet = reader
             .get::<TribleSet, blobschemas::SimpleArchive>(meta_handle)
             .map_err(|e| anyhow::anyhow!("load branch metadata: {e:?}"))?;
-        let name = find!(
-            (handle: TextHandle),
-            pattern!(&meta, [{ metadata::name: ?handle }])
+
+        let matches = {
+            let name = find!(
+                (handle: TextHandle),
+                pattern!(&meta, [{ metadata::name: ?handle }])
+            )
+            .into_iter()
+            .map(|(handle,)| handle)
+            .next();
+            name == Some(expected_name_handle)
+        };
+
+        if !matches {
+            continue;
+        }
+
+        let has_head = find!(
+            (head: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>),
+            pattern!(&meta, [{ triblespace::core::repo::head: ?head }])
         )
         .into_iter()
-        .map(|(handle,)| handle)
-        .next();
-        if name == Some(name_handle) {
-            return Ok(Some(bid));
+        .next()
+        .is_some();
+
+        match best {
+            None => best = Some((has_head, bid)),
+            Some((best_has_head, _)) if !best_has_head && has_head => best = Some((true, bid)),
+            Some(_) => {}
         }
     }
-    Ok(None)
+
+    Ok(best.map(|(_, bid)| bid))
 }
 
 fn load_board(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<BoardState> {
