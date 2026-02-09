@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.11.0"
+//! triblespace = "0.12.0"
 //! ```
 
 use anyhow::{bail, Result};

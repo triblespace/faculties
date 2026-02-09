@@ -7,7 +7,7 @@
 //! hifitime = "4"
 //! rand_core = "0.6.4"
 //! serde_json = "1"
-//! triblespace = "0.11.0"
+//! triblespace = "0.12.0"
 //! ```
 
 use std::collections::{HashMap, HashSet};

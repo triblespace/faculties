@@ -11,7 +11,7 @@
 //! reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.11.0"
+//! triblespace = "0.12.0"
 //! ```
 
 use std::collections::{HashMap, HashSet};
