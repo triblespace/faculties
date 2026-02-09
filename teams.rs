@@ -1388,7 +1388,7 @@ fn build_token_change(
 ) -> Result<TribleSet> {
     let mut change = TribleSet::new();
     let token_id = ufoid();
-.access_token.clone());
+    let access_handle = ws.put(token.access_token.clone());
     let expires_at = token.expires_at;
     let created_at = epoch_interval(now_epoch());
     let tenant_handle = ws.put(token.tenant.clone());
@@ -2871,10 +2871,7 @@ fn find_branch_id(pile: &mut Pile<Blake3>, name: &str) -> Result<Option<Id>, Str
     let iter = pile
         .branches()
         .map_err(|err| format!("list branches: {err:?}"))?;
-    let expected = LongString::from(name)
-        .to_blob()
-        .get_handle::<Blake3>()
-        .to_value();
+    let expected = name.to_owned().to_blob().get_handle::<Blake3>();
 
     for branch in iter {
         let branch_id = branch.map_err(|err| format!("branch id: {err:?}"))?;
