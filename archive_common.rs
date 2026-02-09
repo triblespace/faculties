@@ -107,55 +107,31 @@ pub mod archive_schema {
         metadata.union(<Handle<Blake3, FileBytes> as metadata::ConstMetadata>::describe(blobs)?);
         metadata.union(<FileBytes as metadata::ConstMetadata>::describe(blobs)?);
 
-        macro_rules! add_attribute {
-            ($attribute:expr, $name:expr) => {
-                metadata.union(describe_attribute(blobs, &$attribute, $name)?);
-            };
-        }
+        metadata.union(metadata::Metadata::describe(&archive::kind, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::reply_to, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_name, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_role, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_model, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_provider, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::content, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::created_at, blobs)?);
 
-        add_attribute!(archive::kind, "kind");
-        add_attribute!(archive::reply_to, "reply_to");
-        add_attribute!(archive::author, "author");
-        add_attribute!(archive::author_name, "author_name");
-        add_attribute!(archive::author_role, "author_role");
-        add_attribute!(archive::author_model, "author_model");
-        add_attribute!(archive::author_provider, "author_provider");
-        add_attribute!(archive::content, "content");
-        add_attribute!(archive::created_at, "created_at");
-
-        add_attribute!(archive::content_type, "content_type");
-        add_attribute!(archive::attachment, "attachment");
-        add_attribute!(archive::attachment_source_id, "attachment_source_id");
-        add_attribute!(
-            archive::attachment_source_pointer,
-            "attachment_source_pointer"
-        );
-        add_attribute!(archive::attachment_name, "attachment_name");
-        add_attribute!(archive::attachment_mime, "attachment_mime");
-        add_attribute!(archive::attachment_size_bytes, "attachment_size_bytes");
-        add_attribute!(archive::attachment_width_px, "attachment_width_px");
-        add_attribute!(archive::attachment_height_px, "attachment_height_px");
-        add_attribute!(archive::attachment_data, "attachment_data");
+        metadata.union(metadata::Metadata::describe(&archive::content_type, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_source_id, blobs)?);
+        metadata.union(metadata::Metadata::describe(
+            &archive::attachment_source_pointer,
+            blobs,
+        )?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_name, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_mime, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_size_bytes, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_width_px, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_height_px, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_data, blobs)?);
 
         Ok(metadata)
-    }
-
-    fn describe_attribute<B, S>(
-        blobs: &mut B,
-        attribute: &Attribute<S>,
-        name: &str,
-    ) -> std::result::Result<TribleSet, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-        S: ValueSchema,
-    {
-        let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put(name.to_owned())?;
-        let attribute_id = metadata::Metadata::id(attribute);
-        tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::name: handle,
-        };
-        Ok(tribles)
     }
 }
 
@@ -270,24 +246,18 @@ pub mod import_schema {
         metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
         metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
 
-        macro_rules! add_attribute {
-            ($attribute:expr, $name:expr) => {
-                metadata.union(describe_attribute(blobs, &$attribute, $name)?);
-            };
-        }
-
-        add_attribute!(kind, "import_kind");
-        add_attribute!(batch, "import_batch");
-        add_attribute!(source_format, "import_source_format");
-        add_attribute!(source_path, "import_source_path");
-        add_attribute!(source_raw_root, "import_source_raw_root");
-        add_attribute!(source_conversation_id, "import_source_conversation_id");
-        add_attribute!(source_title, "import_source_title");
-        add_attribute!(source_message_id, "import_source_message_id");
-        add_attribute!(source_author, "import_source_author");
-        add_attribute!(source_role, "import_source_role");
-        add_attribute!(source_parent_id, "import_source_parent_id");
-        add_attribute!(source_created_at, "import_source_created_at");
+        metadata.union(describe_attribute(blobs, &kind)?);
+        metadata.union(describe_attribute(blobs, &batch)?);
+        metadata.union(describe_attribute(blobs, &source_format)?);
+        metadata.union(describe_attribute(blobs, &source_path)?);
+        metadata.union(describe_attribute(blobs, &source_raw_root)?);
+        metadata.union(describe_attribute(blobs, &source_conversation_id)?);
+        metadata.union(describe_attribute(blobs, &source_title)?);
+        metadata.union(describe_attribute(blobs, &source_message_id)?);
+        metadata.union(describe_attribute(blobs, &source_author)?);
+        metadata.union(describe_attribute(blobs, &source_role)?);
+        metadata.union(describe_attribute(blobs, &source_parent_id)?);
+        metadata.union(describe_attribute(blobs, &source_created_at)?);
 
         Ok(metadata)
     }
@@ -295,17 +265,14 @@ pub mod import_schema {
     fn describe_attribute<B, S>(
         blobs: &mut B,
         attribute: &Attribute<S>,
-        name: &str,
     ) -> std::result::Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
         S: ValueSchema,
     {
         let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put(name.to_owned())?;
         let attribute_id = metadata::Metadata::id(attribute);
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::name: handle,
             metadata::tag: tag_attribute,
         };
         Ok(tribles)
@@ -394,7 +361,7 @@ fn open_repo_for_atlas(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile.branches().map_err(|e| anyhow!("list branches: {e:?}"))?;
-    let expected = LongString::from(branch_name)
+    let expected = String::from(branch_name)
         .to_blob()
         .get_handle::<Blake3>()
         .to_value();

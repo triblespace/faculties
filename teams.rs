@@ -133,55 +133,31 @@ mod archive_schema {
         metadata.union(<Handle<Blake3, FileBytes> as metadata::ConstMetadata>::describe(blobs)?);
         metadata.union(<FileBytes as metadata::ConstMetadata>::describe(blobs)?);
 
-        macro_rules! add_attribute {
-            ($attribute:expr, $name:expr) => {
-                metadata.union(describe_attribute(blobs, &$attribute, $name)?);
-            };
-        }
+        metadata.union(metadata::Metadata::describe(&archive::kind, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::reply_to, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_name, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_role, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_model, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::author_provider, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::content, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::created_at, blobs)?);
 
-        add_attribute!(archive::kind, "kind");
-        add_attribute!(archive::reply_to, "reply_to");
-        add_attribute!(archive::author, "author");
-        add_attribute!(archive::author_name, "author_name");
-        add_attribute!(archive::author_role, "author_role");
-        add_attribute!(archive::author_model, "author_model");
-        add_attribute!(archive::author_provider, "author_provider");
-        add_attribute!(archive::content, "content");
-        add_attribute!(archive::created_at, "created_at");
-
-        add_attribute!(archive::content_type, "content_type");
-        add_attribute!(archive::attachment, "attachment");
-        add_attribute!(archive::attachment_source_id, "attachment_source_id");
-        add_attribute!(
-            archive::attachment_source_pointer,
-            "attachment_source_pointer"
-        );
-        add_attribute!(archive::attachment_name, "attachment_name");
-        add_attribute!(archive::attachment_mime, "attachment_mime");
-        add_attribute!(archive::attachment_size_bytes, "attachment_size_bytes");
-        add_attribute!(archive::attachment_width_px, "attachment_width_px");
-        add_attribute!(archive::attachment_height_px, "attachment_height_px");
-        add_attribute!(archive::attachment_data, "attachment_data");
+        metadata.union(metadata::Metadata::describe(&archive::content_type, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_source_id, blobs)?);
+        metadata.union(metadata::Metadata::describe(
+            &archive::attachment_source_pointer,
+            blobs,
+        )?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_name, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_mime, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_size_bytes, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_width_px, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_height_px, blobs)?);
+        metadata.union(metadata::Metadata::describe(&archive::attachment_data, blobs)?);
 
         Ok(metadata)
-    }
-
-    fn describe_attribute<B, S>(
-        blobs: &mut B,
-        attribute: &Attribute<S>,
-        name: &str,
-    ) -> std::result::Result<TribleSet, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-        S: ValueSchema,
-    {
-        let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put(name.to_owned())?;
-        let attribute_id = metadata::Metadata::id(attribute);
-        tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::name: handle,
-        };
-        Ok(tribles)
     }
 }
 
@@ -333,26 +309,20 @@ mod teams_schema {
         metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
         metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
 
-        macro_rules! add_attribute {
-            ($attribute:expr, $name:expr) => {
-                metadata.union(describe_attribute(blobs, &$attribute, $name)?);
-            };
-        }
-
-        add_attribute!(teams::chat, "teams_chat");
-        add_attribute!(teams::chat_id, "teams_chat_id");
-        add_attribute!(teams::message_id, "teams_message_id");
-        add_attribute!(teams::message_raw, "teams_message_raw");
-        add_attribute!(teams::user_id, "teams_user_id");
-        add_attribute!(teams::delta_link, "teams_delta_link");
-        add_attribute!(teams::access_token, "teams_access_token");
-        add_attribute!(teams::refresh_token, "teams_refresh_token");
-        add_attribute!(teams::expires_at, "teams_expires_at");
-        add_attribute!(teams::token_type, "teams_token_type");
-        add_attribute!(teams::scope, "teams_scope");
-        add_attribute!(teams::tenant, "teams_tenant");
-        add_attribute!(teams::client_id, "teams_client_id");
-        add_attribute!(teams::client_secret, "teams_client_secret");
+        metadata.union(describe_attribute(blobs, &teams::chat)?);
+        metadata.union(describe_attribute(blobs, &teams::chat_id)?);
+        metadata.union(describe_attribute(blobs, &teams::message_id)?);
+        metadata.union(describe_attribute(blobs, &teams::message_raw)?);
+        metadata.union(describe_attribute(blobs, &teams::user_id)?);
+        metadata.union(describe_attribute(blobs, &teams::delta_link)?);
+        metadata.union(describe_attribute(blobs, &teams::access_token)?);
+        metadata.union(describe_attribute(blobs, &teams::refresh_token)?);
+        metadata.union(describe_attribute(blobs, &teams::expires_at)?);
+        metadata.union(describe_attribute(blobs, &teams::token_type)?);
+        metadata.union(describe_attribute(blobs, &teams::scope)?);
+        metadata.union(describe_attribute(blobs, &teams::tenant)?);
+        metadata.union(describe_attribute(blobs, &teams::client_id)?);
+        metadata.union(describe_attribute(blobs, &teams::client_secret)?);
 
         Ok(metadata)
     }
@@ -360,17 +330,14 @@ mod teams_schema {
     fn describe_attribute<B, S>(
         blobs: &mut B,
         attribute: &Attribute<S>,
-        name: &str,
     ) -> std::result::Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
         S: ValueSchema,
     {
         let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let handle = blobs.put(name.to_owned())?;
         let attribute_id = metadata::Metadata::id(attribute);
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::name: handle,
             metadata::tag: teams::tag_attribute,
         };
         Ok(tribles)
