@@ -297,10 +297,15 @@ fn describe_kind<B>(
 where
     B: BlobStore<Blake3>,
 {
+    let mut tribles = TribleSet::new();
+    let name_handle = blobs.put(name.to_string())?;
+    let description_handle = blobs.put(description.to_string())?;
 
-    let (blobs.put(description.to_owned())?) = blobs.put(description     metadata::name: (blobs.put(name.to_owned())?),
+    tribles += entity! { ExclusiveId::force_ref(id) @
+        metadata::name: name_handle,
         metadata::description: description_handle,
-    })
+    };
+    Ok(tribles)
 }
 
 fn cmd_capture(pile: &Path, branch: &str, args: WorkspaceCaptureArgs) -> Result<()> {
@@ -363,10 +368,7 @@ fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
     let reader = pile.reader().context("pile reader")?;
     let iter = pile.branches().context("list branches")?;
-    let expected = LongString::from(branch_name)
-        .to_blob()
-        .get_handle::<Blake3>()
-        .to_value();
+    let expected = branch_name.to_owned().to_blob().get_handle::<Blake3>();
 
     for branch in iter {
         let branch_id = branch.context("branch id")?;
@@ -415,11 +417,12 @@ fn capture_snapshot(
         playground_workspace::kind: playground_workspace::kind_snapshot,
         playground_workspace::created_at: created_at,
     };
-t_path);
+    let root_handle = ws.put(root_path);
     change += entity! { &snapshot_id @ playground_workspace::root_path: root_handle };
 
     if let Some(label) = label {
-        let (ws.put(label.to_stri entity! { &snapshot_id @ playground_workspace::label: label_handle };
+        let label_handle = ws.put(label.to_owned());
+        change += entity! { &snapshot_id @ playground_workspace::label: label_handle };
     }
 
     for entry in entries {
@@ -427,8 +430,8 @@ t_path);
         let entry_ref = *entry_id;
         change += entity! { &snapshot_id @ playground_workspace::entry: entry_ref };
 
-        let (ws.put(entry.path)) = ws.put(entry.path);
-        change :path: path_handle };
+        let path_handle = ws.put(entry.path);
+        change += entity! { &entry_id @ playground_workspace::path: path_handle };
 
         let kind_id = match entry.kind {
             EntryKind::File => playground_workspace::kind_file,
@@ -700,10 +703,34 @@ fn restore_snapshot(
         return Ok(None);
     };
 
+    let root_path =
+        load_string_attr(&mut ws, &catalog, snapshot_id, playground_workspace::root_path)?;
+    let restore_root = resolve_restore_root(target_root, root_path.as_deref())?;
     let entries = collect_snapshot_entries(&mut ws, &catalog, snapshot_id)?;
-    restore_entries(target_root, &entries, force)?;
+    restore_entries(&restore_root, &entries, force)?;
 
     Ok(Some(snapshot_id))
+}
+
+fn resolve_restore_root(target_root: &Path, root_path: Option<&str>) -> Result<PathBuf> {
+    let Some(root_path) = root_path.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(target_root.to_path_buf());
+    };
+
+    if root_path == "." {
+        return Ok(target_root.to_path_buf());
+    }
+
+    let rel = Path::new(root_path);
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| std::matches!(c, Component::ParentDir))
+    {
+        return Err(anyhow!("invalid snapshot root_path: {}", root_path));
+    }
+
+    Ok(target_root.join(rel))
 }
 
 fn latest_snapshot(catalog: &TribleSet) -> Result<Option<Id>> {
