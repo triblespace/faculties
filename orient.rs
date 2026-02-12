@@ -32,6 +32,7 @@ const DEFAULT_LOCAL_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH: &str = "config";
+const ORIENT_STATE_BRANCH: &str = "orient";
 
 const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
@@ -39,6 +40,7 @@ const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 
 const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
+const KIND_ORIENT_CHECKPOINT_ID: Id = id_hex!("163114E5F2272D15F21E1994EF418A31");
 
 type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
 type CommitHandle = Value<valueschemas::Handle<valueschemas::Blake3, SimpleArchive>>;
@@ -83,6 +85,17 @@ mod board {
         "C1EAAA039DA7F486E4A54CC87D42E72C" as task: valueschemas::GenId;
         "61C44E0F8A73443ED592A713151E99A4" as status: valueschemas::ShortString;
         "8200ADEDC8D4D3D6D01CDC7396DF9AEC" as at: valueschemas::ShortString;
+    }
+}
+
+mod orient_state {
+    use super::*;
+    attributes! {
+        "077630536F9D01DBE64320D7044D55A5" as at: valueschemas::NsTAIInterval;
+        "6F2D6C7C796B41C2DC7885E7E4D3D750" as local_head: valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>;
+        "6E6A761126C5101CC69BE185A4B4EC4C" as compass_head: valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>;
+        "3A58593A230497DEC735E92381C4C522" as relations_head: valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>;
+        "789078EA4AA95F7B7AD047FF23E04C60" as config_head: valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>;
     }
 }
 
@@ -539,6 +552,9 @@ fn cmd_show(
     todo_limit: usize,
 ) -> Result<()> {
     let mut repo = open_repo(pile)?;
+    let current_heads =
+        load_watched_heads(&mut repo, local_branch, compass_branch, relations_branch)?;
+
     let config_identity = load_config_identity(&mut repo)?;
     let local_branch_id = resolve_branch_id_from_config_or_name(
         &mut repo,
@@ -683,6 +699,7 @@ fn cmd_show(
     }
 
     drop(compass_ws);
+    save_checkpoint_heads(&mut repo, &current_heads)?;
     repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
     Ok(())
 }
@@ -719,6 +736,94 @@ fn load_watched_heads(
         relations: branch_head_by_id(repo, relations_branch_id)?,
         config: branch_head_by_name(repo, CONFIG_BRANCH)?,
     })
+}
+
+fn load_checkpoint_heads(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+) -> Result<Option<WatchedHeads>> {
+    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), ORIENT_STATE_BRANCH)? else {
+        return Ok(None);
+    };
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout orient state: {e:?}"))?;
+
+    let mut latest: Option<(Id, i128)> = None;
+    for (checkpoint_id, at) in find!(
+        (checkpoint_id: Id, at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?checkpoint_id @
+            metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
+            orient_state::at: ?at,
+        }])
+    ) {
+        let key = interval_key(at);
+        if latest.is_none_or(|(_, current)| key > current) {
+            latest = Some((checkpoint_id, key));
+        }
+    }
+
+    let Some((checkpoint_id, _)) = latest else {
+        return Ok(None);
+    };
+
+    Ok(Some(WatchedHeads {
+        local: load_optional_commit_head(&space, checkpoint_id, orient_state::local_head),
+        compass: load_optional_commit_head(&space, checkpoint_id, orient_state::compass_head),
+        relations: load_optional_commit_head(&space, checkpoint_id, orient_state::relations_head),
+        config: load_optional_commit_head(&space, checkpoint_id, orient_state::config_head),
+    }))
+}
+
+fn load_optional_commit_head(
+    space: &TribleSet,
+    checkpoint_id: Id,
+    attr: Attribute<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
+) -> Option<CommitHandle> {
+    find!(
+        (entity: Id, value: CommitHandle),
+        pattern!(space, [{ ?entity @ attr: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == checkpoint_id).then_some(value))
+}
+
+fn save_checkpoint_heads(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    heads: &WatchedHeads,
+) -> Result<()> {
+    let branch_id = ensure_branch(repo, ORIENT_STATE_BRANCH)?;
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
+
+    let checkpoint_id = ufoid();
+    let now = epoch_interval(now_epoch());
+    let mut change = entity! { &checkpoint_id @
+        metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
+        orient_state::at: now,
+    };
+
+    if let Some(head) = heads.local {
+        change += entity! { &checkpoint_id @ orient_state::local_head: head };
+    }
+    if let Some(head) = heads.compass {
+        change += entity! { &checkpoint_id @ orient_state::compass_head: head };
+    }
+    if let Some(head) = heads.relations {
+        change += entity! { &checkpoint_id @ orient_state::relations_head: head };
+    }
+    if let Some(head) = heads.config {
+        change += entity! { &checkpoint_id @ orient_state::config_head: head };
+    }
+
+    ws.commit(change, None, Some("orient checkpoint"));
+    repo.push(&mut ws)
+        .map_err(|e| anyhow!("push orient checkpoint: {e:?}"))?;
+    Ok(())
 }
 
 fn branch_head_by_id(
@@ -860,9 +965,16 @@ fn cmd_sleep(
 ) -> Result<()> {
     let timeout = parse_sleep_target(target.as_ref())?;
     let mut repo = open_repo(pile)?;
+    let mut detected_change_before_sleep = false;
     let wait_result = (|| -> Result<bool> {
         let baseline =
             load_watched_heads(&mut repo, local_branch, compass_branch, relations_branch)?;
+        if let Some(last_seen) = load_checkpoint_heads(&mut repo)? {
+            if baseline != last_seen {
+                detected_change_before_sleep = true;
+                return Ok(true);
+            }
+        }
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
 
@@ -883,6 +995,9 @@ fn cmd_sleep(
     let close_result = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
     let changed = wait_result?;
     close_result?;
+    if detected_change_before_sleep {
+        println!("Detected branch changes since last orientation snapshot; returning immediately.");
+    }
     if !changed {
         println!("No change detected since sleep started; showing current snapshot.");
     }
@@ -1003,8 +1118,17 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     > as metadata::ConstMetadata>::describe(
         repo.storage_mut()
     )?);
+    metadata.union(<valueschemas::Handle<
+        valueschemas::Blake3,
+        blobschemas::SimpleArchive,
+    > as metadata::ConstMetadata>::describe(
+        repo.storage_mut()
+    )?);
     metadata
         .union(<blobschemas::LongString as metadata::ConstMetadata>::describe(repo.storage_mut())?);
+    metadata.union(
+        <blobschemas::SimpleArchive as metadata::ConstMetadata>::describe(repo.storage_mut())?,
+    );
     metadata.union(
         <valueschemas::NsTAIInterval as metadata::ConstMetadata>::describe(repo.storage_mut())?,
     );
