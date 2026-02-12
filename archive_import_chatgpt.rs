@@ -20,7 +20,6 @@ use serde_json::Value as JsonValue;
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::blob::Bytes;
-use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::*;
 
 #[path = "archive_common.rs"]
@@ -96,7 +95,7 @@ fn import_chatgpt_file(
     let export_root = path.parent().unwrap_or_else(|| Path::new("."));
     let export_files =
         index_export_files(export_root).with_context(|| format!("index {}", export_root.display()))?;
-.to_string_lossy().to_string());
+    let path_handle = ws.put(path.to_string_lossy().to_string());
 
     let mut stats = ImportStats::default();
     for convo in conversations {
@@ -217,8 +216,9 @@ fn import_chatgpt_file(
                 .or_else(|| created_epoch.clone())
                 .unwrap_or_else(common::now_epoch);
             let created_at = common::epoch_interval(created_at_epoch);
+            let content_handle = ws.put(content);
 
-            let (ws.put(content)){ message_entity @
+            change += entity! { message_entity @
                 common::archive::kind: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
@@ -255,8 +255,9 @@ fn import_chatgpt_file(
                 // Always link the message -> attachment, even if we don't have bytes.
                 change += entity! { message_entity @ common::archive::attachment: attachment_id };
 
-                let (ws.put(source_id.clone())) = ws.put(source_id.clone());
-          common::archive::kind: common::archive::kind_attachment,
+                let source_id_handle = ws.put(source_id.clone());
+                change += entity! { attachment_entity @
+                    common::archive::kind: common::archive::kind_attachment,
                     common::archive::attachment_source_id: source_id_handle,
                 };
 
@@ -292,9 +293,8 @@ fn import_chatgpt_file(
                         if attachment_data_loaded.insert(attachment_id) {
                             let bytes = fs::read(path)
                                 .with_context(|| format!("read attachment {}", path.display()))?;
-                            let (ws.put(
-                                Bytes::from_source(bytes),
-                            )) = ws.attachment_entity @
+                            let data_handle = ws.put(Bytes::from_source(bytes));
+                            change += entity! { attachment_entity @
                                 common::archive::attachment_data: data_handle,
                             };
                             stats.attachments += 1;

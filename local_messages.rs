@@ -96,7 +96,7 @@ enum Command {
     List {
         /// Reader id or label.
         reader: String,
-        /// Only show messages unread by the reader
+        /// Only show inbox messages unread by the reader.
         #[arg(long)]
         unread: bool,
         #[arg(long, default_value_t = 20)]
@@ -160,6 +160,10 @@ fn truncate_single_line(text: &str, max: usize) -> String {
         }
     }
     out
+}
+
+fn render_list_body(text: &str) -> String {
+    text.replace('\r', "").replace('\n', "\\n")
 }
 
 fn id_prefix(id: Id) -> String {
@@ -542,10 +546,17 @@ fn cmd_list(
     let mut shown = 0usize;
 
     for msg in messages {
-        let read = reads.get(&(msg.id, reader_id)).copied();
-        if unread && read.is_some() {
+        let incoming = msg.to == reader_id;
+        let outgoing = msg.from == reader_id;
+        if !incoming && !outgoing {
             continue;
         }
+
+        let read = reads.get(&(msg.id, reader_id)).copied();
+        if unread && !(incoming && read.is_none()) {
+            continue;
+        }
+
         let from_label = party_names
             .get(&msg.from)
             .cloned()
@@ -554,7 +565,17 @@ fn cmd_list(
             .get(&msg.to)
             .cloned()
             .unwrap_or_else(|| id_prefix(msg.to));
-        let status = if read.is_some() { "read" } else { "unread" };
+        let status = if incoming {
+            if read.is_some() {
+                "read".to_string()
+            } else {
+                "unread".to_string()
+            }
+        } else if reads.contains_key(&(msg.id, msg.to)) {
+            format!("read-by:{to_label}")
+        } else {
+            "sent".to_string()
+        };
         let age = format_age(now_key, msg.created_at);
         println!(
             "[{}] {} {} -> {} ({}) {}",
@@ -563,7 +584,7 @@ fn cmd_list(
             from_label,
             to_label,
             status,
-            truncate_single_line(&msg.body, 120)
+            render_list_body(&msg.body)
         );
         shown += 1;
         if shown >= limit {

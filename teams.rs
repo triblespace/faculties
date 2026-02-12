@@ -8,7 +8,7 @@
 //! hifitime = "4.2.3"
 //! libc = "0.2"
 //! rand_core = "0.6.4"
-//! reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "json"] }
+//! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! triblespace = "0.12.0"

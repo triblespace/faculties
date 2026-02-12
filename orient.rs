@@ -2,19 +2,26 @@
 //! ```cargo
 //! [dependencies]
 //! anyhow = "1.0"
+//! chrono = { version = "0.4.39", features = ["clock"] }
 //! clap = { version = "4.5.4", features = ["derive"] }
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
+//! humantime = "2.1.0"
 //! rand_core = "0.6.4"
 //! triblespace = "0.12.0"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
+use chrono::{
+    DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
+};
 use clap::{CommandFactory, Parser, Subcommand};
 use hifitime::Epoch;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
+use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
@@ -33,8 +40,8 @@ const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
 
-
 type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
+type CommitHandle = Value<valueschemas::Handle<valueschemas::Blake3, SimpleArchive>>;
 
 mod local {
     use super::*;
@@ -56,6 +63,9 @@ mod config_schema {
     attributes! {
         "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
+        "EDEFFF6AFF6318E44CCF6A602B012604" as compass_branch_id: valueschemas::GenId;
+        "2ED6FF7EAB93CB5608555AE4B9664CF8" as local_messages_branch_id: valueschemas::GenId;
+        "D35F4F02E29825FBC790E324EFCD1B34" as relations_branch_id: valueschemas::GenId;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
     }
 }
@@ -77,7 +87,10 @@ mod board {
 }
 
 #[derive(Parser)]
-#[command(name = "orient", about = "Orient the agent with recent messages and goals")]
+#[command(
+    name = "orient",
+    about = "Orient the agent with recent messages and goals"
+)]
 struct Cli {
     /// Path to the pile file to use
     #[arg(long, default_value = "self.pile", global = true)]
@@ -108,6 +121,37 @@ enum Command {
         /// Max todo goals to show
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
+    },
+    /// Sleep until relevant branches change, then show orientation
+    Sleep {
+        #[command(subcommand)]
+        target: Option<SleepTarget>,
+        /// Max local messages to show
+        #[arg(long, default_value_t = 10, global = true)]
+        message_limit: usize,
+        /// Max doing goals to show
+        #[arg(long, default_value_t = 5, global = true)]
+        doing_limit: usize,
+        /// Max todo goals to show
+        #[arg(long, default_value_t = 5, global = true)]
+        todo_limit: usize,
+        /// Poll interval while sleeping for branch changes
+        #[arg(long, default_value_t = 1000, global = true)]
+        poll_ms: u64,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum SleepTarget {
+    /// Sleep for a duration (e.g. 30s, 15m, 9h)
+    For {
+        /// Duration to sleep
+        duration: String,
+    },
+    /// Sleep until a specific time (e.g. 09:00, 9am, or 2026-02-13T09:00:00+01:00)
+    Until {
+        /// Time to wake up
+        when: String,
     },
 }
 
@@ -145,6 +189,17 @@ struct BoardState {
 #[derive(Debug, Clone, Default)]
 struct ConfigIdentity {
     persona_id: Option<Id>,
+    compass_branch_id: Option<Id>,
+    local_messages_branch_id: Option<Id>,
+    relations_branch_id: Option<Id>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WatchedHeads {
+    local: Option<CommitHandle>,
+    compass: Option<CommitHandle>,
+    relations: Option<CommitHandle>,
+    config: Option<CommitHandle>,
 }
 
 fn now_epoch() -> Epoch {
@@ -181,11 +236,8 @@ fn id_prefix(id: Id) -> String {
 
 fn load_relations_labels(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch: &str,
+    branch_id: Id,
 ) -> Result<HashMap<Id, String>> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch)? else {
-        bail!("missing relations branch '{branch}' (create with relations faculty)");
-    };
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
@@ -209,10 +261,7 @@ fn load_relations_labels(
     Ok(labels)
 }
 
-fn read_text(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
-    handle: TextHandle,
-) -> Result<String> {
+fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws
         .get::<View<str>, blobschemas::LongString>(handle)
         .map_err(|e| anyhow!("load longstring: {e:?}"))?;
@@ -346,10 +395,17 @@ fn load_board(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<BoardSta
                 board::at: ?at
         }])
     ) {
-        status_events.push(StatusEvent { task: task_id, status, at });
+        status_events.push(StatusEvent {
+            task: task_id,
+            status,
+            at,
+        });
     }
 
-    Ok(BoardState { tasks, status_events })
+    Ok(BoardState {
+        tasks,
+        status_events,
+    })
 }
 
 fn latest_status(events: &[StatusEvent]) -> HashMap<Id, StatusEvent> {
@@ -407,7 +463,70 @@ fn load_config_identity(
     .into_iter()
     .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
 
-    Ok(ConfigIdentity { persona_id })
+    let local_messages_branch_id = find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::local_messages_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
+
+    let compass_branch_id = find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::compass_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
+
+    let relations_branch_id = find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::relations_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
+
+    Ok(ConfigIdentity {
+        persona_id,
+        compass_branch_id,
+        local_messages_branch_id,
+        relations_branch_id,
+    })
+}
+
+fn branch_exists(pile: &mut Pile<valueschemas::Blake3>, id: Id) -> Result<bool> {
+    let iter = pile
+        .branches()
+        .map_err(|e| anyhow!("list branches: {e:?}"))?;
+    for entry in iter {
+        let branch_id = entry.map_err(|e| anyhow!("branch id: {e:?}"))?;
+        if branch_id == id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn resolve_branch_id_from_config_or_name(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    configured_id: Option<Id>,
+    fallback_name: &str,
+    create_if_missing: bool,
+) -> Result<Id> {
+    if let Some(branch_id) = configured_id {
+        if branch_exists(repo.storage_mut(), branch_id)? {
+            return Ok(branch_id);
+        }
+        bail!(
+            "configured branch id {:x} missing for '{fallback_name}' (update config)",
+            branch_id
+        );
+    }
+
+    if create_if_missing {
+        ensure_branch(repo, fallback_name)
+    } else {
+        find_branch_by_name(repo.storage_mut(), fallback_name)?
+            .ok_or_else(|| anyhow!("missing branch '{fallback_name}'"))
+    }
 }
 
 fn cmd_show(
@@ -420,8 +539,25 @@ fn cmd_show(
     todo_limit: usize,
 ) -> Result<()> {
     let mut repo = open_repo(pile)?;
-    let local_branch_id = ensure_branch(&mut repo, local_branch)?;
-    let compass_branch_id = ensure_branch(&mut repo, compass_branch)?;
+    let config_identity = load_config_identity(&mut repo)?;
+    let local_branch_id = resolve_branch_id_from_config_or_name(
+        &mut repo,
+        config_identity.local_messages_branch_id,
+        local_branch,
+        true,
+    )?;
+    let compass_branch_id = resolve_branch_id_from_config_or_name(
+        &mut repo,
+        config_identity.compass_branch_id,
+        compass_branch,
+        true,
+    )?;
+    let relations_branch_id = resolve_branch_id_from_config_or_name(
+        &mut repo,
+        config_identity.relations_branch_id,
+        relations_branch,
+        false,
+    )?;
 
     let mut local_ws = repo
         .pull(local_branch_id)
@@ -429,13 +565,17 @@ fn cmd_show(
     let local_space = local_ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout local: {e:?}"))?;
-    let config_identity = load_config_identity(&mut repo)?;
-    let reader_id = config_identity
-        .persona_id
-        .ok_or_else(|| anyhow!("missing persona_id in config (set via `playground config set persona-id <hex-id>`)"))?;
-    let party_names = load_relations_labels(&mut repo, relations_branch)?;
+    let reader_id = config_identity.persona_id.ok_or_else(|| {
+        anyhow!(
+            "missing persona_id in config (set via `playground config set persona-id <hex-id>`)"
+        )
+    })?;
+    let party_names = load_relations_labels(&mut repo, relations_branch_id)?;
     if !party_names.contains_key(&reader_id) {
-        bail!("persona_id {:x} missing from relations (add via relations faculty)", reader_id);
+        bail!(
+            "persona_id {:x} missing from relations (add via relations faculty)",
+            reader_id
+        );
     }
     let reads = load_reads(&local_space);
     let mut messages = load_messages(&mut local_ws, &local_space)?;
@@ -445,14 +585,8 @@ fn cmd_show(
         .filter(|msg| msg.to == reader_id && !reads.contains_key(&(msg.id, reader_id)))
         .cloned()
         .collect();
-    let use_unread = !unread.is_empty();
-    if use_unread {
-        unread.truncate(message_limit);
-        messages = unread;
-    } else {
-        messages.retain(|msg| msg.to == reader_id || msg.from == reader_id);
-        messages.truncate(message_limit);
-    }
+    unread.truncate(message_limit);
+    messages = unread;
 
     let now_key = interval_key(epoch_interval(now_epoch()));
 
@@ -461,11 +595,7 @@ fn cmd_show(
         .get(&reader_id)
         .cloned()
         .unwrap_or_else(|| id_prefix(reader_id));
-    println!(
-        "Local messages ({} for {}):",
-        if use_unread { "unread" } else { "recent" },
-        reader_label
-    );
+    println!("Local messages (unread inbox for {}):", reader_label);
     if messages.is_empty() {
         println!("- None");
     } else {
@@ -479,20 +609,21 @@ fn cmd_show(
                 .cloned()
                 .unwrap_or_else(|| id_prefix(msg.to));
             let age = format_age(now_key, msg.created_at);
-            let status = if reads.contains_key(&(msg.id, reader_id)) {
-                "read"
-            } else {
-                "unread"
-            };
             println!(
-                "- [{}] {} {} -> {} ({}) {}",
+                "- [{}] {} {} -> {} ({})",
                 id_prefix(msg.id),
                 age,
                 from_label,
                 to_label,
-                status,
-                truncate_single_line(&msg.body, 120)
+                "unread",
             );
+            if msg.body.is_empty() {
+                println!("    ");
+            } else {
+                for line in msg.body.lines() {
+                    println!("    {}", line.trim_end_matches('\r'));
+                }
+            }
         }
     }
 
@@ -552,9 +683,218 @@ fn cmd_show(
     }
 
     drop(compass_ws);
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
+    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
     Ok(())
+}
+
+fn load_watched_heads(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    local_branch: &str,
+    compass_branch: &str,
+    relations_branch: &str,
+) -> Result<WatchedHeads> {
+    let config_identity = load_config_identity(repo)?;
+    let local_branch_id = resolve_branch_id_from_config_or_name(
+        repo,
+        config_identity.local_messages_branch_id,
+        local_branch,
+        true,
+    )?;
+    let compass_branch_id = resolve_branch_id_from_config_or_name(
+        repo,
+        config_identity.compass_branch_id,
+        compass_branch,
+        true,
+    )?;
+    let relations_branch_id = resolve_branch_id_from_config_or_name(
+        repo,
+        config_identity.relations_branch_id,
+        relations_branch,
+        false,
+    )?;
+
+    Ok(WatchedHeads {
+        local: branch_head_by_id(repo, local_branch_id)?,
+        compass: branch_head_by_id(repo, compass_branch_id)?,
+        relations: branch_head_by_id(repo, relations_branch_id)?,
+        config: branch_head_by_name(repo, CONFIG_BRANCH)?,
+    })
+}
+
+fn branch_head_by_id(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_id: Id,
+) -> Result<Option<CommitHandle>> {
+    repo.storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {:x}: {e:?}", branch_id))
+}
+
+fn branch_head_by_name(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_name: &str,
+) -> Result<Option<CommitHandle>> {
+    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? else {
+        return Ok(None);
+    };
+    repo.storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))
+}
+
+fn parse_sleep_target(target: Option<&SleepTarget>) -> Result<Option<Duration>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    match target {
+        SleepTarget::For { duration } => {
+            let duration = duration.trim();
+            if duration.is_empty() {
+                bail!("sleep for requires a duration (e.g. 30s, 15m, 9h)");
+            }
+            let parsed = humantime::parse_duration(duration)
+                .map_err(|e| anyhow!("invalid sleep duration '{duration}': {e}"))?;
+            if parsed.is_zero() {
+                bail!("sleep duration must be greater than zero");
+            }
+            Ok(Some(parsed))
+        }
+        SleepTarget::Until { when } => {
+            let (parsed, _) = parse_until_spec(when)?;
+            Ok(Some(parsed))
+        }
+    }
+}
+
+fn parse_until_spec(raw: &str) -> Result<(Duration, DateTime<Local>)> {
+    let when = raw.trim();
+    if when.is_empty() {
+        bail!("sleep until requires a time (e.g. 09:00, 9am, 2026-02-13T09:00:00+01:00)");
+    }
+
+    if let Ok(system_time) = humantime::parse_rfc3339_weak(when) {
+        let target_local = DateTime::<Local>::from(system_time);
+        let timeout = system_time
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO);
+        return Ok((timeout, target_local));
+    }
+
+    if let Some(local_datetime) = parse_local_datetime_spec(when)? {
+        let timeout = chrono_duration_to_std(local_datetime.signed_duration_since(Local::now()));
+        return Ok((timeout, local_datetime));
+    }
+
+    if let Some(local_time) = parse_local_time_spec(when) {
+        let now = Local::now();
+        let mut target_naive = now.date_naive().and_time(local_time);
+        let mut target_local = localize_naive_datetime(target_naive)?;
+        if target_local <= now {
+            target_naive += ChronoDuration::days(1);
+            target_local = localize_naive_datetime(target_naive)?;
+        }
+        let timeout = chrono_duration_to_std(target_local.signed_duration_since(now));
+        return Ok((timeout, target_local));
+    }
+
+    bail!(
+        "invalid sleep until value '{when}'. Use HH:MM, 9am, local datetime, or RFC3339 timestamp"
+    );
+}
+
+fn parse_local_datetime_spec(raw: &str) -> Result<Option<DateTime<Local>>> {
+    for fmt in [
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(raw, fmt) {
+            return Ok(Some(localize_naive_datetime(naive)?));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_local_time_spec(raw: &str) -> Option<NaiveTime> {
+    for fmt in [
+        "%H:%M", "%H:%M:%S", "%I:%M %P", "%I:%M%P", "%I %P", "%I%P", "%I:%M %p", "%I:%M%p",
+        "%I %p", "%I%p",
+    ] {
+        if let Ok(time) = NaiveTime::parse_from_str(raw, fmt) {
+            return Some(time);
+        }
+    }
+    None
+}
+
+fn localize_naive_datetime(naive: NaiveDateTime) -> Result<DateTime<Local>> {
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Ok(dt),
+        LocalResult::Ambiguous(a, b) => Ok(if a <= b { a } else { b }),
+        LocalResult::None => bail!(
+            "local time '{}' does not exist (likely DST transition)",
+            naive.format("%Y-%m-%d %H:%M:%S")
+        ),
+    }
+}
+
+fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
+    if duration <= ChronoDuration::zero() {
+        Duration::ZERO
+    } else {
+        duration.to_std().unwrap_or(Duration::MAX)
+    }
+}
+
+fn cmd_sleep(
+    pile: &Path,
+    compass_branch: &str,
+    local_branch: &str,
+    relations_branch: &str,
+    target: Option<SleepTarget>,
+    message_limit: usize,
+    doing_limit: usize,
+    todo_limit: usize,
+    poll_ms: u64,
+) -> Result<()> {
+    let timeout = parse_sleep_target(target.as_ref())?;
+    let mut repo = open_repo(pile)?;
+    let wait_result = (|| -> Result<bool> {
+        let baseline =
+            load_watched_heads(&mut repo, local_branch, compass_branch, relations_branch)?;
+        let poll = Duration::from_millis(poll_ms.max(1));
+        let start = Instant::now();
+
+        loop {
+            if let Some(timeout) = timeout {
+                if start.elapsed() >= timeout {
+                    return Ok(false);
+                }
+            }
+            std::thread::sleep(poll);
+            let current =
+                load_watched_heads(&mut repo, local_branch, compass_branch, relations_branch)?;
+            if current != baseline {
+                return Ok(true);
+            }
+        }
+    })();
+    let close_result = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    let changed = wait_result?;
+    close_result?;
+    if !changed {
+        println!("No change detected since sleep started; showing current snapshot.");
+    }
+    cmd_show(
+        pile,
+        compass_branch,
+        local_branch,
+        relations_branch,
+        message_limit,
+        doing_limit,
+        todo_limit,
+    )
 }
 
 fn render_tags(tags: &[String]) -> String {
@@ -578,21 +918,6 @@ fn render_tags(tags: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn truncate_single_line(text: &str, max_len: usize) -> String {
-    let mut out = String::new();
-    for ch in text.chars() {
-        if ch == '\n' || ch == '\r' {
-            break;
-        }
-        out.push(ch);
-        if out.len() >= max_len {
-            out.push_str("...");
-            break;
-        }
-    }
-    out
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
@@ -629,9 +954,7 @@ fn find_branch_by_name(
         .to_owned()
         .to_blob()
         .get_handle::<valueschemas::Blake3>();
-    let reader = pile
-        .reader()
-        .map_err(|e| anyhow!("pile reader: {e:?}"))?;
+    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile
         .branches()
         .map_err(|e| anyhow!("list branches: {e:?}"))?;
@@ -674,20 +997,20 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     metadata.union(<valueschemas::GenId as metadata::ConstMetadata>::describe(
         repo.storage_mut(),
     )?);
+    metadata.union(<valueschemas::Handle<
+        valueschemas::Blake3,
+        blobschemas::LongString,
+    > as metadata::ConstMetadata>::describe(
+        repo.storage_mut()
+    )?);
+    metadata
+        .union(<blobschemas::LongString as metadata::ConstMetadata>::describe(repo.storage_mut())?);
     metadata.union(
-        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstMetadata>::describe(
-            repo.storage_mut(),
-        )?,
+        <valueschemas::NsTAIInterval as metadata::ConstMetadata>::describe(repo.storage_mut())?,
     );
-    metadata.union(<blobschemas::LongString as metadata::ConstMetadata>::describe(
-        repo.storage_mut(),
-    )?);
-    metadata.union(<valueschemas::NsTAIInterval as metadata::ConstMetadata>::describe(
-        repo.storage_mut(),
-    )?);
-    metadata.union(<valueschemas::ShortString as metadata::ConstMetadata>::describe(
-        repo.storage_mut(),
-    )?);
+    metadata.union(
+        <valueschemas::ShortString as metadata::ConstMetadata>::describe(repo.storage_mut())?,
+    );
 
     let mut ws = repo
         .pull(branch_id)
@@ -701,8 +1024,7 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
     }
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
+    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
     Ok(())
 }
 
@@ -730,6 +1052,23 @@ fn main() -> Result<()> {
             message_limit,
             doing_limit,
             todo_limit,
+        ),
+        Command::Sleep {
+            target,
+            message_limit,
+            doing_limit,
+            todo_limit,
+            poll_ms,
+        } => cmd_sleep(
+            &cli.pile,
+            &cli.compass_branch,
+            &cli.local_branch,
+            &cli.relations_branch,
+            target,
+            message_limit,
+            doing_limit,
+            todo_limit,
+            poll_ms,
         ),
     }
 }
