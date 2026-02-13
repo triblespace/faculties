@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
-//! triblespace = "0.12.0"
+//! triblespace = "0.13.0"
 //! ```
 
 use std::fs;
@@ -22,7 +22,6 @@ use triblespace::core::blob::{Blob, Bytes};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::core::value::RawValue;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::{FileBytes, LongString, SimpleArchive};
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
@@ -743,24 +742,13 @@ fn compute_state_handle(
     let mut canonical_entries = entries.to_vec();
     canonical_entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let state_root = derive_entity_id(&mut vec![
-        (
-            playground_workspace::kind.id(),
-            playground_workspace::kind
-                .value_from(playground_workspace::kind_snapshot)
-                .raw,
-        ),
-        (
-            playground_workspace::root_path.id(),
-            playground_workspace::root_path.value_from(root_handle).raw,
-        ),
-    ]);
-
     let mut state = TribleSet::new();
-    state += entity! { ExclusiveId::force_ref(&state_root) @
+    let root_entity = entity! { _ @
         playground_workspace::kind: playground_workspace::kind_snapshot,
         playground_workspace::root_path: root_handle,
     };
+    let state_root = entity_id_from_set(&root_entity);
+    state.union(root_entity);
 
     for entry in canonical_entries.iter() {
         let (entry_id, entry_set) = build_entry_entity(entry);
@@ -772,67 +760,62 @@ fn compute_state_handle(
     ws.put(blob)
 }
 
-fn build_entry_entity(entry: &MaterializedEntry) -> (Id, TribleSet) {
-    let mut pairs = vec![
-        (
-            playground_workspace::path.id(),
-            playground_workspace::path.value_from(entry.path_handle).raw,
-        ),
-        (
-            playground_workspace::kind.id(),
-            playground_workspace::kind.value_from(entry.kind).raw,
-        ),
-    ];
-
-    if let Some(mode) = entry.mode {
-        pairs.push((playground_workspace::mode.id(), mode.raw));
-    }
-    if let Some(bytes) = entry.bytes_handle {
-        pairs.push((playground_workspace::bytes.id(), bytes.raw));
-    }
-    if let Some(link_target) = entry.link_target_handle {
-        pairs.push((playground_workspace::link_target.id(), link_target.raw));
-    }
-
-    let entry_id = derive_entity_id(&mut pairs);
-    let mut set = entity! { ExclusiveId::force_ref(&entry_id) @
-        playground_workspace::path: entry.path_handle,
-        playground_workspace::kind: entry.kind,
-    };
-    if let Some(mode) = entry.mode {
-        set += entity! { ExclusiveId::force_ref(&entry_id) @ playground_workspace::mode: mode };
-    }
-    if let Some(bytes) = entry.bytes_handle {
-        set += entity! { ExclusiveId::force_ref(&entry_id) @ playground_workspace::bytes: bytes };
-    }
-    if let Some(link_target) = entry.link_target_handle {
-        set += entity! { ExclusiveId::force_ref(&entry_id) @ playground_workspace::link_target: link_target };
-    }
-
-    (entry_id, set)
+fn entity_id_from_set(set: &TribleSet) -> Id {
+    *set.iter()
+        .next()
+        .expect("entity! must have at least one attribute/value pair")
+        .e()
 }
 
-fn derive_entity_id(pairs: &mut Vec<(Id, RawValue)>) -> Id {
-    pairs.sort_unstable();
-    let mut hasher = Blake3::new();
-    let mut last: Option<(Id, RawValue)> = None;
-
-    for (a, v) in pairs.iter() {
-        if let Some((la, lv)) = last {
-            if *a == la && *v == lv {
-                continue;
-            }
-        }
-        hasher.update(&a[..]);
-        hasher.update(&v[..]);
-        last = Some((*a, *v));
-    }
-
-    let digest = hasher.finalize();
-    let digest_bytes = digest.as_bytes();
-    let mut raw = [0u8; 16];
-    raw.copy_from_slice(&digest_bytes[digest_bytes.len() - 16..]);
-    Id::new(raw).unwrap()
+fn build_entry_entity(entry: &MaterializedEntry) -> (Id, TribleSet) {
+    let set = match (entry.mode, entry.bytes_handle, entry.link_target_handle) {
+        (Some(mode), Some(bytes), Some(link_target)) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+            playground_workspace::mode: mode,
+            playground_workspace::bytes: bytes,
+            playground_workspace::link_target: link_target,
+        },
+        (Some(mode), Some(bytes), None) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+            playground_workspace::mode: mode,
+            playground_workspace::bytes: bytes,
+        },
+        (Some(mode), None, Some(link_target)) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+            playground_workspace::mode: mode,
+            playground_workspace::link_target: link_target,
+        },
+        (None, Some(bytes), Some(link_target)) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+            playground_workspace::bytes: bytes,
+            playground_workspace::link_target: link_target,
+        },
+        (Some(mode), None, None) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+            playground_workspace::mode: mode,
+        },
+        (None, Some(bytes), None) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+            playground_workspace::bytes: bytes,
+        },
+        (None, None, Some(link_target)) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+            playground_workspace::link_target: link_target,
+        },
+        (None, None, None) => entity! { _ @
+            playground_workspace::path: entry.path_handle,
+            playground_workspace::kind: entry.kind,
+        },
+    };
+    let entry_id = entity_id_from_set(&set);
+    (entry_id, set)
 }
 
 #[derive(Clone, Debug)]
