@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
-//! triblespace = "0.13.0"
+//! triblespace = "0.13.1"
 //! ```
 
 use std::fs;
@@ -768,51 +768,12 @@ fn entity_id_from_set(set: &TribleSet) -> Id {
 }
 
 fn build_entry_entity(entry: &MaterializedEntry) -> (Id, TribleSet) {
-    let set = match (entry.mode, entry.bytes_handle, entry.link_target_handle) {
-        (Some(mode), Some(bytes), Some(link_target)) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-            playground_workspace::mode: mode,
-            playground_workspace::bytes: bytes,
-            playground_workspace::link_target: link_target,
-        },
-        (Some(mode), Some(bytes), None) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-            playground_workspace::mode: mode,
-            playground_workspace::bytes: bytes,
-        },
-        (Some(mode), None, Some(link_target)) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-            playground_workspace::mode: mode,
-            playground_workspace::link_target: link_target,
-        },
-        (None, Some(bytes), Some(link_target)) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-            playground_workspace::bytes: bytes,
-            playground_workspace::link_target: link_target,
-        },
-        (Some(mode), None, None) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-            playground_workspace::mode: mode,
-        },
-        (None, Some(bytes), None) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-            playground_workspace::bytes: bytes,
-        },
-        (None, None, Some(link_target)) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-            playground_workspace::link_target: link_target,
-        },
-        (None, None, None) => entity! { _ @
-            playground_workspace::path: entry.path_handle,
-            playground_workspace::kind: entry.kind,
-        },
+    let set = entity! { _ @
+        playground_workspace::path: entry.path_handle,
+        playground_workspace::kind: entry.kind,
+        playground_workspace::mode?: entry.mode,
+        playground_workspace::bytes?: entry.bytes_handle,
+        playground_workspace::link_target?: entry.link_target_handle,
     };
     let entry_id = entity_id_from_set(&set);
     (entry_id, set)
