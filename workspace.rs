@@ -10,10 +10,11 @@
 //! ```
 
 use std::fs;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -21,8 +22,9 @@ use triblespace::core::blob::{Blob, Bytes};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::value::RawValue;
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobschemas::{FileBytes, LongString};
+use triblespace::prelude::blobschemas::{FileBytes, LongString, SimpleArchive};
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
@@ -35,7 +37,9 @@ mod playground_workspace {
     attributes! {
         "E39FB34126FE01A32F1D4B3DAD0F1874" as pub kind: GenId;
         "A95E92FB35943C570BE45FF811B0BD07" as pub created_at: NsTAIInterval;
+        "5D36AA8480B30F62394911A003F20DDF" as pub parent_snapshot: GenId;
         "B667B02CEB4493232632473ECB782287" as pub root_path: Handle<Blake3, LongString>;
+        "813B3BFA590103FFAD324FC72CDDC3F5" as pub state: Handle<Blake3, SimpleArchive>;
         "435869D280EC3123D391A32025C6F3CC" as pub label: Handle<Blake3, LongString>;
         "C69E168C68E317858A62BA51FC326E97" as pub entry: GenId;
         "1032F072E6730AB40A6F5F568C4C23EB" as pub path: Handle<Blake3, LongString>;
@@ -73,6 +77,10 @@ enum Command {
     Capture(WorkspaceCaptureArgs),
     /// List available workspace snapshots.
     List,
+    /// Diff two snapshots.
+    Diff(WorkspaceDiffArgs),
+    /// Merge two snapshots with a common base.
+    Merge(WorkspaceMergeArgs),
     /// Restore a workspace snapshot to a target directory.
     Restore(WorkspaceRestoreArgs),
 }
@@ -99,6 +107,38 @@ struct WorkspaceRestoreArgs {
     force: bool,
 }
 
+#[derive(Args)]
+struct WorkspaceDiffArgs {
+    /// Left snapshot id (hex) or 'latest'
+    left: String,
+    /// Right snapshot id (hex) or 'latest'
+    right: String,
+}
+
+#[derive(Args)]
+struct WorkspaceMergeArgs {
+    /// Base snapshot id (hex) or 'latest'
+    base: String,
+    /// Ours snapshot id (hex) or 'latest'
+    ours: String,
+    /// Theirs snapshot id (hex) or 'latest'
+    theirs: String,
+    /// Optional label for the merged snapshot
+    #[arg(long)]
+    label: Option<String>,
+    /// Conflict policy when both sides changed differently vs base
+    #[arg(long, value_enum, default_value_t = ConflictPolicy::Fail)]
+    conflicts: ConflictPolicy,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+enum ConflictPolicy {
+    Fail,
+    Ours,
+    Theirs,
+}
+
 #[derive(Debug, Clone)]
 struct SnapshotInfo {
     id: Id,
@@ -106,23 +146,42 @@ struct SnapshotInfo {
     created_key: i128,
     label: Option<String>,
     root_path: Option<String>,
+    state: Option<Value<Handle<Blake3, SimpleArchive>>>,
+    parents: Vec<Id>,
     entry_count: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+struct SnapshotData {
+    id: Id,
+    root_path: String,
+    entries: Vec<CapturedEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     File,
     Dir,
     Symlink,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedEntry {
     path: String,
     kind: EntryKind,
     mode: Option<u32>,
     bytes: Option<Vec<u8>>,
     link_target: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedEntry {
+    path: String,
+    kind: Id,
+    mode: Option<Value<U256BE>>,
+    path_handle: Value<Handle<Blake3, LongString>>,
+    bytes_handle: Option<Value<Handle<Blake3, FileBytes>>>,
+    link_target_handle: Option<Value<Handle<Blake3, LongString>>>,
 }
 
 const EXCLUDED_DIRS: &[&str] = &[
@@ -161,6 +220,8 @@ fn main() -> Result<()> {
     match cmd {
         Command::Capture(args) => cmd_capture(&pile, &branch, args),
         Command::List => cmd_list(&pile, &branch),
+        Command::Diff(args) => cmd_diff(&pile, &branch, args),
+        Command::Merge(args) => cmd_merge(&pile, &branch, args),
         Command::Restore(args) => cmd_restore(&pile, &branch, args),
     }
 }
@@ -197,7 +258,9 @@ where
     metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
     metadata.union(<U256BE as metadata::ConstMetadata>::describe(blobs)?);
     metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
+    metadata.union(<Handle<Blake3, SimpleArchive> as metadata::ConstMetadata>::describe(blobs)?);
     metadata.union(<FileBytes as metadata::ConstMetadata>::describe(blobs)?);
+    metadata.union(<SimpleArchive as metadata::ConstMetadata>::describe(blobs)?);
     metadata.union(<LongString as metadata::ConstMetadata>::describe(blobs)?);
 
     metadata.union(describe_attribute(blobs, &playground_workspace::kind, "workspace_kind")?);
@@ -208,8 +271,18 @@ where
     )?);
     metadata.union(describe_attribute(
         blobs,
+        &playground_workspace::parent_snapshot,
+        "workspace_parent_snapshot",
+    )?);
+    metadata.union(describe_attribute(
+        blobs,
         &playground_workspace::root_path,
         "workspace_root_path",
+    )?);
+    metadata.union(describe_attribute(
+        blobs,
+        &playground_workspace::state,
+        "workspace_state",
     )?);
     metadata.union(describe_attribute(
         blobs,
@@ -327,6 +400,179 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_diff(pile: &Path, branch: &str, args: WorkspaceDiffArgs) -> Result<()> {
+    let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let result = (|| -> Result<()> {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|err| anyhow!("pull workspace branch: {err:?}"))?;
+        let catalog = ws.checkout(..).context("checkout workspace branch")?;
+
+        let left_id = resolve_snapshot_id(&catalog, args.left.as_str())?;
+        let right_id = resolve_snapshot_id(&catalog, args.right.as_str())?;
+        let left = load_snapshot_data(&mut ws, &catalog, left_id)?;
+        let right = load_snapshot_data(&mut ws, &catalog, right_id)?;
+
+        if left.root_path != right.root_path {
+            println!(
+                "root differs: left={} right={}",
+                left.root_path, right.root_path
+            );
+        }
+
+        let left_map = build_entry_map(&left.entries)?;
+        let right_map = build_entry_map(&right.entries)?;
+        let mut paths = BTreeSet::new();
+        for path in left_map.keys() {
+            paths.insert(path.clone());
+        }
+        for path in right_map.keys() {
+            paths.insert(path.clone());
+        }
+
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        let mut modified = 0usize;
+        for path in paths {
+            let l = left_map.get(path.as_str());
+            let r = right_map.get(path.as_str());
+            match (l, r) {
+                (None, Some(_)) => {
+                    added += 1;
+                    println!("A {path}");
+                }
+                (Some(_), None) => {
+                    removed += 1;
+                    println!("D {path}");
+                }
+                (Some(a), Some(b)) if a != b => {
+                    modified += 1;
+                    println!("M {path}");
+                }
+                _ => {}
+            }
+        }
+
+        println!(
+            "summary: +{added} -{removed} ~{modified} (left={:x} right={:x})",
+            left.id, right.id
+        );
+        Ok(())
+    })();
+
+    let close_result = repo.close().map_err(|err| anyhow!("close pile: {err:?}"));
+    match (result, close_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close_err)) => {
+            eprintln!("warning: close pile after error: {close_err:#}");
+            Err(err)
+        }
+    }
+}
+
+fn cmd_merge(pile: &Path, branch: &str, args: WorkspaceMergeArgs) -> Result<()> {
+    let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let result = (|| -> Result<()> {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|err| anyhow!("pull workspace branch: {err:?}"))?;
+        let catalog = ws.checkout(..).context("checkout workspace branch")?;
+
+        let base_id = resolve_snapshot_id(&catalog, args.base.as_str())?;
+        let ours_id = resolve_snapshot_id(&catalog, args.ours.as_str())?;
+        let theirs_id = resolve_snapshot_id(&catalog, args.theirs.as_str())?;
+
+        let base = load_snapshot_data(&mut ws, &catalog, base_id)?;
+        let ours = load_snapshot_data(&mut ws, &catalog, ours_id)?;
+        let theirs = load_snapshot_data(&mut ws, &catalog, theirs_id)?;
+
+        let merged_root = merge_root_path(
+            base.root_path.as_str(),
+            ours.root_path.as_str(),
+            theirs.root_path.as_str(),
+            args.conflicts,
+        )?;
+
+        let base_map = build_entry_map(&base.entries)?;
+        let ours_map = build_entry_map(&ours.entries)?;
+        let theirs_map = build_entry_map(&theirs.entries)?;
+        let mut all_paths = BTreeSet::new();
+        for path in base_map.keys() {
+            all_paths.insert(path.clone());
+        }
+        for path in ours_map.keys() {
+            all_paths.insert(path.clone());
+        }
+        for path in theirs_map.keys() {
+            all_paths.insert(path.clone());
+        }
+
+        let mut merged_entries = Vec::new();
+        let mut conflicts = Vec::new();
+        for path in all_paths {
+            let base_entry = base_map.get(path.as_str());
+            let ours_entry = ours_map.get(path.as_str());
+            let theirs_entry = theirs_map.get(path.as_str());
+            match merge_path(base_entry, ours_entry, theirs_entry, args.conflicts) {
+                Ok(Some(entry)) => merged_entries.push(entry),
+                Ok(None) => {}
+                Err(_) => conflicts.push(path),
+            }
+        }
+
+        if !conflicts.is_empty() && args.conflicts == ConflictPolicy::Fail {
+            let preview = conflicts.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+            return Err(anyhow!(
+                "merge conflicts on {} path(s): {}{}",
+                conflicts.len(),
+                preview,
+                if conflicts.len() > 8 { ", ..." } else { "" }
+            ));
+        }
+
+        merged_entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let label = args.label.unwrap_or_else(|| {
+            format!(
+                "merge:{}+{}<-{}",
+                id_short(ours_id),
+                id_short(theirs_id),
+                id_short(base_id),
+            )
+        });
+        let snapshot_id = write_snapshot(
+            &mut ws,
+            merged_root.as_str(),
+            &merged_entries,
+            Some(label.as_str()),
+            &[ours_id, theirs_id],
+        );
+        repo.push(&mut ws)
+            .map_err(|err| anyhow!("push merged snapshot: {err:?}"))?;
+
+        println!("snapshot: {snapshot_id:x}");
+        println!(
+            "merged entries={} conflicts={} policy={:?}",
+            merged_entries.len(),
+            conflicts.len(),
+            args.conflicts
+        );
+        Ok(())
+    })();
+
+    let close_result = repo.close().map_err(|err| anyhow!("close pile: {err:?}"));
+    match (result, close_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close_err)) => {
+            eprintln!("warning: close pile after error: {close_err:#}");
+            Err(err)
+        }
+    }
+}
+
 fn cmd_restore(pile: &Path, branch: &str, args: WorkspaceRestoreArgs) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile, branch)?;
     let snapshot_id = parse_optional_hex_id(args.snapshot.as_deref())?;
@@ -407,59 +653,186 @@ fn capture_snapshot(
     let mut ws = repo
         .pull(branch_id)
         .map_err(|err| anyhow!("pull workspace branch: {err:?}"))?;
+    let catalog = ws.checkout(..).context("checkout workspace branch")?;
 
-    let (root_path, entries) = collect_mapped_entries(mappings).context("collect workspace entries")?;
+    let (root_path, entries) =
+        collect_mapped_entries(mappings).context("collect workspace entries")?;
+    let parent = latest_snapshot(&catalog).context("find latest snapshot")?;
+    let parents = parent.into_iter().collect::<Vec<_>>();
+    let snapshot_id = write_snapshot(&mut ws, root_path.as_str(), &entries, label, &parents);
+    repo.push(&mut ws)
+        .map_err(|err| anyhow!("push snapshot: {err:?}"))?;
+    Ok(snapshot_id)
+}
 
+fn write_snapshot(
+    ws: &mut Workspace<Pile<Blake3>>,
+    root_path: &str,
+    entries: &[CapturedEntry],
+    label: Option<&str>,
+    parents: &[Id],
+) -> Id {
     let snapshot_id = ufoid();
     let created_at = epoch_interval(now_epoch());
+    let materialized_entries = materialize_entries(ws, entries);
+    let root_handle = ws.put(root_path.to_owned());
+    let state_handle = compute_state_handle(ws, root_handle, &materialized_entries);
     let mut change = TribleSet::new();
     change += entity! { &snapshot_id @
         playground_workspace::kind: playground_workspace::kind_snapshot,
         playground_workspace::created_at: created_at,
     };
-    let root_handle = ws.put(root_path);
-    change += entity! { &snapshot_id @ playground_workspace::root_path: root_handle };
+    change += entity! { &snapshot_id @
+        playground_workspace::root_path: root_handle,
+        playground_workspace::state: state_handle,
+    };
 
     if let Some(label) = label {
         let label_handle = ws.put(label.to_owned());
         change += entity! { &snapshot_id @ playground_workspace::label: label_handle };
     }
+    for parent in parents {
+        change += entity! { &snapshot_id @ playground_workspace::parent_snapshot: *parent };
+    }
 
+    for entry in &materialized_entries {
+        let (entry_id, entry_set) = build_entry_entity(entry);
+        change += entity! { &snapshot_id @ playground_workspace::entry: entry_id };
+        change.union(entry_set);
+    }
+
+    ws.commit(change, None, Some("playground_workspace snapshot"));
+    *snapshot_id
+}
+
+fn materialize_entries(
+    ws: &mut Workspace<Pile<Blake3>>,
+    entries: &[CapturedEntry],
+) -> Vec<MaterializedEntry> {
+    let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
-        let entry_id = ufoid();
-        let entry_ref = *entry_id;
-        change += entity! { &snapshot_id @ playground_workspace::entry: entry_ref };
-
-        let path_handle = ws.put(entry.path);
-        change += entity! { &entry_id @ playground_workspace::path: path_handle };
-
-        let kind_id = match entry.kind {
+        let kind = match entry.kind {
             EntryKind::File => playground_workspace::kind_file,
             EntryKind::Dir => playground_workspace::kind_dir,
             EntryKind::Symlink => playground_workspace::kind_symlink,
         };
-        change += entity! { &entry_id @ playground_workspace::kind: kind_id };
+        let mode = entry.mode.map(|value| (value as u64).to_value());
+        let path_handle = ws.put(entry.path.clone());
+        let bytes_handle = entry
+            .bytes
+            .as_ref()
+            .map(|bytes| ws.put(Bytes::from_source(bytes.clone())));
+        let link_target_handle = entry.link_target.as_ref().map(|target| ws.put(target.clone()));
+        out.push(MaterializedEntry {
+            path: entry.path.clone(),
+            kind,
+            mode,
+            path_handle,
+            bytes_handle,
+            link_target_handle,
+        });
+    }
+    out
+}
 
-        if let Some(mode) = entry.mode {
-            let mode_val: Value<U256BE> = (mode as u64).to_value();
-            change += entity! { &entry_id @ playground_workspace::mode: mode_val };
-        }
+fn compute_state_handle(
+    ws: &mut Workspace<Pile<Blake3>>,
+    root_handle: Value<Handle<Blake3, LongString>>,
+    entries: &[MaterializedEntry],
+) -> Value<Handle<Blake3, SimpleArchive>> {
+    let mut canonical_entries = entries.to_vec();
+    canonical_entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-        if let Some(bytes) = entry.bytes {
-            let handle = ws.put(Bytes::from_source(bytes));
-            change += entity! { &entry_id @ playground_workspace::bytes: handle };
-        }
+    let state_root = derive_entity_id(&mut vec![
+        (
+            playground_workspace::kind.id(),
+            playground_workspace::kind
+                .value_from(playground_workspace::kind_snapshot)
+                .raw,
+        ),
+        (
+            playground_workspace::root_path.id(),
+            playground_workspace::root_path.value_from(root_handle).raw,
+        ),
+    ]);
 
-        if let Some(target) = entry.link_target {
-            let handle = ws.put(target);
-            change += entity! { &entry_id @ playground_workspace::link_target: handle };
-        }
+    let mut state = TribleSet::new();
+    state += entity! { ExclusiveId::force_ref(&state_root) @
+        playground_workspace::kind: playground_workspace::kind_snapshot,
+        playground_workspace::root_path: root_handle,
+    };
+
+    for entry in canonical_entries.iter() {
+        let (entry_id, entry_set) = build_entry_entity(entry);
+        state += entity! { ExclusiveId::force_ref(&state_root) @ playground_workspace::entry: entry_id };
+        state.union(entry_set);
     }
 
-    ws.commit(change, None, Some("playground_workspace snapshot"));
-    repo.push(&mut ws)
-        .map_err(|err| anyhow!("push snapshot: {err:?}"))?;
-    Ok(*snapshot_id)
+    let blob: Blob<SimpleArchive> = state.to_blob();
+    ws.put(blob)
+}
+
+fn build_entry_entity(entry: &MaterializedEntry) -> (Id, TribleSet) {
+    let mut pairs = vec![
+        (
+            playground_workspace::path.id(),
+            playground_workspace::path.value_from(entry.path_handle).raw,
+        ),
+        (
+            playground_workspace::kind.id(),
+            playground_workspace::kind.value_from(entry.kind).raw,
+        ),
+    ];
+
+    if let Some(mode) = entry.mode {
+        pairs.push((playground_workspace::mode.id(), mode.raw));
+    }
+    if let Some(bytes) = entry.bytes_handle {
+        pairs.push((playground_workspace::bytes.id(), bytes.raw));
+    }
+    if let Some(link_target) = entry.link_target_handle {
+        pairs.push((playground_workspace::link_target.id(), link_target.raw));
+    }
+
+    let entry_id = derive_entity_id(&mut pairs);
+    let mut set = entity! { ExclusiveId::force_ref(&entry_id) @
+        playground_workspace::path: entry.path_handle,
+        playground_workspace::kind: entry.kind,
+    };
+    if let Some(mode) = entry.mode {
+        set += entity! { ExclusiveId::force_ref(&entry_id) @ playground_workspace::mode: mode };
+    }
+    if let Some(bytes) = entry.bytes_handle {
+        set += entity! { ExclusiveId::force_ref(&entry_id) @ playground_workspace::bytes: bytes };
+    }
+    if let Some(link_target) = entry.link_target_handle {
+        set += entity! { ExclusiveId::force_ref(&entry_id) @ playground_workspace::link_target: link_target };
+    }
+
+    (entry_id, set)
+}
+
+fn derive_entity_id(pairs: &mut Vec<(Id, RawValue)>) -> Id {
+    pairs.sort_unstable();
+    let mut hasher = Blake3::new();
+    let mut last: Option<(Id, RawValue)> = None;
+
+    for (a, v) in pairs.iter() {
+        if let Some((la, lv)) = last {
+            if *a == la && *v == lv {
+                continue;
+            }
+        }
+        hasher.update(&a[..]);
+        hasher.update(&v[..]);
+        last = Some((*a, *v));
+    }
+
+    let digest = hasher.finalize();
+    let digest_bytes = digest.as_bytes();
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&digest_bytes[digest_bytes.len() - 16..]);
+    Id::new(raw).unwrap()
 }
 
 #[derive(Clone, Debug)]
@@ -665,6 +1038,8 @@ fn list_snapshots(
         let label = load_string_attr(&mut ws, &catalog, snapshot_id, playground_workspace::label)?;
         let root_path =
             load_string_attr(&mut ws, &catalog, snapshot_id, playground_workspace::root_path)?;
+        let state = load_handle_attr::<SimpleArchive>(&catalog, snapshot_id, playground_workspace::state);
+        let parents = load_id_attrs(&catalog, snapshot_id, playground_workspace::parent_snapshot);
         let entry_count = count_entries(&catalog, snapshot_id);
         let (lower, _): (Epoch, Epoch) = created_at.from_value();
         let created_key = interval_key(created_at);
@@ -674,6 +1049,8 @@ fn list_snapshots(
             created_key,
             label,
             root_path,
+            state,
+            parents,
             entry_count,
         });
     }
@@ -750,6 +1127,89 @@ fn latest_snapshot(catalog: &TribleSet) -> Result<Option<Id>> {
         }
     }
     Ok(latest.map(|(id, _)| id))
+}
+
+fn resolve_snapshot_id(catalog: &TribleSet, raw: &str) -> Result<Id> {
+    if raw.eq_ignore_ascii_case("latest") {
+        return latest_snapshot(catalog)?
+            .ok_or_else(|| anyhow!("no snapshots found"));
+    }
+    parse_hex_id(raw)
+}
+
+fn parse_hex_id(raw: &str) -> Result<Id> {
+    Id::from_hex(raw).ok_or_else(|| anyhow!("invalid snapshot id {raw}"))
+}
+
+fn load_snapshot_data(
+    ws: &mut Workspace<Pile<Blake3>>,
+    catalog: &TribleSet,
+    snapshot_id: Id,
+) -> Result<SnapshotData> {
+    let root_path = load_string_attr(ws, catalog, snapshot_id, playground_workspace::root_path)?
+        .unwrap_or_else(|| ".".to_string());
+    let entries = collect_snapshot_entries(ws, catalog, snapshot_id)?;
+    Ok(SnapshotData {
+        id: snapshot_id,
+        root_path,
+        entries,
+    })
+}
+
+fn build_entry_map(entries: &[CapturedEntry]) -> Result<HashMap<String, CapturedEntry>> {
+    let mut map = HashMap::new();
+    for entry in entries {
+        if map.insert(entry.path.clone(), entry.clone()).is_some() {
+            return Err(anyhow!("duplicate path in snapshot: {}", entry.path));
+        }
+    }
+    Ok(map)
+}
+
+fn merge_root_path(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    policy: ConflictPolicy,
+) -> Result<String> {
+    if ours == theirs {
+        return Ok(ours.to_string());
+    }
+    if base == ours {
+        return Ok(theirs.to_string());
+    }
+    if base == theirs {
+        return Ok(ours.to_string());
+    }
+    match policy {
+        ConflictPolicy::Ours => Ok(ours.to_string()),
+        ConflictPolicy::Theirs => Ok(theirs.to_string()),
+        ConflictPolicy::Fail => Err(anyhow!(
+            "conflicting root_path values (base={base}, ours={ours}, theirs={theirs})"
+        )),
+    }
+}
+
+fn merge_path(
+    base: Option<&CapturedEntry>,
+    ours: Option<&CapturedEntry>,
+    theirs: Option<&CapturedEntry>,
+    policy: ConflictPolicy,
+) -> Result<Option<CapturedEntry>> {
+    if ours == theirs {
+        return Ok(ours.cloned());
+    }
+    if base == ours {
+        return Ok(theirs.cloned());
+    }
+    if base == theirs {
+        return Ok(ours.cloned());
+    }
+    match policy {
+        ConflictPolicy::Ours => Ok(ours.cloned()),
+        ConflictPolicy::Theirs => Ok(theirs.cloned()),
+        ConflictPolicy::Fail => Err(anyhow!("merge conflict")),
+    }
 }
 
 fn collect_snapshot_entries(
@@ -1044,6 +1504,22 @@ fn load_u256_attr(
     .map(|(value,)| value)
 }
 
+fn load_id_attrs(catalog: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Vec<Id> {
+    let mut ids = find!(
+        (value: Value<GenId>),
+        pattern!(catalog, [{
+            entity_id @
+            attr: ?value,
+        }])
+    )
+    .into_iter()
+    .filter_map(|(value,)| Id::try_from_value(&value).ok())
+    .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 fn load_handle_attr<S>(
     catalog: &TribleSet,
     entity_id: Id,
@@ -1145,13 +1621,40 @@ fn print_snapshots(snapshots: &[SnapshotInfo]) {
     for snapshot in snapshots {
         let label = snapshot.label.as_deref().unwrap_or("-");
         let root = snapshot.root_path.as_deref().unwrap_or("-");
+        let state = snapshot
+            .state
+            .map(archive_handle_short)
+            .unwrap_or_else(|| "-".to_string());
+        let parents = if snapshot.parents.is_empty() {
+            "-".to_string()
+        } else {
+            snapshot
+                .parents
+                .iter()
+                .map(|id| id_short(*id))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         println!(
-            "{id:x}  {time}  entries={entries}  label={label}  root={root}",
+            "{id:x}  {time}  entries={entries}  label={label}  root={root}  state={state}  parents={parents}",
             id = snapshot.id,
             time = snapshot.created_at,
             entries = snapshot.entry_count
         );
     }
+}
+
+fn id_short(id: Id) -> String {
+    let full = format!("{id:x}");
+    full.chars().take(8).collect()
+}
+
+fn archive_handle_short(handle: Value<Handle<Blake3, SimpleArchive>>) -> String {
+    let mut out = String::with_capacity(8);
+    for byte in handle.raw.iter().take(4) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 fn parse_optional_hex_id(raw: Option<&str>) -> Result<Option<Id>> {
