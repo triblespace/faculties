@@ -1010,6 +1010,6 @@ where
 
     Ok(entity! { ExclusiveId::force_ref(id) @
         metadata::name: name_handle,
-        metadata::description: (blobs.put(description.to_string())?),
+        metadata::description: blobs.put(description.to_string())?,
     })
 }
