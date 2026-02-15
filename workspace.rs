@@ -696,7 +696,10 @@ fn write_snapshot(
     }
 
     for entry in &materialized_entries {
-        let (entry_id, entry_set) = build_entry_entity(entry);
+        let entry_set = build_entry_entity(entry);
+        let entry_id = entry_set
+            .root()
+            .expect("entity! must export a single root id");
         change += entity! { &snapshot_id @ playground_workspace::entry: entry_id };
         change += entry_set;
     }
@@ -748,11 +751,16 @@ fn compute_state_handle(
         playground_workspace::kind: playground_workspace::kind_snapshot,
         playground_workspace::root_path: root_handle,
     };
-    let state_root = entity_id_from_set(&root_entity);
+    let state_root = root_entity
+        .root()
+        .expect("entity! must export a single root id");
     state += root_entity;
 
     for entry in canonical_entries.iter() {
-        let (entry_id, entry_set) = build_entry_entity(entry);
+        let entry_set = build_entry_entity(entry);
+        let entry_id = entry_set
+            .root()
+            .expect("entity! must export a single root id");
         state += entity! { ExclusiveId::force_ref(&state_root) @ playground_workspace::entry: entry_id };
         state += entry_set;
     }
@@ -761,23 +769,14 @@ fn compute_state_handle(
     ws.put(blob)
 }
 
-fn entity_id_from_set(set: &TribleSet) -> Id {
-    *set.iter()
-        .next()
-        .expect("entity! must have at least one attribute/value pair")
-        .e()
-}
-
-fn build_entry_entity(entry: &MaterializedEntry) -> (Id, TribleSet) {
-    let set = entity! { _ @
+fn build_entry_entity(entry: &MaterializedEntry) -> Fragment {
+    entity! { _ @
         playground_workspace::path: entry.path_handle,
         playground_workspace::kind: entry.kind,
         playground_workspace::mode?: entry.mode,
         playground_workspace::bytes?: entry.bytes_handle,
         playground_workspace::link_target?: entry.link_target_handle,
-    };
-    let entry_id = entity_id_from_set(&set);
-    (entry_id, set)
+    }
 }
 
 #[derive(Clone, Debug)]

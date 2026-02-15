@@ -180,7 +180,7 @@ fn cmd_search(cli: &Cli, keys: ApiKeys, provider: Provider, query: &str, max_res
 }
 
 fn cmd_fetch(cli: &Cli, keys: ApiKeys, provider: Provider, url: &str, max_characters: usize) -> Result<()> {
-    let provider = choose_provider(provider, &keys)?;
+    let provider = choose_provider_fetch(provider, &keys)?;
     let client = Client::builder()
         .user_agent("playground-web-faculty/0")
         .build()
@@ -225,6 +225,21 @@ fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
                 bail!("no web provider configured (set config.tavily_api_key and/or config.exa_api_key)");
             }
         }
+    }
+}
+
+fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
+    match provider {
+        Provider::Auto => {
+            if keys.exa.is_some() {
+                Ok(Provider::Exa)
+            } else if keys.tavily.is_some() {
+                Ok(Provider::Tavily)
+            } else {
+                bail!("no web provider configured (set config.tavily_api_key and/or config.exa_api_key)");
+            }
+        }
+        other => choose_provider(other, keys),
     }
 }
 
