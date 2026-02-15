@@ -99,37 +99,38 @@ pub mod archive_schema {
     {
         let mut metadata = archive::describe(blobs)?;
 
-        metadata.union(<GenId as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<ShortString as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<U256BE as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, FileBytes> as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<FileBytes as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<ShortString as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<U256BE as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<FileBytes as metadata::ConstDescribe>::describe(blobs)?);
 
-        metadata.union(metadata::Metadata::describe(&archive::kind, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::reply_to, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::author, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::author_name, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::author_role, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::author_model, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::author_provider, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::content, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::created_at, blobs)?);
+        metadata.union(metadata::Describe::describe(&archive::kind, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::reply_to, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::author, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::author_name, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::author_role, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::author_model, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::author_provider, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::content, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::created_at, blobs)?.into_facts());
 
-        metadata.union(metadata::Metadata::describe(&archive::content_type, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment_source_id, blobs)?);
-        metadata.union(metadata::Metadata::describe(
-            &archive::attachment_source_pointer,
-            blobs,
-        )?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment_name, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment_mime, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment_size_bytes, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment_width_px, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment_height_px, blobs)?);
-        metadata.union(metadata::Metadata::describe(&archive::attachment_data, blobs)?);
+        metadata.union(metadata::Describe::describe(&archive::content_type, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::attachment, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::attachment_source_id, blobs)?.into_facts());
+        metadata.union(
+            metadata::Describe::describe(&archive::attachment_source_pointer, blobs)?.into_facts(),
+        );
+        metadata.union(metadata::Describe::describe(&archive::attachment_name, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::attachment_mime, blobs)?.into_facts());
+        metadata.union(
+            metadata::Describe::describe(&archive::attachment_size_bytes, blobs)?.into_facts(),
+        );
+        metadata.union(metadata::Describe::describe(&archive::attachment_width_px, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::attachment_height_px, blobs)?.into_facts());
+        metadata.union(metadata::Describe::describe(&archive::attachment_data, blobs)?.into_facts());
 
         Ok(metadata)
     }
@@ -241,10 +242,10 @@ pub mod import_schema {
     {
         let mut metadata = describe(blobs)?;
 
-        metadata.union(<GenId as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<ShortString as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
+        metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<ShortString as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
+        metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
 
         metadata.union(describe_attribute(blobs, &kind)?);
         metadata.union(describe_attribute(blobs, &batch)?);
@@ -270,8 +271,8 @@ pub mod import_schema {
         B: BlobStore<Blake3>,
         S: ValueSchema,
     {
-        let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
-        let attribute_id = metadata::Metadata::id(attribute);
+        let mut tribles = metadata::Describe::describe(attribute, blobs)?.into_facts();
+        let attribute_id = attribute.id();
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
             metadata::tag: tag_attribute,
         };

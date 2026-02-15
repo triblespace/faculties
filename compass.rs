@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
 //! time = { version = "0.3.36", features = ["formatting", "macros"] }
-//! triblespace = "0.13.1"
+//! triblespace = "0.14.0"
 //! ```
 
 use anyhow::{bail, Result};
@@ -935,14 +935,14 @@ where
 {
     let mut metadata = TribleSet::new();
 
-    metadata.union(<valueschemas::GenId as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<valueschemas::ShortString as metadata::ConstMetadata>::describe(blobs)?);
+    metadata.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<valueschemas::ShortString as metadata::ConstDescribe>::describe(blobs)?);
     metadata.union(
-        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstMetadata>::describe(
+        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
             blobs,
         )?,
     );
-    metadata.union(<blobschemas::LongString as metadata::ConstMetadata>::describe(blobs)?);
+    metadata.union(<blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?);
 
     metadata.union(describe_attribute(blobs, &board::title, "compass_title")?);
     metadata.union(describe_attribute(
@@ -988,9 +988,9 @@ where
     B: BlobStore<valueschemas::Blake3>,
     S: ValueSchema,
 {
-    let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
+    let mut tribles = metadata::Describe::describe(attribute, blobs)?.into_facts();
     let handle = blobs.put(name.to_owned())?;
-    let attribute_id = metadata::Metadata::id(attribute);
+    let attribute_id = attribute.id();
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
         metadata::name: handle,
     };

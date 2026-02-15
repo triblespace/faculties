@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.13.1"
+//! triblespace = "0.14.0"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -1173,127 +1173,52 @@ fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
     let branch_id = ensure_branch(&mut repo, atlas_branch)?;
 
     let mut metadata_set = TribleSet::new();
-    metadata_set.union(<valueschemas::GenId as metadata::ConstMetadata>::describe(
+    metadata_set.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(
         repo.storage_mut(),
     )?);
     metadata_set.union(
-        <valueschemas::NsTAIInterval as metadata::ConstMetadata>::describe(repo.storage_mut())?,
+        <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?,
     );
-    metadata_set.union(<valueschemas::U256BE as metadata::ConstMetadata>::describe(
+    metadata_set.union(<valueschemas::U256BE as metadata::ConstDescribe>::describe(
         repo.storage_mut(),
     )?);
     metadata_set.union(
-        <valueschemas::ShortString as metadata::ConstMetadata>::describe(repo.storage_mut())?,
+        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?,
     );
     metadata_set.union(<valueschemas::Handle<
         valueschemas::Blake3,
         blobschemas::LongString,
-    > as metadata::ConstMetadata>::describe(
+    > as metadata::ConstDescribe>::describe(
         repo.storage_mut()
     )?);
     metadata_set
-        .union(<blobschemas::LongString as metadata::ConstMetadata>::describe(repo.storage_mut())?);
+        .union(<blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?);
 
-    metadata_set.union(metadata::Metadata::describe(
-        &config::kind,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &config::updated_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &config::branch,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &config::branch_id,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &config::persona_id,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::kind,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::command_text,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::requested_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::about_request,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::started_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::finished_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::exit_code,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::stderr_text,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &exec::error,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &llm::kind,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &llm::about_request,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &llm::requested_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &llm::started_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &llm::finished_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &llm::error,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &local::to,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &local::created_at,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &local::about_message,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &local::reader,
-        repo.storage_mut(),
-    )?);
-    metadata_set.union(metadata::Metadata::describe(
-        &relations::alias,
-        repo.storage_mut(),
-    )?);
+    metadata_set.union(metadata::Describe::describe(&config::kind, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&config::updated_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&config::branch, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&config::branch_id, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&config::persona_id, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::kind, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::command_text, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::requested_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::about_request, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::started_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::finished_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::exit_code, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::stderr_text, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&exec::error, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&llm::kind, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&llm::about_request, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&llm::requested_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&llm::started_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&llm::finished_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&llm::error, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&local::to, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&local::created_at, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&local::about_message, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&local::reader, repo.storage_mut())?.into_facts());
+    metadata_set.union(metadata::Describe::describe(&relations::alias, repo.storage_mut())?.into_facts());
 
     let mut ws = repo
         .pull(branch_id)

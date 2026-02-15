@@ -8,7 +8,7 @@
 //! hifitime = "4.2.3"
 //! humantime = "2.1.0"
 //! rand_core = "0.6.4"
-//! triblespace = "0.13.1"
+//! triblespace = "0.14.0"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -1109,31 +1109,31 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     let branch_id = ensure_branch(&mut repo, ATLAS_BRANCH)?;
     let mut metadata = TribleSet::new();
 
-    metadata.union(<valueschemas::GenId as metadata::ConstMetadata>::describe(
+    metadata.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(
         repo.storage_mut(),
     )?);
     metadata.union(<valueschemas::Handle<
         valueschemas::Blake3,
         blobschemas::LongString,
-    > as metadata::ConstMetadata>::describe(
+    > as metadata::ConstDescribe>::describe(
         repo.storage_mut()
     )?);
     metadata.union(<valueschemas::Handle<
         valueschemas::Blake3,
         blobschemas::SimpleArchive,
-    > as metadata::ConstMetadata>::describe(
+    > as metadata::ConstDescribe>::describe(
         repo.storage_mut()
     )?);
     metadata
-        .union(<blobschemas::LongString as metadata::ConstMetadata>::describe(repo.storage_mut())?);
+        .union(<blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?);
     metadata.union(
-        <blobschemas::SimpleArchive as metadata::ConstMetadata>::describe(repo.storage_mut())?,
+        <blobschemas::SimpleArchive as metadata::ConstDescribe>::describe(repo.storage_mut())?,
     );
     metadata.union(
-        <valueschemas::NsTAIInterval as metadata::ConstMetadata>::describe(repo.storage_mut())?,
+        <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?,
     );
     metadata.union(
-        <valueschemas::ShortString as metadata::ConstMetadata>::describe(repo.storage_mut())?,
+        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?,
     );
 
     let mut ws = repo

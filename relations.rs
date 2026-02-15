@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.13.1"
+//! triblespace = "0.14.0"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -696,18 +696,18 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
     let mut metadata = TribleSet::new();
 
-    metadata.union(<valueschemas::GenId as metadata::ConstMetadata>::describe(
+    metadata.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(
         repo.storage_mut(),
     )?);
-    metadata.union(<valueschemas::ShortString as metadata::ConstMetadata>::describe(
+    metadata.union(<valueschemas::ShortString as metadata::ConstDescribe>::describe(
         repo.storage_mut(),
     )?);
     metadata.union(
-        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstMetadata>::describe(
+        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
             repo.storage_mut(),
         )?,
     );
-    metadata.union(<blobschemas::LongString as metadata::ConstMetadata>::describe(
+    metadata.union(<blobschemas::LongString as metadata::ConstDescribe>::describe(
         repo.storage_mut(),
     )?);
 
@@ -766,9 +766,9 @@ where
     B: BlobStore<valueschemas::Blake3>,
     S: ValueSchema,
 {
-    let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
+    let mut tribles = metadata::Describe::describe(attribute, blobs)?.into_facts();
     let handle = blobs.put(name.to_owned())?;
-    let attribute_id = metadata::Metadata::id(attribute);
+    let attribute_id = attribute.id();
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
         metadata::name: handle,
     };

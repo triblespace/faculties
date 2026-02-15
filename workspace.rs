@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
-//! triblespace = "0.13.1"
+//! triblespace = "0.14.0"
 //! ```
 
 use std::fs;
@@ -253,14 +253,14 @@ where
 {
     let mut metadata = TribleSet::new();
 
-    metadata.union(<GenId as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<NsTAIInterval as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<U256BE as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<Handle<Blake3, LongString> as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<Handle<Blake3, SimpleArchive> as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<FileBytes as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<SimpleArchive as metadata::ConstMetadata>::describe(blobs)?);
-    metadata.union(<LongString as metadata::ConstMetadata>::describe(blobs)?);
+    metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<U256BE as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<Handle<Blake3, SimpleArchive> as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<FileBytes as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<SimpleArchive as metadata::ConstDescribe>::describe(blobs)?);
+    metadata.union(<LongString as metadata::ConstDescribe>::describe(blobs)?);
 
     metadata.union(describe_attribute(blobs, &playground_workspace::kind, "workspace_kind")?);
     metadata.union(describe_attribute(
@@ -351,9 +351,9 @@ where
     B: BlobStore<Blake3>,
     S: ValueSchema,
 {
-    let mut tribles = metadata::Metadata::describe(attribute, blobs)?;
+    let mut tribles = metadata::Describe::describe(attribute, blobs)?.into_facts();
     let handle = blobs.put(name.to_owned())?;
-    let attribute_id = metadata::Metadata::id(attribute);
+    let attribute_id = attribute.id();
     tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
         metadata::name: handle,
     };
