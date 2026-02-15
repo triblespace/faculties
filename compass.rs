@@ -935,46 +935,45 @@ where
 {
     let mut metadata = TribleSet::new();
 
-    metadata.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<valueschemas::ShortString as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(
+    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <valueschemas::ShortString as metadata::ConstDescribe>::describe(blobs)?;
+    metadata +=
         <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
             blobs,
-        )?,
-    );
-    metadata.union(<blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?);
+        )?;
+    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?;
 
-    metadata.union(describe_attribute(blobs, &board::title, "compass_title")?);
-    metadata.union(describe_attribute(
+    metadata += describe_attribute(blobs, &board::title, "compass_title")?;
+    metadata += describe_attribute(
         blobs,
         &board::created_at,
         "compass_created_at",
-    )?);
-    metadata.union(describe_attribute(blobs, &board::tag, "compass_tag")?);
-    metadata.union(describe_attribute(blobs, &board::parent, "compass_parent")?);
-    metadata.union(describe_attribute(blobs, &board::task, "compass_task")?);
-    metadata.union(describe_attribute(blobs, &board::status, "compass_status")?);
-    metadata.union(describe_attribute(blobs, &board::at, "compass_at")?);
-    metadata.union(describe_attribute(blobs, &board::note, "compass_note")?);
+    )?;
+    metadata += describe_attribute(blobs, &board::tag, "compass_tag")?;
+    metadata += describe_attribute(blobs, &board::parent, "compass_parent")?;
+    metadata += describe_attribute(blobs, &board::task, "compass_task")?;
+    metadata += describe_attribute(blobs, &board::status, "compass_status")?;
+    metadata += describe_attribute(blobs, &board::at, "compass_at")?;
+    metadata += describe_attribute(blobs, &board::note, "compass_note")?;
 
-    metadata.union(describe_kind(
+    metadata += describe_kind(
         blobs,
         &KIND_GOAL_ID,
         "compass_goal",
         "Compass goal kind.",
-    )?);
-    metadata.union(describe_kind(
+    )?;
+    metadata += describe_kind(
         blobs,
         &KIND_STATUS_ID,
         "compass_status_kind",
         "Compass status kind.",
-    )?);
-    metadata.union(describe_kind(
+    )?;
+    metadata += describe_kind(
         blobs,
         &KIND_NOTE_ID,
         "compass_note_kind",
         "Compass note kind.",
-    )?);
+    )?;
 
     Ok(metadata)
 }

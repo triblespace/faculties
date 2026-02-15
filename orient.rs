@@ -1109,32 +1109,28 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     let branch_id = ensure_branch(&mut repo, ATLAS_BRANCH)?;
     let mut metadata = TribleSet::new();
 
-    metadata.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(
+    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(
         repo.storage_mut(),
-    )?);
-    metadata.union(<valueschemas::Handle<
+    )?;
+    metadata += <valueschemas::Handle<
         valueschemas::Blake3,
         blobschemas::LongString,
     > as metadata::ConstDescribe>::describe(
         repo.storage_mut()
-    )?);
-    metadata.union(<valueschemas::Handle<
+    )?;
+    metadata += <valueschemas::Handle<
         valueschemas::Blake3,
         blobschemas::SimpleArchive,
     > as metadata::ConstDescribe>::describe(
         repo.storage_mut()
-    )?);
-    metadata
-        .union(<blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?);
-    metadata.union(
-        <blobschemas::SimpleArchive as metadata::ConstDescribe>::describe(repo.storage_mut())?,
-    );
-    metadata.union(
-        <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?,
-    );
-    metadata.union(
-        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?,
-    );
+    )?;
+    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+    metadata +=
+        <blobschemas::SimpleArchive as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+    metadata +=
+        <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+    metadata +=
+        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
     let mut ws = repo
         .pull(branch_id)

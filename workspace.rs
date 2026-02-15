@@ -253,91 +253,91 @@ where
 {
     let mut metadata = TribleSet::new();
 
-    metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<U256BE as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<Handle<Blake3, SimpleArchive> as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<FileBytes as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<SimpleArchive as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<LongString as metadata::ConstDescribe>::describe(blobs)?);
+    metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <U256BE as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <Handle<Blake3, SimpleArchive> as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <SimpleArchive as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <LongString as metadata::ConstDescribe>::describe(blobs)?;
 
-    metadata.union(describe_attribute(blobs, &playground_workspace::kind, "workspace_kind")?);
-    metadata.union(describe_attribute(
+    metadata += describe_attribute(blobs, &playground_workspace::kind, "workspace_kind")?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::created_at,
         "workspace_created_at",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::parent_snapshot,
         "workspace_parent_snapshot",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::root_path,
         "workspace_root_path",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::state,
         "workspace_state",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::label,
         "workspace_label",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::entry,
         "workspace_entry",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::path,
         "workspace_path",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::mode,
         "workspace_mode",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::bytes,
         "workspace_bytes",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &playground_workspace::link_target,
         "workspace_link_target",
-    )?);
+    )?;
 
-    metadata.union(describe_kind(
+    metadata += describe_kind(
         blobs,
         &playground_workspace::kind_snapshot,
         "workspace_snapshot",
         "Workspace snapshot kind.",
-    )?);
-    metadata.union(describe_kind(
+    )?;
+    metadata += describe_kind(
         blobs,
         &playground_workspace::kind_file,
         "workspace_file",
         "Workspace file entry kind.",
-    )?);
-    metadata.union(describe_kind(
+    )?;
+    metadata += describe_kind(
         blobs,
         &playground_workspace::kind_dir,
         "workspace_dir",
         "Workspace directory entry kind.",
-    )?);
-    metadata.union(describe_kind(
+    )?;
+    metadata += describe_kind(
         blobs,
         &playground_workspace::kind_symlink,
         "workspace_symlink",
         "Workspace symlink entry kind.",
-    )?);
+    )?;
 
     Ok(metadata)
 }
@@ -697,7 +697,7 @@ fn write_snapshot(
     for entry in &materialized_entries {
         let (entry_id, entry_set) = build_entry_entity(entry);
         change += entity! { &snapshot_id @ playground_workspace::entry: entry_id };
-        change.union(entry_set);
+        change += entry_set;
     }
 
     ws.commit(change, None, Some("playground_workspace snapshot"));
@@ -748,12 +748,12 @@ fn compute_state_handle(
         playground_workspace::root_path: root_handle,
     };
     let state_root = entity_id_from_set(&root_entity);
-    state.union(root_entity);
+    state += root_entity;
 
     for entry in canonical_entries.iter() {
         let (entry_id, entry_set) = build_entry_entity(entry);
         state += entity! { ExclusiveId::force_ref(&state_root) @ playground_workspace::entry: entry_id };
-        state.union(entry_set);
+        state += entry_set;
     }
 
     let blob: Blob<SimpleArchive> = state.to_blob();

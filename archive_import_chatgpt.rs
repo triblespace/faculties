@@ -123,7 +123,7 @@ fn import_chatgpt_file(
                 Some("import chatgpt json tree"),
             );
             common::push_workspace(repo, &mut ws).context("push json tree")?;
-            catalog.union(raw_delta);
+            catalog += raw_delta;
             stats.commits += 1;
         }
 
@@ -327,7 +327,7 @@ fn import_chatgpt_file(
         if !delta.is_empty() {
             ws.commit(delta.clone(), None, Some("import chatgpt"));
             common::push_workspace(repo, &mut ws).context("push import")?;
-            catalog.union(delta);
+            catalog += delta;
             stats.commits += 1;
         }
         stats.conversations += 1;

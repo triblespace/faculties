@@ -696,49 +696,47 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
     let mut metadata = TribleSet::new();
 
-    metadata.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(
-        repo.storage_mut(),
-    )?);
-    metadata.union(<valueschemas::ShortString as metadata::ConstDescribe>::describe(
-        repo.storage_mut(),
-    )?);
-    metadata.union(
+    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+    metadata +=
+        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+    metadata +=
         <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
             repo.storage_mut(),
-        )?,
-    );
-    metadata.union(<blobschemas::LongString as metadata::ConstDescribe>::describe(
-        repo.storage_mut(),
-    )?);
+        )?;
+    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
-    metadata.union(describe_attribute(repo.storage_mut(), &metadata::name, "name")?);
-    metadata.union(describe_attribute(repo.storage_mut(), &relations::alias, "relations_alias")?);
-    metadata.union(describe_attribute(repo.storage_mut(), &relations::affinity, "relations_affinity")?);
-    metadata.union(describe_attribute(
+    metadata += describe_attribute(repo.storage_mut(), &metadata::name, "name")?;
+    metadata += describe_attribute(repo.storage_mut(), &relations::alias, "relations_alias")?;
+    metadata += describe_attribute(repo.storage_mut(), &relations::affinity, "relations_affinity")?;
+    metadata += describe_attribute(
         repo.storage_mut(),
         &relations::first_name,
         "relations_first_name",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         repo.storage_mut(),
         &relations::last_name,
         "relations_last_name",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         repo.storage_mut(),
         &relations::display_name,
         "relations_display_name",
-    )?);
-    metadata.union(describe_attribute(repo.storage_mut(), &metadata::description, "description")?);
-    metadata.union(describe_attribute(repo.storage_mut(), &relations::teams_user_id, "relations_teams_user_id")?);
-    metadata.union(describe_attribute(repo.storage_mut(), &relations::email, "relations_email")?);
+    )?;
+    metadata += describe_attribute(repo.storage_mut(), &metadata::description, "description")?;
+    metadata += describe_attribute(
+        repo.storage_mut(),
+        &relations::teams_user_id,
+        "relations_teams_user_id",
+    )?;
+    metadata += describe_attribute(repo.storage_mut(), &relations::email, "relations_email")?;
 
-    metadata.union(describe_kind(
+    metadata += describe_kind(
         repo.storage_mut(),
         &KIND_PERSON_ID,
         "person",
         "Relationship person entity.",
-    )?);
+    )?;
 
     let mut ws = repo
         .pull(branch_id)

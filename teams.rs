@@ -125,38 +125,37 @@ mod archive_schema {
     {
         let mut metadata = archive::describe(blobs)?;
 
-        metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<ShortString as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<U256BE as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<FileBytes as metadata::ConstDescribe>::describe(blobs)?);
+        metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <ShortString as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <U256BE as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata.union(metadata::Describe::describe(&archive::kind, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::reply_to, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_name, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_role, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_model, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_provider, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::content, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::created_at, blobs)?.into_facts());
+        metadata += metadata::Describe::describe(&archive::kind, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::reply_to, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_name, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_role, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_model, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_provider, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::content, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::created_at, blobs)?.into_facts();
 
-        metadata.union(metadata::Describe::describe(&archive::content_type, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_source_id, blobs)?.into_facts());
-        metadata.union(
-            metadata::Describe::describe(&archive::attachment_source_pointer, blobs)?.into_facts(),
-        );
-        metadata.union(metadata::Describe::describe(&archive::attachment_name, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_mime, blobs)?.into_facts());
-        metadata.union(
-            metadata::Describe::describe(&archive::attachment_size_bytes, blobs)?.into_facts(),
-        );
-        metadata.union(metadata::Describe::describe(&archive::attachment_width_px, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_height_px, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_data, blobs)?.into_facts());
+        metadata += metadata::Describe::describe(&archive::content_type, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_source_id, blobs)?.into_facts();
+        metadata +=
+            metadata::Describe::describe(&archive::attachment_source_pointer, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_name, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_mime, blobs)?.into_facts();
+        metadata +=
+            metadata::Describe::describe(&archive::attachment_size_bytes, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_width_px, blobs)?.into_facts();
+        metadata +=
+            metadata::Describe::describe(&archive::attachment_height_px, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_data, blobs)?.into_facts();
 
         Ok(metadata)
     }
@@ -306,24 +305,24 @@ mod teams_schema {
     {
         let mut metadata = teams::describe(blobs)?;
 
-        metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
+        metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata.union(describe_attribute(blobs, &teams::chat)?);
-        metadata.union(describe_attribute(blobs, &teams::chat_id)?);
-        metadata.union(describe_attribute(blobs, &teams::message_id)?);
-        metadata.union(describe_attribute(blobs, &teams::message_raw)?);
-        metadata.union(describe_attribute(blobs, &teams::user_id)?);
-        metadata.union(describe_attribute(blobs, &teams::delta_link)?);
-        metadata.union(describe_attribute(blobs, &teams::access_token)?);
-        metadata.union(describe_attribute(blobs, &teams::refresh_token)?);
-        metadata.union(describe_attribute(blobs, &teams::expires_at)?);
-        metadata.union(describe_attribute(blobs, &teams::token_type)?);
-        metadata.union(describe_attribute(blobs, &teams::scope)?);
-        metadata.union(describe_attribute(blobs, &teams::tenant)?);
-        metadata.union(describe_attribute(blobs, &teams::client_id)?);
-        metadata.union(describe_attribute(blobs, &teams::client_secret)?);
+        metadata += describe_attribute(blobs, &teams::chat)?;
+        metadata += describe_attribute(blobs, &teams::chat_id)?;
+        metadata += describe_attribute(blobs, &teams::message_id)?;
+        metadata += describe_attribute(blobs, &teams::message_raw)?;
+        metadata += describe_attribute(blobs, &teams::user_id)?;
+        metadata += describe_attribute(blobs, &teams::delta_link)?;
+        metadata += describe_attribute(blobs, &teams::access_token)?;
+        metadata += describe_attribute(blobs, &teams::refresh_token)?;
+        metadata += describe_attribute(blobs, &teams::expires_at)?;
+        metadata += describe_attribute(blobs, &teams::token_type)?;
+        metadata += describe_attribute(blobs, &teams::scope)?;
+        metadata += describe_attribute(blobs, &teams::tenant)?;
+        metadata += describe_attribute(blobs, &teams::client_id)?;
+        metadata += describe_attribute(blobs, &teams::client_secret)?;
 
         Ok(metadata)
     }
@@ -847,7 +846,7 @@ fn pull_once_with_cache(
         if let Some(cursor_change) =
             build_cursor_change(&mut ws, &catalog, cursor_state.as_ref(), new_cursor)?
         {
-            change.union(cursor_change);
+            change += cursor_change;
         }
 
         if change.is_empty() {
@@ -2244,7 +2243,7 @@ fn open_pile(path: &PathBuf) -> Result<Pile<Blake3>> {
 fn seed_default_metadata(repo: &mut Repository<Pile<Blake3>>) -> Result<()> {
     let mut metadata = build_archive_metadata(repo.storage_mut())
         .context("build archive metadata")?;
-    metadata.union(build_teams_metadata(repo.storage_mut()).context("build teams metadata")?);
+    metadata += build_teams_metadata(repo.storage_mut()).context("build teams metadata")?;
     repo.set_default_metadata(metadata)
         .context("set repository default metadata")?;
     Ok(())
@@ -2270,7 +2269,7 @@ fn emit_schema_to_atlas(pile_path: &PathBuf) -> Result<()> {
 
     let mut metadata = build_archive_metadata(repo.storage_mut())
         .context("build archive metadata")?;
-    metadata.union(build_teams_metadata(repo.storage_mut()).context("build teams metadata")?);
+    metadata += build_teams_metadata(repo.storage_mut()).context("build teams metadata")?;
 
     let mut ws = map_err_debug(repo.pull(branch_id), "pull atlas workspace")?;
     let space = map_err_debug(ws.checkout(..), "checkout atlas workspace")?;

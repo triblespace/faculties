@@ -99,38 +99,36 @@ pub mod archive_schema {
     {
         let mut metadata = archive::describe(blobs)?;
 
-        metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<ShortString as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<U256BE as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<FileBytes as metadata::ConstDescribe>::describe(blobs)?);
+        metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <ShortString as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <U256BE as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata.union(metadata::Describe::describe(&archive::kind, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::reply_to, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_name, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_role, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_model, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::author_provider, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::content, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::created_at, blobs)?.into_facts());
+        metadata += metadata::Describe::describe(&archive::kind, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::reply_to, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_name, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_role, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_model, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::author_provider, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::content, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::created_at, blobs)?.into_facts();
 
-        metadata.union(metadata::Describe::describe(&archive::content_type, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_source_id, blobs)?.into_facts());
-        metadata.union(
-            metadata::Describe::describe(&archive::attachment_source_pointer, blobs)?.into_facts(),
-        );
-        metadata.union(metadata::Describe::describe(&archive::attachment_name, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_mime, blobs)?.into_facts());
-        metadata.union(
-            metadata::Describe::describe(&archive::attachment_size_bytes, blobs)?.into_facts(),
-        );
-        metadata.union(metadata::Describe::describe(&archive::attachment_width_px, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_height_px, blobs)?.into_facts());
-        metadata.union(metadata::Describe::describe(&archive::attachment_data, blobs)?.into_facts());
+        metadata += metadata::Describe::describe(&archive::content_type, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_source_id, blobs)?.into_facts();
+        metadata +=
+            metadata::Describe::describe(&archive::attachment_source_pointer, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_name, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_mime, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_size_bytes, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_width_px, blobs)?.into_facts();
+        metadata +=
+            metadata::Describe::describe(&archive::attachment_height_px, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::attachment_data, blobs)?.into_facts();
 
         Ok(metadata)
     }
@@ -242,23 +240,23 @@ pub mod import_schema {
     {
         let mut metadata = describe(blobs)?;
 
-        metadata.union(<GenId as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<ShortString as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
-        metadata.union(<Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?);
+        metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <ShortString as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
+        metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata.union(describe_attribute(blobs, &kind)?);
-        metadata.union(describe_attribute(blobs, &batch)?);
-        metadata.union(describe_attribute(blobs, &source_format)?);
-        metadata.union(describe_attribute(blobs, &source_path)?);
-        metadata.union(describe_attribute(blobs, &source_raw_root)?);
-        metadata.union(describe_attribute(blobs, &source_conversation_id)?);
-        metadata.union(describe_attribute(blobs, &source_title)?);
-        metadata.union(describe_attribute(blobs, &source_message_id)?);
-        metadata.union(describe_attribute(blobs, &source_author)?);
-        metadata.union(describe_attribute(blobs, &source_role)?);
-        metadata.union(describe_attribute(blobs, &source_parent_id)?);
-        metadata.union(describe_attribute(blobs, &source_created_at)?);
+        metadata += describe_attribute(blobs, &kind)?;
+        metadata += describe_attribute(blobs, &batch)?;
+        metadata += describe_attribute(blobs, &source_format)?;
+        metadata += describe_attribute(blobs, &source_path)?;
+        metadata += describe_attribute(blobs, &source_raw_root)?;
+        metadata += describe_attribute(blobs, &source_conversation_id)?;
+        metadata += describe_attribute(blobs, &source_title)?;
+        metadata += describe_attribute(blobs, &source_message_id)?;
+        metadata += describe_attribute(blobs, &source_author)?;
+        metadata += describe_attribute(blobs, &source_role)?;
+        metadata += describe_attribute(blobs, &source_parent_id)?;
+        metadata += describe_attribute(blobs, &source_created_at)?;
 
         Ok(metadata)
     }
@@ -399,10 +397,8 @@ fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Opt
 pub fn seed_default_metadata(repo: &mut Repo) -> Result<()> {
     let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
         .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
-    metadata.union(
-        import_schema::build_import_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build import metadata: {e:?}"))?,
-    );
+    metadata += import_schema::build_import_metadata(repo.storage_mut())
+        .map_err(|e| anyhow!("build import metadata: {e:?}"))?;
     repo.set_default_metadata(metadata)
         .map_err(|e| anyhow!("set default metadata: {e:?}"))?;
     Ok(())
@@ -412,10 +408,8 @@ pub fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     let (mut repo, branch_id) = open_repo_for_atlas(pile_path, ATLAS_BRANCH)?;
     let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
         .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
-    metadata.union(
-        import_schema::build_import_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build import metadata: {e:?}"))?,
-    );
+    metadata += import_schema::build_import_metadata(repo.storage_mut())
+        .map_err(|e| anyhow!("build import metadata: {e:?}"))?;
 
     let mut ws = repo
         .pull(branch_id)

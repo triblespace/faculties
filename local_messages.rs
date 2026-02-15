@@ -673,43 +673,42 @@ where
 {
     let mut metadata = TribleSet::new();
 
-    metadata.union(<valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(<valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?);
-    metadata.union(
+    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?;
+    metadata += <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
+    metadata +=
         <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
             blobs,
-        )?,
-    );
-    metadata.union(<blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?);
+        )?;
+    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?;
 
-    metadata.union(describe_attribute(blobs, &local::from, "local_from")?);
-    metadata.union(describe_attribute(blobs, &local::to, "local_to")?);
-    metadata.union(describe_attribute(blobs, &local::body, "local_body")?);
-    metadata.union(describe_attribute(
+    metadata += describe_attribute(blobs, &local::from, "local_from")?;
+    metadata += describe_attribute(blobs, &local::to, "local_to")?;
+    metadata += describe_attribute(blobs, &local::body, "local_body")?;
+    metadata += describe_attribute(
         blobs,
         &local::created_at,
         "local_created_at",
-    )?);
-    metadata.union(describe_attribute(
+    )?;
+    metadata += describe_attribute(
         blobs,
         &local::about_message,
         "local_about_message",
-    )?);
-    metadata.union(describe_attribute(blobs, &local::reader, "local_reader")?);
-    metadata.union(describe_attribute(blobs, &local::read_at, "local_read_at")?);
+    )?;
+    metadata += describe_attribute(blobs, &local::reader, "local_reader")?;
+    metadata += describe_attribute(blobs, &local::read_at, "local_read_at")?;
 
-    metadata.union(describe_kind(
+    metadata += describe_kind(
         blobs,
         &KIND_MESSAGE_ID,
         "local_message",
         "Local message kind.",
-    )?);
-    metadata.union(describe_kind(
+    )?;
+    metadata += describe_kind(
         blobs,
         &KIND_READ_ID,
         "local_read",
         "Local read receipt kind.",
-    )?);
+    )?;
 
     Ok(metadata)
 }
