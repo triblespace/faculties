@@ -1191,31 +1191,31 @@ fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
     )?;
     metadata_set += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
-    metadata_set += metadata::Describe::describe(&config::kind, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&config::updated_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&config::branch, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&config::branch_id, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&config::persona_id, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::kind, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::command_text, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::requested_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::about_request, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::started_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::finished_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::exit_code, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::stderr_text, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&exec::error, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&llm::kind, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&llm::about_request, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&llm::requested_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&llm::started_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&llm::finished_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&llm::error, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&local::to, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&local::created_at, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&local::about_message, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&local::reader, repo.storage_mut())?.into_facts();
-    metadata_set += metadata::Describe::describe(&relations::alias, repo.storage_mut())?.into_facts();
+    metadata_set += metadata::Describe::describe(&config::kind, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::updated_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::branch, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::persona_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::kind, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::command_text, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::requested_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::about_request, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::started_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::finished_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::exit_code, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::stderr_text, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&exec::error, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&llm::kind, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&llm::about_request, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&llm::requested_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&llm::started_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&llm::finished_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&llm::error, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&local::to, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&local::created_at, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&local::about_message, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&local::reader, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&relations::alias, repo.storage_mut())?;
 
     let mut ws = repo
         .pull(branch_id)

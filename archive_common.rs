@@ -107,28 +107,26 @@ pub mod archive_schema {
         metadata += <Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?;
         metadata += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata += metadata::Describe::describe(&archive::kind, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::reply_to, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::author, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::author_name, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::author_role, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::author_model, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::author_provider, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::content, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::created_at, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::kind, blobs)?;
+        metadata += metadata::Describe::describe(&archive::reply_to, blobs)?;
+        metadata += metadata::Describe::describe(&archive::author, blobs)?;
+        metadata += metadata::Describe::describe(&archive::author_name, blobs)?;
+        metadata += metadata::Describe::describe(&archive::author_role, blobs)?;
+        metadata += metadata::Describe::describe(&archive::author_model, blobs)?;
+        metadata += metadata::Describe::describe(&archive::author_provider, blobs)?;
+        metadata += metadata::Describe::describe(&archive::content, blobs)?;
+        metadata += metadata::Describe::describe(&archive::created_at, blobs)?;
 
-        metadata += metadata::Describe::describe(&archive::content_type, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::attachment, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::attachment_source_id, blobs)?.into_facts();
-        metadata +=
-            metadata::Describe::describe(&archive::attachment_source_pointer, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::attachment_name, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::attachment_mime, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::attachment_size_bytes, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::attachment_width_px, blobs)?.into_facts();
-        metadata +=
-            metadata::Describe::describe(&archive::attachment_height_px, blobs)?.into_facts();
-        metadata += metadata::Describe::describe(&archive::attachment_data, blobs)?.into_facts();
+        metadata += metadata::Describe::describe(&archive::content_type, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_source_id, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_source_pointer, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_name, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_mime, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_size_bytes, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_width_px, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_height_px, blobs)?;
+        metadata += metadata::Describe::describe(&archive::attachment_data, blobs)?;
 
         Ok(metadata)
     }
@@ -269,7 +267,8 @@ pub mod import_schema {
         B: BlobStore<Blake3>,
         S: ValueSchema,
     {
-        let mut tribles = metadata::Describe::describe(attribute, blobs)?.into_facts();
+        let mut tribles = TribleSet::new();
+        tribles += metadata::Describe::describe(attribute, blobs)?;
         let attribute_id = attribute.id();
         tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
             metadata::tag: tag_attribute,
