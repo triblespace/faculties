@@ -7,7 +7,7 @@
 //! hifitime = "4"
 //! rand_core = "0.6.4"
 //! serde_json = "1"
-//! triblespace = "0.14.0"
+//! triblespace = "0.16.0"
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -90,7 +90,8 @@ fn import_chatgpt_file(
 
     let json_tree_metadata =
         triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?;
+            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
+            .into_facts();
 
     let export_root = path.parent().unwrap_or_else(|| Path::new("."));
     let export_files =
@@ -110,10 +111,13 @@ fn import_chatgpt_file(
                 repo.storage_mut(),
                 None,
             );
-            let raw_root = raw_importer
+            let raw_fragment = raw_importer
                 .import_str(&convo_raw)
                 .with_context(|| format!("import json tree for conversation {convo_id}"))?;
-            let raw_delta = raw_importer.data().difference(&catalog);
+            let raw_root = raw_fragment
+                .root()
+                .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
+            let raw_delta = raw_fragment.facts().difference(&catalog);
             (raw_root, raw_delta)
         };
         if !raw_delta.is_empty() {
