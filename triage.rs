@@ -14,12 +14,12 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, ReadError};
-use triblespace::core::repo::{PullError, Repository, Workspace};
+use triblespace::core::repo::{BlobStoreMeta, PullError, Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
@@ -39,6 +39,9 @@ const KIND_EXEC_RESULT_ID: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
 const KIND_LLM_REQUEST_ID: Id = id_hex!("1524B4C030D4F10365D9DCEE801A09C8");
 const KIND_LLM_IN_PROGRESS_ID: Id = id_hex!("16C69FC4928D54BF93E6F3222B4685A7");
 const KIND_LLM_RESULT_ID: Id = id_hex!("DE498E4697F9F01219C75E7BC183DB91");
+const REPO_HEAD_ATTR: Id = id_hex!("272FBC56108F336C4D2E17289468C35F");
+const REPO_PARENT_ATTR: Id = id_hex!("317044B612C690000D798CA660ECFD2A");
+const REPO_CONTENT_ATTR: Id = id_hex!("4DD4DDD05CC31734B03ABB4E43188B1F");
 
 type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
 
@@ -149,6 +152,8 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         min_repeat: usize,
     },
+    /// Inspect commit-chain integrity for the target branch
+    Chain,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -238,6 +243,20 @@ struct LoopReport {
     recent: Vec<ExecAttempt>,
     top_patterns: Vec<PatternSummary>,
     contiguous_head: Option<PatternSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct ChainIssue {
+    commit_hash: String,
+    depth_from_head: usize,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct ChainReport {
+    commit_head: String,
+    checked_commits: usize,
+    issue: Option<ChainIssue>,
 }
 
 fn now_epoch() -> Epoch {
@@ -1161,6 +1180,194 @@ fn collect_recent_llm_failures(state: &LlmState, recent: usize) -> Vec<LlmResult
     failures.into_iter().take(recent.min(5)).collect()
 }
 
+fn verify_commit_chain(
+    reader: &triblespace::core::repo::pile::PileReader<valueschemas::Blake3>,
+    start: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
+) -> ChainReport {
+    let head_hash: Value<valueschemas::Hash<valueschemas::Blake3>> =
+        valueschemas::Handle::to_hash(start);
+    let commit_head: String = head_hash.from_value();
+
+    let mut queue: VecDeque<(
+        Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
+        usize,
+    )> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    queue.push_back((start, 0));
+
+    let mut checked_commits = 0usize;
+    while let Some((commit, depth)) = queue.pop_front() {
+        let commit_hash_value: Value<valueschemas::Hash<valueschemas::Blake3>> =
+            valueschemas::Handle::to_hash(commit);
+        let commit_hash: String = commit_hash_value.from_value();
+        if !visited.insert(commit_hash.clone()) {
+            continue;
+        }
+
+        match reader.metadata(commit) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return ChainReport {
+                    commit_head,
+                    checked_commits,
+                    issue: Some(ChainIssue {
+                        commit_hash,
+                        depth_from_head: depth,
+                        reason: "commit blob missing".to_string(),
+                    }),
+                };
+            }
+            Err(err) => {
+                return ChainReport {
+                    commit_head,
+                    checked_commits,
+                    issue: Some(ChainIssue {
+                        commit_hash,
+                        depth_from_head: depth,
+                        reason: format!("commit metadata error: {err:?}"),
+                    }),
+                };
+            }
+        }
+
+        let commit_meta: TribleSet = match reader.get(commit) {
+            Ok(meta) => meta,
+            Err(err) => {
+                return ChainReport {
+                    commit_head,
+                    checked_commits,
+                    issue: Some(ChainIssue {
+                        commit_hash,
+                        depth_from_head: depth,
+                        reason: format!("commit decode failed: {err:?}"),
+                    }),
+                };
+            }
+        };
+
+        let mut content_present = false;
+        let mut parents = Vec::new();
+        for trible in commit_meta.iter() {
+            if trible.a() == &REPO_CONTENT_ATTR {
+                let content = *trible
+                    .v::<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>();
+                match reader.metadata(content) {
+                    Ok(Some(_)) => content_present = true,
+                    Ok(None) => {}
+                    Err(err) => {
+                        return ChainReport {
+                            commit_head,
+                            checked_commits,
+                            issue: Some(ChainIssue {
+                                commit_hash,
+                                depth_from_head: depth,
+                                reason: format!("content metadata error: {err:?}"),
+                            }),
+                        };
+                    }
+                }
+            } else if trible.a() == &REPO_PARENT_ATTR {
+                parents.push(
+                    *trible.v::<
+                        valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>,
+                    >(),
+                );
+            }
+        }
+
+        if !content_present {
+            return ChainReport {
+                commit_head,
+                checked_commits,
+                issue: Some(ChainIssue {
+                    commit_hash,
+                    depth_from_head: depth,
+                    reason: "content blob missing".to_string(),
+                }),
+            };
+        }
+
+        checked_commits += 1;
+        for parent in parents {
+            queue.push_back((parent, depth + 1));
+        }
+    }
+
+    ChainReport {
+        commit_head,
+        checked_commits,
+        issue: None,
+    }
+}
+
+fn cmd_chain(repo: &mut Repository<Pile<valueschemas::Blake3>>, cli: &Cli) -> Result<()> {
+    let config = load_latest_config(repo, cli.config_branch.as_str())?;
+    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let Some(branch_meta_handle) = repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|err| anyhow!("read branch metadata head: {err:?}"))?
+    else {
+        bail!("target branch {branch_id:x} has no branch metadata head");
+    };
+
+    let reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|err| anyhow!("open pile reader: {err:?}"))?;
+    let branch_meta: TribleSet = reader
+        .get(branch_meta_handle)
+        .map_err(|err| anyhow!("decode branch metadata: {err:?}"))?;
+
+    let mut branch_name = None;
+    let mut commit_head = None;
+    for trible in branch_meta.iter() {
+        if trible.a() == &metadata::name.id() {
+            let handle =
+                *trible.v::<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>();
+            if let Ok(view) = reader.get::<View<str>, _>(handle) {
+                branch_name = Some(view.as_ref().to_string());
+            }
+        } else if trible.a() == &REPO_HEAD_ATTR {
+            commit_head = Some(
+                *trible
+                    .v::<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>(),
+            );
+        }
+    }
+
+    let Some(commit_head) = commit_head else {
+        bail!("branch metadata for {branch_id:x} has no repo head");
+    };
+
+    let report = verify_commit_chain(&reader, commit_head);
+    println!("Commit-chain integrity");
+    println!("- pile: {}", cli.pile.display());
+    println!(
+        "- branch: {} ({branch_id:x})",
+        branch_name.unwrap_or_else(|| "<unnamed>".to_string())
+    );
+    println!("- current commit head: {}", report.commit_head);
+    match report.issue {
+        Some(issue) => {
+            println!("- status: broken");
+            println!("- issue: {}", issue.reason);
+            println!("- issue commit: {}", issue.commit_hash);
+            println!("- depth from head: {}", issue.depth_from_head);
+            println!(
+                "- commits verified before failure: {}",
+                report.checked_commits
+            );
+        }
+        None => {
+            println!("- status: healthy");
+            println!("- commits verified: {}", report.checked_commits);
+        }
+    }
+
+    Ok(())
+}
+
 fn cmd_loops(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     cli: &Cli,
@@ -1315,6 +1522,7 @@ fn main() -> Result<()> {
             stale_min,
         } => cmd_scan(&mut repo, &cli, *recent, *loop_min, *stale_min),
         Command::Loops { recent, min_repeat } => cmd_loops(&mut repo, &cli, *recent, *min_repeat),
+        Command::Chain => cmd_chain(&mut repo, &cli),
     };
     let close_result = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
     command_result?;
