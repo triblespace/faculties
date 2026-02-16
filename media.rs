@@ -21,13 +21,17 @@ use rand_core::OsRng;
 use reqwest::blocking::Client;
 use triblespace::core::blob::Bytes;
 use triblespace::core::metadata;
+use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::Repository;
 use triblespace::core::repo::pile::Pile;
+use triblespace::core::repo::PushResult;
 use triblespace::prelude::blobschemas::{FileBytes, LongString};
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, Hash, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 const ATLAS_BRANCH: &str = "atlas";
+const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
 #[derive(Parser)]
 #[command(
@@ -41,8 +45,25 @@ struct Cli {
     /// Branch name to store media entities into (created if missing).
     #[arg(long, default_value = "media", global = true)]
     branch: String,
+    /// Branch id to store media entities into (hex). Overrides config/env branch id.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+mod config_schema {
+    use super::*;
+    attributes! {
+        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
+        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
+        "229941B84503AAE4976A49E020D1282B" as media_branch_id: GenId;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigBranches {
+    media_branch_id: Option<Id>,
 }
 
 #[derive(Subcommand)]
@@ -109,6 +130,7 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
+    let branch_id = resolve_store_branch_id(&cli)?;
 
     match cmd {
         Command::Capture {
@@ -116,7 +138,7 @@ fn main() -> Result<()> {
             mime,
             name,
             alt,
-        } => cmd_capture(&cli, path, mime.as_deref(), name.as_deref(), alt.as_deref()),
+        } => cmd_capture(&cli, branch_id, path, mime.as_deref(), name.as_deref(), alt.as_deref()),
         Command::Fetch {
             url,
             mime,
@@ -125,6 +147,7 @@ fn main() -> Result<()> {
             max_bytes,
         } => cmd_fetch(
             &cli,
+            branch_id,
             url.as_str(),
             mime.as_deref(),
             name.as_deref(),
@@ -136,6 +159,7 @@ fn main() -> Result<()> {
 
 fn cmd_capture(
     cli: &Cli,
+    branch_id: Id,
     path: &Path,
     mime_override: Option<&str>,
     name_override: Option<&str>,
@@ -151,6 +175,7 @@ fn cmd_capture(
     let marker = store_media(
         &cli.pile,
         &cli.branch,
+        branch_id,
         bytes.as_slice(),
         mime.as_str(),
         guessed_name.as_deref(),
@@ -163,6 +188,7 @@ fn cmd_capture(
 
 fn cmd_fetch(
     cli: &Cli,
+    branch_id: Id,
     url: &str,
     mime_override: Option<&str>,
     name_override: Option<&str>,
@@ -205,6 +231,7 @@ fn cmd_fetch(
     let marker = store_media(
         &cli.pile,
         &cli.branch,
+        branch_id,
         bytes.as_ref(),
         mime.as_str(),
         guessed_name.as_deref(),
@@ -219,13 +246,15 @@ fn cmd_fetch(
 fn store_media(
     pile_path: &Path,
     branch_name: &str,
+    branch_id: Id,
     bytes: &[u8],
     mime: &str,
     name: Option<&str>,
     source_url: Option<&str>,
     alt: &str,
 ) -> Result<String> {
-    let (mut repo, branch_id) = open_repo(pile_path, branch_name)?;
+    let mut repo = open_repo(pile_path)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull branch: {e:?}"))?;
@@ -409,12 +438,24 @@ fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
     (epoch, epoch).to_value()
 }
 
+fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
+    let (lower, _upper): (Epoch, Epoch) = interval.from_value();
+    lower.to_tai_duration().total_nanoseconds()
+}
+
 fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
+    let mut repo = open_repo(pile_path)?;
+    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+        id
+    } else {
+        repo.create_branch(ATLAS_BRANCH, None)
+            .map_err(|e| anyhow!("create branch: {e:?}"))?
+            .release()
+    };
     let metadata = build_media_metadata(repo.storage_mut())
         .map_err(|e| anyhow!("build media metadata: {e:?}"))?;
 
@@ -502,7 +543,7 @@ where
     })
 }
 
-fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>, Id)> {
+fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
@@ -513,17 +554,40 @@ fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>
     pile.restore()
         .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
 
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release(),
-    };
-    Ok((repo, branch_id))
+    Ok(Repository::new(pile, signing_key))
+}
+
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
 }
 
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
@@ -571,4 +635,80 @@ fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Opt
         }
     }
     Ok(fallback)
+}
+
+fn resolve_store_branch_id(cli: &Cli) -> Result<Id> {
+    let env_branch_id = std::env::var("TRIBLESPACE_BRANCH_ID").ok();
+    let explicit = parse_optional_hex_id_labeled(
+        cli.branch_id.as_deref().or(env_branch_id.as_deref()),
+        "branch id",
+    )?;
+    let mut repo = open_repo(&cli.pile)?;
+    let config = load_config_branches(&mut repo)?;
+    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+    resolve_branch_id(explicit, config.media_branch_id, cli.branch.as_str())
+}
+
+fn load_config_branches(repo: &mut Repository<Pile<Blake3>>) -> Result<ConfigBranches> {
+    let Some(_) = repo
+        .storage_mut()
+        .head(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("config branch head: {e:?}"))?
+    else {
+        return Ok(ConfigBranches::default());
+    };
+    let mut ws = repo
+        .pull(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
+
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        pattern!(&space, [{
+            ?config_id @
+            config_schema::kind: &CONFIG_KIND_ID,
+            config_schema::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.is_none_or(|(_, current)| key > current) {
+            latest = Some((config_id, key));
+        }
+    }
+    let Some((config_id, _)) = latest else {
+        return Ok(ConfigBranches::default());
+    };
+    let media_branch_id = find!(
+        (entity: Id, value: Value<GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::media_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
+    Ok(ConfigBranches { media_branch_id })
+}
+
+fn resolve_branch_id(explicit: Option<Id>, configured: Option<Id>, branch_name: &str) -> Result<Id> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
+    configured.ok_or_else(|| {
+        anyhow!(
+            "missing {branch_name} branch id in config (set via `playground config set media-branch-id <hex-id>`)"
+        )
+    })
+}
+
+fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let id = Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))?;
+    Ok(Some(id))
 }

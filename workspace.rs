@@ -20,8 +20,9 @@ use hifitime::Epoch;
 use rand_core::OsRng;
 use triblespace::core::blob::{Blob, Bytes};
 use triblespace::core::metadata;
+use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::{PushResult, Repository, Workspace};
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::{FileBytes, LongString, SimpleArchive};
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
@@ -29,6 +30,17 @@ use triblespace::prelude::*;
 
 const DEFAULT_WORKSPACE_BRANCH: &str = "workspace";
 const ATLAS_BRANCH: &str = "atlas";
+const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
+
+mod config_schema {
+    use super::*;
+    attributes! {
+        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
+        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
+        "20D37D92C2AEF5C98899C4C35AA1E35E" as workspace_branch_id: GenId;
+    }
+}
 
 mod playground_workspace {
     use super::*;
@@ -66,6 +78,9 @@ struct Cli {
     /// Branch name for workspace snapshots
     #[arg(long, default_value = DEFAULT_WORKSPACE_BRANCH, global = true)]
     branch: String,
+    /// Branch id for workspace snapshots (hex). Overrides config.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -183,6 +198,11 @@ struct MaterializedEntry {
     link_target_handle: Option<Value<Handle<Blake3, LongString>>>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ConfigBranches {
+    workspace_branch_id: Option<Id>,
+}
+
 const EXCLUDED_DIRS: &[&str] = &[
     ".git",
     ".hg",
@@ -204,6 +224,7 @@ fn main() -> Result<()> {
     let Cli {
         pile,
         branch,
+        branch_id,
         command,
     } = Cli::parse();
     if let Err(err) = emit_schema_to_atlas(&pile) {
@@ -215,18 +236,36 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
+    let explicit_branch_id = parse_optional_hex_id_labeled(branch_id.as_deref(), "branch id")?;
+    let mut cfg_repo = open_repo(&pile)?;
+    let cfg = load_config_branches(&mut cfg_repo)?;
+    cfg_repo
+        .close()
+        .map_err(|err| anyhow!("close pile: {err:?}"))?;
+    let workspace_branch_id = resolve_branch_id(
+        explicit_branch_id,
+        cfg.workspace_branch_id,
+        DEFAULT_WORKSPACE_BRANCH,
+    )?;
 
     match cmd {
-        Command::Capture(args) => cmd_capture(&pile, &branch, args),
-        Command::List => cmd_list(&pile, &branch),
-        Command::Diff(args) => cmd_diff(&pile, &branch, args),
-        Command::Merge(args) => cmd_merge(&pile, &branch, args),
-        Command::Restore(args) => cmd_restore(&pile, &branch, args),
+        Command::Capture(args) => cmd_capture(&pile, &branch, workspace_branch_id, args),
+        Command::List => cmd_list(&pile, &branch, workspace_branch_id),
+        Command::Diff(args) => cmd_diff(&pile, &branch, workspace_branch_id, args),
+        Command::Merge(args) => cmd_merge(&pile, &branch, workspace_branch_id, args),
+        Command::Restore(args) => cmd_restore(&pile, &branch, workspace_branch_id, args),
     }
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
+    let mut repo = open_repo(pile_path)?;
+    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+        id
+    } else {
+        repo.create_branch(ATLAS_BRANCH, None)
+            .map_err(|e| anyhow!("create branch: {e:?}"))?
+            .release()
+    };
     let metadata = build_workspace_metadata(repo.storage_mut())
         .map_err(|e| anyhow!("build workspace metadata: {e:?}"))?;
 
@@ -381,8 +420,9 @@ where
     Ok(tribles)
 }
 
-fn cmd_capture(pile: &Path, branch: &str, args: WorkspaceCaptureArgs) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+fn cmd_capture(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceCaptureArgs) -> Result<()> {
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch)?;
     let mappings = build_mappings(&args.paths)?;
     let snapshot_id = capture_snapshot(&mut repo, branch_id, &mappings, args.label.as_deref())?;
     println!("snapshot: {snapshot_id:x}");
@@ -391,8 +431,9 @@ fn cmd_capture(pile: &Path, branch: &str, args: WorkspaceCaptureArgs) -> Result<
     Ok(())
 }
 
-fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+fn cmd_list(pile: &Path, branch: &str, branch_id: Id) -> Result<()> {
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch)?;
     let snapshots = list_snapshots(&mut repo, branch_id)?;
     print_snapshots(&snapshots);
     repo.close()
@@ -400,8 +441,9 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_diff(pile: &Path, branch: &str, args: WorkspaceDiffArgs) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+fn cmd_diff(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceDiffArgs) -> Result<()> {
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch)?;
     let result = (|| -> Result<()> {
         let mut ws = repo
             .pull(branch_id)
@@ -472,8 +514,9 @@ fn cmd_diff(pile: &Path, branch: &str, args: WorkspaceDiffArgs) -> Result<()> {
     }
 }
 
-fn cmd_merge(pile: &Path, branch: &str, args: WorkspaceMergeArgs) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+fn cmd_merge(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceMergeArgs) -> Result<()> {
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch)?;
     let result = (|| -> Result<()> {
         let mut ws = repo
             .pull(branch_id)
@@ -573,8 +616,9 @@ fn cmd_merge(pile: &Path, branch: &str, args: WorkspaceMergeArgs) -> Result<()> 
     }
 }
 
-fn cmd_restore(pile: &Path, branch: &str, args: WorkspaceRestoreArgs) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+fn cmd_restore(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceRestoreArgs) -> Result<()> {
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch)?;
     let snapshot_id = parse_optional_hex_id(args.snapshot.as_deref())?;
     let target = args.target.unwrap_or_else(|| PathBuf::from("."));
     let restored = restore_snapshot(&mut repo, branch_id, snapshot_id, &target, args.force)?;
@@ -587,7 +631,7 @@ fn cmd_restore(pile: &Path, branch: &str, args: WorkspaceRestoreArgs) -> Result<
     Ok(())
 }
 
-fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>, Id)> {
+fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
@@ -597,18 +641,95 @@ fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     pile.restore()
         .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
-
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release(),
+    Ok(Repository::new(pile, signing_key))
+}
+
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
+}
+
+fn load_config_branches(repo: &mut Repository<Pile<Blake3>>) -> Result<ConfigBranches> {
+    let Some(_) = repo
+        .storage_mut()
+        .head(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("config branch head: {e:?}"))?
+    else {
+        return Ok(ConfigBranches::default());
     };
-    Ok((repo, branch_id))
+
+    let mut ws = repo
+        .pull(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
+
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        pattern!(&space, [{
+            ?config_id @
+            config_schema::kind: &CONFIG_KIND_ID,
+            config_schema::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.is_none_or(|(_, current)| key > current) {
+            latest = Some((config_id, key));
+        }
+    }
+    let Some((config_id, _)) = latest else {
+        return Ok(ConfigBranches::default());
+    };
+
+    let workspace_branch_id = find!(
+        (entity: Id, value: Value<GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::workspace_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
+
+    Ok(ConfigBranches { workspace_branch_id })
+}
+
+fn resolve_branch_id(explicit_id: Option<Id>, configured_id: Option<Id>, branch_name: &str) -> Result<Id> {
+    if let Some(id) = explicit_id {
+        return Ok(id);
+    }
+    configured_id.ok_or_else(|| {
+        anyhow!(
+            "missing {branch_name} branch id in config (set via `playground config set workspace-branch-id <hex-id>`)"
+        )
+    })
 }
 
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
@@ -1609,6 +1730,18 @@ fn parse_optional_hex_id(raw: Option<&str>) -> Result<Option<Id>> {
         return Ok(None);
     }
     let id = Id::from_hex(raw).ok_or_else(|| anyhow!("invalid snapshot id {raw}"))?;
+    Ok(Some(id))
+}
+
+fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let id = Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))?;
     Ok(Some(id))
 }
 

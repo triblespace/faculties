@@ -14,12 +14,14 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
+use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::{Pile, ReadError};
-use triblespace::core::repo::{BlobStoreMeta, PullError, Repository, Workspace};
+use triblespace::core::repo::{BlobStoreMeta, PullError, PushResult, Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
@@ -28,6 +30,14 @@ const DEFAULT_CONFIG_BRANCH: &str = "config";
 const DEFAULT_LOCAL_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 const DEFAULT_ATLAS_BRANCH: &str = "atlas";
+const DEFAULT_COMPASS_BRANCH: &str = "compass";
+const DEFAULT_EXEC_BRANCH: &str = "cognition";
+const DEFAULT_TEAMS_BRANCH: &str = "teams";
+const DEFAULT_WORKSPACE_BRANCH: &str = "workspace";
+const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
+const DEFAULT_WEB_BRANCH: &str = "web";
+const DEFAULT_MEDIA_BRANCH: &str = "media";
+const FIXED_CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 
 const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 const KIND_LOCAL_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
@@ -52,6 +62,15 @@ mod config {
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
         "35E36AE7B60AD946661BD63B3CD64672" as branch: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as branch_id: valueschemas::GenId;
+        "EDEFFF6AFF6318E44CCF6A602B012604" as compass_branch_id: valueschemas::GenId;
+        "C188E12ABBDD83D283A23DBAD4B784AF" as exec_branch_id: valueschemas::GenId;
+        "2ED6FF7EAB93CB5608555AE4B9664CF8" as local_messages_branch_id: valueschemas::GenId;
+        "D35F4F02E29825FBC790E324EFCD1B34" as relations_branch_id: valueschemas::GenId;
+        "22A0E76B8044311563369298306906E3" as teams_branch_id: valueschemas::GenId;
+        "20D37D92C2AEF5C98899C4C35AA1E35E" as workspace_branch_id: valueschemas::GenId;
+        "047112FC535518D289E64FBE0B60F06E" as archive_branch_id: valueschemas::GenId;
+        "A4DFF7BE658B1EA16F866E3039FFF8D6" as web_branch_id: valueschemas::GenId;
+        "229941B84503AAE4976A49E020D1282B" as media_branch_id: valueschemas::GenId;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
     }
 }
@@ -154,6 +173,21 @@ enum Command {
     },
     /// Inspect commit-chain integrity for the target branch
     Chain,
+    /// Repair branch-level consistency issues
+    Repair {
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RepairCommand {
+    /// Merge duplicate named branches into canonical config-registered IDs
+    BranchDuplicates {
+        /// Preview actions without writing changes
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -161,6 +195,15 @@ struct ConfigSnapshot {
     updated_at: Option<i128>,
     branch_name: Option<String>,
     branch_id: Option<Id>,
+    compass_branch_id: Option<Id>,
+    exec_branch_id: Option<Id>,
+    local_messages_branch_id: Option<Id>,
+    relations_branch_id: Option<Id>,
+    teams_branch_id: Option<Id>,
+    workspace_branch_id: Option<Id>,
+    archive_branch_id: Option<Id>,
+    web_branch_id: Option<Id>,
+    media_branch_id: Option<Id>,
     persona_id: Option<Id>,
 }
 
@@ -384,6 +427,15 @@ fn find_branch_by_name(
     pile: &mut Pile<valueschemas::Blake3>,
     branch_name: &str,
 ) -> Result<Option<Id>> {
+    Ok(find_branch_ids_by_name(pile, branch_name)?
+        .into_iter()
+        .next())
+}
+
+fn find_branch_ids_by_name(
+    pile: &mut Pile<valueschemas::Blake3>,
+    branch_name: &str,
+) -> Result<Vec<Id>> {
     let name_handle = branch_name
         .to_owned()
         .to_blob()
@@ -392,8 +444,9 @@ fn find_branch_by_name(
     let iter = pile
         .branches()
         .map_err(|e| anyhow!("list branches: {e:?}"))?;
-    for branch in iter {
-        let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
+    let mut matches = Vec::new();
+    for branch_entry in iter {
+        let branch_id = branch_entry.map_err(|e| anyhow!("branch id: {e:?}"))?;
         let Some(head) = pile
             .head(branch_id)
             .map_err(|e| anyhow!("branch head: {e:?}"))?
@@ -414,11 +467,52 @@ fn find_branch_by_name(
         if names.next().is_some() {
             continue;
         }
-        if name == name_handle {
-            return Ok(Some(branch_id));
+        if name != name_handle {
+            continue;
         }
+        let head_ts = reader
+            .metadata(head)
+            .ok()
+            .flatten()
+            .map(|meta| meta.timestamp)
+            .unwrap_or(0);
+        matches.push((branch_id, head_ts));
     }
-    Ok(None)
+    matches.sort_by_key(|(id, ts)| (Reverse(*ts), format!("{id:x}")));
+    Ok(matches.into_iter().map(|(id, _)| id).collect())
+}
+
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("read branch {branch_id:x} head: {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow!("store branch name blob: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow!("store branch metadata: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
 }
 
 fn ensure_branch(
@@ -428,9 +522,26 @@ fn ensure_branch(
     if let Some(id) = find_branch_by_name(repo.storage_mut(), branch_name)? {
         return Ok(id);
     }
-    repo.create_branch(branch_name, None)
-        .map_err(|e| anyhow!("create branch: {e:?}"))
-        .map(|branch| branch.release())
+
+    let branch_id = *genid();
+    ensure_branch_with_id(repo, branch_id, branch_name)?;
+    Ok(branch_id)
+}
+
+fn push_workspace(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+) -> Result<()> {
+    while let Some(mut conflict) = repo
+        .try_push(ws)
+        .map_err(|e| anyhow!("push workspace: {e:?}"))?
+    {
+        conflict
+            .merge(ws)
+            .map_err(|e| anyhow!("merge workspace: {e:?}"))?;
+        *ws = conflict;
+    }
+    Ok(())
 }
 
 fn load_latest_config(
@@ -440,7 +551,13 @@ fn load_latest_config(
     let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? else {
         return Ok(None);
     };
+    load_latest_config_from_branch_id(repo, branch_id)
+}
 
+fn load_latest_config_from_branch_id(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_id: Id,
+) -> Result<Option<ConfigSnapshot>> {
     let mut ws = pull_workspace(repo, branch_id, "pull config workspace")?;
     let space = ws
         .checkout(..)
@@ -477,6 +594,87 @@ fn load_latest_config(
     ) {
         if entity == config_id {
             snapshot.branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::compass_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.compass_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::exec_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.exec_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::local_messages_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.local_messages_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::relations_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.relations_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::teams_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.teams_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::workspace_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.workspace_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::archive_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.archive_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::web_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.web_branch_id = Some(value.from_value());
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::media_branch_id: ?value }])
+    ) {
+        if entity == config_id {
+            snapshot.media_branch_id = Some(value.from_value());
             break;
         }
     }
@@ -1245,15 +1443,17 @@ fn verify_commit_chain(
             }
         };
 
-        let mut content_present = false;
+        let mut saw_content_attr = false;
+        let mut missing_content_ref = false;
         let mut parents = Vec::new();
         for trible in commit_meta.iter() {
             if trible.a() == &REPO_CONTENT_ATTR {
+                saw_content_attr = true;
                 let content = *trible
                     .v::<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>();
                 match reader.metadata(content) {
-                    Ok(Some(_)) => content_present = true,
-                    Ok(None) => {}
+                    Ok(Some(_)) => {}
+                    Ok(None) => missing_content_ref = true,
                     Err(err) => {
                         return ChainReport {
                             commit_head,
@@ -1275,14 +1475,18 @@ fn verify_commit_chain(
             }
         }
 
-        if !content_present {
+        // Commits may intentionally omit repo::content (for example merge-only
+        // commits). Only treat missing content as corruption when the commit
+        // explicitly references repo::content blobs and one of those blobs is
+        // unavailable.
+        if saw_content_attr && missing_content_ref {
             return ChainReport {
                 commit_head,
                 checked_commits,
                 issue: Some(ChainIssue {
                     commit_hash,
                     depth_from_head: depth,
-                    reason: "content blob missing".to_string(),
+                    reason: "referenced content blob missing".to_string(),
                 }),
             };
         }
@@ -1437,6 +1641,298 @@ fn cmd_loops(
     Ok(())
 }
 
+#[derive(Debug)]
+struct BranchRepairOutcome {
+    name: String,
+    canonical_id: Id,
+    duplicate_ids: Vec<Id>,
+    merged_facts: usize,
+    merged_branches: usize,
+    deleted_branches: usize,
+    skipped_branches: usize,
+}
+
+fn insert_canonical_branch(
+    map: &mut HashMap<String, Id>,
+    name: &str,
+    id: Option<Id>,
+) -> Result<()> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+    match map.get(name).copied() {
+        Some(existing) if existing != id => {
+            bail!("conflicting canonical ids for branch name '{name}': {existing:x} vs {id:x}");
+        }
+        _ => {
+            map.insert(name.to_owned(), id);
+            Ok(())
+        }
+    }
+}
+
+fn delete_branch(repo: &mut Repository<Pile<valueschemas::Blake3>>, branch_id: Id) -> Result<()> {
+    let mut expected = repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|err| anyhow!("read branch {branch_id:x} head: {err:?}"))?;
+    if expected.is_none() {
+        return Ok(());
+    }
+
+    for _ in 0..3 {
+        let result = repo
+            .storage_mut()
+            .update(branch_id, expected, None)
+            .map_err(|err| anyhow!("delete branch {branch_id:x}: {err:?}"))?;
+        match result {
+            PushResult::Success() => return Ok(()),
+            PushResult::Conflict(current) => {
+                if current.is_none() {
+                    return Ok(());
+                }
+                expected = current;
+            }
+        }
+    }
+    bail!("delete branch {branch_id:x}: conflict after retries")
+}
+
+fn repair_named_duplicates(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_name: &str,
+    canonical_id: Id,
+    dry_run: bool,
+) -> Result<BranchRepairOutcome> {
+    if !dry_run {
+        ensure_branch_with_id(repo, canonical_id, branch_name)?;
+    }
+
+    let duplicate_ids = find_branch_ids_by_name(repo.storage_mut(), branch_name)?
+        .into_iter()
+        .filter(|id| *id != canonical_id)
+        .collect::<Vec<_>>();
+
+    let mut outcome = BranchRepairOutcome {
+        name: branch_name.to_owned(),
+        canonical_id,
+        duplicate_ids: duplicate_ids.clone(),
+        merged_facts: 0,
+        merged_branches: 0,
+        deleted_branches: 0,
+        skipped_branches: 0,
+    };
+    if duplicate_ids.is_empty() {
+        return Ok(outcome);
+    }
+
+    if dry_run {
+        let canonical_exists = repo
+            .storage_mut()
+            .head(canonical_id)
+            .map_err(|e| anyhow!("read canonical branch {canonical_id:x} head: {e:?}"))?
+            .is_some();
+        if !canonical_exists {
+            outcome.skipped_branches = outcome.duplicate_ids.len();
+            return Ok(outcome);
+        }
+    }
+
+    let mut canonical_ws = repo
+        .pull(canonical_id)
+        .map_err(|err| anyhow!("pull canonical branch {canonical_id:x}: {err:?}"))?;
+    let mut canonical_data = canonical_ws
+        .checkout(..)
+        .map_err(|err| anyhow!("checkout canonical branch {canonical_id:x}: {err:?}"))?;
+
+    for duplicate_id in duplicate_ids {
+        let mut duplicate_ws = match repo.pull(duplicate_id) {
+            Ok(ws) => ws,
+            Err(err) => {
+                outcome.skipped_branches += 1;
+                eprintln!(
+                    "warning: skip duplicate branch {duplicate_id:x} ({branch_name}): pull failed ({err:?})"
+                );
+                continue;
+            }
+        };
+        let duplicate_data = match duplicate_ws.checkout(..) {
+            Ok(set) => set,
+            Err(err) => {
+                outcome.skipped_branches += 1;
+                eprintln!(
+                    "warning: skip duplicate branch {duplicate_id:x} ({branch_name}): checkout failed ({err:?})"
+                );
+                continue;
+            }
+        };
+
+        let delta = duplicate_data.difference(&canonical_data);
+        if !delta.is_empty() {
+            outcome.merged_facts += delta.len();
+            outcome.merged_branches += 1;
+            if !dry_run {
+                canonical_ws.commit(delta.clone(), None, Some("triage repair branch duplicates"));
+                push_workspace(repo, &mut canonical_ws)?;
+                canonical_data += delta;
+            }
+        }
+
+        if !dry_run {
+            match delete_branch(repo, duplicate_id) {
+                Ok(()) => outcome.deleted_branches += 1,
+                Err(err) => {
+                    outcome.skipped_branches += 1;
+                    eprintln!(
+                        "warning: failed to delete duplicate branch {duplicate_id:x} ({branch_name}): {err:#}"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
+fn cmd_repair_branch_duplicates(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    cli: &Cli,
+    dry_run: bool,
+) -> Result<()> {
+    let mut canonical = HashMap::<String, Id>::new();
+    insert_canonical_branch(
+        &mut canonical,
+        cli.config_branch.as_str(),
+        Some(FIXED_CONFIG_BRANCH_ID),
+    )?;
+
+    let config_branch_head = repo
+        .storage_mut()
+        .head(FIXED_CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("read fixed config branch head: {e:?}"))?;
+    let config_snapshot = if config_branch_head.is_some() {
+        load_latest_config_from_branch_id(repo, FIXED_CONFIG_BRANCH_ID)?
+    } else {
+        load_latest_config(repo, cli.config_branch.as_str())?
+    };
+
+    if let Some(cfg) = config_snapshot.as_ref() {
+        let core_name = cfg
+            .branch_name
+            .as_deref()
+            .unwrap_or(cli.branch.as_str())
+            .to_owned();
+        let core_id = match cfg.branch_id {
+            Some(id) => Some(id),
+            None => find_branch_by_name(repo.storage_mut(), core_name.as_str())?,
+        };
+        insert_canonical_branch(&mut canonical, core_name.as_str(), core_id)?;
+        insert_canonical_branch(&mut canonical, DEFAULT_EXEC_BRANCH, cfg.exec_branch_id)?;
+        insert_canonical_branch(
+            &mut canonical,
+            DEFAULT_COMPASS_BRANCH,
+            cfg.compass_branch_id,
+        )?;
+        insert_canonical_branch(
+            &mut canonical,
+            DEFAULT_LOCAL_BRANCH,
+            cfg.local_messages_branch_id,
+        )?;
+        insert_canonical_branch(
+            &mut canonical,
+            DEFAULT_RELATIONS_BRANCH,
+            cfg.relations_branch_id,
+        )?;
+        insert_canonical_branch(&mut canonical, DEFAULT_TEAMS_BRANCH, cfg.teams_branch_id)?;
+        insert_canonical_branch(
+            &mut canonical,
+            DEFAULT_WORKSPACE_BRANCH,
+            cfg.workspace_branch_id,
+        )?;
+        insert_canonical_branch(
+            &mut canonical,
+            DEFAULT_ARCHIVE_BRANCH,
+            cfg.archive_branch_id,
+        )?;
+        insert_canonical_branch(&mut canonical, DEFAULT_WEB_BRANCH, cfg.web_branch_id)?;
+        insert_canonical_branch(&mut canonical, DEFAULT_MEDIA_BRANCH, cfg.media_branch_id)?;
+    }
+
+    let mut names: Vec<String> = canonical.keys().cloned().collect();
+    names.sort();
+
+    println!(
+        "Repair duplicate named branches{}",
+        if dry_run { " (dry-run)" } else { "" }
+    );
+    println!("- pile: {}", cli.pile.display());
+    println!("- canonical branch entries: {}", names.len());
+
+    let mut outcomes = Vec::new();
+    for name in names {
+        let canonical_id = canonical[&name];
+        let outcome = repair_named_duplicates(repo, name.as_str(), canonical_id, dry_run)?;
+        outcomes.push(outcome);
+    }
+
+    let touched = outcomes
+        .iter()
+        .filter(|o| !o.duplicate_ids.is_empty())
+        .count();
+    let merged_branches: usize = outcomes.iter().map(|o| o.merged_branches).sum();
+    let merged_facts: usize = outcomes.iter().map(|o| o.merged_facts).sum();
+    let deleted: usize = outcomes.iter().map(|o| o.deleted_branches).sum();
+    let skipped: usize = outcomes.iter().map(|o| o.skipped_branches).sum();
+
+    println!();
+    println!("Summary");
+    println!("- names with duplicates: {touched}");
+    println!("- merged duplicate branches: {merged_branches}");
+    println!("- merged facts: {merged_facts}");
+    if dry_run {
+        println!(
+            "- branches to delete: {}",
+            outcomes
+                .iter()
+                .map(|o| o.duplicate_ids.len())
+                .sum::<usize>()
+        );
+    } else {
+        println!("- deleted duplicate branches: {deleted}");
+    }
+    if skipped > 0 {
+        println!("- skipped branches: {skipped}");
+    }
+
+    println!();
+    println!("Details");
+    for outcome in outcomes {
+        if outcome.duplicate_ids.is_empty() {
+            continue;
+        }
+        let duplicate_list = outcome
+            .duplicate_ids
+            .iter()
+            .map(|id| format!("{id:x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "- {} -> {:x} | duplicates: [{}] | merged_facts={} | {}",
+            outcome.name,
+            outcome.canonical_id,
+            duplicate_list,
+            outcome.merged_facts,
+            if dry_run {
+                "would_delete=true".to_string()
+            } else {
+                format!("deleted={}", outcome.deleted_branches)
+            }
+        );
+    }
+
+    Ok(())
+}
+
 fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
     let mut repo = open_repo(pile_path)?;
     let branch_id = ensure_branch(&mut repo, atlas_branch)?;
@@ -1462,6 +1958,16 @@ fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
     metadata_set += metadata::Describe::describe(&config::updated_at, repo.storage_mut())?;
     metadata_set += metadata::Describe::describe(&config::branch, repo.storage_mut())?;
     metadata_set += metadata::Describe::describe(&config::branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::compass_branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::exec_branch_id, repo.storage_mut())?;
+    metadata_set +=
+        metadata::Describe::describe(&config::local_messages_branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::relations_branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::teams_branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::workspace_branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::archive_branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::web_branch_id, repo.storage_mut())?;
+    metadata_set += metadata::Describe::describe(&config::media_branch_id, repo.storage_mut())?;
     metadata_set += metadata::Describe::describe(&config::persona_id, repo.storage_mut())?;
     metadata_set += metadata::Describe::describe(&exec::kind, repo.storage_mut())?;
     metadata_set += metadata::Describe::describe(&exec::command_text, repo.storage_mut())?;
@@ -1523,6 +2029,11 @@ fn main() -> Result<()> {
         } => cmd_scan(&mut repo, &cli, *recent, *loop_min, *stale_min),
         Command::Loops { recent, min_repeat } => cmd_loops(&mut repo, &cli, *recent, *min_repeat),
         Command::Chain => cmd_chain(&mut repo, &cli),
+        Command::Repair { command } => match command {
+            RepairCommand::BranchDuplicates { dry_run } => {
+                cmd_repair_branch_duplicates(&mut repo, &cli, *dry_run)
+            }
+        },
     };
     let close_result = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
     command_result?;

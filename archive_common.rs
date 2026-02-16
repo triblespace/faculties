@@ -8,8 +8,9 @@ use hifitime::Epoch;
 use rand_core::OsRng;
 use std::fs;
 use triblespace::core::metadata;
+use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::{PushResult, Repository, Workspace};
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
@@ -283,12 +284,65 @@ pub type Repo = Repository<Pile<Blake3>>;
 pub type Ws = Workspace<Pile<Blake3>>;
 
 const ATLAS_BRANCH: &str = "atlas";
+const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
+
+mod config_schema {
+    use super::*;
+    attributes! {
+        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
+        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
+        "047112FC535518D289E64FBE0B60F06E" as archive_branch_id: valueschemas::GenId;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigBranches {
+    archive_branch_id: Option<Id>,
+}
 
 pub fn default_pile_path() -> PathBuf {
     PathBuf::from("self.pile")
 }
 
-pub fn open_repo_for_write(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)> {
+pub fn open_repo_for_write(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<(Repo, Id)> {
+    let mut repo = open_repo(pile_path)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
+    seed_default_metadata(&mut repo)?;
+    Ok((repo, branch_id))
+}
+
+pub fn open_repo_for_read(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<(Repo, Id)> {
+    let mut repo = open_repo(pile_path)?;
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
+        .is_none()
+    {
+        repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+        return Err(anyhow!("unknown branch {branch_name} ({branch_id:x})"));
+    }
+    Ok((repo, branch_id))
+}
+
+pub fn resolve_archive_branch_id(
+    pile_path: &Path,
+    branch_name: &str,
+    branch_id_override: Option<&str>,
+) -> Result<Id> {
+    let env_branch_id = std::env::var("TRIBLESPACE_BRANCH_ID").ok();
+    let explicit = parse_optional_hex_id_labeled(
+        branch_id_override.or(env_branch_id.as_deref()),
+        "branch id",
+    )?;
+    let mut repo = open_repo(pile_path)?;
+    let config = load_config_branches(&mut repo)?;
+    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+    resolve_branch_id(explicit, config.archive_branch_id, branch_name)
+}
+
+fn open_repo(pile_path: &Path) -> Result<Repo> {
     if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
@@ -298,62 +352,52 @@ pub fn open_repo_for_write(pile_path: &Path, branch_name: &str) -> Result<(Repo,
         Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
     pile.restore()
         .map_err(|e| anyhow!("restore pile: {e:?}"))?;
-
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release(),
-    };
-
-    seed_default_metadata(&mut repo)?;
-
-    Ok((repo, branch_id))
-}
-
-pub fn open_repo_for_read(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)> {
-    let mut pile =
-        Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile: {e:?}"))?;
-
-    let Some(branch_id) = find_branch_by_name(&mut pile, branch_name)? else {
-        return Err(anyhow!("unknown branch {branch_name}"));
-    };
-
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let repo = Repository::new(pile, signing_key);
-
-    Ok((repo, branch_id))
+    Ok(Repository::new(pile, signing_key))
 }
 
 fn open_repo_for_atlas(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)> {
-    if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
-    }
-
-    let mut pile =
-        Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile: {e:?}"))?;
-
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
-    let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
+    let mut repo = open_repo(pile_path)?;
+    let branch_id = match find_branch_by_name(repo.storage_mut(), branch_name)? {
         Some(id) => id,
         None => repo
             .create_branch(branch_name, None)
             .map_err(|e| anyhow!("create branch: {e:?}"))?
             .release(),
     };
-
     Ok((repo, branch_id))
+}
+
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
 }
 
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
@@ -427,6 +471,73 @@ pub fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn load_config_branches(repo: &mut Repo) -> Result<ConfigBranches> {
+    let Some(_) = repo
+        .storage_mut()
+        .head(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("config branch head: {e:?}"))?
+    else {
+        return Ok(ConfigBranches::default());
+    };
+
+    let mut ws = repo
+        .pull(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
+
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        pattern!(&space, [{
+            ?config_id @
+            config_schema::kind: &CONFIG_KIND_ID,
+            config_schema::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.is_none_or(|(_, current)| key > current) {
+            latest = Some((config_id, key));
+        }
+    }
+    let Some((config_id, _)) = latest else {
+        return Ok(ConfigBranches::default());
+    };
+
+    let archive_branch_id = find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::archive_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
+
+    Ok(ConfigBranches { archive_branch_id })
+}
+
+fn resolve_branch_id(explicit: Option<Id>, configured: Option<Id>, branch_name: &str) -> Result<Id> {
+    if let Some(id) = explicit {
+        return Ok(id);
+    }
+    configured.ok_or_else(|| {
+        anyhow!(
+            "missing {branch_name} branch id in config (set via `playground config set archive-branch-id <hex-id>`)"
+        )
+    })
+}
+
+fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let id = Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))?;
+    Ok(Some(id))
+}
+
 pub fn push_workspace(repo: &mut Repo, ws: &mut Ws) -> Result<()> {
     while let Some(mut conflict) = repo
         .try_push(ws)
@@ -477,6 +588,11 @@ pub fn epoch_from_seconds(value: f64) -> Option<Epoch> {
 
 pub fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
     (epoch, epoch).to_value()
+}
+
+fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
+    let (lower, _upper): (Epoch, Epoch) = interval.from_value();
+    lower.to_tai_duration().total_nanoseconds()
 }
 
 pub fn ensure_author(

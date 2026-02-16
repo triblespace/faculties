@@ -34,6 +34,9 @@ struct Cli {
     /// Branch name to write into (created if missing).
     #[arg(long, default_value = "archive", global = true)]
     branch: String,
+    /// Branch id to write into (hex). Overrides config/env branch id.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
     /// File or directory containing ChatGPT exports.
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
@@ -631,7 +634,12 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, &cli.branch)?;
+    let branch_id = common::resolve_archive_branch_id(
+        &pile_path,
+        &cli.branch,
+        cli.branch_id.as_deref(),
+    )?;
+    let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, branch_id, &cli.branch)?;
     let stats = import_chatgpt_path(&path, &mut repo, branch_id)?;
     println!(
         "Imported {} conversation(s), {} message(s), {} attachment(s) in {} new commit(s).",

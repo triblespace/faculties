@@ -25,14 +25,16 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
 use triblespace::core::metadata;
+use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::{PushResult, Repository, Workspace};
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 const ATLAS_BRANCH: &str = "atlas";
-const CONFIG_BRANCH: &str = "config";
+const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum Provider {
@@ -50,9 +52,9 @@ struct Cli {
     /// Branch name to store web events into (created if missing).
     #[arg(long, default_value = "web", global = true)]
     branch: String,
-    /// Branch name to read configuration from.
-    #[arg(long, default_value = CONFIG_BRANCH, global = true)]
-    config_branch: String,
+    /// Branch id to store web events into (hex). Overrides config/env branch id.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
     /// Override Tavily API key (otherwise loaded from config.tavily_api_key).
     #[arg(long, global = true)]
     tavily_api_key: Option<String>,
@@ -93,12 +95,11 @@ mod config_schema {
     attributes! {
         "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
+        "A4DFF7BE658B1EA16F866E3039FFF8D6" as web_branch_id: GenId;
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<Blake3, LongString>;
     }
 }
-
-const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
 mod web_schema {
     use super::*;
@@ -130,6 +131,13 @@ struct ApiKeys {
     exa: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ConfigSnapshot {
+    tavily_api_key: Option<String>,
+    exa_api_key: Option<String>,
+    web_branch_id: Option<Id>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Err(err) = emit_schema_to_atlas(&cli.pile) {
@@ -142,23 +150,44 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let keys = load_api_keys(&cli.pile, &cli.config_branch, &cli.tavily_api_key, &cli.exa_api_key)?;
+    let config = load_config_snapshot(&cli.pile)?;
+    let keys = resolve_api_keys(&cli, &config);
 
     match cmd {
         Command::Search {
             query,
             max_results,
             provider,
-        } => cmd_search(&cli, keys, *provider, query, *max_results),
+        } => cmd_search(&cli, &config, keys, *provider, query, *max_results),
         Command::Fetch {
             url,
             provider,
             max_characters,
-        } => cmd_fetch(&cli, keys, *provider, url, *max_characters),
+        } => cmd_fetch(&cli, &config, keys, *provider, url, *max_characters),
     }
 }
 
-fn cmd_search(cli: &Cli, keys: ApiKeys, provider: Provider, query: &str, max_results: usize) -> Result<()> {
+fn resolve_api_keys(cli: &Cli, config: &ConfigSnapshot) -> ApiKeys {
+    ApiKeys {
+        tavily: cli
+            .tavily_api_key
+            .clone()
+            .or_else(|| config.tavily_api_key.clone()),
+        exa: cli
+            .exa_api_key
+            .clone()
+            .or_else(|| config.exa_api_key.clone()),
+    }
+}
+
+fn cmd_search(
+    cli: &Cli,
+    config: &ConfigSnapshot,
+    keys: ApiKeys,
+    provider: Provider,
+    query: &str,
+    max_results: usize,
+) -> Result<()> {
     let provider = choose_provider(provider, &keys)?;
     let client = Client::builder()
         .user_agent("playground-web-faculty/0")
@@ -176,10 +205,18 @@ fn cmd_search(cli: &Cli, keys: ApiKeys, provider: Provider, query: &str, max_res
     if cli.no_store {
         return Ok(());
     }
-    store_search(cli, provider, query, &results)
+    let branch_id = resolve_store_branch_id(cli, config.web_branch_id)?;
+    store_search(cli, branch_id, provider, query, &results)
 }
 
-fn cmd_fetch(cli: &Cli, keys: ApiKeys, provider: Provider, url: &str, max_characters: usize) -> Result<()> {
+fn cmd_fetch(
+    cli: &Cli,
+    config: &ConfigSnapshot,
+    keys: ApiKeys,
+    provider: Provider,
+    url: &str,
+    max_characters: usize,
+) -> Result<()> {
     let provider = choose_provider_fetch(provider, &keys)?;
     let client = Client::builder()
         .user_agent("playground-web-faculty/0")
@@ -199,7 +236,8 @@ fn cmd_fetch(cli: &Cli, keys: ApiKeys, provider: Provider, url: &str, max_charac
     if cli.no_store {
         return Ok(());
     }
-    store_fetch(cli, provider, url, &content)
+    let branch_id = resolve_store_branch_id(cli, config.web_branch_id)?;
+    store_fetch(cli, branch_id, provider, url, &content)
 }
 
 fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
@@ -243,53 +281,67 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
     }
 }
 
-fn load_api_keys(pile_path: &Path, config_branch: &str, tavily_override: &Option<String>, exa_override: &Option<String>) -> Result<ApiKeys> {
+fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
     let debug = std::env::var_os("PLAYGROUND_WEB_DEBUG").is_some();
-
-    let mut keys = ApiKeys {
-        tavily: tavily_override.clone(),
-        exa: exa_override.clone(),
+    let mut repo = open_repo(pile_path)?;
+    let snapshot = if repo
+        .storage_mut()
+        .head(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("config branch head: {e:?}"))?
+        .is_none()
+    {
+        ConfigSnapshot::default()
+    } else {
+        let mut ws = repo
+            .pull(CONFIG_BRANCH_ID)
+            .map_err(|e| anyhow!("pull config: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout config: {e:?}"))?;
+        match latest_config_id(&space)? {
+            Some(config_id) => {
+                if debug {
+                    eprintln!("[web] latest config id: {config_id:x}");
+                }
+                ConfigSnapshot {
+                    tavily_api_key: load_string_attr(
+                        &mut ws,
+                        &space,
+                        config_id,
+                        config_schema::tavily_api_key,
+                    )?,
+                    exa_api_key: load_string_attr(
+                        &mut ws,
+                        &space,
+                        config_id,
+                        config_schema::exa_api_key,
+                    )?,
+                    web_branch_id: load_id_attr(&space, config_id, config_schema::web_branch_id),
+                }
+            }
+            None => ConfigSnapshot::default(),
+        }
     };
-    if keys.tavily.is_some() && keys.exa.is_some() {
-        return Ok(keys);
-    }
+    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+    Ok(snapshot)
+}
 
-    let (mut repo, branch_id) = open_repo(pile_path, config_branch)?;
-    if debug {
-        eprintln!("[web] config branch {config_branch} -> {branch_id:x}");
-    }
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull config: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout config: {e:?}"))?;
+fn resolve_store_branch_id(cli: &Cli, configured_id: Option<Id>) -> Result<Id> {
+    let env_branch_id = std::env::var("TRIBLESPACE_BRANCH_ID").ok();
+    let explicit = parse_optional_hex_id_labeled(
+        cli.branch_id.as_deref().or(env_branch_id.as_deref()),
+        "branch id",
+    )?;
+    resolve_branch_id(explicit, configured_id, cli.branch.as_str())
+}
 
-    let config_id = latest_config_id(&space)?;
-    if debug {
-        match config_id {
-            Some(id) => eprintln!("[web] latest config id: {id:x}"),
-            None => eprintln!("[web] no config entries found"),
-        }
+fn resolve_branch_id(explicit: Option<Id>, configured: Option<Id>, branch_name: &str) -> Result<Id> {
+    if let Some(id) = explicit {
+        return Ok(id);
     }
-    if let Some(config_id) = config_id {
-        if keys.tavily.is_none() {
-            keys.tavily = load_string_attr(&mut ws, &space, config_id, config_schema::tavily_api_key)?;
-        }
-        if keys.exa.is_none() {
-            keys.exa = load_string_attr(&mut ws, &space, config_id, config_schema::exa_api_key)?;
-        }
-    }
-    if debug {
-        eprintln!(
-            "[web] keys loaded: tavily={} exa={}",
-            keys.tavily.is_some(),
-            keys.exa.is_some()
-        );
-    }
-
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
-
-    Ok(keys)
+    configured.ok_or_else(|| {
+        anyhow!(
+            "missing {branch_name} branch id in config (set via `playground config set web-branch-id <hex-id>`)"
+        )
+    })
 }
 
 fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
@@ -337,6 +389,19 @@ fn load_string_attr(
     Ok(Some(view.to_string()))
 }
 
+fn load_id_attr(
+    space: &TribleSet,
+    entity: Id,
+    attr: Attribute<GenId>,
+) -> Option<Id> {
+    find!(
+        (entity_id: Id, value: Value<GenId>),
+        pattern!(space, [{ ?entity_id @ attr: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity_id, value)| (entity_id == entity).then_some(value.from_value()))
+}
+
 #[derive(Clone, Debug)]
 struct SearchResult {
     url: String,
@@ -364,8 +429,15 @@ fn print_search_results(provider: Provider, query: &str, results: &[SearchResult
     }
 }
 
-fn store_search(cli: &Cli, provider: Provider, query: &str, results: &[SearchResult]) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(&cli.pile, &cli.branch)?;
+fn store_search(
+    cli: &Cli,
+    branch_id: Id,
+    provider: Provider,
+    query: &str,
+    results: &[SearchResult],
+) -> Result<()> {
+    let mut repo = open_repo(&cli.pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, cli.branch.as_str())?;
     let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
     let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
 
@@ -422,8 +494,9 @@ fn store_search(cli: &Cli, provider: Provider, query: &str, results: &[SearchRes
     Ok(())
 }
 
-fn store_fetch(cli: &Cli, provider: Provider, url: &str, content: &str) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(&cli.pile, &cli.branch)?;
+fn store_fetch(cli: &Cli, branch_id: Id, provider: Provider, url: &str, content: &str) -> Result<()> {
+    let mut repo = open_repo(&cli.pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, cli.branch.as_str())?;
     let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
     let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
 
@@ -646,7 +719,14 @@ fn exa_contents(client: &Client, api_key: &str, url: &str, max_characters: usize
 // --- Atlas schema metadata ---
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
+    let mut repo = open_repo(pile_path)?;
+    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+        id
+    } else {
+        repo.create_branch(ATLAS_BRANCH, None)
+            .map_err(|e| anyhow!("create branch: {e:?}"))?
+            .release()
+    };
     let metadata = build_web_metadata(repo.storage_mut())
         .map_err(|e| anyhow!("build web metadata: {e:?}"))?;
 
@@ -726,7 +806,7 @@ where
 
 // --- Pile helpers ---
 
-fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>, Id)> {
+fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
@@ -737,17 +817,40 @@ fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>
     pile.restore()
         .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
 
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release(),
-    };
-    Ok((repo, branch_id))
+    Ok(Repository::new(pile, signing_key))
+}
+
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
 }
 
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
@@ -796,4 +899,16 @@ fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Opt
         }
     }
     Ok(fallback)
+}
+
+fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let id = Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))?;
+    Ok(Some(id))
 }

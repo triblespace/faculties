@@ -32,6 +32,9 @@ struct Cli {
     /// Branch name to query.
     #[arg(long, default_value = "archive", global = true)]
     branch: String,
+    /// Branch id to query (hex). Overrides config/env branch id.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -336,7 +339,12 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, &cli.branch)?;
+    let branch_id = common::resolve_archive_branch_id(
+        &pile_path,
+        &cli.branch,
+        cli.branch_id.as_deref(),
+    )?;
+    let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
 
     let res = (|| -> Result<()> {
         let mut ws = repo

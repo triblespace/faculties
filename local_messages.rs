@@ -18,13 +18,16 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::branch as branch_proto;
+use triblespace::core::repo::{PushResult, Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 const ATLAS_BRANCH: &str = "atlas";
+const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
 const KIND_MESSAGE_LABEL: &str = "local_message";
 const KIND_READ_LABEL: &str = "local_read";
@@ -56,12 +59,36 @@ mod local {
     }
 }
 
+mod config_schema {
+    use super::*;
+    attributes! {
+        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
+        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
+        "2ED6FF7EAB93CB5608555AE4B9664CF8" as local_messages_branch_id: valueschemas::GenId;
+        "D35F4F02E29825FBC790E324EFCD1B34" as relations_branch_id: valueschemas::GenId;
+    }
+}
+
 fn normalize_label(label: &str) -> Result<String> {
     let trimmed = label.trim();
     if trimmed.is_empty() {
         bail!("label is empty");
     }
     Ok(trimmed.to_string())
+}
+
+fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{label} is empty");
+    }
+    let Some(id) = Id::from_hex(trimmed) else {
+        bail!("invalid {label} '{trimmed}'");
+    };
+    Ok(Some(id))
 }
 
 #[derive(Parser)]
@@ -73,9 +100,15 @@ struct Cli {
     /// Branch name for local messages
     #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
     branch: String,
+    /// Branch id for local messages (hex). Overrides config.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
     /// Branch name for relations
     #[arg(long, default_value = DEFAULT_RELATIONS_BRANCH, global = true)]
     relations_branch: String,
+    /// Branch id for relations (hex). Overrides config.
+    #[arg(long, global = true)]
+    relations_branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -117,6 +150,12 @@ struct MessageRow {
     to: Id,
     body: String,
     created_at: i128,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConfigBranches {
+    local_messages_branch_id: Option<Id>,
+    relations_branch_id: Option<Id>,
 }
 
 fn now_epoch() -> Epoch {
@@ -173,15 +212,21 @@ fn id_prefix(id: Id) -> String {
 
 fn load_relations_space(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    relations_branch: &str,
+    relations_branch_id: Id,
 ) -> Result<TribleSet> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), relations_branch)? else {
+    if repo
+        .storage_mut()
+        .head(relations_branch_id)
+        .map_err(|e| anyhow::anyhow!("relations branch head: {e:?}"))?
+        .is_none()
+    {
         bail!(
-            "missing relations branch '{relations_branch}' (create with relations faculty)"
+            "missing relations branch {:x} (create with relations faculty)",
+            relations_branch_id
         );
-    };
+    }
     let mut ws = repo
-        .pull(branch_id)
+        .pull(relations_branch_id)
         .map_err(|e| anyhow::anyhow!("pull relations workspace: {e:?}"))?;
     let space = ws
         .checkout(..)
@@ -238,10 +283,7 @@ fn load_person_labels(
     labels
 }
 
-fn open_repo(
-    path: &Path,
-    branch_name: &str,
-) -> Result<(Repository<Pile<valueschemas::Blake3>>, Id)> {
+fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("create pile dir {}: {e}", parent.display()))?;
@@ -252,17 +294,109 @@ fn open_repo(
     pile.restore()
         .map_err(|e| anyhow::anyhow!("restore pile {}: {e:?}", path.display()))?;
 
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
-            .release(),
+    Ok(Repository::new(pile, signing_key))
+}
+
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow::anyhow!("branch head {branch_name}: {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow::anyhow!("store branch name {branch_name}: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow::anyhow!("store branch metadata {branch_name}: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow::anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
+}
+
+fn load_config_branches(repo: &mut Repository<Pile<valueschemas::Blake3>>) -> Result<ConfigBranches> {
+    let Some(_config_head) = repo
+        .storage_mut()
+        .head(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow::anyhow!("config branch head: {e:?}"))?
+    else {
+        return Ok(ConfigBranches::default());
     };
-    Ok((repo, branch_id))
+
+    let mut ws = repo
+        .pull(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow::anyhow!("pull config workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout config workspace: {e:?}"))?;
+
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?config_id @
+            config_schema::kind: &CONFIG_KIND_ID,
+            config_schema::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.is_none_or(|(_, current)| key > current) {
+            latest = Some((config_id, key));
+        }
+    }
+    let Some((config_id, _)) = latest else {
+        return Ok(ConfigBranches::default());
+    };
+
+    let local_messages_branch_id = find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::local_messages_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
+    let relations_branch_id = find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::relations_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
+
+    Ok(ConfigBranches {
+        local_messages_branch_id,
+        relations_branch_id,
+    })
+}
+
+fn resolve_branch_id(
+    explicit_id: Option<Id>,
+    configured_id: Option<Id>,
+    branch_name: &str,
+) -> Result<Id> {
+    if let Some(id) = explicit_id {
+        return Ok(id);
+    }
+    configured_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing {branch_name} branch id in config (set it via `playground config set`)"
+        )
+    })
 }
 
 fn find_branch_by_name(
@@ -377,14 +511,16 @@ fn load_text(
 
 fn cmd_send(
     pile: &Path,
-    branch: &str,
-    relations_branch: &str,
+    branch_id: Id,
+    relations_branch_id: Id,
+    branch_name: &str,
     text: String,
     from: String,
     to: String,
 ) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
-    let relations_space = load_relations_space(&mut repo, relations_branch)?;
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
+    let relations_space = load_relations_space(&mut repo, relations_branch_id)?;
     let from_id = resolve_person_id(&relations_space, &from)?;
     let to_id = resolve_person_id(&relations_space, &to)?;
 
@@ -422,13 +558,15 @@ fn cmd_send(
 
 fn cmd_ack(
     pile: &Path,
-    branch: &str,
-    relations_branch: &str,
+    branch_id: Id,
+    relations_branch_id: Id,
+    branch_name: &str,
     id: String,
     by: String,
 ) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
-    let relations_space = load_relations_space(&mut repo, relations_branch)?;
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
+    let relations_space = load_relations_space(&mut repo, relations_branch_id)?;
     let reader_id = resolve_person_id(&relations_space, &by)?;
 
     let mut ws = repo
@@ -466,14 +604,16 @@ fn cmd_ack(
 
 fn cmd_list(
     pile: &Path,
-    branch: &str,
-    relations_branch: &str,
+    branch_id: Id,
+    relations_branch_id: Id,
+    branch_name: &str,
     reader: String,
     unread: bool,
     limit: usize,
 ) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
-    let relations_space = load_relations_space(&mut repo, relations_branch)?;
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
+    let relations_space = load_relations_space(&mut repo, relations_branch_id)?;
     let party_names = load_person_labels(&mut repo, &relations_space);
     let mut ws = repo
         .pull(branch_id)
@@ -614,11 +754,32 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
+    let branch_id_override = parse_optional_hex_id(cli.branch_id.as_deref(), "branch id")?;
+    let relations_branch_id_override =
+        parse_optional_hex_id(cli.relations_branch_id.as_deref(), "relations branch id")?;
+
+    let mut config_repo = open_repo(&cli.pile)?;
+    let config_branches = load_config_branches(&mut config_repo)?;
+    config_repo
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    let branch_id = resolve_branch_id(
+        branch_id_override,
+        config_branches.local_messages_branch_id,
+        &cli.branch,
+    )?;
+    let relations_branch_id = resolve_branch_id(
+        relations_branch_id_override,
+        config_branches.relations_branch_id,
+        &cli.relations_branch,
+    )?;
+
     match cmd {
         Command::Send { text, from, to } => cmd_send(
             &cli.pile,
+            branch_id,
+            relations_branch_id,
             &cli.branch,
-            &cli.relations_branch,
             text,
             from,
             to,
@@ -629,16 +790,18 @@ fn main() -> Result<()> {
             limit,
         } => cmd_list(
             &cli.pile,
+            branch_id,
+            relations_branch_id,
             &cli.branch,
-            &cli.relations_branch,
             reader,
             unread,
             limit,
         ),
         Command::Ack { id, by } => cmd_ack(
             &cli.pile,
+            branch_id,
+            relations_branch_id,
             &cli.branch,
-            &cli.relations_branch,
             id,
             by,
         ),
@@ -646,7 +809,14 @@ fn main() -> Result<()> {
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
+    let mut repo = open_repo(pile_path)?;
+    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+        id
+    } else {
+        repo.create_branch(ATLAS_BRANCH, None)
+            .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
+            .release()
+    };
     let metadata = build_local_metadata(repo.storage_mut())
         .map_err(|e| anyhow::anyhow!("build local metadata: {e:?}"))?;
 
@@ -737,7 +907,7 @@ fn describe_kind<B>(
     id: &Id,
     name: &str,
     description: &str,
-) -> std::result::Result<TribleSet, B::PutError>
+) -> std::result::Result<Fragment, B::PutError>
 where
     B: BlobStore<valueschemas::Blake3>,
 {

@@ -4,6 +4,7 @@
 //! anyhow = "1.0"
 //! clap = { version = "4.5.4", features = ["derive"] }
 //! ed25519-dalek = "2.1.1"
+//! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! time = { version = "0.3.36", features = ["formatting", "macros"] }
 //! triblespace = "0.16.0"
@@ -12,6 +13,7 @@
 use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -19,11 +21,14 @@ use std::path::{Path, PathBuf};
 use time::macros::format_description;
 use time::OffsetDateTime;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::branch as branch_proto;
+use triblespace::core::repo::{PushResult, Repository, Workspace};
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
 const ATLAS_BRANCH: &str = "atlas";
+const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const KIND_GOAL_LABEL: &str = "goal";
 const KIND_STATUS_LABEL: &str = "status";
 const KIND_NOTE_LABEL: &str = "note";
@@ -58,6 +63,15 @@ mod board {
     }
 }
 
+mod config_schema {
+    use super::*;
+    attributes! {
+        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
+        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
+        "EDEFFF6AFF6318E44CCF6A602B012604" as compass_branch_id: valueschemas::GenId;
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "compass", about = "A small TribleSpace kanban faculty")]
 struct Cli {
@@ -67,6 +81,9 @@ struct Cli {
     /// Branch name for the board
     #[arg(long, default_value = "compass", global = true)]
     branch: String,
+    /// Branch id for the board (hex). Overrides config.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -140,11 +157,21 @@ struct BoardState {
     note_events: Vec<NoteEvent>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ConfigBranches {
+    compass_branch_id: Option<Id>,
+}
+
 fn now_stamp() -> String {
     let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
     OffsetDateTime::now_utc()
         .format(&format)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    lower.to_tai_duration().total_nanoseconds()
 }
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
@@ -166,7 +193,21 @@ fn id_prefix(id: Id) -> String {
     hex[..8].to_string()
 }
 
-fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<valueschemas::Blake3>>, Id)> {
+fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{label} is empty");
+    }
+    let Some(id) = Id::from_hex(trimmed) else {
+        bail!("invalid {label} '{trimmed}'");
+    };
+    Ok(Some(id))
+}
+
+fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("create pile dir {}: {e}", parent.display()))?;
@@ -177,17 +218,93 @@ fn open_repo(path: &Path, branch_name: &str) -> Result<(Repository<Pile<valuesch
     pile.restore()
         .map_err(|e| anyhow::anyhow!("restore pile {}: {e:?}", path.display()))?;
 
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
-            .release(),
+    Ok(Repository::new(pile, signing_key))
+}
+
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow::anyhow!("branch head {branch_name}: {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow::anyhow!("store branch name {branch_name}: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow::anyhow!("store branch metadata {branch_name}: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow::anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
+}
+
+fn load_config_branches(repo: &mut Repository<Pile<valueschemas::Blake3>>) -> Result<ConfigBranches> {
+    let Some(_) = repo
+        .storage_mut()
+        .head(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow::anyhow!("config branch head: {e:?}"))?
+    else {
+        return Ok(ConfigBranches::default());
     };
-    Ok((repo, branch_id))
+    let mut ws = repo
+        .pull(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow::anyhow!("pull config workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout config workspace: {e:?}"))?;
+
+    let mut latest: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?config_id @
+            config_schema::kind: &CONFIG_KIND_ID,
+            config_schema::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        if latest.as_ref().is_none_or(|(_, current)| key > *current) {
+            latest = Some((config_id, key));
+        }
+    }
+    let Some((config_id, _)) = latest else {
+        return Ok(ConfigBranches::default());
+    };
+    let compass_branch_id = find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config_schema::compass_branch_id: ?value }])
+    )
+    .into_iter()
+    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
+
+    Ok(ConfigBranches { compass_branch_id })
+}
+
+fn resolve_branch_id(explicit_id: Option<Id>, configured_id: Option<Id>) -> Result<Id> {
+    if let Some(id) = explicit_id {
+        return Ok(id);
+    }
+    configured_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing compass branch id in config (set via `playground config set compass-branch-id <hex-id>`)"
+        )
+    })
 }
 
 fn find_branch_by_name(
@@ -620,7 +737,8 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
 
 fn cmd_add(
     pile: &Path,
-    branch: &str,
+    branch_name: &str,
+    branch_id: Id,
     title: String,
     status: String,
     parent: Option<String>,
@@ -634,7 +752,8 @@ fn cmd_add(
         validate_short("tag", tag)?;
     }
 
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -697,7 +816,8 @@ fn cmd_add(
 
 fn cmd_list(
     pile: &Path,
-    branch: &str,
+    branch_name: &str,
+    branch_id: Id,
     status_filter: Vec<String>,
     show_done: bool,
 ) -> Result<()> {
@@ -706,7 +826,8 @@ fn cmd_list(
         validate_short("status", status)?;
     }
 
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -721,11 +842,18 @@ fn cmd_list(
     res
 }
 
-fn cmd_move(pile: &Path, branch: &str, id: String, status: String) -> Result<()> {
+fn cmd_move(
+    pile: &Path,
+    branch_name: &str,
+    branch_id: Id,
+    id: String,
+    status: String,
+) -> Result<()> {
     let status = normalize_status(status);
     validate_short("status", &status)?;
 
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -757,8 +885,9 @@ fn cmd_move(pile: &Path, branch: &str, id: String, status: String) -> Result<()>
     Ok(())
 }
 
-fn cmd_note(pile: &Path, branch: &str, id: String, note: String) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+fn cmd_note(pile: &Path, branch_name: &str, branch_id: Id, id: String, note: String) -> Result<()> {
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -790,8 +919,9 @@ fn cmd_note(pile: &Path, branch: &str, id: String, note: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_show(pile: &Path, branch: &str, id: String) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
+fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result<()> {
+    let mut repo = open_repo(pile)?;
+    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
@@ -881,6 +1011,13 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
+    let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref(), "branch id")?;
+    let mut cfg_repo = open_repo(&cli.pile)?;
+    let cfg = load_config_branches(&mut cfg_repo)?;
+    cfg_repo
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    let branch_id = resolve_branch_id(explicit_branch_id, cfg.compass_branch_id)?;
 
     match cmd {
         Command::Add {
@@ -892,21 +1029,29 @@ fn main() -> Result<()> {
         } => cmd_add(
             &cli.pile,
             &cli.branch,
+            branch_id,
             title,
             status,
             parent,
             tag,
             note,
         ),
-        Command::List { status, all } => cmd_list(&cli.pile, &cli.branch, status, all),
-        Command::Move { id, status } => cmd_move(&cli.pile, &cli.branch, id, status),
-        Command::Note { id, note } => cmd_note(&cli.pile, &cli.branch, id, note),
-        Command::Show { id } => cmd_show(&cli.pile, &cli.branch, id),
+        Command::List { status, all } => cmd_list(&cli.pile, &cli.branch, branch_id, status, all),
+        Command::Move { id, status } => cmd_move(&cli.pile, &cli.branch, branch_id, id, status),
+        Command::Note { id, note } => cmd_note(&cli.pile, &cli.branch, branch_id, id, note),
+        Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
     }
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile_path, ATLAS_BRANCH)?;
+    let mut repo = open_repo(pile_path)?;
+    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+        id
+    } else {
+        repo.create_branch(ATLAS_BRANCH, None)
+            .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
+            .release()
+    };
     let metadata = build_compass_metadata(repo.storage_mut())
         .map_err(|e| anyhow::anyhow!("build compass metadata: {e:?}"))?;
 

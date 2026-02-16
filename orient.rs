@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::branch as branch_proto;
+use triblespace::core::repo::{PushResult, Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
@@ -31,8 +32,9 @@ const DEFAULT_COMPASS_BRANCH: &str = "compass";
 const DEFAULT_LOCAL_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
 const ATLAS_BRANCH: &str = "atlas";
-const CONFIG_BRANCH: &str = "config";
+const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const ORIENT_STATE_BRANCH: &str = "orient";
+const ORIENT_STATE_BRANCH_ID: Id = id_hex!("68C108C793D53853A504478A5A2D6551");
 
 const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
@@ -108,15 +110,6 @@ struct Cli {
     /// Path to the pile file to use
     #[arg(long, default_value = "self.pile", global = true)]
     pile: PathBuf,
-    /// Compass branch name
-    #[arg(long, default_value = DEFAULT_COMPASS_BRANCH, global = true)]
-    compass_branch: String,
-    /// Local messages branch name
-    #[arg(long, default_value = DEFAULT_LOCAL_BRANCH, global = true)]
-    local_branch: String,
-    /// Relations branch name
-    #[arg(long, default_value = DEFAULT_RELATIONS_BRANCH, global = true)]
-    relations_branch: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -439,11 +432,15 @@ fn latest_status(events: &[StatusEvent]) -> HashMap<Id, StatusEvent> {
 fn load_config_identity(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
 ) -> Result<ConfigIdentity> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), CONFIG_BRANCH)? else {
+    let Some(_config_head) = repo
+        .storage_mut()
+        .head(CONFIG_BRANCH_ID)
+        .map_err(|e| anyhow!("config branch head: {e:?}"))?
+    else {
         return Ok(ConfigIdentity::default());
     };
     let mut ws = repo
-        .pull(branch_id)
+        .pull(CONFIG_BRANCH_ID)
         .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
     let space = ws
         .checkout(..)
@@ -505,74 +502,90 @@ fn load_config_identity(
     })
 }
 
-fn branch_exists(pile: &mut Pile<valueschemas::Blake3>, id: Id) -> Result<bool> {
-    let iter = pile
-        .branches()
-        .map_err(|e| anyhow!("list branches: {e:?}"))?;
-    for entry in iter {
-        let branch_id = entry.map_err(|e| anyhow!("branch id: {e:?}"))?;
-        if branch_id == id {
-            return Ok(true);
-        }
+fn ensure_branch_with_id(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name} ({branch_id:x}): {e:?}"))?
+        .is_some()
+    {
+        return Ok(());
     }
-    Ok(false)
+
+    let name_blob = branch_name.to_owned().to_blob();
+    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
+    repo.storage_mut()
+        .put(name_blob)
+        .map_err(|e| anyhow!("store branch name blob {branch_name}: {e:?}"))?;
+    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
+    let metadata_handle = repo
+        .storage_mut()
+        .put(metadata.to_blob())
+        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
+    let result = repo
+        .storage_mut()
+        .update(branch_id, None, Some(metadata_handle))
+        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
+    match result {
+        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
+    }
 }
 
-fn resolve_branch_id_from_config_or_name(
+fn resolve_configured_branch_id(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     configured_id: Option<Id>,
-    fallback_name: &str,
+    branch_name: &str,
     create_if_missing: bool,
 ) -> Result<Id> {
-    if let Some(branch_id) = configured_id {
-        if branch_exists(repo.storage_mut(), branch_id)? {
-            return Ok(branch_id);
-        }
+    let branch_id = configured_id.ok_or_else(|| {
+        anyhow!("missing {branch_name} branch id in config (run `playground config set {branch_name}-branch-id <hex-id>`)")
+    })?;
+    if create_if_missing {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+    } else if repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("branch head {branch_name} ({branch_id:x}): {e:?}"))?
+        .is_none()
+    {
         bail!(
-            "configured branch id {:x} missing for '{fallback_name}' (update config)",
+            "configured branch id {:x} missing for '{branch_name}'",
             branch_id
         );
     }
-
-    if create_if_missing {
-        ensure_branch(repo, fallback_name)
-    } else {
-        find_branch_by_name(repo.storage_mut(), fallback_name)?
-            .ok_or_else(|| anyhow!("missing branch '{fallback_name}'"))
-    }
+    Ok(branch_id)
 }
 
-fn cmd_show(
-    pile: &Path,
-    compass_branch: &str,
-    local_branch: &str,
-    relations_branch: &str,
-    message_limit: usize,
-    doing_limit: usize,
-    todo_limit: usize,
-) -> Result<()> {
+fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: usize) -> Result<()> {
     let mut repo = open_repo(pile)?;
-    let current_heads =
-        load_watched_heads(&mut repo, local_branch, compass_branch, relations_branch)?;
-
     let config_identity = load_config_identity(&mut repo)?;
-    let local_branch_id = resolve_branch_id_from_config_or_name(
+    let local_branch_id = resolve_configured_branch_id(
         &mut repo,
         config_identity.local_messages_branch_id,
-        local_branch,
+        DEFAULT_LOCAL_BRANCH,
         true,
     )?;
-    let compass_branch_id = resolve_branch_id_from_config_or_name(
+    let compass_branch_id = resolve_configured_branch_id(
         &mut repo,
         config_identity.compass_branch_id,
-        compass_branch,
+        DEFAULT_COMPASS_BRANCH,
         true,
     )?;
-    let relations_branch_id = resolve_branch_id_from_config_or_name(
+    let relations_branch_id = resolve_configured_branch_id(
         &mut repo,
         config_identity.relations_branch_id,
-        relations_branch,
+        DEFAULT_RELATIONS_BRANCH,
         false,
+    )?;
+    let current_heads = load_watched_heads(
+        &mut repo,
+        local_branch_id,
+        compass_branch_id,
+        relations_branch_id,
     )?;
 
     let mut local_ws = repo
@@ -706,42 +719,27 @@ fn cmd_show(
 
 fn load_watched_heads(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    local_branch: &str,
-    compass_branch: &str,
-    relations_branch: &str,
+    local_branch_id: Id,
+    compass_branch_id: Id,
+    relations_branch_id: Id,
 ) -> Result<WatchedHeads> {
-    let config_identity = load_config_identity(repo)?;
-    let local_branch_id = resolve_branch_id_from_config_or_name(
-        repo,
-        config_identity.local_messages_branch_id,
-        local_branch,
-        true,
-    )?;
-    let compass_branch_id = resolve_branch_id_from_config_or_name(
-        repo,
-        config_identity.compass_branch_id,
-        compass_branch,
-        true,
-    )?;
-    let relations_branch_id = resolve_branch_id_from_config_or_name(
-        repo,
-        config_identity.relations_branch_id,
-        relations_branch,
-        false,
-    )?;
-
     Ok(WatchedHeads {
         local: branch_head_by_id(repo, local_branch_id)?,
         compass: branch_head_by_id(repo, compass_branch_id)?,
         relations: branch_head_by_id(repo, relations_branch_id)?,
-        config: branch_head_by_name(repo, CONFIG_BRANCH)?,
+        config: branch_head_by_id(repo, CONFIG_BRANCH_ID)?,
     })
 }
 
 fn load_checkpoint_heads(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
 ) -> Result<Option<WatchedHeads>> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), ORIENT_STATE_BRANCH)? else {
+    let Some(branch_id) = repo
+        .storage_mut()
+        .head(ORIENT_STATE_BRANCH_ID)
+        .map_err(|e| anyhow!("orient state branch head: {e:?}"))?
+        .map(|_| ORIENT_STATE_BRANCH_ID)
+    else {
         return Ok(None);
     };
     let mut ws = repo
@@ -795,7 +793,8 @@ fn save_checkpoint_heads(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     heads: &WatchedHeads,
 ) -> Result<()> {
-    let branch_id = ensure_branch(repo, ORIENT_STATE_BRANCH)?;
+    ensure_branch_with_id(repo, ORIENT_STATE_BRANCH_ID, ORIENT_STATE_BRANCH)?;
+    let branch_id = ORIENT_STATE_BRANCH_ID;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
@@ -833,18 +832,6 @@ fn branch_head_by_id(
     repo.storage_mut()
         .head(branch_id)
         .map_err(|e| anyhow!("branch head {:x}: {e:?}", branch_id))
-}
-
-fn branch_head_by_name(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_name: &str,
-) -> Result<Option<CommitHandle>> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? else {
-        return Ok(None);
-    };
-    repo.storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))
 }
 
 fn parse_sleep_target(target: Option<&SleepTarget>) -> Result<Option<Duration>> {
@@ -954,9 +941,6 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
 
 fn cmd_sleep(
     pile: &Path,
-    compass_branch: &str,
-    local_branch: &str,
-    relations_branch: &str,
     target: Option<SleepTarget>,
     message_limit: usize,
     doing_limit: usize,
@@ -965,10 +949,33 @@ fn cmd_sleep(
 ) -> Result<()> {
     let timeout = parse_sleep_target(target.as_ref())?;
     let mut repo = open_repo(pile)?;
+    let config_identity = load_config_identity(&mut repo)?;
+    let local_branch_id = resolve_configured_branch_id(
+        &mut repo,
+        config_identity.local_messages_branch_id,
+        DEFAULT_LOCAL_BRANCH,
+        true,
+    )?;
+    let compass_branch_id = resolve_configured_branch_id(
+        &mut repo,
+        config_identity.compass_branch_id,
+        DEFAULT_COMPASS_BRANCH,
+        true,
+    )?;
+    let relations_branch_id = resolve_configured_branch_id(
+        &mut repo,
+        config_identity.relations_branch_id,
+        DEFAULT_RELATIONS_BRANCH,
+        false,
+    )?;
     let mut detected_change_before_sleep = false;
     let wait_result = (|| -> Result<bool> {
-        let baseline =
-            load_watched_heads(&mut repo, local_branch, compass_branch, relations_branch)?;
+        let baseline = load_watched_heads(
+            &mut repo,
+            local_branch_id,
+            compass_branch_id,
+            relations_branch_id,
+        )?;
         if let Some(last_seen) = load_checkpoint_heads(&mut repo)? {
             if baseline != last_seen {
                 detected_change_before_sleep = true;
@@ -985,8 +992,12 @@ fn cmd_sleep(
                 }
             }
             std::thread::sleep(poll);
-            let current =
-                load_watched_heads(&mut repo, local_branch, compass_branch, relations_branch)?;
+            let current = load_watched_heads(
+                &mut repo,
+                local_branch_id,
+                compass_branch_id,
+                relations_branch_id,
+            )?;
             if current != baseline {
                 return Ok(true);
             }
@@ -1003,9 +1014,6 @@ fn cmd_sleep(
     }
     cmd_show(
         pile,
-        compass_branch,
-        local_branch,
-        relations_branch,
         message_limit,
         doing_limit,
         todo_limit,
@@ -1164,15 +1172,7 @@ fn main() -> Result<()> {
             message_limit,
             doing_limit,
             todo_limit,
-        } => cmd_show(
-            &cli.pile,
-            &cli.compass_branch,
-            &cli.local_branch,
-            &cli.relations_branch,
-            message_limit,
-            doing_limit,
-            todo_limit,
-        ),
+        } => cmd_show(&cli.pile, message_limit, doing_limit, todo_limit),
         Command::Sleep {
             target,
             message_limit,
@@ -1181,9 +1181,6 @@ fn main() -> Result<()> {
             poll_ms,
         } => cmd_sleep(
             &cli.pile,
-            &cli.compass_branch,
-            &cli.local_branch,
-            &cli.relations_branch,
             target,
             message_limit,
             doing_limit,
