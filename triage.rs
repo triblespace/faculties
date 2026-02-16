@@ -18,7 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
-use triblespace::core::repo::{Repository, Workspace};
+use triblespace::core::repo::pile::{Pile, ReadError};
+use triblespace::core::repo::{PullError, Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
@@ -327,6 +328,39 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     Ok(Repository::new(pile, SigningKey::generate(&mut OsRng)))
 }
 
+fn pull_workspace(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    branch_id: Id,
+    context: &str,
+) -> Result<Workspace<Pile<valueschemas::Blake3>>> {
+    match repo.pull(branch_id) {
+        Ok(ws) => Ok(ws),
+        Err(err) => {
+            let Some(valid_length) = pull_corrupt_valid_length(&err) else {
+                return Err(anyhow!("{context}: {err:?}"));
+            };
+            eprintln!(
+                "warning: {context}: corrupt pile tail (valid_length={valid_length}), restoring and retrying"
+            );
+            repo.storage_mut()
+                .restore()
+                .map_err(|restore_err| anyhow!("{context}: restore pile: {restore_err:?}"))?;
+            repo.pull(branch_id)
+                .map_err(|retry_err| anyhow!("{context} after restore: {retry_err:?}"))
+        }
+    }
+}
+
+fn pull_corrupt_valid_length<B: std::error::Error>(
+    err: &PullError<ReadError, ReadError, B>,
+) -> Option<usize> {
+    match err {
+        PullError::BlobReader(ReadError::CorruptPile { valid_length })
+        | PullError::BranchStorage(ReadError::CorruptPile { valid_length }) => Some(*valid_length),
+        _ => None,
+    }
+}
+
 fn find_branch_by_name(
     pile: &mut Pile<valueschemas::Blake3>,
     branch_name: &str,
@@ -388,9 +422,7 @@ fn load_latest_config(
         return Ok(None);
     };
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
+    let mut ws = pull_workspace(repo, branch_id, "pull config workspace")?;
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
@@ -956,9 +988,7 @@ fn cmd_scan(
 ) -> Result<()> {
     let config = load_latest_config(repo, cli.config_branch.as_str())?;
     let branch_id = resolve_target_branch(repo, cli, &config)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull target workspace: {e:?}"))?;
+    let mut ws = pull_workspace(repo, branch_id, "pull target workspace")?;
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout target workspace: {e:?}"))?;
@@ -1046,6 +1076,26 @@ fn cmd_scan(
         println!("- no contiguous failure loop >= {loop_min} in recent exec results");
     }
 
+    let recent_llm_failures = collect_recent_llm_failures(&llm_state, recent);
+    println!();
+    println!("Recent LLM failures");
+    if recent_llm_failures.is_empty() {
+        println!("- none in recent window");
+    } else {
+        for row in recent_llm_failures {
+            let age = row
+                .finished_at
+                .map(|at| format_age(now_key, at))
+                .unwrap_or_else(|| "-".to_string());
+            let detail = row
+                .error
+                .as_deref()
+                .map(first_line)
+                .unwrap_or_else(|| "<missing error text>".to_string());
+            println!("- {age} | {}", truncate_single_line(detail.as_str(), 140));
+        }
+    }
+
     println!();
     println!("Suggested next checks");
     if llm_pending > 0 && llm_state.in_progress.is_empty() {
@@ -1097,6 +1147,18 @@ fn cmd_scan(
     }
 
     Ok(())
+}
+
+fn collect_recent_llm_failures(state: &LlmState, recent: usize) -> Vec<LlmResultRow> {
+    let mut failures: Vec<LlmResultRow> = state
+        .results
+        .iter()
+        .filter(|row| row.error.is_some())
+        .cloned()
+        .collect();
+    failures.sort_by_key(|row| row.finished_at.unwrap_or(i128::MIN));
+    failures.reverse();
+    failures.into_iter().take(recent.min(5)).collect()
 }
 
 fn cmd_loops(
@@ -1173,14 +1235,11 @@ fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
     let branch_id = ensure_branch(&mut repo, atlas_branch)?;
 
     let mut metadata_set = TribleSet::new();
-    metadata_set += <valueschemas::GenId as metadata::ConstDescribe>::describe(
-        repo.storage_mut(),
-    )?;
+    metadata_set += <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
     metadata_set +=
         <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata_set += <valueschemas::U256BE as metadata::ConstDescribe>::describe(
-        repo.storage_mut(),
-    )?;
+    metadata_set +=
+        <valueschemas::U256BE as metadata::ConstDescribe>::describe(repo.storage_mut())?;
     metadata_set +=
         <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
     metadata_set += <valueschemas::Handle<
@@ -1189,7 +1248,8 @@ fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
     > as metadata::ConstDescribe>::describe(
         repo.storage_mut()
     )?;
-    metadata_set += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+    metadata_set +=
+        <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
     metadata_set += metadata::Describe::describe(&config::kind, repo.storage_mut())?;
     metadata_set += metadata::Describe::describe(&config::updated_at, repo.storage_mut())?;
