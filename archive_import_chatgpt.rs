@@ -640,11 +640,23 @@ fn main() -> Result<()> {
         cli.branch_id.as_deref(),
     )?;
     let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, branch_id, &cli.branch)?;
-    let stats = import_chatgpt_path(&path, &mut repo, branch_id)?;
-    println!(
-        "Imported {} conversation(s), {} message(s), {} attachment(s) in {} new commit(s).",
-        stats.conversations, stats.messages, stats.attachments, stats.commits
-    );
-    repo.close()
-        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()))
+    let res = import_chatgpt_path(&path, &mut repo, branch_id);
+    let close_res = repo
+        .close()
+        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    match (res, close_res) {
+        (Ok(stats), Ok(())) => {
+            println!(
+                "Imported {} conversation(s), {} message(s), {} attachment(s) in {} new commit(s).",
+                stats.conversations, stats.messages, stats.attachments, stats.commits
+            );
+            Ok(())
+        }
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close_err)) => {
+            eprintln!("warning: close pile after error: {close_err:#}");
+            Err(err)
+        }
+    }
 }

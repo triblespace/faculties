@@ -283,45 +283,45 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
 
 fn load_config_snapshot(pile_path: &Path) -> Result<ConfigSnapshot> {
     let debug = std::env::var_os("PLAYGROUND_WEB_DEBUG").is_some();
-    let mut repo = open_repo(pile_path)?;
-    let snapshot = if repo
-        .storage_mut()
-        .head(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("config branch head: {e:?}"))?
-        .is_none()
-    {
-        ConfigSnapshot::default()
-    } else {
-        let mut ws = repo
-            .pull(CONFIG_BRANCH_ID)
-            .map_err(|e| anyhow!("pull config: {e:?}"))?;
-        let space = ws.checkout(..).map_err(|e| anyhow!("checkout config: {e:?}"))?;
-        match latest_config_id(&space)? {
-            Some(config_id) => {
-                if debug {
-                    eprintln!("[web] latest config id: {config_id:x}");
+    with_repo(pile_path, |repo| {
+        let snapshot = if repo
+            .storage_mut()
+            .head(CONFIG_BRANCH_ID)
+            .map_err(|e| anyhow!("config branch head: {e:?}"))?
+            .is_none()
+        {
+            ConfigSnapshot::default()
+        } else {
+            let mut ws = repo
+                .pull(CONFIG_BRANCH_ID)
+                .map_err(|e| anyhow!("pull config: {e:?}"))?;
+            let space = ws.checkout(..).map_err(|e| anyhow!("checkout config: {e:?}"))?;
+            match latest_config_id(&space)? {
+                Some(config_id) => {
+                    if debug {
+                        eprintln!("[web] latest config id: {config_id:x}");
+                    }
+                    ConfigSnapshot {
+                        tavily_api_key: load_string_attr(
+                            &mut ws,
+                            &space,
+                            config_id,
+                            config_schema::tavily_api_key,
+                        )?,
+                        exa_api_key: load_string_attr(
+                            &mut ws,
+                            &space,
+                            config_id,
+                            config_schema::exa_api_key,
+                        )?,
+                        web_branch_id: load_id_attr(&space, config_id, config_schema::web_branch_id),
+                    }
                 }
-                ConfigSnapshot {
-                    tavily_api_key: load_string_attr(
-                        &mut ws,
-                        &space,
-                        config_id,
-                        config_schema::tavily_api_key,
-                    )?,
-                    exa_api_key: load_string_attr(
-                        &mut ws,
-                        &space,
-                        config_id,
-                        config_schema::exa_api_key,
-                    )?,
-                    web_branch_id: load_id_attr(&space, config_id, config_schema::web_branch_id),
-                }
+                None => ConfigSnapshot::default(),
             }
-            None => ConfigSnapshot::default(),
-        }
-    };
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(snapshot)
+        };
+        Ok(snapshot)
+    })
 }
 
 fn resolve_store_branch_id(cli: &Cli, configured_id: Option<Id>) -> Result<Id> {
@@ -436,97 +436,93 @@ fn store_search(
     query: &str,
     results: &[SearchResult],
 ) -> Result<()> {
-    let mut repo = open_repo(&cli.pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, cli.branch.as_str())?;
-    let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-    let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
+    with_repo(&cli.pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, cli.branch.as_str())?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
+        let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
 
-    let provider_str = match provider {
-        Provider::Tavily => "tavily",
-        Provider::Exa => "exa",
-        Provider::Auto => "auto",
-    };
-    let created_at = epoch_interval(now_epoch());
-    let query_handle = ws.put(query.to_string());
-
-    let search_fragment = entity! { _ @
-        metadata::tag: &web_schema::kind_search,
-        web_schema::query: query_handle,
-        web_schema::provider: provider_str,
-        web_schema::created_at: created_at,
-    };
-    let search_id = search_fragment
-        .root()
-        .ok_or_else(|| anyhow!("search fragment missing root export"))?;
-
-    let mut change = TribleSet::new();
-    change += search_fragment;
-
-    for r in results {
-        let url_handle = ws.put(r.url.clone());
-        let result_base = entity! { _ @
-            metadata::tag: &web_schema::kind_result,
-            web_schema::url: url_handle,
+        let provider_str = match provider {
+            Provider::Tavily => "tavily",
+            Provider::Exa => "exa",
+            Provider::Auto => "auto",
         };
-        let result_id = result_base
+        let created_at = epoch_interval(now_epoch());
+        let query_handle = ws.put(query.to_string());
+
+        let search_fragment = entity! { _ @
+            metadata::tag: &web_schema::kind_search,
+            web_schema::query: query_handle,
+            web_schema::provider: provider_str,
+            web_schema::created_at: created_at,
+        };
+        let search_id = search_fragment
             .root()
-            .ok_or_else(|| anyhow!("result fragment missing root export"))?;
-        change += result_base;
-        change += entity! { ExclusiveId::force_ref(&search_id) @ web_schema::result: result_id };
+            .ok_or_else(|| anyhow!("search fragment missing root export"))?;
 
-        if let Some(title) = r.title.as_deref().filter(|s| !s.is_empty()) {
-            change += entity! { ExclusiveId::force_ref(&result_id) @ web_schema::title: ws.put(title.to_string()) };
+        let mut change = TribleSet::new();
+        change += search_fragment;
+
+        for r in results {
+            let url_handle = ws.put(r.url.clone());
+            let result_base = entity! { _ @
+                metadata::tag: &web_schema::kind_result,
+                web_schema::url: url_handle,
+            };
+            let result_id = result_base
+                .root()
+                .ok_or_else(|| anyhow!("result fragment missing root export"))?;
+            change += result_base;
+            change += entity! { ExclusiveId::force_ref(&search_id) @ web_schema::result: result_id };
+
+            if let Some(title) = r.title.as_deref().filter(|s| !s.is_empty()) {
+                change += entity! { ExclusiveId::force_ref(&result_id) @ web_schema::title: ws.put(title.to_string()) };
+            }
+            if let Some(snippet) = r.snippet.as_deref().filter(|s| !s.is_empty()) {
+                change += entity! { ExclusiveId::force_ref(&result_id) @ web_schema::snippet: ws.put(snippet.to_string()) };
+            }
         }
-        if let Some(snippet) = r.snippet.as_deref().filter(|s| !s.is_empty()) {
-            change += entity! { ExclusiveId::force_ref(&result_id) @ web_schema::snippet: ws.put(snippet.to_string()) };
+
+        let delta = change.difference(&catalog);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("web search"));
+            push_workspace(repo, &mut ws).context("push web search")?;
         }
-    }
 
-    let delta = change.difference(&catalog);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("web search"));
-        push_workspace(&mut repo, &mut ws).context("push web search")?;
-    }
-
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn store_fetch(cli: &Cli, branch_id: Id, provider: Provider, url: &str, content: &str) -> Result<()> {
-    let mut repo = open_repo(&cli.pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, cli.branch.as_str())?;
-    let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
-    let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
+    with_repo(&cli.pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, cli.branch.as_str())?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull web ws: {e:?}"))?;
+        let catalog = ws.checkout(..).map_err(|e| anyhow!("checkout web ws: {e:?}"))?;
 
-    let provider_str = match provider {
-        Provider::Tavily => "tavily",
-        Provider::Exa => "exa",
-        Provider::Auto => "auto",
-    };
-    let created_at = epoch_interval(now_epoch());
-    let url_handle = ws.put(url.to_string());
-    let content_handle = ws.put(content.to_string());
+        let provider_str = match provider {
+            Provider::Tavily => "tavily",
+            Provider::Exa => "exa",
+            Provider::Auto => "auto",
+        };
+        let created_at = epoch_interval(now_epoch());
+        let url_handle = ws.put(url.to_string());
+        let content_handle = ws.put(content.to_string());
 
-    let fetch_fragment = entity! { _ @
-        metadata::tag: &web_schema::kind_fetch,
-        web_schema::provider: provider_str,
-        web_schema::created_at: created_at,
-        web_schema::url: url_handle,
-        web_schema::content: content_handle,
-    };
+        let fetch_fragment = entity! { _ @
+            metadata::tag: &web_schema::kind_fetch,
+            web_schema::provider: provider_str,
+            web_schema::created_at: created_at,
+            web_schema::url: url_handle,
+            web_schema::content: content_handle,
+        };
 
-    let delta = fetch_fragment.difference(&catalog);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("web fetch"));
-        push_workspace(&mut repo, &mut ws).context("push web fetch")?;
-    }
+        let delta = fetch_fragment.difference(&catalog);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("web fetch"));
+            push_workspace(repo, &mut ws).context("push web fetch")?;
+        }
 
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
-
-    Ok(())
+        Ok(())
+    })
 }
 
 fn push_workspace(repo: &mut Repository<Pile<Blake3>>, ws: &mut Workspace<Pile<Blake3>>) -> Result<()> {
@@ -719,29 +715,29 @@ fn exa_contents(client: &Client, api_key: &str, url: &str, max_characters: usize
 // --- Atlas schema metadata ---
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-        id
-    } else {
-        repo.create_branch(ATLAS_BRANCH, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release()
-    };
-    let metadata = build_web_metadata(repo.storage_mut())
-        .map_err(|e| anyhow!("build web metadata: {e:?}"))?;
+    with_repo(pile_path, |repo| {
+        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+            id
+        } else {
+            repo.create_branch(ATLAS_BRANCH, None)
+                .map_err(|e| anyhow!("create branch: {e:?}"))?
+                .release()
+        };
+        let metadata = build_web_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build web metadata: {e:?}"))?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull atlas: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull atlas: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn build_web_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
@@ -814,11 +810,30 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
 
     let mut pile = Pile::<Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore().map_err(|e| anyhow!("restore pile {}: {e:?}", path.display())) {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(err);
+    }
 
     let signing_key = SigningKey::generate(&mut OsRng);
     Ok(Repository::new(pile, signing_key))
+}
+
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch_with_id(

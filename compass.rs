@@ -215,11 +215,35 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow::anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow::anyhow!(
+            "restore pile {}: {err:?}",
+            path.display()
+        ));
+    }
 
     let signing_key = SigningKey::generate(&mut OsRng);
     Ok(Repository::new(pile, signing_key))
+}
+
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch_with_id(
@@ -752,19 +776,18 @@ fn cmd_add(
         validate_short("tag", tag)?;
     }
 
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let parent_id = match parent {
-        Some(parent_input) => {
-            let board = load_board(&mut ws)?;
-            Some(resolve_task_id(&parent_input, &board.tasks)?)
-        }
-        None => None,
-    };
-    let task_ref = {
+    let task_ref = with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let parent_id = match parent {
+            Some(parent_input) => {
+                let board = load_board(&mut ws)?;
+                Some(resolve_task_id(&parent_input, &board.tasks)?)
+            }
+            None => None,
+        };
         let task_id = ufoid();
         let task_ref = task_id.id;
         let now = now_stamp();
@@ -805,11 +828,8 @@ fn cmd_add(
         ws.commit(change, None, Some("add goal"));
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push goal: {e:?}"))?;
-        task_ref
-    };
-    drop(ws);
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+        Ok(task_ref)
+    })?;
     println!("Added goal {:x}", task_ref);
     Ok(())
 }
@@ -826,20 +846,15 @@ fn cmd_list(
         validate_short("status", status)?;
     }
 
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let res = (|| -> Result<()> {
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
         render_board(&board, &status_filter, show_done);
         Ok(())
-    })();
-    drop(ws);
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    res
+    })
 }
 
 fn cmd_move(
@@ -852,12 +867,11 @@ fn cmd_move(
     let status = normalize_status(status);
     validate_short("status", &status)?;
 
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let res = (|| -> Result<Id> {
+    let task_id = with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
         let task_id = resolve_task_id(&id, &board.tasks)?;
         let now = now_stamp();
@@ -876,22 +890,17 @@ fn cmd_move(
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push status: {e:?}"))?;
         Ok(task_id)
-    })();
-    drop(ws);
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    let task_id = res?;
+    })?;
     println!("Moved goal {:x} to {}", task_id, status);
     Ok(())
 }
 
 fn cmd_note(pile: &Path, branch_name: &str, branch_id: Id, id: String, note: String) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let res = (|| -> Result<Id> {
+    let task_id = with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
         let task_id = resolve_task_id(&id, &board.tasks)?;
         let now = now_stamp();
@@ -910,22 +919,17 @@ fn cmd_note(pile: &Path, branch_name: &str, branch_id: Id, id: String, note: Str
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push note: {e:?}"))?;
         Ok(task_id)
-    })();
-    drop(ws);
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    let task_id = res?;
+    })?;
     println!("Noted goal {:x}", task_id);
     Ok(())
 }
 
 fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let res = (|| -> Result<()> {
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
         let task_id = resolve_task_id(&id, &board.tasks)?;
 
@@ -993,11 +997,7 @@ fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result
             }
         }
         Ok(())
-    })();
-    drop(ws);
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    res
+    })
 }
 
 fn main() -> Result<()> {
@@ -1012,11 +1012,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref(), "branch id")?;
-    let mut cfg_repo = open_repo(&cli.pile)?;
-    let cfg = load_config_branches(&mut cfg_repo)?;
-    cfg_repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    let cfg = with_repo(&cli.pile, load_config_branches)?;
     let branch_id = resolve_branch_id(explicit_branch_id, cfg.compass_branch_id)?;
 
     match cmd {
@@ -1044,32 +1040,31 @@ fn main() -> Result<()> {
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-        id
-    } else {
-        repo.create_branch(ATLAS_BRANCH, None)
-            .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
-            .release()
-    };
-    let metadata = build_compass_metadata(repo.storage_mut())
-        .map_err(|e| anyhow::anyhow!("build compass metadata: {e:?}"))?;
+    with_repo(pile_path, |repo| {
+        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+            id
+        } else {
+            repo.create_branch(ATLAS_BRANCH, None)
+                .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
+                .release()
+        };
+        let metadata = build_compass_metadata(repo.storage_mut())
+            .map_err(|e| anyhow::anyhow!("build compass metadata: {e:?}"))?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull atlas workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout atlas workspace: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull atlas workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout atlas workspace: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn build_compass_metadata<B>(

@@ -307,21 +307,34 @@ pub fn default_pile_path() -> PathBuf {
 
 pub fn open_repo_for_write(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<(Repo, Id)> {
     let mut repo = open_repo(pile_path)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    seed_default_metadata(&mut repo)?;
+    let res = (|| -> Result<(), anyhow::Error> {
+        ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
+        seed_default_metadata(&mut repo)?;
+        Ok(())
+    })();
+    if let Err(err) = res {
+        let _ = repo.close();
+        return Err(err);
+    }
     Ok((repo, branch_id))
 }
 
 pub fn open_repo_for_read(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<(Repo, Id)> {
     let mut repo = open_repo(pile_path)?;
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
-        .is_none()
-    {
-        repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-        return Err(anyhow!("unknown branch {branch_name} ({branch_id:x})"));
+    let res = (|| -> Result<(), anyhow::Error> {
+        if repo
+            .storage_mut()
+            .head(branch_id)
+            .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
+            .is_none()
+        {
+            return Err(anyhow!("unknown branch {branch_name} ({branch_id:x})"));
+        }
+        Ok(())
+    })();
+    if let Err(err) = res {
+        let _ = repo.close();
+        return Err(err);
     }
     Ok((repo, branch_id))
 }
@@ -336,9 +349,7 @@ pub fn resolve_archive_branch_id(
         branch_id_override.or(env_branch_id.as_deref()),
         "branch id",
     )?;
-    let mut repo = open_repo(pile_path)?;
-    let config = load_config_branches(&mut repo)?;
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+    let config = with_repo(pile_path, load_config_branches)?;
     resolve_branch_id(explicit, config.archive_branch_id, branch_name)
 }
 
@@ -350,22 +361,26 @@ fn open_repo(pile_path: &Path) -> Result<Repo> {
 
     let mut pile =
         Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile: {e:?}"))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow!("restore pile: {err:?}"));
+    }
     let signing_key = SigningKey::generate(&mut OsRng);
     Ok(Repository::new(pile, signing_key))
 }
 
-fn open_repo_for_atlas(pile_path: &Path, branch_name: &str) -> Result<(Repo, Id)> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = match find_branch_by_name(repo.storage_mut(), branch_name)? {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release(),
-    };
-    Ok((repo, branch_id))
+fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repo) -> Result<T>) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch_with_id(
@@ -448,27 +463,33 @@ pub fn seed_default_metadata(repo: &mut Repo) -> Result<()> {
 }
 
 pub fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let (mut repo, branch_id) = open_repo_for_atlas(pile_path, ATLAS_BRANCH)?;
-    let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
-        .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
-    metadata += import_schema::build_import_metadata(repo.storage_mut())
-        .map_err(|e| anyhow!("build import metadata: {e:?}"))?;
+    with_repo(pile_path, |repo| {
+        let branch_id = match find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+            Some(id) => id,
+            None => repo
+                .create_branch(ATLAS_BRANCH, None)
+                .map_err(|e| anyhow!("create branch: {e:?}"))?
+                .release(),
+        };
+        let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
+        metadata += import_schema::build_import_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build import metadata: {e:?}"))?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn load_config_branches(repo: &mut Repo) -> Result<ConfigBranches> {

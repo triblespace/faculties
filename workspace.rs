@@ -237,11 +237,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
     let explicit_branch_id = parse_optional_hex_id_labeled(branch_id.as_deref(), "branch id")?;
-    let mut cfg_repo = open_repo(&pile)?;
-    let cfg = load_config_branches(&mut cfg_repo)?;
-    cfg_repo
-        .close()
-        .map_err(|err| anyhow!("close pile: {err:?}"))?;
+    let cfg = with_repo(&pile, load_config_branches)?;
     let workspace_branch_id = resolve_branch_id(
         explicit_branch_id,
         cfg.workspace_branch_id,
@@ -258,32 +254,31 @@ fn main() -> Result<()> {
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-        id
-    } else {
-        repo.create_branch(ATLAS_BRANCH, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release()
-    };
-    let metadata = build_workspace_metadata(repo.storage_mut())
-        .map_err(|e| anyhow!("build workspace metadata: {e:?}"))?;
+    with_repo(pile_path, |repo| {
+        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+            id
+        } else {
+            repo.create_branch(ATLAS_BRANCH, None)
+                .map_err(|e| anyhow!("create branch: {e:?}"))?
+                .release()
+        };
+        let metadata = build_workspace_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build workspace metadata: {e:?}"))?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close()
-        .map_err(|err| anyhow!("close pile: {err:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn build_workspace_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
@@ -421,30 +416,27 @@ where
 }
 
 fn cmd_capture(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceCaptureArgs) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch)?;
     let mappings = build_mappings(&args.paths)?;
-    let snapshot_id = capture_snapshot(&mut repo, branch_id, &mappings, args.label.as_deref())?;
+    let snapshot_id = with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch)?;
+        capture_snapshot(repo, branch_id, &mappings, args.label.as_deref())
+    })?;
     println!("snapshot: {snapshot_id:x}");
-    repo.close()
-        .map_err(|err| anyhow!("close pile: {err:?}"))?;
     Ok(())
 }
 
 fn cmd_list(pile: &Path, branch: &str, branch_id: Id) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch)?;
-    let snapshots = list_snapshots(&mut repo, branch_id)?;
+    let snapshots = with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch)?;
+        list_snapshots(repo, branch_id)
+    })?;
     print_snapshots(&snapshots);
-    repo.close()
-        .map_err(|err| anyhow!("close pile: {err:?}"))?;
     Ok(())
 }
 
 fn cmd_diff(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceDiffArgs) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch)?;
-    let result = (|| -> Result<()> {
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|err| anyhow!("pull workspace branch: {err:?}"))?;
@@ -500,24 +492,12 @@ fn cmd_diff(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceDiffArgs) -
             left.id, right.id
         );
         Ok(())
-    })();
-
-    let close_result = repo.close().map_err(|err| anyhow!("close pile: {err:?}"));
-    match (result, close_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(err)) => Err(err),
-        (Err(err), Ok(())) => Err(err),
-        (Err(err), Err(close_err)) => {
-            eprintln!("warning: close pile after error: {close_err:#}");
-            Err(err)
-        }
-    }
+    })
 }
 
 fn cmd_merge(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceMergeArgs) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch)?;
-    let result = (|| -> Result<()> {
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|err| anyhow!("pull workspace branch: {err:?}"))?;
@@ -602,32 +582,20 @@ fn cmd_merge(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceMergeArgs)
             args.conflicts
         );
         Ok(())
-    })();
-
-    let close_result = repo.close().map_err(|err| anyhow!("close pile: {err:?}"));
-    match (result, close_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(err)) => Err(err),
-        (Err(err), Ok(())) => Err(err),
-        (Err(err), Err(close_err)) => {
-            eprintln!("warning: close pile after error: {close_err:#}");
-            Err(err)
-        }
-    }
+    })
 }
 
 fn cmd_restore(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceRestoreArgs) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch)?;
     let snapshot_id = parse_optional_hex_id(args.snapshot.as_deref())?;
     let target = args.target.unwrap_or_else(|| PathBuf::from("."));
-    let restored = restore_snapshot(&mut repo, branch_id, snapshot_id, &target, args.force)?;
+    let restored = with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch)?;
+        restore_snapshot(repo, branch_id, snapshot_id, &target, args.force)
+    })?;
     match restored {
         Some(id) => println!("restored: {id:x}"),
         None => println!("no snapshots found"),
     }
-    repo.close()
-        .map_err(|err| anyhow!("close pile: {err:?}"))?;
     Ok(())
 }
 
@@ -639,10 +607,29 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
 
     let mut pile = Pile::<Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow!("restore pile {}: {err:?}", path.display()));
+    }
     let signing_key = SigningKey::generate(&mut OsRng);
     Ok(Repository::new(pile, signing_key))
+}
+
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo.close().map_err(|err| anyhow!("close pile: {err:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch_with_id(

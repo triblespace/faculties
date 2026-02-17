@@ -260,11 +260,30 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     }
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow!("restore pile {}: {err:?}", path.display()));
+    }
 
     let signing_key = SigningKey::generate(&mut OsRng);
     Ok(Repository::new(pile, signing_key))
+}
+
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch_with_id(
@@ -580,65 +599,65 @@ fn cmd_add(
         None => ufoid().id,
     };
 
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut change = ensure_kind_entities(&mut ws)?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let mut change = ensure_kind_entities(&mut ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
-    if let Some(existing) = find_person_by_label(&space, &label)? {
-        if existing != person_id {
-            bail!(
-                "label '{label}' already belongs to person {}",
-                id_prefix(existing)
-            );
+        if let Some(existing) = find_person_by_label(&space, &label)? {
+            if existing != person_id {
+                bail!(
+                    "label '{label}' already belongs to person {}",
+                    id_prefix(existing)
+                );
+            }
         }
-    }
 
-    let label_handle = ws.put(label.clone());
-    change += entity! { ExclusiveId::force_ref(&person_id) @
-        metadata::tag: &KIND_PERSON_ID,
-        metadata::name: label_handle,
-    };
+        let label_handle = ws.put(label.clone());
+        change += entity! { ExclusiveId::force_ref(&person_id) @
+            metadata::tag: &KIND_PERSON_ID,
+            metadata::name: label_handle,
+        };
 
-    if let Some(display) = display_name {
-        let handle = ws.put(display);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
-    }
-    if let Some(value) = first_name {
-        let handle = ws.put(value);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
-    }
-    if let Some(value) = last_name {
-        let handle = ws.put(value);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
-    }
-    if let Some(value) = affinity {
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
-    }
-    if let Some(value) = note {
-        let handle = ws.put(value);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
-    }
-    if let Some(value) = teams_user_id {
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::teams_user_id: value };
-    }
-    if let Some(value) = email {
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::email: value };
-    }
-    for alias in aliases {
-        let alias = alias.trim();
-        if !alias.is_empty() {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::alias: alias.to_string() };
+        if let Some(display) = display_name {
+            let handle = ws.put(display);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
         }
-    }
+        if let Some(value) = first_name {
+            let handle = ws.put(value);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
+        }
+        if let Some(value) = last_name {
+            let handle = ws.put(value);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
+        }
+        if let Some(value) = affinity {
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
+        }
+        if let Some(value) = note {
+            let handle = ws.put(value);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
+        }
+        if let Some(value) = teams_user_id {
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::teams_user_id: value };
+        }
+        if let Some(value) = email {
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::email: value };
+        }
+        for alias in aliases {
+            let alias = alias.trim();
+            if !alias.is_empty() {
+                change += entity! { ExclusiveId::force_ref(&person_id) @ relations::alias: alias.to_string() };
+            }
+        }
 
-    ws.commit(change, None, Some("relations add"));
-    repo.push(&mut ws).map_err(|e| anyhow!("push person: {e:?}"))?;
-    drop(ws);
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+        ws.commit(change, None, Some("relations add"));
+        repo.push(&mut ws).map_err(|e| anyhow!("push person: {e:?}"))?;
+        Ok(())
+    })?;
     println!("Added {} ({label}).", format!("{person_id:x}"));
     Ok(())
 }
@@ -660,229 +679,225 @@ fn cmd_set(
 ) -> Result<()> {
     let label = label.map(|l| normalize_label(&l)).transpose()?;
 
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut change = ensure_kind_entities(&mut ws)?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+    let person_id = with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let mut change = ensure_kind_entities(&mut ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
-    let person_id = resolve_person_id(&space, &id)?;
+        let person_id = resolve_person_id(&space, &id)?;
 
-    if let Some(label) = label {
-        if let Some(existing) = find_person_by_label(&space, &label)? {
-            if existing != person_id {
-                bail!(
-                    "label '{label}' already belongs to person {}",
-                    id_prefix(existing)
-                );
+        if let Some(label) = label {
+            if let Some(existing) = find_person_by_label(&space, &label)? {
+                if existing != person_id {
+                    bail!(
+                        "label '{label}' already belongs to person {}",
+                        id_prefix(existing)
+                    );
+                }
+            }
+            let handle = ws.put(label);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::name: handle };
+        }
+        if let Some(display) = display_name {
+            let handle = ws.put(display);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
+        }
+        if let Some(value) = first_name {
+            let handle = ws.put(value);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
+        }
+        if let Some(value) = last_name {
+            let handle = ws.put(value);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
+        }
+        if let Some(value) = affinity {
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
+        }
+        if let Some(value) = note {
+            let handle = ws.put(value);
+            change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
+        }
+        if let Some(value) = teams_user_id {
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::teams_user_id: value };
+        }
+        if let Some(value) = email {
+            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::email: value };
+        }
+        for alias in aliases {
+            let alias = alias.trim();
+            if !alias.is_empty() {
+                change += entity! { ExclusiveId::force_ref(&person_id) @ relations::alias: alias.to_string() };
             }
         }
-        let handle = ws.put(label);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::name: handle };
-    }
-    if let Some(display) = display_name {
-        let handle = ws.put(display);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
-    }
-    if let Some(value) = first_name {
-        let handle = ws.put(value);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
-    }
-    if let Some(value) = last_name {
-        let handle = ws.put(value);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
-    }
-    if let Some(value) = affinity {
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
-    }
-    if let Some(value) = note {
-        let handle = ws.put(value);
-        change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
-    }
-    if let Some(value) = teams_user_id {
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::teams_user_id: value };
-    }
-    if let Some(value) = email {
-        change += entity! { ExclusiveId::force_ref(&person_id) @ relations::email: value };
-    }
-    for alias in aliases {
-        let alias = alias.trim();
-        if !alias.is_empty() {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::alias: alias.to_string() };
-        }
-    }
 
-    if !change.is_empty() {
-        ws.commit(change, None, Some("relations set"));
-        repo.push(&mut ws).map_err(|e| anyhow!("push person: {e:?}"))?;
-    }
-    drop(ws);
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+        if !change.is_empty() {
+            ws.commit(change, None, Some("relations set"));
+            repo.push(&mut ws).map_err(|e| anyhow!("push person: {e:?}"))?;
+        }
+        Ok(person_id)
+    })?;
     println!("Updated {}.", format!("{person_id:x}"));
     Ok(())
 }
 
 fn cmd_list(pile: &Path, branch_name: &str, branch_id: Id, limit: usize) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut people = load_people(&mut ws)?;
-    people.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let mut people = load_people(&mut ws)?;
+        people.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.id.cmp(&b.id)));
 
-    if people.is_empty() {
-        println!("No people.");
-    } else {
-        for person in people.into_iter().take(limit) {
-            let label = person
-                .label
-                .clone()
-                .unwrap_or_else(|| "<unnamed>".to_string());
-            let mut line = format!("[{}] {}", id_prefix(person.id), label);
-            let fallback_name = match (&person.first_name, &person.last_name) {
-                (Some(first), Some(last)) => Some(format!("{first} {last}")),
-                (Some(first), None) => Some(first.clone()),
-                (None, Some(last)) => Some(last.clone()),
-                (None, None) => None,
-            };
-            let display = person.display_name.as_ref().or(fallback_name.as_ref());
-            if let Some(display) = display {
-                line.push_str(&format!(" ({display})"));
+        if people.is_empty() {
+            println!("No people.");
+        } else {
+            for person in people.into_iter().take(limit) {
+                let label = person
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| "<unnamed>".to_string());
+                let mut line = format!("[{}] {}", id_prefix(person.id), label);
+                let fallback_name = match (&person.first_name, &person.last_name) {
+                    (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                    (Some(first), None) => Some(first.clone()),
+                    (None, Some(last)) => Some(last.clone()),
+                    (None, None) => None,
+                };
+                let display = person.display_name.as_ref().or(fallback_name.as_ref());
+                if let Some(display) = display {
+                    line.push_str(&format!(" ({display})"));
+                }
+                if let Some(affinity) = &person.affinity {
+                    line.push_str(&format!(" [{affinity}]"));
+                }
+                println!("{line}");
             }
-            if let Some(affinity) = &person.affinity {
-                line.push_str(&format!(" [{affinity}]"));
-            }
-            println!("{line}");
         }
-    }
-
-    drop(ws);
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        Ok(())
+    })
 }
 
 fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
-    let person_id = resolve_person_id(&space, &id)?;
-    let people = load_people(&mut ws)?;
-    let Some(person) = people.into_iter().find(|p| p.id == person_id) else {
-        bail!("unknown person id {id}");
-    };
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let person_id = resolve_person_id(&space, &id)?;
+        let people = load_people(&mut ws)?;
+        let Some(person) = people.into_iter().find(|p| p.id == person_id) else {
+            bail!("unknown person id {id}");
+        };
 
-    println!("id: {:x}", person.id);
-    if let Some(label) = person.label {
-        println!("label: {label}");
-    }
-    if let Some(first) = person.first_name {
-        println!("first_name: {first}");
-    }
-    if let Some(last) = person.last_name {
-        println!("last_name: {last}");
-    }
-    if let Some(display) = person.display_name {
-        println!("display_name: {display}");
-    }
-    if let Some(affinity) = person.affinity {
-        println!("affinity: {affinity}");
-    }
-    if let Some(value) = person.teams_user_id {
-        println!("teams_user_id: {value}");
-    }
-    if let Some(value) = person.email {
-        println!("email: {value}");
-    }
-    if !person.aliases.is_empty() {
-        println!("aliases:");
-        for alias in person.aliases {
-            println!("- {alias}");
+        println!("id: {:x}", person.id);
+        if let Some(label) = person.label {
+            println!("label: {label}");
         }
-    }
-    if let Some(note) = person.note {
-        println!("note:");
-        println!("{note}");
-    }
+        if let Some(first) = person.first_name {
+            println!("first_name: {first}");
+        }
+        if let Some(last) = person.last_name {
+            println!("last_name: {last}");
+        }
+        if let Some(display) = person.display_name {
+            println!("display_name: {display}");
+        }
+        if let Some(affinity) = person.affinity {
+            println!("affinity: {affinity}");
+        }
+        if let Some(value) = person.teams_user_id {
+            println!("teams_user_id: {value}");
+        }
+        if let Some(value) = person.email {
+            println!("email: {value}");
+        }
+        if !person.aliases.is_empty() {
+            println!("aliases:");
+            for alias in person.aliases {
+                println!("- {alias}");
+            }
+        }
+        if let Some(note) = person.note {
+            println!("note:");
+            println!("{note}");
+        }
 
-    drop(ws);
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        Ok(())
+    })
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-        id
-    } else {
-        repo.create_branch(ATLAS_BRANCH, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release()
-    };
-    let mut metadata = TribleSet::new();
+    with_repo(pile_path, |repo| {
+        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+            id
+        } else {
+            repo.create_branch(ATLAS_BRANCH, None)
+                .map_err(|e| anyhow!("create branch: {e:?}"))?
+                .release()
+        };
+        let mut metadata = TribleSet::new();
 
-    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata +=
-        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata +=
-        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
+        metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
+                repo.storage_mut(),
+            )?;
+        metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+
+        metadata += describe_attribute(repo.storage_mut(), &metadata::name, "name")?;
+        metadata += describe_attribute(repo.storage_mut(), &relations::alias, "relations_alias")?;
+        metadata += describe_attribute(repo.storage_mut(), &relations::affinity, "relations_affinity")?;
+        metadata += describe_attribute(
             repo.storage_mut(),
+            &relations::first_name,
+            "relations_first_name",
         )?;
-    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata += describe_attribute(
+            repo.storage_mut(),
+            &relations::last_name,
+            "relations_last_name",
+        )?;
+        metadata += describe_attribute(
+            repo.storage_mut(),
+            &relations::display_name,
+            "relations_display_name",
+        )?;
+        metadata += describe_attribute(repo.storage_mut(), &metadata::description, "description")?;
+        metadata += describe_attribute(
+            repo.storage_mut(),
+            &relations::teams_user_id,
+            "relations_teams_user_id",
+        )?;
+        metadata += describe_attribute(repo.storage_mut(), &relations::email, "relations_email")?;
 
-    metadata += describe_attribute(repo.storage_mut(), &metadata::name, "name")?;
-    metadata += describe_attribute(repo.storage_mut(), &relations::alias, "relations_alias")?;
-    metadata += describe_attribute(repo.storage_mut(), &relations::affinity, "relations_affinity")?;
-    metadata += describe_attribute(
-        repo.storage_mut(),
-        &relations::first_name,
-        "relations_first_name",
-    )?;
-    metadata += describe_attribute(
-        repo.storage_mut(),
-        &relations::last_name,
-        "relations_last_name",
-    )?;
-    metadata += describe_attribute(
-        repo.storage_mut(),
-        &relations::display_name,
-        "relations_display_name",
-    )?;
-    metadata += describe_attribute(repo.storage_mut(), &metadata::description, "description")?;
-    metadata += describe_attribute(
-        repo.storage_mut(),
-        &relations::teams_user_id,
-        "relations_teams_user_id",
-    )?;
-    metadata += describe_attribute(repo.storage_mut(), &relations::email, "relations_email")?;
+        metadata += describe_kind(
+            repo.storage_mut(),
+            &KIND_PERSON_ID,
+            "person",
+            "Relationship person entity.",
+        )?;
 
-    metadata += describe_kind(
-        repo.storage_mut(),
-        &KIND_PERSON_ID,
-        "person",
-        "Relationship person entity.",
-    )?;
-
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn describe_attribute<B, S>(
@@ -935,11 +950,7 @@ fn main() -> Result<()> {
         return Ok(());
     };
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref(), "branch id")?;
-    let mut cfg_repo = open_repo(&cli.pile)?;
-    let cfg = load_config_branches(&mut cfg_repo)?;
-    cfg_repo
-        .close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
+    let cfg = with_repo(&cli.pile, load_config_branches)?;
     let branch_id = resolve_branch_id(explicit_branch_id, cfg.relations_branch_id)?;
 
     match cmd {

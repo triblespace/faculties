@@ -291,11 +291,35 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow::anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow::anyhow!(
+            "restore pile {}: {err:?}",
+            path.display()
+        ));
+    }
 
     let signing_key = SigningKey::generate(&mut OsRng);
     Ok(Repository::new(pile, signing_key))
+}
+
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo
+        .close()
+        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch_with_id(
@@ -518,42 +542,41 @@ fn cmd_send(
     from: String,
     to: String,
 ) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let relations_space = load_relations_space(&mut repo, relations_branch_id)?;
-    let from_id = resolve_person_id(&relations_space, &from)?;
-    let to_id = resolve_person_id(&relations_space, &to)?;
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let relations_space = load_relations_space(repo, relations_branch_id)?;
+        let from_id = resolve_person_id(&relations_space, &from)?;
+        let to_id = resolve_person_id(&relations_space, &to)?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let mut change = ensure_metadata(&mut ws)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let mut change = ensure_metadata(&mut ws)?;
 
-    let now = epoch_interval(now_epoch());
-    let message_id = ufoid();
-    let body_handle = ws.put(text.clone());
-    change += entity! { &message_id @
-        metadata::tag: &KIND_MESSAGE_ID,
-        local::from: from_id,
-        local::to: to_id,
-        local::body: body_handle,
-        local::created_at: now,
-    };
+        let now = epoch_interval(now_epoch());
+        let message_id = ufoid();
+        let body_handle = ws.put(text.clone());
+        change += entity! { &message_id @
+            metadata::tag: &KIND_MESSAGE_ID,
+            local::from: from_id,
+            local::to: to_id,
+            local::body: body_handle,
+            local::created_at: now,
+        };
 
-    ws.commit(change, None, Some("local message"));
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push message: {e:?}"))?;
-    drop(ws);
-    println!(
-        "[{}] {} -> {}: {}",
-        id_prefix(*message_id),
-        from_id,
-        to_id,
-        truncate_single_line(&text, 120)
-    );
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        ws.commit(change, None, Some("local message"));
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push message: {e:?}"))?;
+        drop(ws);
+        println!(
+            "[{}] {} -> {}: {}",
+            id_prefix(*message_id),
+            from_id,
+            to_id,
+            truncate_single_line(&text, 120)
+        );
+        Ok(())
+    })
 }
 
 fn cmd_ack(
@@ -564,42 +587,41 @@ fn cmd_ack(
     id: String,
     by: String,
 ) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let relations_space = load_relations_space(&mut repo, relations_branch_id)?;
-    let reader_id = resolve_person_id(&relations_space, &by)?;
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let relations_space = load_relations_space(repo, relations_branch_id)?;
+        let reader_id = resolve_person_id(&relations_space, &by)?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let mut change = ensure_metadata(&mut ws)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let mut change = ensure_metadata(&mut ws)?;
 
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let message_id = resolve_message_id(&space, &id)?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let message_id = resolve_message_id(&space, &id)?;
 
-    let now = epoch_interval(now_epoch());
-    let read_id = ufoid();
-    change += entity! { &read_id @
-        metadata::tag: &KIND_READ_ID,
-        local::about_message: message_id,
-        local::reader: reader_id,
-        local::read_at: now,
-    };
+        let now = epoch_interval(now_epoch());
+        let read_id = ufoid();
+        change += entity! { &read_id @
+            metadata::tag: &KIND_READ_ID,
+            local::about_message: message_id,
+            local::reader: reader_id,
+            local::read_at: now,
+        };
 
-    ws.commit(change, None, Some("local message read"));
-    repo.push(&mut ws)
-        .map_err(|e| anyhow::anyhow!("push read: {e:?}"))?;
-    drop(ws);
-    println!(
-        "Marked {} as read by {}.",
-        id_prefix(message_id),
-        reader_id
-    );
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        ws.commit(change, None, Some("local message read"));
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push read: {e:?}"))?;
+        drop(ws);
+        println!(
+            "Marked {} as read by {}.",
+            id_prefix(message_id),
+            reader_id
+        );
+        Ok(())
+    })
 }
 
 fn cmd_list(
@@ -611,16 +633,16 @@ fn cmd_list(
     unread: bool,
     limit: usize,
 ) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let relations_space = load_relations_space(&mut repo, relations_branch_id)?;
-    let party_names = load_person_labels(&mut repo, &relations_space);
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    with_repo(pile, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let relations_space = load_relations_space(repo, relations_branch_id)?;
+        let party_names = load_person_labels(repo, &relations_space);
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
     let mut messages = Vec::new();
     for (message_id, from, to, body, created_at) in find!(
@@ -736,10 +758,9 @@ fn cmd_list(
         println!("No messages.");
     }
 
-    drop(ws);
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        drop(ws);
+        Ok(())
+    })
 }
 
 fn main() -> Result<()> {
@@ -758,11 +779,7 @@ fn main() -> Result<()> {
     let relations_branch_id_override =
         parse_optional_hex_id(cli.relations_branch_id.as_deref(), "relations branch id")?;
 
-    let mut config_repo = open_repo(&cli.pile)?;
-    let config_branches = load_config_branches(&mut config_repo)?;
-    config_repo
-        .close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
+    let config_branches = with_repo(&cli.pile, |repo| load_config_branches(repo))?;
     let branch_id = resolve_branch_id(
         branch_id_override,
         config_branches.local_messages_branch_id,
@@ -809,32 +826,31 @@ fn main() -> Result<()> {
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-        id
-    } else {
-        repo.create_branch(ATLAS_BRANCH, None)
-            .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
-            .release()
-    };
-    let metadata = build_local_metadata(repo.storage_mut())
-        .map_err(|e| anyhow::anyhow!("build local metadata: {e:?}"))?;
+    with_repo(pile_path, |repo| {
+        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+            id
+        } else {
+            repo.create_branch(ATLAS_BRANCH, None)
+                .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
+                .release()
+        };
+        let metadata = build_local_metadata(repo.storage_mut())
+            .map_err(|e| anyhow::anyhow!("build local metadata: {e:?}"))?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull atlas workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout atlas workspace: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow::anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close()
-        .map_err(|e| anyhow::anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull atlas workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout atlas workspace: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn build_local_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>

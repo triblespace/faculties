@@ -864,7 +864,13 @@ where
     let mut repo = repo;
     let result = f(&mut repo);
     let pile = repo.into_storage();
-    let _ = pile.close();
+    let close_res = pile.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
     result
 }
 
@@ -2286,7 +2292,11 @@ struct AttachmentSource {
 
 fn open_pile(path: &PathBuf) -> Result<Pile<Blake3>> {
     let mut pile = Pile::open(path).with_context(|| format!("open pile {}", path.display()))?;
-    pile.restore().context("restore pile")?;
+    if let Err(err) = pile.restore().context("restore pile") {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(err);
+    }
     Ok(pile)
 }
 
@@ -2301,8 +2311,13 @@ fn seed_default_metadata(repo: &mut Repository<Pile<Blake3>>) -> Result<()> {
 
 fn emit_schema_to_atlas(pile_path: &PathBuf) -> Result<()> {
     let mut pile = open_pile(pile_path)?;
-    let existing =
-        find_branch_id(&mut pile, ATLAS_BRANCH).map_err(|err| anyhow::anyhow!(err))?;
+    let existing = match find_branch_id(&mut pile, ATLAS_BRANCH) {
+        Ok(existing) => existing,
+        Err(err) => {
+            let _ = pile.close();
+            return Err(anyhow::anyhow!(err));
+        }
+    };
     let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
 
     let branch_id = match existing {
@@ -2317,21 +2332,20 @@ fn emit_schema_to_atlas(pile_path: &PathBuf) -> Result<()> {
         },
     };
 
-    let mut metadata = build_archive_metadata(repo.storage_mut())
-        .context("build archive metadata")?;
-    metadata += build_teams_metadata(repo.storage_mut()).context("build teams metadata")?;
+    with_repo_close(repo, |repo| {
+        let mut metadata = build_archive_metadata(repo.storage_mut())
+            .context("build archive metadata")?;
+        metadata += build_teams_metadata(repo.storage_mut()).context("build teams metadata")?;
 
-    let mut ws = map_err_debug(repo.pull(branch_id), "pull atlas workspace")?;
-    let space = map_err_debug(ws.checkout(..), "checkout atlas workspace")?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        map_err_debug(repo.push(&mut ws), "push atlas metadata")?;
-    }
-
-    let pile = repo.into_storage();
-    let _ = pile.close();
-    Ok(())
+        let mut ws = map_err_debug(repo.pull(branch_id), "pull atlas workspace")?;
+        let space = map_err_debug(ws.checkout(..), "checkout atlas workspace")?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            map_err_debug(repo.push(&mut ws), "push atlas metadata")?;
+        }
+        Ok(())
+    })
 }
 
 fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -> Result<()> {

@@ -561,160 +561,156 @@ fn resolve_configured_branch_id(
 }
 
 fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: usize) -> Result<()> {
-    let mut repo = open_repo(pile)?;
-    let config_identity = load_config_identity(&mut repo)?;
-    let local_branch_id = resolve_configured_branch_id(
-        &mut repo,
-        config_identity.local_messages_branch_id,
-        DEFAULT_LOCAL_BRANCH,
-        true,
-    )?;
-    let compass_branch_id = resolve_configured_branch_id(
-        &mut repo,
-        config_identity.compass_branch_id,
-        DEFAULT_COMPASS_BRANCH,
-        true,
-    )?;
-    let relations_branch_id = resolve_configured_branch_id(
-        &mut repo,
-        config_identity.relations_branch_id,
-        DEFAULT_RELATIONS_BRANCH,
-        false,
-    )?;
-    let current_heads = load_watched_heads(
-        &mut repo,
-        local_branch_id,
-        compass_branch_id,
-        relations_branch_id,
-    )?;
+    with_repo(pile, |repo| {
+        let config_identity = load_config_identity(repo)?;
+        let local_branch_id = resolve_configured_branch_id(
+            repo,
+            config_identity.local_messages_branch_id,
+            DEFAULT_LOCAL_BRANCH,
+            true,
+        )?;
+        let compass_branch_id = resolve_configured_branch_id(
+            repo,
+            config_identity.compass_branch_id,
+            DEFAULT_COMPASS_BRANCH,
+            true,
+        )?;
+        let relations_branch_id = resolve_configured_branch_id(
+            repo,
+            config_identity.relations_branch_id,
+            DEFAULT_RELATIONS_BRANCH,
+            false,
+        )?;
+        let current_heads =
+            load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
 
-    let mut local_ws = repo
-        .pull(local_branch_id)
-        .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
-    let local_space = local_ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout local: {e:?}"))?;
-    let reader_id = config_identity.persona_id.ok_or_else(|| {
-        anyhow!(
-            "missing persona_id in config (set via `playground config set persona-id <hex-id>`)"
-        )
-    })?;
-    let party_names = load_relations_labels(&mut repo, relations_branch_id)?;
-    if !party_names.contains_key(&reader_id) {
-        bail!(
-            "persona_id {:x} missing from relations (add via relations faculty)",
-            reader_id
-        );
-    }
-    let reads = load_reads(&local_space);
-    let mut messages = load_messages(&mut local_ws, &local_space)?;
-
-    let mut unread: Vec<MessageRow> = messages
-        .iter()
-        .filter(|msg| msg.to == reader_id && !reads.contains_key(&(msg.id, reader_id)))
-        .cloned()
-        .collect();
-    unread.truncate(message_limit);
-    messages = unread;
-
-    let now_key = interval_key(epoch_interval(now_epoch()));
-
-    println!("Orient");
-    let reader_label = party_names
-        .get(&reader_id)
-        .cloned()
-        .unwrap_or_else(|| id_prefix(reader_id));
-    println!("Local messages (unread inbox for {}):", reader_label);
-    if messages.is_empty() {
-        println!("- None");
-    } else {
-        for msg in &messages {
-            let from_label = party_names
-                .get(&msg.from)
-                .cloned()
-                .unwrap_or_else(|| id_prefix(msg.from));
-            let to_label = party_names
-                .get(&msg.to)
-                .cloned()
-                .unwrap_or_else(|| id_prefix(msg.to));
-            let age = format_age(now_key, msg.created_at);
-            println!(
-                "- [{}] {} {} -> {} ({})",
-                id_prefix(msg.id),
-                age,
-                from_label,
-                to_label,
-                "unread",
+        let mut local_ws = repo
+            .pull(local_branch_id)
+            .map_err(|e| anyhow!("pull local workspace: {e:?}"))?;
+        let local_space = local_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout local: {e:?}"))?;
+        let reader_id = config_identity.persona_id.ok_or_else(|| {
+            anyhow!(
+                "missing persona_id in config (set via `playground config set persona-id <hex-id>`)"
+            )
+        })?;
+        let party_names = load_relations_labels(repo, relations_branch_id)?;
+        if !party_names.contains_key(&reader_id) {
+            bail!(
+                "persona_id {:x} missing from relations (add via relations faculty)",
+                reader_id
             );
-            if msg.body.is_empty() {
-                println!("    ");
-            } else {
-                for line in msg.body.lines() {
-                    println!("    {}", line.trim_end_matches('\r'));
+        }
+        let reads = load_reads(&local_space);
+        let mut messages = load_messages(&mut local_ws, &local_space)?;
+
+        let mut unread: Vec<MessageRow> = messages
+            .iter()
+            .filter(|msg| msg.to == reader_id && !reads.contains_key(&(msg.id, reader_id)))
+            .cloned()
+            .collect();
+        unread.truncate(message_limit);
+        messages = unread;
+
+        let now_key = interval_key(epoch_interval(now_epoch()));
+
+        println!("Orient");
+        let reader_label = party_names
+            .get(&reader_id)
+            .cloned()
+            .unwrap_or_else(|| id_prefix(reader_id));
+        println!("Local messages (unread inbox for {}):", reader_label);
+        if messages.is_empty() {
+            println!("- None");
+        } else {
+            for msg in &messages {
+                let from_label = party_names
+                    .get(&msg.from)
+                    .cloned()
+                    .unwrap_or_else(|| id_prefix(msg.from));
+                let to_label = party_names
+                    .get(&msg.to)
+                    .cloned()
+                    .unwrap_or_else(|| id_prefix(msg.to));
+                let age = format_age(now_key, msg.created_at);
+                println!(
+                    "- [{}] {} {} -> {} ({})",
+                    id_prefix(msg.id),
+                    age,
+                    from_label,
+                    to_label,
+                    "unread",
+                );
+                if msg.body.is_empty() {
+                    println!("    ");
+                } else {
+                    for line in msg.body.lines() {
+                        println!("    {}", line.trim_end_matches('\r'));
+                    }
                 }
             }
         }
-    }
 
-    drop(local_ws);
+        drop(local_ws);
 
-    let mut compass_ws = repo
-        .pull(compass_branch_id)
-        .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
-    let board = load_board(&mut compass_ws)?;
-    let latest = latest_status(&board.status_events);
+        let mut compass_ws = repo
+            .pull(compass_branch_id)
+            .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
+        let board = load_board(&mut compass_ws)?;
+        let latest = latest_status(&board.status_events);
 
-    let mut doing = Vec::new();
-    let mut todo = Vec::new();
-    for task in board.tasks.values() {
-        let status = latest
-            .get(&task.id)
-            .map(|ev| ev.status.to_lowercase())
-            .unwrap_or_else(|| "todo".to_string());
-        let status_at = latest.get(&task.id).map(|ev| ev.at.clone());
-        let sort_key = status_at.as_deref().unwrap_or(&task.created_at);
-        if status == "doing" {
-            doing.push((sort_key.to_string(), task.clone()));
-        } else if status == "todo" {
-            todo.push((sort_key.to_string(), task.clone()));
-        }
-    }
-
-    let sort_tasks = |tasks: &mut Vec<(String, Task)>| {
-        tasks.sort_by(|a, b| b.0.cmp(&a.0));
-    };
-    sort_tasks(&mut doing);
-    sort_tasks(&mut todo);
-
-    println!();
-    println!("Compass:");
-    if doing.is_empty() && todo.is_empty() {
-        println!("- No goals.");
-    } else {
-        println!("Doing:");
-        if doing.is_empty() {
-            println!("- None");
-        } else {
-            for (_key, task) in doing.into_iter().take(doing_limit) {
-                let tag_suffix = render_tags(&task.tags);
-                println!("- [{}] {}{}", id_prefix(task.id), task.title, tag_suffix);
+        let mut doing = Vec::new();
+        let mut todo = Vec::new();
+        for task in board.tasks.values() {
+            let status = latest
+                .get(&task.id)
+                .map(|ev| ev.status.to_lowercase())
+                .unwrap_or_else(|| "todo".to_string());
+            let status_at = latest.get(&task.id).map(|ev| ev.at.clone());
+            let sort_key = status_at.as_deref().unwrap_or(&task.created_at);
+            if status == "doing" {
+                doing.push((sort_key.to_string(), task.clone()));
+            } else if status == "todo" {
+                todo.push((sort_key.to_string(), task.clone()));
             }
         }
-        println!("Todo:");
-        if todo.is_empty() {
-            println!("- None");
+
+        let sort_tasks = |tasks: &mut Vec<(String, Task)>| {
+            tasks.sort_by(|a, b| b.0.cmp(&a.0));
+        };
+        sort_tasks(&mut doing);
+        sort_tasks(&mut todo);
+
+        println!();
+        println!("Compass:");
+        if doing.is_empty() && todo.is_empty() {
+            println!("- No goals.");
         } else {
-            for (_key, task) in todo.into_iter().take(todo_limit) {
-                let tag_suffix = render_tags(&task.tags);
-                println!("- [{}] {}{}", id_prefix(task.id), task.title, tag_suffix);
+            println!("Doing:");
+            if doing.is_empty() {
+                println!("- None");
+            } else {
+                for (_key, task) in doing.into_iter().take(doing_limit) {
+                    let tag_suffix = render_tags(&task.tags);
+                    println!("- [{}] {}{}", id_prefix(task.id), task.title, tag_suffix);
+                }
+            }
+            println!("Todo:");
+            if todo.is_empty() {
+                println!("- None");
+            } else {
+                for (_key, task) in todo.into_iter().take(todo_limit) {
+                    let tag_suffix = render_tags(&task.tags);
+                    println!("- [{}] {}{}", id_prefix(task.id), task.title, tag_suffix);
+                }
             }
         }
-    }
 
-    drop(compass_ws);
-    save_checkpoint_heads(&mut repo, &current_heads)?;
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        drop(compass_ws);
+        save_checkpoint_heads(repo, &current_heads)?;
+        Ok(())
+    })
 }
 
 fn load_watched_heads(
@@ -948,64 +944,52 @@ fn cmd_sleep(
     poll_ms: u64,
 ) -> Result<()> {
     let timeout = parse_sleep_target(target.as_ref())?;
-    let mut repo = open_repo(pile)?;
-    let config_identity = load_config_identity(&mut repo)?;
-    let local_branch_id = resolve_configured_branch_id(
-        &mut repo,
-        config_identity.local_messages_branch_id,
-        DEFAULT_LOCAL_BRANCH,
-        true,
-    )?;
-    let compass_branch_id = resolve_configured_branch_id(
-        &mut repo,
-        config_identity.compass_branch_id,
-        DEFAULT_COMPASS_BRANCH,
-        true,
-    )?;
-    let relations_branch_id = resolve_configured_branch_id(
-        &mut repo,
-        config_identity.relations_branch_id,
-        DEFAULT_RELATIONS_BRANCH,
-        false,
-    )?;
-    let mut detected_change_before_sleep = false;
-    let wait_result = (|| -> Result<bool> {
-        let baseline = load_watched_heads(
-            &mut repo,
-            local_branch_id,
-            compass_branch_id,
-            relations_branch_id,
+    let (detected_change_before_sleep, changed) = with_repo(pile, |repo| {
+        let config_identity = load_config_identity(repo)?;
+        let local_branch_id = resolve_configured_branch_id(
+            repo,
+            config_identity.local_messages_branch_id,
+            DEFAULT_LOCAL_BRANCH,
+            true,
         )?;
-        if let Some(last_seen) = load_checkpoint_heads(&mut repo)? {
+        let compass_branch_id = resolve_configured_branch_id(
+            repo,
+            config_identity.compass_branch_id,
+            DEFAULT_COMPASS_BRANCH,
+            true,
+        )?;
+        let relations_branch_id = resolve_configured_branch_id(
+            repo,
+            config_identity.relations_branch_id,
+            DEFAULT_RELATIONS_BRANCH,
+            false,
+        )?;
+
+        let mut detected_change_before_sleep = false;
+        let baseline = load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
+        if let Some(last_seen) = load_checkpoint_heads(repo)? {
             if baseline != last_seen {
                 detected_change_before_sleep = true;
-                return Ok(true);
+                return Ok((detected_change_before_sleep, true));
             }
         }
+
         let poll = Duration::from_millis(poll_ms.max(1));
         let start = Instant::now();
 
         loop {
             if let Some(timeout) = timeout {
                 if start.elapsed() >= timeout {
-                    return Ok(false);
+                    return Ok((detected_change_before_sleep, false));
                 }
             }
             std::thread::sleep(poll);
-            let current = load_watched_heads(
-                &mut repo,
-                local_branch_id,
-                compass_branch_id,
-                relations_branch_id,
-            )?;
+            let current = load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
             if current != baseline {
-                return Ok(true);
+                return Ok((detected_change_before_sleep, true));
             }
         }
-    })();
-    let close_result = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
-    let changed = wait_result?;
-    close_result?;
+    })?;
     if detected_change_before_sleep {
         println!("Detected branch changes since last orientation snapshot; returning immediately.");
     }
@@ -1051,10 +1035,29 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
 
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow!("restore pile {}: {err:?}", path.display()));
+    }
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     Ok(Repository::new(pile, signing_key))
+}
+
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<valueschemas::Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch(
@@ -1113,47 +1116,42 @@ fn find_branch_by_name(
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = ensure_branch(&mut repo, ATLAS_BRANCH)?;
-    let mut metadata = TribleSet::new();
+    with_repo(pile_path, |repo| {
+        let branch_id = ensure_branch(repo, ATLAS_BRANCH)?;
+        let mut metadata = TribleSet::new();
 
-    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(
-        repo.storage_mut(),
-    )?;
-    metadata += <valueschemas::Handle<
-        valueschemas::Blake3,
-        blobschemas::LongString,
-    > as metadata::ConstDescribe>::describe(
-        repo.storage_mut()
-    )?;
-    metadata += <valueschemas::Handle<
-        valueschemas::Blake3,
-        blobschemas::SimpleArchive,
-    > as metadata::ConstDescribe>::describe(
-        repo.storage_mut()
-    )?;
-    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata +=
-        <blobschemas::SimpleArchive as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata +=
-        <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata +=
-        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata += <valueschemas::Handle<
+            valueschemas::Blake3,
+            blobschemas::LongString,
+        > as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata += <valueschemas::Handle<
+            valueschemas::Blake3,
+            blobschemas::SimpleArchive,
+        > as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <blobschemas::SimpleArchive as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn main() -> Result<()> {

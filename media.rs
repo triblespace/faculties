@@ -253,56 +253,55 @@ fn store_media(
     source_url: Option<&str>,
     alt: &str,
 ) -> Result<String> {
-    let mut repo = open_repo(pile_path)?;
-    ensure_branch_with_id(&mut repo, branch_id, branch_name)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull branch: {e:?}"))?;
+    with_repo(pile_path, |repo| {
+        ensure_branch_with_id(repo, branch_id, branch_name)?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull branch: {e:?}"))?;
 
-    let file_handle: Value<Handle<Blake3, FileBytes>> =
-        ws.put::<FileBytes, _>(Bytes::from_source(bytes.to_vec()));
-    let item = entity! { _ @
-        metadata::tag: media_schema::kind_item,
-        media_schema::bytes: file_handle,
-    };
-    let item_id = item.root().expect("entity! root id");
+        let file_handle: Value<Handle<Blake3, FileBytes>> =
+            ws.put::<FileBytes, _>(Bytes::from_source(bytes.to_vec()));
+        let item = entity! { _ @
+            metadata::tag: media_schema::kind_item,
+            media_schema::bytes: file_handle,
+        };
+        let item_id = item.root().expect("entity! root id");
 
-    let mut change = TribleSet::new();
-    change += item;
+        let mut change = TribleSet::new();
+        change += item;
 
-    let now = epoch_interval(now_epoch());
-    let record_id = ufoid();
-    change += entity! { &record_id @
-        metadata::tag: media_schema::kind_record,
-        media_schema::about_item: item_id,
-        media_schema::created_at: now,
-        media_schema::mime: mime,
-    };
-    if let Some(name) = name.filter(|s| !s.trim().is_empty()) {
-        let handle = ws.put(name.to_owned());
-        change += entity! { &record_id @ media_schema::name: handle };
-    }
-    if let Some(source_url) = source_url.filter(|s| !s.trim().is_empty()) {
-        let handle = ws.put(source_url.to_owned());
-        change += entity! { &record_id @ media_schema::source_url: handle };
-    }
-    if !alt.trim().is_empty() {
-        let handle = ws.put(alt.to_owned());
-        change += entity! { &record_id @ media_schema::alt: handle };
-    }
+        let now = epoch_interval(now_epoch());
+        let record_id = ufoid();
+        change += entity! { &record_id @
+            metadata::tag: media_schema::kind_record,
+            media_schema::about_item: item_id,
+            media_schema::created_at: now,
+            media_schema::mime: mime,
+        };
+        if let Some(name) = name.filter(|s| !s.trim().is_empty()) {
+            let handle = ws.put(name.to_owned());
+            change += entity! { &record_id @ media_schema::name: handle };
+        }
+        if let Some(source_url) = source_url.filter(|s| !s.trim().is_empty()) {
+            let handle = ws.put(source_url.to_owned());
+            change += entity! { &record_id @ media_schema::source_url: handle };
+        }
+        if !alt.trim().is_empty() {
+            let handle = ws.put(alt.to_owned());
+            change += entity! { &record_id @ media_schema::alt: handle };
+        }
 
-    ws.commit(change, None, Some("media ingest"));
-    repo.push(&mut ws)
-        .map_err(|e| anyhow!("push media ingest: {e:?}"))?;
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+        ws.commit(change, None, Some("media ingest"));
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push media ingest: {e:?}"))?;
 
-    let marker = format_blob_marker(
-        alt,
-        digest_hex_for_file_handle(file_handle).as_str(),
-        Some(mime),
-        name,
-    );
-    Ok(marker)
+        Ok(format_blob_marker(
+            alt,
+            digest_hex_for_file_handle(file_handle).as_str(),
+            Some(mime),
+            name,
+        ))
+    })
 }
 
 fn choose_alt(alt_override: Option<&str>, name: Option<&str>) -> String {
@@ -448,31 +447,31 @@ fn now_epoch() -> Epoch {
 }
 
 fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    let mut repo = open_repo(pile_path)?;
-    let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-        id
-    } else {
-        repo.create_branch(ATLAS_BRANCH, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release()
-    };
-    let metadata = build_media_metadata(repo.storage_mut())
-        .map_err(|e| anyhow!("build media metadata: {e:?}"))?;
+    with_repo(pile_path, |repo| {
+        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
+            id
+        } else {
+            repo.create_branch(ATLAS_BRANCH, None)
+                .map_err(|e| anyhow!("create branch: {e:?}"))?
+                .release()
+        };
+        let metadata = build_media_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build media metadata: {e:?}"))?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull atlas: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
-    let delta = metadata.difference(&space);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-    }
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull atlas: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
+        let delta = metadata.difference(&space);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn build_media_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
@@ -551,11 +550,30 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
 
     let mut pile =
         Pile::<Blake3>::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore().map_err(|e| anyhow!("restore pile {}: {e:?}", path.display())) {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(err);
+    }
 
     let signing_key = SigningKey::generate(&mut OsRng);
     Ok(Repository::new(pile, signing_key))
+}
+
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let result = f(&mut repo);
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn ensure_branch_with_id(
@@ -643,9 +661,7 @@ fn resolve_store_branch_id(cli: &Cli) -> Result<Id> {
         cli.branch_id.as_deref().or(env_branch_id.as_deref()),
         "branch id",
     )?;
-    let mut repo = open_repo(&cli.pile)?;
-    let config = load_config_branches(&mut repo)?;
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+    let config = with_repo(&cli.pile, load_config_branches)?;
     resolve_branch_id(explicit, config.media_branch_id, cli.branch.as_str())
 }
 

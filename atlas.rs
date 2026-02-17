@@ -75,85 +75,81 @@ fn main() -> Result<()> {
 }
 
 fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
+    with_repo(pile, branch, |repo, branch_id| {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
 
-    let mut rows = collect_rows(&mut ws, &space)?;
-    rows.sort_by(|a, b| match a.name.cmp(&b.name) {
-        Ordering::Equal => format!("{:x}", a.id).cmp(&format!("{:x}", b.id)),
-        other => other,
-    });
+        let mut rows = collect_rows(&mut ws, &space)?;
+        rows.sort_by(|a, b| match a.name.cmp(&b.name) {
+            Ordering::Equal => format!("{:x}", a.id).cmp(&format!("{:x}", b.id)),
+            other => other,
+        });
 
-    for row in rows {
-        let short_id = id_prefix(row.id);
-        let tags = if row.tags.is_empty() {
-            String::new()
-        } else {
-            format!(
-                " [{}]",
-                row.tags
-                    .iter()
-                    .map(|id| id_prefix(*id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let description = row
-            .description
-            .map(|d| format!(" - {d}"))
-            .unwrap_or_default();
-        let source_module = row
-            .source_module
-            .map(|m| format!(" @{m}"))
-            .unwrap_or_default();
-        println!(
-            "{short_id} {name}{source_module}{tags}{description}",
-            name = row.name
-        );
-    }
-
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        for row in rows {
+            let short_id = id_prefix(row.id);
+            let tags = if row.tags.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [{}]",
+                    row.tags
+                        .iter()
+                        .map(|id| id_prefix(*id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let description = row
+                .description
+                .map(|d| format!(" - {d}"))
+                .unwrap_or_default();
+            let source_module = row
+                .source_module
+                .map(|m| format!(" @{m}"))
+                .unwrap_or_default();
+            println!(
+                "{short_id} {name}{source_module}{tags}{description}",
+                name = row.name
+            );
+        }
+        Ok(())
+    })
 }
 
 fn cmd_show(pile: &Path, branch: &str, prefix: &str) -> Result<()> {
-    let (mut repo, branch_id) = open_repo(pile, branch)?;
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
-    let rows = collect_rows(&mut ws, &space)?;
-    let row = resolve_prefix(rows, prefix)?;
+    with_repo(pile, branch, |repo, branch_id| {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
+        let rows = collect_rows(&mut ws, &space)?;
+        let row = resolve_prefix(rows, prefix)?;
 
-    println!("id: {:x}", row.id);
-    println!("name: {}", row.name);
-    if let Some(description) = row.description {
-        println!("description: {description}");
-    }
-    if let Some(source_module) = row.source_module {
-        println!("source_module: {source_module}");
-    }
-    if !row.tags.is_empty() {
-        let tags = row
-            .tags
-            .iter()
-            .map(|id| format!("{id:x}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("tags: {tags}");
-    }
-
-    repo.close()
-        .map_err(|e| anyhow!("close pile: {e:?}"))?;
-    Ok(())
+        println!("id: {:x}", row.id);
+        println!("name: {}", row.name);
+        if let Some(description) = row.description {
+            println!("description: {description}");
+        }
+        if let Some(source_module) = row.source_module {
+            println!("source_module: {source_module}");
+        }
+        if !row.tags.is_empty() {
+            let tags = row
+                .tags
+                .iter()
+                .map(|id| format!("{id:x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("tags: {tags}");
+        }
+        Ok(())
+    })
 }
 
 fn collect_rows(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet) -> Result<Vec<MetaRow>> {
@@ -241,8 +237,11 @@ fn open_repo(pile_path: &Path, branch_name: &str) -> Result<(Repository<Pile<Bla
 
     let mut pile =
         Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile: {e:?}"))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow!("restore pile: {err:?}"));
+    }
 
     let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -256,6 +255,23 @@ fn open_repo(pile_path: &Path, branch_name: &str) -> Result<(Repository<Pile<Bla
     };
 
     Ok((repo, branch_id))
+}
+
+fn with_repo<T>(
+    pile_path: &Path,
+    branch_name: &str,
+    f: impl FnOnce(&mut Repository<Pile<Blake3>>, Id) -> Result<T>,
+) -> Result<T> {
+    let (mut repo, branch_id) = open_repo(pile_path, branch_name)?;
+    let result = f(&mut repo, branch_id);
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
 }
 
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {

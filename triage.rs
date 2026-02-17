@@ -385,8 +385,11 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     }
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
-    pile.restore()
-        .map_err(|e| anyhow!("restore pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore() {
+        // Avoid Drop warnings on early errors.
+        let _ = pile.close();
+        return Err(anyhow!("restore pile {}: {err:?}", path.display()));
+    }
     Ok(Repository::new(pile, SigningKey::generate(&mut OsRng)))
 }
 
@@ -1935,75 +1938,78 @@ fn cmd_repair_branch_duplicates(
 
 fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
     let mut repo = open_repo(pile_path)?;
-    let branch_id = ensure_branch(&mut repo, atlas_branch)?;
+    let res = (|| -> Result<(), anyhow::Error> {
+        let branch_id = ensure_branch(&mut repo, atlas_branch)?;
 
-    let mut metadata_set = TribleSet::new();
-    metadata_set += <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata_set +=
-        <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata_set +=
-        <valueschemas::U256BE as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata_set +=
-        <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-    metadata_set += <valueschemas::Handle<
-        valueschemas::Blake3,
-        blobschemas::LongString,
-    > as metadata::ConstDescribe>::describe(
-        repo.storage_mut()
-    )?;
-    metadata_set +=
-        <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        let mut metadata_set = TribleSet::new();
+        metadata_set +=
+            <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata_set +=
+            <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata_set += <valueschemas::U256BE as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata_set +=
+            <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata_set += <valueschemas::Handle<
+            valueschemas::Blake3,
+            blobschemas::LongString,
+        > as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata_set +=
+            <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
-    metadata_set += metadata::Describe::describe(&config::kind, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::updated_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::branch, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::compass_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::exec_branch_id, repo.storage_mut())?;
-    metadata_set +=
-        metadata::Describe::describe(&config::local_messages_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::relations_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::teams_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::workspace_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::archive_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::web_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::media_branch_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&config::persona_id, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::kind, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::command_text, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::requested_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::about_request, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::started_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::finished_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::exit_code, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::stderr_text, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&exec::error, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&llm::kind, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&llm::about_request, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&llm::requested_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&llm::started_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&llm::finished_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&llm::error, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&local::to, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&local::created_at, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&local::about_message, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&local::reader, repo.storage_mut())?;
-    metadata_set += metadata::Describe::describe(&relations::alias, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::kind, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::updated_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::branch, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::compass_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::exec_branch_id, repo.storage_mut())?;
+        metadata_set +=
+            metadata::Describe::describe(&config::local_messages_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::relations_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::teams_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::workspace_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::archive_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::web_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::media_branch_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&config::persona_id, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::kind, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::command_text, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::requested_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::about_request, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::started_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::finished_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::exit_code, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::stderr_text, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&exec::error, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&llm::kind, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&llm::about_request, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&llm::requested_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&llm::started_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&llm::finished_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&llm::error, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&local::to, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&local::created_at, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&local::about_message, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&local::reader, repo.storage_mut())?;
+        metadata_set += metadata::Describe::describe(&relations::alias, repo.storage_mut())?;
 
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-    let current = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-    let delta = metadata_set.difference(&current);
-    if !delta.is_empty() {
-        ws.commit(delta, None, Some("atlas schema metadata"));
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-    }
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
+        let current = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
+        let delta = metadata_set.difference(&current);
+        if !delta.is_empty() {
+            ws.commit(delta, None, Some("atlas schema metadata"));
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
+        }
 
-    repo.close().map_err(|e| anyhow!("close pile: {e:?}"))?;
+        Ok(())
+    })();
+
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    res.and(close_res)?;
     Ok(())
 }
 
