@@ -140,12 +140,7 @@ fn import_copilot_file(path: &std::path::Path, repo: &mut common::Repo, branch_i
         .and_then(JsonValue::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_owned)
-        .unwrap_or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("copilot-export")
-                .to_string()
-        });
+        .unwrap_or_else(|| format!("copilot:{raw_root:x}"));
 
     let mut records = Vec::new();
     for (idx, request) in requests.iter().enumerate() {
@@ -190,23 +185,21 @@ fn import_copilot_file(path: &std::path::Path, repo: &mut common::Repo, branch_i
 
     let source_path = path.to_string_lossy().to_string();
     let source_path_handle = ws.put(source_path.clone());
-    let batch_id = common::stable_id(&[
-        "playground",
-        "import",
-        "copilot",
-        "batch",
-        source_path.as_str(),
-        conversation_id.as_str(),
-    ]);
+    let batch_fragment = entity! { _ @
+        common::import_schema::kind: common::import_schema::kind_batch,
+        common::import_schema::source_format: "copilot",
+        common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
+    };
+    let batch_id = batch_fragment
+        .root()
+        .expect("entity! must export a single root id");
     let batch_entity = ExclusiveId::force_ref(&batch_id);
     let mut change = TribleSet::new();
 
+    change += batch_fragment;
     change += entity! { batch_entity @
-        common::import_schema::kind: common::import_schema::kind_batch,
-        common::import_schema::source_format: "copilot",
         common::import_schema::source_path: source_path_handle,
         common::import_schema::source_raw_root: raw_root,
-        common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
     };
 
     let mut author_cache: HashMap<String, Id> = HashMap::new();
@@ -233,7 +226,8 @@ fn import_copilot_file(path: &std::path::Path, repo: &mut common::Repo, branch_i
             id
         };
 
-        let created_at = common::epoch_interval(message.created_at.unwrap_or_else(common::now_epoch));
+        let created_at =
+            common::epoch_interval(message.created_at.unwrap_or_else(common::unknown_epoch));
         let content_handle = ws.put(message.content.clone());
         change += entity! { message_entity @
             common::archive::kind: common::archive::kind_message,

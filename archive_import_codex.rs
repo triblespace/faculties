@@ -139,7 +139,7 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
         root
     };
 
-    let conversation_hint = detect_file_conversation_hint(path, &raw_records);
+    let conversation_hint = detect_file_conversation_hint(&raw_records, raw_root);
     let mut messages = collect_codex_messages(&raw_records, &conversation_hint);
     messages.sort_by_key(|m| m.order);
 
@@ -158,22 +158,20 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
 
     for (conversation_id, mut convo_messages) in by_conversation {
         convo_messages.sort_by_key(|m| m.order);
-        let batch_id = common::stable_id(&[
-            "playground",
-            "import",
-            "codex",
-            "batch",
-            source_path.as_str(),
-            conversation_id.as_str(),
-        ]);
-        let batch_entity = ExclusiveId::force_ref(&batch_id);
-
-        change += entity! { batch_entity @
+        let batch_fragment = entity! { _ @
             common::import_schema::kind: common::import_schema::kind_batch,
             common::import_schema::source_format: "codex",
+            common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
+        };
+        let batch_id = batch_fragment
+            .root()
+            .expect("entity! must export a single root id");
+        let batch_entity = ExclusiveId::force_ref(&batch_id);
+
+        change += batch_fragment;
+        change += entity! { batch_entity @
             common::import_schema::source_path: source_path_handle,
             common::import_schema::source_raw_root: raw_root,
-            common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
         };
 
         let mut previous: Option<(Id, String)> = None;
@@ -200,7 +198,8 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
                 id
             };
 
-            let created_at = common::epoch_interval(message.created_at.unwrap_or_else(common::now_epoch));
+            let created_at =
+                common::epoch_interval(message.created_at.unwrap_or_else(common::unknown_epoch));
 
             change += entity! { message_entity @
                 common::archive::kind: common::archive::kind_message,
@@ -438,7 +437,7 @@ fn collect_response_messages(records: &[JsonValue], conversation_hint: &str) -> 
     out
 }
 
-fn detect_file_conversation_hint(path: &Path, records: &[JsonValue]) -> String {
+fn detect_file_conversation_hint(records: &[JsonValue], raw_root: Id) -> String {
     for record in records {
         let Some(object) = record.as_object() else {
             continue;
@@ -452,11 +451,7 @@ fn detect_file_conversation_hint(path: &Path, records: &[JsonValue]) -> String {
             }
         }
     }
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("codex-export")
-        .to_string()
+    format!("codex:{raw_root:x}")
 }
 
 fn extract_conversation_id(object: &Map<String, JsonValue>) -> Option<&str> {

@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
@@ -101,15 +101,14 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
 
     let source_path = path.to_string_lossy().to_string();
     let source_path_handle = ws.put(source_path.clone());
-    let default_conversation_id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("gemini-export")
-        .to_string();
+    let default_conversation_id = format!(
+        "gemini:{:x}",
+        common::stable_id(&["playground", "import", "gemini", "conversation", raw.as_str()])
+    );
 
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let (raw_root, mut records) = if extension == "html" || extension == "htm" {
-        let records = parse_gemini_activity_html(path, &raw);
+        let records = parse_gemini_activity_html(&raw, &default_conversation_id);
         (None, records)
     } else if extension == "jsonl" {
         let mut records = Vec::new();
@@ -193,20 +192,18 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
     let mut change = TribleSet::new();
     let mut author_cache: HashMap<String, Id> = HashMap::new();
     for (conversation_id, messages) in by_conversation {
-        let batch_id = common::stable_id(&[
-            "playground",
-            "import",
-            "gemini",
-            "batch",
-            source_path.as_str(),
-            conversation_id.as_str(),
-        ]);
-        let batch_entity = ExclusiveId::force_ref(&batch_id);
-        change += entity! { batch_entity @
+        let batch_fragment = entity! { _ @
             common::import_schema::kind: common::import_schema::kind_batch,
             common::import_schema::source_format: "gemini",
-            common::import_schema::source_path: source_path_handle,
             common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
+        };
+        let batch_id = batch_fragment
+            .root()
+            .expect("entity! must export a single root id");
+        let batch_entity = ExclusiveId::force_ref(&batch_id);
+        change += batch_fragment;
+        change += entity! { batch_entity @
+            common::import_schema::source_path: source_path_handle,
         };
         if let Some(raw_root) = raw_root {
             change += entity! { batch_entity @ common::import_schema::source_raw_root: raw_root };
@@ -233,7 +230,8 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
                 author_cache.insert(author_key, id);
                 id
             };
-            let created_at = common::epoch_interval(message.created_at.unwrap_or_else(common::now_epoch));
+            let created_at =
+                common::epoch_interval(message.created_at.unwrap_or_else(common::unknown_epoch));
             let content_handle = ws.put(message.content.clone());
             change += entity! { message_entity @
                 common::archive::kind: common::archive::kind_message,
@@ -290,11 +288,7 @@ fn collect_gemini_files(path: &std::path::Path, out: &mut Vec<PathBuf>) -> Resul
     Ok(())
 }
 
-fn parse_gemini_activity_html(path: &Path, html: &str) -> Vec<MessageRecord> {
-    let conversation_id = format!(
-        "gemini:{}",
-        path.file_stem().and_then(|s| s.to_str()).unwrap_or("activity")
-    );
+fn parse_gemini_activity_html(html: &str, conversation_id: &str) -> Vec<MessageRecord> {
     let document = Html::parse_document(html);
     let outer_selector = Selector::parse(
         "div.outer-cell.mdl-cell.mdl-cell--12-col.mdl-shadow--2dp",
@@ -375,7 +369,7 @@ fn parse_gemini_activity_html(path: &Path, html: &str) -> Vec<MessageRecord> {
         let created_at = timestamp;
         if !user_lines.is_empty() {
             out.push(MessageRecord {
-                conversation_id: conversation_id.clone(),
+                conversation_id: conversation_id.to_string(),
                 source_message_id: format!("activity-{index:08}:user"),
                 role: "user".to_string(),
                 author: "user".to_string(),
@@ -386,7 +380,7 @@ fn parse_gemini_activity_html(path: &Path, html: &str) -> Vec<MessageRecord> {
         }
         if !assistant_lines.is_empty() {
             out.push(MessageRecord {
-                conversation_id: conversation_id.clone(),
+                conversation_id: conversation_id.to_string(),
                 source_message_id: format!("activity-{index:08}:assistant"),
                 role: "assistant".to_string(),
                 author: "assistant".to_string(),

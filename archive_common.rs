@@ -599,6 +599,10 @@ pub fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
+pub fn unknown_epoch() -> Epoch {
+    Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0)
+}
+
 pub fn epoch_from_seconds(value: f64) -> Option<Epoch> {
     if value.is_finite() {
         Some(Epoch::from_unix_seconds(value))

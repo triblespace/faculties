@@ -146,25 +146,26 @@ fn import_chatgpt_file(
             .and_then(JsonValue::as_object)
             .ok_or_else(|| anyhow!("conversation {convo_id} missing mapping"))?;
 
-        let batch_id = common::stable_id(&["playground", "import", "chatgpt", "batch", convo_id]);
-        let batch_entity = ExclusiveId::force_ref(&batch_id);
-
-        let mut change = TribleSet::new();
-        change += entity! { batch_entity @
+        let batch_fragment = entity! { _ @
             common::import_schema::kind: common::import_schema::kind_batch,
             common::import_schema::source_format: "chatgpt",
-            common::import_schema::source_path: path_handle,
-            common::import_schema::source_raw_root: raw_root,
             common::import_schema::source_conversation_id: ws.put(convo_id.to_string()),
         };
-        if !title.is_empty() {
-            change += entity! { batch_entity @
-                common::import_schema::source_title: ws.put(title.to_string()),
-            };
-        }
-        if let Some(created_at) = created_at {
-            change += entity! { batch_entity @ common::import_schema::source_created_at: created_at };
-        }
+        let batch_id = batch_fragment
+            .root()
+            .expect("entity! must export a single root id");
+        let batch_entity = ExclusiveId::force_ref(&batch_id);
+        let title_handle = (!title.is_empty()).then(|| ws.put(title.to_string()));
+
+        let mut change = TribleSet::new();
+        change += batch_fragment;
+        change += entity! { batch_entity @
+            common::import_schema::source_path: path_handle,
+            common::import_schema::source_raw_root: raw_root,
+            common::import_schema::source_title?: title_handle,
+            common::import_schema::source_created_at?: created_at,
+        };
+        let mut author_cache: HashMap<String, Id> = HashMap::new();
 
         let mut node_to_message: HashMap<&str, Id> = HashMap::new();
         for (node_id, node) in mapping {
@@ -213,15 +214,22 @@ fn import_chatgpt_file(
                 .and_then(JsonValue::as_str)
                 .unwrap_or(role);
 
-            let (author_id, author_change) = common::ensure_author(&mut ws, &catalog, name, role)?;
-            change += author_change;
+            let author_key = format!("{name}::{role}");
+            let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
+                id
+            } else {
+                let (id, author_change) = common::ensure_author(&mut ws, &catalog, name, role)?;
+                change += author_change;
+                author_cache.insert(author_key, id);
+                id
+            };
 
             let created_at_epoch = message
                 .get("create_time")
                 .and_then(JsonValue::as_f64)
                 .and_then(common::epoch_from_seconds)
                 .or_else(|| created_epoch.clone())
-                .unwrap_or_else(common::now_epoch);
+                .unwrap_or_else(common::unknown_epoch);
             let created_at = common::epoch_interval(created_at_epoch);
             let content_handle = ws.put(content);
 
