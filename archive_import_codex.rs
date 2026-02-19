@@ -6,14 +6,21 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
+//! serde_json = "1"
 //! triblespace = "0.16.0"
 //! ```
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
-
+use hifitime::Epoch;
+use serde_json::{Map, Value as JsonValue};
+use triblespace::core::id::ExclusiveId;
+use triblespace::core::import::json_tree::JsonTreeImporter;
+use triblespace::prelude::*;
 
 #[path = "archive_common.rs"]
 mod common;
@@ -27,9 +34,519 @@ struct Cli {
     /// Branch name to write into (created if missing).
     #[arg(long, default_value = "archive", global = true)]
     branch: String,
-    /// Import path shortcut.
+    /// Branch id to write into (hex). Overrides config/env branch id.
+    #[arg(long, global = true)]
+    branch_id: Option<String>,
+    /// File or directory containing Codex exports.
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ImportStats {
+    files: usize,
+    conversations: usize,
+    messages: usize,
+    commits: usize,
+}
+
+#[derive(Debug, Clone)]
+struct MessageRecord {
+    conversation_id: String,
+    source_message_id: String,
+    role: String,
+    author: String,
+    content: String,
+    created_at: Option<Epoch>,
+    order: usize,
+}
+
+fn import_codex_path(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+    if path.is_dir() {
+        let mut paths = Vec::new();
+        collect_jsonl_files(path, &mut paths)
+            .with_context(|| format!("scan {}", path.display()))?;
+        paths.sort();
+        let mut total = ImportStats::default();
+        for file in paths {
+            let stats = import_codex_file(&file, repo, branch_id)
+                .with_context(|| format!("import {}", file.display()))?;
+            total.files += stats.files;
+            total.conversations += stats.conversations;
+            total.messages += stats.messages;
+            total.commits += stats.commits;
+        }
+        return Ok(total);
+    }
+    import_codex_file(path, repo, branch_id)
+}
+
+fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+    let raw_text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut raw_records = Vec::new();
+    for (line_idx, line) in raw_text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value: JsonValue = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse jsonl line {}", line_idx + 1))?;
+        raw_records.push(value);
+    }
+
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+    let mut catalog = ws.checkout(..).context("checkout workspace")?;
+
+    let mut stats = ImportStats {
+        files: 1,
+        ..ImportStats::default()
+    };
+
+    if raw_records.is_empty() {
+        return Ok(stats);
+    }
+
+    let json_tree_metadata =
+        triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
+            .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
+            .into_facts();
+
+    let raw_root = {
+        let raw_payload = serde_json::to_string(&raw_records).context("serialize codex jsonl")?;
+        let mut importer = JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
+            repo.storage_mut(),
+            None,
+        );
+        let fragment = importer
+            .import_str(&raw_payload)
+            .context("import codex raw json tree")?;
+        let root = fragment
+            .root()
+            .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
+        let delta = fragment.facts().difference(&catalog);
+        if !delta.is_empty() {
+            ws.commit(
+                delta.clone(),
+                Some(json_tree_metadata.clone()),
+                Some("import codex json tree"),
+            );
+            common::push_workspace(repo, &mut ws).context("push codex json tree")?;
+            catalog += delta;
+            stats.commits += 1;
+        }
+        root
+    };
+
+    let conversation_hint = detect_file_conversation_hint(path, &raw_records);
+    let mut messages = collect_codex_messages(&raw_records, &conversation_hint);
+    messages.sort_by_key(|m| m.order);
+
+    let mut by_conversation: BTreeMap<String, Vec<MessageRecord>> = BTreeMap::new();
+    for message in messages {
+        by_conversation
+            .entry(message.conversation_id.clone())
+            .or_default()
+            .push(message);
+    }
+
+    let source_path = path.to_string_lossy().to_string();
+    let source_path_handle = ws.put(source_path.clone());
+    let mut change = TribleSet::new();
+    let mut author_cache: HashMap<String, Id> = HashMap::new();
+
+    for (conversation_id, mut convo_messages) in by_conversation {
+        convo_messages.sort_by_key(|m| m.order);
+        let batch_id = common::stable_id(&[
+            "playground",
+            "import",
+            "codex",
+            "batch",
+            source_path.as_str(),
+            conversation_id.as_str(),
+        ]);
+        let batch_entity = ExclusiveId::force_ref(&batch_id);
+
+        change += entity! { batch_entity @
+            common::import_schema::kind: common::import_schema::kind_batch,
+            common::import_schema::source_format: "codex",
+            common::import_schema::source_path: source_path_handle,
+            common::import_schema::source_raw_root: raw_root,
+            common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
+        };
+
+        let mut previous: Option<(Id, String)> = None;
+        for message in convo_messages {
+            let message_id = common::stable_id(&[
+                "playground",
+                "import",
+                "codex",
+                "message",
+                message.conversation_id.as_str(),
+                message.source_message_id.as_str(),
+            ]);
+            let message_entity = ExclusiveId::force_ref(&message_id);
+            let content_handle = ws.put(message.content.clone());
+
+            let author_key = format!("{}::{}", message.author, message.role);
+            let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
+                id
+            } else {
+                let (id, author_change) =
+                    common::ensure_author(&mut ws, &catalog, &message.author, &message.role)?;
+                change += author_change;
+                author_cache.insert(author_key, id);
+                id
+            };
+
+            let created_at = common::epoch_interval(message.created_at.unwrap_or_else(common::now_epoch));
+
+            change += entity! { message_entity @
+                common::archive::kind: common::archive::kind_message,
+                common::archive::author: author_id,
+                common::archive::content: content_handle,
+                common::archive::created_at: created_at,
+            };
+
+            change += entity! { message_entity @
+                common::import_schema::batch: batch_id,
+                common::import_schema::source_message_id: ws.put(message.source_message_id.clone()),
+                common::import_schema::source_author: ws.put(message.author.clone()),
+                common::import_schema::source_role: ws.put(message.role.clone()),
+                common::import_schema::source_created_at: created_at,
+            };
+
+            if let Some((parent_id, parent_source_id)) = previous.as_ref() {
+                change += entity! { message_entity @ common::archive::reply_to: *parent_id };
+                change += entity! { message_entity @
+                    common::import_schema::source_parent_id: ws.put(parent_source_id.clone()),
+                };
+            }
+
+            previous = Some((message_id, message.source_message_id.clone()));
+            stats.messages += 1;
+        }
+
+        stats.conversations += 1;
+    }
+
+    let delta = change.difference(&catalog);
+    if !delta.is_empty() {
+        ws.commit(delta.clone(), None, Some("import codex"));
+        common::push_workspace(repo, &mut ws).context("push codex import")?;
+        stats.commits += 1;
+    }
+
+    Ok(stats)
+}
+
+fn collect_jsonl_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))? {
+        let entry = entry.context("read dir entry")?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type().context("entry type")?;
+        if file_type.is_dir() {
+            collect_jsonl_files(&entry_path, out)?;
+        } else if file_type.is_file()
+            && entry_path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        {
+            out.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_codex_messages(records: &[JsonValue], conversation_hint: &str) -> Vec<MessageRecord> {
+    let history_messages = collect_history_messages(records);
+    if !history_messages.is_empty() {
+        return history_messages;
+    }
+
+    let event_messages = collect_event_messages(records, conversation_hint);
+    if !event_messages.is_empty() {
+        return event_messages;
+    }
+
+    collect_response_messages(records, conversation_hint)
+}
+
+fn collect_history_messages(records: &[JsonValue]) -> Vec<MessageRecord> {
+    let mut out = Vec::new();
+    for (idx, record) in records.iter().enumerate() {
+        let Some(object) = record.as_object() else {
+            continue;
+        };
+        let Some(session_id) = object.get("session_id").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(text) = object.get("text").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        let created_at = object
+            .get("ts")
+            .and_then(json_f64)
+            .and_then(common::epoch_from_seconds);
+        out.push(MessageRecord {
+            conversation_id: session_id.to_string(),
+            source_message_id: format!("history-{idx:08}"),
+            role: "user".to_string(),
+            author: "user".to_string(),
+            content: text.to_string(),
+            created_at,
+            order: idx,
+        });
+    }
+    out
+}
+
+fn collect_event_messages(records: &[JsonValue], conversation_hint: &str) -> Vec<MessageRecord> {
+    let mut out = Vec::new();
+    for (idx, record) in records.iter().enumerate() {
+        let Some(object) = record.as_object() else {
+            continue;
+        };
+        if object.get("type").and_then(JsonValue::as_str) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = object.get("payload").and_then(JsonValue::as_object) else {
+            continue;
+        };
+        let Some(payload_type) = payload.get("type").and_then(JsonValue::as_str) else {
+            continue;
+        };
+
+        let (role, author, content) = match payload_type {
+            "user_message" => (
+                "user".to_string(),
+                "user".to_string(),
+                payload.get("message").and_then(JsonValue::as_str),
+            ),
+            "agent_message" => (
+                "assistant".to_string(),
+                "assistant".to_string(),
+                payload.get("message").and_then(JsonValue::as_str),
+            ),
+            _ => continue,
+        };
+        let Some(content) = content.map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let created_at = object
+            .get("timestamp")
+            .and_then(JsonValue::as_str)
+            .and_then(parse_epoch_str);
+        let conversation_id = extract_conversation_id(object).unwrap_or(conversation_hint);
+        out.push(MessageRecord {
+            conversation_id: conversation_id.to_string(),
+            source_message_id: format!("event-{idx:08}"),
+            role,
+            author,
+            content: content.to_string(),
+            created_at,
+            order: idx,
+        });
+    }
+    out
+}
+
+fn collect_response_messages(records: &[JsonValue], conversation_hint: &str) -> Vec<MessageRecord> {
+    let mut out = Vec::new();
+
+    for (idx, record) in records.iter().enumerate() {
+        let Some(object) = record.as_object() else {
+            continue;
+        };
+        let record_type = object.get("type").and_then(JsonValue::as_str);
+        match record_type {
+            Some("response_item") => {
+                let Some(payload) = object.get("payload").and_then(JsonValue::as_object) else {
+                    continue;
+                };
+                if payload.get("type").and_then(JsonValue::as_str) != Some("message") {
+                    continue;
+                }
+                let role = payload
+                    .get("role")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("assistant")
+                    .to_string();
+                let author = canonical_author_name(&role).to_string();
+                let Some(content) = payload
+                    .get("content")
+                    .and_then(extract_codex_content_text)
+                    .filter(|s| !s.trim().is_empty())
+                else {
+                    continue;
+                };
+                let created_at = object
+                    .get("timestamp")
+                    .and_then(JsonValue::as_str)
+                    .and_then(parse_epoch_str);
+                let conversation_id = extract_conversation_id(payload)
+                    .or_else(|| extract_conversation_id(object))
+                    .unwrap_or(conversation_hint)
+                    .to_string();
+                out.push(MessageRecord {
+                    conversation_id,
+                    source_message_id: format!("response-item-{idx:08}-{role}"),
+                    role,
+                    author,
+                    content,
+                    created_at,
+                    order: idx,
+                });
+            }
+            Some("message") => {
+                let role = object
+                    .get("role")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("user")
+                    .to_string();
+                let author = canonical_author_name(&role).to_string();
+                let Some(content) = object
+                    .get("content")
+                    .and_then(extract_codex_content_text)
+                    .filter(|s| !s.trim().is_empty())
+                else {
+                    continue;
+                };
+                let created_at = object
+                    .get("timestamp")
+                    .and_then(JsonValue::as_str)
+                    .and_then(parse_epoch_str);
+                let conversation_id = extract_conversation_id(object)
+                    .unwrap_or(conversation_hint)
+                    .to_string();
+                out.push(MessageRecord {
+                    conversation_id,
+                    source_message_id: format!("message-{idx:08}-{role}"),
+                    role,
+                    author,
+                    content,
+                    created_at,
+                    order: idx,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn detect_file_conversation_hint(path: &Path, records: &[JsonValue]) -> String {
+    for record in records {
+        let Some(object) = record.as_object() else {
+            continue;
+        };
+        if let Some(conversation_id) = extract_conversation_id(object) {
+            return conversation_id.to_string();
+        }
+        if object.get("timestamp").is_some() {
+            if let Some(id) = object.get("id").and_then(JsonValue::as_str) {
+                return id.to_string();
+            }
+        }
+    }
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("codex-export")
+        .to_string()
+}
+
+fn extract_conversation_id(object: &Map<String, JsonValue>) -> Option<&str> {
+    object
+        .get("conversation_id")
+        .and_then(JsonValue::as_str)
+        .or_else(|| object.get("session_id").and_then(JsonValue::as_str))
+        .or_else(|| object.get("conversationId").and_then(JsonValue::as_str))
+}
+
+fn extract_codex_content_text(value: &JsonValue) -> Option<String> {
+    let Some(items) = value.as_array() else {
+        return value
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty());
+    };
+    let mut parts = Vec::new();
+    for item in items {
+        if let Some(text) = item.as_str() {
+            if !text.trim().is_empty() {
+                parts.push(text.to_string());
+            }
+            continue;
+        }
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        if let Some(text) = obj.get("text").and_then(JsonValue::as_str) {
+            if !text.trim().is_empty() {
+                parts.push(text.to_string());
+            }
+            continue;
+        }
+        if let Some(text) = obj.get("value").and_then(JsonValue::as_str) {
+            if !text.trim().is_empty() {
+                parts.push(text.to_string());
+            }
+            continue;
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+fn canonical_author_name(role: &str) -> &str {
+    match role {
+        "user" => "user",
+        "assistant" | "agent" | "model" => "assistant",
+        "developer" => "developer",
+        "system" => "system",
+        _ => role,
+    }
+}
+
+fn parse_epoch_str(value: &str) -> Option<Epoch> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(epoch) = trimmed.parse::<Epoch>() {
+        return Some(epoch);
+    }
+    if let Ok(seconds) = trimmed.parse::<f64>() {
+        return parse_epoch_number(seconds);
+    }
+    None
+}
+
+fn parse_epoch_number(value: f64) -> Option<Epoch> {
+    if !value.is_finite() {
+        return None;
+    }
+    // Heuristic: values above 10^11 are usually milliseconds since unix epoch.
+    let seconds = if value.abs() > 1.0e11 {
+        value / 1000.0
+    } else {
+        value
+    };
+    common::epoch_from_seconds(seconds)
+}
+
+fn json_f64(value: &JsonValue) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|v| v as f64))
+        .or_else(|| value.as_u64().map(|v| v as f64))
 }
 
 fn main() -> Result<()> {
@@ -38,12 +555,35 @@ fn main() -> Result<()> {
     if let Err(err) = common::emit_schema_to_atlas(&pile_path) {
         eprintln!("atlas emit: {err}");
     }
-    if cli.path.is_none() {
+    let Some(path) = cli.path else {
         let mut command = Cli::command();
         command.print_help()?;
         println!();
         return Ok(());
+    };
+    let branch_id = common::resolve_archive_branch_id(
+        &pile_path,
+        &cli.branch,
+        cli.branch_id.as_deref(),
+    )?;
+    let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, branch_id, &cli.branch)?;
+    let res = import_codex_path(&path, &mut repo, branch_id);
+    let close_res = repo
+        .close()
+        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    match (res, close_res) {
+        (Ok(stats), Ok(())) => {
+            println!(
+                "Imported {} file(s), {} conversation(s), {} message(s) in {} new commit(s).",
+                stats.files, stats.conversations, stats.messages, stats.commits
+            );
+            Ok(())
+        }
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(close_err)) => {
+            eprintln!("warning: close pile after error: {close_err:#}");
+            Err(err)
+        }
     }
-
-    bail!("Codex importer not implemented yet.")
 }
