@@ -22,7 +22,6 @@ use triblespace::core::id::ExclusiveId;
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
 
-
 #[path = "archive_common.rs"]
 mod common;
 
@@ -64,7 +63,11 @@ struct MessageRecord {
     order: usize,
 }
 
-fn import_copilot_path(path: &std::path::Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+fn import_copilot_path(
+    path: &std::path::Path,
+    repo: &mut common::Repo,
+    branch_id: Id,
+) -> Result<ImportStats> {
     if path.is_dir() {
         let mut files = Vec::new();
         collect_copilot_files(path, &mut files)
@@ -84,16 +87,17 @@ fn import_copilot_path(path: &std::path::Path, repo: &mut common::Repo, branch_i
     import_copilot_file(path, repo, branch_id)
 }
 
-fn import_copilot_file(path: &std::path::Path, repo: &mut common::Repo, branch_id: Id) -> Result<ImportStats> {
+fn import_copilot_file(
+    path: &std::path::Path,
+    repo: &mut common::Repo,
+    branch_id: Id,
+) -> Result<ImportStats> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let root: JsonValue = serde_json::from_str(&raw).context("parse copilot json")?;
     let object = root
         .as_object()
         .ok_or_else(|| anyhow!("copilot export must be a JSON object"))?;
-    let requests = object
-        .get("requests")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| anyhow!("copilot export missing requests[]"))?;
+    let mut records = parse_copilot_records(object)?;
 
     let mut ws = repo
         .pull(branch_id)
@@ -135,51 +139,7 @@ fn import_copilot_file(path: &std::path::Path, repo: &mut common::Repo, branch_i
         root
     };
 
-    let conversation_id = object
-        .get("conversationId")
-        .and_then(JsonValue::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| format!("copilot:{raw_root:x}"));
-
-    let mut records = Vec::new();
-    for (idx, request) in requests.iter().enumerate() {
-        let Some(req_obj) = request.as_object() else {
-            continue;
-        };
-        let request_id = req_obj
-            .get("requestId")
-            .and_then(JsonValue::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("request-{idx:08}"));
-        let created_at = req_obj
-            .get("timestamp")
-            .and_then(json_f64)
-            .and_then(parse_epoch_number);
-
-        if let Some(user_text) = extract_copilot_user_text(req_obj) {
-            records.push(MessageRecord {
-                source_message_id: format!("{request_id}:user"),
-                role: "user".to_string(),
-                author: "user".to_string(),
-                content: user_text,
-                created_at,
-                order: idx * 2,
-            });
-        }
-
-        if let Some(assistant_text) = extract_copilot_assistant_text(req_obj) {
-            records.push(MessageRecord {
-                source_message_id: format!("{request_id}:assistant"),
-                role: "assistant".to_string(),
-                author: "assistant".to_string(),
-                content: assistant_text,
-                created_at,
-                order: idx * 2 + 1,
-            });
-        }
-    }
+    let conversation_id = resolve_copilot_conversation_id(object, raw_root);
 
     records.sort_by_key(|m| m.order);
 
@@ -277,14 +237,171 @@ fn collect_copilot_files(path: &std::path::Path, out: &mut Vec<PathBuf>) -> Resu
         if !file_type.is_file() {
             continue;
         }
-        let Some(name) = entry_path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if name.starts_with("chat_") && entry_path.extension().and_then(|s| s.to_str()) == Some("json") {
+        if entry_path.extension().and_then(|s| s.to_str()) == Some("json") {
             out.push(entry_path);
         }
     }
     Ok(())
+}
+
+fn parse_copilot_records(object: &Map<String, JsonValue>) -> Result<Vec<MessageRecord>> {
+    if let Some(requests) = object.get("requests").and_then(JsonValue::as_array) {
+        return Ok(parse_copilot_requests(requests));
+    }
+    if let Some(messages) = object.get("messages").and_then(JsonValue::as_array) {
+        return Ok(parse_copilot_messages(messages));
+    }
+    Err(anyhow!("copilot export missing requests[] or messages[]"))
+}
+
+fn parse_copilot_requests(requests: &[JsonValue]) -> Vec<MessageRecord> {
+    let mut records = Vec::new();
+    for (idx, request) in requests.iter().enumerate() {
+        let Some(req_obj) = request.as_object() else {
+            continue;
+        };
+        let request_id = req_obj
+            .get("requestId")
+            .and_then(JsonValue::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("request-{idx:08}"));
+        let created_at = req_obj.get("timestamp").and_then(parse_epoch_value);
+
+        if let Some(user_text) = extract_copilot_user_text(req_obj) {
+            records.push(MessageRecord {
+                source_message_id: format!("{request_id}:user"),
+                role: "user".to_string(),
+                author: "user".to_string(),
+                content: user_text,
+                created_at,
+                order: idx * 2,
+            });
+        }
+
+        if let Some(assistant_text) = extract_copilot_assistant_text(req_obj) {
+            records.push(MessageRecord {
+                source_message_id: format!("{request_id}:assistant"),
+                role: "assistant".to_string(),
+                author: "assistant".to_string(),
+                content: assistant_text,
+                created_at,
+                order: idx * 2 + 1,
+            });
+        }
+    }
+    records
+}
+
+fn parse_copilot_messages(messages: &[JsonValue]) -> Vec<MessageRecord> {
+    let mut records = Vec::new();
+    for (idx, message) in messages.iter().enumerate() {
+        let Some(msg_obj) = message.as_object() else {
+            continue;
+        };
+        let role = msg_obj
+            .get("role")
+            .and_then(JsonValue::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("assistant")
+            .to_string();
+        let Some(content) = extract_message_content(msg_obj) else {
+            continue;
+        };
+        let source_message_id = msg_obj
+            .get("id")
+            .and_then(JsonValue::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("message-{idx:08}"));
+        let created_at = msg_obj
+            .get("createdAt")
+            .or_else(|| msg_obj.get("created_at"))
+            .or_else(|| msg_obj.get("timestamp"))
+            .and_then(parse_epoch_value);
+        records.push(MessageRecord {
+            source_message_id,
+            author: canonical_author_name(&role).to_string(),
+            role,
+            content,
+            created_at,
+            order: idx,
+        });
+    }
+    records
+}
+
+fn resolve_copilot_conversation_id(object: &Map<String, JsonValue>, raw_root: Id) -> String {
+    for key in ["conversationId", "threadID", "threadUrl", "threadName"] {
+        if let Some(value) = object.get(key).and_then(JsonValue::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    format!("copilot:{raw_root:x}")
+}
+
+fn extract_message_content(message: &Map<String, JsonValue>) -> Option<String> {
+    if let Some(text) = message.get("content").and_then(JsonValue::as_str) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(parts) = message
+        .get("content")
+        .and_then(JsonValue::as_object)
+        .and_then(|obj| obj.get("parts"))
+        .and_then(JsonValue::as_array)
+    {
+        let mut out = Vec::new();
+        for part in parts {
+            if let Some(text) = part.as_str() {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+        if !out.is_empty() {
+            return Some(out.join("\n\n"));
+        }
+    }
+    None
+}
+
+fn canonical_author_name(role: &str) -> &str {
+    match role {
+        "user" => "user",
+        "assistant" | "agent" | "model" => "assistant",
+        "developer" => "developer",
+        "system" => "system",
+        _ => role,
+    }
+}
+
+fn parse_epoch_value(value: &JsonValue) -> Option<Epoch> {
+    if let Some(seconds) = json_f64(value) {
+        return parse_epoch_number(seconds);
+    }
+    value.as_str().and_then(parse_epoch_str)
+}
+
+fn parse_epoch_str(value: &str) -> Option<Epoch> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(epoch) = trimmed.parse::<Epoch>() {
+        return Some(epoch);
+    }
+    if let Ok(seconds) = trimmed.parse::<f64>() {
+        return parse_epoch_number(seconds);
+    }
+    None
 }
 
 fn extract_copilot_user_text(req: &Map<String, JsonValue>) -> Option<String> {
@@ -438,11 +555,8 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let branch_id = common::resolve_archive_branch_id(
-        &pile_path,
-        &cli.branch,
-        cli.branch_id.as_deref(),
-    )?;
+    let branch_id =
+        common::resolve_archive_branch_id(&pile_path, &cli.branch, cli.branch_id.as_deref())?;
     let (mut repo, branch_id) = common::open_repo_for_write(&pile_path, branch_id, &cli.branch)?;
     let res = import_copilot_path(&path, &mut repo, branch_id);
     let close_res = repo
