@@ -572,29 +572,6 @@ pub fn push_workspace(repo: &mut Repo, ws: &mut Ws) -> Result<()> {
     Ok(())
 }
 
-pub fn stable_id(parts: &[&str]) -> Id {
-    use triblespace::core::id::RawId;
-    use triblespace::core::value::schemas::hash::Blake3 as Blake3Hasher;
-
-    let mut hasher = Blake3Hasher::new();
-    for (idx, part) in parts.iter().enumerate() {
-        if idx > 0 {
-            hasher.update(&[0x1f]);
-        }
-        hasher.update(part.as_bytes());
-    }
-    let digest = hasher.finalize();
-    let mut raw: RawId = [0u8; 16];
-    let bytes = digest.as_bytes();
-    let raw_len = raw.len();
-    raw.copy_from_slice(&bytes[bytes.len() - raw_len..]);
-    Id::new(raw).unwrap_or_else(|| {
-        raw[0] = 1;
-        // SAFETY: raw has been ensured non-nil.
-        unsafe { Id::force(raw) }
-    })
-}
-
 pub fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }

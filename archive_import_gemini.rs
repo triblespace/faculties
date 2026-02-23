@@ -101,10 +101,7 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
 
     let source_path = path.to_string_lossy().to_string();
     let source_path_handle = ws.put(source_path.clone());
-    let default_conversation_id = format!(
-        "gemini:{:x}",
-        common::stable_id(&["playground", "import", "gemini", "conversation", raw.as_str()])
-    );
+    let default_conversation_id = format!("gemini:{}", raw_fingerprint_prefix(raw.as_str()));
 
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     let (raw_root, mut records) = if extension == "html" || extension == "htm" {
@@ -267,6 +264,20 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
         stats.commits += 1;
     }
     Ok(stats)
+}
+
+fn raw_fingerprint_prefix(raw: &str) -> String {
+    use triblespace::core::value::schemas::hash::Blake3 as Blake3Hasher;
+
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(16);
+    for byte in digest.as_bytes().iter().take(8) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 fn collect_gemini_files(path: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
