@@ -108,7 +108,14 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
     let mut records = parse_gemini_activity_html(&raw);
 
     records.sort_by_key(|r| r.order);
-    let conversation_id = derive_conversation_id(records.first(), raw.as_str());
+    if records.is_empty() {
+        return Ok(stats);
+    }
+    let conversation_id = derive_conversation_id(
+        records
+            .first()
+            .expect("checked non-empty records before deriving conversation id"),
+    );
     for record in &mut records {
         record.conversation_id = conversation_id.clone();
     }
@@ -364,12 +371,8 @@ fn build_activity_source_message_id(
     format!("activity:{hash}:{index:08}:{role}")
 }
 
-fn derive_conversation_id(first_record: Option<&MessageRecord>, raw: &str) -> String {
-    if let Some(first) = first_record {
-        let seed = format!("conversation:{}", first.source_message_id);
-        return format!("gemini:{}", hash_prefix(seed.as_str()));
-    }
-    let seed = format!("conversation:{}", hash_prefix(raw));
+fn derive_conversation_id(first_record: &MessageRecord) -> String {
+    let seed = format!("conversation:{}", first_record.source_message_id);
     format!("gemini:{}", hash_prefix(seed.as_str()))
 }
 
