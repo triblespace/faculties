@@ -487,13 +487,13 @@ where
     out += <LongString as metadata::ConstDescribe>::describe(blobs)?;
     out += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
 
-    out += describe_attribute(blobs, &media_schema::bytes, "media_bytes")?;
-    out += describe_attribute(blobs, &media_schema::about_item, "media_about_item")?;
-    out += describe_attribute(blobs, &media_schema::created_at, "media_created_at")?;
-    out += describe_attribute(blobs, &media_schema::mime, "media_mime")?;
-    out += describe_attribute(blobs, &media_schema::name, "media_name")?;
-    out += describe_attribute(blobs, &media_schema::source_url, "media_source_url")?;
-    out += describe_attribute(blobs, &media_schema::alt, "media_alt")?;
+    out += metadata::Describe::describe(&media_schema::bytes, blobs)?;
+    out += metadata::Describe::describe(&media_schema::about_item, blobs)?;
+    out += metadata::Describe::describe(&media_schema::created_at, blobs)?;
+    out += metadata::Describe::describe(&media_schema::mime, blobs)?;
+    out += metadata::Describe::describe(&media_schema::name, blobs)?;
+    out += metadata::Describe::describe(&media_schema::source_url, blobs)?;
+    out += metadata::Describe::describe(&media_schema::alt, blobs)?;
 
     out += describe_kind(
         blobs,
@@ -508,23 +508,6 @@ where
         "Media ingest event with contextual metadata.",
     )?;
     Ok(out)
-}
-
-fn describe_attribute<B, S>(
-    blobs: &mut B,
-    attribute: &Attribute<S>,
-    name: &str,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<Blake3>,
-    S: ValueSchema,
-{
-    let mut tribles = TribleSet::new();
-    tribles += metadata::Describe::describe(attribute, blobs)?;
-    let handle = blobs.put(name.to_owned())?;
-    let attribute_id = attribute.id();
-    tribles += entity! { ExclusiveId::force_ref(&attribute_id) @ metadata::name: handle };
-    Ok(tribles)
 }
 
 fn describe_kind<B>(

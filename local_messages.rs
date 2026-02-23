@@ -867,21 +867,13 @@ where
         )?;
     metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?;
 
-    metadata += describe_attribute(blobs, &local::from, "local_from")?;
-    metadata += describe_attribute(blobs, &local::to, "local_to")?;
-    metadata += describe_attribute(blobs, &local::body, "local_body")?;
-    metadata += describe_attribute(
-        blobs,
-        &local::created_at,
-        "local_created_at",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &local::about_message,
-        "local_about_message",
-    )?;
-    metadata += describe_attribute(blobs, &local::reader, "local_reader")?;
-    metadata += describe_attribute(blobs, &local::read_at, "local_read_at")?;
+    metadata += metadata::Describe::describe(&local::from, blobs)?;
+    metadata += metadata::Describe::describe(&local::to, blobs)?;
+    metadata += metadata::Describe::describe(&local::body, blobs)?;
+    metadata += metadata::Describe::describe(&local::created_at, blobs)?;
+    metadata += metadata::Describe::describe(&local::about_message, blobs)?;
+    metadata += metadata::Describe::describe(&local::reader, blobs)?;
+    metadata += metadata::Describe::describe(&local::read_at, blobs)?;
 
     metadata += describe_kind(
         blobs,
@@ -897,25 +889,6 @@ where
     )?;
 
     Ok(metadata)
-}
-
-fn describe_attribute<B, S>(
-    blobs: &mut B,
-    attribute: &Attribute<S>,
-    name: &str,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-    S: ValueSchema,
-{
-    let mut tribles = TribleSet::new();
-    tribles += metadata::Describe::describe(attribute, blobs)?;
-    let handle = blobs.put(name.to_owned())?;
-    let attribute_id = attribute.id();
-    tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::name: handle,
-    };
-    Ok(tribles)
 }
 
 fn describe_kind<B>(

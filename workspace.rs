@@ -296,57 +296,17 @@ where
     metadata += <SimpleArchive as metadata::ConstDescribe>::describe(blobs)?;
     metadata += <LongString as metadata::ConstDescribe>::describe(blobs)?;
 
-    metadata += describe_attribute(blobs, &playground_workspace::kind, "workspace_kind")?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::created_at,
-        "workspace_created_at",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::parent_snapshot,
-        "workspace_parent_snapshot",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::root_path,
-        "workspace_root_path",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::state,
-        "workspace_state",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::label,
-        "workspace_label",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::entry,
-        "workspace_entry",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::path,
-        "workspace_path",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::mode,
-        "workspace_mode",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::bytes,
-        "workspace_bytes",
-    )?;
-    metadata += describe_attribute(
-        blobs,
-        &playground_workspace::link_target,
-        "workspace_link_target",
-    )?;
+    metadata += metadata::Describe::describe(&playground_workspace::kind, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::created_at, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::parent_snapshot, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::root_path, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::state, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::label, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::entry, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::path, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::mode, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::bytes, blobs)?;
+    metadata += metadata::Describe::describe(&playground_workspace::link_target, blobs)?;
 
     metadata += describe_kind(
         blobs,
@@ -374,25 +334,6 @@ where
     )?;
 
     Ok(metadata)
-}
-
-fn describe_attribute<B, S>(
-    blobs: &mut B,
-    attribute: &Attribute<S>,
-    name: &str,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<Blake3>,
-    S: ValueSchema,
-{
-    let mut tribles = TribleSet::new();
-    tribles += metadata::Describe::describe(attribute, blobs)?;
-    let handle = blobs.put(name.to_owned())?;
-    let attribute_id = attribute.id();
-    tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::name: handle,
-    };
-    Ok(tribles)
 }
 
 fn describe_kind<B>(
@@ -855,23 +796,21 @@ fn compute_state_handle(
     canonical_entries.sort_by(|a, b| a.path.cmp(&b.path));
 
     let mut state = TribleSet::new();
-    let root_entity = entity! { _ @
-        playground_workspace::kind: playground_workspace::kind_snapshot,
-        playground_workspace::root_path: root_handle,
-    };
-    let state_root = root_entity
-        .root()
-        .expect("entity! must export a single root id");
-    state += root_entity;
+    let mut entry_ids = Vec::with_capacity(canonical_entries.len());
 
     for entry in canonical_entries.iter() {
         let entry_set = build_entry_entity(entry);
         let entry_id = entry_set
             .root()
             .expect("entity! must export a single root id");
-        state += entity! { ExclusiveId::force_ref(&state_root) @ playground_workspace::entry: entry_id };
+        entry_ids.push(entry_id);
         state += entry_set;
     }
+    state += entity! { _ @
+        playground_workspace::kind: playground_workspace::kind_snapshot,
+        playground_workspace::root_path: root_handle,
+        playground_workspace::entry*: entry_ids,
+    };
 
     let blob: Blob<SimpleArchive> = state.to_blob();
     ws.put(blob)

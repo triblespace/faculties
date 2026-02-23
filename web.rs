@@ -461,26 +461,33 @@ fn store_search(
 
         let mut change = TribleSet::new();
         change += search_fragment;
+        let mut result_ids = Vec::with_capacity(results.len());
 
         for r in results {
             let url_handle = ws.put(r.url.clone());
-            let result_base = entity! { _ @
+            let title_handle = r
+                .title
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|title| ws.put(title.to_string()));
+            let snippet_handle = r
+                .snippet
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|snippet| ws.put(snippet.to_string()));
+            let result_fragment = entity! { _ @
                 metadata::tag: &web_schema::kind_result,
                 web_schema::url: url_handle,
+                web_schema::title?: title_handle,
+                web_schema::snippet?: snippet_handle,
             };
-            let result_id = result_base
+            let result_id = result_fragment
                 .root()
                 .ok_or_else(|| anyhow!("result fragment missing root export"))?;
-            change += result_base;
-            change += entity! { ExclusiveId::force_ref(&search_id) @ web_schema::result: result_id };
-
-            if let Some(title) = r.title.as_deref().filter(|s| !s.is_empty()) {
-                change += entity! { ExclusiveId::force_ref(&result_id) @ web_schema::title: ws.put(title.to_string()) };
-            }
-            if let Some(snippet) = r.snippet.as_deref().filter(|s| !s.is_empty()) {
-                change += entity! { ExclusiveId::force_ref(&result_id) @ web_schema::snippet: ws.put(snippet.to_string()) };
-            }
+            result_ids.push(result_id);
+            change += result_fragment;
         }
+        change += entity! { ExclusiveId::force_ref(&search_id) @ web_schema::result*: result_ids };
 
         let delta = change.difference(&catalog);
         if !delta.is_empty() {
@@ -752,37 +759,20 @@ where
     out += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
     out += <LongString as metadata::ConstDescribe>::describe(blobs)?;
 
-    out += describe_attribute(blobs, &web_schema::query, "web_query")?;
-    out += describe_attribute(blobs, &web_schema::provider, "web_provider")?;
-    out += describe_attribute(blobs, &web_schema::created_at, "web_created_at")?;
-    out += describe_attribute(blobs, &web_schema::result, "web_result")?;
-    out += describe_attribute(blobs, &web_schema::url, "web_url")?;
-    out += describe_attribute(blobs, &web_schema::title, "web_title")?;
-    out += describe_attribute(blobs, &web_schema::snippet, "web_snippet")?;
-    out += describe_attribute(blobs, &web_schema::content, "web_content")?;
+    out += metadata::Describe::describe(&web_schema::query, blobs)?;
+    out += metadata::Describe::describe(&web_schema::provider, blobs)?;
+    out += metadata::Describe::describe(&web_schema::created_at, blobs)?;
+    out += metadata::Describe::describe(&web_schema::result, blobs)?;
+    out += metadata::Describe::describe(&web_schema::url, blobs)?;
+    out += metadata::Describe::describe(&web_schema::title, blobs)?;
+    out += metadata::Describe::describe(&web_schema::snippet, blobs)?;
+    out += metadata::Describe::describe(&web_schema::content, blobs)?;
 
     out += describe_kind(blobs, &web_schema::kind_search, "web_kind_search", "Web search event kind.")?;
     out += describe_kind(blobs, &web_schema::kind_result, "web_kind_result", "Web result entity kind.")?;
     out += describe_kind(blobs, &web_schema::kind_fetch, "web_kind_fetch", "Web fetch/extract event kind.")?;
 
     Ok(out)
-}
-
-fn describe_attribute<B, S>(
-    blobs: &mut B,
-    attribute: &Attribute<S>,
-    name: &str,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<Blake3>,
-    S: ValueSchema,
-{
-    let mut tribles = TribleSet::new();
-    tribles += metadata::Describe::describe(attribute, blobs)?;
-    let handle = blobs.put(name.to_owned())?;
-    let attribute_id = attribute.id();
-    tribles += entity! { ExclusiveId::force_ref(&attribute_id) @ metadata::name: handle };
-    Ok(tribles)
 }
 
 fn describe_kind<B>(

@@ -851,31 +851,15 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
             )?;
         metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
-        metadata += describe_attribute(repo.storage_mut(), &metadata::name, "name")?;
-        metadata += describe_attribute(repo.storage_mut(), &relations::alias, "relations_alias")?;
-        metadata += describe_attribute(repo.storage_mut(), &relations::affinity, "relations_affinity")?;
-        metadata += describe_attribute(
-            repo.storage_mut(),
-            &relations::first_name,
-            "relations_first_name",
-        )?;
-        metadata += describe_attribute(
-            repo.storage_mut(),
-            &relations::last_name,
-            "relations_last_name",
-        )?;
-        metadata += describe_attribute(
-            repo.storage_mut(),
-            &relations::display_name,
-            "relations_display_name",
-        )?;
-        metadata += describe_attribute(repo.storage_mut(), &metadata::description, "description")?;
-        metadata += describe_attribute(
-            repo.storage_mut(),
-            &relations::teams_user_id,
-            "relations_teams_user_id",
-        )?;
-        metadata += describe_attribute(repo.storage_mut(), &relations::email, "relations_email")?;
+        metadata += metadata::Describe::describe(&metadata::name, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::alias, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::affinity, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::first_name, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::last_name, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::display_name, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&metadata::description, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::teams_user_id, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::email, repo.storage_mut())?;
 
         metadata += describe_kind(
             repo.storage_mut(),
@@ -898,25 +882,6 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
         }
         Ok(())
     })
-}
-
-fn describe_attribute<B, S>(
-    blobs: &mut B,
-    attribute: &Attribute<S>,
-    name: &str,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-    S: ValueSchema,
-{
-    let mut tribles = TribleSet::new();
-    tribles += metadata::Describe::describe(attribute, blobs)?;
-    let handle = blobs.put(name.to_owned())?;
-    let attribute_id = attribute.id();
-    tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::name: handle,
-    };
-    Ok(tribles)
 }
 
 fn describe_kind<B>(

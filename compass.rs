@@ -1083,18 +1083,14 @@ where
         )?;
     metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?;
 
-    metadata += describe_attribute(blobs, &board::title, "compass_title")?;
-    metadata += describe_attribute(
-        blobs,
-        &board::created_at,
-        "compass_created_at",
-    )?;
-    metadata += describe_attribute(blobs, &board::tag, "compass_tag")?;
-    metadata += describe_attribute(blobs, &board::parent, "compass_parent")?;
-    metadata += describe_attribute(blobs, &board::task, "compass_task")?;
-    metadata += describe_attribute(blobs, &board::status, "compass_status")?;
-    metadata += describe_attribute(blobs, &board::at, "compass_at")?;
-    metadata += describe_attribute(blobs, &board::note, "compass_note")?;
+    metadata += metadata::Describe::describe(&board::title, blobs)?;
+    metadata += metadata::Describe::describe(&board::created_at, blobs)?;
+    metadata += metadata::Describe::describe(&board::tag, blobs)?;
+    metadata += metadata::Describe::describe(&board::parent, blobs)?;
+    metadata += metadata::Describe::describe(&board::task, blobs)?;
+    metadata += metadata::Describe::describe(&board::status, blobs)?;
+    metadata += metadata::Describe::describe(&board::at, blobs)?;
+    metadata += metadata::Describe::describe(&board::note, blobs)?;
 
     metadata += describe_kind(
         blobs,
@@ -1116,25 +1112,6 @@ where
     )?;
 
     Ok(metadata)
-}
-
-fn describe_attribute<B, S>(
-    blobs: &mut B,
-    attribute: &Attribute<S>,
-    name: &str,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-    S: ValueSchema,
-{
-    let mut tribles = TribleSet::new();
-    tribles += metadata::Describe::describe(attribute, blobs)?;
-    let handle = blobs.put(name.to_owned())?;
-    let attribute_id = attribute.id();
-    tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-        metadata::name: handle,
-    };
-    Ok(tribles)
 }
 
 fn describe_kind<B>(
