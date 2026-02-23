@@ -235,22 +235,8 @@ fn import_chatgpt_file(
                 .unwrap_or_else(common::unknown_epoch);
             let created_at = common::epoch_interval(created_at_epoch);
             let content_handle = ws.put(content);
-
-            change += entity! { &message_entity @
-                common::archive::kind: common::archive::kind_message,
-                common::archive::author: author_id,
-                common::archive::content: content_handle,
-                common::archive::created_at: created_at,
-                common::import_schema::source_author: ws.put(name.to_string()),
-                common::import_schema::source_role: ws.put(role.to_string()),
-                common::import_schema::source_created_at: created_at,
-            };
-
-            if let Some(content_type) = message_content_type(message) {
-                if !content_type.is_empty() {
-                    change += entity! { &message_entity @ common::archive::content_type: content_type };
-                }
-            }
+            let content_type = message_content_type(message).filter(|value| !value.is_empty());
+            let mut attachment_ids = Vec::new();
 
             // Import attachments referenced by this message (images, files, etc).
             for attachment in collect_attachments(message) {
@@ -274,35 +260,15 @@ fn import_chatgpt_file(
                 let attachment_entity = attachment_id
                     .aquire()
                     .expect("entity! root ids should be acquired in current thread");
-                change += attachment_fragment;
+                attachment_ids.push(attachment_id);
 
-                // Always link the message -> attachment, even if we don't have bytes.
-                change += entity! { &message_entity @ common::archive::attachment: attachment_id };
-
-                if let Some(pointer) = source_pointer {
-                    change += entity! { &attachment_entity @
-                        common::archive::attachment_source_pointer: ws.put(pointer),
-                    };
-                }
-                if let Some(name) = name {
-                    change += entity! { &attachment_entity @
-                        common::archive::attachment_name: ws.put(name),
-                    };
-                }
-                if let Some(mime) = mime {
-                    change += entity! { &attachment_entity @
-                        common::archive::attachment_mime: mime.as_str(),
-                    };
-                }
-                if let Some(size) = size_bytes {
-                    change += entity! { &attachment_entity @ common::archive::attachment_size_bytes: size };
-                }
-                if let Some(width) = width_px {
-                    change += entity! { &attachment_entity @ common::archive::attachment_width_px: width };
-                }
-                if let Some(height) = height_px {
-                    change += entity! { &attachment_entity @ common::archive::attachment_height_px: height };
-                }
+                let source_pointer_handle = source_pointer.map(|pointer| ws.put(pointer));
+                let attachment_name = name.map(|value| ws.put(value));
+                let attachment_mime = mime.as_deref();
+                let attachment_size = size_bytes;
+                let attachment_width = width_px;
+                let attachment_height = height_px;
+                let mut attachment_data = None;
 
                 let needs_data = attachment_data_handle(&catalog, attachment_id).is_none()
                     && attachment_data_handle(&change, attachment_id).is_none();
@@ -311,24 +277,49 @@ fn import_chatgpt_file(
                         if attachment_data_loaded.insert(attachment_id) {
                             let bytes = fs::read(path)
                                 .with_context(|| format!("read attachment {}", path.display()))?;
-                            let data_handle = ws.put(Bytes::from_source(bytes));
-                            change += entity! { &attachment_entity @
-                                common::archive::attachment_data: data_handle,
-                            };
+                            attachment_data = Some(ws.put(Bytes::from_source(bytes)));
                             stats.attachments += 1;
                         }
                     }
                 }
+
+                change += entity! { &attachment_entity @
+                    common::archive::kind: common::archive::kind_attachment,
+                    common::archive::attachment_source_id: source_id_handle,
+                    common::archive::attachment_source_pointer?: source_pointer_handle,
+                    common::archive::attachment_name?: attachment_name,
+                    common::archive::attachment_mime?: attachment_mime,
+                    common::archive::attachment_size_bytes?: attachment_size,
+                    common::archive::attachment_width_px?: attachment_width,
+                    common::archive::attachment_height_px?: attachment_height,
+                    common::archive::attachment_data?: attachment_data,
+                };
             }
 
-            if let Some(parent) = node.get("parent").and_then(JsonValue::as_str) {
-                if let Some(parent_id) = node_to_message.get(parent).copied() {
-                    change += entity! { &message_entity @
-                        common::archive::reply_to: parent_id,
-                        common::import_schema::source_parent_id: ws.put(parent.to_string()),
-                    };
-                }
-            }
+            let (reply_to, source_parent_id) = node
+                .get("parent")
+                .and_then(JsonValue::as_str)
+                .and_then(|parent| {
+                    node_to_message
+                        .get(parent)
+                        .copied()
+                        .map(|parent_id| (Some(parent_id), Some(ws.put(parent.to_string()))))
+                })
+                .unwrap_or((None, None));
+
+            change += entity! { &message_entity @
+                common::archive::kind: common::archive::kind_message,
+                common::archive::author: author_id,
+                common::archive::content: content_handle,
+                common::archive::created_at: created_at,
+                common::archive::content_type?: content_type,
+                common::archive::attachment*: attachment_ids,
+                common::archive::reply_to?: reply_to,
+                common::import_schema::source_author: ws.put(name.to_string()),
+                common::import_schema::source_role: ws.put(role.to_string()),
+                common::import_schema::source_created_at: created_at,
+                common::import_schema::source_parent_id?: source_parent_id,
+            };
 
             stats.messages += 1;
         }

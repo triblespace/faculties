@@ -192,6 +192,10 @@ fn import_copilot_file(
 
         let created_at =
             common::epoch_interval(message.created_at.unwrap_or_else(common::unknown_epoch));
+        let reply_to = previous.as_ref().map(|(parent_id, _)| *parent_id);
+        let source_parent_id = previous
+            .as_ref()
+            .map(|(_, parent_source_id)| ws.put(parent_source_id.clone()));
         let content_handle = ws.put(message.content.clone());
         change += entity! { &message_entity @
             common::archive::kind: common::archive::kind_message,
@@ -201,13 +205,9 @@ fn import_copilot_file(
             common::import_schema::source_author: ws.put(message.author.clone()),
             common::import_schema::source_role: ws.put(message.role.clone()),
             common::import_schema::source_created_at: created_at,
+            common::archive::reply_to?: reply_to,
+            common::import_schema::source_parent_id?: source_parent_id,
         };
-        if let Some((parent_id, parent_source_id)) = previous.as_ref() {
-            change += entity! { &message_entity @
-                common::archive::reply_to: *parent_id,
-                common::import_schema::source_parent_id: ws.put(parent_source_id.clone()),
-            };
-        }
         previous = Some((message_id, message.source_message_id.clone()));
         stats.messages += 1;
     }
