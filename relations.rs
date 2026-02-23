@@ -179,6 +179,14 @@ fn normalize_label(label: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn normalize_aliases(aliases: Vec<String>) -> Vec<String> {
+    aliases
+        .into_iter()
+        .map(|alias| alias.trim().to_string())
+        .filter(|alias| !alias.is_empty())
+        .collect()
+}
+
 fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -617,42 +625,23 @@ fn cmd_add(
         }
 
         let label_handle = ws.put(label.clone());
+        let display_name_handle = display_name.map(|value| ws.put(value));
+        let first_name_handle = first_name.map(|value| ws.put(value));
+        let last_name_handle = last_name.map(|value| ws.put(value));
+        let note_handle = note.map(|value| ws.put(value));
+        let aliases = normalize_aliases(aliases);
         change += entity! { ExclusiveId::force_ref(&person_id) @
             metadata::tag: &KIND_PERSON_ID,
             metadata::name: label_handle,
+            relations::display_name?: display_name_handle,
+            relations::first_name?: first_name_handle,
+            relations::last_name?: last_name_handle,
+            relations::affinity?: affinity,
+            metadata::description?: note_handle,
+            relations::teams_user_id?: teams_user_id,
+            relations::email?: email,
+            relations::alias*: aliases.iter().map(String::as_str),
         };
-
-        if let Some(display) = display_name {
-            let handle = ws.put(display);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
-        }
-        if let Some(value) = first_name {
-            let handle = ws.put(value);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
-        }
-        if let Some(value) = last_name {
-            let handle = ws.put(value);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
-        }
-        if let Some(value) = affinity {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
-        }
-        if let Some(value) = note {
-            let handle = ws.put(value);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
-        }
-        if let Some(value) = teams_user_id {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::teams_user_id: value };
-        }
-        if let Some(value) = email {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::email: value };
-        }
-        for alias in aliases {
-            let alias = alias.trim();
-            if !alias.is_empty() {
-                change += entity! { ExclusiveId::force_ref(&person_id) @ relations::alias: alias.to_string() };
-            }
-        }
 
         ws.commit(change, None, Some("relations add"));
         repo.push(&mut ws).map_err(|e| anyhow!("push person: {e:?}"))?;
@@ -689,48 +678,44 @@ fn cmd_set(
 
         let person_id = resolve_person_id(&space, &id)?;
 
-        if let Some(label) = label {
-            if let Some(existing) = find_person_by_label(&space, &label)? {
+        if let Some(label_value) = label.as_deref() {
+            if let Some(existing) = find_person_by_label(&space, label_value)? {
                 if existing != person_id {
                     bail!(
-                        "label '{label}' already belongs to person {}",
+                        "label '{label_value}' already belongs to person {}",
                         id_prefix(existing)
                     );
                 }
             }
-            let handle = ws.put(label);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::name: handle };
         }
-        if let Some(display) = display_name {
-            let handle = ws.put(display);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::display_name: handle };
-        }
-        if let Some(value) = first_name {
-            let handle = ws.put(value);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::first_name: handle };
-        }
-        if let Some(value) = last_name {
-            let handle = ws.put(value);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::last_name: handle };
-        }
-        if let Some(value) = affinity {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::affinity: value };
-        }
-        if let Some(value) = note {
-            let handle = ws.put(value);
-            change += entity! { ExclusiveId::force_ref(&person_id) @ metadata::description: handle };
-        }
-        if let Some(value) = teams_user_id {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::teams_user_id: value };
-        }
-        if let Some(value) = email {
-            change += entity! { ExclusiveId::force_ref(&person_id) @ relations::email: value };
-        }
-        for alias in aliases {
-            let alias = alias.trim();
-            if !alias.is_empty() {
-                change += entity! { ExclusiveId::force_ref(&person_id) @ relations::alias: alias.to_string() };
-            }
+        let label_handle = label.map(|value| ws.put(value));
+        let display_name_handle = display_name.map(|value| ws.put(value));
+        let first_name_handle = first_name.map(|value| ws.put(value));
+        let last_name_handle = last_name.map(|value| ws.put(value));
+        let note_handle = note.map(|value| ws.put(value));
+        let aliases = normalize_aliases(aliases);
+        let has_updates = label_handle.is_some()
+            || display_name_handle.is_some()
+            || first_name_handle.is_some()
+            || last_name_handle.is_some()
+            || affinity.is_some()
+            || note_handle.is_some()
+            || teams_user_id.is_some()
+            || email.is_some()
+            || !aliases.is_empty();
+
+        if has_updates {
+            change += entity! { ExclusiveId::force_ref(&person_id) @
+                metadata::name?: label_handle,
+                relations::display_name?: display_name_handle,
+                relations::first_name?: first_name_handle,
+                relations::last_name?: last_name_handle,
+                relations::affinity?: affinity,
+                metadata::description?: note_handle,
+                relations::teams_user_id?: teams_user_id,
+                relations::email?: email,
+                relations::alias*: aliases.iter().map(String::as_str),
+            };
         }
 
         if !change.is_empty() {
