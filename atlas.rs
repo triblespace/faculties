@@ -53,6 +53,7 @@ struct MetaRow {
     description: Option<String>,
     source_module: Option<String>,
     tags: Vec<Id>,
+    grouped_by: Vec<Id>,
 }
 
 fn main() -> Result<()> {
@@ -95,8 +96,20 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
                 String::new()
             } else {
                 format!(
-                    " [{}]",
+                    " [tags: {}]",
                     row.tags
+                        .iter()
+                        .map(|id| id_prefix(*id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            let grouped_by = if row.grouped_by.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [groups: {}]",
+                    row.grouped_by
                         .iter()
                         .map(|id| id_prefix(*id))
                         .collect::<Vec<_>>()
@@ -112,7 +125,7 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
                 .map(|m| format!(" @{m}"))
                 .unwrap_or_default();
             println!(
-                "{short_id} {name}{source_module}{tags}{description}",
+                "{short_id} {name}{source_module}{tags}{grouped_by}{description}",
                 name = row.name
             );
         }
@@ -147,6 +160,15 @@ fn cmd_show(pile: &Path, branch: &str, prefix: &str) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("tags: {tags}");
+        }
+        if !row.grouped_by.is_empty() {
+            let groups = row
+                .grouped_by
+                .iter()
+                .map(|id| format!("{id:x}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("grouped_by: {groups}");
         }
         Ok(())
     })
@@ -186,13 +208,25 @@ fn collect_rows(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet) -> Result<V
             None => None,
         };
 
-        let tags = find!(
+        let mut tags = find!(
             (tag: Id),
             pattern!(space, [{ id @ metadata::tag: ?tag }])
         )
         .into_iter()
         .map(|(tag,)| tag)
         .collect::<Vec<_>>();
+        tags.sort();
+        tags.dedup();
+
+        let mut grouped_by = find!(
+            (group: Id),
+            pattern!(space, [{ ?group @ metadata::tag: id }])
+        )
+        .into_iter()
+        .map(|(group,)| group)
+        .collect::<Vec<_>>();
+        grouped_by.sort();
+        grouped_by.dedup();
 
         rows.push(MetaRow {
             id,
@@ -200,6 +234,7 @@ fn collect_rows(ws: &mut Workspace<Pile<Blake3>>, space: &TribleSet) -> Result<V
             description,
             source_module: source_module_value,
             tags,
+            grouped_by,
         });
     }
     Ok(rows)

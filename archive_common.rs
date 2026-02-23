@@ -7,6 +7,7 @@ use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::fs;
+use triblespace::core::id::ExclusiveId;
 use triblespace::core::metadata;
 use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
@@ -74,18 +75,21 @@ pub mod archive_schema {
             B: BlobStore<Blake3>,
         {
             let mut tribles = TribleSet::new();
+            let kind_message_entity = super::super::aquire_or_force(kind_message);
+            let kind_author_entity = super::super::aquire_or_force(kind_author);
+            let kind_attachment_entity = super::super::aquire_or_force(kind_attachment);
 
-            tribles += entity! { ExclusiveId::force_ref(&kind_message) @
+            tribles += entity! { &kind_message_entity @
                 metadata::name: blobs.put("kind_message".to_string())?,
                 metadata::description: blobs.put("Message payload kind.".to_string())?,
             };
 
-            tribles += entity! { ExclusiveId::force_ref(&kind_author) @
+            tribles += entity! { &kind_author_entity @
                 metadata::name: blobs.put("kind_author".to_string())?,
                 metadata::description: blobs.put("Author entity kind.".to_string())?,
             };
 
-            tribles += entity! { ExclusiveId::force_ref(&kind_attachment) @
+            tribles += entity! { &kind_attachment_entity @
                 metadata::name: blobs.put("kind_attachment".to_string())?,
                 metadata::description: blobs.put("Attachment entity kind.".to_string())?,
             };
@@ -183,8 +187,14 @@ pub mod import_schema {
         B: BlobStore<Blake3>,
     {
         let mut tribles = TribleSet::new();
+        let import_metadata_entity = super::aquire_or_force(import_metadata);
+        let tag_protocol_entity = super::aquire_or_force(tag_protocol);
+        let tag_kind_entity = super::aquire_or_force(tag_kind);
+        let tag_attribute_entity = super::aquire_or_force(tag_attribute);
+        let tag_tag_entity = super::aquire_or_force(tag_tag);
+        let kind_batch_entity = super::aquire_or_force(kind_batch);
 
-        tribles += entity! { ExclusiveId::force_ref(&import_metadata) @
+        tribles += entity! { &import_metadata_entity @
             metadata::name: blobs.put("import_metadata".to_string())?,
             metadata::description: blobs.put(
                 "Root id for describing import metadata.".to_string(),
@@ -192,7 +202,7 @@ pub mod import_schema {
             metadata::tag: tag_protocol,
         };
 
-        tribles += entity! { ExclusiveId::force_ref(&tag_protocol) @
+        tribles += entity! { &tag_protocol_entity @
             metadata::name: blobs.put("tag_protocol".to_string())?,
             metadata::description: blobs.put(
                 "Tag for import protocol metadata.".to_string(),
@@ -200,34 +210,49 @@ pub mod import_schema {
             metadata::tag: tag_tag,
         };
 
-        tribles += entity! { ExclusiveId::force_ref(&tag_kind) @
+        tribles += entity! { &tag_kind_entity @
             metadata::name: blobs.put("tag_kind".to_string())?,
             metadata::description: blobs.put(
                 "Tag for import protocol kind constants.".to_string(),
             )?,
             metadata::tag: tag_tag,
+            metadata::tag: kind_batch,
         };
 
-        tribles += entity! { ExclusiveId::force_ref(&tag_attribute) @
+        tribles += entity! { &tag_attribute_entity @
             metadata::name: blobs.put("tag_attribute".to_string())?,
             metadata::description: blobs.put(
                 "Tag for import protocol attributes.".to_string(),
             )?,
             metadata::tag: tag_tag,
+            metadata::tag: kind.id(),
+            metadata::tag: batch.id(),
+            metadata::tag: source_format.id(),
+            metadata::tag: source_path.id(),
+            metadata::tag: source_raw_root.id(),
+            metadata::tag: source_conversation_id.id(),
+            metadata::tag: source_title.id(),
+            metadata::tag: source_message_id.id(),
+            metadata::tag: source_author.id(),
+            metadata::tag: source_role.id(),
+            metadata::tag: source_parent_id.id(),
+            metadata::tag: source_created_at.id(),
         };
 
-        tribles += entity! { ExclusiveId::force_ref(&tag_tag) @
+        tribles += entity! { &tag_tag_entity @
             metadata::name: blobs.put("tag_tag".to_string())?,
             metadata::description: blobs.put(
                 "Tag for import protocol tag constants.".to_string(),
             )?,
             metadata::tag: tag_tag,
+            metadata::tag: tag_protocol,
+            metadata::tag: tag_kind,
+            metadata::tag: tag_attribute,
         };
 
-        tribles += entity! { ExclusiveId::force_ref(&kind_batch) @
+        tribles += entity! { &kind_batch_entity @
             metadata::name: blobs.put("kind_batch".to_string())?,
             metadata::description: blobs.put("Import batch entity kind.".to_string())?,
-            metadata::tag: tag_kind,
         };
 
         Ok(tribles)
@@ -244,37 +269,20 @@ pub mod import_schema {
         metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
         metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata += describe_attribute(blobs, &kind)?;
-        metadata += describe_attribute(blobs, &batch)?;
-        metadata += describe_attribute(blobs, &source_format)?;
-        metadata += describe_attribute(blobs, &source_path)?;
-        metadata += describe_attribute(blobs, &source_raw_root)?;
-        metadata += describe_attribute(blobs, &source_conversation_id)?;
-        metadata += describe_attribute(blobs, &source_title)?;
-        metadata += describe_attribute(blobs, &source_message_id)?;
-        metadata += describe_attribute(blobs, &source_author)?;
-        metadata += describe_attribute(blobs, &source_role)?;
-        metadata += describe_attribute(blobs, &source_parent_id)?;
-        metadata += describe_attribute(blobs, &source_created_at)?;
+        metadata += metadata::Describe::describe(&kind, blobs)?;
+        metadata += metadata::Describe::describe(&batch, blobs)?;
+        metadata += metadata::Describe::describe(&source_format, blobs)?;
+        metadata += metadata::Describe::describe(&source_path, blobs)?;
+        metadata += metadata::Describe::describe(&source_raw_root, blobs)?;
+        metadata += metadata::Describe::describe(&source_conversation_id, blobs)?;
+        metadata += metadata::Describe::describe(&source_title, blobs)?;
+        metadata += metadata::Describe::describe(&source_message_id, blobs)?;
+        metadata += metadata::Describe::describe(&source_author, blobs)?;
+        metadata += metadata::Describe::describe(&source_role, blobs)?;
+        metadata += metadata::Describe::describe(&source_parent_id, blobs)?;
+        metadata += metadata::Describe::describe(&source_created_at, blobs)?;
 
         Ok(metadata)
-    }
-
-    fn describe_attribute<B, S>(
-        blobs: &mut B,
-        attribute: &Attribute<S>,
-    ) -> std::result::Result<TribleSet, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-        S: ValueSchema,
-    {
-        let mut tribles = TribleSet::new();
-        tribles += metadata::Describe::describe(attribute, blobs)?;
-        let attribute_id = attribute.id();
-        tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::tag: tag_attribute,
-        };
-        Ok(tribles)
     }
 }
 
@@ -282,6 +290,10 @@ pub use archive_schema::archive;
 
 pub type Repo = Repository<Pile<Blake3>>;
 pub type Ws = Workspace<Pile<Blake3>>;
+
+fn aquire_or_force(id: Id) -> ExclusiveId {
+    id.aquire().unwrap_or_else(|| ExclusiveId::force(id))
+}
 
 const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
@@ -607,7 +619,8 @@ pub fn ensure_author(
         let mut change = TribleSet::new();
         if author_role_handle(catalog, author_id).is_none() && !role.is_empty() {
             let handle = ws.put(role.to_owned());
-            change += entity! { ExclusiveId::force_ref(&author_id) @
+            let author_entity = aquire_or_force(author_id);
+            change += entity! { &author_entity @
                 archive::author_role: handle
             };
         }
