@@ -7,11 +7,10 @@
 //! hifitime = "4"
 //! rand_core = "0.6.4"
 //! scraper = "0.23"
-//! serde_json = "1"
 //! triblespace = "0.16.0"
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -19,9 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use hifitime::{Duration, Epoch};
 use scraper::{Html, Selector};
-use serde_json::{Map, Value as JsonValue};
 use triblespace::core::id::ExclusiveId;
-use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
 
 
@@ -92,7 +89,7 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let mut catalog = ws.checkout(..).context("checkout workspace")?;
+    let catalog = ws.checkout(..).context("checkout workspace")?;
 
     let mut stats = ImportStats {
         files: 1,
@@ -101,83 +98,20 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
 
     let source_path = path.to_string_lossy().to_string();
     let source_path_handle = ws.put(source_path.clone());
-    let default_conversation_id = format!("gemini:{}", raw_fingerprint_prefix(raw.as_str()));
-
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    let (raw_root, mut records) = if extension == "html" || extension == "htm" {
-        let records = parse_gemini_activity_html(&raw, &default_conversation_id);
-        (None, records)
-    } else if extension == "jsonl" {
-        let mut records = Vec::new();
-        for (line_idx, line) in raw.lines().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let json: JsonValue = serde_json::from_str(trimmed)
-                .with_context(|| format!("parse jsonl line {}", line_idx + 1))?;
-            records.push((line_idx, json));
-        }
-        let mut parsed = Vec::new();
-        let mut order = 0usize;
-        let mut dedupe = HashSet::new();
-        for (_, json) in &records {
-            collect_gemini_messages(
-                json,
-                &default_conversation_id,
-                &mut parsed,
-                &mut dedupe,
-                &mut order,
-            );
-        }
-        (None, parsed)
-    } else {
-        let root: JsonValue = serde_json::from_str(&raw).context("parse gemini json")?;
-
-        let json_tree_metadata =
-            triblespace::core::import::json_tree::build_json_tree_metadata(repo.storage_mut())
-                .map_err(|e| anyhow!("build json tree metadata: {e:?}"))?
-                .into_facts();
-        let raw_root = {
-            let mut importer =
-                JsonTreeImporter::<_, triblespace::prelude::valueschemas::Blake3>::new(
-                    repo.storage_mut(),
-                    None,
-                );
-            let fragment = importer
-                .import_str(&raw)
-                .context("import gemini raw json tree")?;
-            let root_id = fragment
-                .root()
-                .ok_or_else(|| anyhow!("json tree importer did not return a single root"))?;
-            let delta = fragment.facts().difference(&catalog);
-            if !delta.is_empty() {
-                ws.commit(
-                    delta.clone(),
-                    Some(json_tree_metadata.clone()),
-                    Some("import gemini json tree"),
-                );
-                common::push_workspace(repo, &mut ws).context("push gemini json tree")?;
-                catalog += delta;
-                stats.commits += 1;
-            }
-            root_id
-        };
-
-        let mut parsed = Vec::new();
-        let mut order = 0usize;
-        let mut dedupe = HashSet::new();
-        collect_gemini_messages(
-            &root,
-            &default_conversation_id,
-            &mut parsed,
-            &mut dedupe,
-            &mut order,
-        );
-        (Some(raw_root), parsed)
-    };
+    if extension != "html" && extension != "htm" {
+        return Err(anyhow!(
+            "Gemini importer currently supports only HTML exports; got {}",
+            path.display()
+        ));
+    }
+    let mut records = parse_gemini_activity_html(&raw);
 
     records.sort_by_key(|r| r.order);
+    let conversation_id = derive_conversation_id(records.first(), raw.as_str());
+    for record in &mut records {
+        record.conversation_id = conversation_id.clone();
+    }
     let mut by_conversation: BTreeMap<String, Vec<MessageRecord>> = BTreeMap::new();
     for record in records {
         by_conversation
@@ -202,9 +136,6 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
         change += entity! { batch_entity @
             common::import_schema::source_path: source_path_handle,
         };
-        if let Some(raw_root) = raw_root {
-            change += entity! { batch_entity @ common::import_schema::source_raw_root: raw_root };
-        }
 
         let mut previous: Option<(Id, String)> = None;
         for message in messages {
@@ -266,11 +197,11 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
     Ok(stats)
 }
 
-fn raw_fingerprint_prefix(raw: &str) -> String {
+fn hash_prefix(input: &str) -> String {
     use triblespace::core::value::schemas::hash::Blake3 as Blake3Hasher;
 
     let mut hasher = Blake3Hasher::new();
-    hasher.update(raw.as_bytes());
+    hasher.update(input.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(16);
     for byte in digest.as_bytes().iter().take(8) {
@@ -293,14 +224,14 @@ fn collect_gemini_files(path: &std::path::Path, out: &mut Vec<PathBuf>) -> Resul
             continue;
         }
         match entry_path.extension().and_then(|s| s.to_str()) {
-            Some("json") | Some("jsonl") | Some("html") | Some("htm") => out.push(entry_path),
+            Some("html") | Some("htm") => out.push(entry_path),
             _ => {}
         }
     }
     Ok(())
 }
 
-fn parse_gemini_activity_html(html: &str, conversation_id: &str) -> Vec<MessageRecord> {
+fn parse_gemini_activity_html(html: &str) -> Vec<MessageRecord> {
     let document = Html::parse_document(html);
     let outer_selector = Selector::parse(
         "div.outer-cell.mdl-cell.mdl-cell--12-col.mdl-shadow--2dp",
@@ -380,23 +311,35 @@ fn parse_gemini_activity_html(html: &str, conversation_id: &str) -> Vec<MessageR
 
         let created_at = timestamp;
         if !user_lines.is_empty() {
+            let user_content = user_lines.join("\n");
             out.push(MessageRecord {
-                conversation_id: conversation_id.to_string(),
-                source_message_id: format!("activity-{index:08}:user"),
+                conversation_id: String::new(),
+                source_message_id: build_activity_source_message_id(
+                    "user",
+                    created_at,
+                    user_content.as_str(),
+                    index,
+                ),
                 role: "user".to_string(),
                 author: "user".to_string(),
-                content: user_lines.join("\n"),
+                content: user_content,
                 created_at,
                 order: index * 2,
             });
         }
         if !assistant_lines.is_empty() {
+            let assistant_content = assistant_lines.join("\n\n");
             out.push(MessageRecord {
-                conversation_id: conversation_id.to_string(),
-                source_message_id: format!("activity-{index:08}:assistant"),
+                conversation_id: String::new(),
+                source_message_id: build_activity_source_message_id(
+                    "assistant",
+                    created_at,
+                    assistant_content.as_str(),
+                    index,
+                ),
                 role: "assistant".to_string(),
                 author: "assistant".to_string(),
-                content: assistant_lines.join("\n\n"),
+                content: assistant_content,
                 created_at,
                 order: index * 2 + 1,
             });
@@ -405,6 +348,29 @@ fn parse_gemini_activity_html(html: &str, conversation_id: &str) -> Vec<MessageR
     }
 
     out
+}
+
+fn build_activity_source_message_id(
+    role: &str,
+    created_at: Option<Epoch>,
+    content: &str,
+    index: usize,
+) -> String {
+    let ts = created_at
+        .map(|epoch| epoch.to_tai_duration().total_nanoseconds().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let seed = format!("activity|{role}|{ts}|{}", content.trim());
+    let hash = hash_prefix(seed.as_str());
+    format!("activity:{hash}:{index:08}:{role}")
+}
+
+fn derive_conversation_id(first_record: Option<&MessageRecord>, raw: &str) -> String {
+    if let Some(first) = first_record {
+        let seed = format!("conversation:{}", first.source_message_id);
+        return format!("gemini:{}", hash_prefix(seed.as_str()));
+    }
+    let seed = format!("conversation:{}", hash_prefix(raw));
+    format!("gemini:{}", hash_prefix(seed.as_str()))
 }
 
 fn is_gemini_meta_line(line: &str) -> bool {
@@ -542,217 +508,6 @@ fn decode_entity(entity: &str) -> Option<char> {
             }
             None
         }
-    }
-}
-
-fn collect_gemini_messages(
-    node: &JsonValue,
-    default_conversation_id: &str,
-    out: &mut Vec<MessageRecord>,
-    dedupe: &mut HashSet<String>,
-    next_index: &mut usize,
-) {
-    if let Some(obj) = node.as_object() {
-        if let Some((role, content)) = extract_message_from_object(obj) {
-            let conversation_id = extract_conversation_id(obj)
-                .unwrap_or(default_conversation_id)
-                .to_string();
-            let source_message_id = extract_source_message_id(obj).unwrap_or_else(|| {
-                let id = format!("node-{:08}", *next_index);
-                *next_index += 1;
-                id
-            });
-            let created_at = extract_created_at(obj);
-            let dedupe_key = format!(
-                "{}|{}|{}|{}|{}",
-                conversation_id,
-                source_message_id,
-                role,
-                created_at
-                    .map(|e| e.to_tai_seconds().to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                content
-            );
-            if dedupe.insert(dedupe_key) {
-                let role = canonical_role(&role).to_string();
-                let author = canonical_author_name(&role).to_string();
-                let order = *next_index;
-                *next_index += 1;
-                out.push(MessageRecord {
-                    conversation_id,
-                    source_message_id,
-                    role,
-                    author,
-                    content,
-                    created_at,
-                    order,
-                });
-            }
-        }
-
-        for value in obj.values() {
-            collect_gemini_messages(
-                value,
-                default_conversation_id,
-                out,
-                dedupe,
-                next_index,
-            );
-        }
-        return;
-    }
-
-    if let Some(items) = node.as_array() {
-        for item in items {
-            collect_gemini_messages(
-                item,
-                default_conversation_id,
-                out,
-                dedupe,
-                next_index,
-            );
-        }
-    }
-}
-
-fn extract_message_from_object(object: &Map<String, JsonValue>) -> Option<(String, String)> {
-    let role = object.get("role").and_then(JsonValue::as_str)?;
-    let content = object
-        .get("text")
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned)
-        .or_else(|| object.get("message").and_then(extract_text))
-        .or_else(|| object.get("content").and_then(extract_text))
-        .or_else(|| object.get("parts").and_then(extract_text))?;
-    let content = content.trim().to_string();
-    if content.is_empty() {
-        return None;
-    }
-    Some((role.to_string(), content))
-}
-
-fn extract_text(value: &JsonValue) -> Option<String> {
-    match value {
-        JsonValue::String(s) => {
-            if s.trim().is_empty() {
-                None
-            } else {
-                Some(s.to_string())
-            }
-        }
-        JsonValue::Array(items) => {
-            let mut segments = Vec::new();
-            for item in items {
-                if let Some(text) = extract_text(item) {
-                    if !text.trim().is_empty() {
-                        segments.push(text);
-                    }
-                }
-            }
-            if segments.is_empty() {
-                None
-            } else {
-                Some(segments.join("\n\n"))
-            }
-        }
-        JsonValue::Object(obj) => obj
-            .get("text")
-            .and_then(JsonValue::as_str)
-            .map(str::to_owned)
-            .or_else(|| obj.get("content").and_then(extract_text))
-            .or_else(|| obj.get("parts").and_then(extract_text))
-            .or_else(|| obj.get("message").and_then(extract_text))
-            .or_else(|| obj.get("response").and_then(extract_text)),
-        _ => None,
-    }
-}
-
-fn extract_conversation_id(object: &Map<String, JsonValue>) -> Option<&str> {
-    object
-        .get("conversation_id")
-        .and_then(JsonValue::as_str)
-        .or_else(|| object.get("conversationId").and_then(JsonValue::as_str))
-        .or_else(|| object.get("chat_id").and_then(JsonValue::as_str))
-        .or_else(|| object.get("thread_id").and_then(JsonValue::as_str))
-}
-
-fn extract_source_message_id(object: &Map<String, JsonValue>) -> Option<String> {
-    object
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .or_else(|| object.get("message_id").and_then(JsonValue::as_str))
-        .or_else(|| object.get("messageId").and_then(JsonValue::as_str))
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_owned)
-}
-
-fn extract_created_at(object: &Map<String, JsonValue>) -> Option<Epoch> {
-    const KEYS: [&str; 7] = [
-        "timestamp",
-        "time",
-        "created_at",
-        "create_time",
-        "createdAt",
-        "update_time",
-        "updated_at",
-    ];
-    for key in KEYS {
-        let Some(value) = object.get(key) else {
-            continue;
-        };
-        if let Some(epoch) = parse_epoch(value) {
-            return Some(epoch);
-        }
-    }
-    None
-}
-
-fn parse_epoch(value: &JsonValue) -> Option<Epoch> {
-    match value {
-        JsonValue::Number(num) => num.as_f64().and_then(parse_epoch_number),
-        JsonValue::String(text) => parse_epoch_string(text),
-        _ => None,
-    }
-}
-
-fn parse_epoch_string(value: &str) -> Option<Epoch> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(epoch) = trimmed.parse::<Epoch>() {
-        return Some(epoch);
-    }
-    trimmed.parse::<f64>().ok().and_then(parse_epoch_number)
-}
-
-fn parse_epoch_number(value: f64) -> Option<Epoch> {
-    if !value.is_finite() {
-        return None;
-    }
-    let seconds = if value.abs() > 1.0e11 {
-        value / 1000.0
-    } else {
-        value
-    };
-    common::epoch_from_seconds(seconds)
-}
-
-fn canonical_role(role: &str) -> &str {
-    match role {
-        "model" | "assistant" | "agent" => "assistant",
-        "human" | "user" => "user",
-        "system" => "system",
-        _ => role,
-    }
-}
-
-fn canonical_author_name(role: &str) -> &str {
-    match role {
-        "assistant" => "assistant",
-        "user" => "user",
-        "system" => "system",
-        _ => role,
     }
 }
 
