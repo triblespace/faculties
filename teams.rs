@@ -3466,23 +3466,21 @@ fn build_ingest_change(
                 .then_with(|| left.message_id.cmp(&right.message_id))
         });
 
-        // Ensure the chat entity exists.
-        if !index.chats.contains(&chat_id) {
-            change += entity! { ExclusiveId::force_ref(&chat_id) @
-                archive::kind: teams::kind_chat,
-            };
-        }
-        if !index.chat_id_set.contains(&chat_id) {
+        let missing_chat_kind = !index.chats.contains(&chat_id);
+        let chat_id_handle = if !index.chat_id_set.contains(&chat_id) {
             let chat_external = messages
                 .first()
                 .map(|msg| msg.chat_external_id.clone())
                 .unwrap_or_default();
-            if !chat_external.is_empty() {
-                let handle = ws.put(chat_external);
-                change += entity! { ExclusiveId::force_ref(&chat_id) @
-                    teams::chat_id: handle,
-                };
-            }
+            (!chat_external.is_empty()).then(|| ws.put(chat_external))
+        } else {
+            None
+        };
+        if missing_chat_kind || chat_id_handle.is_some() {
+            change += entity! { ExclusiveId::force_ref(&chat_id) @
+                archive::kind?: missing_chat_kind.then_some(teams::kind_chat),
+                teams::chat_id?: chat_id_handle,
+            };
         }
 
         let mut predecessor = index
@@ -3514,59 +3512,47 @@ fn build_ingest_change(
                 // New message entity.
                 let content_handle = ws.put(message.content);
                 let raw_handle = ws.put(message.raw_json);
+                let external_handle = ws.put(message.message_external_id);
                 change += entity! { ExclusiveId::force_ref(&message.message_id) @
                     archive::kind: archive::kind_message,
                     archive::author: message.author_id,
                     archive::created_at: message.created_at,
                     archive::content: content_handle,
                     teams::chat: chat_id,
-                };
-                change += entity! { ExclusiveId::force_ref(&message.message_id) @
                     teams::message_raw: raw_handle,
-                };
-
-                if predecessor.is_some() {
-                    change += entity! { ExclusiveId::force_ref(&message.message_id) @ archive::reply_to: predecessor.unwrap() };
-                }
-
-                let external_handle = ws.put(message.message_external_id);
-                change += entity! { ExclusiveId::force_ref(&message.message_id) @
                     teams::message_id: external_handle,
+                    archive::reply_to?: predecessor,
                 };
             } else {
                 // Fill in missing metadata for existing messages when possible.
-                if !index.message_chat_set.contains(&message.message_id) {
+                let message_chat = (!index.message_chat_set.contains(&message.message_id))
+                    .then_some(chat_id);
+                let message_external = (!index.message_external_id_set.contains(&message.message_id))
+                    .then(|| ws.put(message.message_external_id.clone()));
+                let message_raw = (!index.message_raw_set.contains(&message.message_id))
+                    .then(|| ws.put(message.raw_json.clone()));
+                let message_created_at = (!index.message_created_at_set.contains(&message.message_id))
+                    .then_some(message.created_at);
+                let message_content = (!index.message_content_set.contains(&message.message_id))
+                    .then(|| ws.put(message.content.clone()));
+                let message_reply_to = (predecessor.is_some()
+                    && !index.reply_to_set.contains(&message.message_id))
+                    .then_some(predecessor.unwrap());
+
+                if message_chat.is_some()
+                    || message_external.is_some()
+                    || message_raw.is_some()
+                    || message_created_at.is_some()
+                    || message_content.is_some()
+                    || message_reply_to.is_some()
+                {
                     change += entity! { ExclusiveId::force_ref(&message.message_id) @
-                        teams::chat: chat_id,
-                    };
-                }
-                if !index.message_external_id_set.contains(&message.message_id) {
-                    let external_handle =
-                        ws.put(message.message_external_id.clone());
-                    change += entity! { ExclusiveId::force_ref(&message.message_id) @
-                        teams::message_id: external_handle,
-                    };
-                }
-                if !index.message_raw_set.contains(&message.message_id) {
-                    let raw_handle = ws.put(message.raw_json.clone());
-                    change += entity! { ExclusiveId::force_ref(&message.message_id) @
-                        teams::message_raw: raw_handle,
-                    };
-                }
-                if !index.message_created_at_set.contains(&message.message_id) {
-                    change += entity! { ExclusiveId::force_ref(&message.message_id) @
-                        archive::created_at: message.created_at,
-                    };
-                }
-                if !index.message_content_set.contains(&message.message_id) {
-                    let content_handle = ws.put(message.content.clone());
-                    change += entity! { ExclusiveId::force_ref(&message.message_id) @
-                        archive::content: content_handle,
-                    };
-                }
-                if predecessor.is_some() && !index.reply_to_set.contains(&message.message_id) {
-                    change += entity! { ExclusiveId::force_ref(&message.message_id) @
-                        archive::reply_to: predecessor.unwrap(),
+                        teams::chat?: message_chat,
+                        teams::message_id?: message_external,
+                        teams::message_raw?: message_raw,
+                        archive::created_at?: message_created_at,
+                        archive::content?: message_content,
+                        archive::reply_to?: message_reply_to,
                     };
                 }
             }
@@ -3586,34 +3572,30 @@ fn ensure_author(
     author_external_id: Option<&str>,
     author_display_name: Option<&str>,
 ) {
-    if !index.authors.contains(&author_id) {
-        *change += entity! { ExclusiveId::force_ref(&author_id) @
-            archive::kind: archive::kind_author,
-        };
-    }
-
-    if !index.author_name_set.contains(&author_id) {
+    let missing_author_kind = !index.authors.contains(&author_id);
+    let author_name = (!index.author_name_set.contains(&author_id)).then(|| {
         let name = author_display_name
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .or(author_external_id)
             .unwrap_or("unknown");
-        let handle = ws.put(name.to_string());
-        *change += entity! { ExclusiveId::force_ref(&author_id) @
-            archive::author_name: handle,
-        };
-    }
-
-    if !index.author_user_id_set.contains(&author_id) {
-        if let Some(user_id) = author_external_id
+        ws.put(name.to_string())
+    });
+    let author_user_id = if !index.author_user_id_set.contains(&author_id) {
+        author_external_id
             .map(str::trim)
             .filter(|value| !value.is_empty())
-        {
-            let handle = ws.put(user_id.to_string());
-            *change += entity! { ExclusiveId::force_ref(&author_id) @
-                teams::user_id: handle,
-            };
-        }
+            .map(|user_id| ws.put(user_id.to_string()))
+    } else {
+        None
+    };
+
+    if missing_author_kind || author_name.is_some() || author_user_id.is_some() {
+        *change += entity! { ExclusiveId::force_ref(&author_id) @
+            archive::kind?: missing_author_kind.then_some(archive::kind_author),
+            archive::author_name?: author_name,
+            teams::user_id?: author_user_id,
+        };
     }
 }
 
@@ -3678,38 +3660,24 @@ fn ensure_attachments(
         let size = bytes.len() as u64;
         let data_handle = ws.put(Bytes::from_source(bytes));
         let source_id_handle = ws.put(source_id.to_owned());
+        let source_pointer = source.source_url.as_ref().map(|url| ws.put(url.to_owned()));
+        let attachment_name = source
+            .name
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|name| ws.put(name.to_owned()));
+        let attachment_mime = shortstring_value(content_type.as_deref());
 
         *change += entity! { ExclusiveId::force_ref(&attachment_id) @
             archive::kind: archive::kind_attachment,
             archive::attachment_source_id: source_id_handle,
             archive::attachment_data: data_handle,
             archive::attachment_size_bytes: size.to_value(),
+            archive::attachment_source_pointer?: source_pointer,
+            archive::attachment_name?: attachment_name,
+            archive::attachment_mime?: attachment_mime,
         };
-
-        if let Some(url) = source.source_url.as_ref() {
-            let handle = ws.put(url.to_owned());
-            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                archive::attachment_source_pointer: handle,
-            };
-        }
-
-        if let Some(name) = source
-            .name
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-        {
-            let handle = ws.put(name.to_owned());
-            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                archive::attachment_name: handle,
-            };
-        }
-
-        if let Some(mime) = shortstring_value(content_type.as_deref()) {
-            *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-                archive::attachment_mime: mime,
-            };
-        }
     }
 }
 
