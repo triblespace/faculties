@@ -247,6 +247,11 @@ mod teams_schema {
                     "Tag for Teams protocol kind constants.".to_string(),
                 )?,
                 metadata::tag: tag_tag,
+                metadata::tag: kind_chat,
+                metadata::tag: kind_cursor,
+                metadata::tag: kind_token,
+                metadata::tag: kind_log,
+                metadata::tag: kind_config,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&tag_attribute) @
@@ -255,6 +260,20 @@ mod teams_schema {
                     "Tag for Teams protocol attributes.".to_string(),
                 )?,
                 metadata::tag: tag_tag,
+                metadata::tag: chat.id(),
+                metadata::tag: chat_id.id(),
+                metadata::tag: message_id.id(),
+                metadata::tag: message_raw.id(),
+                metadata::tag: user_id.id(),
+                metadata::tag: delta_link.id(),
+                metadata::tag: access_token.id(),
+                metadata::tag: refresh_token.id(),
+                metadata::tag: expires_at.id(),
+                metadata::tag: token_type.id(),
+                metadata::tag: scope.id(),
+                metadata::tag: tenant.id(),
+                metadata::tag: client_id.id(),
+                metadata::tag: client_secret.id(),
             };
 
             tribles += entity! { ExclusiveId::force_ref(&tag_tag) @
@@ -263,34 +282,32 @@ mod teams_schema {
                     "Tag for Teams protocol tag constants.".to_string(),
                 )?,
                 metadata::tag: tag_tag,
+                metadata::tag: tag_protocol,
+                metadata::tag: tag_kind,
+                metadata::tag: tag_attribute,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_chat) @
                 metadata::name: blobs.put("kind_chat".to_string())?,
                 metadata::description: blobs.put("Teams chat entity kind.".to_string())?,
-                metadata::tag: tag_kind,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_cursor) @
                 metadata::name: blobs.put("kind_cursor".to_string())?,
                 metadata::description: blobs.put("Teams delta cursor kind.".to_string())?,
-                metadata::tag: tag_kind,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_token) @
                 metadata::name: blobs.put("kind_token".to_string())?,
                 metadata::description: blobs.put("Teams token cache kind.".to_string())?,
-                metadata::tag: tag_kind,
             };
             tribles += entity! { ExclusiveId::force_ref(&kind_log) @
                 metadata::name: blobs.put("kind_log".to_string())?,
                 metadata::description: blobs.put("Teams log entry kind.".to_string())?,
-                metadata::tag: tag_kind,
             };
             tribles += entity! { ExclusiveId::force_ref(&kind_config) @
                 metadata::name: blobs.put("kind_config".to_string())?,
                 metadata::description: blobs.put("Teams app configuration kind.".to_string())?,
-                metadata::tag: tag_kind,
             };
 
             Ok(tribles)
@@ -307,39 +324,22 @@ mod teams_schema {
         metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
         metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata += describe_attribute(blobs, &teams::chat)?;
-        metadata += describe_attribute(blobs, &teams::chat_id)?;
-        metadata += describe_attribute(blobs, &teams::message_id)?;
-        metadata += describe_attribute(blobs, &teams::message_raw)?;
-        metadata += describe_attribute(blobs, &teams::user_id)?;
-        metadata += describe_attribute(blobs, &teams::delta_link)?;
-        metadata += describe_attribute(blobs, &teams::access_token)?;
-        metadata += describe_attribute(blobs, &teams::refresh_token)?;
-        metadata += describe_attribute(blobs, &teams::expires_at)?;
-        metadata += describe_attribute(blobs, &teams::token_type)?;
-        metadata += describe_attribute(blobs, &teams::scope)?;
-        metadata += describe_attribute(blobs, &teams::tenant)?;
-        metadata += describe_attribute(blobs, &teams::client_id)?;
-        metadata += describe_attribute(blobs, &teams::client_secret)?;
+        metadata += metadata::Describe::describe(&teams::chat, blobs)?;
+        metadata += metadata::Describe::describe(&teams::chat_id, blobs)?;
+        metadata += metadata::Describe::describe(&teams::message_id, blobs)?;
+        metadata += metadata::Describe::describe(&teams::message_raw, blobs)?;
+        metadata += metadata::Describe::describe(&teams::user_id, blobs)?;
+        metadata += metadata::Describe::describe(&teams::delta_link, blobs)?;
+        metadata += metadata::Describe::describe(&teams::access_token, blobs)?;
+        metadata += metadata::Describe::describe(&teams::refresh_token, blobs)?;
+        metadata += metadata::Describe::describe(&teams::expires_at, blobs)?;
+        metadata += metadata::Describe::describe(&teams::token_type, blobs)?;
+        metadata += metadata::Describe::describe(&teams::scope, blobs)?;
+        metadata += metadata::Describe::describe(&teams::tenant, blobs)?;
+        metadata += metadata::Describe::describe(&teams::client_id, blobs)?;
+        metadata += metadata::Describe::describe(&teams::client_secret, blobs)?;
 
         Ok(metadata)
-    }
-
-    fn describe_attribute<B, S>(
-        blobs: &mut B,
-        attribute: &Attribute<S>,
-    ) -> std::result::Result<TribleSet, B::PutError>
-    where
-        B: BlobStore<Blake3>,
-        S: ValueSchema,
-    {
-        let mut tribles = TribleSet::new();
-        tribles += metadata::Describe::describe(attribute, blobs)?;
-        let attribute_id = attribute.id();
-        tribles += entity! { ExclusiveId::force_ref(&attribute_id) @
-            metadata::tag: teams::tag_attribute,
-        };
-        Ok(tribles)
     }
 }
 
