@@ -449,18 +449,7 @@ fn store_search(
         let created_at = epoch_interval(now_epoch());
         let query_handle = ws.put(query.to_string());
 
-        let search_fragment = entity! { _ @
-            metadata::tag: &web_schema::kind_search,
-            web_schema::query: query_handle,
-            web_schema::provider: provider_str,
-            web_schema::created_at: created_at,
-        };
-        let search_id = search_fragment
-            .root()
-            .ok_or_else(|| anyhow!("search fragment missing root export"))?;
-
         let mut change = TribleSet::new();
-        change += search_fragment;
         let mut result_ids = Vec::with_capacity(results.len());
 
         for r in results {
@@ -487,7 +476,13 @@ fn store_search(
             result_ids.push(result_id);
             change += result_fragment;
         }
-        change += entity! { ExclusiveId::force_ref(&search_id) @ web_schema::result*: result_ids };
+        change += entity! { _ @
+            metadata::tag: &web_schema::kind_search,
+            web_schema::query: query_handle,
+            web_schema::provider: provider_str,
+            web_schema::created_at: created_at,
+            web_schema::result*: result_ids,
+        };
 
         let delta = change.difference(&catalog);
         if !delta.is_empty() {
