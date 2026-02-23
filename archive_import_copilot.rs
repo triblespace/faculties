@@ -18,7 +18,6 @@ use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use hifitime::Epoch;
 use serde_json::{Map, Value as JsonValue};
-use triblespace::core::id::ExclusiveId;
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::*;
 
@@ -153,11 +152,13 @@ fn import_copilot_file(
     let batch_id = batch_fragment
         .root()
         .expect("entity! must export a single root id");
-    let batch_entity = ExclusiveId::force_ref(&batch_id);
+    let batch_entity = batch_id
+        .aquire()
+        .expect("entity! root ids should be acquired in current thread");
     let mut change = TribleSet::new();
 
     change += batch_fragment;
-    change += entity! { batch_entity @
+    change += entity! { &batch_entity @
         common::import_schema::source_path: source_path_handle,
         common::import_schema::source_raw_root: raw_root,
     };
@@ -173,7 +174,9 @@ fn import_copilot_file(
         let message_id = message_fragment
             .root()
             .expect("entity! must export a single root id");
-        let message_entity = ExclusiveId::force_ref(&message_id);
+        let message_entity = message_id
+            .aquire()
+            .expect("entity! root ids should be acquired in current thread");
         change += message_fragment;
 
         let author_key = format!("{}::{}", message.author, message.role);
@@ -190,22 +193,18 @@ fn import_copilot_file(
         let created_at =
             common::epoch_interval(message.created_at.unwrap_or_else(common::unknown_epoch));
         let content_handle = ws.put(message.content.clone());
-        change += entity! { message_entity @
+        change += entity! { &message_entity @
             common::archive::kind: common::archive::kind_message,
             common::archive::author: author_id,
             common::archive::content: content_handle,
             common::archive::created_at: created_at,
-        };
-        change += entity! { message_entity @
-            common::import_schema::batch: batch_id,
-            common::import_schema::source_message_id: source_message_id_handle,
             common::import_schema::source_author: ws.put(message.author.clone()),
             common::import_schema::source_role: ws.put(message.role.clone()),
             common::import_schema::source_created_at: created_at,
         };
         if let Some((parent_id, parent_source_id)) = previous.as_ref() {
-            change += entity! { message_entity @ common::archive::reply_to: *parent_id };
-            change += entity! { message_entity @
+            change += entity! { &message_entity @
+                common::archive::reply_to: *parent_id,
                 common::import_schema::source_parent_id: ws.put(parent_source_id.clone()),
             };
         }

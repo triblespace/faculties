@@ -18,7 +18,6 @@ use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use serde_json::Value as JsonValue;
 use triblespace::core::import::json_tree::JsonTreeImporter;
-use triblespace::core::id::ExclusiveId;
 use triblespace::core::blob::Bytes;
 use triblespace::prelude::*;
 
@@ -154,12 +153,14 @@ fn import_chatgpt_file(
         let batch_id = batch_fragment
             .root()
             .expect("entity! must export a single root id");
-        let batch_entity = ExclusiveId::force_ref(&batch_id);
+        let batch_entity = batch_id
+            .aquire()
+            .expect("entity! root ids should be acquired in current thread");
         let title_handle = (!title.is_empty()).then(|| ws.put(title.to_string()));
 
         let mut change = TribleSet::new();
         change += batch_fragment;
-        change += entity! { batch_entity @
+        change += entity! { &batch_entity @
             common::import_schema::source_path: path_handle,
             common::import_schema::source_raw_root: raw_root,
             common::import_schema::source_title?: title_handle,
@@ -181,7 +182,7 @@ fn import_chatgpt_file(
                     .root()
                     .expect("entity! must export a single root id");
                 change += message_fragment;
-                node_to_message.insert(node_id.as_str(), (message_id, source_message_id_handle));
+                node_to_message.insert(node_id.as_str(), message_id);
             }
         }
 
@@ -195,12 +196,13 @@ fn import_chatgpt_file(
                 continue;
             }
             let content = extract_message_text(message).unwrap_or_default();
-            let Some((message_id, source_message_id_handle)) =
-                node_to_message.get(node_id.as_str()).copied()
+            let Some(message_id) = node_to_message.get(node_id.as_str()).copied()
             else {
                 continue;
             };
-            let message_entity = ExclusiveId::force_ref(&message_id);
+            let message_entity = message_id
+                .aquire()
+                .expect("entity! root ids should be acquired in current thread");
 
             let role = message
                 .get("author")
@@ -234,16 +236,19 @@ fn import_chatgpt_file(
             let created_at = common::epoch_interval(created_at_epoch);
             let content_handle = ws.put(content);
 
-            change += entity! { message_entity @
+            change += entity! { &message_entity @
                 common::archive::kind: common::archive::kind_message,
                 common::archive::author: author_id,
                 common::archive::content: content_handle,
                 common::archive::created_at: created_at,
+                common::import_schema::source_author: ws.put(name.to_string()),
+                common::import_schema::source_role: ws.put(role.to_string()),
+                common::import_schema::source_created_at: created_at,
             };
 
             if let Some(content_type) = message_content_type(message) {
                 if !content_type.is_empty() {
-                    change += entity! { message_entity @ common::archive::content_type: content_type };
+                    change += entity! { &message_entity @ common::archive::content_type: content_type };
                 }
             }
 
@@ -266,35 +271,37 @@ fn import_chatgpt_file(
                 let attachment_id = attachment_fragment
                     .root()
                     .expect("entity! must export a single root id");
-                let attachment_entity = ExclusiveId::force_ref(&attachment_id);
+                let attachment_entity = attachment_id
+                    .aquire()
+                    .expect("entity! root ids should be acquired in current thread");
                 change += attachment_fragment;
 
                 // Always link the message -> attachment, even if we don't have bytes.
-                change += entity! { message_entity @ common::archive::attachment: attachment_id };
+                change += entity! { &message_entity @ common::archive::attachment: attachment_id };
 
                 if let Some(pointer) = source_pointer {
-                    change += entity! { attachment_entity @
+                    change += entity! { &attachment_entity @
                         common::archive::attachment_source_pointer: ws.put(pointer),
                     };
                 }
                 if let Some(name) = name {
-                    change += entity! { attachment_entity @
+                    change += entity! { &attachment_entity @
                         common::archive::attachment_name: ws.put(name),
                     };
                 }
                 if let Some(mime) = mime {
-                    change += entity! { attachment_entity @
+                    change += entity! { &attachment_entity @
                         common::archive::attachment_mime: mime.as_str(),
                     };
                 }
                 if let Some(size) = size_bytes {
-                    change += entity! { attachment_entity @ common::archive::attachment_size_bytes: size };
+                    change += entity! { &attachment_entity @ common::archive::attachment_size_bytes: size };
                 }
                 if let Some(width) = width_px {
-                    change += entity! { attachment_entity @ common::archive::attachment_width_px: width };
+                    change += entity! { &attachment_entity @ common::archive::attachment_width_px: width };
                 }
                 if let Some(height) = height_px {
-                    change += entity! { attachment_entity @ common::archive::attachment_height_px: height };
+                    change += entity! { &attachment_entity @ common::archive::attachment_height_px: height };
                 }
 
                 let needs_data = attachment_data_handle(&catalog, attachment_id).is_none()
@@ -305,7 +312,7 @@ fn import_chatgpt_file(
                             let bytes = fs::read(path)
                                 .with_context(|| format!("read attachment {}", path.display()))?;
                             let data_handle = ws.put(Bytes::from_source(bytes));
-                            change += entity! { attachment_entity @
+                            change += entity! { &attachment_entity @
                                 common::archive::attachment_data: data_handle,
                             };
                             stats.attachments += 1;
@@ -315,21 +322,13 @@ fn import_chatgpt_file(
             }
 
             if let Some(parent) = node.get("parent").and_then(JsonValue::as_str) {
-                if let Some((parent_id, _)) = node_to_message.get(parent).copied() {
-                    change += entity! { message_entity @ common::archive::reply_to: parent_id };
-                    change += entity! { message_entity @
+                if let Some(parent_id) = node_to_message.get(parent).copied() {
+                    change += entity! { &message_entity @
+                        common::archive::reply_to: parent_id,
                         common::import_schema::source_parent_id: ws.put(parent.to_string()),
                     };
                 }
             }
-
-            change += entity! { message_entity @
-                common::import_schema::batch: batch_id,
-                common::import_schema::source_message_id: source_message_id_handle,
-                common::import_schema::source_author: ws.put(name.to_string()),
-                common::import_schema::source_role: ws.put(role.to_string()),
-                common::import_schema::source_created_at: created_at,
-            };
 
             stats.messages += 1;
         }
