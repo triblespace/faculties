@@ -18,7 +18,6 @@ use anyhow::{Context, Result, anyhow};
 use clap::{CommandFactory, Parser};
 use hifitime::{Duration, Epoch};
 use scraper::{Html, Selector};
-use triblespace::core::id::ExclusiveId;
 use triblespace::prelude::*;
 
 
@@ -123,7 +122,7 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
         .expect("entity! must export a single root id");
     let batch_entity = batch_id
         .aquire()
-        .unwrap_or_else(|| ExclusiveId::force(batch_id));
+        .expect("entity! root ids should be acquired in current thread");
     change += batch_fragment;
     change += entity! { &batch_entity @
         common::import_schema::source_path: source_path_handle,
@@ -141,7 +140,7 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
             .expect("entity! must export a single root id");
         let message_entity = message_id
             .aquire()
-            .unwrap_or_else(|| ExclusiveId::force(message_id));
+            .expect("entity! root ids should be acquired in current thread");
         change += message_fragment;
         let author_key = format!("{}::{}", message.author, message.role);
         let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
