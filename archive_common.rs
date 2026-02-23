@@ -146,12 +146,10 @@ pub mod import_schema {
 
     attributes! {
         "41F6FA1633D8CB6AC7B2741BA0E140F4" as pub kind: GenId;
-        "891508CAD6E1430B221ADA937EFBD982" as pub batch: GenId;
+        "891508CAD6E1430B221ADA937EFBD982" as pub conversation: GenId;
         "E997DCAAF43BAA04790FCB0FA0FBFE3A" as pub source_format: ShortString;
-        "8E8D4B9F29ED8306FB1057CF68FC5204" as pub source_path: Handle<Blake3, LongString>;
         "973FB59D3452D3A8276172F8E3272324" as pub source_raw_root: GenId;
         "87B587A3906056038FD767F4225274F9" as pub source_conversation_id: Handle<Blake3, LongString>;
-        "43586813BD6ABE2C23021410D3DC8109" as pub source_title: Handle<Blake3, LongString>;
         "1B2A09FF44D2A5736FA320AB255026C1" as pub source_message_id: Handle<Blake3, LongString>;
         "AA3CF220F15CCF724276F1251AFE053B" as pub source_author: Handle<Blake3, LongString>;
         "B4C084B61FB46A932BFCA75B8BC621FA" as pub source_role: Handle<Blake3, LongString>;
@@ -164,9 +162,9 @@ pub mod import_schema {
     #[allow(dead_code)]
     pub const import_metadata: Id = id_hex!("5D57DD8335FECADB173616D780965F0C");
 
-    /// Tag for import batch entities.
+    /// Tag for import conversation entities.
     #[allow(non_upper_case_globals)]
-    pub const kind_batch: Id = id_hex!("573E4291B63CBA1B5AE090B0C25A2D34");
+    pub const kind_conversation: Id = id_hex!("573E4291B63CBA1B5AE090B0C25A2D34");
 
     /// Tag for import protocol metadata.
     #[allow(non_upper_case_globals)]
@@ -192,7 +190,7 @@ pub mod import_schema {
         let tag_kind_entity = super::aquire_or_force(tag_kind);
         let tag_attribute_entity = super::aquire_or_force(tag_attribute);
         let tag_tag_entity = super::aquire_or_force(tag_tag);
-        let kind_batch_entity = super::aquire_or_force(kind_batch);
+        let kind_conversation_entity = super::aquire_or_force(kind_conversation);
 
         tribles += entity! { &import_metadata_entity @
             metadata::name: blobs.put("import_metadata".to_string())?,
@@ -216,7 +214,7 @@ pub mod import_schema {
                 "Tag for import protocol kind constants.".to_string(),
             )?,
             metadata::tag: tag_tag,
-            metadata::tag: kind_batch,
+            metadata::tag: kind_conversation,
         };
 
         tribles += entity! { &tag_attribute_entity @
@@ -226,12 +224,10 @@ pub mod import_schema {
             )?,
             metadata::tag: tag_tag,
             metadata::tag: kind.id(),
-            metadata::tag: batch.id(),
+            metadata::tag: conversation.id(),
             metadata::tag: source_format.id(),
-            metadata::tag: source_path.id(),
             metadata::tag: source_raw_root.id(),
             metadata::tag: source_conversation_id.id(),
-            metadata::tag: source_title.id(),
             metadata::tag: source_message_id.id(),
             metadata::tag: source_author.id(),
             metadata::tag: source_role.id(),
@@ -250,9 +246,9 @@ pub mod import_schema {
             metadata::tag: tag_attribute,
         };
 
-        tribles += entity! { &kind_batch_entity @
-            metadata::name: blobs.put("kind_batch".to_string())?,
-            metadata::description: blobs.put("Import batch entity kind.".to_string())?,
+        tribles += entity! { &kind_conversation_entity @
+            metadata::name: blobs.put("kind_conversation".to_string())?,
+            metadata::description: blobs.put("Import conversation entity kind.".to_string())?,
         };
 
         Ok(tribles)
@@ -270,12 +266,10 @@ pub mod import_schema {
         metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
 
         metadata += metadata::Describe::describe(&kind, blobs)?;
-        metadata += metadata::Describe::describe(&batch, blobs)?;
+        metadata += metadata::Describe::describe(&conversation, blobs)?;
         metadata += metadata::Describe::describe(&source_format, blobs)?;
-        metadata += metadata::Describe::describe(&source_path, blobs)?;
         metadata += metadata::Describe::describe(&source_raw_root, blobs)?;
         metadata += metadata::Describe::describe(&source_conversation_id, blobs)?;
-        metadata += metadata::Describe::describe(&source_title, blobs)?;
         metadata += metadata::Describe::describe(&source_message_id, blobs)?;
         metadata += metadata::Describe::describe(&source_author, blobs)?;
         metadata += metadata::Describe::describe(&source_role, blobs)?;

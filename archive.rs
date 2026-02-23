@@ -65,7 +65,7 @@ enum Command {
         #[arg(long)]
         case_sensitive: bool,
     },
-    /// List imported batches (per-conversation for ChatGPT).
+    /// List imported conversations.
     Imports {
         format: Option<String>,
         #[arg(long, default_value_t = 50)]
@@ -542,18 +542,18 @@ fn main() -> Result<()> {
             Command::Imports { format, limit } => {
                 let format_filter = format.map(|s| s.to_lowercase());
 
-                let mut batches = Vec::new();
-                for (batch_id, source_format, conversation_id_handle) in find!(
+                let mut conversations = Vec::new();
+                for (conversation_id, source_format, source_conversation_id_handle) in find!(
                     (
-                        batch: Id,
+                        conversation: Id,
                         format: String,
-                        convo: Value<Handle<Blake3, LongString>>
+                        source_conversation_id: Value<Handle<Blake3, LongString>>
                     ),
                     pattern!(&catalog, [{
-                        ?batch @
-                            common::import_schema::kind: common::import_schema::kind_batch,
+                        ?conversation @
+                            common::import_schema::kind: common::import_schema::kind_conversation,
                             common::import_schema::source_format: ?format,
-                            common::import_schema::source_conversation_id: ?convo,
+                            common::import_schema::source_conversation_id: ?source_conversation_id,
                     }])
                 ) {
                     if let Some(filter) = format_filter.as_deref() {
@@ -561,41 +561,21 @@ fn main() -> Result<()> {
                             continue;
                         }
                     }
-                    let convo_id = load_longstring(&mut ws, conversation_id_handle)?;
-                    let created_at = find!(
-                        (created: Value<NsTAIInterval>),
-                        pattern!(&catalog, [{ batch_id @ common::import_schema::source_created_at: ?created }])
-                    )
-                    .into_iter()
-                    .next()
-                    .map(|(c,)| c);
-                    let key = created_at.map(interval_key).unwrap_or(i128::MIN);
-                    batches.push((key, batch_id, source_format, convo_id));
+                    let source_conversation_id =
+                        load_longstring(&mut ws, source_conversation_id_handle)?;
+                    conversations.push((conversation_id, source_format, source_conversation_id));
                 }
 
-                batches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                for (_key, batch_id, source_format, convo_id) in batches.into_iter().rev().take(limit) {
-                    let title = find!(
-                        (title: Value<Handle<Blake3, LongString>>),
-                        pattern!(&catalog, [{ batch_id @ common::import_schema::source_title: ?title }])
-                    )
-                    .into_iter()
-                    .next()
-                    .map(|(t,)| load_longstring(&mut ws, t))
-                    .transpose()?
-                    .unwrap_or_default();
-
-                    if title.is_empty() {
-                        println!("{} {} convo={}", &format!("{batch_id:x}")[..8], source_format, convo_id);
-                    } else {
-                        println!(
-                            "{} {} convo={} title={}",
-                            &format!("{batch_id:x}")[..8],
-                            source_format,
-                            convo_id,
-                            snippet(&title, 80)
-                        );
-                    }
+                conversations.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+                for (conversation_id, source_format, source_conversation_id) in
+                    conversations.into_iter().take(limit)
+                {
+                    println!(
+                        "{} {} convo={}",
+                        &format!("{conversation_id:x}")[..8],
+                        source_format,
+                        source_conversation_id
+                    );
                 }
             }
         }

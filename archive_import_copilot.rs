@@ -142,33 +142,25 @@ fn import_copilot_file(
 
     records.sort_by_key(|m| m.order);
 
-    let source_path = path.to_string_lossy().to_string();
-    let source_path_handle = ws.put(source_path.clone());
-    let batch_fragment = entity! { _ @
-        common::import_schema::kind: common::import_schema::kind_batch,
+    let conversation_fragment = entity! { _ @
+        common::import_schema::kind: common::import_schema::kind_conversation,
         common::import_schema::source_format: "copilot",
         common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
-    };
-    let batch_id = batch_fragment
-        .root()
-        .expect("entity! must export a single root id");
-    let batch_entity = batch_id
-        .aquire()
-        .expect("entity! root ids should be acquired in current thread");
-    let mut change = TribleSet::new();
-
-    change += batch_fragment;
-    change += entity! { &batch_entity @
-        common::import_schema::source_path: source_path_handle,
         common::import_schema::source_raw_root: raw_root,
     };
+    let conversation_id = conversation_fragment
+        .root()
+        .expect("entity! must export a single root id");
+    let mut change = TribleSet::new();
+
+    change += conversation_fragment;
 
     let mut author_cache: HashMap<String, Id> = HashMap::new();
     let mut previous: Option<(Id, String)> = None;
     for message in records {
         let source_message_id_handle = ws.put(message.source_message_id.clone());
         let message_fragment = entity! { _ @
-            common::import_schema::batch: batch_id,
+            common::import_schema::conversation: conversation_id,
             common::import_schema::source_message_id: source_message_id_handle,
         };
         let message_id = message_fragment

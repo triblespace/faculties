@@ -98,8 +98,6 @@ fn import_chatgpt_file(
     let export_root = path.parent().unwrap_or_else(|| Path::new("."));
     let export_files =
         index_export_files(export_root).with_context(|| format!("index {}", export_root.display()))?;
-    let path_handle = ws.put(path.to_string_lossy().to_string());
-
     let mut stats = ImportStats::default();
     for convo in conversations {
         let convo_id = convo
@@ -133,39 +131,28 @@ fn import_chatgpt_file(
             stats.commits += 1;
         }
 
-        let title = convo.get("title").and_then(JsonValue::as_str).unwrap_or("");
         let created_epoch = convo
             .get("create_time")
             .and_then(JsonValue::as_f64)
             .and_then(common::epoch_from_seconds);
-        let created_at = created_epoch.map(common::epoch_interval);
 
         let mapping = convo
             .get("mapping")
             .and_then(JsonValue::as_object)
             .ok_or_else(|| anyhow!("conversation {convo_id} missing mapping"))?;
 
-        let batch_fragment = entity! { _ @
-            common::import_schema::kind: common::import_schema::kind_batch,
+        let conversation_fragment = entity! { _ @
+            common::import_schema::kind: common::import_schema::kind_conversation,
             common::import_schema::source_format: "chatgpt",
             common::import_schema::source_conversation_id: ws.put(convo_id.to_string()),
+            common::import_schema::source_raw_root: raw_root,
         };
-        let batch_id = batch_fragment
+        let conversation_id = conversation_fragment
             .root()
             .expect("entity! must export a single root id");
-        let batch_entity = batch_id
-            .aquire()
-            .expect("entity! root ids should be acquired in current thread");
-        let title_handle = (!title.is_empty()).then(|| ws.put(title.to_string()));
 
         let mut change = TribleSet::new();
-        change += batch_fragment;
-        change += entity! { &batch_entity @
-            common::import_schema::source_path: path_handle,
-            common::import_schema::source_raw_root: raw_root,
-            common::import_schema::source_title?: title_handle,
-            common::import_schema::source_created_at?: created_at,
-        };
+        change += conversation_fragment;
         let mut author_cache: HashMap<String, Id> = HashMap::new();
 
         let mut node_to_message = HashMap::new();
@@ -175,7 +162,7 @@ fn import_chatgpt_file(
             if should_import {
                 let source_message_id_handle = ws.put(node_id.to_string());
                 let message_fragment = entity! { _ @
-                    common::import_schema::batch: batch_id,
+                    common::import_schema::conversation: conversation_id,
                     common::import_schema::source_message_id: source_message_id_handle,
                 };
                 let message_id = message_fragment

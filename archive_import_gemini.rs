@@ -94,8 +94,6 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
         ..ImportStats::default()
     };
 
-    let source_path = path.to_string_lossy().to_string();
-    let source_path_handle = ws.put(source_path.clone());
     let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     if extension != "html" && extension != "htm" {
         return Err(anyhow!(
@@ -110,29 +108,25 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
         return Ok(stats);
     }
     stats.conversations = 1;
+    let conversation_id = build_gemini_conversation_id(&records);
 
     let mut change = TribleSet::new();
     let mut author_cache: HashMap<String, Id> = HashMap::new();
-    let batch_fragment = entity! { _ @
-        common::import_schema::kind: common::import_schema::kind_batch,
+    let conversation_fragment = entity! { _ @
+        common::import_schema::kind: common::import_schema::kind_conversation,
         common::import_schema::source_format: "gemini",
+        common::import_schema::source_conversation_id: ws.put(conversation_id),
     };
-    let batch_id = batch_fragment
+    let conversation_id = conversation_fragment
         .root()
         .expect("entity! must export a single root id");
-    let batch_entity = batch_id
-        .aquire()
-        .expect("entity! root ids should be acquired in current thread");
-    change += batch_fragment;
-    change += entity! { &batch_entity @
-        common::import_schema::source_path: source_path_handle,
-    };
+    change += conversation_fragment;
 
     let mut previous: Option<(Id, String)> = None;
     for message in records {
         let source_message_id_handle = ws.put(message.source_message_id.clone());
         let message_fragment = entity! { _ @
-            common::import_schema::batch: batch_id,
+            common::import_schema::conversation: conversation_id,
             common::import_schema::source_message_id: source_message_id_handle,
         };
         let message_id = message_fragment
@@ -195,6 +189,15 @@ fn hash_prefix(input: &str) -> String {
         let _ = write!(&mut out, "{byte:02x}");
     }
     out
+}
+
+fn build_gemini_conversation_id(records: &[MessageRecord]) -> String {
+    let mut seed = String::from("gemini|");
+    for record in records {
+        seed.push_str(&record.source_message_id);
+        seed.push('|');
+    }
+    format!("gemini:{}", hash_prefix(seed.as_str()))
 }
 
 fn collect_gemini_files(path: &std::path::Path, out: &mut Vec<PathBuf>) -> Result<()> {
