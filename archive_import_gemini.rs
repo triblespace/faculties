@@ -10,7 +10,7 @@
 //! triblespace = "0.16.0"
 //! ```
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -55,7 +55,6 @@ struct ImportStats {
 
 #[derive(Debug, Clone)]
 struct MessageRecord {
-    conversation_id: String,
     source_message_id: String,
     role: String,
     author: String,
@@ -111,88 +110,69 @@ fn import_gemini_file(path: &std::path::Path, repo: &mut common::Repo, branch_id
     if records.is_empty() {
         return Ok(stats);
     }
-    let conversation_id = derive_conversation_id(
-        records
-            .first()
-            .expect("checked non-empty records before deriving conversation id"),
-    );
-    for record in &mut records {
-        record.conversation_id = conversation_id.clone();
-    }
-    let mut by_conversation: BTreeMap<String, Vec<MessageRecord>> = BTreeMap::new();
-    for record in records {
-        by_conversation
-            .entry(record.conversation_id.clone())
-            .or_default()
-            .push(record);
-    }
+    stats.conversations = 1;
 
     let mut change = TribleSet::new();
     let mut author_cache: HashMap<String, Id> = HashMap::new();
-    for (conversation_id, messages) in by_conversation {
-        let batch_fragment = entity! { _ @
-            common::import_schema::kind: common::import_schema::kind_batch,
-            common::import_schema::source_format: "gemini",
-            common::import_schema::source_conversation_id: ws.put(conversation_id.clone()),
+    let batch_fragment = entity! { _ @
+        common::import_schema::kind: common::import_schema::kind_batch,
+        common::import_schema::source_format: "gemini",
+    };
+    let batch_id = batch_fragment
+        .root()
+        .expect("entity! must export a single root id");
+    let batch_entity = ExclusiveId::force_ref(&batch_id);
+    change += batch_fragment;
+    change += entity! { batch_entity @
+        common::import_schema::source_path: source_path_handle,
+    };
+
+    let mut previous: Option<(Id, String)> = None;
+    for message in records {
+        let source_message_id_handle = ws.put(message.source_message_id.clone());
+        let message_fragment = entity! { _ @
+            common::import_schema::batch: batch_id,
+            common::import_schema::source_message_id: source_message_id_handle,
         };
-        let batch_id = batch_fragment
+        let message_id = message_fragment
             .root()
             .expect("entity! must export a single root id");
-        let batch_entity = ExclusiveId::force_ref(&batch_id);
-        change += batch_fragment;
-        change += entity! { batch_entity @
-            common::import_schema::source_path: source_path_handle,
+        let message_entity = ExclusiveId::force_ref(&message_id);
+        change += message_fragment;
+        let author_key = format!("{}::{}", message.author, message.role);
+        let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
+            id
+        } else {
+            let (id, author_change) =
+                common::ensure_author(&mut ws, &catalog, &message.author, &message.role)?;
+            change += author_change;
+            author_cache.insert(author_key, id);
+            id
         };
-
-        let mut previous: Option<(Id, String)> = None;
-        for message in messages {
-            let source_message_id_handle = ws.put(message.source_message_id.clone());
-            let message_fragment = entity! { _ @
-                common::import_schema::batch: batch_id,
-                common::import_schema::source_message_id: source_message_id_handle,
-            };
-            let message_id = message_fragment
-                .root()
-                .expect("entity! must export a single root id");
-            let message_entity = ExclusiveId::force_ref(&message_id);
-            change += message_fragment;
-            let author_key = format!("{}::{}", message.author, message.role);
-            let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
-                id
-            } else {
-                let (id, author_change) =
-                    common::ensure_author(&mut ws, &catalog, &message.author, &message.role)?;
-                change += author_change;
-                author_cache.insert(author_key, id);
-                id
-            };
-            let created_at =
-                common::epoch_interval(message.created_at.unwrap_or_else(common::unknown_epoch));
-            let content_handle = ws.put(message.content.clone());
+        let created_at =
+            common::epoch_interval(message.created_at.unwrap_or_else(common::unknown_epoch));
+        let content_handle = ws.put(message.content.clone());
+        change += entity! { message_entity @
+            common::archive::kind: common::archive::kind_message,
+            common::archive::author: author_id,
+            common::archive::content: content_handle,
+            common::archive::created_at: created_at,
+        };
+        change += entity! { message_entity @
+            common::import_schema::batch: batch_id,
+            common::import_schema::source_message_id: source_message_id_handle,
+            common::import_schema::source_author: ws.put(message.author.clone()),
+            common::import_schema::source_role: ws.put(message.role.clone()),
+            common::import_schema::source_created_at: created_at,
+        };
+        if let Some((parent_id, parent_source_id)) = previous.as_ref() {
+            change += entity! { message_entity @ common::archive::reply_to: *parent_id };
             change += entity! { message_entity @
-                common::archive::kind: common::archive::kind_message,
-                common::archive::author: author_id,
-                common::archive::content: content_handle,
-                common::archive::created_at: created_at,
+                common::import_schema::source_parent_id: ws.put(parent_source_id.clone()),
             };
-            change += entity! { message_entity @
-                common::import_schema::batch: batch_id,
-                common::import_schema::source_message_id: source_message_id_handle,
-                common::import_schema::source_author: ws.put(message.author.clone()),
-                common::import_schema::source_role: ws.put(message.role.clone()),
-                common::import_schema::source_created_at: created_at,
-            };
-            if let Some((parent_id, parent_source_id)) = previous.as_ref() {
-                change += entity! { message_entity @ common::archive::reply_to: *parent_id };
-                change += entity! { message_entity @
-                    common::import_schema::source_parent_id: ws.put(parent_source_id.clone()),
-                };
-            }
-            previous = Some((message_id, message.source_message_id.clone()));
-            stats.messages += 1;
         }
-
-        stats.conversations += 1;
+        previous = Some((message_id, message.source_message_id.clone()));
+        stats.messages += 1;
     }
 
     let delta = change.difference(&catalog);
@@ -320,7 +300,6 @@ fn parse_gemini_activity_html(html: &str) -> Vec<MessageRecord> {
         if !user_lines.is_empty() {
             let user_content = user_lines.join("\n");
             out.push(MessageRecord {
-                conversation_id: String::new(),
                 source_message_id: build_activity_source_message_id(
                     "user",
                     created_at,
@@ -337,7 +316,6 @@ fn parse_gemini_activity_html(html: &str) -> Vec<MessageRecord> {
         if !assistant_lines.is_empty() {
             let assistant_content = assistant_lines.join("\n\n");
             out.push(MessageRecord {
-                conversation_id: String::new(),
                 source_message_id: build_activity_source_message_id(
                     "assistant",
                     created_at,
@@ -369,11 +347,6 @@ fn build_activity_source_message_id(
     let seed = format!("activity|{role}|{ts}|{}", content.trim());
     let hash = hash_prefix(seed.as_str());
     format!("activity:{hash}:{index:08}:{role}")
-}
-
-fn derive_conversation_id(first_record: &MessageRecord) -> String {
-    let seed = format!("conversation:{}", first_record.source_message_id);
-    format!("gemini:{}", hash_prefix(seed.as_str()))
 }
 
 fn is_gemini_meta_line(line: &str) -> bool {
