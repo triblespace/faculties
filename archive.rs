@@ -10,10 +10,11 @@
 //! ```
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use hifitime::Epoch;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
@@ -41,6 +42,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Import external archives into the archive branch.
+    Import {
+        #[arg(value_enum)]
+        source: ImportSource,
+        /// Optional path override for this source (or backup root for `all`).
+        path: Option<PathBuf>,
+    },
     /// List the most recent messages.
     List {
         #[arg(long, default_value_t = 50)]
@@ -71,6 +79,167 @@ enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ImportSource {
+    Chatgpt,
+    Codex,
+    Copilot,
+    Gemini,
+    All,
+}
+
+impl ImportSource {
+    fn label(self) -> &'static str {
+        match self {
+            ImportSource::Chatgpt => "chatgpt",
+            ImportSource::Codex => "codex",
+            ImportSource::Copilot => "copilot",
+            ImportSource::Gemini => "gemini",
+            ImportSource::All => "all",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ImportJob {
+    source: ImportSource,
+    path: PathBuf,
+}
+
+fn faculty_dir() -> Result<PathBuf> {
+    let arg0 = std::env::args()
+        .next()
+        .ok_or_else(|| anyhow!("missing argv[0]"))?;
+    let path = PathBuf::from(arg0);
+    let abs = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory")?
+            .join(path)
+    };
+    let parent = abs
+        .parent()
+        .ok_or_else(|| anyhow!("cannot resolve faculty directory"))?;
+    Ok(parent.to_path_buf())
+}
+
+fn importer_script_name(source: ImportSource) -> Option<&'static str> {
+    match source {
+        ImportSource::Chatgpt => Some("archive_import_chatgpt.rs"),
+        ImportSource::Codex => Some("archive_import_codex.rs"),
+        ImportSource::Copilot => Some("archive_import_copilot.rs"),
+        ImportSource::Gemini => Some("archive_import_gemini.rs"),
+        ImportSource::All => None,
+    }
+}
+
+fn default_source_path(source: ImportSource, base: &Path) -> PathBuf {
+    match source {
+        ImportSource::Chatgpt => base.to_path_buf(),
+        ImportSource::Codex => base.join("codex"),
+        ImportSource::Copilot => base.join("copilot"),
+        ImportSource::Gemini => base.join("gemini/Takeout/My Activity/Gemini Apps/My Activity.html"),
+        ImportSource::All => base.to_path_buf(),
+    }
+}
+
+fn resolve_import_jobs(source: ImportSource, path: Option<&Path>) -> Result<Vec<ImportJob>> {
+    match source {
+        ImportSource::All => {
+            let root = path
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("chatgptbackup"));
+            Ok(vec![
+                ImportJob {
+                    source: ImportSource::Chatgpt,
+                    path: default_source_path(ImportSource::Chatgpt, &root),
+                },
+                ImportJob {
+                    source: ImportSource::Codex,
+                    path: default_source_path(ImportSource::Codex, &root),
+                },
+                ImportJob {
+                    source: ImportSource::Copilot,
+                    path: default_source_path(ImportSource::Copilot, &root),
+                },
+                ImportJob {
+                    source: ImportSource::Gemini,
+                    path: default_source_path(ImportSource::Gemini, &root),
+                },
+            ])
+        }
+        one => Ok(vec![ImportJob {
+            source: one,
+            path: path
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| default_source_path(one, Path::new("chatgptbackup"))),
+        }]),
+    }
+}
+
+fn run_import_jobs(
+    source: ImportSource,
+    path: Option<&Path>,
+    pile_path: &Path,
+    branch_name: &str,
+    branch_id: Id,
+) -> Result<()> {
+    let jobs = resolve_import_jobs(source, path)?;
+    let importers_dir = faculty_dir()?.join("../importers");
+    let branch_id_hex = format!("{branch_id:x}");
+
+    for job in jobs {
+        let Some(script_name) = importer_script_name(job.source) else {
+            continue;
+        };
+        if source == ImportSource::All && !job.path.exists() {
+            eprintln!(
+                "skip {} import (path missing): {}",
+                job.source.label(),
+                job.path.display()
+            );
+            continue;
+        }
+        if !job.path.exists() {
+            bail!(
+                "{} import path not found: {}",
+                job.source.label(),
+                job.path.display()
+            );
+        }
+        let script_path = importers_dir.join(script_name);
+        if !script_path.exists() {
+            bail!("missing importer script {}", script_path.display());
+        }
+        println!("import {} from {}", job.source.label(), job.path.display());
+        let status = ProcessCommand::new(&script_path)
+            .arg("--pile")
+            .arg(pile_path)
+            .arg("--branch")
+            .arg(branch_name)
+            .arg("--branch-id")
+            .arg(&branch_id_hex)
+            .arg(&job.path)
+            .status()
+            .with_context(|| {
+                format!(
+                    "run {} importer at {}",
+                    job.source.label(),
+                    script_path.display()
+                )
+            })?;
+        if !status.success() {
+            bail!(
+                "{} importer failed with exit status {status}",
+                job.source.label()
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
@@ -344,6 +513,16 @@ fn main() -> Result<()> {
         &cli.branch,
         cli.branch_id.as_deref(),
     )?;
+    if let Command::Import { source, path } = cmd {
+        return run_import_jobs(
+            source,
+            path.as_deref(),
+            &pile_path,
+            &cli.branch,
+            branch_id,
+        );
+    }
+
     let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
 
     let res = (|| -> Result<()> {
@@ -353,6 +532,7 @@ fn main() -> Result<()> {
         let catalog = ws.checkout(..).context("checkout workspace")?;
 
         match cmd {
+            Command::Import { .. } => unreachable!("import is handled before opening the branch"),
             Command::List { limit } => {
                 let mut records = Vec::new();
                 for (message_id, author_id, content_handle, created_at) in find!(
