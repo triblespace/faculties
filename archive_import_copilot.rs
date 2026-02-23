@@ -165,15 +165,16 @@ fn import_copilot_file(
     let mut author_cache: HashMap<String, Id> = HashMap::new();
     let mut previous: Option<(Id, String)> = None;
     for message in records {
-        let message_id = common::stable_id(&[
-            "playground",
-            "import",
-            "copilot",
-            "message",
-            conversation_id.as_str(),
-            message.source_message_id.as_str(),
-        ]);
+        let source_message_id_handle = ws.put(message.source_message_id.clone());
+        let message_fragment = entity! { _ @
+            common::import_schema::batch: batch_id,
+            common::import_schema::source_message_id: source_message_id_handle,
+        };
+        let message_id = message_fragment
+            .root()
+            .expect("entity! must export a single root id");
         let message_entity = ExclusiveId::force_ref(&message_id);
+        change += message_fragment;
 
         let author_key = format!("{}::{}", message.author, message.role);
         let author_id = if let Some(id) = author_cache.get(&author_key).copied() {
@@ -197,7 +198,7 @@ fn import_copilot_file(
         };
         change += entity! { message_entity @
             common::import_schema::batch: batch_id,
-            common::import_schema::source_message_id: ws.put(message.source_message_id.clone()),
+            common::import_schema::source_message_id: source_message_id_handle,
             common::import_schema::source_author: ws.put(message.author.clone()),
             common::import_schema::source_role: ws.put(message.role.clone()),
             common::import_schema::source_created_at: created_at,

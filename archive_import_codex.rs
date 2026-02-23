@@ -176,15 +176,16 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
 
         let mut previous: Option<(Id, String)> = None;
         for message in convo_messages {
-            let message_id = common::stable_id(&[
-                "playground",
-                "import",
-                "codex",
-                "message",
-                message.conversation_id.as_str(),
-                message.source_message_id.as_str(),
-            ]);
+            let source_message_id_handle = ws.put(message.source_message_id.clone());
+            let message_fragment = entity! { _ @
+                common::import_schema::batch: batch_id,
+                common::import_schema::source_message_id: source_message_id_handle,
+            };
+            let message_id = message_fragment
+                .root()
+                .expect("entity! must export a single root id");
             let message_entity = ExclusiveId::force_ref(&message_id);
+            change += message_fragment;
             let content_handle = ws.put(message.content.clone());
 
             let author_key = format!("{}::{}", message.author, message.role);
@@ -210,7 +211,7 @@ fn import_codex_file(path: &Path, repo: &mut common::Repo, branch_id: Id) -> Res
 
             change += entity! { message_entity @
                 common::import_schema::batch: batch_id,
-                common::import_schema::source_message_id: ws.put(message.source_message_id.clone()),
+                common::import_schema::source_message_id: source_message_id_handle,
                 common::import_schema::source_author: ws.put(message.author.clone()),
                 common::import_schema::source_role: ws.put(message.role.clone()),
                 common::import_schema::source_created_at: created_at,

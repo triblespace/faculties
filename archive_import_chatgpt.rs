@@ -167,22 +167,21 @@ fn import_chatgpt_file(
         };
         let mut author_cache: HashMap<String, Id> = HashMap::new();
 
-        let mut node_to_message: HashMap<&str, Id> = HashMap::new();
+        let mut node_to_message = HashMap::new();
         for (node_id, node) in mapping {
             let message = node.get("message").and_then(JsonValue::as_object);
             let should_import = message.is_some_and(should_import_message);
             if should_import {
-                node_to_message.insert(
-                    node_id.as_str(),
-                    common::stable_id(&[
-                        "playground",
-                        "import",
-                        "chatgpt",
-                        "message",
-                        convo_id,
-                        node_id.as_str(),
-                    ]),
-                );
+                let source_message_id_handle = ws.put(node_id.to_string());
+                let message_fragment = entity! { _ @
+                    common::import_schema::batch: batch_id,
+                    common::import_schema::source_message_id: source_message_id_handle,
+                };
+                let message_id = message_fragment
+                    .root()
+                    .expect("entity! must export a single root id");
+                change += message_fragment;
+                node_to_message.insert(node_id.as_str(), (message_id, source_message_id_handle));
             }
         }
 
@@ -196,7 +195,9 @@ fn import_chatgpt_file(
                 continue;
             }
             let content = extract_message_text(message).unwrap_or_default();
-            let Some(message_id) = node_to_message.get(node_id.as_str()).copied() else {
+            let Some((message_id, source_message_id_handle)) =
+                node_to_message.get(node_id.as_str()).copied()
+            else {
                 continue;
             };
             let message_entity = ExclusiveId::force_ref(&message_id);
@@ -257,24 +258,19 @@ fn import_chatgpt_file(
                     width_px,
                     height_px,
                 } = attachment;
-                let attachment_id =
-                    common::stable_id(&[
-                        "playground",
-                        "import",
-                        "chatgpt",
-                        "attachment",
-                        source_id.as_str(),
-                    ]);
-                let attachment_entity = ExclusiveId::force_ref(&attachment_id);
-
-                // Always link the message -> attachment, even if we don't have bytes.
-                change += entity! { message_entity @ common::archive::attachment: attachment_id };
-
                 let source_id_handle = ws.put(source_id.clone());
-                change += entity! { attachment_entity @
+                let attachment_fragment = entity! { _ @
                     common::archive::kind: common::archive::kind_attachment,
                     common::archive::attachment_source_id: source_id_handle,
                 };
+                let attachment_id = attachment_fragment
+                    .root()
+                    .expect("entity! must export a single root id");
+                let attachment_entity = ExclusiveId::force_ref(&attachment_id);
+                change += attachment_fragment;
+
+                // Always link the message -> attachment, even if we don't have bytes.
+                change += entity! { message_entity @ common::archive::attachment: attachment_id };
 
                 if let Some(pointer) = source_pointer {
                     change += entity! { attachment_entity @
@@ -319,7 +315,7 @@ fn import_chatgpt_file(
             }
 
             if let Some(parent) = node.get("parent").and_then(JsonValue::as_str) {
-                if let Some(parent_id) = node_to_message.get(parent).copied() {
+                if let Some((parent_id, _)) = node_to_message.get(parent).copied() {
                     change += entity! { message_entity @ common::archive::reply_to: parent_id };
                     change += entity! { message_entity @
                         common::import_schema::source_parent_id: ws.put(parent.to_string()),
@@ -329,7 +325,7 @@ fn import_chatgpt_file(
 
             change += entity! { message_entity @
                 common::import_schema::batch: batch_id,
-                common::import_schema::source_message_id: ws.put(node_id.to_string()),
+                common::import_schema::source_message_id: source_message_id_handle,
                 common::import_schema::source_author: ws.put(name.to_string()),
                 common::import_schema::source_role: ws.put(role.to_string()),
                 common::import_schema::source_created_at: created_at,
