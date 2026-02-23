@@ -272,24 +272,22 @@ fn store_media(
 
         let now = epoch_interval(now_epoch());
         let record_id = ufoid();
+        let name_handle = name
+            .filter(|s| !s.trim().is_empty())
+            .map(|value| ws.put(value.to_owned()));
+        let source_url_handle = source_url
+            .filter(|s| !s.trim().is_empty())
+            .map(|value| ws.put(value.to_owned()));
+        let alt_handle = (!alt.trim().is_empty()).then(|| ws.put(alt.to_owned()));
         change += entity! { &record_id @
             metadata::tag: media_schema::kind_record,
             media_schema::about_item: item_id,
             media_schema::created_at: now,
             media_schema::mime: mime,
+            media_schema::name?: name_handle,
+            media_schema::source_url?: source_url_handle,
+            media_schema::alt?: alt_handle,
         };
-        if let Some(name) = name.filter(|s| !s.trim().is_empty()) {
-            let handle = ws.put(name.to_owned());
-            change += entity! { &record_id @ media_schema::name: handle };
-        }
-        if let Some(source_url) = source_url.filter(|s| !s.trim().is_empty()) {
-            let handle = ws.put(source_url.to_owned());
-            change += entity! { &record_id @ media_schema::source_url: handle };
-        }
-        if !alt.trim().is_empty() {
-            let handle = ws.put(alt.to_owned());
-            change += entity! { &record_id @ media_schema::alt: handle };
-        }
 
         ws.commit(change, None, Some("media ingest"));
         repo.push(&mut ws)

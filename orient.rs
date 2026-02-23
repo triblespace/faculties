@@ -797,23 +797,14 @@ fn save_checkpoint_heads(
 
     let checkpoint_id = ufoid();
     let now = epoch_interval(now_epoch());
-    let mut change = entity! { &checkpoint_id @
+    let change = entity! { &checkpoint_id @
         metadata::tag: &KIND_ORIENT_CHECKPOINT_ID,
         orient_state::at: now,
+        orient_state::local_head?: heads.local,
+        orient_state::compass_head?: heads.compass,
+        orient_state::relations_head?: heads.relations,
+        orient_state::config_head?: heads.config,
     };
-
-    if let Some(head) = heads.local {
-        change += entity! { &checkpoint_id @ orient_state::local_head: head };
-    }
-    if let Some(head) = heads.compass {
-        change += entity! { &checkpoint_id @ orient_state::compass_head: head };
-    }
-    if let Some(head) = heads.relations {
-        change += entity! { &checkpoint_id @ orient_state::relations_head: head };
-    }
-    if let Some(head) = heads.config {
-        change += entity! { &checkpoint_id @ orient_state::config_head: head };
-    }
 
     ws.commit(change, None, Some("orient checkpoint"));
     repo.push(&mut ws)

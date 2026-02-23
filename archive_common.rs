@@ -629,15 +629,13 @@ pub fn ensure_author(
 
     let author_id = ufoid();
     let name_handle = ws.put(name.to_owned());
+    let role_handle = (!role.is_empty()).then(|| ws.put(role.to_owned()));
     let mut change = TribleSet::new();
     change += entity! { &author_id @
         archive::kind: archive::kind_author,
         archive::author_name: name_handle,
+        archive::author_role?: role_handle,
     };
-    if !role.is_empty() {
-        let handle = ws.put(role.to_owned());
-        change += entity! { &author_id @ archive::author_role: handle };
-    }
     Ok((*author_id, change))
 }
 

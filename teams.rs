@@ -1429,6 +1429,18 @@ fn build_token_change(
     let created_at = epoch_interval(now_epoch());
     let tenant_handle = ws.put(token.tenant.clone());
     let client_handle = ws.put(token.client_id.clone());
+    let refresh_handle = token
+        .refresh_token
+        .as_ref()
+        .map(|refresh| ws.put(refresh.to_owned()));
+    let token_type_handle = token
+        .token_type
+        .as_ref()
+        .map(|token_type| ws.put(token_type.to_owned()));
+    let scope_handle = token
+        .scope
+        .as_ref()
+        .map(|scope| ws.put(scope.to_owned()));
 
     change += entity! { &token_id @
         archive::kind: teams::kind_token,
@@ -1437,20 +1449,10 @@ fn build_token_change(
         teams::expires_at: expires_at,
         teams::tenant: tenant_handle,
         teams::client_id: client_handle,
+        teams::refresh_token?: refresh_handle,
+        teams::token_type?: token_type_handle,
+        teams::scope?: scope_handle,
     };
-
-    if let Some(refresh) = token.refresh_token.as_ref() {
-        let handle = ws.put(refresh.to_owned());
-        change += entity! { &token_id @ teams::refresh_token: handle };
-    }
-    if let Some(token_type) = token.token_type.as_ref() {
-        let handle = ws.put(token_type.to_owned());
-        change += entity! { &token_id @ teams::token_type: handle };
-    }
-    if let Some(scope) = token.scope.as_ref() {
-        let handle = ws.put(scope.to_owned());
-        change += entity! { &token_id @ teams::scope: handle };
-    }
 
     Ok(change.difference(catalog))
 }
@@ -1479,28 +1481,25 @@ fn build_config_change(
     let mut change = TribleSet::new();
     let config_id = ufoid();
     let created_at = epoch_interval(now_epoch());
+    let tenant_handle = data.tenant.as_ref().map(|value| ws.put(value.to_owned()));
+    let client_id_handle = data
+        .client_id
+        .as_ref()
+        .map(|value| ws.put(value.to_owned()));
+    let client_secret_handle = data
+        .client_secret
+        .as_ref()
+        .map(|value| ws.put(value.to_owned()));
+    let user_id_handle = data.user_id.as_ref().map(|value| ws.put(value.to_owned()));
 
     change += entity! { &config_id @
         archive::kind: teams::kind_config,
         archive::created_at: created_at,
+        teams::tenant?: tenant_handle,
+        teams::client_id?: client_id_handle,
+        teams::client_secret?: client_secret_handle,
+        teams::user_id?: user_id_handle,
     };
-
-    if let Some(tenant) = data.tenant.as_ref() {
-        let handle = ws.put(tenant.to_owned());
-        change += entity! { &config_id @ teams::tenant: handle };
-    }
-    if let Some(client_id) = data.client_id.as_ref() {
-        let handle = ws.put(client_id.to_owned());
-        change += entity! { &config_id @ teams::client_id: handle };
-    }
-    if let Some(client_secret) = data.client_secret.as_ref() {
-        let handle = ws.put(client_secret.to_owned());
-        change += entity! { &config_id @ teams::client_secret: handle };
-    }
-    if let Some(user_id) = data.user_id.as_ref() {
-        let handle = ws.put(user_id.to_owned());
-        change += entity! { &config_id @ teams::user_id: handle };
-    }
 
     Ok(change.difference(catalog))
 }

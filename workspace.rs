@@ -727,31 +727,25 @@ fn write_snapshot(
     let root_handle = ws.put(root_path.to_owned());
     let state_handle = compute_state_handle(ws, root_handle, &materialized_entries);
     let mut change = TribleSet::new();
-    change += entity! { &snapshot_id @
-        playground_workspace::kind: playground_workspace::kind_snapshot,
-        playground_workspace::created_at: created_at,
-    };
-    change += entity! { &snapshot_id @
-        playground_workspace::root_path: root_handle,
-        playground_workspace::state: state_handle,
-    };
-
-    if let Some(label) = label {
-        let label_handle = ws.put(label.to_owned());
-        change += entity! { &snapshot_id @ playground_workspace::label: label_handle };
-    }
-    for parent in parents {
-        change += entity! { &snapshot_id @ playground_workspace::parent_snapshot: *parent };
-    }
-
+    let label_handle = label.map(|value| ws.put(value.to_owned()));
+    let mut entry_ids = Vec::with_capacity(materialized_entries.len());
     for entry in &materialized_entries {
         let entry_set = build_entry_entity(entry);
         let entry_id = entry_set
             .root()
             .expect("entity! must export a single root id");
-        change += entity! { &snapshot_id @ playground_workspace::entry: entry_id };
+        entry_ids.push(entry_id);
         change += entry_set;
     }
+    change += entity! { &snapshot_id @
+        playground_workspace::kind: playground_workspace::kind_snapshot,
+        playground_workspace::created_at: created_at,
+        playground_workspace::root_path: root_handle,
+        playground_workspace::state: state_handle,
+        playground_workspace::label?: label_handle,
+        playground_workspace::parent_snapshot*: parents.iter().copied(),
+        playground_workspace::entry*: entry_ids,
+    };
 
     ws.commit(change, None, Some("playground_workspace snapshot"));
     *snapshot_id

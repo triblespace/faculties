@@ -791,21 +791,17 @@ fn cmd_add(
         let task_id = ufoid();
         let task_ref = task_id.id;
         let now = now_stamp();
+        let title_handle = ws.put(title);
 
         let mut change = TribleSet::new();
         change += ensure_kind_entities(&mut ws)?;
         change += entity! { &task_id @
             metadata::tag: &KIND_GOAL_ID,
-            board::title: ws.put(title),
+            board::title: title_handle,
             board::created_at: now.as_str(),
+            board::parent?: parent_id.as_ref(),
+            board::tag*: tags.iter().map(|tag| tag.as_str()),
         };
-        if let Some(parent_id) = parent_id {
-            change += entity! { &task_id @ board::parent: &parent_id };
-        }
-
-        for tag in tags {
-            change += entity! { &task_id @ board::tag: tag.as_str() };
-        }
 
         let status_id = ufoid();
         change += entity! { &status_id @
