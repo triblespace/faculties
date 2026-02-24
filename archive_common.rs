@@ -12,7 +12,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{PushResult, Repository, Workspace};
-use triblespace::prelude::blobschemas::LongString;
+use triblespace::prelude::blobschemas::{LongString, SimpleArchive};
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -284,6 +284,7 @@ pub use archive_schema::archive;
 
 pub type Repo = Repository<Pile<Blake3>>;
 pub type Ws = Workspace<Pile<Blake3>>;
+pub type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 
 fn aquire_or_force(id: Id) -> ExclusiveId {
     id.aquire().unwrap_or_else(|| ExclusiveId::force(id))
@@ -576,6 +577,47 @@ pub fn push_workspace(repo: &mut Repo, ws: &mut Ws) -> Result<()> {
         *ws = conflict;
     }
     Ok(())
+}
+
+pub fn refresh_catalog(
+    ws: &mut Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<CommitHandle>,
+) -> Result<()> {
+    let next_head = ws.head();
+    if *catalog_head == next_head {
+        return Ok(());
+    }
+
+    let delta = ws
+        .checkout(*catalog_head..next_head)
+        .context("checkout workspace delta")?;
+    if !delta.is_empty() {
+        *catalog += delta;
+    }
+    *catalog_head = next_head;
+    Ok(())
+}
+
+pub fn commit_delta(
+    repo: &mut Repo,
+    ws: &mut Ws,
+    catalog: &mut TribleSet,
+    catalog_head: &mut Option<CommitHandle>,
+    change: TribleSet,
+    metadata: Option<&TribleSet>,
+    message: &'static str,
+) -> Result<bool> {
+    let delta = change.difference(catalog);
+    if delta.is_empty() {
+        return Ok(false);
+    }
+
+    ws.commit(delta, metadata.cloned(), Some(message));
+    push_workspace(repo, ws).with_context(|| format!("push {message}"))?;
+    refresh_catalog(ws, catalog, catalog_head)
+        .with_context(|| format!("refresh catalog after {message}"))?;
+    Ok(true)
 }
 
 pub fn now_epoch() -> Epoch {
