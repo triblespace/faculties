@@ -608,6 +608,10 @@ pub fn commit_delta(
     metadata: Option<&TribleSet>,
     message: &'static str,
 ) -> Result<bool> {
+    if change.is_empty() {
+        return Ok(false);
+    }
+
     let delta = change.difference(catalog);
     if delta.is_empty() {
         return Ok(false);

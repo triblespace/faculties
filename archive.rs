@@ -222,7 +222,11 @@ fn run_import_jobs(
             bail!("missing importer script {}", script_path.display());
         }
         println!("import {} from {}", job.source.label(), job.path.display());
-        let status = ProcessCommand::new(&script_path)
+        // Importers share archive_common.rs; force a rebuild so rust-script
+        // picks up shared-module edits instead of reusing a stale cached binary.
+        let status = ProcessCommand::new("rust-script")
+            .arg("--force")
+            .arg(&script_path)
             .arg("--pile")
             .arg(pile_path)
             .arg("--branch")
