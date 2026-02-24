@@ -40,6 +40,8 @@ mod common {
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use rand_core::OsRng;
+    use rayon::ThreadPoolBuilder;
+    use rayon::prelude::*;
     use std::fs;
     use triblespace::core::id::ExclusiveId;
     use triblespace::core::metadata;
@@ -350,6 +352,38 @@ mod common {
 
     pub fn default_pile_path() -> PathBuf {
         PathBuf::from("self.pile")
+    }
+
+    pub fn parse_paths_parallel<T, F>(
+        label: &str,
+        paths: &[PathBuf],
+        parse_one: F,
+    ) -> Result<Vec<(PathBuf, Result<T>)>>
+    where
+        T: Send,
+        F: Fn(&Path) -> Result<T> + Send + Sync,
+    {
+        let total_files = paths.len();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let parser_pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .with_context(|| format!("build {label} parser thread pool"))?;
+        let parse_start = std::time::Instant::now();
+        println!(
+            "{label} phase parse: {} file(s) using {} thread(s)",
+            total_files, threads
+        );
+        let parsed_files = parser_pool.install(|| {
+            paths
+                .par_iter()
+                .map(|path| (path.to_path_buf(), parse_one(path.as_path())))
+                .collect()
+        });
+        println!("{label} phase parse: done in {:?}", parse_start.elapsed());
+        Ok(parsed_files)
     }
 
     pub fn open_repo_for_write(
