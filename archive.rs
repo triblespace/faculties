@@ -12,6 +12,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -22,7 +23,6 @@ use triblespace::prelude::*;
 
 #[path = "archive_common.rs"]
 mod common;
-
 
 #[derive(Parser)]
 #[command(name = "archive", about = "Query imported archives in TribleSpace")]
@@ -55,9 +55,7 @@ enum Command {
         limit: usize,
     },
     /// Show one message by id prefix.
-    Show {
-        id: String,
-    },
+    Show { id: String },
     /// Show a reply_to chain ending at the given message id prefix.
     Thread {
         id: String,
@@ -141,7 +139,9 @@ fn default_source_path(source: ImportSource, base: &Path) -> PathBuf {
         ImportSource::Chatgpt => base.to_path_buf(),
         ImportSource::Codex => base.join("codex"),
         ImportSource::Copilot => base.join("copilot"),
-        ImportSource::Gemini => base.join("gemini/Takeout/My Activity/Gemini Apps/My Activity.html"),
+        ImportSource::Gemini => {
+            base.join("gemini/Takeout/My Activity/Gemini Apps/My Activity.html")
+        }
         ImportSource::All => base.to_path_buf(),
     }
 }
@@ -187,6 +187,7 @@ fn run_import_jobs(
     branch_name: &str,
     branch_id: Id,
 ) -> Result<()> {
+    let all_start = Instant::now();
     let jobs = resolve_import_jobs(source, path)?;
     let importers_dir = faculty_dir()?.join("../importers");
     let branch_id_hex = format!("{branch_id:x}");
@@ -198,7 +199,8 @@ fn run_import_jobs(
         pile_path.display()
     );
 
-    for job in jobs {
+    let total_jobs = jobs.len();
+    for (job_index, job) in jobs.into_iter().enumerate() {
         let Some(script_name) = importer_script_name(job.source) else {
             continue;
         };
@@ -221,7 +223,14 @@ fn run_import_jobs(
         if !script_path.exists() {
             bail!("missing importer script {}", script_path.display());
         }
-        println!("import {} from {}", job.source.label(), job.path.display());
+        let job_start = Instant::now();
+        println!(
+            "archive import progress {}/{}: {} from {}",
+            job_index + 1,
+            total_jobs,
+            job.source.label(),
+            job.path.display()
+        );
         // Importers share archive_common.rs; force a rebuild so rust-script
         // picks up shared-module edits instead of reusing a stale cached binary.
         let status = ProcessCommand::new("rust-script")
@@ -248,7 +257,16 @@ fn run_import_jobs(
                 job.source.label()
             );
         }
+        println!(
+            "archive import done {}/{}: {} in {:?}",
+            job_index + 1,
+            total_jobs,
+            job.source.label(),
+            job_start.elapsed()
+        );
     }
+
+    println!("archive import all jobs done in {:?}", all_start.elapsed());
 
     Ok(())
 }
@@ -258,7 +276,10 @@ fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn load_longstring(ws: &mut common::Ws, handle: Value<Handle<Blake3, LongString>>) -> Result<String> {
+fn load_longstring(
+    ws: &mut common::Ws,
+    handle: Value<Handle<Blake3, LongString>>,
+) -> Result<String> {
     let view: View<str> = ws.get(handle).context("read longstring")?;
     Ok(view.to_string())
 }
@@ -456,7 +477,14 @@ fn message_record(
     ws: &mut common::Ws,
     catalog: &TribleSet,
     message_id: Id,
-) -> Result<(Id, String, Option<String>, Value<NsTAIInterval>, Value<Handle<Blake3, LongString>>, Option<Id>)> {
+) -> Result<(
+    Id,
+    String,
+    Option<String>,
+    Value<NsTAIInterval>,
+    Value<Handle<Blake3, LongString>>,
+    Option<Id>,
+)> {
     let Some((author_id, content_handle, created_at)) = find!(
         (
             author: Id,
@@ -472,8 +500,7 @@ fn message_record(
     )
     .into_iter()
     .next()
-    .map(|(a, c, t)| (a, c, t))
-    else {
+    .map(|(a, c, t)| (a, c, t)) else {
         return Err(anyhow!("message {message_id:x} missing required fields"));
     };
 
@@ -519,19 +546,10 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    let branch_id = common::resolve_archive_branch_id(
-        &pile_path,
-        &cli.branch,
-        cli.branch_id.as_deref(),
-    )?;
+    let branch_id =
+        common::resolve_archive_branch_id(&pile_path, &cli.branch, cli.branch_id.as_deref())?;
     if let Command::Import { source, path } = cmd {
-        return run_import_jobs(
-            source,
-            path.as_deref(),
-            &pile_path,
-            &cli.branch,
-            branch_id,
-        );
+        return run_import_jobs(source, path.as_deref(), &pile_path, &cli.branch, branch_id);
     }
 
     let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
@@ -561,11 +579,19 @@ fn main() -> Result<()> {
                             common::archive::created_at: ?created_at,
                     }])
                 ) {
-                    records.push((interval_key(created_at), message_id, author_id, content_handle, created_at));
+                    records.push((
+                        interval_key(created_at),
+                        message_id,
+                        author_id,
+                        content_handle,
+                        created_at,
+                    ));
                 }
                 records.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
                 let take = limit.min(records.len());
-                for (_key, message_id, author_id, content_handle, created_at) in records.into_iter().rev().take(take) {
+                for (_key, message_id, author_id, content_handle, created_at) in
+                    records.into_iter().rev().take(take)
+                {
                     let name = author_name(&mut ws, &catalog, author_id)?;
                     let role = author_role(&mut ws, &catalog, author_id)?;
                     let content = load_longstring(&mut ws, content_handle)?;
@@ -575,7 +601,11 @@ fn main() -> Result<()> {
                         "{} {} {} {}",
                         &format!("{message_id:x}")[..8],
                         lower,
-                        if role.is_empty() { name } else { format!("{name} ({role})") },
+                        if role.is_empty() {
+                            name
+                        } else {
+                            format!("{name} ({role})")
+                        },
                         snippet(&content, 120)
                     );
                 }
@@ -673,7 +703,11 @@ fn main() -> Result<()> {
                         "{} {} {} {}",
                         &format!("{message_id:x}")[..8],
                         lower,
-                        if role.is_empty() { name } else { format!("{name} ({role})") },
+                        if role.is_empty() {
+                            name
+                        } else {
+                            format!("{name} ({role})")
+                        },
                         snippet(&content, 120)
                     );
                 }
@@ -712,11 +746,19 @@ fn main() -> Result<()> {
                         content.to_lowercase()
                     };
                     if haystack.contains(&needle) {
-                        matches.push((interval_key(created_at), message_id, author_id, created_at, content));
+                        matches.push((
+                            interval_key(created_at),
+                            message_id,
+                            author_id,
+                            created_at,
+                            content,
+                        ));
                     }
                 }
                 matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                for (_key, message_id, author_id, created_at, content) in matches.into_iter().rev().take(limit) {
+                for (_key, message_id, author_id, created_at, content) in
+                    matches.into_iter().rev().take(limit)
+                {
                     let name = author_name(&mut ws, &catalog, author_id)?;
                     let role = author_role(&mut ws, &catalog, author_id)?;
                     let (lower, _upper): (Epoch, Epoch) = created_at.from_value();
@@ -725,7 +767,11 @@ fn main() -> Result<()> {
                         "{} {} {} {}",
                         &format!("{message_id:x}")[..8],
                         lower,
-                        if role.is_empty() { name } else { format!("{name} ({role})") },
+                        if role.is_empty() {
+                            name
+                        } else {
+                            format!("{name} ({role})")
+                        },
                         snippet(&content, 120)
                     );
                 }
