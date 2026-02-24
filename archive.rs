@@ -9,16 +9,22 @@
 //! rayon = "1.10"
 //! scraper = "0.23"
 //! serde_json = "1"
+//! tracing = "0.1"
+//! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 //! triblespace = "0.16.0"
 //! ```
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use hifitime::Epoch;
+use tracing::info_span;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
@@ -43,6 +49,7 @@ mod common {
     use rayon::ThreadPoolBuilder;
     use rayon::prelude::*;
     use std::fs;
+    use tracing::info_span;
     use triblespace::core::id::ExclusiveId;
     use triblespace::core::metadata;
     use triblespace::core::repo::branch as branch_proto;
@@ -363,6 +370,7 @@ mod common {
         T: Send,
         F: Fn(&Path) -> Result<T> + Send + Sync,
     {
+        let _span = info_span!("parallel_parse", label = label, files = paths.len()).entered();
         let total_files = paths.len();
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -379,10 +387,26 @@ mod common {
         let parsed_files = parser_pool.install(|| {
             paths
                 .par_iter()
-                .map(|path| (path.to_path_buf(), parse_one(path.as_path())))
+                .map(|path| {
+                    let _file_span = info_span!(
+                        "parse_file",
+                        label = label,
+                        path = %path.display()
+                    )
+                    .entered();
+                    (path.to_path_buf(), parse_one(path.as_path()))
+                })
                 .collect()
         });
-        println!("{label} phase parse: done in {:?}", parse_start.elapsed());
+        let elapsed = parse_start.elapsed();
+        println!("{label} phase parse: done in {:?}", elapsed);
+        tracing::info!(
+            label = label,
+            files = total_files,
+            threads = threads,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "parallel parse complete"
+        );
         Ok(parsed_files)
     }
 
@@ -815,6 +839,12 @@ struct Cli {
     /// Branch id to query (hex). Overrides config/env branch id.
     #[arg(long, global = true)]
     branch_id: Option<String>,
+    /// Enable tracing spans for importer profiling.
+    #[arg(long, global = true)]
+    trace: bool,
+    /// Optional tracing filter (defaults to `info`).
+    #[arg(long, global = true)]
+    trace_filter: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -940,6 +970,15 @@ fn run_import_jobs(
 ) -> Result<()> {
     let all_start = Instant::now();
     let jobs = resolve_import_jobs(source, path)?;
+    let _span = info_span!(
+        "archive_import",
+        source = source.label(),
+        jobs = jobs.len(),
+        branch = branch_name,
+        branch_id = %format!("{branch_id:x}"),
+        pile = %pile_path.display()
+    )
+    .entered();
     println!(
         "archive import: {} job(s) -> {} ({:x}) on pile {}",
         jobs.len(),
@@ -950,6 +989,14 @@ fn run_import_jobs(
 
     let total_jobs = jobs.len();
     for (job_index, job) in jobs.into_iter().enumerate() {
+        let _job_span = info_span!(
+            "archive_import_job",
+            source = job.source.label(),
+            job_index = job_index + 1,
+            total_jobs = total_jobs,
+            path = %job.path.display()
+        )
+        .entered();
         if source == ImportSource::All && !job.path.exists() {
             eprintln!(
                 "skip {} import (path missing): {}",
@@ -1014,11 +1061,50 @@ fn run_import_jobs(
             job.source.label(),
             job_start.elapsed()
         );
+        tracing::info!(
+            source = job.source.label(),
+            job_index = job_index + 1,
+            total_jobs = total_jobs,
+            elapsed_ms = job_start.elapsed().as_millis() as u64,
+            "archive import job complete"
+        );
     }
 
-    println!("archive import all jobs done in {:?}", all_start.elapsed());
+    let total_elapsed = all_start.elapsed();
+    println!("archive import all jobs done in {:?}", total_elapsed);
+    tracing::info!(
+        source = source.label(),
+        jobs = total_jobs,
+        elapsed_ms = total_elapsed.as_millis() as u64,
+        "archive import complete"
+    );
 
     Ok(())
+}
+
+fn init_tracing(enabled: bool, filter: Option<&str>) {
+    static TRACE_INIT: Once = Once::new();
+    if !enabled {
+        return;
+    }
+
+    TRACE_INIT.call_once(|| {
+        let env_filter = filter
+            .map(EnvFilter::new)
+            .or_else(|| {
+                std::env::var("PLAYGROUND_ARCHIVE_TRACE_FILTER")
+                    .ok()
+                    .map(EnvFilter::new)
+            })
+            .unwrap_or_else(|| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_target(false)
+            .without_time()
+            .with_env_filter(env_filter)
+            .with_span_events(FmtSpan::CLOSE)
+            .try_init();
+        tracing::info!("archive tracing enabled");
+    });
 }
 
 fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
@@ -1285,6 +1371,7 @@ fn snippet(text: &str, max: usize) -> String {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_tracing(cli.trace, cli.trace_filter.as_deref());
     let pile_path = cli.pile.clone().unwrap_or_else(common::default_pile_path);
     if let Err(err) = common::emit_schema_to_atlas(&pile_path) {
         eprintln!("atlas emit: {err}");
