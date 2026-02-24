@@ -190,6 +190,13 @@ fn run_import_jobs(
     let jobs = resolve_import_jobs(source, path)?;
     let importers_dir = faculty_dir()?.join("../importers");
     let branch_id_hex = format!("{branch_id:x}");
+    println!(
+        "archive import: {} job(s) -> {} ({}) on pile {}",
+        jobs.len(),
+        branch_name,
+        branch_id_hex,
+        pile_path.display()
+    );
 
     for job in jobs {
         let Some(script_name) = importer_script_name(job.source) else {
