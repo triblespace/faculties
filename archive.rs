@@ -6,12 +6,14 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
+//! rayon = "1.10"
+//! scraper = "0.23"
+//! serde_json = "1"
 //! triblespace = "0.16.0"
 //! ```
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,6 +23,14 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
+#[path = "../importers/archive_import_chatgpt.rs"]
+mod archive_import_chatgpt;
+#[path = "../importers/archive_import_codex.rs"]
+mod archive_import_codex;
+#[path = "../importers/archive_import_copilot.rs"]
+mod archive_import_copilot;
+#[path = "../importers/archive_import_gemini.rs"]
+mod archive_import_gemini;
 #[path = "archive_common.rs"]
 mod common;
 
@@ -106,34 +116,6 @@ struct ImportJob {
     path: PathBuf,
 }
 
-fn faculty_dir() -> Result<PathBuf> {
-    let arg0 = std::env::args()
-        .next()
-        .ok_or_else(|| anyhow!("missing argv[0]"))?;
-    let path = PathBuf::from(arg0);
-    let abs = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .context("resolve current directory")?
-            .join(path)
-    };
-    let parent = abs
-        .parent()
-        .ok_or_else(|| anyhow!("cannot resolve faculty directory"))?;
-    Ok(parent.to_path_buf())
-}
-
-fn importer_script_name(source: ImportSource) -> Option<&'static str> {
-    match source {
-        ImportSource::Chatgpt => Some("archive_import_chatgpt.rs"),
-        ImportSource::Codex => Some("archive_import_codex.rs"),
-        ImportSource::Copilot => Some("archive_import_copilot.rs"),
-        ImportSource::Gemini => Some("archive_import_gemini.rs"),
-        ImportSource::All => None,
-    }
-}
-
 fn default_source_path(source: ImportSource, base: &Path) -> PathBuf {
     match source {
         ImportSource::Chatgpt => base.to_path_buf(),
@@ -189,21 +171,16 @@ fn run_import_jobs(
 ) -> Result<()> {
     let all_start = Instant::now();
     let jobs = resolve_import_jobs(source, path)?;
-    let importers_dir = faculty_dir()?.join("../importers");
-    let branch_id_hex = format!("{branch_id:x}");
     println!(
-        "archive import: {} job(s) -> {} ({}) on pile {}",
+        "archive import: {} job(s) -> {} ({:x}) on pile {}",
         jobs.len(),
         branch_name,
-        branch_id_hex,
+        branch_id,
         pile_path.display()
     );
 
     let total_jobs = jobs.len();
     for (job_index, job) in jobs.into_iter().enumerate() {
-        let Some(script_name) = importer_script_name(job.source) else {
-            continue;
-        };
         if source == ImportSource::All && !job.path.exists() {
             eprintln!(
                 "skip {} import (path missing): {}",
@@ -219,10 +196,6 @@ fn run_import_jobs(
                 job.path.display()
             );
         }
-        let script_path = importers_dir.join(script_name);
-        if !script_path.exists() {
-            bail!("missing importer script {}", script_path.display());
-        }
         let job_start = Instant::now();
         println!(
             "archive import progress {}/{}: {} from {}",
@@ -231,32 +204,40 @@ fn run_import_jobs(
             job.source.label(),
             job.path.display()
         );
-        // Importers share archive_common.rs; force a rebuild so rust-script
-        // picks up shared-module edits instead of reusing a stale cached binary.
-        let status = ProcessCommand::new("rust-script")
-            .arg("--force")
-            .arg(&script_path)
-            .arg("--pile")
-            .arg(pile_path)
-            .arg("--branch")
-            .arg(branch_name)
-            .arg("--branch-id")
-            .arg(&branch_id_hex)
-            .arg(&job.path)
-            .status()
-            .with_context(|| {
-                format!(
-                    "run {} importer at {}",
-                    job.source.label(),
-                    script_path.display()
-                )
-            })?;
-        if !status.success() {
-            bail!(
-                "{} importer failed with exit status {status}",
-                job.source.label()
-            );
+        match job.source {
+            ImportSource::Chatgpt => archive_import_chatgpt::import_into_archive(
+                &job.path,
+                pile_path,
+                branch_name,
+                branch_id,
+            ),
+            ImportSource::Codex => archive_import_codex::import_into_archive(
+                &job.path,
+                pile_path,
+                branch_name,
+                branch_id,
+            ),
+            ImportSource::Copilot => archive_import_copilot::import_into_archive(
+                &job.path,
+                pile_path,
+                branch_name,
+                branch_id,
+            ),
+            ImportSource::Gemini => archive_import_gemini::import_into_archive(
+                &job.path,
+                pile_path,
+                branch_name,
+                branch_id,
+            ),
+            ImportSource::All => Ok(()),
         }
+        .with_context(|| {
+            format!(
+                "run {} importer for {}",
+                job.source.label(),
+                job.path.display()
+            )
+        })?;
         println!(
             "archive import done {}/{}: {} in {:?}",
             job_index + 1,
