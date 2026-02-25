@@ -9,7 +9,7 @@
 //! triblespace = "0.16.0"
 //! ```
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
@@ -69,12 +69,24 @@ mod config_schema {
     }
 }
 
+mod relations_schema {
+    use super::*;
+    attributes! {
+        "299E28A10114DC8C3B1661CD90CB8DF6" as label_norm: valueschemas::ShortString;
+        "3E8812F6D22B2C93E2BCF0CE3C8C1979" as alias_norm: valueschemas::ShortString;
+    }
+}
+
 fn normalize_label(label: &str) -> Result<String> {
     let trimmed = label.trim();
     if trimmed.is_empty() {
         bail!("label is empty");
     }
     Ok(trimmed.to_string())
+}
+
+fn normalize_lookup_key(label: &str) -> Result<String> {
+    Ok(normalize_label(label)?.to_ascii_lowercase())
 }
 
 fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
@@ -92,7 +104,10 @@ fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
 }
 
 #[derive(Parser)]
-#[command(name = "local-messages", about = "Local messaging faculty for the agent")]
+#[command(
+    name = "local-messages",
+    about = "Local messaging faculty for the agent"
+)]
 struct Cli {
     /// Path to the pile file to use
     #[arg(long, default_value = "self.pile", global = true)]
@@ -234,26 +249,47 @@ fn load_relations_space(
     Ok(space)
 }
 
+fn resolve_normalized_person_matches(relations_space: &TribleSet, key: &str) -> Vec<Id> {
+    let mut matches = HashSet::new();
+
+    for (person_id,) in find!(
+        (person_id: Id),
+        pattern!(&relations_space, [{
+            ?person_id @
+            metadata::tag: &KIND_PERSON_ID,
+            relations_schema::label_norm: key,
+        }])
+    ) {
+        matches.insert(person_id);
+    }
+
+    for (person_id,) in find!(
+        (person_id: Id),
+        pattern!(&relations_space, [{
+            ?person_id @
+            metadata::tag: &KIND_PERSON_ID,
+            relations_schema::alias_norm: key,
+        }])
+    ) {
+        matches.insert(person_id);
+    }
+
+    matches.into_iter().collect()
+}
+
 fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
     let trimmed = input.trim();
     if let Some(id) = Id::from_hex(trimmed) {
         return Ok(id);
     }
     let label = normalize_label(trimmed)?;
-    let mut matches = Vec::new();
-    let label_handle = label.to_owned().to_blob().get_handle::<valueschemas::Blake3>();
-    for (person_id,) in find!(
-        (person_id: Id),
-        pattern!(&relations_space, [{
-            ?person_id @
-            metadata::tag: &KIND_PERSON_ID,
-            metadata::name: label_handle,
-        }])
-    ) {
-        matches.push(person_id);
-    }
+    let key = normalize_lookup_key(trimmed)?;
+    let matches = resolve_normalized_person_matches(relations_space, &key);
+
     match matches.len() {
-        0 => bail!("unknown person label '{label}' (use relations faculty)"),
+        0 => bail!(
+            "unknown person label '{label}' (run playground/migrations/relations_backfill_norm.rs for older piles)"
+        ),
         1 => Ok(matches[0]),
         _ => bail!("multiple people match label '{label}'"),
     }
@@ -294,10 +330,7 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     if let Err(err) = pile.restore() {
         // Avoid Drop warnings on early errors.
         let _ = pile.close();
-        return Err(anyhow::anyhow!(
-            "restore pile {}: {err:?}",
-            path.display()
-        ));
+        return Err(anyhow::anyhow!("restore pile {}: {err:?}", path.display()));
     }
 
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -355,7 +388,9 @@ fn ensure_branch_with_id(
     }
 }
 
-fn load_config_branches(repo: &mut Repository<Pile<valueschemas::Blake3>>) -> Result<ConfigBranches> {
+fn load_config_branches(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+) -> Result<ConfigBranches> {
     let Some(_config_head) = repo
         .storage_mut()
         .head(CONFIG_BRANCH_ID)
@@ -525,10 +560,7 @@ fn resolve_message_id(space: &TribleSet, prefix: &str) -> Result<Id> {
     }
 }
 
-fn load_text(
-    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
-    handle: TextHandle,
-) -> Result<String> {
+fn load_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
     let view: View<str> = ws.get(handle).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     Ok(view.as_ref().to_string())
 }
@@ -615,11 +647,7 @@ fn cmd_ack(
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push read: {e:?}"))?;
         drop(ws);
-        println!(
-            "Marked {} as read by {}.",
-            id_prefix(message_id),
-            reader_id
-        );
+        println!("Marked {} as read by {}.", id_prefix(message_id), reader_id);
         Ok(())
     })
 }
@@ -644,119 +672,119 @@ fn cmd_list(
             .checkout(..)
             .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
-    let mut messages = Vec::new();
-    for (message_id, from, to, body, created_at) in find!(
-        (
-            message_id: Id,
-            from: Id,
-            to: Id,
-            body: TextHandle,
-            created_at: Value<valueschemas::NsTAIInterval>
-        ),
-        pattern!(&space, [{
-            ?message_id @
-            metadata::tag: &KIND_MESSAGE_ID,
-            local::from: ?from,
-            local::to: ?to,
-            local::body: ?body,
-            local::created_at: ?created_at,
-        }])
-    ) {
-        let body_text = load_text(&mut ws, body)?;
-        messages.push(MessageRow {
-            id: message_id,
-            from,
-            to,
-            body: body_text,
-            created_at: interval_key(created_at),
-        });
-    }
-
-    let mut reads: HashMap<(Id, Id), i128> = HashMap::new();
-    for (_read_id, message_id, reader_id, read_at) in find!(
-        (
-            read_id: Id,
-            message_id: Id,
-            reader_id: Id,
-            read_at: Value<valueschemas::NsTAIInterval>
-        ),
-        pattern!(&space, [{
-            ?read_id @
-            metadata::tag: &KIND_READ_ID,
-            local::about_message: ?message_id,
-            local::reader: ?reader_id,
-            local::read_at: ?read_at,
-        }])
-    ) {
-        let key = (message_id, reader_id);
-        let ts = interval_key(read_at);
-        reads
-            .entry(key)
-            .and_modify(|existing| {
-                if ts > *existing {
-                    *existing = ts;
-                }
-            })
-            .or_insert(ts);
-    }
-
-    messages.sort_by_key(|msg| msg.created_at);
-    messages.reverse();
-
-    let now_key = interval_key(epoch_interval(now_epoch()));
-    let reader_id = resolve_person_id(&relations_space, &reader)?;
-    let mut shown = 0usize;
-
-    for msg in messages {
-        let incoming = msg.to == reader_id;
-        let outgoing = msg.from == reader_id;
-        if !incoming && !outgoing {
-            continue;
+        let mut messages = Vec::new();
+        for (message_id, from, to, body, created_at) in find!(
+            (
+                message_id: Id,
+                from: Id,
+                to: Id,
+                body: TextHandle,
+                created_at: Value<valueschemas::NsTAIInterval>
+            ),
+            pattern!(&space, [{
+                ?message_id @
+                metadata::tag: &KIND_MESSAGE_ID,
+                local::from: ?from,
+                local::to: ?to,
+                local::body: ?body,
+                local::created_at: ?created_at,
+            }])
+        ) {
+            let body_text = load_text(&mut ws, body)?;
+            messages.push(MessageRow {
+                id: message_id,
+                from,
+                to,
+                body: body_text,
+                created_at: interval_key(created_at),
+            });
         }
 
-        let read = reads.get(&(msg.id, reader_id)).copied();
-        if unread && !(incoming && read.is_none()) {
-            continue;
+        let mut reads: HashMap<(Id, Id), i128> = HashMap::new();
+        for (_read_id, message_id, reader_id, read_at) in find!(
+            (
+                read_id: Id,
+                message_id: Id,
+                reader_id: Id,
+                read_at: Value<valueschemas::NsTAIInterval>
+            ),
+            pattern!(&space, [{
+                ?read_id @
+                metadata::tag: &KIND_READ_ID,
+                local::about_message: ?message_id,
+                local::reader: ?reader_id,
+                local::read_at: ?read_at,
+            }])
+        ) {
+            let key = (message_id, reader_id);
+            let ts = interval_key(read_at);
+            reads
+                .entry(key)
+                .and_modify(|existing| {
+                    if ts > *existing {
+                        *existing = ts;
+                    }
+                })
+                .or_insert(ts);
         }
 
-        let from_label = party_names
-            .get(&msg.from)
-            .cloned()
-            .unwrap_or_else(|| id_prefix(msg.from));
-        let to_label = party_names
-            .get(&msg.to)
-            .cloned()
-            .unwrap_or_else(|| id_prefix(msg.to));
-        let status = if incoming {
-            if read.is_some() {
-                "read".to_string()
-            } else {
-                "unread".to_string()
+        messages.sort_by_key(|msg| msg.created_at);
+        messages.reverse();
+
+        let now_key = interval_key(epoch_interval(now_epoch()));
+        let reader_id = resolve_person_id(&relations_space, &reader)?;
+        let mut shown = 0usize;
+
+        for msg in messages {
+            let incoming = msg.to == reader_id;
+            let outgoing = msg.from == reader_id;
+            if !incoming && !outgoing {
+                continue;
             }
-        } else if reads.contains_key(&(msg.id, msg.to)) {
-            format!("read-by:{to_label}")
-        } else {
-            "sent".to_string()
-        };
-        let age = format_age(now_key, msg.created_at);
-        println!(
-            "[{}] {} {} -> {} ({}) {}",
-            id_prefix(msg.id),
-            age,
-            from_label,
-            to_label,
-            status,
-            render_list_body(&msg.body)
-        );
-        shown += 1;
-        if shown >= limit {
-            break;
-        }
-    }
 
-    if shown == 0 {
-        println!("No messages.");
-    }
+            let read = reads.get(&(msg.id, reader_id)).copied();
+            if unread && !(incoming && read.is_none()) {
+                continue;
+            }
+
+            let from_label = party_names
+                .get(&msg.from)
+                .cloned()
+                .unwrap_or_else(|| id_prefix(msg.from));
+            let to_label = party_names
+                .get(&msg.to)
+                .cloned()
+                .unwrap_or_else(|| id_prefix(msg.to));
+            let status = if incoming {
+                if read.is_some() {
+                    "read".to_string()
+                } else {
+                    "unread".to_string()
+                }
+            } else if reads.contains_key(&(msg.id, msg.to)) {
+                format!("read-by:{to_label}")
+            } else {
+                "sent".to_string()
+            };
+            let age = format_age(now_key, msg.created_at);
+            println!(
+                "[{}] {} {} -> {} ({}) {}",
+                id_prefix(msg.id),
+                age,
+                from_label,
+                to_label,
+                status,
+                render_list_body(&msg.body)
+            );
+            shown += 1;
+            if shown >= limit {
+                break;
+            }
+        }
+
+        if shown == 0 {
+            println!("No messages.");
+        }
 
         drop(ws);
         Ok(())

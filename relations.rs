@@ -14,7 +14,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
@@ -36,6 +36,8 @@ mod relations {
     use super::*;
     attributes! {
         "8F162B593D390E1424394DBF6883A72C" as alias: valueschemas::ShortString;
+        "299E28A10114DC8C3B1661CD90CB8DF6" as label_norm: valueschemas::ShortString;
+        "3E8812F6D22B2C93E2BCF0CE3C8C1979" as alias_norm: valueschemas::ShortString;
         "32B22FBA3EC2ADC3FFEB48483FE8961F" as affinity: valueschemas::ShortString;
         "F0AD0BBFAC4C4C899637573DC965622E" as first_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "764DD765142B3F4725B614BD3B9118EC" as last_name: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
@@ -142,9 +144,7 @@ enum Command {
         limit: usize,
     },
     /// Show a person
-    Show {
-        id: String,
-    },
+    Show { id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -179,12 +179,29 @@ fn normalize_label(label: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+fn normalize_lookup_key(value: &str) -> Result<String> {
+    Ok(normalize_label(value)?.to_ascii_lowercase())
+}
+
 fn normalize_aliases(aliases: Vec<String>) -> Vec<String> {
     aliases
         .into_iter()
         .map(|alias| alias.trim().to_string())
         .filter(|alias| !alias.is_empty())
         .collect()
+}
+
+fn normalize_alias_lookup_keys(aliases: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for alias in aliases {
+        let key = alias.trim().to_ascii_lowercase();
+        if key.is_empty() || !seen.insert(key.clone()) {
+            continue;
+        }
+        out.push(key);
+    }
+    out
 }
 
 fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
@@ -257,7 +274,9 @@ fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
 }
 
 fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle) -> Result<String> {
-    let view: View<str> = ws.get(handle).map_err(|e| anyhow!("load longstring: {e:?}"))?;
+    let view: View<str> = ws
+        .get(handle)
+        .map_err(|e| anyhow!("load longstring: {e:?}"))?;
     Ok(view.to_string())
 }
 
@@ -327,7 +346,9 @@ fn ensure_branch_with_id(
     }
 }
 
-fn load_config_branches(repo: &mut Repository<Pile<valueschemas::Blake3>>) -> Result<ConfigBranches> {
+fn load_config_branches(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+) -> Result<ConfigBranches> {
     let Some(_) = repo
         .storage_mut()
         .head(CONFIG_BRANCH_ID)
@@ -389,10 +410,15 @@ fn find_branch_by_name(
         .to_blob()
         .get_handle::<valueschemas::Blake3>();
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let iter = pile.branches().map_err(|e| anyhow!("list branches: {e:?}"))?;
+    let iter = pile
+        .branches()
+        .map_err(|e| anyhow!("list branches: {e:?}"))?;
     for branch in iter {
         let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
-        let Some(head) = pile.head(branch_id).map_err(|e| anyhow!("branch head: {e:?}"))? else {
+        let Some(head) = pile
+            .head(branch_id)
+            .map_err(|e| anyhow!("branch head: {e:?}"))?
+        else {
             continue;
         };
         let metadata_set: TribleSet = reader
@@ -565,25 +591,29 @@ fn load_people(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<Per
     Ok(people.into_values().collect())
 }
 
-fn find_person_by_label(space: &TribleSet, label: &str) -> Result<Option<Id>> {
-    let label = normalize_label(label)?;
-    let mut matches = Vec::new();
-    let label_handle = label.to_owned().to_blob().get_handle::<valueschemas::Blake3>();
+fn find_people_by_lookup_key(space: &TribleSet, key: &str) -> HashSet<Id> {
+    let mut matches = HashSet::new();
     for (person_id,) in find!(
         (person_id: Id),
         pattern!(&space, [{
             ?person_id @
             metadata::tag: &KIND_PERSON_ID,
-            metadata::name: label_handle,
+            relations::label_norm: key,
         }])
     ) {
-        matches.push(person_id);
+        matches.insert(person_id);
     }
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(Some(matches[0])),
-        _ => bail!("multiple people match label '{label}'"),
+    for (person_id,) in find!(
+        (person_id: Id),
+        pattern!(&space, [{
+            ?person_id @
+            metadata::tag: &KIND_PERSON_ID,
+            relations::alias_norm: key,
+        }])
+    ) {
+        matches.insert(person_id);
     }
+    matches
 }
 
 fn cmd_add(
@@ -602,6 +632,7 @@ fn cmd_add(
     email: Option<String>,
 ) -> Result<()> {
     let label = normalize_label(&label)?;
+    let label_lookup = normalize_lookup_key(&label)?;
     let person_id = match id {
         Some(raw) => parse_hex_id(&raw, "person id")?,
         None => ufoid().id,
@@ -615,12 +646,25 @@ fn cmd_add(
         let mut change = ensure_kind_entities(&mut ws)?;
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
-        if let Some(existing) = find_person_by_label(&space, &label)? {
+        let aliases = normalize_aliases(aliases);
+        let alias_lookup = normalize_alias_lookup_keys(&aliases);
+
+        for existing in find_people_by_lookup_key(&space, &label_lookup) {
             if existing != person_id {
                 bail!(
-                    "label '{label}' already belongs to person {}",
+                    "lookup key '{label_lookup}' already belongs to person {}",
                     id_prefix(existing)
                 );
+            }
+        }
+        for key in &alias_lookup {
+            for existing in find_people_by_lookup_key(&space, key) {
+                if existing != person_id {
+                    bail!(
+                        "lookup key '{key}' already belongs to person {}",
+                        id_prefix(existing)
+                    );
+                }
             }
         }
 
@@ -629,10 +673,10 @@ fn cmd_add(
         let first_name_handle = first_name.map(|value| ws.put(value));
         let last_name_handle = last_name.map(|value| ws.put(value));
         let note_handle = note.map(|value| ws.put(value));
-        let aliases = normalize_aliases(aliases);
         change += entity! { ExclusiveId::force_ref(&person_id) @
             metadata::tag: &KIND_PERSON_ID,
             metadata::name: label_handle,
+            relations::label_norm: label_lookup.as_str(),
             relations::display_name?: display_name_handle,
             relations::first_name?: first_name_handle,
             relations::last_name?: last_name_handle,
@@ -641,10 +685,12 @@ fn cmd_add(
             relations::teams_user_id?: teams_user_id,
             relations::email?: email,
             relations::alias*: aliases.iter().map(String::as_str),
+            relations::alias_norm*: alias_lookup.iter().map(String::as_str),
         };
 
         ws.commit(change, None, Some("relations add"));
-        repo.push(&mut ws).map_err(|e| anyhow!("push person: {e:?}"))?;
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push person: {e:?}"))?;
         Ok(())
     })?;
     println!("Added {} ({label}).", format!("{person_id:x}"));
@@ -667,6 +713,7 @@ fn cmd_set(
     email: Option<String>,
 ) -> Result<()> {
     let label = label.map(|l| normalize_label(&l)).transpose()?;
+    let label_lookup = label.as_deref().map(normalize_lookup_key).transpose()?;
 
     let person_id = with_repo(pile, |repo| {
         ensure_branch_with_id(repo, branch_id, branch_name)?;
@@ -678,23 +725,37 @@ fn cmd_set(
 
         let person_id = resolve_person_id(&space, &id)?;
 
-        if let Some(label_value) = label.as_deref() {
-            if let Some(existing) = find_person_by_label(&space, label_value)? {
+        let aliases = normalize_aliases(aliases);
+        let alias_lookup = normalize_alias_lookup_keys(&aliases);
+
+        if let Some(key) = label_lookup.as_deref() {
+            for existing in find_people_by_lookup_key(&space, key) {
                 if existing != person_id {
                     bail!(
-                        "label '{label_value}' already belongs to person {}",
+                        "lookup key '{key}' already belongs to person {}",
                         id_prefix(existing)
                     );
                 }
             }
         }
+        for key in &alias_lookup {
+            for existing in find_people_by_lookup_key(&space, key) {
+                if existing != person_id {
+                    bail!(
+                        "lookup key '{key}' already belongs to person {}",
+                        id_prefix(existing)
+                    );
+                }
+            }
+        }
+
         let label_handle = label.map(|value| ws.put(value));
         let display_name_handle = display_name.map(|value| ws.put(value));
         let first_name_handle = first_name.map(|value| ws.put(value));
         let last_name_handle = last_name.map(|value| ws.put(value));
         let note_handle = note.map(|value| ws.put(value));
-        let aliases = normalize_aliases(aliases);
         let has_updates = label_handle.is_some()
+            || label_lookup.is_some()
             || display_name_handle.is_some()
             || first_name_handle.is_some()
             || last_name_handle.is_some()
@@ -707,6 +768,7 @@ fn cmd_set(
         if has_updates {
             change += entity! { ExclusiveId::force_ref(&person_id) @
                 metadata::name?: label_handle,
+                relations::label_norm?: label_lookup.as_deref(),
                 relations::display_name?: display_name_handle,
                 relations::first_name?: first_name_handle,
                 relations::last_name?: last_name_handle,
@@ -715,12 +777,14 @@ fn cmd_set(
                 relations::teams_user_id?: teams_user_id,
                 relations::email?: email,
                 relations::alias*: aliases.iter().map(String::as_str),
+                relations::alias_norm*: alias_lookup.iter().map(String::as_str),
             };
         }
 
         if !change.is_empty() {
             ws.commit(change, None, Some("relations set"));
-            repo.push(&mut ws).map_err(|e| anyhow!("push person: {e:?}"))?;
+            repo.push(&mut ws)
+                .map_err(|e| anyhow!("push person: {e:?}"))?;
         }
         Ok(person_id)
     })?;
@@ -834,10 +898,13 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
             <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
                 repo.storage_mut(),
             )?;
-        metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
         metadata += metadata::Describe::describe(&metadata::name, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::label_norm, repo.storage_mut())?;
         metadata += metadata::Describe::describe(&relations::alias, repo.storage_mut())?;
+        metadata += metadata::Describe::describe(&relations::alias_norm, repo.storage_mut())?;
         metadata += metadata::Describe::describe(&relations::affinity, repo.storage_mut())?;
         metadata += metadata::Describe::describe(&relations::first_name, repo.storage_mut())?;
         metadata += metadata::Describe::describe(&relations::last_name, repo.storage_mut())?;
