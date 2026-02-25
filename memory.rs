@@ -118,6 +118,9 @@ fn main() -> Result<()> {
                     }
                     first = false;
                     println!("memory lookup failed: {err}");
+                    println!(
+                        "warning: memory is for intentional lookups of shown `mem <id>` chunks; do not continue by guessing/replaying ids."
+                    );
                     println!("hint: run `/opt/playground/faculties/orient.rs show` for fresh ids.");
                     continue;
                 }

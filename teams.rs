@@ -752,7 +752,7 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let pile_path = cli
         .pile
         .clone()
-        .or_else(|| std::env::var("TRIBLESPACE_PILE").ok().map(PathBuf::from))
+        .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("self.pile"));
     let branch = std::env::var("TRIBLESPACE_BRANCH").ok().unwrap_or_else(|| cli.branch.clone());
     let env_branch_id = std::env::var("TRIBLESPACE_BRANCH_ID").ok();
