@@ -110,10 +110,19 @@ fn main() -> Result<()> {
 
         let mut first = true;
         for raw in &cli.ids {
-            let chunk_id = resolve_prefix(index.keys().copied(), raw)?;
-            let chunk = index
-                .get(&chunk_id)
-                .with_context(|| format!("missing chunk {raw}"))?;
+            let chunk_id = match resolve_chunk_or_turn_id(&index, raw) {
+                Ok(chunk_id) => chunk_id,
+                Err(err) => {
+                    if !first {
+                        println!();
+                    }
+                    first = false;
+                    println!("memory lookup failed: {err}");
+                    println!("hint: run `/opt/playground/faculties/orient.rs show` for fresh ids.");
+                    continue;
+                }
+            };
+            let chunk = index.get(&chunk_id).with_context(|| format!("missing chunk {raw}"))?;
             if !first {
                 println!();
             }
@@ -264,27 +273,51 @@ fn id_prefix(id: Id) -> String {
     hex[..8].to_string()
 }
 
-fn resolve_prefix(ids: impl Iterator<Item = Id>, prefix: &str) -> Result<Id> {
-    let mut prefix = prefix.trim().to_ascii_lowercase();
+fn resolve_chunk_or_turn_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id> {
+    let prefix = normalize_prefix(raw)?;
+
+    let mut chunk_matches = Vec::new();
+    for chunk_id in index.keys().copied() {
+        if id_starts_with(chunk_id, prefix.as_str()) {
+            chunk_matches.push(chunk_id);
+        }
+    }
+    match chunk_matches.len() {
+        1 => return Ok(chunk_matches[0]),
+        n if n > 1 => {
+            bail!("multiple chunk ids match prefix '{prefix}' (use a longer prefix)")
+        }
+        _ => {}
+    }
+
+    let mut turn_matches = Vec::new();
+    for chunk in index.values() {
+        if let Some(turn_id) = chunk.about_exec_result {
+            if id_starts_with(turn_id, prefix.as_str()) {
+                turn_matches.push((turn_id, chunk.id));
+            }
+        }
+    }
+    match turn_matches.len() {
+        0 => bail!("no chunk id or turn_id matches prefix '{prefix}'"),
+        1 => Ok(turn_matches[0].1),
+        _ => bail!("multiple turn_id values match prefix '{prefix}' (use a longer prefix)"),
+    }
+}
+
+fn normalize_prefix(raw: &str) -> Result<String> {
+    let mut prefix = raw.trim().to_ascii_lowercase();
     if let Some(rest) = prefix.strip_prefix("0x") {
         prefix = rest.to_string();
     }
     if prefix.is_empty() {
         bail!("id prefix is empty");
     }
+    Ok(prefix)
+}
 
-    let mut matches = Vec::new();
-    for id in ids {
-        let hex = format!("{id:x}");
-        if hex.starts_with(&prefix) {
-            matches.push(id);
-        }
-    }
-    match matches.len() {
-        0 => bail!("no chunk id matches prefix '{prefix}'"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple chunk ids match prefix '{prefix}' (use a longer prefix)"),
-    }
+fn id_starts_with(id: Id, prefix: &str) -> bool {
+    format!("{id:x}").starts_with(prefix)
 }
 
 fn parse_optional_hex_id(raw: Option<&str>) -> Result<Option<Id>> {
