@@ -10,7 +10,7 @@
 //! ```
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -79,33 +79,17 @@ struct Cli {
     /// Worker id to annotate (hex). Defaults to $WORKER_ID.
     #[arg(long, global = true)]
     worker_id: Option<String>,
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Record a reason note.
-    #[command(alias = "log")]
-    Add {
-        /// Free-form reasoning text.
-        text: String,
-    },
-    /// Record a reason note, then run a command.
-    #[command(alias = "run")]
-    Act {
-        /// Free-form reasoning text.
-        text: String,
-        /// Command to run after logging the reason.
-        #[arg(
-            value_name = "COMMAND",
-            required = true,
-            num_args = 1..,
-            trailing_var_arg = true,
-            allow_hyphen_values = true
-        )]
-        command: Vec<String>,
-    },
+    /// Free-form reasoning text.
+    #[arg(value_name = "TEXT")]
+    text: Option<String>,
+    /// Optional command to run after logging the reason (pass after `--`).
+    #[arg(
+        value_name = "COMMAND",
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        last = true
+    )]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -468,7 +452,7 @@ fn main() -> Result<()> {
         eprintln!("atlas emit: {err}");
     }
 
-    let Some(command) = cli.command else {
+    let Some(text) = cli.text.as_ref() else {
         let mut cmd = Cli::command();
         cmd.print_help()?;
         println!();
@@ -494,42 +478,37 @@ fn main() -> Result<()> {
     let worker_id =
         parse_optional_hex_id(cli.worker_id.as_deref().or(env_worker_id.as_deref()), "worker id")?;
 
-    match command {
-        Command::Add { text } => {
-            if text.trim().is_empty() {
-                bail!("reason text is empty");
-            }
-            let reason_id = append_reason(
-                &pile_path,
-                &cli.branch,
-                config_branch_id,
-                explicit_branch_id,
-                turn_id,
-                worker_id,
-                &text,
-                None,
-            )?;
-            println!("[{}] reason logged", id_prefix(reason_id));
-            Ok(())
-        }
-        Command::Act { text, command } => {
-            if text.trim().is_empty() {
-                bail!("reason text is empty");
-            }
-            let command_text = render_command(&command);
-            let reason_id = append_reason(
-                &pile_path,
-                &cli.branch,
-                config_branch_id,
-                explicit_branch_id,
-                turn_id,
-                worker_id,
-                &text,
-                Some(command_text.as_str()),
-            )?;
-            eprintln!("[{}] reason logged: {}", id_prefix(reason_id), text.trim());
-            let exit_code = run_command(&command)?;
-            std::process::exit(exit_code);
-        }
+    if text.trim().is_empty() {
+        bail!("reason text is empty");
     }
+
+    if cli.command.is_empty() {
+        let reason_id = append_reason(
+            &pile_path,
+            &cli.branch,
+            config_branch_id,
+            explicit_branch_id,
+            turn_id,
+            worker_id,
+            text,
+            None,
+        )?;
+        println!("[{}] reason logged", id_prefix(reason_id));
+        return Ok(());
+    }
+
+    let command_text = render_command(&cli.command);
+    let reason_id = append_reason(
+        &pile_path,
+        &cli.branch,
+        config_branch_id,
+        explicit_branch_id,
+        turn_id,
+        worker_id,
+        text,
+        Some(command_text.as_str()),
+    )?;
+    eprintln!("[{}] reason logged: {}", id_prefix(reason_id), text.trim());
+    let exit_code = run_command(&cli.command)?;
+    std::process::exit(exit_code);
 }
