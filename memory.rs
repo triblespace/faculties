@@ -113,21 +113,12 @@ fn main() -> Result<()> {
             let chunk_id = match resolve_chunk_or_turn_id(&index, raw) {
                 Ok(chunk_id) => chunk_id,
                 Err(err) => {
-                    if !first {
-                        println!();
-                    }
-                    first = false;
-                    println!("memory lookup failed: {err}");
-                    println!(
-                        "note: memory lookups work best when using ids shown as `mem <id>` chunk references."
-                    );
-                    println!(
-                        "hint: run `/opt/playground/faculties/orient.rs show` to refresh available ids."
-                    );
-                    continue;
+                    return Err(invalid_memory_id_error(raw, err));
                 }
             };
-            let chunk = index.get(&chunk_id).with_context(|| format!("missing chunk {raw}"))?;
+            let chunk = index
+                .get(&chunk_id)
+                .with_context(|| format!("missing chunk {raw}"))?;
             if !first {
                 println!();
             }
@@ -173,7 +164,9 @@ fn load_core_branch_id(repo: &mut Repository<Pile<Blake3>>) -> Result<Id> {
 
     latest
         .map(|(_id, _key, branch_id)| branch_id)
-        .ok_or_else(|| anyhow!("config missing branch_id; set it with `playground config set branch-id <ID>`"))
+        .ok_or_else(|| {
+            anyhow!("config missing branch_id; set it with `playground config set branch-id <ID>`")
+        })
 }
 
 fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
@@ -310,6 +303,15 @@ fn resolve_chunk_or_turn_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id>
     }
 }
 
+fn invalid_memory_id_error(raw: &str, cause: anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "memory lookup failed for id `{raw}`: {cause}\n\
+         hint: that id is wrong here.\n\
+         hint: only call `memory <id>` when you want to inspect an id that already appeared in prior output.\n\
+         hint: do not guess memory ids or loop lookups; switch to a concrete non-memory action if no valid id is available."
+    )
+}
+
 fn normalize_prefix(raw: &str) -> Result<String> {
     let mut prefix = raw.trim().to_ascii_lowercase();
     if let Some(rest) = prefix.strip_prefix("0x") {
@@ -348,7 +350,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
             .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
     }
 
-    let mut pile = Pile::<Blake3>::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
+    let mut pile =
+        Pile::<Blake3>::open(path).map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {
         let _ = pile.close();
         return Err(anyhow!("restore pile {}: {err:?}", path.display()));
@@ -356,7 +359,10 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
     Ok(Repository::new(pile, SigningKey::generate(&mut OsRng)))
 }
 
-fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>) -> Result<T> {
+fn with_repo<T>(
+    pile: &Path,
+    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+) -> Result<T> {
     let mut repo = open_repo(pile)?;
     let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
@@ -369,10 +375,7 @@ fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Re
     result
 }
 
-fn ensure_branch(
-    repo: &mut Repository<Pile<Blake3>>,
-    branch_name: &str,
-) -> Result<Id> {
+fn ensure_branch(repo: &mut Repository<Pile<Blake3>>, branch_name: &str) -> Result<Id> {
     if let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? {
         return Ok(branch_id);
     }
@@ -382,10 +385,7 @@ fn ensure_branch(
 }
 
 fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
-    let name_handle = branch_name
-        .to_owned()
-        .to_blob()
-        .get_handle::<Blake3>();
+    let name_handle = branch_name.to_owned().to_blob().get_handle::<Blake3>();
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile
         .branches()
@@ -429,7 +429,8 @@ fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
         metadata += <GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
         metadata += <U256BE as metadata::ConstDescribe>::describe(repo.storage_mut())?;
         metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata +=
+            <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(repo.storage_mut())?;
         metadata += <LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
 
         // context chunk protocol bits we rely on.
