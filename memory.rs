@@ -67,7 +67,7 @@ struct Cli {
     /// Optional explicit branch id (hex) to read chunks from (defaults to config.branch_id).
     #[arg(long, global = true)]
     branch_id: Option<String>,
-    /// One or more chunk ids / id prefixes to show.
+    /// One or more chunk ids / id prefixes to show, or `turn <turn-id>` to list facets for a turn.
     #[arg(value_name = "ID")]
     ids: Vec<String>,
 }
@@ -108,9 +108,16 @@ fn main() -> Result<()> {
         let catalog = ws.checkout(..).context("checkout branch")?;
         let index = load_chunks(&catalog);
 
+        if cli.ids.first().is_some_and(|value| value == "turn") {
+            if cli.ids.len() != 2 {
+                bail!("usage: memory turn <turn-id>");
+            }
+            return print_turn_facets(&mut ws, &index, &cli.ids[1]);
+        }
+
         let mut first = true;
         for raw in &cli.ids {
-            let chunk_id = match resolve_chunk_or_turn_id(&index, raw) {
+            let chunk_id = match resolve_chunk_id(&index, raw) {
                 Ok(chunk_id) => chunk_id,
                 Err(err) => {
                     return Err(invalid_memory_id_error(raw, err));
@@ -271,7 +278,7 @@ fn id_prefix(id: Id) -> String {
     hex[..8].to_string()
 }
 
-fn resolve_chunk_or_turn_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id> {
+fn resolve_chunk_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id> {
     let prefix = normalize_prefix(raw)?;
 
     let mut chunk_matches = Vec::new();
@@ -288,6 +295,19 @@ fn resolve_chunk_or_turn_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id>
         _ => {}
     }
 
+    for chunk in index.values() {
+        if let Some(turn_id) = chunk.about_exec_result {
+            if id_starts_with(turn_id, prefix.as_str()) {
+                bail!("turn id `{prefix}` is not a chunk id; use `memory turn {prefix}`");
+            }
+        }
+    }
+
+    bail!("no chunk id matches prefix '{prefix}'")
+}
+
+fn print_turn_facets(ws: &mut Workspace<Pile<Blake3>>, index: &HashMap<Id, Chunk>, raw: &str) -> Result<()> {
+    let prefix = normalize_prefix(raw)?;
     let mut turn_matches = Vec::new();
     for chunk in index.values() {
         if let Some(turn_id) = chunk.about_exec_result {
@@ -297,10 +317,37 @@ fn resolve_chunk_or_turn_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id>
         }
     }
     match turn_matches.len() {
-        0 => bail!("no chunk id or turn_id matches prefix '{prefix}'"),
-        1 => Ok(turn_matches[0].1),
-        _ => bail!("multiple turn_id values match prefix '{prefix}' (use a longer prefix)"),
+        0 => bail!("no turn_id matches prefix '{prefix}'"),
+        _ => {}
     }
+
+    turn_matches.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    turn_matches.dedup();
+
+    let first_turn = turn_matches[0].0;
+    if turn_matches.iter().any(|(turn_id, _)| *turn_id != first_turn) {
+        bail!("multiple turn_id values match prefix '{prefix}' (use a longer prefix)");
+    }
+
+    let mut chunks: Vec<&Chunk> = turn_matches
+        .iter()
+        .filter_map(|(_, chunk_id)| index.get(chunk_id))
+        .collect();
+    chunks.sort_unstable_by(|a, b| a.level.cmp(&b.level).then(a.id.cmp(&b.id)));
+
+    println!(
+        "turn {} has {} memory facet(s)",
+        id_prefix(first_turn),
+        chunks.len()
+    );
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        print_chunk(ws, chunk)?;
+    }
+
+    Ok(())
 }
 
 fn invalid_memory_id_error(raw: &str, cause: anyhow::Error) -> anyhow::Error {
