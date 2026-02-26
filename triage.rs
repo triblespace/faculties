@@ -49,6 +49,7 @@ const KIND_EXEC_RESULT_ID: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
 const KIND_LLM_REQUEST_ID: Id = id_hex!("1524B4C030D4F10365D9DCEE801A09C8");
 const KIND_LLM_IN_PROGRESS_ID: Id = id_hex!("16C69FC4928D54BF93E6F3222B4685A7");
 const KIND_LLM_RESULT_ID: Id = id_hex!("DE498E4697F9F01219C75E7BC183DB91");
+const KIND_REASON_EVENT_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
 const REPO_HEAD_ATTR: Id = id_hex!("272FBC56108F336C4D2E17289468C35F");
 const REPO_PARENT_ATTR: Id = id_hex!("317044B612C690000D798CA660ECFD2A");
 const REPO_CONTENT_ATTR: Id = id_hex!("4DD4DDD05CC31734B03ABB4E43188B1F");
@@ -119,6 +120,16 @@ mod llm {
     }
 }
 
+mod reason {
+    use super::*;
+    attributes! {
+        "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "FBA9BC32A457C7BFFDB7E0181D3E82A4" as created_at: valueschemas::NsTAIInterval;
+        "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
+        "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "triage",
@@ -170,6 +181,12 @@ enum Command {
         recent: usize,
         #[arg(long, default_value_t = 3)]
         min_repeat: usize,
+    },
+    /// Show an interleaved recent activity timeline (exec/llm/reason)
+    Timeline {
+        /// Max events to print (newest first)
+        #[arg(long, default_value_t = 80)]
+        recent: usize,
     },
     /// Inspect commit-chain integrity for the target branch
     Chain,
@@ -260,6 +277,21 @@ struct LlmState {
     requests: HashMap<Id, LlmRequestRow>,
     in_progress: Vec<LlmInProgressRow>,
     results: Vec<LlmResultRow>,
+}
+
+#[derive(Debug, Clone)]
+struct ReasonEventRow {
+    created_at: Option<i128>,
+    text: Option<String>,
+    about_turn: Option<Id>,
+    command_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TimelineRow {
+    at: i128,
+    source: &'static str,
+    detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -931,6 +963,69 @@ fn collect_llm_state(
 
     state.results = result_map.into_values().collect();
     Ok(state)
+}
+
+fn collect_reason_state(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+) -> Result<Vec<ReasonEventRow>> {
+    let mut rows: HashMap<Id, ReasonEventRow> = HashMap::new();
+
+    for (reason_id,) in find!(
+        (reason_id: Id),
+        pattern!(&space, [{ ?reason_id @ metadata::tag: &KIND_REASON_EVENT_ID }])
+    ) {
+        rows.insert(
+            reason_id,
+            ReasonEventRow {
+                created_at: None,
+                text: None,
+                about_turn: None,
+                command_text: None,
+            },
+        );
+    }
+
+    for (reason_id, created_at) in find!(
+        (reason_id: Id, created_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{ ?reason_id @ reason::created_at: ?created_at }])
+    ) {
+        if let Some(row) = rows.get_mut(&reason_id) {
+            row.created_at = Some(interval_key(created_at));
+        }
+    }
+
+    for (reason_id, handle) in find!(
+        (reason_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?reason_id @ reason::text: ?handle }])
+    ) {
+        if let Some(row) = rows.get_mut(&reason_id) {
+            row.text = Some(read_text(ws, handle)?);
+        }
+    }
+
+    for (reason_id, about_turn) in find!(
+        (reason_id: Id, about_turn: Id),
+        pattern!(&space, [{ ?reason_id @ reason::about_turn: ?about_turn }])
+    ) {
+        if let Some(row) = rows.get_mut(&reason_id) {
+            row.about_turn = Some(about_turn);
+        }
+    }
+
+    for (reason_id, handle) in find!(
+        (reason_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?reason_id @ reason::command_text: ?handle }])
+    ) {
+        if let Some(row) = rows.get_mut(&reason_id) {
+            row.command_text = Some(read_text(ws, handle)?);
+        }
+    }
+
+    let mut list: Vec<ReasonEventRow> = rows.into_values().collect();
+    list.sort_by_key(|row| row.created_at.unwrap_or(i128::MIN));
+    list.reverse();
+    Ok(list)
 }
 
 fn pending_exec_count(state: &ExecState) -> usize {
@@ -1644,6 +1739,151 @@ fn cmd_loops(
     Ok(())
 }
 
+fn build_timeline_rows(
+    exec_state: &ExecState,
+    llm_state: &LlmState,
+    reason_rows: &[ReasonEventRow],
+    recent: usize,
+) -> Vec<TimelineRow> {
+    let mut rows = Vec::<TimelineRow>::new();
+
+    for request in exec_state.requests.values() {
+        if let (Some(at), Some(command)) = (request.requested_at, request.command.as_ref()) {
+            rows.push(TimelineRow {
+                at,
+                source: "exec",
+                detail: format!(
+                    "[{}] {}",
+                    id_prefix(request.id),
+                    truncate_single_line(command, 120)
+                ),
+            });
+        }
+    }
+
+    let request_commands: HashMap<Id, String> = exec_state
+        .requests
+        .values()
+        .filter_map(|request| request.command.clone().map(|command| (request.id, command)))
+        .collect();
+
+    for result in &exec_state.results {
+        let at = result.finished_at.unwrap_or(i128::MIN);
+        let command = request_commands
+            .get(&result.about_request)
+            .cloned()
+            .unwrap_or_else(|| "<missing command>".to_string());
+        let status = if let Some(error) = result.error.as_ref() {
+            format!("error {}", truncate_single_line(error, 72))
+        } else if let Some(stderr) = result.stderr_text.as_ref() {
+            let line = first_line(stderr);
+            if line == "<ok>" {
+                format!("exit {}", result.exit_code.unwrap_or(0))
+            } else {
+                format!(
+                    "exit {} stderr {}",
+                    result.exit_code.unwrap_or(-1),
+                    truncate_single_line(line.as_str(), 72)
+                )
+            }
+        } else {
+            format!("exit {}", result.exit_code.unwrap_or(-1))
+        };
+        rows.push(TimelineRow {
+            at,
+            source: "exec-result",
+            detail: format!(
+                "[{}:{}] {} | {}",
+                id_prefix(result.about_request),
+                id_prefix(result.id),
+                truncate_single_line(command.as_str(), 100),
+                status
+            ),
+        });
+    }
+
+    for request in llm_state.requests.keys() {
+        if let Some(entry) = llm_state.requests.get(request) {
+            if let Some(at) = entry.requested_at {
+                rows.push(TimelineRow {
+                    at,
+                    source: "llm",
+                    detail: format!("[{}] request", id_prefix(*request)),
+                });
+            }
+        }
+    }
+    for result in &llm_state.results {
+        if let Some(error) = result.error.as_ref() {
+            rows.push(TimelineRow {
+                at: result.finished_at.unwrap_or(i128::MIN),
+                source: "llm-error",
+                detail: truncate_single_line(error, 130),
+            });
+        }
+    }
+
+    for row in reason_rows {
+        let text = row.text.as_deref().unwrap_or("<missing>");
+        let mut detail = String::new();
+        if let Some(turn_id) = row.about_turn {
+            detail.push_str(format!("[turn {}] ", id_prefix(turn_id)).as_str());
+        }
+        detail.push_str(truncate_single_line(text, 120).as_str());
+        if let Some(command) = row.command_text.as_ref() {
+            detail.push_str(" | ");
+            detail.push_str(truncate_single_line(command, 96).as_str());
+        }
+        rows.push(TimelineRow {
+            at: row.created_at.unwrap_or(i128::MIN),
+            source: "reason",
+            detail,
+        });
+    }
+
+    rows.sort_by_key(|row| row.at);
+    rows.reverse();
+    if rows.len() > recent {
+        rows.truncate(recent);
+    }
+    rows
+}
+
+fn cmd_timeline(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    cli: &Cli,
+    recent: usize,
+) -> Result<()> {
+    let config = load_latest_config(repo, cli.config_branch.as_str())?;
+    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull target workspace: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout target workspace: {e:?}"))?;
+    let exec_state = collect_exec_state(&mut ws, &space)?;
+    let llm_state = collect_llm_state(&mut ws, &space)?;
+    let reason_state = collect_reason_state(&mut ws, &space)?;
+    let rows = build_timeline_rows(&exec_state, &llm_state, &reason_state, recent);
+    let now_key = now_epoch().to_tai_duration().total_nanoseconds();
+
+    println!("Triage timeline");
+    println!("- pile: {}", cli.pile.display());
+    println!("- branch: {branch_id:x}");
+    println!("- rows: {}", rows.len());
+    println!();
+    for row in rows {
+        println!(
+            "- {:>5} {:>11} | {}",
+            format_age(now_key, row.at),
+            row.source,
+            row.detail
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct BranchRepairOutcome {
     name: String,
@@ -1946,7 +2186,8 @@ fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
             <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
         metadata_set +=
             <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata_set += <valueschemas::U256BE as metadata::ConstDescribe>::describe(repo.storage_mut())?;
+        metadata_set +=
+            <valueschemas::U256BE as metadata::ConstDescribe>::describe(repo.storage_mut())?;
         metadata_set +=
             <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
         metadata_set += <valueschemas::Handle<
@@ -1960,14 +2201,18 @@ fn emit_schema_to_atlas(pile_path: &Path, atlas_branch: &str) -> Result<()> {
         metadata_set += metadata::Describe::describe(&config::updated_at, repo.storage_mut())?;
         metadata_set += metadata::Describe::describe(&config::branch, repo.storage_mut())?;
         metadata_set += metadata::Describe::describe(&config::branch_id, repo.storage_mut())?;
-        metadata_set += metadata::Describe::describe(&config::compass_branch_id, repo.storage_mut())?;
+        metadata_set +=
+            metadata::Describe::describe(&config::compass_branch_id, repo.storage_mut())?;
         metadata_set += metadata::Describe::describe(&config::exec_branch_id, repo.storage_mut())?;
         metadata_set +=
             metadata::Describe::describe(&config::local_messages_branch_id, repo.storage_mut())?;
-        metadata_set += metadata::Describe::describe(&config::relations_branch_id, repo.storage_mut())?;
+        metadata_set +=
+            metadata::Describe::describe(&config::relations_branch_id, repo.storage_mut())?;
         metadata_set += metadata::Describe::describe(&config::teams_branch_id, repo.storage_mut())?;
-        metadata_set += metadata::Describe::describe(&config::workspace_branch_id, repo.storage_mut())?;
-        metadata_set += metadata::Describe::describe(&config::archive_branch_id, repo.storage_mut())?;
+        metadata_set +=
+            metadata::Describe::describe(&config::workspace_branch_id, repo.storage_mut())?;
+        metadata_set +=
+            metadata::Describe::describe(&config::archive_branch_id, repo.storage_mut())?;
         metadata_set += metadata::Describe::describe(&config::web_branch_id, repo.storage_mut())?;
         metadata_set += metadata::Describe::describe(&config::media_branch_id, repo.storage_mut())?;
         metadata_set += metadata::Describe::describe(&config::persona_id, repo.storage_mut())?;
@@ -2034,6 +2279,7 @@ fn main() -> Result<()> {
             stale_min,
         } => cmd_scan(&mut repo, &cli, *recent, *loop_min, *stale_min),
         Command::Loops { recent, min_repeat } => cmd_loops(&mut repo, &cli, *recent, *min_repeat),
+        Command::Timeline { recent } => cmd_timeline(&mut repo, &cli, *recent),
         Command::Chain => cmd_chain(&mut repo, &cli),
         Command::Repair { command } => match command {
             RepairCommand::BranchDuplicates { dry_run } => {
