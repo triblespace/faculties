@@ -128,10 +128,10 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Sleep until relevant branches change, then show orientation
-    Sleep {
+    /// Wait until relevant branches change, then show orientation
+    Wait {
         #[command(subcommand)]
-        target: Option<SleepTarget>,
+        target: Option<WaitTarget>,
         /// Max local messages to show
         #[arg(long, default_value_t = 10, global = true)]
         message_limit: usize,
@@ -141,20 +141,20 @@ enum Command {
         /// Max todo goals to show
         #[arg(long, default_value_t = 5, global = true)]
         todo_limit: usize,
-        /// Poll interval while sleeping for branch changes
+        /// Poll interval while waiting for branch changes
         #[arg(long, default_value_t = 1000, global = true)]
         poll_ms: u64,
     },
 }
 
 #[derive(Subcommand, Debug, Clone)]
-enum SleepTarget {
-    /// Sleep for a duration (e.g. 30s, 15m, 9h)
+enum WaitTarget {
+    /// Wait for a duration (e.g. 30s, 15m, 9h)
     For {
-        /// Duration to sleep
+        /// Duration to wait
         duration: String,
     },
-    /// Sleep until a specific time (e.g. 09:00, 9am, or 2026-02-13T09:00:00+01:00)
+    /// Wait until a specific time (e.g. 09:00, 9am, or 2026-02-13T09:00:00+01:00)
     Until {
         /// Time to wake up
         when: String,
@@ -821,24 +821,24 @@ fn branch_head_by_id(
         .map_err(|e| anyhow!("branch head {:x}: {e:?}", branch_id))
 }
 
-fn parse_sleep_target(target: Option<&SleepTarget>) -> Result<Option<Duration>> {
+fn parse_wait_target(target: Option<&WaitTarget>) -> Result<Option<Duration>> {
     let Some(target) = target else {
         return Ok(None);
     };
     match target {
-        SleepTarget::For { duration } => {
+        WaitTarget::For { duration } => {
             let duration = duration.trim();
             if duration.is_empty() {
-                bail!("sleep for requires a duration (e.g. 30s, 15m, 9h)");
+                bail!("wait for requires a duration (e.g. 30s, 15m, 9h)");
             }
             let parsed = humantime::parse_duration(duration)
-                .map_err(|e| anyhow!("invalid sleep duration '{duration}': {e}"))?;
+                .map_err(|e| anyhow!("invalid wait duration '{duration}': {e}"))?;
             if parsed.is_zero() {
-                bail!("sleep duration must be greater than zero");
+                bail!("wait duration must be greater than zero");
             }
             Ok(Some(parsed))
         }
-        SleepTarget::Until { when } => {
+        WaitTarget::Until { when } => {
             let (parsed, _) = parse_until_spec(when)?;
             Ok(Some(parsed))
         }
@@ -848,7 +848,7 @@ fn parse_sleep_target(target: Option<&SleepTarget>) -> Result<Option<Duration>> 
 fn parse_until_spec(raw: &str) -> Result<(Duration, DateTime<Local>)> {
     let when = raw.trim();
     if when.is_empty() {
-        bail!("sleep until requires a time (e.g. 09:00, 9am, 2026-02-13T09:00:00+01:00)");
+        bail!("wait until requires a time (e.g. 09:00, 9am, 2026-02-13T09:00:00+01:00)");
     }
 
     if let Ok(system_time) = humantime::parse_rfc3339_weak(when) {
@@ -877,7 +877,7 @@ fn parse_until_spec(raw: &str) -> Result<(Duration, DateTime<Local>)> {
     }
 
     bail!(
-        "invalid sleep until value '{when}'. Use HH:MM, 9am, local datetime, or RFC3339 timestamp"
+        "invalid wait until value '{when}'. Use HH:MM, 9am, local datetime, or RFC3339 timestamp"
     );
 }
 
@@ -926,16 +926,16 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
     }
 }
 
-fn cmd_sleep(
+fn cmd_wait(
     pile: &Path,
-    target: Option<SleepTarget>,
+    target: Option<WaitTarget>,
     message_limit: usize,
     doing_limit: usize,
     todo_limit: usize,
     poll_ms: u64,
 ) -> Result<()> {
-    let timeout = parse_sleep_target(target.as_ref())?;
-    let (detected_change_before_sleep, changed) = with_repo(pile, |repo| {
+    let timeout = parse_wait_target(target.as_ref())?;
+    let (detected_change_before_wait, changed) = with_repo(pile, |repo| {
         let config_identity = load_config_identity(repo)?;
         let local_branch_id = resolve_configured_branch_id(
             repo,
@@ -956,12 +956,12 @@ fn cmd_sleep(
             false,
         )?;
 
-        let mut detected_change_before_sleep = false;
+        let mut detected_change_before_wait = false;
         let baseline = load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
         if let Some(last_seen) = load_checkpoint_heads(repo)? {
             if baseline != last_seen {
-                detected_change_before_sleep = true;
-                return Ok((detected_change_before_sleep, true));
+                detected_change_before_wait = true;
+                return Ok((detected_change_before_wait, true));
             }
         }
 
@@ -971,21 +971,21 @@ fn cmd_sleep(
         loop {
             if let Some(timeout) = timeout {
                 if start.elapsed() >= timeout {
-                    return Ok((detected_change_before_sleep, false));
+                    return Ok((detected_change_before_wait, false));
                 }
             }
             std::thread::sleep(poll);
             let current = load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
             if current != baseline {
-                return Ok((detected_change_before_sleep, true));
+                return Ok((detected_change_before_wait, true));
             }
         }
     })?;
-    if detected_change_before_sleep {
+    if detected_change_before_wait {
         println!("Detected branch changes since last orientation snapshot; returning immediately.");
     }
     if !changed {
-        println!("No change detected since sleep started; showing current snapshot.");
+        println!("No change detected since wait started; showing current snapshot.");
     }
     cmd_show(
         pile,
@@ -1162,13 +1162,13 @@ fn main() -> Result<()> {
             doing_limit,
             todo_limit,
         } => cmd_show(&cli.pile, message_limit, doing_limit, todo_limit),
-        Command::Sleep {
+        Command::Wait {
             target,
             message_limit,
             doing_limit,
             todo_limit,
             poll_ms,
-        } => cmd_sleep(
+        } => cmd_wait(
             &cli.pile,
             target,
             message_limit,
