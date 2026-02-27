@@ -49,6 +49,8 @@ mod ctx {
         "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<Blake3, LongString>;
         "4EAF7FE3122A0AE2D8309B79DCCB8D75" as start_at: NsTAIInterval;
         "95D629052C40FA09B378DDC507BEA0D3" as end_at: NsTAIInterval;
+        "2407DD8440508B474B073A5ECF098500" as lens_id: GenId;
+        "9B83D68AECD6888AA9CE95E754494768" as child: GenId;
         "CB97C36A32DEC70E0D1149E7C5D88588" as left: GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as right: GenId;
         "316834CC6B0EA6F073BF5362D67AC530" as about_exec_result: GenId;
@@ -75,10 +77,10 @@ struct Cli {
 #[derive(Debug, Clone)]
 struct Chunk {
     id: Id,
+    lens_id: Id,
     level: u64,
     summary: Value<Handle<Blake3, LongString>>,
-    left: Option<Id>,
-    right: Option<Id>,
+    children: Vec<Id>,
     about_exec_result: Option<Id>,
 }
 
@@ -179,11 +181,17 @@ fn load_core_branch_id(repo: &mut Repository<Pile<Blake3>>) -> Result<Id> {
 fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
     let mut chunks = HashMap::<Id, Chunk>::new();
 
-    for (chunk_id, level, summary) in find!(
-        (chunk_id: Id, level: Value<U256BE>, summary: Value<Handle<Blake3, LongString>>),
+    for (chunk_id, lens_id, level, summary) in find!(
+        (
+            chunk_id: Id,
+            lens_id: Value<GenId>,
+            level: Value<U256BE>,
+            summary: Value<Handle<Blake3, LongString>>
+        ),
         pattern!(space, [{
             ?chunk_id @
             ctx::kind: &KIND_CHUNK_ID,
+            ctx::lens_id: ?lens_id,
             ctx::level: ?level,
             ctx::summary: ?summary,
         }])
@@ -193,13 +201,26 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
             chunk_id,
             Chunk {
                 id: chunk_id,
+                lens_id: Id::from_value(&lens_id),
                 level,
                 summary,
-                left: None,
-                right: None,
+                children: Vec::new(),
                 about_exec_result: None,
             },
         );
+    }
+
+    for (chunk_id, child) in find!(
+        (chunk_id: Id, child: Value<GenId>),
+        pattern!(space, [{
+            ?chunk_id @
+            ctx::kind: &KIND_CHUNK_ID,
+            ctx::child: ?child,
+        }])
+    ) {
+        if let Some(chunk) = chunks.get_mut(&chunk_id) {
+            chunk.children.push(Id::from_value(&child));
+        }
     }
 
     for (chunk_id, child) in find!(
@@ -211,7 +232,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.left = Some(Id::from_value(&child));
+            chunk.children.push(Id::from_value(&child));
         }
     }
 
@@ -224,7 +245,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.right = Some(Id::from_value(&child));
+            chunk.children.push(Id::from_value(&child));
         }
     }
 
@@ -241,6 +262,27 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }
     }
 
+    let start_by_id: HashMap<Id, i128> = find!(
+        (chunk_id: Id, start_at: Value<NsTAIInterval>),
+        pattern!(space, [{
+            ?chunk_id @
+            ctx::kind: &KIND_CHUNK_ID,
+            ctx::start_at: ?start_at,
+        }])
+    )
+    .into_iter()
+    .map(|(chunk_id, start_at)| (chunk_id, interval_key(start_at)))
+    .collect();
+    for chunk in chunks.values_mut() {
+        chunk.children.sort_by_key(|child_id| {
+            (
+                start_by_id.get(child_id).copied().unwrap_or(i128::MAX),
+                *child_id,
+            )
+        });
+        chunk.children.dedup();
+    }
+
     chunks
 }
 
@@ -254,16 +296,23 @@ fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
 }
 
 fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, chunk: &Chunk) -> Result<()> {
-    let mut header = format!("mem {} lvl={}", id_prefix(chunk.id), chunk.level);
+    let mut header = format!(
+        "mem {} lens={} lvl={}",
+        id_prefix(chunk.id),
+        id_prefix(chunk.lens_id),
+        chunk.level
+    );
     if let Some(exec_id) = chunk.about_exec_result {
         header.push_str(&format!(" exec={}", id_prefix(exec_id)));
     }
-    if let (Some(left), Some(right)) = (chunk.left, chunk.right) {
-        header.push_str(&format!(
-            " children={} {}",
-            id_prefix(left),
-            id_prefix(right)
-        ));
+    if !chunk.children.is_empty() {
+        header.push_str(" children=");
+        for (idx, child) in chunk.children.iter().enumerate() {
+            if idx > 0 {
+                header.push(',');
+            }
+            header.push_str(id_prefix(*child).as_str());
+        }
     }
     println!("{header}");
 
