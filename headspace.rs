@@ -14,6 +14,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(
     name = "headspace",
+    bin_name = "headspace",
     about = "Manage active LLM headspace (profile/model/reasoning)."
 )]
 struct Cli {
@@ -354,15 +355,19 @@ fn run_capture(runner: &PlaygroundRunner, pile: &Path, args: &[&str]) -> Result<
 }
 
 fn run_status(runner: &PlaygroundRunner, pile: &Path, args: &[&str]) -> Result<()> {
-    let status = build_command(runner, pile, args)
-        .status()
+    let output = build_command(runner, pile, args)
+        .output()
         .with_context(|| format!("run `{}`", render_invocation(runner, pile, args)))?;
-    if status.success() {
+    if output.status.success() {
         return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Err(anyhow!(
-        "command failed with status {status}: {}",
-        render_invocation(runner, pile, args)
+        "command failed ({}):\n{}\n{}",
+        output.status,
+        stdout,
+        stderr
     ))
 }
 
