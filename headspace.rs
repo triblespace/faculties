@@ -56,6 +56,11 @@ enum Command {
         #[arg(value_enum, value_name = "FIELD")]
         field: UnsetField,
     },
+    /// Manage memory lenses used by headspace/memory compaction
+    Lens {
+        #[command(subcommand)]
+        command: LensCommand,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -94,6 +99,7 @@ enum SetField {
     MaxOutputTokens,
     PromptSafetyMarginTokens,
     PromptCharsPerToken,
+    CompactionProfileId,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -101,6 +107,65 @@ enum SetField {
 enum UnsetField {
     ApiKey,
     ReasoningEffort,
+    CompactionProfileId,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum LensCommand {
+    /// List configured memory lenses
+    List,
+    /// Add a memory lens
+    Add(LensAddArgs),
+    /// Set one field on a memory lens
+    Set(LensSetArgs),
+    /// Reset one field (or all fields) to defaults for a memory lens
+    Reset(LensResetArgs),
+    /// Remove a memory lens
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Args, Debug, Clone)]
+struct LensAddArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(long, value_name = "ID")]
+    id: Option<String>,
+    #[arg(long, value_name = "PROMPT")]
+    prompt: Option<String>,
+    #[arg(long = "compaction-prompt", value_name = "PROMPT")]
+    compaction_prompt: Option<String>,
+    #[arg(long = "max-output-tokens", value_name = "TOKENS")]
+    max_output_tokens: Option<u64>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct LensSetArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(value_enum, value_name = "FIELD")]
+    field: LensField,
+    #[arg(value_name = "VALUE")]
+    value: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct LensResetArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+    #[arg(value_enum, value_name = "FIELD")]
+    field: Option<LensField>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+#[value(rename_all = "kebab-case")]
+enum LensField {
+    Id,
+    Prompt,
+    CompactionPrompt,
+    MaxOutputTokens,
 }
 
 enum PlaygroundRunner {
@@ -119,136 +184,81 @@ fn main() -> Result<()> {
 
     let runner = resolve_runner(&cli)?;
     match command {
-        Command::Show => show_headspace(&runner, &cli.pile),
+        Command::Show => {
+            let output = run_capture(&runner, &cli.pile, &["headspace", "show"])?;
+            print!("{output}");
+            Ok(())
+        }
         Command::List => {
-            let output = run_capture(&runner, &cli.pile, &["config", "profile", "list"])?;
+            let output = run_capture(&runner, &cli.pile, &["headspace", "list"])?;
             print!("{output}");
             Ok(())
         }
         Command::Use { profile } => {
-            run_status(&runner, &cli.pile, &["config", "profile", "use", profile.as_str()])?;
-            show_headspace(&runner, &cli.pile)
+            run_status(&runner, &cli.pile, &["headspace", "use", profile.as_str()])
         }
         Command::Add(args) => {
             run_status(
                 &runner,
                 &cli.pile,
-                &["config", "profile", "add", args.name.as_str()],
+                &["headspace", "add", args.name.as_str()],
             )?;
             apply_add_overrides(&runner, &cli.pile, &args)?;
-            show_headspace(&runner, &cli.pile)
+            Ok(())
         }
         Command::Set { field, value } => {
             let key = set_field_key(*field);
             run_status(
                 &runner,
                 &cli.pile,
-                &["config", "set", key, value.as_str()],
+                &["headspace", "set", key, value.as_str()],
             )?;
-            show_headspace(&runner, &cli.pile)
+            Ok(())
         }
         Command::Unset { field } => {
             let key = unset_field_key(*field);
-            run_status(&runner, &cli.pile, &["config", "unset", key])?;
-            show_headspace(&runner, &cli.pile)
+            run_status(&runner, &cli.pile, &["headspace", "unset", key])
+        }
+        Command::Lens { command } => {
+            let mut args = vec!["headspace".to_string(), "lens".to_string()];
+            extend_lens_args(&mut args, command.clone());
+            run_status_vec(&runner, &cli.pile, &args)
         }
     }
-}
-
-fn show_headspace(runner: &PlaygroundRunner, pile: &Path) -> Result<()> {
-    let config = run_capture(runner, pile, &["config", "show"])?;
-    let profiles = run_capture(runner, pile, &["config", "profile", "list"])?;
-
-    println!("active:");
-    let mut in_llm = false;
-    for line in config.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[llm]" {
-            in_llm = true;
-            continue;
-        }
-        if in_llm && trimmed.starts_with('[') {
-            break;
-        }
-        if !in_llm {
-            continue;
-        }
-        if matches_key(trimmed, "profile_id")
-            || matches_key(trimmed, "profile_name")
-            || matches_key(trimmed, "model")
-            || matches_key(trimmed, "base_url")
-            || matches_key(trimmed, "reasoning_effort")
-            || matches_key(trimmed, "stream")
-            || matches_key(trimmed, "context_window_tokens")
-            || matches_key(trimmed, "max_output_tokens")
-            || matches_key(trimmed, "prompt_safety_margin_tokens")
-            || matches_key(trimmed, "prompt_chars_per_token")
-            || matches_key(trimmed, "compaction_profile_id")
-        {
-            println!("  {trimmed}");
-        }
-    }
-
-    println!();
-    println!("profiles:");
-    for line in profiles.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        println!("  {line}");
-    }
-    Ok(())
-}
-
-fn matches_key(line: &str, key: &str) -> bool {
-    let Some((lhs, _rhs)) = line.split_once('=') else {
-        return false;
-    };
-    lhs.trim() == key
 }
 
 fn apply_add_overrides(runner: &PlaygroundRunner, pile: &Path, args: &AddArgs) -> Result<()> {
     if let Some(value) = args.model.as_deref() {
-        run_status(runner, pile, &["config", "set", "llm-model", value])?;
+        run_status(runner, pile, &["headspace", "set", "model", value])?;
     }
     if let Some(value) = args.base_url.as_deref() {
-        run_status(runner, pile, &["config", "set", "llm-base-url", value])?;
+        run_status(runner, pile, &["headspace", "set", "base-url", value])?;
     }
     if let Some(value) = args.api_key.as_deref() {
-        run_status(runner, pile, &["config", "set", "llm-api-key", value])?;
+        run_status(runner, pile, &["headspace", "set", "api-key", value])?;
     }
     if let Some(value) = args.reasoning_effort.as_deref() {
-        run_status(runner, pile, &["config", "set", "llm-reasoning-effort", value])?;
+        run_status(runner, pile, &["headspace", "set", "reasoning-effort", value])?;
     }
     if let Some(value) = args.stream {
         run_status(
             runner,
             pile,
-            &["config", "set", "llm-stream", if value { "true" } else { "false" }],
+            &["headspace", "set", "stream", if value { "true" } else { "false" }],
         )?;
     }
     if let Some(value) = args.context_window_tokens {
         run_status(
             runner,
             pile,
-            &[
-                "config",
-                "set",
-                "llm-context-window-tokens",
-                value.to_string().as_str(),
-            ],
+            &["headspace", "set", "context-window-tokens", value.to_string().as_str()],
         )?;
     }
     if let Some(value) = args.max_output_tokens {
         run_status(
             runner,
             pile,
-            &[
-                "config",
-                "set",
-                "llm-max-output-tokens",
-                value.to_string().as_str(),
-            ],
+            &["headspace", "set", "max-output-tokens", value.to_string().as_str()],
         )?;
     }
     if let Some(value) = args.prompt_safety_margin_tokens {
@@ -256,9 +266,9 @@ fn apply_add_overrides(runner: &PlaygroundRunner, pile: &Path, args: &AddArgs) -
             runner,
             pile,
             &[
-                "config",
+                "headspace",
                 "set",
-                "llm-prompt-safety-margin-tokens",
+                "prompt-safety-margin-tokens",
                 value.to_string().as_str(),
             ],
         )?;
@@ -267,12 +277,7 @@ fn apply_add_overrides(runner: &PlaygroundRunner, pile: &Path, args: &AddArgs) -
         run_status(
             runner,
             pile,
-            &[
-                "config",
-                "set",
-                "llm-prompt-chars-per-token",
-                value.to_string().as_str(),
-            ],
+            &["headspace", "set", "prompt-chars-per-token", value.to_string().as_str()],
         )?;
     }
     Ok(())
@@ -280,22 +285,78 @@ fn apply_add_overrides(runner: &PlaygroundRunner, pile: &Path, args: &AddArgs) -
 
 fn set_field_key(field: SetField) -> &'static str {
     match field {
-        SetField::Model => "llm-model",
-        SetField::BaseUrl => "llm-base-url",
-        SetField::ApiKey => "llm-api-key",
-        SetField::ReasoningEffort => "llm-reasoning-effort",
-        SetField::Stream => "llm-stream",
-        SetField::ContextWindowTokens => "llm-context-window-tokens",
-        SetField::MaxOutputTokens => "llm-max-output-tokens",
-        SetField::PromptSafetyMarginTokens => "llm-prompt-safety-margin-tokens",
-        SetField::PromptCharsPerToken => "llm-prompt-chars-per-token",
+        SetField::Model => "model",
+        SetField::BaseUrl => "base-url",
+        SetField::ApiKey => "api-key",
+        SetField::ReasoningEffort => "reasoning-effort",
+        SetField::Stream => "stream",
+        SetField::ContextWindowTokens => "context-window-tokens",
+        SetField::MaxOutputTokens => "max-output-tokens",
+        SetField::PromptSafetyMarginTokens => "prompt-safety-margin-tokens",
+        SetField::PromptCharsPerToken => "prompt-chars-per-token",
+        SetField::CompactionProfileId => "compaction-profile-id",
     }
 }
 
 fn unset_field_key(field: UnsetField) -> &'static str {
     match field {
-        UnsetField::ApiKey => "llm-api-key",
-        UnsetField::ReasoningEffort => "llm-reasoning-effort",
+        UnsetField::ApiKey => "api-key",
+        UnsetField::ReasoningEffort => "reasoning-effort",
+        UnsetField::CompactionProfileId => "compaction-profile-id",
+    }
+}
+
+fn lens_field_key(field: LensField) -> &'static str {
+    match field {
+        LensField::Id => "id",
+        LensField::Prompt => "prompt",
+        LensField::CompactionPrompt => "compaction-prompt",
+        LensField::MaxOutputTokens => "max-output-tokens",
+    }
+}
+
+fn extend_lens_args(args: &mut Vec<String>, command: LensCommand) {
+    match command {
+        LensCommand::List => {
+            args.push("list".to_string());
+        }
+        LensCommand::Add(add) => {
+            args.push("add".to_string());
+            args.push(add.name);
+            if let Some(id) = add.id {
+                args.push("--id".to_string());
+                args.push(id);
+            }
+            if let Some(prompt) = add.prompt {
+                args.push("--prompt".to_string());
+                args.push(prompt);
+            }
+            if let Some(prompt) = add.compaction_prompt {
+                args.push("--compaction-prompt".to_string());
+                args.push(prompt);
+            }
+            if let Some(tokens) = add.max_output_tokens {
+                args.push("--max-output-tokens".to_string());
+                args.push(tokens.to_string());
+            }
+        }
+        LensCommand::Set(set) => {
+            args.push("set".to_string());
+            args.push(set.name);
+            args.push(lens_field_key(set.field).to_string());
+            args.push(set.value);
+        }
+        LensCommand::Reset(reset) => {
+            args.push("reset".to_string());
+            args.push(reset.name);
+            if let Some(field) = reset.field {
+                args.push(lens_field_key(field).to_string());
+            }
+        }
+        LensCommand::Remove { name } => {
+            args.push("remove".to_string());
+            args.push(name);
+        }
     }
 }
 
@@ -359,6 +420,14 @@ fn run_status(runner: &PlaygroundRunner, pile: &Path, args: &[&str]) -> Result<(
         .output()
         .with_context(|| format!("run `{}`", render_invocation(runner, pile, args)))?;
     if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.is_empty() {
+            print!("{stdout}");
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.is_empty() {
+            eprint!("{stderr}");
+        }
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -369,6 +438,11 @@ fn run_status(runner: &PlaygroundRunner, pile: &Path, args: &[&str]) -> Result<(
         stdout,
         stderr
     ))
+}
+
+fn run_status_vec(runner: &PlaygroundRunner, pile: &Path, args: &[String]) -> Result<()> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_status(runner, pile, refs.as_slice())
 }
 
 fn build_command(runner: &PlaygroundRunner, pile: &Path, args: &[&str]) -> ProcessCommand {
