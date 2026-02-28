@@ -32,6 +32,8 @@ use triblespace::prelude::*;
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_STREAM: bool = false;
+const DEFAULT_TRANSPORT: LlmTransport = LlmTransport::ChatCompletions;
+const DEFAULT_REASONING_SUMMARY: LlmReasoningSummary = LlmReasoningSummary::Detailed;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
@@ -100,10 +102,12 @@ mod playground_config {
         "6691CF3F872C6107DCFAD0BCF7CDC1A0" as llm_profile_id: GenId;
         "85BE7BDA465B3CB0F800F76EEF8FAC9B" as llm_model: Handle<Blake3, LongString>;
         "B216CFBBF85AA1350B142D510E26268B" as llm_base_url: Handle<Blake3, LongString>;
+        "605C55F6ADB1F3FBFE0787AC2715924E" as llm_transport: Handle<Blake3, LongString>;
         "55F3FFD721AF7C1258E45BC91CDBF30F" as llm_api_key: Handle<Blake3, LongString>;
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<Blake3, LongString>;
         "BA4E05799CA2ACDCF3F9350FC8742F2F" as llm_reasoning_effort: Handle<Blake3, LongString>;
+        "73876213CFB8CF73CF0139E20B9770A1" as llm_reasoning_summary: Handle<Blake3, LongString>;
         "5F04F7A0EB4EBBE6161022B336F83513" as llm_stream: U256BE;
         "F9CEA1A2E81D738BB125B4D144B7A746" as llm_context_window_tokens: U256BE;
         "4200F6746B36F2784DEBA1555595D6AC" as llm_max_output_tokens: U256BE;
@@ -176,10 +180,14 @@ struct AddArgs {
     model: Option<String>,
     #[arg(long = "base-url")]
     base_url: Option<String>,
+    #[arg(long, value_enum)]
+    transport: Option<LlmTransport>,
     #[arg(long = "api-key")]
     api_key: Option<String>,
     #[arg(long = "reasoning-effort")]
     reasoning_effort: Option<String>,
+    #[arg(long = "reasoning-summary", value_enum)]
+    reasoning_summary: Option<LlmReasoningSummary>,
     #[arg(long)]
     stream: Option<bool>,
     #[arg(long = "context-window-tokens")]
@@ -197,8 +205,10 @@ struct AddArgs {
 enum SetField {
     Model,
     BaseUrl,
+    Transport,
     ApiKey,
     ReasoningEffort,
+    ReasoningSummary,
     Stream,
     ContextWindowTokens,
     MaxOutputTokens,
@@ -212,6 +222,7 @@ enum SetField {
 enum UnsetField {
     ApiKey,
     ReasoningEffort,
+    ReasoningSummary,
     CompactionProfileId,
 }
 
@@ -273,6 +284,60 @@ enum LensField {
     MaxOutputTokens,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+enum LlmTransport {
+    ChatCompletions,
+    Responses,
+}
+
+impl LlmTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat-completions",
+            Self::Responses => "responses",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "chat-completions" => Some(Self::ChatCompletions),
+            "responses" => Some(Self::Responses),
+            _ => None,
+        }
+    }
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[value(rename_all = "kebab-case")]
+enum LlmReasoningSummary {
+    Auto,
+    Concise,
+    Detailed,
+    None,
+}
+
+impl LlmReasoningSummary {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+            Self::None => "none",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "auto" => Some(Self::Auto),
+            "concise" => Some(Self::Concise),
+            "detailed" => Some(Self::Detailed),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Config {
     pile_path: PathBuf,
@@ -308,7 +373,9 @@ struct LlmConfig {
     model: String,
     base_url: String,
     api_key: Option<String>,
+    transport: LlmTransport,
     reasoning_effort: Option<String>,
+    reasoning_summary: Option<LlmReasoningSummary>,
     stream: bool,
     context_window_tokens: u64,
     max_output_tokens: u64,
@@ -417,11 +484,17 @@ fn apply_add_overrides(config: &mut Config, args: &AddArgs) -> Result<()> {
     if let Some(value) = args.base_url.as_deref() {
         config.llm.base_url = value.to_string();
     }
+    if let Some(value) = args.transport {
+        config.llm.transport = value;
+    }
     if let Some(value) = args.api_key.as_deref() {
         config.llm.api_key = Some(value.trim().to_string());
     }
     if let Some(value) = args.reasoning_effort.as_deref() {
         config.llm.reasoning_effort = Some(value.trim().to_string());
+    }
+    if let Some(value) = args.reasoning_summary {
+        config.llm.reasoning_summary = Some(value);
     }
     if let Some(value) = args.stream {
         config.llm.stream = value;
@@ -445,12 +518,23 @@ fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
     match field {
         SetField::Model => config.llm.model = load_value_or_file(value, "llm_model")?,
         SetField::BaseUrl => config.llm.base_url = load_value_or_file(value, "llm_base_url")?,
+        SetField::Transport => {
+            let raw = load_value_or_file_trimmed(value, "llm_transport")?;
+            config.llm.transport = LlmTransport::parse(raw.as_str())
+                .ok_or_else(|| anyhow!("llm_transport must be one of: chat-completions, responses"))?;
+        }
         SetField::ApiKey => {
             config.llm.api_key = Some(load_value_or_file_trimmed(value, "llm_api_key")?)
         }
         SetField::ReasoningEffort => {
             config.llm.reasoning_effort =
                 Some(load_value_or_file_trimmed(value, "llm_reasoning_effort")?)
+        }
+        SetField::ReasoningSummary => {
+            let raw = load_value_or_file_trimmed(value, "llm_reasoning_summary")?;
+            config.llm.reasoning_summary = Some(LlmReasoningSummary::parse(raw.as_str()).ok_or_else(|| {
+                anyhow!("llm_reasoning_summary must be one of: auto, concise, detailed, none")
+            })?);
         }
         SetField::Stream => config.llm.stream = parse_bool(value, "llm_stream")?,
         SetField::ContextWindowTokens => {
@@ -478,6 +562,7 @@ fn apply_unset(config: &mut Config, field: UnsetField) -> Result<()> {
     match field {
         UnsetField::ApiKey => config.llm.api_key = None,
         UnsetField::ReasoningEffort => config.llm.reasoning_effort = None,
+        UnsetField::ReasoningSummary => config.llm.reasoning_summary = None,
         UnsetField::CompactionProfileId => config.llm_compaction_profile_id = None,
     }
     Ok(())
@@ -667,6 +752,7 @@ fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
     println!("  profile_name = \"{}\"", config.llm_profile_name);
     println!("  model = \"{}\"", config.llm.model);
     println!("  base_url = \"{}\"", config.llm.base_url);
+    println!("  transport = \"{}\"", config.llm.transport.as_str());
     println!(
         "  api_key = {}",
         if show_secrets {
@@ -678,6 +764,14 @@ fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
     println!(
         "  reasoning_effort = {}",
         format_option_quoted(config.llm.reasoning_effort.as_deref())
+    );
+    println!(
+        "  reasoning_summary = {}",
+        config
+            .llm
+            .reasoning_summary
+            .map(|summary| format!("\"{}\"", summary.as_str()))
+            .unwrap_or_else(|| "null".to_string())
     );
     println!("  stream = {}", config.llm.stream);
     println!(
@@ -1118,6 +1212,18 @@ fn load_latest_config(
     if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::llm_base_url)? {
         config.llm.base_url = url;
     }
+    if let Some(transport) =
+        load_string_attr(ws, catalog, config_id, playground_config::llm_transport)?
+    {
+        if let Some(parsed) = LlmTransport::parse(transport.as_str()) {
+            config.llm.transport = parsed;
+        } else {
+            eprintln!(
+                "warning: unsupported llm transport '{transport}', using {}",
+                config.llm.transport.as_str()
+            );
+        }
+    }
     if let Some(effort) = load_string_attr(
         ws,
         catalog,
@@ -1125,6 +1231,25 @@ fn load_latest_config(
         playground_config::llm_reasoning_effort,
     )? {
         config.llm.reasoning_effort = Some(effort);
+    }
+    if let Some(summary) = load_string_attr(
+        ws,
+        catalog,
+        config_id,
+        playground_config::llm_reasoning_summary,
+    )? {
+        if let Some(parsed) = LlmReasoningSummary::parse(summary.as_str()) {
+            config.llm.reasoning_summary = Some(parsed);
+        } else {
+            eprintln!(
+                "warning: unsupported llm reasoning summary '{summary}', using {}",
+                config
+                    .llm
+                    .reasoning_summary
+                    .map(LlmReasoningSummary::as_str)
+                    .unwrap_or("null")
+            );
+        }
     }
     if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::llm_api_key)? {
         config.llm.api_key = Some(key);
@@ -1282,6 +1407,12 @@ fn load_latest_llm_profile(
     if let Some(url) = load_string_attr(ws, catalog, entry_id, playground_config::llm_base_url)? {
         llm.base_url = url;
     }
+    if let Some(transport) =
+        load_string_attr(ws, catalog, entry_id, playground_config::llm_transport)?
+    {
+        llm.transport = LlmTransport::parse(transport.as_str())
+            .ok_or_else(|| anyhow!("unsupported llm transport '{transport}'"))?;
+    }
     if let Some(effort) = load_string_attr(
         ws,
         catalog,
@@ -1289,6 +1420,17 @@ fn load_latest_llm_profile(
         playground_config::llm_reasoning_effort,
     )? {
         llm.reasoning_effort = Some(effort);
+    }
+    if let Some(summary) = load_string_attr(
+        ws,
+        catalog,
+        entry_id,
+        playground_config::llm_reasoning_summary,
+    )? {
+        llm.reasoning_summary = Some(
+            LlmReasoningSummary::parse(summary.as_str())
+                .ok_or_else(|| anyhow!("unsupported llm reasoning summary '{summary}'"))?,
+        );
     }
     if let Some(key) = load_string_attr(ws, catalog, entry_id, playground_config::llm_api_key)? {
         llm.api_key = Some(key);
@@ -1487,6 +1629,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     let profile_name = ws.put(config.llm_profile_name.clone());
     let llm_model = ws.put(config.llm.model.clone());
     let llm_base_url = ws.put(config.llm.base_url.clone());
+    let llm_transport = ws.put(config.llm.transport.as_str().to_string());
     let llm_stream: Value<U256BE> = if config.llm.stream { 1u64 } else { 0u64 }.to_value();
     let llm_context_window_tokens: Value<U256BE> = config.llm.context_window_tokens.to_value();
     let llm_max_output_tokens: Value<U256BE> = config.llm.max_output_tokens.to_value();
@@ -1501,6 +1644,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
         metadata::name: profile_name,
         playground_config::llm_model: llm_model,
         playground_config::llm_base_url: llm_base_url,
+        playground_config::llm_transport: llm_transport,
         playground_config::llm_stream: llm_stream,
         playground_config::llm_context_window_tokens: llm_context_window_tokens,
         playground_config::llm_max_output_tokens: llm_max_output_tokens,
@@ -1515,6 +1659,10 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     if let Some(effort) = config.llm.reasoning_effort.as_ref() {
         let handle = ws.put(effort.clone());
         change += entity! { &profile_entry_id @ playground_config::llm_reasoning_effort: handle };
+    }
+    if let Some(summary) = config.llm.reasoning_summary {
+        let handle = ws.put(summary.as_str().to_string());
+        change += entity! { &profile_entry_id @ playground_config::llm_reasoning_summary: handle };
     }
 
     for lens in &memory_lenses {
@@ -1611,7 +1759,9 @@ impl Default for LlmConfig {
             model: DEFAULT_MODEL.to_string(),
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
+            transport: DEFAULT_TRANSPORT,
             reasoning_effort: None,
+            reasoning_summary: Some(DEFAULT_REASONING_SUMMARY),
             stream: DEFAULT_STREAM,
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
