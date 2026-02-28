@@ -15,6 +15,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::Instant;
@@ -873,6 +874,7 @@ enum Command {
     },
     /// Search message content (substring match).
     Search {
+        #[arg(help = "Substring to search for. Use @path for file input or @- for stdin.")]
         text: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -1369,6 +1371,20 @@ fn snippet(text: &str, max: usize) -> String {
     out
 }
 
+fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
+    if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
+        return std::fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
+    }
+    Ok(raw.to_string())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.trace, cli.trace_filter.as_deref());
@@ -1554,8 +1570,9 @@ fn main() -> Result<()> {
                 limit,
                 case_sensitive,
             } => {
+                let text = load_value_or_file(&text, "search text")?;
                 let needle = if case_sensitive {
-                    text.clone()
+                    text
                 } else {
                     text.to_lowercase()
                 };

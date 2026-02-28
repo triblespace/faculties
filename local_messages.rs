@@ -9,13 +9,14 @@
 //! triblespace = "0.16.0"
 //! ```
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
 use triblespace::core::repo::branch as branch_proto;
@@ -103,6 +104,20 @@ fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
     Ok(Some(id))
 }
 
+fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
+    if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
+        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
+    }
+    Ok(raw.to_string())
+}
+
 #[derive(Parser)]
 #[command(
     name = "local-messages",
@@ -137,7 +152,7 @@ enum Command {
         /// Receiver label.
         to: String,
         /// Message text.
-        #[arg(value_name = "TEXT")]
+        #[arg(value_name = "TEXT", help = "Message text. Use @path for file input or @- for stdin.")]
         text: String,
     },
     /// List recent messages (latest first)
@@ -820,15 +835,18 @@ fn main() -> Result<()> {
     )?;
 
     match cmd {
-        Command::Send { text, from, to } => cmd_send(
-            &cli.pile,
-            branch_id,
-            relations_branch_id,
-            &cli.branch,
-            text,
-            from,
-            to,
-        ),
+        Command::Send { text, from, to } => {
+            let text = load_value_or_file(&text, "message text")?;
+            cmd_send(
+                &cli.pile,
+                branch_id,
+                relations_branch_id,
+                &cli.branch,
+                text,
+                from,
+                to,
+            )
+        }
         Command::List {
             reader,
             unread,

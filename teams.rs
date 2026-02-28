@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -378,10 +379,10 @@ struct Cli {
     /// Microsoft Graph delta endpoint.
     #[arg(long, default_value = DEFAULT_DELTA_URL, global = true)]
     delta_url: String,
-    /// OAuth bearer token (optional; otherwise use token command).
+    /// OAuth bearer token (optional; otherwise use token command). Use @path for file input or @- for stdin.
     #[arg(long, global = true)]
     token: Option<String>,
-    /// Command that outputs a bearer token.
+    /// Command that outputs a bearer token. Use @path for file input or @- for stdin.
     #[arg(
         long,
         default_value =
@@ -412,6 +413,7 @@ enum CommandMode {
     /// Send a message into a Teams chat.
     Send {
         chat_id: String,
+        #[arg(help = "Message text. Use @path for file input or @- for stdin.")]
         text: String,
     },
     /// Users directory commands.
@@ -443,10 +445,10 @@ enum CommandMode {
         #[arg(long)]
         client_id: String,
         /// Azure app client secret (stored in the pile).
-        #[arg(long)]
+        #[arg(long, help = "Azure app client secret (stored in the pile). Use @path for file input or @- for stdin.")]
         client_secret: Option<String>,
         /// Space-delimited scopes (defaults to chat + presence + user read + offline_access).
-        #[arg(long)]
+        #[arg(long, help = "Space-delimited scopes. Use @path for file input or @- for stdin.")]
         scopes: Option<String>,
     },
 }
@@ -563,7 +565,7 @@ enum ChatCommand {
         #[arg(long)]
         group: bool,
         /// Optional group chat topic.
-        #[arg(long)]
+        #[arg(long, help = "Optional group chat topic. Use @path for file input or @- for stdin.")]
         topic: Option<String>,
     },
 }
@@ -676,6 +678,7 @@ fn main() -> Result<()> {
             if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
                 eprintln!("atlas emit: {err}");
             }
+            let text = load_value_or_file(&text, "message text")?;
             send_message(config, &chat_id, &text)
         }
         CommandMode::Users { command } => {
@@ -706,7 +709,13 @@ fn main() -> Result<()> {
             }
             match command {
                 ChatCommand::Invite { chat_id, user_id, owner } => invite_to_chat(config, &chat_id, &user_id, owner),
-                ChatCommand::Create { user_ids, group, topic } => create_chat(config, user_ids, group, topic),
+                ChatCommand::Create { user_ids, group, topic } => {
+                    let topic = topic
+                        .as_deref()
+                        .map(|value| load_value_or_file(value, "chat topic"))
+                        .transpose()?;
+                    create_chat(config, user_ids, group, topic)
+                }
             }
         }
         CommandMode::Attachments { command } => {
@@ -737,12 +746,25 @@ fn main() -> Result<()> {
                 }
             }
         }
-        CommandMode::Login { tenant, client_id, client_secret, scopes } => {
+        CommandMode::Login {
+            tenant,
+            client_id,
+            client_secret,
+            scopes,
+        } => {
             let config = build_config(&cli)?;
             if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
                 eprintln!("atlas emit: {err}");
             }
-            let scopes = scopes.unwrap_or_else(default_scopes);
+            let scopes = scopes
+                .as_deref()
+                .map(|value| load_value_or_file(value, "scopes"))
+                .transpose()?
+                .unwrap_or_else(default_scopes);
+            let client_secret = client_secret
+                .as_deref()
+                .map(|value| load_value_or_file_trimmed(value, "client secret"))
+                .transpose()?;
             login_device_code(&config, &tenant, &client_id, client_secret.as_deref(), &scopes)
         }
     }
@@ -771,11 +793,14 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
         .unwrap_or_else(|| cli.delta_url.clone());
     let token = cli
         .token
-        .clone()
+        .as_deref()
+        .map(|value| load_value_or_file_trimmed(value, "token"))
+        .transpose()?
         .or_else(|| std::env::var("TEAMS_TOKEN").ok());
     let token_command = std::env::var("TEAMS_TOKEN_COMMAND")
         .ok()
         .unwrap_or_else(|| cli.token_command.clone());
+    let token_command = load_value_or_file_trimmed(&token_command, "token command")?;
     Ok(TeamsBridgeConfig {
         pile_path,
         branch,
@@ -3968,6 +3993,24 @@ fn map_err_debug<T, E: std::fmt::Debug>(
     context: &str,
 ) -> Result<T> {
     result.map_err(|err| anyhow::anyhow!("{context}: {err:?}"))
+}
+
+fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
+    if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
+        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
+    }
+    Ok(raw.to_string())
+}
+
+fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
+    Ok(load_value_or_file(raw, label)?.trim().to_string())
 }
 
 fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Option<Id>> {

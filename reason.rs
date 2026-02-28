@@ -15,6 +15,7 @@ use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use triblespace::core::metadata;
@@ -80,7 +81,7 @@ struct Cli {
     #[arg(long, global = true)]
     worker_id: Option<String>,
     /// Free-form reasoning text.
-    #[arg(value_name = "TEXT")]
+    #[arg(value_name = "TEXT", help = "Free-form reasoning text. Use @path for file input or @- for stdin.")]
     text: Option<String>,
     /// Optional command to run after logging the reason (pass after `--`).
     #[arg(
@@ -135,6 +136,20 @@ fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
         bail!("invalid {label} '{trimmed}'");
     };
     Ok(Some(id))
+}
+
+fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
+    if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
+        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
+    }
+    Ok(raw.to_string())
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
@@ -452,12 +467,13 @@ fn main() -> Result<()> {
         eprintln!("atlas emit: {err}");
     }
 
-    let Some(text) = cli.text.as_ref() else {
+    let Some(text_raw) = cli.text.as_ref() else {
         let mut cmd = Cli::command();
         cmd.print_help()?;
         println!();
         return Ok(());
     };
+    let text = load_value_or_file(text_raw, "reason text")?;
 
     let env_config_branch_id = std::env::var("CONFIG_BRANCH_ID").ok();
     let env_turn_id = std::env::var("TURN_ID").ok();
@@ -490,7 +506,7 @@ fn main() -> Result<()> {
             explicit_branch_id,
             turn_id,
             worker_id,
-            text,
+            &text,
             None,
         )?;
         println!("[{}] reason logged", id_prefix(reason_id));
@@ -505,7 +521,7 @@ fn main() -> Result<()> {
         explicit_branch_id,
         turn_id,
         worker_id,
-        text,
+        &text,
         Some(command_text.as_str()),
     )?;
     eprintln!("[{}] reason logged: {}", id_prefix(reason_id), text.trim());

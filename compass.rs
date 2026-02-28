@@ -10,13 +10,14 @@
 //! triblespace = "0.16.0"
 //! ```
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -92,6 +93,7 @@ struct Cli {
 enum Command {
     /// Add a new goal
     Add {
+        #[arg(help = "Goal title. Use @path for file input or @- for stdin.")]
         title: String,
         #[arg(long, default_value = "todo")]
         status: String,
@@ -100,7 +102,7 @@ enum Command {
         parent: Option<String>,
         #[arg(long)]
         tag: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "Initial note. Use @path for file input or @- for stdin.")]
         note: Option<String>,
     },
     /// List goals in kanban columns (hides done by default)
@@ -119,6 +121,7 @@ enum Command {
     /// Add a note to a goal
     Note {
         id: String,
+        #[arg(help = "Note text. Use @path for file input or @- for stdin.")]
         note: String,
     },
     /// Show a goal with history and notes
@@ -205,6 +208,20 @@ fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
         bail!("invalid {label} '{trimmed}'");
     };
     Ok(Some(id))
+}
+
+fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
+    if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
+        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
+    }
+    Ok(raw.to_string())
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
@@ -1018,19 +1035,29 @@ fn main() -> Result<()> {
             parent,
             tag,
             note,
-        } => cmd_add(
-            &cli.pile,
-            &cli.branch,
-            branch_id,
-            title,
-            status,
-            parent,
-            tag,
-            note,
-        ),
+        } => {
+            let title = load_value_or_file(&title, "goal title")?;
+            let note = note
+                .as_deref()
+                .map(|value| load_value_or_file(value, "goal note"))
+                .transpose()?;
+            cmd_add(
+                &cli.pile,
+                &cli.branch,
+                branch_id,
+                title,
+                status,
+                parent,
+                tag,
+                note,
+            )
+        }
         Command::List { status, all } => cmd_list(&cli.pile, &cli.branch, branch_id, status, all),
         Command::Move { id, status } => cmd_move(&cli.pile, &cli.branch, branch_id, id, status),
-        Command::Note { id, note } => cmd_note(&cli.pile, &cli.branch, branch_id, id, note),
+        Command::Note { id, note } => {
+            let note = load_value_or_file(&note, "goal note")?;
+            cmd_note(&cli.pile, &cli.branch, branch_id, id, note)
+        }
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
     }
 }

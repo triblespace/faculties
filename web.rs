@@ -13,6 +13,7 @@
 //! ```
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -55,10 +56,10 @@ struct Cli {
     /// Branch id to store web events into (hex). Overrides config/env branch id.
     #[arg(long, global = true)]
     branch_id: Option<String>,
-    /// Override Tavily API key (otherwise loaded from config.tavily_api_key).
+    /// Override Tavily API key (otherwise loaded from config.tavily_api_key). Use @path for file input or @- for stdin.
     #[arg(long, global = true)]
     tavily_api_key: Option<String>,
-    /// Override Exa API key (otherwise loaded from config.exa_api_key).
+    /// Override Exa API key (otherwise loaded from config.exa_api_key). Use @path for file input or @- for stdin.
     #[arg(long, global = true)]
     exa_api_key: Option<String>,
     /// Do not write events to the pile; only print results.
@@ -72,6 +73,7 @@ struct Cli {
 enum Command {
     /// Search the web for a query.
     Search {
+        #[arg(help = "Search query. Use @path for file input or @- for stdin.")]
         query: String,
         #[arg(long, default_value_t = 5)]
         max_results: usize,
@@ -151,14 +153,17 @@ fn main() -> Result<()> {
     };
 
     let config = load_config_snapshot(&cli.pile)?;
-    let keys = resolve_api_keys(&cli, &config);
+    let keys = resolve_api_keys(&cli, &config)?;
 
     match cmd {
         Command::Search {
             query,
             max_results,
             provider,
-        } => cmd_search(&cli, &config, keys, *provider, query, *max_results),
+        } => {
+            let query = load_value_or_file(query, "search query")?;
+            cmd_search(&cli, &config, keys, *provider, &query, *max_results)
+        }
         Command::Fetch {
             url,
             provider,
@@ -167,17 +172,20 @@ fn main() -> Result<()> {
     }
 }
 
-fn resolve_api_keys(cli: &Cli, config: &ConfigSnapshot) -> ApiKeys {
-    ApiKeys {
-        tavily: cli
-            .tavily_api_key
-            .clone()
-            .or_else(|| config.tavily_api_key.clone()),
-        exa: cli
-            .exa_api_key
-            .clone()
-            .or_else(|| config.exa_api_key.clone()),
-    }
+fn resolve_api_keys(cli: &Cli, config: &ConfigSnapshot) -> Result<ApiKeys> {
+    let tavily = cli
+        .tavily_api_key
+        .as_deref()
+        .map(|value| load_value_or_file_trimmed(value, "tavily api key"))
+        .transpose()?
+        .or_else(|| config.tavily_api_key.clone());
+    let exa = cli
+        .exa_api_key
+        .as_deref()
+        .map(|value| load_value_or_file_trimmed(value, "exa api key"))
+        .transpose()?
+        .or_else(|| config.exa_api_key.clone());
+    Ok(ApiKeys { tavily, exa })
 }
 
 fn cmd_search(
@@ -911,4 +919,22 @@ fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Optio
     }
     let id = Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))?;
     Ok(Some(id))
+}
+
+fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
+    if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
+        return fs::read_to_string(path).with_context(|| format!("read {label} from {path}"));
+    }
+    Ok(raw.to_string())
+}
+
+fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
+    Ok(load_value_or_file(raw, label)?.trim().to_string())
 }
