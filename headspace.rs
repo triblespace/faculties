@@ -108,7 +108,7 @@ mod playground_config {
         "4200F6746B36F2784DEBA1555595D6AC" as llm_max_output_tokens: U256BE;
         "1FF004BB48F7A4F8F72541F4D4FA75FF" as llm_prompt_safety_margin_tokens: U256BE;
         "095FAECDB8FF205DF591DF594E593B01" as llm_prompt_chars_per_token: U256BE;
-        "167BABF8DFCD69AB4DB69773AAB18C4B" as llm_compaction_merge_arity: U256BE;
+        "167BABF8DFCD69AB4DB69773AAB18C4B" as memory_compaction_arity: U256BE;
         "24CF9D532E03C44CF719546DDE7E0493" as memory_lens_id: GenId;
         "1F0A596CD677F732CD5C506F74C61F6B" as memory_lens_prompt: Handle<Blake3, LongString>;
         "1067F34FE4517B058A74BC2118868DA4" as memory_lens_compaction_prompt: Handle<Blake3, LongString>;
@@ -279,7 +279,7 @@ struct Config {
     llm_profile_id: Option<Id>,
     llm_profile_name: String,
     llm_compaction_profile_id: Option<Id>,
-    llm_compaction_merge_arity: u64,
+    memory_compaction_arity: u64,
     memory_lenses: Vec<MemoryLensConfig>,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
@@ -1224,11 +1224,11 @@ fn load_latest_config(
     if let Some(factor) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::llm_compaction_merge_arity,
+        playground_config::memory_compaction_arity,
     )
     .and_then(u256be_to_u64)
     {
-        config.llm_compaction_merge_arity = factor.max(2);
+        config.memory_compaction_arity = factor.max(2);
     }
 
     if let Some(profile_id) = config.llm_profile_id {
@@ -1424,10 +1424,10 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
         playground_config::active_llm_profile_id: profile_id,
     };
 
-    let llm_compaction_merge_arity: Value<U256BE> =
-        config.llm_compaction_merge_arity.max(2).to_value();
+    let memory_compaction_arity: Value<U256BE> =
+        config.memory_compaction_arity.max(2).to_value();
     change += entity! { &config_id @
-        playground_config::llm_compaction_merge_arity: llm_compaction_merge_arity,
+        playground_config::memory_compaction_arity: memory_compaction_arity,
     };
 
     if let Some(id) = config.branch_id {
@@ -1627,7 +1627,7 @@ fn default_config(pile_path: PathBuf) -> Config {
         llm_profile_id: None,
         llm_profile_name: "default".to_string(),
         llm_compaction_profile_id: None,
-        llm_compaction_merge_arity: 8,
+        memory_compaction_arity: 8,
         memory_lenses: default_memory_lenses(),
         tavily_api_key: None,
         exa_api_key: None,
