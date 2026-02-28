@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -152,7 +153,7 @@ enum Command {
     Set {
         #[arg(value_enum, value_name = "FIELD")]
         field: SetField,
-        #[arg(value_name = "VALUE")]
+        #[arg(value_name = "VALUE", help = "Value to set. Use @path for file input or @- for stdin.")]
         value: String,
     },
     /// Clear one optional field on the active profile
@@ -251,7 +252,7 @@ struct LensSetArgs {
     name: String,
     #[arg(value_enum, value_name = "FIELD")]
     field: LensField,
-    #[arg(value_name = "VALUE")]
+    #[arg(value_name = "VALUE", help = "Value to set. Use @path for file input or @- for stdin.")]
     value: String,
 }
 
@@ -1690,6 +1691,13 @@ fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     if let Some(path) = raw.strip_prefix('@') {
+        if path == "-" {
+            let mut value = String::new();
+            std::io::stdin()
+                .read_to_string(&mut value)
+                .with_context(|| format!("read {label} from stdin"))?;
+            return Ok(value);
+        }
         return fs::read_to_string(path).with_context(|| format!("read {label} from {}", path));
     }
     Ok(raw.to_string())
