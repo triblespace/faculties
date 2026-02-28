@@ -1046,7 +1046,7 @@ fn latest_memory_lens_entries(catalog: &TribleSet) -> HashMap<Id, (Id, i128)> {
         latest
             .entry(lens_id)
             .and_modify(|slot| {
-                if key > slot.1 {
+                if key > slot.1 || (key == slot.1 && entry_id > slot.0) {
                     *slot = (entry_id, key);
                 }
             })
@@ -1060,7 +1060,7 @@ fn load_latest_config(
     catalog: &TribleSet,
     pile_path: &Path,
 ) -> Result<Option<Config>> {
-    let mut latest: Option<(Id, Value<NsTAIInterval>)> = None;
+    let mut latest: Option<(Id, i128)> = None;
 
     for (config_id, updated_at) in find!(
         (config_id: Id, updated_at: Value<NsTAIInterval>),
@@ -1072,12 +1072,13 @@ fn load_latest_config(
     ) {
         let key = interval_key(updated_at);
         match latest {
-            Some((_, current)) if interval_key(current) >= key => {}
-            _ => latest = Some((config_id, updated_at)),
+            Some((current_id, current_key))
+                if current_key > key || (current_key == key && current_id >= config_id) => {}
+            _ => latest = Some((config_id, key)),
         }
     }
 
-    let Some((config_id, _)) = latest else {
+    let Some((config_id, config_updated_key)) = latest else {
         return Ok(None);
     };
 
@@ -1237,7 +1238,7 @@ fn load_latest_config(
         }
     }
 
-    let lenses = load_latest_memory_lenses(ws, catalog)?;
+    let lenses = load_memory_lenses_for_snapshot(ws, catalog, config_updated_key)?;
     if !lenses.is_empty() {
         config.memory_lenses = lenses;
     }
@@ -1250,7 +1251,7 @@ fn load_latest_llm_profile(
     catalog: &TribleSet,
     profile_id: Id,
 ) -> Result<Option<(LlmConfig, String)>> {
-    let mut latest: Option<(Id, Value<NsTAIInterval>)> = None;
+    let mut latest: Option<(Id, i128)> = None;
 
     for (entry_id, updated_at) in find!(
         (entry_id: Id, updated_at: Value<NsTAIInterval>),
@@ -1263,8 +1264,9 @@ fn load_latest_llm_profile(
     ) {
         let key = interval_key(updated_at);
         match latest {
-            Some((_, current)) if interval_key(current) >= key => {}
-            _ => latest = Some((entry_id, updated_at)),
+            Some((current_id, current_key))
+                if current_key > key || (current_key == key && current_id >= entry_id) => {}
+            _ => latest = Some((entry_id, key)),
         }
     }
 
@@ -1333,13 +1335,17 @@ fn load_latest_llm_profile(
     Ok(Some((llm, name)))
 }
 
-fn load_latest_memory_lenses(
+fn load_memory_lenses_for_snapshot(
     ws: &mut Workspace<Pile<Blake3>>,
     catalog: &TribleSet,
+    snapshot_key: i128,
 ) -> Result<Vec<MemoryLensConfig>> {
     let latest = latest_memory_lens_entries(catalog);
     let mut lenses_by_name: HashMap<String, (MemoryLensConfig, i128)> = HashMap::new();
     for (lens_id, (entry_id, updated_key)) in latest {
+        if updated_key != snapshot_key {
+            continue;
+        }
         let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
             .unwrap_or_else(|| format!("lens-{lens_id:x}"));
         let prompt =
