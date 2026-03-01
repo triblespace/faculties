@@ -32,7 +32,6 @@ use triblespace::prelude::*;
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_STREAM: bool = false;
-const DEFAULT_TRANSPORT: LlmTransport = LlmTransport::ChatCompletions;
 const DEFAULT_REASONING_SUMMARY: LlmReasoningSummary = LlmReasoningSummary::Detailed;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
@@ -102,7 +101,6 @@ mod playground_config {
         "6691CF3F872C6107DCFAD0BCF7CDC1A0" as llm_profile_id: GenId;
         "85BE7BDA465B3CB0F800F76EEF8FAC9B" as llm_model: Handle<Blake3, LongString>;
         "B216CFBBF85AA1350B142D510E26268B" as llm_base_url: Handle<Blake3, LongString>;
-        "605C55F6ADB1F3FBFE0787AC2715924E" as llm_transport: Handle<Blake3, LongString>;
         "55F3FFD721AF7C1258E45BC91CDBF30F" as llm_api_key: Handle<Blake3, LongString>;
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<Blake3, LongString>;
@@ -157,7 +155,10 @@ enum Command {
     Set {
         #[arg(value_enum, value_name = "FIELD")]
         field: SetField,
-        #[arg(value_name = "VALUE", help = "Value to set. Use @path for file input or @- for stdin.")]
+        #[arg(
+            value_name = "VALUE",
+            help = "Value to set. Use @path for file input or @- for stdin."
+        )]
         value: String,
     },
     /// Clear one optional field on the active profile
@@ -180,8 +181,6 @@ struct AddArgs {
     model: Option<String>,
     #[arg(long = "base-url")]
     base_url: Option<String>,
-    #[arg(long, value_enum)]
-    transport: Option<LlmTransport>,
     #[arg(long = "api-key")]
     api_key: Option<String>,
     #[arg(long = "reasoning-effort")]
@@ -205,7 +204,6 @@ struct AddArgs {
 enum SetField {
     Model,
     BaseUrl,
-    Transport,
     ApiKey,
     ReasoningEffort,
     ReasoningSummary,
@@ -263,7 +261,10 @@ struct LensSetArgs {
     name: String,
     #[arg(value_enum, value_name = "FIELD")]
     field: LensField,
-    #[arg(value_name = "VALUE", help = "Value to set. Use @path for file input or @- for stdin.")]
+    #[arg(
+        value_name = "VALUE",
+        help = "Value to set. Use @path for file input or @- for stdin."
+    )]
     value: String,
 }
 
@@ -282,30 +283,6 @@ enum LensField {
     Prompt,
     CompactionPrompt,
     MaxOutputTokens,
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[value(rename_all = "kebab-case")]
-enum LlmTransport {
-    ChatCompletions,
-    Responses,
-}
-
-impl LlmTransport {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::ChatCompletions => "chat-completions",
-            Self::Responses => "responses",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "chat-completions" => Some(Self::ChatCompletions),
-            "responses" => Some(Self::Responses),
-            _ => None,
-        }
-    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,7 +350,6 @@ struct LlmConfig {
     model: String,
     base_url: String,
     api_key: Option<String>,
-    transport: LlmTransport,
     reasoning_effort: Option<String>,
     reasoning_summary: Option<LlmReasoningSummary>,
     stream: bool,
@@ -484,9 +460,6 @@ fn apply_add_overrides(config: &mut Config, args: &AddArgs) -> Result<()> {
     if let Some(value) = args.base_url.as_deref() {
         config.llm.base_url = value.to_string();
     }
-    if let Some(value) = args.transport {
-        config.llm.transport = value;
-    }
     if let Some(value) = args.api_key.as_deref() {
         config.llm.api_key = Some(value.trim().to_string());
     }
@@ -518,11 +491,6 @@ fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
     match field {
         SetField::Model => config.llm.model = load_value_or_file(value, "llm_model")?,
         SetField::BaseUrl => config.llm.base_url = load_value_or_file(value, "llm_base_url")?,
-        SetField::Transport => {
-            let raw = load_value_or_file_trimmed(value, "llm_transport")?;
-            config.llm.transport = LlmTransport::parse(raw.as_str())
-                .ok_or_else(|| anyhow!("llm_transport must be one of: chat-completions, responses"))?;
-        }
         SetField::ApiKey => {
             config.llm.api_key = Some(load_value_or_file_trimmed(value, "llm_api_key")?)
         }
@@ -532,9 +500,10 @@ fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
         }
         SetField::ReasoningSummary => {
             let raw = load_value_or_file_trimmed(value, "llm_reasoning_summary")?;
-            config.llm.reasoning_summary = Some(LlmReasoningSummary::parse(raw.as_str()).ok_or_else(|| {
-                anyhow!("llm_reasoning_summary must be one of: auto, concise, detailed, none")
-            })?);
+            config.llm.reasoning_summary =
+                Some(LlmReasoningSummary::parse(raw.as_str()).ok_or_else(|| {
+                    anyhow!("llm_reasoning_summary must be one of: auto, concise, detailed, none")
+                })?);
         }
         SetField::Stream => config.llm.stream = parse_bool(value, "llm_stream")?,
         SetField::ContextWindowTokens => {
@@ -752,7 +721,6 @@ fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
     println!("  profile_name = \"{}\"", config.llm_profile_name);
     println!("  model = \"{}\"", config.llm.model);
     println!("  base_url = \"{}\"", config.llm.base_url);
-    println!("  transport = \"{}\"", config.llm.transport.as_str());
     println!(
         "  api_key = {}",
         if show_secrets {
@@ -1212,18 +1180,6 @@ fn load_latest_config(
     if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::llm_base_url)? {
         config.llm.base_url = url;
     }
-    if let Some(transport) =
-        load_string_attr(ws, catalog, config_id, playground_config::llm_transport)?
-    {
-        if let Some(parsed) = LlmTransport::parse(transport.as_str()) {
-            config.llm.transport = parsed;
-        } else {
-            eprintln!(
-                "warning: unsupported llm transport '{transport}', using {}",
-                config.llm.transport.as_str()
-            );
-        }
-    }
     if let Some(effort) = load_string_attr(
         ws,
         catalog,
@@ -1407,12 +1363,6 @@ fn load_latest_llm_profile(
     if let Some(url) = load_string_attr(ws, catalog, entry_id, playground_config::llm_base_url)? {
         llm.base_url = url;
     }
-    if let Some(transport) =
-        load_string_attr(ws, catalog, entry_id, playground_config::llm_transport)?
-    {
-        llm.transport = LlmTransport::parse(transport.as_str())
-            .ok_or_else(|| anyhow!("unsupported llm transport '{transport}'"))?;
-    }
     if let Some(effort) = load_string_attr(
         ws,
         catalog,
@@ -1567,8 +1517,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
         playground_config::active_llm_profile_id: profile_id,
     };
 
-    let memory_compaction_arity: Value<U256BE> =
-        config.memory_compaction_arity.max(2).to_value();
+    let memory_compaction_arity: Value<U256BE> = config.memory_compaction_arity.max(2).to_value();
     change += entity! { &config_id @
         playground_config::memory_compaction_arity: memory_compaction_arity,
     };
@@ -1629,7 +1578,6 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     let profile_name = ws.put(config.llm_profile_name.clone());
     let llm_model = ws.put(config.llm.model.clone());
     let llm_base_url = ws.put(config.llm.base_url.clone());
-    let llm_transport = ws.put(config.llm.transport.as_str().to_string());
     let llm_stream: Value<U256BE> = if config.llm.stream { 1u64 } else { 0u64 }.to_value();
     let llm_context_window_tokens: Value<U256BE> = config.llm.context_window_tokens.to_value();
     let llm_max_output_tokens: Value<U256BE> = config.llm.max_output_tokens.to_value();
@@ -1644,7 +1592,6 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
         metadata::name: profile_name,
         playground_config::llm_model: llm_model,
         playground_config::llm_base_url: llm_base_url,
-        playground_config::llm_transport: llm_transport,
         playground_config::llm_stream: llm_stream,
         playground_config::llm_context_window_tokens: llm_context_window_tokens,
         playground_config::llm_max_output_tokens: llm_max_output_tokens,
@@ -1759,7 +1706,6 @@ impl Default for LlmConfig {
             model: DEFAULT_MODEL.to_string(),
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
-            transport: DEFAULT_TRANSPORT,
             reasoning_effort: None,
             reasoning_summary: Some(DEFAULT_REASONING_SUMMARY),
             stream: DEFAULT_STREAM,
