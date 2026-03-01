@@ -112,11 +112,6 @@ fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
-}
-
 fn resolve_pile_path(cli: &Cli) -> PathBuf {
     cli.pile
         .clone()
@@ -509,7 +504,7 @@ fn main() -> Result<()> {
             &text,
             None,
         )?;
-        println!("[{}] reason logged", id_prefix(reason_id));
+        println!("reason_id: {reason_id:x}");
         return Ok(());
     }
 
@@ -522,9 +517,20 @@ fn main() -> Result<()> {
         turn_id,
         worker_id,
         &text,
+        None,
+    )?;
+    let action_event_id = append_reason(
+        &pile_path,
+        &cli.branch,
+        config_branch_id,
+        explicit_branch_id,
+        turn_id,
+        worker_id,
+        command_text.as_str(),
         Some(command_text.as_str()),
     )?;
-    eprintln!("[{}] reason logged: {}", id_prefix(reason_id), text.trim());
+    eprintln!("reason_id: {reason_id:x}");
+    eprintln!("reason_action_id: {action_event_id:x}");
     let exit_code = run_command(&cli.command)?;
     std::process::exit(exit_code);
 }
