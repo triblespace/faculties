@@ -38,6 +38,8 @@ mod archive_import_codex;
 mod archive_import_copilot;
 #[path = "../importers/archive_import_gemini.rs"]
 mod archive_import_gemini;
+#[path = "../importers/archive_import_claude_code.rs"]
+mod archive_import_claude_code;
 mod common {
     #![allow(dead_code)]
 
@@ -203,6 +205,8 @@ mod common {
             "B4C084B61FB46A932BFCA75B8BC621FA" as pub source_role: Handle<Blake3, LongString>;
             "220DA5084D6261B5420922EADC064A5A" as pub source_parent_id: Handle<Blake3, LongString>;
             "F672605621E56674127FD210CFFDFF2A" as pub source_created_at: NsTAIInterval;
+            /// Conversation → message edge (repeated).
+            "06DB96427C8EA6FC982D44E018AB0831" as pub message: GenId;
         }
 
         /// Root id for describing the import metadata protocol.
@@ -896,6 +900,7 @@ enum ImportSource {
     Codex,
     Copilot,
     Gemini,
+    ClaudeCode,
     All,
 }
 
@@ -906,6 +911,7 @@ impl ImportSource {
             ImportSource::Codex => "codex",
             ImportSource::Copilot => "copilot",
             ImportSource::Gemini => "gemini",
+            ImportSource::ClaudeCode => "claude-code",
             ImportSource::All => "all",
         }
     }
@@ -925,6 +931,7 @@ fn default_source_path(source: ImportSource, base: &Path) -> PathBuf {
         ImportSource::Gemini => {
             base.join("gemini/Takeout/My Activity/Gemini Apps/My Activity.html")
         }
+        ImportSource::ClaudeCode => base.join("claude-code"),
         ImportSource::All => base.to_path_buf(),
     }
 }
@@ -951,6 +958,10 @@ fn resolve_import_jobs(source: ImportSource, path: Option<&Path>) -> Result<Vec<
                 ImportJob {
                     source: ImportSource::Gemini,
                     path: default_source_path(ImportSource::Gemini, &root),
+                },
+                ImportJob {
+                    source: ImportSource::ClaudeCode,
+                    path: default_source_path(ImportSource::ClaudeCode, &root),
                 },
             ])
         }
@@ -1042,6 +1053,12 @@ fn run_import_jobs(
                 branch_id,
             ),
             ImportSource::Gemini => archive_import_gemini::import_into_archive(
+                &job.path,
+                pile_path,
+                branch_name,
+                branch_id,
+            ),
+            ImportSource::ClaudeCode => archive_import_claude_code::import_into_archive(
                 &job.path,
                 pile_path,
                 branch_name,
