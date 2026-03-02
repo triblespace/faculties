@@ -27,7 +27,6 @@ use triblespace::core::repo::{PushResult, Repository, Workspace};
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
-const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const KIND_GOAL_LABEL: &str = "goal";
@@ -346,68 +345,6 @@ fn resolve_branch_id(explicit_id: Option<Id>, configured_id: Option<Id>) -> Resu
             "missing compass branch id in config (set via `playground config set compass-branch-id <hex-id>`)"
         )
     })
-}
-
-fn find_branch_by_name(
-    pile: &mut Pile<valueschemas::Blake3>,
-    branch_name: &str,
-) -> Result<Option<Id>> {
-    let expected_name_handle = branch_name
-        .to_owned()
-        .to_blob()
-        .get_handle::<valueschemas::Blake3>();
-    let reader = pile
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-    let iter = pile
-        .branches()
-        .map_err(|e| anyhow::anyhow!("list branches: {e:?}"))?;
-
-    // Prefer branches that actually have a commit head set. This avoids
-    // accidentally picking an empty duplicate branch when legacy metadata is
-    // present in the pile.
-    let mut best: Option<(bool, Id)> = None;
-
-    for bid in iter {
-        let bid = bid?;
-        let Some(meta_handle) = pile.head(bid)? else {
-            continue;
-        };
-        let meta: TribleSet = reader
-            .get::<TribleSet, blobschemas::SimpleArchive>(meta_handle)
-            .map_err(|e| anyhow::anyhow!("load branch metadata: {e:?}"))?;
-
-        let matches = {
-            let name = find!(
-                (handle: TextHandle),
-                pattern!(&meta, [{ metadata::name: ?handle }])
-            )
-            .into_iter()
-            .map(|(handle,)| handle)
-            .next();
-            name == Some(expected_name_handle)
-        };
-
-        if !matches {
-            continue;
-        }
-
-        let has_head = find!(
-            (head: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>),
-            pattern!(&meta, [{ triblespace::core::repo::head: ?head }])
-        )
-        .into_iter()
-        .next()
-        .is_some();
-
-        match best {
-            None => best = Some((has_head, bid)),
-            Some((best_has_head, _)) if !best_has_head && has_head => best = Some((true, bid)),
-            Some(_) => {}
-        }
-    }
-
-    Ok(best.map(|(_, bid)| bid))
 }
 
 fn load_board(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<BoardState> {
@@ -1015,9 +952,6 @@ fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Err(err) = emit_schema_to_atlas(&cli.pile) {
-        eprintln!("atlas emit: {err}");
-    }
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -1060,96 +994,4 @@ fn main() -> Result<()> {
         }
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
     }
-}
-
-fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-            id
-        } else {
-            repo.create_branch(ATLAS_BRANCH, None)
-                .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
-                .release()
-        };
-        let metadata = build_compass_metadata(repo.storage_mut())
-            .map_err(|e| anyhow::anyhow!("build compass metadata: {e:?}"))?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull atlas workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout atlas workspace: {e:?}"))?;
-        let delta = metadata.difference(&space);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas schema metadata"));
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push atlas metadata: {e:?}"))?;
-        }
-        Ok(())
-    })
-}
-
-fn build_compass_metadata<B>(
-    blobs: &mut B,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-{
-    let mut metadata = TribleSet::new();
-
-    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <valueschemas::ShortString as metadata::ConstDescribe>::describe(blobs)?;
-    metadata +=
-        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
-            blobs,
-        )?;
-    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?;
-
-    metadata += metadata::Describe::describe(&board::title, blobs)?;
-    metadata += metadata::Describe::describe(&board::created_at, blobs)?;
-    metadata += metadata::Describe::describe(&board::tag, blobs)?;
-    metadata += metadata::Describe::describe(&board::parent, blobs)?;
-    metadata += metadata::Describe::describe(&board::task, blobs)?;
-    metadata += metadata::Describe::describe(&board::status, blobs)?;
-    metadata += metadata::Describe::describe(&board::at, blobs)?;
-    metadata += metadata::Describe::describe(&board::note, blobs)?;
-
-    metadata += describe_kind(
-        blobs,
-        &KIND_GOAL_ID,
-        "compass_goal",
-        "Compass goal kind.",
-    )?;
-    metadata += describe_kind(
-        blobs,
-        &KIND_STATUS_ID,
-        "compass_status_kind",
-        "Compass status kind.",
-    )?;
-    metadata += describe_kind(
-        blobs,
-        &KIND_NOTE_ID,
-        "compass_note_kind",
-        "Compass note kind.",
-    )?;
-
-    Ok(metadata)
-}
-
-fn describe_kind<B>(
-    blobs: &mut B,
-    id: &Id,
-    name: &str,
-    description: &str,
-) -> std::result::Result<Fragment, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-{
-    let name_handle = blobs.put(name.to_string())?;
-
-    Ok(entity! { ExclusiveId::force_ref(id) @
-        metadata::name: name_handle,
-        metadata::description: blobs.put(description.to_string())?,
-    })
 }

@@ -29,7 +29,6 @@ use triblespace::prelude::blobschemas::{FileBytes, LongString};
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, Hash, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
-const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
@@ -121,9 +120,6 @@ mod media_schema {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Err(err) = emit_schema_to_atlas(&cli.pile) {
-        eprintln!("atlas emit: {err}");
-    }
     let Some(cmd) = cli.command.as_ref() else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -444,85 +440,6 @@ fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
-fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-            id
-        } else {
-            repo.create_branch(ATLAS_BRANCH, None)
-                .map_err(|e| anyhow!("create branch: {e:?}"))?
-                .release()
-        };
-        let metadata = build_media_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build media metadata: {e:?}"))?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull atlas: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout atlas: {e:?}"))?;
-        let delta = metadata.difference(&space);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas schema metadata"));
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-        }
-        Ok(())
-    })
-}
-
-fn build_media_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<Blake3>,
-{
-    let mut out = TribleSet::new();
-    out += <GenId as metadata::ConstDescribe>::describe(blobs)?;
-    out += <ShortString as metadata::ConstDescribe>::describe(blobs)?;
-    out += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
-    out += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
-    out += <Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?;
-    out += <LongString as metadata::ConstDescribe>::describe(blobs)?;
-    out += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
-
-    out += metadata::Describe::describe(&media_schema::bytes, blobs)?;
-    out += metadata::Describe::describe(&media_schema::about_item, blobs)?;
-    out += metadata::Describe::describe(&media_schema::created_at, blobs)?;
-    out += metadata::Describe::describe(&media_schema::mime, blobs)?;
-    out += metadata::Describe::describe(&media_schema::name, blobs)?;
-    out += metadata::Describe::describe(&media_schema::source_url, blobs)?;
-    out += metadata::Describe::describe(&media_schema::alt, blobs)?;
-
-    out += describe_kind(
-        blobs,
-        &media_schema::kind_item,
-        "media_kind_item",
-        "Canonical media item keyed by blob handle.",
-    )?;
-    out += describe_kind(
-        blobs,
-        &media_schema::kind_record,
-        "media_kind_record",
-        "Media ingest event with contextual metadata.",
-    )?;
-    Ok(out)
-}
-
-fn describe_kind<B>(
-    blobs: &mut B,
-    id: &Id,
-    name: &str,
-    description: &str,
-) -> std::result::Result<Fragment, B::PutError>
-where
-    B: BlobStore<Blake3>,
-{
-    Ok(entity! { ExclusiveId::force_ref(id) @
-        metadata::name: blobs.put(name.to_string())?,
-        metadata::description: blobs.put(description.to_string())?,
-    })
-}
-
 fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
@@ -587,53 +504,6 @@ fn ensure_branch_with_id(
     match result {
         PushResult::Success() | PushResult::Conflict(_) => Ok(()),
     }
-}
-
-fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
-    let expected_name_handle = branch_name.to_owned().to_blob().get_handle::<Blake3>();
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let iter = pile
-        .branches()
-        .map_err(|e| anyhow!("list branches: {e:?}"))?;
-
-    let mut fallback: Option<Id> = None;
-    for bid in iter {
-        let bid = bid?;
-        let Some(meta_handle) = pile.head(bid)? else {
-            continue;
-        };
-        let meta: TribleSet = reader
-            .get::<TribleSet, blobschemas::SimpleArchive>(meta_handle)
-            .map_err(|e| anyhow!("load branch metadata: {e:?}"))?;
-        let mut names = find!(
-            (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(&meta, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some(name) = names.next().map(|(handle,)| handle) else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if name.raw != expected_name_handle.raw {
-            continue;
-        }
-        let has_commit_head = find!(
-            (handle: Value<Handle<Blake3, blobschemas::SimpleArchive>>),
-            pattern!(&meta, [{ triblespace::core::repo::head: ?handle }])
-        )
-        .into_iter()
-        .next()
-        .is_some();
-        if has_commit_head {
-            return Ok(Some(bid));
-        }
-        if fallback.is_none() {
-            fallback = Some(bid);
-        }
-    }
-    Ok(fallback)
 }
 
 fn resolve_store_branch_id(cli: &Cli) -> Result<Id> {

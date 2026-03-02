@@ -344,7 +344,6 @@ mod common {
         id.aquire().unwrap_or_else(|| ExclusiveId::force(id))
     }
 
-    const ATLAS_BRANCH: &str = "atlas";
     const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
     const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
@@ -532,45 +531,6 @@ mod common {
         }
     }
 
-    fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
-        let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-        let iter = pile
-            .branches()
-            .map_err(|e| anyhow!("list branches: {e:?}"))?;
-        let expected = String::from(branch_name)
-            .to_blob()
-            .get_handle::<Blake3>()
-            .to_value();
-
-        for branch in iter {
-            let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
-            let Some(head) = pile
-                .head(branch_id)
-                .map_err(|e| anyhow!("branch head: {e:?}"))?
-            else {
-                continue;
-            };
-            let metadata_set: TribleSet = reader
-                .get(head)
-                .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
-            let mut names = find!(
-                (handle: Value<Handle<Blake3, LongString>>),
-                pattern!(&metadata_set, [{ metadata::name: ?handle }])
-            )
-            .into_iter();
-            let Some((handle,)) = names.next() else {
-                continue;
-            };
-            if names.next().is_some() {
-                continue;
-            }
-            if handle == expected {
-                return Ok(Some(branch_id));
-            }
-        }
-        Ok(None)
-    }
-
     pub fn seed_default_metadata(repo: &mut Repo) -> Result<()> {
         let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
             .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
@@ -579,36 +539,6 @@ mod common {
         repo.set_default_metadata(metadata)
             .map_err(|e| anyhow!("set default metadata: {e:?}"))?;
         Ok(())
-    }
-
-    pub fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-        with_repo(pile_path, |repo| {
-            let branch_id = match find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-                Some(id) => id,
-                None => repo
-                    .create_branch(ATLAS_BRANCH, None)
-                    .map_err(|e| anyhow!("create branch: {e:?}"))?
-                    .release(),
-            };
-            let mut metadata = archive_schema::build_archive_metadata(repo.storage_mut())
-                .map_err(|e| anyhow!("build archive metadata: {e:?}"))?;
-            metadata += import_schema::build_import_metadata(repo.storage_mut())
-                .map_err(|e| anyhow!("build import metadata: {e:?}"))?;
-
-            let mut ws = repo
-                .pull(branch_id)
-                .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-            let space = ws
-                .checkout(..)
-                .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-            let delta = metadata.difference(&space);
-            if !delta.is_empty() {
-                ws.commit(delta, None, Some("atlas schema metadata"));
-                repo.push(&mut ws)
-                    .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-            }
-            Ok(())
-        })
     }
 
     fn load_config_branches(repo: &mut Repo) -> Result<ConfigBranches> {
@@ -1406,9 +1336,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.trace, cli.trace_filter.as_deref());
     let pile_path = cli.pile.clone().unwrap_or_else(common::default_pile_path);
-    if let Err(err) = common::emit_schema_to_atlas(&pile_path) {
-        eprintln!("atlas emit: {err}");
-    }
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;

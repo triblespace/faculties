@@ -1,0 +1,6 @@
+#!/bin/sh
+# Breath faculty — marks the boundary between memory and present moment.
+# Usage: breath [fill_pct]
+#   fill_pct: context fill percentage (0-100, default 0)
+pct="${1:-0}"
+echo "context filled to ${pct}%. present moment begins."

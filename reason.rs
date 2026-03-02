@@ -25,7 +25,6 @@ use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "cognition";
-const ATLAS_BRANCH: &str = "atlas";
 const FIXED_CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
@@ -256,15 +255,6 @@ fn find_branch_by_name(
     Ok(None)
 }
 
-fn ensure_branch(repo: &mut Repository<Pile<valueschemas::Blake3>>, branch_name: &str) -> Result<Id> {
-    if let Some(id) = find_branch_by_name(repo.storage_mut(), branch_name)? {
-        return Ok(id);
-    }
-    let branch_id = *ufoid();
-    ensure_branch_with_id(repo, branch_id, branch_name)?;
-    Ok(branch_id)
-}
-
 fn load_config_snapshot(repo: &mut Repository<Pile<valueschemas::Blake3>>, branch_id: Id) -> Result<ConfigSnapshot> {
     let Some(_head) = repo
         .storage_mut()
@@ -336,54 +326,6 @@ fn resolve_target_branch_id(
     }
 
     Ok(*ufoid())
-}
-
-fn build_reason_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-{
-    let mut metadata_set = TribleSet::new();
-
-    metadata_set += <valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?;
-    metadata_set += <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
-    metadata_set += <valueschemas::Handle<
-        valueschemas::Blake3,
-        blobschemas::LongString,
-    > as metadata::ConstDescribe>::describe(blobs)?;
-    metadata_set += <blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?;
-
-    metadata_set += metadata::Describe::describe(&reason_schema::text, blobs)?;
-    metadata_set += metadata::Describe::describe(&reason_schema::created_at, blobs)?;
-    metadata_set += metadata::Describe::describe(&reason_schema::about_turn, blobs)?;
-    metadata_set += metadata::Describe::describe(&reason_schema::worker, blobs)?;
-    metadata_set += metadata::Describe::describe(&reason_schema::command_text, blobs)?;
-
-    metadata_set += entity! { ExclusiveId::force_ref(&KIND_REASON_ID) @
-        metadata::name: blobs.put("reason_event".to_string())?,
-        metadata::description: blobs.put(
-            "Explicit rationale note linked to a turn and optional command.".to_string(),
-        )?,
-    };
-
-    Ok(metadata_set)
-}
-
-fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = ensure_branch(repo, ATLAS_BRANCH)?;
-        let metadata = build_reason_metadata(repo.storage_mut()).context("build reason metadata")?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-        let catalog = ws.checkout(..).context("checkout atlas workspace")?;
-        let delta = metadata.difference(&catalog);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas reason metadata"));
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-        }
-        Ok(())
-    })
 }
 
 fn append_reason(
@@ -458,9 +400,6 @@ fn run_command(command: &[String]) -> Result<i32> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let pile_path = resolve_pile_path(&cli);
-    if let Err(err) = emit_schema_to_atlas(&pile_path) {
-        eprintln!("atlas emit: {err}");
-    }
 
     let Some(text_raw) = cli.text.as_ref() else {
         let mut cmd = Cli::command();

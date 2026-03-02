@@ -18,7 +18,6 @@ use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
-use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
@@ -26,7 +25,6 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
-const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 
 const KIND_CONFIG_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
@@ -86,10 +84,6 @@ struct Chunk {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Err(err) = emit_schema_to_atlas(&cli.pile) {
-        eprintln!("atlas emit: {err}");
-    }
-
     if cli.ids.is_empty() {
         let mut command = Cli::command();
         command.print_help()?;
@@ -469,91 +463,4 @@ fn with_repo<T>(
         eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
     result
-}
-
-fn ensure_branch(repo: &mut Repository<Pile<Blake3>>, branch_name: &str) -> Result<Id> {
-    if let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? {
-        return Ok(branch_id);
-    }
-    repo.create_branch(branch_name, None)
-        .map_err(|e| anyhow!("create branch: {e:?}"))
-        .map(|branch| branch.release())
-}
-
-fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
-    let name_handle = branch_name.to_owned().to_blob().get_handle::<Blake3>();
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let iter = pile
-        .branches()
-        .map_err(|e| anyhow!("list branches: {e:?}"))?;
-
-    for branch in iter {
-        let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
-        let Some(head) = pile
-            .head(branch_id)
-            .map_err(|e| anyhow!("branch head: {e:?}"))?
-        else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader
-            .get(head)
-            .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
-        let mut names = find!(
-            (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some(name) = names.next().map(|(handle,)| handle) else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if name == name_handle {
-            return Ok(Some(branch_id));
-        }
-    }
-
-    Ok(None)
-}
-
-fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = ensure_branch(repo, ATLAS_BRANCH)?;
-        let mut metadata = TribleSet::new();
-
-        metadata += <GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata += <U256BE as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata +=
-            <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata += <LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-
-        // context chunk protocol bits we rely on.
-        metadata += metadata::Describe::describe(&ctx::kind, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&ctx::level, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&ctx::summary, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&ctx::start_at, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&ctx::end_at, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&ctx::left, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&ctx::right, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&ctx::about_exec_result, repo.storage_mut())?;
-
-        // config fields used to locate the core branch.
-        metadata += metadata::Describe::describe(&config_schema::kind, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&config_schema::updated_at, repo.storage_mut())?;
-        metadata += metadata::Describe::describe(&config_schema::branch_id, repo.storage_mut())?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-        let space = ws.checkout(..).context("checkout atlas")?;
-        let delta = metadata.difference(&space);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas schema metadata"));
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-        }
-        Ok(())
-    })
 }

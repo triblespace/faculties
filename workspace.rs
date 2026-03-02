@@ -19,7 +19,6 @@ use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use triblespace::core::blob::{Blob, Bytes};
-use triblespace::core::metadata;
 use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{PushResult, Repository, Workspace};
@@ -29,7 +28,6 @@ use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U
 use triblespace::prelude::*;
 
 const DEFAULT_WORKSPACE_BRANCH: &str = "workspace";
-const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
@@ -227,9 +225,6 @@ fn main() -> Result<()> {
         branch_id,
         command,
     } = Cli::parse();
-    if let Err(err) = emit_schema_to_atlas(&pile) {
-        eprintln!("atlas emit: {err}");
-    }
     let Some(cmd) = command else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -251,109 +246,6 @@ fn main() -> Result<()> {
         Command::Merge(args) => cmd_merge(&pile, &branch, workspace_branch_id, args),
         Command::Restore(args) => cmd_restore(&pile, &branch, workspace_branch_id, args),
     }
-}
-
-fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-            id
-        } else {
-            repo.create_branch(ATLAS_BRANCH, None)
-                .map_err(|e| anyhow!("create branch: {e:?}"))?
-                .release()
-        };
-        let metadata = build_workspace_metadata(repo.storage_mut())
-            .map_err(|e| anyhow!("build workspace metadata: {e:?}"))?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-        let delta = metadata.difference(&space);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas schema metadata"));
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-        }
-        Ok(())
-    })
-}
-
-fn build_workspace_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<Blake3>,
-{
-    let mut metadata = TribleSet::new();
-
-    metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <U256BE as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <Handle<Blake3, LongString> as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <Handle<Blake3, SimpleArchive> as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <SimpleArchive as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <LongString as metadata::ConstDescribe>::describe(blobs)?;
-
-    metadata += metadata::Describe::describe(&playground_workspace::kind, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::created_at, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::parent_snapshot, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::root_path, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::state, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::label, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::entry, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::path, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::mode, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::bytes, blobs)?;
-    metadata += metadata::Describe::describe(&playground_workspace::link_target, blobs)?;
-
-    metadata += describe_kind(
-        blobs,
-        &playground_workspace::kind_snapshot,
-        "workspace_snapshot",
-        "Workspace snapshot kind.",
-    )?;
-    metadata += describe_kind(
-        blobs,
-        &playground_workspace::kind_file,
-        "workspace_file",
-        "Workspace file entry kind.",
-    )?;
-    metadata += describe_kind(
-        blobs,
-        &playground_workspace::kind_dir,
-        "workspace_dir",
-        "Workspace directory entry kind.",
-    )?;
-    metadata += describe_kind(
-        blobs,
-        &playground_workspace::kind_symlink,
-        "workspace_symlink",
-        "Workspace symlink entry kind.",
-    )?;
-
-    Ok(metadata)
-}
-
-fn describe_kind<B>(
-    blobs: &mut B,
-    id: &Id,
-    name: &str,
-    description: &str,
-) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<Blake3>,
-{
-    let mut tribles = TribleSet::new();
-    let name_handle = blobs.put(name.to_string())?;
-    let description_handle = blobs.put(description.to_string())?;
-
-    tribles += entity! { ExclusiveId::force_ref(id) @
-        metadata::name: name_handle,
-        metadata::description: description_handle,
-    };
-    Ok(tribles)
 }
 
 fn cmd_capture(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceCaptureArgs) -> Result<()> {
@@ -658,36 +550,6 @@ fn resolve_branch_id(explicit_id: Option<Id>, configured_id: Option<Id>, branch_
             "missing {branch_name} branch id in config (set via `playground config set workspace-branch-id <hex-id>`)"
         )
     })
-}
-
-fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
-    let reader = pile.reader().context("pile reader")?;
-    let iter = pile.branches().context("list branches")?;
-    let expected = branch_name.to_owned().to_blob().get_handle::<Blake3>();
-
-    for branch in iter {
-        let branch_id = branch.context("branch id")?;
-        let Some(head) = pile.head(branch_id).context("branch head")? else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader.get(head).context("branch metadata")?;
-        let mut names = find!(
-            (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some((handle,)) = names.next() else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if handle == expected {
-            return Ok(Some(branch_id));
-        }
-    }
-
-    Ok(None)
 }
 
 fn capture_snapshot(

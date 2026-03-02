@@ -349,7 +349,6 @@ use teams_schema::{build_teams_metadata, teams};
 
 const DEFAULT_BRANCH: &str = "teams";
 const DEFAULT_LOG_BRANCH: &str = "logs";
-const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const DEFAULT_DELTA_URL: &str =
@@ -642,10 +641,6 @@ struct ConfigBranches {
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
     let Some(mode) = cli.command.take() else {
-        let config = build_config(&cli)?;
-        if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-            eprintln!("atlas emit: {err}");
-        }
         let mut command = Cli::command();
         command.print_help()?;
         println!();
@@ -660,9 +655,6 @@ fn main() -> Result<()> {
             descending,
         } => {
             let config = build_config(&cli)?;
-            if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-                eprintln!("atlas emit: {err}");
-            }
             read_messages(
                 config,
                 ReadOptions {
@@ -675,26 +667,17 @@ fn main() -> Result<()> {
         }
         CommandMode::Send { chat_id, text } => {
             let config = build_config(&cli)?;
-            if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-                eprintln!("atlas emit: {err}");
-            }
             let text = load_value_or_file(&text, "message text")?;
             send_message(config, &chat_id, &text)
         }
         CommandMode::Users { command } => {
             let config = build_config(&cli)?;
-            if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-                eprintln!("atlas emit: {err}");
-            }
             match command {
                 UsersCommand::List { prefix, limit } => list_users(config, prefix.as_deref(), limit),
             }
         }
         CommandMode::Presence { command } => {
             let config = build_config(&cli)?;
-            if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-                eprintln!("atlas emit: {err}");
-            }
             match command {
                 PresenceCommand::Set { availability, activity, duration_mins, session_id } => {
                     set_presence_status(config, availability, activity, duration_mins, session_id)
@@ -704,9 +687,6 @@ fn main() -> Result<()> {
         }
         CommandMode::Chat { command } => {
             let config = build_config(&cli)?;
-            if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-                eprintln!("atlas emit: {err}");
-            }
             match command {
                 ChatCommand::Invite { chat_id, user_id, owner } => invite_to_chat(config, &chat_id, &user_id, owner),
                 ChatCommand::Create { user_ids, group, topic } => {
@@ -720,9 +700,6 @@ fn main() -> Result<()> {
         }
         CommandMode::Attachments { command } => {
             let config = build_config(&cli)?;
-            if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-                eprintln!("atlas emit: {err}");
-            }
             match command {
                 AttachmentsCommand::List { chat_id, message_id, limit, descending } => {
                     list_attachments(config, AttachmentListOptions { chat_id, message_id, limit, descending })
@@ -753,9 +730,6 @@ fn main() -> Result<()> {
             scopes,
         } => {
             let config = build_config(&cli)?;
-            if let Err(err) = emit_schema_to_atlas(&config.pile_path) {
-                eprintln!("atlas emit: {err}");
-            }
             let scopes = scopes
                 .as_deref()
                 .map(|value| load_value_or_file(value, "scopes"))
@@ -2331,45 +2305,6 @@ fn seed_default_metadata(repo: &mut Repository<Pile<Blake3>>) -> Result<()> {
     repo.set_default_metadata(metadata)
         .context("set repository default metadata")?;
     Ok(())
-}
-
-fn emit_schema_to_atlas(pile_path: &PathBuf) -> Result<()> {
-    let mut pile = open_pile(pile_path)?;
-    let existing = match find_branch_id(&mut pile, ATLAS_BRANCH) {
-        Ok(existing) => existing,
-        Err(err) => {
-            let _ = pile.close();
-            return Err(anyhow::anyhow!(err));
-        }
-    };
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
-
-    let branch_id = match existing {
-        Some(id) => id,
-        None => match map_err_debug(repo.create_branch(ATLAS_BRANCH, None), "create branch") {
-            Ok(branch_id) => *branch_id,
-            Err(err) => {
-                let pile = repo.into_storage();
-                let _ = pile.close();
-                return Err(err);
-            }
-        },
-    };
-
-    with_repo_close(repo, |repo| {
-        let mut metadata = build_archive_metadata(repo.storage_mut())
-            .context("build archive metadata")?;
-        metadata += build_teams_metadata(repo.storage_mut()).context("build teams metadata")?;
-
-        let mut ws = map_err_debug(repo.pull(branch_id), "pull atlas workspace")?;
-        let space = map_err_debug(ws.checkout(..), "checkout atlas workspace")?;
-        let delta = metadata.difference(&space);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas schema metadata"));
-            map_err_debug(repo.push(&mut ws), "push atlas metadata")?;
-        }
-        Ok(())
-    })
 }
 
 fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -> Result<()> {

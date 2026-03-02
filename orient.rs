@@ -31,7 +31,6 @@ use triblespace::prelude::*;
 const DEFAULT_COMPASS_BRANCH: &str = "compass";
 const DEFAULT_LOCAL_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
-const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const ORIENT_STATE_BRANCH: &str = "orient";
 const ORIENT_STATE_BRANCH_ID: Id = id_hex!("68C108C793D53853A504478A5A2D6551");
@@ -1051,105 +1050,8 @@ fn with_repo<T>(
     result
 }
 
-fn ensure_branch(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_name: &str,
-) -> Result<Id> {
-    if let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? {
-        return Ok(branch_id);
-    }
-    repo.create_branch(branch_name, None)
-        .map_err(|e| anyhow!("create branch: {e:?}"))
-        .map(|branch| branch.release())
-}
-
-fn find_branch_by_name(
-    pile: &mut Pile<valueschemas::Blake3>,
-    branch_name: &str,
-) -> Result<Option<Id>> {
-    let name_handle = branch_name
-        .to_owned()
-        .to_blob()
-        .get_handle::<valueschemas::Blake3>();
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let iter = pile
-        .branches()
-        .map_err(|e| anyhow!("list branches: {e:?}"))?;
-
-    for branch in iter {
-        let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
-        let Some(head) = pile
-            .head(branch_id)
-            .map_err(|e| anyhow!("branch head: {e:?}"))?
-        else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader
-            .get(head)
-            .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
-        let mut names = find!(
-            (handle: TextHandle),
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some(name) = names.next().map(|(handle,)| handle) else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if name == name_handle {
-            return Ok(Some(branch_id));
-        }
-    }
-
-    Ok(None)
-}
-
-fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = ensure_branch(repo, ATLAS_BRANCH)?;
-        let mut metadata = TribleSet::new();
-
-        metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata += <valueschemas::Handle<
-            valueschemas::Blake3,
-            blobschemas::LongString,
-        > as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata += <valueschemas::Handle<
-            valueschemas::Blake3,
-            blobschemas::SimpleArchive,
-        > as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata +=
-            <blobschemas::LongString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata +=
-            <blobschemas::SimpleArchive as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata +=
-            <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-        metadata +=
-            <valueschemas::ShortString as metadata::ConstDescribe>::describe(repo.storage_mut())?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull atlas workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout atlas workspace: {e:?}"))?;
-        let delta = metadata.difference(&space);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas schema metadata"));
-            repo.push(&mut ws)
-                .map_err(|e| anyhow!("push atlas metadata: {e:?}"))?;
-        }
-        Ok(())
-    })
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Err(err) = emit_schema_to_atlas(&cli.pile) {
-        eprintln!("atlas emit: {err}");
-    }
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;

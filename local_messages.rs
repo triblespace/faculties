@@ -26,7 +26,6 @@ use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "local-messages";
 const DEFAULT_RELATIONS_BRANCH: &str = "relations";
-const ATLAS_BRANCH: &str = "atlas";
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
@@ -473,51 +472,6 @@ fn resolve_branch_id(
     })
 }
 
-fn find_branch_by_name(
-    pile: &mut Pile<valueschemas::Blake3>,
-    branch_name: &str,
-) -> Result<Option<Id>> {
-    let name_handle = branch_name
-        .to_owned()
-        .to_blob()
-        .get_handle::<valueschemas::Blake3>();
-    let reader = pile
-        .reader()
-        .map_err(|e| anyhow::anyhow!("pile reader: {e:?}"))?;
-    let iter = pile
-        .branches()
-        .map_err(|e| anyhow::anyhow!("list branches: {e:?}"))?;
-
-    for branch in iter {
-        let branch_id = branch.map_err(|e| anyhow::anyhow!("branch id: {e:?}"))?;
-        let Some(head) = pile
-            .head(branch_id)
-            .map_err(|e| anyhow::anyhow!("branch head: {e:?}"))?
-        else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader
-            .get(head)
-            .map_err(|e| anyhow::anyhow!("branch metadata: {e:?}"))?;
-        let mut names = find!(
-            (handle: TextHandle),
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some(name) = names.next().map(|(handle,)| handle) else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if name == name_handle {
-            return Ok(Some(branch_id));
-        }
-    }
-
-    Ok(None)
-}
-
 fn ensure_metadata(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
     let space = ws
         .checkout(..)
@@ -808,9 +762,6 @@ fn cmd_list(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Err(err) = emit_schema_to_atlas(&cli.pile) {
-        eprintln!("atlas emit: {err}");
-    }
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;
@@ -871,85 +822,3 @@ fn main() -> Result<()> {
     }
 }
 
-fn emit_schema_to_atlas(pile_path: &Path) -> Result<()> {
-    with_repo(pile_path, |repo| {
-        let branch_id = if let Some(id) = find_branch_by_name(repo.storage_mut(), ATLAS_BRANCH)? {
-            id
-        } else {
-            repo.create_branch(ATLAS_BRANCH, None)
-                .map_err(|e| anyhow::anyhow!("create branch: {e:?}"))?
-                .release()
-        };
-        let metadata = build_local_metadata(repo.storage_mut())
-            .map_err(|e| anyhow::anyhow!("build local metadata: {e:?}"))?;
-
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow::anyhow!("pull atlas workspace: {e:?}"))?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| anyhow::anyhow!("checkout atlas workspace: {e:?}"))?;
-        let delta = metadata.difference(&space);
-        if !delta.is_empty() {
-            ws.commit(delta, None, Some("atlas schema metadata"));
-            repo.push(&mut ws)
-                .map_err(|e| anyhow::anyhow!("push atlas metadata: {e:?}"))?;
-        }
-        Ok(())
-    })
-}
-
-fn build_local_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-{
-    let mut metadata = TribleSet::new();
-
-    metadata += <valueschemas::GenId as metadata::ConstDescribe>::describe(blobs)?;
-    metadata += <valueschemas::NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
-    metadata +=
-        <valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString> as metadata::ConstDescribe>::describe(
-            blobs,
-        )?;
-    metadata += <blobschemas::LongString as metadata::ConstDescribe>::describe(blobs)?;
-
-    metadata += metadata::Describe::describe(&local::from, blobs)?;
-    metadata += metadata::Describe::describe(&local::to, blobs)?;
-    metadata += metadata::Describe::describe(&local::body, blobs)?;
-    metadata += metadata::Describe::describe(&local::created_at, blobs)?;
-    metadata += metadata::Describe::describe(&local::about_message, blobs)?;
-    metadata += metadata::Describe::describe(&local::reader, blobs)?;
-    metadata += metadata::Describe::describe(&local::read_at, blobs)?;
-
-    metadata += describe_kind(
-        blobs,
-        &KIND_MESSAGE_ID,
-        "local_message",
-        "Local message kind.",
-    )?;
-    metadata += describe_kind(
-        blobs,
-        &KIND_READ_ID,
-        "local_read",
-        "Local read receipt kind.",
-    )?;
-
-    Ok(metadata)
-}
-
-fn describe_kind<B>(
-    blobs: &mut B,
-    id: &Id,
-    name: &str,
-    description: &str,
-) -> std::result::Result<Fragment, B::PutError>
-where
-    B: BlobStore<valueschemas::Blake3>,
-{
-    let name_handle = blobs.put(name.to_string())?;
-
-    Ok(entity! { ExclusiveId::force_ref(id) @
-        metadata::name: name_handle,
-        metadata::description: blobs.put(description.to_string())?,
-    })
-}
