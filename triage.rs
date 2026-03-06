@@ -6,6 +6,8 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
+//! serde = { version = "1.0", features = ["derive"] }
+//! serde_json = "1.0"
 //! triblespace = "0.16.0"
 //! ```
 
@@ -14,6 +16,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
+use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -49,6 +52,7 @@ const KIND_LLM_REQUEST_ID: Id = id_hex!("1524B4C030D4F10365D9DCEE801A09C8");
 const KIND_LLM_IN_PROGRESS_ID: Id = id_hex!("16C69FC4928D54BF93E6F3222B4685A7");
 const KIND_LLM_RESULT_ID: Id = id_hex!("DE498E4697F9F01219C75E7BC183DB91");
 const KIND_REASON_EVENT_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
+const KIND_CONTEXT_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 const REPO_HEAD_ATTR: Id = id_hex!("272FBC56108F336C4D2E17289468C35F");
 const REPO_PARENT_ATTR: Id = id_hex!("317044B612C690000D798CA660ECFD2A");
 const REPO_CONTENT_ATTR: Id = id_hex!("4DD4DDD05CC31734B03ABB4E43188B1F");
@@ -72,6 +76,13 @@ mod config {
         "A4DFF7BE658B1EA16F866E3039FFF8D6" as web_branch_id: valueschemas::GenId;
         "229941B84503AAE4976A49E020D1282B" as media_branch_id: valueschemas::GenId;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
+        "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "79E1B50756FB64A30916E9353225E179" as active_model_profile_id: valueschemas::GenId;
+        "6691CF3F872C6107DCFAD0BCF7CDC1A0" as model_profile_id: valueschemas::GenId;
+        "F9CEA1A2E81D738BB125B4D144B7A746" as model_context_window_tokens: valueschemas::U256BE;
+        "4200F6746B36F2784DEBA1555595D6AC" as model_max_output_tokens: valueschemas::U256BE;
+        "1FF004BB48F7A4F8F72541F4D4FA75FF" as model_context_safety_margin_tokens: valueschemas::U256BE;
+        "095FAECDB8FF205DF591DF594E593B01" as model_chars_per_token: valueschemas::U256BE;
     }
 }
 
@@ -102,8 +113,23 @@ mod exec {
         "B878792F16C0C27C776992FA053A2218" as started_at: valueschemas::NsTAIInterval;
         "B4B81B90EFB4D1F5EE62DDE9CB48025D" as finished_at: valueschemas::NsTAIInterval;
         "B68F9025545C7E616EB90C6440220348" as exit_code: valueschemas::U256BE;
+        "CA7AF66AAF5105EC15625ED14E1A2AC0" as stdout_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "BE4D1876B22EAF93AAD1175DB76D1C72" as stderr_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "E9C77284C7DDCF522A8AC4622FE3FB11" as error: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "90307D583A8F085828E1007AE432BF86" as about_thought: valueschemas::GenId;
+    }
+}
+
+mod model_chat {
+    use super::*;
+    attributes! {
+        "5F10520477A04E5FB322C85CC78C6762" as kind: valueschemas::GenId;
+        "5A14A02113CE43A59881D0717726F465" as about_request: valueschemas::GenId;
+        "DA8E31E47919337B3E00724EBE32D14E" as about_thought: valueschemas::GenId;
+        "238CF718317A94DB46B8D75E7CB6D609" as finished_at: valueschemas::NsTAIInterval;
+        "B1B904590F0FA70AD1BA247F3D23A6CC" as output_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "567E35DACDB00C799E75AEED0B6EFDF7" as reasoning_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "9E9B829C473E416E9150D4B94A6A2DC4" as error: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
     }
 }
 
@@ -126,6 +152,30 @@ mod reason {
         "FBA9BC32A457C7BFFDB7E0181D3E82A4" as created_at: valueschemas::NsTAIInterval;
         "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
         "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+    }
+}
+
+mod context {
+    use super::*;
+    attributes! {
+        "81E520987033BE71EB0AFFA8297DE613" as kind: valueschemas::GenId;
+        "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "3D5865566AF5118471DA1FF7F87CB791" as created_at: valueschemas::NsTAIInterval;
+        "4EAF7FE3122A0AE2D8309B79DCCB8D75" as start_at: valueschemas::NsTAIInterval;
+        "95D629052C40FA09B378DDC507BEA0D3" as end_at: valueschemas::NsTAIInterval;
+        "CB97C36A32DEC70E0D1149E7C5D88588" as left: valueschemas::GenId;
+        "087D07E3D9D94F0C4E96813C7BC5E74C" as right: valueschemas::GenId;
+        "9B83D68AECD6888AA9CE95E754494768" as child: valueschemas::GenId;
+        "316834CC6B0EA6F073BF5362D67AC530" as about_exec_result: valueschemas::GenId;
+    }
+}
+
+mod cog {
+    use super::*;
+    attributes! {
+        "07F063ECF1DC9FB3C1984BDB10B98BFA" as kind: valueschemas::GenId;
+        "FA6090FB00EEE2F5EF1E51F1F68EA5B8" as context: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "99F834C6A6A050DECBE42D639288B559" as created_at: valueschemas::NsTAIInterval;
     }
 }
 
@@ -186,6 +236,42 @@ enum Command {
     },
     /// Inspect commit-chain integrity for the target branch
     Chain,
+    /// Show memory cover structure (chunks, hierarchy, budget)
+    Cover {
+        /// Show full summary text instead of truncated
+        #[arg(long, default_value_t = false)]
+        full: bool,
+        /// Show children indented under parents
+        #[arg(long, default_value_t = false)]
+        tree: bool,
+    },
+    /// Inspect a specific memory chunk by ID prefix
+    Chunk {
+        /// Hex ID prefix of the chunk to inspect
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Inspect a full turn cycle: context in, model output, command, exec result
+    Turn {
+        /// Nth most recent turn (1 = latest)
+        #[arg(long, default_value_t = 1)]
+        turn: usize,
+        /// Show full content (context messages, stdout, reasoning)
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
+    /// Show the assembled context for a recent turn
+    Context {
+        /// Nth most recent turn (1 = latest)
+        #[arg(long, default_value_t = 1)]
+        turn: usize,
+        /// Show full message content
+        #[arg(long, default_value_t = false)]
+        full: bool,
+        /// Dump raw JSON
+        #[arg(long, default_value_t = false)]
+        raw: bool,
+    },
     /// Repair branch-level consistency issues
     Repair {
         #[command(subcommand)]
@@ -316,6 +402,51 @@ struct LoopReport {
     contiguous_head: Option<PatternSummary>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ChatRole {
+    System,
+    User,
+    Assistant,
+}
+
+impl std::fmt::Display for ChatRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChatRole::System => write!(f, "system"),
+            ChatRole::User => write!(f, "user"),
+            ChatRole::Assistant => write!(f, "assistant"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ChatMessage {
+    role: ChatRole,
+    content: String,
+}
+
+#[derive(Debug, Clone)]
+struct ContextChunkRow {
+    id: Id,
+    summary: Option<String>,
+    created_at: Option<i128>,
+    start_at: Option<i128>,
+    end_at: Option<i128>,
+    children: Vec<Id>,
+    about_exec_result: Option<Id>,
+}
+
+#[derive(Debug, Clone)]
+struct BudgetInfo {
+    context_window_tokens: u64,
+    max_output_tokens: u64,
+    safety_margin_tokens: u64,
+    chars_per_token: u64,
+    system_prompt_chars: usize,
+    body_budget_chars: i64,
+}
+
 #[derive(Debug, Clone)]
 struct ChainIssue {
     commit_hash: String,
@@ -380,6 +511,32 @@ fn first_line(text: &str) -> String {
         .unwrap_or(text)
         .trim()
         .to_string()
+}
+
+fn format_duration_ns(delta_ns: i128) -> String {
+    let secs = (delta_ns / 1_000_000_000).max(0) as u64;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 { format!("{m}m") } else { format!("{m}m {s}s") }
+    } else if secs < 86_400 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m == 0 { format!("{h}h") } else { format!("{h}h {m}m") }
+    } else {
+        let d = secs / 86_400;
+        let h = (secs % 86_400) / 3600;
+        if h == 0 { format!("{d}d") } else { format!("{d}d {h}h") }
+    }
+}
+
+fn format_tai_ns(ns: i128) -> String {
+    let ns_i64 = ns.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    let epoch = Epoch::from_tai_duration(hifitime::Duration::from_truncated_nanoseconds(ns_i64));
+    let (y, m, d, hh, mm, ss, _) = epoch.to_gregorian_utc();
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
 }
 
 fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
@@ -2159,6 +2316,948 @@ fn cmd_repair_branch_duplicates(
     Ok(())
 }
 
+fn collect_context_chunks(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+) -> Result<Vec<ContextChunkRow>> {
+    let mut chunks: HashMap<Id, ContextChunkRow> = HashMap::new();
+
+    for (chunk_id,) in find!(
+        (chunk_id: Id),
+        pattern!(&space, [{ ?chunk_id @ context::kind: &KIND_CONTEXT_CHUNK_ID }])
+    ) {
+        chunks.insert(chunk_id, ContextChunkRow {
+            id: chunk_id,
+            summary: None,
+            created_at: None,
+            start_at: None,
+            end_at: None,
+            children: Vec::new(),
+            about_exec_result: None,
+        });
+    }
+
+    for (chunk_id, handle) in find!(
+        (chunk_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?chunk_id @ context::summary: ?handle }])
+    ) {
+        if let Some(row) = chunks.get_mut(&chunk_id) {
+            row.summary = Some(read_text(ws, handle)?);
+        }
+    }
+
+    for (chunk_id, value) in find!(
+        (chunk_id: Id, value: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{ ?chunk_id @ context::created_at: ?value }])
+    ) {
+        if let Some(row) = chunks.get_mut(&chunk_id) {
+            row.created_at = Some(interval_key(value));
+        }
+    }
+
+    for (chunk_id, value) in find!(
+        (chunk_id: Id, value: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{ ?chunk_id @ context::start_at: ?value }])
+    ) {
+        if let Some(row) = chunks.get_mut(&chunk_id) {
+            row.start_at = Some(interval_key(value));
+        }
+    }
+
+    for (chunk_id, value) in find!(
+        (chunk_id: Id, value: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{ ?chunk_id @ context::end_at: ?value }])
+    ) {
+        if let Some(row) = chunks.get_mut(&chunk_id) {
+            row.end_at = Some(interval_key(value));
+        }
+    }
+
+    for (parent_id, child_id) in find!(
+        (parent_id: Id, child_id: Id),
+        pattern!(&space, [{ ?parent_id @ context::child: ?child_id }])
+    ) {
+        if let Some(row) = chunks.get_mut(&parent_id) {
+            row.children.push(child_id);
+        }
+    }
+
+    for (chunk_id, exec_id) in find!(
+        (chunk_id: Id, exec_id: Id),
+        pattern!(&space, [{ ?chunk_id @ context::about_exec_result: ?exec_id }])
+    ) {
+        if let Some(row) = chunks.get_mut(&chunk_id) {
+            row.about_exec_result = Some(exec_id);
+        }
+    }
+
+    let mut list: Vec<ContextChunkRow> = chunks.into_values().collect();
+    list.sort_by_key(|row| row.start_at.unwrap_or(i128::MAX));
+    Ok(list)
+}
+
+fn find_root_chunks(chunks: &[ContextChunkRow]) -> Vec<usize> {
+    let child_ids: HashSet<Id> = chunks.iter().flat_map(|c| c.children.iter().copied()).collect();
+    // A root is any chunk that is not a child of another chunk
+    chunks.iter().enumerate()
+        .filter(|(_, c)| !child_ids.contains(&c.id))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn load_budget_from_config(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    config_branch: &str,
+) -> Result<Option<BudgetInfo>> {
+    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), config_branch)? else {
+        return Ok(None);
+    };
+    let mut ws = pull_workspace(repo, branch_id, "pull config for budget")?;
+    let space = ws.checkout(..).map_err(|e| anyhow!("checkout config: {e:?}"))?;
+
+    // Find latest config
+    let mut latest_config: Option<(Id, i128)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?config_id @
+            config::kind: &KIND_CONFIG_ID,
+            config::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        match latest_config {
+            Some((_, best)) if best >= key => {}
+            _ => latest_config = Some((config_id, key)),
+        }
+    }
+    let Some((config_id, _)) = latest_config else {
+        return Ok(None);
+    };
+
+    // Get active model profile id
+    let mut active_profile_id: Option<Id> = None;
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::GenId>),
+        pattern!(&space, [{ ?entity @ config::active_model_profile_id: ?value }])
+    ) {
+        if entity == config_id {
+            active_profile_id = Some(value.from_value());
+            break;
+        }
+    }
+
+    // Get system prompt length
+    let mut system_prompt_chars: usize = 0;
+    for (entity, handle) in find!(
+        (entity: Id, handle: TextHandle),
+        pattern!(&space, [{ ?entity @ config::system_prompt: ?handle }])
+    ) {
+        if entity == config_id {
+            system_prompt_chars = read_text(&mut ws, handle)?.len();
+            break;
+        }
+    }
+
+    // Find model profile
+    let Some(profile_id) = active_profile_id else {
+        return Ok(None);
+    };
+
+    let mut context_window: u64 = 0;
+    let mut max_output: u64 = 0;
+    let mut safety_margin: u64 = 0;
+    let mut chars_per_token: u64 = 4;
+
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ ?entity @ config::model_context_window_tokens: ?value }])
+    ) {
+        if entity == profile_id {
+            context_window = u256be_to_u64(value).unwrap_or(0);
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ ?entity @ config::model_max_output_tokens: ?value }])
+    ) {
+        if entity == profile_id {
+            max_output = u256be_to_u64(value).unwrap_or(0);
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ ?entity @ config::model_context_safety_margin_tokens: ?value }])
+    ) {
+        if entity == profile_id {
+            safety_margin = u256be_to_u64(value).unwrap_or(0);
+            break;
+        }
+    }
+    for (entity, value) in find!(
+        (entity: Id, value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ ?entity @ config::model_chars_per_token: ?value }])
+    ) {
+        if entity == profile_id {
+            chars_per_token = u256be_to_u64(value).unwrap_or(4).max(1);
+            break;
+        }
+    }
+
+    let body_budget_chars = ((context_window as i64) - (max_output as i64) - (safety_margin as i64))
+        * (chars_per_token as i64)
+        - (system_prompt_chars as i64);
+
+    Ok(Some(BudgetInfo {
+        context_window_tokens: context_window,
+        max_output_tokens: max_output,
+        safety_margin_tokens: safety_margin,
+        chars_per_token,
+        system_prompt_chars,
+        body_budget_chars,
+    }))
+}
+
+fn load_turn_context(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    exec_branch_id: Id,
+    turn_offset: usize,
+) -> Result<Option<(Id, String, Vec<ChatMessage>)>> {
+    let mut ws = pull_workspace(repo, exec_branch_id, "pull exec for context")?;
+    let space = ws.checkout(..).map_err(|e| anyhow!("checkout exec: {e:?}"))?;
+
+    // Collect exec requests with timestamps
+    let mut requests: Vec<(Id, i128, Option<String>)> = Vec::new();
+    for (request_id, requested_at) in find!(
+        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?request_id @
+            exec::kind: &KIND_EXEC_REQUEST_ID,
+            exec::requested_at: ?requested_at,
+        }])
+    ) {
+        requests.push((request_id, interval_key(requested_at), None));
+    }
+    // Load command text
+    for (request_id, handle) in find!(
+        (request_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?request_id @ exec::command_text: ?handle }])
+    ) {
+        for entry in requests.iter_mut() {
+            if entry.0 == request_id {
+                entry.2 = Some(read_text(&mut ws, handle)?);
+                break;
+            }
+        }
+    }
+
+    requests.sort_by_key(|r| r.1);
+    requests.reverse();
+
+    if turn_offset == 0 || turn_offset > requests.len() {
+        return Ok(None);
+    }
+    let (request_id, _, command) = &requests[turn_offset - 1];
+    let request_id = *request_id;
+    let command = command.clone().unwrap_or_else(|| "<unknown>".to_string());
+
+    // Find result for this request
+    let mut result_id: Option<Id> = None;
+    for (rid, about_request) in find!(
+        (rid: Id, about_request: Id),
+        pattern!(&space, [{
+            ?rid @
+            exec::kind: &KIND_EXEC_RESULT_ID,
+            exec::about_request: ?about_request,
+        }])
+    ) {
+        if about_request == request_id {
+            result_id = Some(rid);
+            break;
+        }
+    }
+
+    let Some(result_id) = result_id else {
+        return Ok(None);
+    };
+
+    // result -> about_thought -> thought -> context blob
+    let mut thought_id: Option<Id> = None;
+    for (rid, tid) in find!(
+        (rid: Id, tid: Id),
+        pattern!(&space, [{ ?rid @ exec::about_thought: ?tid }])
+    ) {
+        if rid == result_id {
+            thought_id = Some(tid);
+            break;
+        }
+    }
+
+    let Some(thought_id) = thought_id else {
+        return Ok(None);
+    };
+
+    // Load context blob from thought
+    let mut context_json: Option<String> = None;
+    for (tid, handle) in find!(
+        (tid: Id, handle: TextHandle),
+        pattern!(&space, [{ ?tid @ cog::context: ?handle }])
+    ) {
+        if tid == thought_id {
+            context_json = Some(read_text(&mut ws, handle)?);
+            break;
+        }
+    }
+
+    let Some(json) = context_json else {
+        return Ok(None);
+    };
+
+    let messages: Vec<ChatMessage> = serde_json::from_str(&json)
+        .map_err(|e| anyhow!("parse context JSON: {e}"))?;
+
+    Ok(Some((request_id, command, messages)))
+}
+
+fn cmd_cover(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    cli: &Cli,
+    full: bool,
+    tree: bool,
+) -> Result<()> {
+    let config = load_latest_config(repo, cli.config_branch.as_str())?;
+    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let mut ws = pull_workspace(repo, branch_id, "pull target for cover")?;
+    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+
+    let chunks = collect_context_chunks(&mut ws, &space)?;
+    let root_indices = find_root_chunks(&chunks);
+
+    let chunk_map: HashMap<Id, &ContextChunkRow> = chunks.iter().map(|c| (c.id, c)).collect();
+
+    // Compute max depth
+    fn max_depth(chunk: &ContextChunkRow, map: &HashMap<Id, &ContextChunkRow>, depth: usize) -> usize {
+        if chunk.children.is_empty() {
+            return depth;
+        }
+        chunk.children.iter()
+            .filter_map(|cid| map.get(cid))
+            .map(|child| max_depth(child, map, depth + 1))
+            .max()
+            .unwrap_or(depth)
+    }
+
+    let depth = root_indices.iter()
+        .filter_map(|i| chunks.get(*i))
+        .map(|c| max_depth(c, &chunk_map, 0))
+        .max()
+        .unwrap_or(0);
+
+    println!("Memory cover");
+    println!("- pile: {}", cli.pile.display());
+    println!("- branch: {branch_id:x}");
+    println!("- chunks: {} total, {} roots, max depth {depth}", chunks.len(), root_indices.len());
+
+    // Budget
+    let budget = load_budget_from_config(repo, cli.config_branch.as_str())?;
+    if let Some(ref b) = budget {
+        let cover_chars: usize = chunks.iter()
+            .filter_map(|c| c.summary.as_ref())
+            .map(|s| s.len())
+            .sum();
+        let fill_pct = if b.body_budget_chars > 0 {
+            (cover_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        println!();
+        println!("Budget");
+        println!(
+            "  context_window={} max_output={} safety={} chars/tok={}",
+            b.context_window_tokens, b.max_output_tokens, b.safety_margin_tokens, b.chars_per_token
+        );
+        println!(
+            "  system_prompt={} chars  body_budget={} chars",
+            b.system_prompt_chars, b.body_budget_chars
+        );
+        println!("  cover_chars={cover_chars}  fill={fill_pct}%");
+    }
+
+    println!();
+    if tree {
+        println!("Tree (oldest -> newest)");
+        fn print_tree(
+            chunk: &ContextChunkRow,
+            map: &HashMap<Id, &ContextChunkRow>,
+            indent: usize,
+            full: bool,
+        ) {
+            let prefix = "  ".repeat(indent);
+            let range = match (chunk.start_at, chunk.end_at) {
+                (Some(s), Some(e)) => format!(
+                    "{}..{}  ({})",
+                    format_tai_ns(s),
+                    format_tai_ns(e),
+                    format_duration_ns(e.saturating_sub(s))
+                ),
+                (Some(s), None) => format!("{}..?", format_tai_ns(s)),
+                _ => "?..?".to_string(),
+            };
+            let children_label = if chunk.children.is_empty() {
+                "leaf".to_string()
+            } else {
+                format!("{} children", chunk.children.len())
+            };
+            let summary = chunk.summary.as_deref().unwrap_or("<no summary>");
+            let summary_text = if full {
+                summary.to_string()
+            } else {
+                truncate_single_line(summary, 60)
+            };
+            println!(
+                "{prefix}{}  {range}  {children_label}  \"{summary_text}\"",
+                id_prefix(chunk.id)
+            );
+            let mut sorted_children: Vec<&ContextChunkRow> = chunk.children.iter()
+                .filter_map(|cid| map.get(cid).copied())
+                .collect();
+            sorted_children.sort_by_key(|c| c.start_at.unwrap_or(i128::MAX));
+            for child in sorted_children {
+                print_tree(child, map, indent + 1, full);
+            }
+        }
+        for &idx in &root_indices {
+            if let Some(chunk) = chunks.get(idx) {
+                print_tree(chunk, &chunk_map, 1, full);
+            }
+        }
+    } else {
+        println!("Roots (oldest -> newest)");
+        for &idx in &root_indices {
+            if let Some(chunk) = chunks.get(idx) {
+                let range = match (chunk.start_at, chunk.end_at) {
+                    (Some(s), Some(e)) => format!(
+                        "{}..{}  ({})",
+                        format_tai_ns(s),
+                        format_tai_ns(e),
+                        format_duration_ns(e.saturating_sub(s))
+                    ),
+                    (Some(s), None) => format!("{}..?", format_tai_ns(s)),
+                    _ => "?..?".to_string(),
+                };
+                let children_label = if chunk.children.is_empty() {
+                    "leaf".to_string()
+                } else {
+                    format!("{} children", chunk.children.len())
+                };
+                let summary = chunk.summary.as_deref().unwrap_or("<no summary>");
+                let summary_text = if full {
+                    summary.to_string()
+                } else {
+                    truncate_single_line(summary, 60)
+                };
+                println!(
+                    "  {}  {range}  {children_label}  \"{summary_text}\"",
+                    id_prefix(chunk.id)
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_chunk(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    cli: &Cli,
+    id_prefix_str: &str,
+) -> Result<()> {
+    let config = load_latest_config(repo, cli.config_branch.as_str())?;
+    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let mut ws = pull_workspace(repo, branch_id, "pull target for chunk")?;
+    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+
+    let chunks = collect_context_chunks(&mut ws, &space)?;
+    let prefix = id_prefix_str.to_uppercase();
+
+    let matches: Vec<&ContextChunkRow> = chunks.iter()
+        .filter(|c| format!("{:X}", c.id).starts_with(&prefix))
+        .collect();
+
+    if matches.is_empty() {
+        bail!("no chunk found matching prefix '{id_prefix_str}'");
+    }
+    if matches.len() > 1 {
+        println!("Ambiguous prefix '{id_prefix_str}' matches {} chunks:", matches.len());
+        for c in &matches {
+            let range = match (c.start_at, c.end_at) {
+                (Some(s), Some(e)) => format!("{}..{}", format_tai_ns(s), format_tai_ns(e)),
+                _ => "?..?".to_string(),
+            };
+            println!("  {:X}  {range}", c.id);
+        }
+        return Ok(());
+    }
+
+    let chunk = matches[0];
+    let chunk_map: HashMap<Id, &ContextChunkRow> = chunks.iter().map(|c| (c.id, c)).collect();
+
+    println!("Chunk {:X}", chunk.id);
+    match (chunk.start_at, chunk.end_at) {
+        (Some(s), Some(e)) => {
+            println!(
+                "  range: {}..{}  ({})",
+                format_tai_ns(s),
+                format_tai_ns(e),
+                format_duration_ns(e.saturating_sub(s))
+            );
+        }
+        (Some(s), None) => println!("  range: {}..?", format_tai_ns(s)),
+        _ => println!("  range: unknown"),
+    }
+    if let Some(created) = chunk.created_at {
+        println!("  created: {}", format_tai_ns(created));
+    }
+    if let Some(exec_id) = chunk.about_exec_result {
+        println!("  origin: exec:{}", id_prefix(exec_id));
+    }
+    println!("  children: {}", chunk.children.len());
+
+    println!();
+    println!("Summary:");
+    match chunk.summary.as_deref() {
+        Some(text) => {
+            for line in text.lines() {
+                println!("  {line}");
+            }
+        }
+        None => println!("  <no summary>"),
+    }
+
+    if !chunk.children.is_empty() {
+        println!();
+        println!("Children:");
+        let mut sorted_children: Vec<&ContextChunkRow> = chunk.children.iter()
+            .filter_map(|cid| chunk_map.get(cid).copied())
+            .collect();
+        sorted_children.sort_by_key(|c| c.start_at.unwrap_or(i128::MAX));
+        for child in sorted_children {
+            let range = match (child.start_at, child.end_at) {
+                (Some(s), Some(e)) => format!(
+                    "{}..{}  ({})",
+                    format_tai_ns(s),
+                    format_tai_ns(e),
+                    format_duration_ns(e.saturating_sub(s))
+                ),
+                _ => "?..?".to_string(),
+            };
+            let kind = if child.children.is_empty() { "leaf" } else { "node" };
+            let summary = child.summary.as_deref().unwrap_or("<no summary>");
+            println!(
+                "  {}  {range}  {kind}  \"{}\"",
+                id_prefix(child.id),
+                truncate_single_line(summary, 60)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_turn(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    cli: &Cli,
+    turn_offset: usize,
+    full: bool,
+) -> Result<()> {
+    let config = load_latest_config(repo, cli.config_branch.as_str())?;
+    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let mut ws = pull_workspace(repo, branch_id, "pull target for turn")?;
+    let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+
+    // Collect exec requests with timestamps
+    let mut requests: Vec<(Id, i128, Option<String>)> = Vec::new();
+    for (request_id, requested_at) in find!(
+        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?request_id @
+            exec::kind: &KIND_EXEC_REQUEST_ID,
+            exec::requested_at: ?requested_at,
+        }])
+    ) {
+        requests.push((request_id, interval_key(requested_at), None));
+    }
+    for (request_id, handle) in find!(
+        (request_id: Id, handle: TextHandle),
+        pattern!(&space, [{ ?request_id @ exec::command_text: ?handle }])
+    ) {
+        for entry in requests.iter_mut() {
+            if entry.0 == request_id {
+                entry.2 = Some(read_text(&mut ws, handle)?);
+                break;
+            }
+        }
+    }
+    requests.sort_by_key(|r| r.1);
+    requests.reverse();
+
+    if turn_offset == 0 || turn_offset > requests.len() {
+        bail!("turn #{turn_offset} not found ({} total turns)", requests.len());
+    }
+    let (request_id, requested_at, command) = &requests[turn_offset - 1];
+    let request_id = *request_id;
+    let requested_at = *requested_at;
+    let command = command.clone().unwrap_or_else(|| "<unknown>".to_string());
+
+    let now_key = now_epoch().to_tai_duration().total_nanoseconds();
+
+    println!("Turn #{turn_offset}");
+    println!("- request: {}", id_prefix(request_id));
+    println!("- requested: {} ({})", format_tai_ns(requested_at), format_age(now_key, requested_at));
+    println!("- command: {}", if full { command.clone() } else { truncate_single_line(&command, 100) });
+
+    // Find exec result for this request
+    let mut result_id: Option<Id> = None;
+    for (rid, about_request) in find!(
+        (rid: Id, about_request: Id),
+        pattern!(&space, [{
+            ?rid @
+            exec::kind: &KIND_EXEC_RESULT_ID,
+            exec::about_request: ?about_request,
+        }])
+    ) {
+        if about_request == request_id {
+            result_id = Some(rid);
+            break;
+        }
+    }
+
+    // Exec result details
+    if let Some(rid) = result_id {
+        let mut exit_code: Option<i64> = None;
+        let mut finished_at: Option<i128> = None;
+        let mut stdout_text: Option<String> = None;
+        let mut stderr_text: Option<String> = None;
+        let mut error_text: Option<String> = None;
+
+        for (id, value) in find!(
+            (id: Id, value: Value<valueschemas::U256BE>),
+            pattern!(&space, [{ ?id @ exec::exit_code: ?value }])
+        ) {
+            if id == rid {
+                exit_code = u256be_to_u64(value).map(|n| n as i64);
+                break;
+            }
+        }
+        for (id, value) in find!(
+            (id: Id, value: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{ ?id @ exec::finished_at: ?value }])
+        ) {
+            if id == rid {
+                finished_at = Some(interval_key(value));
+                break;
+            }
+        }
+        for (id, handle) in find!(
+            (id: Id, handle: TextHandle),
+            pattern!(&space, [{ ?id @ exec::stdout_text: ?handle }])
+        ) {
+            if id == rid {
+                stdout_text = Some(read_text(&mut ws, handle)?);
+                break;
+            }
+        }
+        for (id, handle) in find!(
+            (id: Id, handle: TextHandle),
+            pattern!(&space, [{ ?id @ exec::stderr_text: ?handle }])
+        ) {
+            if id == rid {
+                stderr_text = Some(read_text(&mut ws, handle)?);
+                break;
+            }
+        }
+        for (id, handle) in find!(
+            (id: Id, handle: TextHandle),
+            pattern!(&space, [{ ?id @ exec::error: ?handle }])
+        ) {
+            if id == rid {
+                error_text = Some(read_text(&mut ws, handle)?);
+                break;
+            }
+        }
+
+        println!();
+        println!("Exec result [{}]", id_prefix(rid));
+        println!(
+            "- exit: {}",
+            exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string())
+        );
+        if let Some(at) = finished_at {
+            let latency = at.saturating_sub(requested_at);
+            println!("- finished: {} (latency {})", format_tai_ns(at), format_duration_ns(latency));
+        }
+        if let Some(ref err) = error_text {
+            println!("- error: {}", if full { err.clone() } else { truncate_single_line(err, 120) });
+        }
+        if let Some(ref stderr) = stderr_text {
+            let display = if full { stderr.clone() } else { truncate_single_line(stderr, 120) };
+            if display != "<ok>" && !display.is_empty() {
+                println!("- stderr: {display}");
+            }
+        }
+        if let Some(ref stdout) = stdout_text {
+            if full {
+                println!("- stdout ({} chars):", stdout.len());
+                for line in stdout.lines() {
+                    println!("    {line}");
+                }
+            } else {
+                println!("- stdout: {} chars \"{}\"", stdout.len(), truncate_single_line(stdout, 80));
+            }
+        }
+
+        // Find thought via result -> about_thought
+        let mut thought_id: Option<Id> = None;
+        for (id, tid) in find!(
+            (id: Id, tid: Id),
+            pattern!(&space, [{ ?id @ exec::about_thought: ?tid }])
+        ) {
+            if id == rid {
+                thought_id = Some(tid);
+                break;
+            }
+        }
+
+        // Find LLM result linked to this request (model_chat result -> about_request)
+        let mut llm_result_id: Option<Id> = None;
+        for (mid, about_req) in find!(
+            (mid: Id, about_req: Id),
+            pattern!(&space, [{
+                ?mid @
+                model_chat::kind: &KIND_LLM_RESULT_ID,
+                model_chat::about_request: ?about_req,
+            }])
+        ) {
+            if about_req == request_id {
+                llm_result_id = Some(mid);
+                break;
+            }
+        }
+
+        // Also try linking via about_thought on the LLM result
+        if llm_result_id.is_none() {
+            if let Some(tid) = thought_id {
+                for (mid, about_thought) in find!(
+                    (mid: Id, about_thought: Id),
+                    pattern!(&space, [{
+                        ?mid @
+                        model_chat::kind: &KIND_LLM_RESULT_ID,
+                        model_chat::about_thought: ?about_thought,
+                    }])
+                ) {
+                    if about_thought == tid {
+                        llm_result_id = Some(mid);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(mid) = llm_result_id {
+            let mut output_text: Option<String> = None;
+            let mut reasoning_text: Option<String> = None;
+            let mut llm_error: Option<String> = None;
+            let mut llm_finished: Option<i128> = None;
+
+            for (id, handle) in find!(
+                (id: Id, handle: TextHandle),
+                pattern!(&space, [{ ?id @ model_chat::output_text: ?handle }])
+            ) {
+                if id == mid {
+                    output_text = Some(read_text(&mut ws, handle)?);
+                    break;
+                }
+            }
+            for (id, handle) in find!(
+                (id: Id, handle: TextHandle),
+                pattern!(&space, [{ ?id @ model_chat::reasoning_text: ?handle }])
+            ) {
+                if id == mid {
+                    reasoning_text = Some(read_text(&mut ws, handle)?);
+                    break;
+                }
+            }
+            for (id, handle) in find!(
+                (id: Id, handle: TextHandle),
+                pattern!(&space, [{ ?id @ model_chat::error: ?handle }])
+            ) {
+                if id == mid {
+                    llm_error = Some(read_text(&mut ws, handle)?);
+                    break;
+                }
+            }
+            for (id, value) in find!(
+                (id: Id, value: Value<valueschemas::NsTAIInterval>),
+                pattern!(&space, [{ ?id @ model_chat::finished_at: ?value }])
+            ) {
+                if id == mid {
+                    llm_finished = Some(interval_key(value));
+                    break;
+                }
+            }
+
+            println!();
+            println!("Model result [{}]", id_prefix(mid));
+            if let Some(at) = llm_finished {
+                println!("- finished: {}", format_tai_ns(at));
+            }
+            if let Some(ref err) = llm_error {
+                println!("- error: {}", if full { err.clone() } else { truncate_single_line(err, 120) });
+            }
+            if let Some(ref reasoning) = reasoning_text {
+                if full {
+                    println!("- reasoning ({} chars):", reasoning.len());
+                    for line in reasoning.lines() {
+                        println!("    {line}");
+                    }
+                } else {
+                    println!("- reasoning: {} chars \"{}\"", reasoning.len(), truncate_single_line(reasoning, 80));
+                }
+            }
+            if let Some(ref output) = output_text {
+                if full {
+                    println!("- output ({} chars):", output.len());
+                    for line in output.lines() {
+                        println!("    {line}");
+                    }
+                } else {
+                    println!("- output: {} chars \"{}\"", output.len(), truncate_single_line(output, 80));
+                }
+            }
+        } else {
+            println!();
+            println!("Model result: not found");
+        }
+
+        // Context summary
+        if let Some(tid) = thought_id {
+            let mut context_json: Option<String> = None;
+            for (id, handle) in find!(
+                (id: Id, handle: TextHandle),
+                pattern!(&space, [{ ?id @ cog::context: ?handle }])
+            ) {
+                if id == tid {
+                    context_json = Some(read_text(&mut ws, handle)?);
+                    break;
+                }
+            }
+            if let Some(ref json) = context_json {
+                let messages: Vec<ChatMessage> = serde_json::from_str(json)
+                    .unwrap_or_default();
+                let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+                println!();
+                println!("Context ({} messages, {} chars)", messages.len(), total_chars);
+                if full {
+                    for (i, msg) in messages.iter().enumerate() {
+                        println!(
+                            "  #{i:<3} [{}] ({} chars)",
+                            msg.role, msg.content.len()
+                        );
+                        for line in msg.content.lines() {
+                            println!("    {line}");
+                        }
+                    }
+                } else {
+                    for (i, msg) in messages.iter().enumerate() {
+                        println!(
+                            "  #{i:<3} [{:<9}] ({:>5} chars) \"{}\"",
+                            msg.role.to_string(),
+                            msg.content.len(),
+                            truncate_single_line(&msg.content, 60)
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        println!();
+        println!("Exec result: not found (turn may still be in progress)");
+    }
+
+    Ok(())
+}
+
+fn cmd_context(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    cli: &Cli,
+    turn: usize,
+    full: bool,
+    raw: bool,
+) -> Result<()> {
+    let config = load_latest_config(repo, cli.config_branch.as_str())?;
+    let branch_id = resolve_target_branch(repo, cli, &config)?;
+
+    let result = load_turn_context(repo, branch_id, turn)?;
+    let Some((request_id, command, messages)) = result else {
+        if turn > 1 {
+            bail!("turn #{turn} not found (not enough turns or no context recorded)");
+        } else {
+            bail!("no turn context found (no exec results with thought/context chain)");
+        }
+    };
+
+    if raw {
+        let json = serde_json::to_string_pretty(&messages)
+            .map_err(|e| anyhow!("serialize context: {e}"))?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+
+    let budget = load_budget_from_config(repo, cli.config_branch.as_str())?;
+    let fill_str = if let Some(ref b) = budget {
+        if b.body_budget_chars > 0 {
+            let pct = (total_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32;
+            format!("  fill={pct}%")
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    println!(
+        "Context for turn #{turn} [{}] ({})",
+        id_prefix(request_id),
+        truncate_single_line(&command, 60)
+    );
+    println!("- messages: {}", messages.len());
+    println!("- estimated chars: {total_chars}{fill_str}");
+    println!();
+
+    for (i, msg) in messages.iter().enumerate() {
+        let role_str = format!("[{}]", msg.role);
+        if full {
+            println!("  #{i:<3} {role_str:<12} ({} chars)", msg.content.len());
+            for line in msg.content.lines() {
+                println!("    {line}");
+            }
+            println!();
+        } else {
+            println!(
+                "  #{i:<3} {role_str:<12} ({:>5} chars) \"{}\"",
+                msg.content.len(),
+                truncate_single_line(&msg.content, 70)
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -2179,6 +3278,10 @@ fn main() -> Result<()> {
         Command::Loops { recent, min_repeat } => cmd_loops(&mut repo, &cli, *recent, *min_repeat),
         Command::Timeline { recent } => cmd_timeline(&mut repo, &cli, *recent),
         Command::Chain => cmd_chain(&mut repo, &cli),
+        Command::Turn { turn, full } => cmd_turn(&mut repo, &cli, *turn, *full),
+        Command::Cover { full, tree } => cmd_cover(&mut repo, &cli, *full, *tree),
+        Command::Chunk { id } => cmd_chunk(&mut repo, &cli, id.as_str()),
+        Command::Context { turn, full, raw } => cmd_context(&mut repo, &cli, *turn, *full, *raw),
         Command::Repair { command } => match command {
             RepairCommand::BranchDuplicates { dry_run } => {
                 cmd_repair_branch_duplicates(&mut repo, &cli, *dry_run)
