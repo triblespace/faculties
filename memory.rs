@@ -10,21 +10,20 @@
 //! ```
 
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
-use hifitime::{Duration, Epoch};
+use hifitime::Epoch;
 use rand_core::OsRng;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
@@ -40,8 +39,40 @@ mod config_schema {
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as branch_id: GenId;
         "24CF9D532E03C44CF719546DDE7E0493" as memory_lens_id: GenId;
+        "C188E12ABBDD83D283A23DBAD4B784AF" as exec_branch_id: GenId;
+        "047112FC535518D289E64FBE0B60F06E" as archive_branch_id: GenId;
     }
 }
+
+mod exec_schema {
+    use super::*;
+    attributes! {
+        "AA2F34973589295FA70B538D92CD30F8" as kind: GenId;
+        "B4B81B90EFB4D1F5EE62DDE9CB48025D" as finished_at: NsTAIInterval;
+    }
+}
+
+const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
+
+mod archive_schema {
+    use super::*;
+    attributes! {
+        "5F10520477A04E5FB322C85CC78C6762" as kind: GenId;
+        "0DA5DD275AA34F86B0297CC35F1B7395" as created_at: NsTAIInterval;
+        "838CC157FFDD37C6AC7CC5A472E43ADB" as author: GenId;
+        "E63EE961ABDB1D1BEC0789FDAFFB9501" as author_name: Handle<Blake3, LongString>;
+    }
+}
+
+mod archive_import_schema {
+    use super::*;
+    attributes! {
+        "E997DCAAF43BAA04790FCB0FA0FBFE3A" as source_format: ShortString;
+        "87B587A3906056038FD767F4225274F9" as source_conversation_id: Handle<Blake3, LongString>;
+    }
+}
+
+const KIND_ARCHIVE_MESSAGE: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
 
 mod ctx {
     use super::*;
@@ -64,11 +95,14 @@ mod ctx {
 #[derive(Parser)]
 #[command(
     name = "memory",
-    about = "Show compacted context chunks (drill down by calling `memory <child>`).\n\n\
+    about = "Show compacted context chunks (drill down by narrowing the time range).\n\n\
              Subcommands:\n  \
-             memory <id>                     — show chunk by id prefix\n  \
-             memory turn <turn-id>           — list memory facets for a turn\n  \
-             memory create <lens> <summary>  — create a memory chunk"
+             memory <from>..<to>             — show best summary covering a time range\n  \
+             memory meta <from>..<to>        — show structural metadata for a time range\n  \
+             memory turn <turn-id>           — list memory facets for a turn (debug)\n  \
+             memory create <lens> <summary>  — create a memory chunk\n\n\
+             Time format: YYYY-MM-DDTHH:MM:SS..YYYY-MM-DDTHH:MM:SS (TAI)\n\
+             Hex id prefixes also accepted as fallback."
 )]
 struct Cli {
     /// Path to the pile file to use.
@@ -88,8 +122,110 @@ struct Chunk {
     lens_id: Id,
     level: u64,
     summary: Value<Handle<Blake3, LongString>>,
+    start_at: Value<NsTAIInterval>,
+    end_at: Value<NsTAIInterval>,
     children: Vec<Id>,
     about_exec_result: Option<Id>,
+    about_archive_message: Option<Id>,
+}
+
+// ---------------------------------------------------------------------------
+// time-range helpers
+// ---------------------------------------------------------------------------
+
+fn format_time_range(start: Epoch, end: Epoch) -> String {
+    let (y1, m1, d1, h1, mi1, s1, _) = start.to_gregorian_tai();
+    let (y2, m2, d2, h2, mi2, s2, _) = end.to_gregorian_tai();
+    format!(
+        "{y1:04}-{m1:02}-{d1:02}T{h1:02}:{mi1:02}:{s1:02}..{y2:04}-{m2:02}-{d2:02}T{h2:02}:{mi2:02}:{s2:02}"
+    )
+}
+
+fn parse_tai_timestamp(s: &str) -> Result<Epoch> {
+    // Parse "YYYY-MM-DDTHH:MM:SS"
+    let parts: Vec<&str> = s.split('T').collect();
+    if parts.len() != 2 {
+        bail!("invalid timestamp: {s}");
+    }
+    let date_parts: Vec<&str> = parts[0].split('-').collect();
+    let time_parts: Vec<&str> = parts[1].split(':').collect();
+    if date_parts.len() != 3 || time_parts.len() != 3 {
+        bail!("invalid timestamp: {s}");
+    }
+    let y: i32 = date_parts[0].parse().context("year")?;
+    let m: u8 = date_parts[1].parse().context("month")?;
+    let d: u8 = date_parts[2].parse().context("day")?;
+    let hh: u8 = time_parts[0].parse().context("hour")?;
+    let mm: u8 = time_parts[1].parse().context("minute")?;
+    let ss: u8 = time_parts[2].parse().context("second")?;
+    Ok(Epoch::from_gregorian_tai(y, m, d, hh, mm, ss, 0))
+}
+
+fn parse_time_range(s: &str) -> Result<(Epoch, Epoch)> {
+    let Some((from_str, to_str)) = s.split_once("..") else {
+        bail!("invalid time range (expected `from..to`): {s}");
+    };
+    let from = parse_tai_timestamp(from_str).context("parsing range start")?;
+    let to = parse_tai_timestamp(to_str).context("parsing range end")?;
+    Ok((from, to))
+}
+
+fn epoch_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
+    let (lower, _): (Epoch, Epoch) = interval.from_value();
+    lower
+}
+
+fn epoch_end_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
+    let (_, upper): (Epoch, Epoch) = interval.from_value();
+    upper
+}
+
+/// Find the best chunk covering a query time range.
+/// Prefers: lowest-level chunk that fully contains the query.
+/// Fallback: best partial overlap at any level.
+fn find_chunk_by_time_range<'a>(
+    chunks: &'a HashMap<Id, Chunk>,
+    query_start: Epoch,
+    query_end: Epoch,
+) -> Option<&'a Chunk> {
+    let query_start_ns = query_start.to_tai_duration().total_nanoseconds();
+    let query_end_ns = query_end.to_tai_duration().total_nanoseconds();
+
+    let mut best_cover: Option<&Chunk> = None;
+    let mut best_overlap: Option<(&Chunk, i128)> = None;
+
+    for chunk in chunks.values() {
+        let chunk_start = epoch_from_interval(chunk.start_at)
+            .to_tai_duration()
+            .total_nanoseconds();
+        let chunk_end = epoch_end_from_interval(chunk.end_at)
+            .to_tai_duration()
+            .total_nanoseconds();
+
+        // Check overlap.
+        if chunk_start > query_end_ns || chunk_end < query_start_ns {
+            continue;
+        }
+
+        // Full containment: chunk covers the entire query.
+        if chunk_start <= query_start_ns && chunk_end >= query_end_ns {
+            match best_cover {
+                Some(prev) if prev.level <= chunk.level => {}
+                _ => best_cover = Some(chunk),
+            }
+        }
+
+        // Track best overlap (by overlap duration).
+        let overlap_start = chunk_start.max(query_start_ns);
+        let overlap_end = chunk_end.min(query_end_ns);
+        let overlap = overlap_end.saturating_sub(overlap_start);
+        match best_overlap {
+            Some((_, prev_overlap)) if prev_overlap >= overlap => {}
+            _ => best_overlap = Some((chunk, overlap)),
+        }
+    }
+
+    best_cover.or(best_overlap.map(|(c, _)| c))
 }
 
 fn main() -> Result<()> {
@@ -104,6 +240,9 @@ fn main() -> Result<()> {
     // Dispatch to subcommand handlers.
     if cli.ids.first().is_some_and(|value| value == "create") {
         return cmd_create(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "meta") {
+        return cmd_meta(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
     }
 
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref())?;
@@ -128,15 +267,23 @@ fn main() -> Result<()> {
 
         let mut first = true;
         for raw in &cli.ids {
-            let chunk_id = match resolve_chunk_id(&index, raw) {
-                Ok(chunk_id) => chunk_id,
-                Err(err) => {
-                    return Err(invalid_memory_id_error(raw, err));
-                }
+            let chunk = if raw.contains("..") {
+                // Time-range lookup.
+                let (start, end) = parse_time_range(raw)?;
+                find_chunk_by_time_range(&index, start, end)
+                    .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
+            } else {
+                // Hex prefix fallback.
+                let chunk_id = match resolve_chunk_id(&index, raw) {
+                    Ok(chunk_id) => chunk_id,
+                    Err(err) => {
+                        return Err(invalid_memory_id_error(raw, err));
+                    }
+                };
+                index
+                    .get(&chunk_id)
+                    .with_context(|| format!("missing chunk {raw}"))?
             };
-            let chunk = index
-                .get(&chunk_id)
-                .with_context(|| format!("missing chunk {raw}"))?;
             if !first {
                 println!();
             }
@@ -155,79 +302,157 @@ fn main() -> Result<()> {
 fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!(
-            "usage: memory create <lens> <summary...>\n\
+            "usage: memory create <lens> [--range <from>..<to>] <summary...>\n\
              \n\
              Create a memory chunk and store it in the pile.\n\
-             Reads branch_id and lens config from the config branch.\n\
-             Per-invocation context from environment variables:\n  \
-             FORK_LEVEL — chunk level (default 0)\n  \
-             FORK_EVENT_TIME_NS — event timestamp as TAI nanoseconds\n  \
-             FORK_ABOUT_EXEC_RESULT — exec result id (hex, optional)\n  \
-             FORK_ABOUT_ARCHIVE_MESSAGE — archive message id (hex, optional)\n  \
-             FORK_CHILD_IDS — comma-separated child chunk ids (hex, optional)"
+             Reads config from the config branch. Scans summary for\n\
+             (memory:<range>) links to infer children and level.\n\
+             Use --range for leaf memories with an explicit time range."
         );
     }
 
     let lens_name = &args[0];
-    let summary_text = args[1..].join(" ");
+
+    // Parse --range flag if present.
+    let mut explicit_range: Option<(Epoch, Epoch)> = None;
+    let mut summary_parts: Vec<&str> = Vec::new();
+    let mut skip_next = false;
+    for (i, arg) in args[1..].iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--range" {
+            if let Some(range_val) = args[1..].get(i + 1) {
+                explicit_range = Some(parse_time_range(range_val)?);
+                skip_next = true;
+                continue;
+            } else {
+                bail!("--range requires a value: --range <from>..<to>");
+            }
+        }
+        summary_parts.push(arg.as_str());
+    }
+    let summary_text = summary_parts.join(" ");
     if summary_text.is_empty() {
-        bail!("summary text is required: memory create <lens> <summary...>");
+        bail!("summary text is required: memory create <lens> [--range <from>..<to>] <summary...>");
     }
 
-    // When FORK_EVENT_TIME_NS is not set, run in validate-only mode:
-    // confirm the summary and lens name but skip the pile write.
-    let event_time_ns: i128 = match env::var("FORK_EVENT_TIME_NS") {
-        Ok(raw) => raw.parse().context("parse FORK_EVENT_TIME_NS")?,
-        Err(_) => {
-            println!("memory noted for {lens_name} lens.");
-            return Ok(());
-        }
-    };
-
-    let level: u64 = env::var("FORK_LEVEL")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .context("parse FORK_LEVEL")?;
-    let about_exec_result = parse_optional_hex_env("FORK_ABOUT_EXEC_RESULT")?;
-    let about_archive_message = parse_optional_hex_env("FORK_ABOUT_ARCHIVE_MESSAGE")?;
-    let child_ids = parse_child_ids_env()?;
-
-    let event_epoch = Epoch::from_tai_duration(Duration::from_total_nanoseconds(event_time_ns));
-    let event_time: Value<NsTAIInterval> = (event_epoch, event_epoch).to_value();
-    let now_epoch =
-        Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-    let created_at: Value<NsTAIInterval> = (now_epoch, now_epoch).to_value();
+    // Scan summary for (memory:<range>) references.
+    let memory_refs = scan_memory_links(&summary_text);
 
     with_repo(pile_path, |repo| {
-        let (branch_id, lens_id) = load_create_config(repo, lens_name)?;
+        let config = load_create_config(repo, lens_name)?;
 
+        // Resolve memory: references against context branch chunks.
+        let mut child_chunks: Vec<ResolvedChunk> = Vec::new();
+        let mut about_exec: Option<(Id, Value<NsTAIInterval>)> = None;
+        let mut about_archive: Option<(Id, Value<NsTAIInterval>)> = None;
+
+        if !memory_refs.is_empty() {
+            let ctx_catalog = {
+                let mut ws = repo
+                    .pull(config.branch_id)
+                    .map_err(|e| anyhow!("pull context branch: {e:?}"))?;
+                ws.checkout(..).context("checkout context branch")?
+            };
+            let index = load_chunks(&ctx_catalog);
+
+            for (raw_range, start, end) in &memory_refs {
+                let chunk = find_chunk_by_time_range(&index, *start, *end)
+                    .ok_or_else(|| anyhow!("memory link (memory:{raw_range}) does not match any chunk"))?;
+                child_chunks.push(ResolvedChunk {
+                    id: chunk.id,
+                    level: chunk.level,
+                    start_at: chunk.start_at,
+                    end_at: chunk.end_at,
+                });
+            }
+        }
+
+        // For leaf chunks with --range, resolve about_exec/about_archive by time.
+        if child_chunks.is_empty() {
+            if let Some((range_start, range_end)) = explicit_range {
+                if let Some(exec_catalog) = config.exec_branch_id.and_then(|bid| {
+                    repo.pull(bid)
+                        .ok()
+                        .and_then(|mut ws| ws.checkout(..).ok())
+                }) {
+                    about_exec = find_exec_by_time_range(&exec_catalog, range_start, range_end);
+                }
+                if about_exec.is_none() {
+                    if let Some(archive_catalog) = config.archive_branch_id.and_then(|bid| {
+                        repo.pull(bid)
+                            .ok()
+                            .and_then(|mut ws| ws.checkout(..).ok())
+                    }) {
+                        about_archive =
+                            find_archive_by_time_range(&archive_catalog, range_start, range_end);
+                    }
+                }
+            }
+        }
+
+        // Infer level and time from resolved references.
+        let (level, start_at, end_at) = if !child_chunks.is_empty() {
+            let max_level = child_chunks.iter().map(|c| c.level).max().unwrap_or(0);
+            let start = child_chunks
+                .iter()
+                .map(|c| c.start_at)
+                .min_by_key(|t| interval_key(*t))
+                .unwrap();
+            let end = child_chunks
+                .iter()
+                .map(|c| c.end_at)
+                .max_by_key(|t| interval_key(*t))
+                .unwrap();
+            (max_level + 1, start, end)
+        } else if let Some((range_start, range_end)) = explicit_range {
+            let start_val: Value<NsTAIInterval> = (range_start, range_start).to_value();
+            let end_val: Value<NsTAIInterval> = (range_end, range_end).to_value();
+            (0u64, start_val, end_val)
+        } else if let Some((_, time)) = about_exec {
+            (0u64, time, time)
+        } else if let Some((_, time)) = about_archive {
+            (0u64, time, time)
+        } else {
+            let now = Epoch::now()
+                .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+            let t: Value<NsTAIInterval> = (now, now).to_value();
+            (0u64, t, t)
+        };
+
+        // Write chunk entity.
         let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+            .pull(config.branch_id)
+            .map_err(|e| anyhow!("pull context branch for write: {e:?}"))?;
 
         let summary_handle = ws.put(summary_text.clone());
         let chunk_id = ufoid();
         let level_value: Value<U256BE> = level.to_value();
+        let now = Epoch::now()
+            .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+        let created_at: Value<NsTAIInterval> = (now, now).to_value();
 
         let mut change = TribleSet::new();
         change += entity! { &chunk_id @
             ctx::kind: KIND_CHUNK_ID,
-            ctx::lens_id: lens_id,
+            ctx::lens_id: config.lens_id,
             ctx::level: level_value,
             ctx::summary: summary_handle,
             ctx::created_at: created_at,
-            ctx::start_at: event_time,
-            ctx::end_at: event_time,
+            ctx::start_at: start_at,
+            ctx::end_at: end_at,
         };
 
-        if let Some(exec_id) = about_exec_result {
+        if let Some((exec_id, _)) = about_exec {
             change += entity! { &chunk_id @ ctx::about_exec_result: exec_id };
         }
-        if let Some(archive_id) = about_archive_message {
+        if let Some((archive_id, _)) = about_archive {
             change += entity! { &chunk_id @ ctx::about_archive_message: archive_id };
         }
-        for child_id in &child_ids {
-            change += entity! { &chunk_id @ ctx::child: *child_id };
+        for child in &child_chunks {
+            change += entity! { &chunk_id @ ctx::child: child.id };
         }
 
         ws.commit(
@@ -238,19 +463,29 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push failed: {e:?}"))?;
 
-        let chunk_id_released = chunk_id.release();
-        let hex = format!("{chunk_id_released:x}");
-        println!("memory created: {}", &hex[..8]);
+        let range_str = format_time_range(
+            epoch_from_interval(start_at),
+            epoch_end_from_interval(end_at),
+        );
+        println!("{range_str}");
         Ok(())
     })
 }
 
-/// Read branch_id (from latest config entity) and lens_id (from lens entry
-/// matching the given name) from the config branch.
+struct CreateConfig {
+    branch_id: Id,
+    lens_id: Id,
+    exec_branch_id: Option<Id>,
+    archive_branch_id: Option<Id>,
+}
+
+/// Read config from the config branch: context branch_id, lens_id matching
+/// the given name, and optional exec/archive branch IDs for reference
+/// resolution.
 fn load_create_config(
     repo: &mut Repository<Pile<Blake3>>,
     lens_name: &str,
-) -> Result<(Id, Id)> {
+) -> Result<CreateConfig> {
     let Some(_head) = repo
         .storage_mut()
         .head(CONFIG_BRANCH_ID)
@@ -266,9 +501,9 @@ fn load_create_config(
         .checkout(..)
         .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
 
-    // Find latest config entity → branch_id.
-    let mut latest_config: Option<(i128, Id)> = None;
-    for (_config_id, updated_at, branch_id) in find!(
+    // Find latest config entity → branch_id, config_entity_id.
+    let mut latest_config: Option<(i128, Id, Id)> = None;
+    for (config_id, updated_at, branch_id) in find!(
         (config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
         pattern!(&catalog, [{
             ?config_id @
@@ -280,13 +515,36 @@ fn load_create_config(
         let key = interval_key(updated_at);
         let branch_id = Id::from_value(&branch_id);
         match latest_config {
-            Some((best_key, _)) if best_key >= key => {}
-            _ => latest_config = Some((key, branch_id)),
+            Some((best_key, _, _)) if best_key >= key => {}
+            _ => latest_config = Some((key, config_id, branch_id)),
         }
     }
-    let branch_id = latest_config
-        .map(|(_, id)| id)
+    let (_, config_entity_id, branch_id) = latest_config
         .ok_or_else(|| anyhow!("config missing branch_id"))?;
+
+    // Optional: exec_branch_id from the config entity.
+    let exec_branch_id = find!(
+        (eid: Id, exec_bid: Value<GenId>),
+        pattern!(&catalog, [{
+            ?eid @
+            config_schema::exec_branch_id: ?exec_bid,
+        }])
+    )
+    .into_iter()
+    .find(|(eid, _)| *eid == config_entity_id)
+    .map(|(_, exec_bid)| Id::from_value(&exec_bid));
+
+    // Optional: archive_branch_id from the config entity.
+    let archive_branch_id = find!(
+        (eid: Id, archive_bid: Value<GenId>),
+        pattern!(&catalog, [{
+            ?eid @
+            config_schema::archive_branch_id: ?archive_bid,
+        }])
+    )
+    .into_iter()
+    .find(|(eid, _)| *eid == config_entity_id)
+    .map(|(_, archive_bid)| Id::from_value(&archive_bid));
 
     // Find lens entry matching the name → lens_id.
     let mut lens_candidates: Vec<(Id, Id, i128)> = Vec::new();
@@ -326,7 +584,12 @@ fn load_create_config(
         if let Some((_, name_handle)) = name_handles.into_iter().next() {
             let view: View<str> = ws.get(name_handle).context("read lens name")?;
             if view.as_ref() == lens_name {
-                return Ok((branch_id, *lens_id));
+                return Ok(CreateConfig {
+                    branch_id,
+                    lens_id: *lens_id,
+                    exec_branch_id,
+                    archive_branch_id,
+                });
             }
         }
     }
@@ -334,28 +597,362 @@ fn load_create_config(
     bail!("no memory lens named '{lens_name}' found in config")
 }
 
-fn parse_optional_hex_env(name: &str) -> Result<Option<Id>> {
-    match env::var(name) {
-        Ok(raw) if !raw.trim().is_empty() => {
-            let id = Id::from_hex(raw.trim())
-                .ok_or_else(|| anyhow!("{name}: invalid hex id"))?;
-            Ok(Some(id))
-        }
-        _ => Ok(None),
+// ---------------------------------------------------------------------------
+// meta subcommand
+// ---------------------------------------------------------------------------
+
+fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        bail!("usage: memory meta <id>");
     }
+
+    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+
+    with_repo(pile_path, |repo| {
+        // Load config for branch IDs and lens name resolution.
+        let config_catalog = {
+            let Some(_head) = repo
+                .storage_mut()
+                .head(CONFIG_BRANCH_ID)
+                .map_err(|e| anyhow!("config branch head: {e:?}"))?
+            else {
+                bail!("config branch is empty");
+            };
+            let mut ws = repo
+                .pull(CONFIG_BRANCH_ID)
+                .map_err(|e| anyhow!("pull config: {e:?}"))?;
+            ws.checkout(..).context("checkout config")?
+        };
+
+        let core_branch_id = {
+            let mut latest: Option<(i128, Id)> = None;
+            for (_config_id, updated_at, branch_id) in find!(
+                (_config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
+                pattern!(&config_catalog, [{
+                    ?_config_id @
+                    config_schema::kind: &KIND_CONFIG_ID,
+                    config_schema::updated_at: ?updated_at,
+                    config_schema::branch_id: ?branch_id,
+                }])
+            ) {
+                let key = interval_key(updated_at);
+                let bid = Id::from_value(&branch_id);
+                match latest {
+                    Some((best, _)) if best >= key => {}
+                    _ => latest = Some((key, bid)),
+                }
+            }
+            latest
+                .map(|(_, bid)| bid)
+                .ok_or_else(|| anyhow!("config missing branch_id"))?
+        };
+
+        let branch_id = explicit_branch_id.unwrap_or(core_branch_id);
+
+        // Load context branch.
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+        let catalog = ws.checkout(..).context("checkout branch")?;
+        let index = load_chunks(&catalog);
+
+        // Resolve chunk (time range or hex fallback).
+        let raw = &args[0];
+        let chunk = if raw.contains("..") {
+            let (start, end) = parse_time_range(raw)?;
+            find_chunk_by_time_range(&index, start, end)
+                .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
+        } else {
+            let chunk_id = resolve_chunk_id(&index, raw)
+                .map_err(|e| invalid_memory_id_error(raw, e))?;
+            index
+                .get(&chunk_id)
+                .with_context(|| format!("missing chunk {raw}"))?
+        };
+
+        // Resolve lens name from config.
+        let lens_name = resolve_lens_name(&mut ws, &config_catalog, chunk.lens_id);
+
+        // Print structural metadata.
+        let range = format_time_range(
+            epoch_from_interval(chunk.start_at),
+            epoch_end_from_interval(chunk.end_at),
+        );
+        println!("range: {}", range);
+        println!("id: {:x}", chunk.id);
+        match lens_name {
+            Some(name) => println!("lens: {} ({:x})", name, chunk.lens_id),
+            None => println!("lens: {:x}", chunk.lens_id),
+        }
+        println!("level: {}", chunk.level);
+
+        if !chunk.children.is_empty() {
+            let child_ranges: Vec<String> = chunk
+                .children
+                .iter()
+                .filter_map(|cid| index.get(cid))
+                .map(|c| {
+                    format_time_range(
+                        epoch_from_interval(c.start_at),
+                        epoch_end_from_interval(c.end_at),
+                    )
+                })
+                .collect();
+            println!("children: {}", child_ranges.join(", "));
+        }
+
+        if let Some(exec_id) = chunk.about_exec_result {
+            println!("about_exec_result: {exec_id:x}");
+        }
+
+        if let Some(archive_id) = chunk.about_archive_message {
+            println!("about_archive_message: {archive_id:x}");
+            // Resolve archive metadata if archive branch is available.
+            print_archive_meta(repo, &mut ws, &config_catalog, archive_id)?;
+        }
+
+        Ok(())
+    })
 }
 
-fn parse_child_ids_env() -> Result<Vec<Id>> {
-    let raw = match env::var("FORK_CHILD_IDS") {
-        Ok(raw) if !raw.trim().is_empty() => raw,
-        _ => return Ok(Vec::new()),
+fn resolve_lens_name(
+    ws: &mut Workspace<Pile<Blake3>>,
+    config_catalog: &TribleSet,
+    lens_id: Id,
+) -> Option<String> {
+    // Find the config entry that maps to this lens_id, then look up its name.
+    for (entry_id, found_lens_id) in find!(
+        (entry_id: Id, found_lens_id: Value<GenId>),
+        pattern!(config_catalog, [{
+            ?entry_id @
+            config_schema::kind: &KIND_MEMORY_LENS_ID,
+            config_schema::memory_lens_id: ?found_lens_id,
+        }])
+    ) {
+        if Id::from_value(&found_lens_id) == lens_id {
+            // Look up name on this entry.
+            for (eid, name_handle) in find!(
+                (eid: Id, name: Value<Handle<Blake3, LongString>>),
+                pattern!(config_catalog, [{ ?eid @ metadata::name: ?name }])
+            ) {
+                if eid == entry_id {
+                    if let Ok(view) = ws.get::<View<str>, LongString>(name_handle) {
+                        return Some(view.as_ref().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn print_archive_meta(
+    repo: &mut Repository<Pile<Blake3>>,
+    ws: &mut Workspace<Pile<Blake3>>,
+    config_catalog: &TribleSet,
+    archive_msg_id: Id,
+) -> Result<()> {
+    // Find archive_branch_id from config.
+    let mut latest_config: Option<(i128, Id)> = None;
+    for (config_id, updated_at) in find!(
+        (config_id: Id, updated_at: Value<NsTAIInterval>),
+        pattern!(config_catalog, [{
+            ?config_id @
+            config_schema::kind: &KIND_CONFIG_ID,
+            config_schema::updated_at: ?updated_at,
+        }])
+    ) {
+        let key = interval_key(updated_at);
+        match latest_config {
+            Some((best, _)) if best >= key => {}
+            _ => latest_config = Some((key, config_id)),
+        }
+    }
+    let Some((_, config_entity_id)) = latest_config else {
+        return Ok(());
     };
-    raw.split(',')
-        .map(|s| {
-            Id::from_hex(s.trim())
-                .ok_or_else(|| anyhow!("FORK_CHILD_IDS: invalid hex id '{}'", s.trim()))
-        })
-        .collect()
+
+    let archive_branch_id = find!(
+        (eid: Id, archive_bid: Value<GenId>),
+        pattern!(config_catalog, [{
+            ?eid @
+            config_schema::archive_branch_id: ?archive_bid,
+        }])
+    )
+    .into_iter()
+    .find(|(eid, _)| *eid == config_entity_id)
+    .map(|(_, bid)| Id::from_value(&bid));
+
+    let Some(archive_branch_id) = archive_branch_id else {
+        return Ok(());
+    };
+
+    // Pull archive branch.
+    let archive_catalog = match repo.pull(archive_branch_id) {
+        Ok(mut archive_ws) => match archive_ws.checkout(..) {
+            Ok(cat) => cat,
+            Err(_) => return Ok(()),
+        },
+        Err(_) => return Ok(()),
+    };
+
+    // Author (as id prefix).
+    for (_msg_id, author_id) in find!(
+        (msg_id: Id, author_id: Value<GenId>),
+        pattern!(&archive_catalog, [{
+            ?msg_id @
+            archive_schema::author: ?author_id,
+        }])
+    ) {
+        if _msg_id == archive_msg_id {
+            let author_id = Id::from_value(&author_id);
+            // Try to resolve author name.
+            let mut author_name: Option<String> = None;
+            for (_aid, name_handle) in find!(
+                (aid: Id, name: Value<Handle<Blake3, LongString>>),
+                pattern!(&archive_catalog, [{
+                    ?aid @
+                    archive_schema::author_name: ?name,
+                }])
+            ) {
+                if _aid == archive_msg_id {
+                    if let Ok(view) = ws.get::<View<str>, LongString>(name_handle) {
+                        author_name = Some(view.as_ref().to_string());
+                    }
+                }
+            }
+            match author_name {
+                Some(name) => println!("  author: {} ({:x})", name, author_id),
+                None => println!("  author: {:x}", author_id),
+            }
+            break;
+        }
+    }
+
+    // Source format.
+    for (_msg_id, fmt) in find!(
+        (msg_id: Id, fmt: Value<ShortString>),
+        pattern!(&archive_catalog, [{
+            ?msg_id @
+            archive_import_schema::source_format: ?fmt,
+        }])
+    ) {
+        if _msg_id == archive_msg_id {
+            let fmt_str = std::str::from_utf8(&fmt.raw)
+                .unwrap_or("<invalid utf8>")
+                .trim_end_matches('\0');
+            println!("  source_format: {}", fmt_str);
+            break;
+        }
+    }
+
+    // Source conversation id.
+    for (_msg_id, conv_handle) in find!(
+        (msg_id: Id, conv: Value<Handle<Blake3, LongString>>),
+        pattern!(&archive_catalog, [{
+            ?msg_id @
+            archive_import_schema::source_conversation_id: ?conv,
+        }])
+    ) {
+        if _msg_id == archive_msg_id {
+            if let Ok(view) = ws.get::<View<str>, LongString>(conv_handle) {
+                println!("  conversation: {}", view.as_ref());
+            }
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// memory link scanning and time-range entity resolution
+// ---------------------------------------------------------------------------
+
+struct ResolvedChunk {
+    id: Id,
+    level: u64,
+    start_at: Value<NsTAIInterval>,
+    end_at: Value<NsTAIInterval>,
+}
+
+/// Scan text for `(memory:<range>)` patterns and return parsed time ranges.
+/// Each entry: (raw_range_text, start_epoch, end_epoch).
+fn scan_memory_links(text: &str) -> Vec<(String, Epoch, Epoch)> {
+    let mut refs = Vec::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("(memory:") {
+        let after = &remaining[start + 8..];
+        if let Some(end) = after.find(')') {
+            let range_text = after[..end].trim();
+            if let Ok((from, to)) = parse_time_range(range_text) {
+                refs.push((range_text.to_string(), from, to));
+            }
+        }
+        remaining = &remaining[start + 8..];
+    }
+    refs
+}
+
+/// Find the exec result whose finished_at falls within the given time range.
+fn find_exec_by_time_range(
+    catalog: &TribleSet,
+    query_start: Epoch,
+    query_end: Epoch,
+) -> Option<(Id, Value<NsTAIInterval>)> {
+    let qs = query_start.to_tai_duration().total_nanoseconds();
+    let qe = query_end.to_tai_duration().total_nanoseconds();
+    let mut best: Option<(Id, Value<NsTAIInterval>, i128)> = None;
+
+    for (result_id, finished_at) in find!(
+        (result_id: Id, finished_at: Value<NsTAIInterval>),
+        pattern!(catalog, [{
+            ?result_id @
+            exec_schema::kind: &KIND_EXEC_RESULT,
+            exec_schema::finished_at: ?finished_at,
+        }])
+    ) {
+        let t = interval_key(finished_at);
+        if t >= qs && t <= qe {
+            // Prefer the closest to query_start.
+            let dist = (t - qs).abs();
+            match best {
+                Some((_, _, prev_dist)) if prev_dist <= dist => {}
+                _ => best = Some((result_id, finished_at, dist)),
+            }
+        }
+    }
+    best.map(|(id, t, _)| (id, t))
+}
+
+/// Find the archive message whose created_at falls within the given time range.
+fn find_archive_by_time_range(
+    catalog: &TribleSet,
+    query_start: Epoch,
+    query_end: Epoch,
+) -> Option<(Id, Value<NsTAIInterval>)> {
+    let qs = query_start.to_tai_duration().total_nanoseconds();
+    let qe = query_end.to_tai_duration().total_nanoseconds();
+    let mut best: Option<(Id, Value<NsTAIInterval>, i128)> = None;
+
+    for (msg_id, created_at) in find!(
+        (msg_id: Id, created_at: Value<NsTAIInterval>),
+        pattern!(catalog, [{
+            ?msg_id @
+            archive_schema::kind: &KIND_ARCHIVE_MESSAGE,
+            archive_schema::created_at: ?created_at,
+        }])
+    ) {
+        let t = interval_key(created_at);
+        if t >= qs && t <= qe {
+            let dist = (t - qs).abs();
+            match best {
+                Some((_, _, prev_dist)) if prev_dist <= dist => {}
+                _ => best = Some((msg_id, created_at, dist)),
+            }
+        }
+    }
+    best.map(|(id, t, _)| (id, t))
 }
 
 // ---------------------------------------------------------------------------
@@ -420,6 +1017,9 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         let level = u256be_to_u64(level).unwrap_or_default();
+        // start_at/end_at populated in a secondary pass below.
+        let zero_epoch = Epoch::from_gregorian_tai(1970, 1, 1, 0, 0, 0, 0);
+        let zero_interval: Value<NsTAIInterval> = (zero_epoch, zero_epoch).to_value();
         chunks.insert(
             chunk_id,
             Chunk {
@@ -427,8 +1027,11 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
                 lens_id: Id::from_value(&lens_id),
                 level,
                 summary,
+                start_at: zero_interval,
+                end_at: zero_interval,
                 children: Vec::new(),
                 about_exec_result: None,
+                about_archive_message: None,
             },
         );
     }
@@ -485,17 +1088,49 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }
     }
 
-    let start_by_id: HashMap<Id, i128> = find!(
+    for (chunk_id, archive_id) in find!(
+        (chunk_id: Id, archive_id: Value<GenId>),
+        pattern!(space, [{
+            ?chunk_id @
+            ctx::kind: &KIND_CHUNK_ID,
+            ctx::about_archive_message: ?archive_id,
+        }])
+    ) {
+        if let Some(chunk) = chunks.get_mut(&chunk_id) {
+            chunk.about_archive_message = Some(Id::from_value(&archive_id));
+        }
+    }
+
+    for (chunk_id, start_at) in find!(
         (chunk_id: Id, start_at: Value<NsTAIInterval>),
         pattern!(space, [{
             ?chunk_id @
             ctx::kind: &KIND_CHUNK_ID,
             ctx::start_at: ?start_at,
         }])
-    )
-    .into_iter()
-    .map(|(chunk_id, start_at)| (chunk_id, interval_key(start_at)))
-    .collect();
+    ) {
+        if let Some(chunk) = chunks.get_mut(&chunk_id) {
+            chunk.start_at = start_at;
+        }
+    }
+
+    for (chunk_id, end_at) in find!(
+        (chunk_id: Id, end_at: Value<NsTAIInterval>),
+        pattern!(space, [{
+            ?chunk_id @
+            ctx::kind: &KIND_CHUNK_ID,
+            ctx::end_at: ?end_at,
+        }])
+    ) {
+        if let Some(chunk) = chunks.get_mut(&chunk_id) {
+            chunk.end_at = end_at;
+        }
+    }
+
+    let start_by_id: HashMap<Id, i128> = chunks
+        .values()
+        .map(|c| (c.id, interval_key(c.start_at)))
+        .collect();
     for chunk in chunks.values_mut() {
         chunk.children.sort_by_key(|child_id| {
             (
@@ -519,26 +1154,6 @@ fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
 }
 
 fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, chunk: &Chunk) -> Result<()> {
-    let mut header = format!(
-        "mem {} lens={} lvl={}",
-        id_prefix(chunk.id),
-        id_prefix(chunk.lens_id),
-        chunk.level
-    );
-    if let Some(exec_id) = chunk.about_exec_result {
-        header.push_str(&format!(" exec={}", id_prefix(exec_id)));
-    }
-    if !chunk.children.is_empty() {
-        header.push_str(" children=");
-        for (idx, child) in chunk.children.iter().enumerate() {
-            if idx > 0 {
-                header.push(',');
-            }
-            header.push_str(id_prefix(*child).as_str());
-        }
-    }
-    println!("{header}");
-
     let summary: View<str> = ws.get(chunk.summary).context("read chunk summary")?;
     print!("{}", summary.trim_end());
     println!();
