@@ -18,18 +18,16 @@ use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
-use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 
 const KIND_CONFIG_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
-const KIND_MEMORY_LENS_ID: Id = id_hex!("D982F64C48F263A312D6E342D09554B0");
 const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 
 mod config_schema {
@@ -38,7 +36,6 @@ mod config_schema {
         "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as branch_id: GenId;
-        "24CF9D532E03C44CF719546DDE7E0493" as memory_lens_id: GenId;
         "C188E12ABBDD83D283A23DBAD4B784AF" as exec_branch_id: GenId;
         "047112FC535518D289E64FBE0B60F06E" as archive_branch_id: GenId;
     }
@@ -78,12 +75,10 @@ mod ctx {
     use super::*;
     attributes! {
         "81E520987033BE71EB0AFFA8297DE613" as kind: GenId;
-        "8D5B05B6360EDFB6101A3E9A73A32F43" as level: U256BE;
         "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<Blake3, LongString>;
         "3D5865566AF5118471DA1FF7F87CB791" as created_at: NsTAIInterval;
         "4EAF7FE3122A0AE2D8309B79DCCB8D75" as start_at: NsTAIInterval;
         "95D629052C40FA09B378DDC507BEA0D3" as end_at: NsTAIInterval;
-        "2407DD8440508B474B073A5ECF098500" as lens_id: GenId;
         "9B83D68AECD6888AA9CE95E754494768" as child: GenId;
         "CB97C36A32DEC70E0D1149E7C5D88588" as left: GenId;
         "087D07E3D9D94F0C4E96813C7BC5E74C" as right: GenId;
@@ -97,10 +92,9 @@ mod ctx {
     name = "memory",
     about = "Show compacted context chunks (drill down by narrowing the time range).\n\n\
              Subcommands:\n  \
-             memory <from>..<to>             — show best summary covering a time range\n  \
-             memory meta <from>..<to>        — show structural metadata for a time range\n  \
-             memory turn <turn-id>           — list memory facets for a turn (debug)\n  \
-             memory create <lens> <summary>  — create a memory chunk\n\n\
+             memory <from>..<to>              — show best summary covering a time range\n  \
+             memory meta <from>..<to>         — show structural metadata for a time range\n  \
+             memory create [<range>] <summary> — create a memory chunk\n\n\
              Time format: YYYY-MM-DDTHH:MM:SS..YYYY-MM-DDTHH:MM:SS (TAI)\n\
              Hex id prefixes also accepted as fallback."
 )]
@@ -111,7 +105,7 @@ struct Cli {
     /// Optional explicit branch id (hex) to read chunks from (defaults to config.branch_id).
     #[arg(long, global = true)]
     branch_id: Option<String>,
-    /// One or more chunk ids / id prefixes to show, or `turn <turn-id>`, or `create <lens> <summary>`.
+    /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
     #[arg(value_name = "ID")]
     ids: Vec<String>,
 }
@@ -119,8 +113,6 @@ struct Cli {
 #[derive(Debug, Clone)]
 struct Chunk {
     id: Id,
-    lens_id: Id,
-    level: u64,
     summary: Value<Handle<Blake3, LongString>>,
     start_at: Value<NsTAIInterval>,
     end_at: Value<NsTAIInterval>,
@@ -181,8 +173,8 @@ fn epoch_end_from_interval(interval: Value<NsTAIInterval>) -> Epoch {
 }
 
 /// Find the best chunk covering a query time range.
-/// Prefers: lowest-level chunk that fully contains the query.
-/// Fallback: best partial overlap at any level.
+/// Prefers: narrowest chunk that fully contains the query (most specific).
+/// Fallback: best partial overlap.
 fn find_chunk_by_time_range<'a>(
     chunks: &'a HashMap<Id, Chunk>,
     query_start: Epoch,
@@ -191,7 +183,7 @@ fn find_chunk_by_time_range<'a>(
     let query_start_ns = query_start.to_tai_duration().total_nanoseconds();
     let query_end_ns = query_end.to_tai_duration().total_nanoseconds();
 
-    let mut best_cover: Option<&Chunk> = None;
+    let mut best_cover: Option<(&Chunk, i128)> = None; // (chunk, width)
     let mut best_overlap: Option<(&Chunk, i128)> = None;
 
     for chunk in chunks.values() {
@@ -207,11 +199,12 @@ fn find_chunk_by_time_range<'a>(
             continue;
         }
 
-        // Full containment: chunk covers the entire query.
+        // Full containment: chunk covers the entire query. Prefer narrowest.
         if chunk_start <= query_start_ns && chunk_end >= query_end_ns {
+            let width = chunk_end - chunk_start;
             match best_cover {
-                Some(prev) if prev.level <= chunk.level => {}
-                _ => best_cover = Some(chunk),
+                Some((_, prev_width)) if prev_width <= width => {}
+                _ => best_cover = Some((chunk, width)),
             }
         }
 
@@ -225,7 +218,9 @@ fn find_chunk_by_time_range<'a>(
         }
     }
 
-    best_cover.or(best_overlap.map(|(c, _)| c))
+    best_cover
+        .map(|(c, _)| c)
+        .or(best_overlap.map(|(c, _)| c))
 }
 
 fn main() -> Result<()> {
@@ -302,50 +297,45 @@ fn main() -> Result<()> {
 fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
     if args.is_empty() {
         bail!(
-            "usage: memory create <lens> [--range <from>..<to>] <summary...>\n\
+            "usage: memory create [<from>..<to>] <summary...>\n\
              \n\
              Create a memory chunk and store it in the pile.\n\
              Reads config from the config branch. Scans summary for\n\
-             (memory:<range>) links to infer children and level.\n\
-             Use --range for leaf memories with an explicit time range."
+             (memory:<range>) links to infer children.\n\
+             An optional time range as the first argument grounds the\n\
+             memory in that period. Without it, defaults to now."
         );
     }
 
-    let lens_name = &args[0];
-
-    // Parse --range flag if present.
+    // If the first argument looks like a time range, parse it.
     let mut explicit_range: Option<(Epoch, Epoch)> = None;
-    let mut summary_parts: Vec<&str> = Vec::new();
-    let mut skip_next = false;
-    for (i, arg) in args[1..].iter().enumerate() {
-        if skip_next {
-            skip_next = false;
-            continue;
+    let summary_start_idx;
+    if args[0].contains("..") {
+        if let Ok(range) = parse_time_range(&args[0]) {
+            explicit_range = Some(range);
+            summary_start_idx = 1;
+        } else {
+            summary_start_idx = 0;
         }
-        if arg == "--range" {
-            if let Some(range_val) = args[1..].get(i + 1) {
-                explicit_range = Some(parse_time_range(range_val)?);
-                skip_next = true;
-                continue;
-            } else {
-                bail!("--range requires a value: --range <from>..<to>");
-            }
-        }
-        summary_parts.push(arg.as_str());
+    } else {
+        summary_start_idx = 0;
     }
-    let summary_text = summary_parts.join(" ");
+
+    let summary_text: String = args[summary_start_idx..].join(" ");
     if summary_text.is_empty() {
-        bail!("summary text is required: memory create <lens> [--range <from>..<to>] <summary...>");
+        bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
 
     // Scan summary for (memory:<range>) references.
     let memory_refs = scan_memory_links(&summary_text);
 
     with_repo(pile_path, |repo| {
-        let config = load_create_config(repo, lens_name)?;
+        let config = load_create_config(repo)?;
 
         // Resolve memory: references against context branch chunks.
-        let mut child_chunks: Vec<ResolvedChunk> = Vec::new();
+        let mut child_ids: Vec<Id> = Vec::new();
+        let mut children_start: Option<Value<NsTAIInterval>> = None;
+        let mut children_end: Option<Value<NsTAIInterval>> = None;
         let mut about_exec: Option<(Id, Value<NsTAIInterval>)> = None;
         let mut about_archive: Option<(Id, Value<NsTAIInterval>)> = None;
 
@@ -361,17 +351,21 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             for (raw_range, start, end) in &memory_refs {
                 let chunk = find_chunk_by_time_range(&index, *start, *end)
                     .ok_or_else(|| anyhow!("memory link (memory:{raw_range}) does not match any chunk"))?;
-                child_chunks.push(ResolvedChunk {
-                    id: chunk.id,
-                    level: chunk.level,
-                    start_at: chunk.start_at,
-                    end_at: chunk.end_at,
-                });
+                child_ids.push(chunk.id);
+                // Track union time span of children.
+                match children_start {
+                    Some(prev) if interval_key(prev) <= interval_key(chunk.start_at) => {}
+                    _ => children_start = Some(chunk.start_at),
+                }
+                match children_end {
+                    Some(prev) if interval_key(prev) >= interval_key(chunk.end_at) => {}
+                    _ => children_end = Some(chunk.end_at),
+                }
             }
         }
 
-        // For leaf chunks with --range, resolve about_exec/about_archive by time.
-        if child_chunks.is_empty() {
+        // For memories without children and with a range, resolve provenance.
+        if child_ids.is_empty() {
             if let Some((range_start, range_end)) = explicit_range {
                 if let Some(exec_catalog) = config.exec_branch_id.and_then(|bid| {
                     repo.pull(bid)
@@ -393,33 +387,22 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             }
         }
 
-        // Infer level and time from resolved references.
-        let (level, start_at, end_at) = if !child_chunks.is_empty() {
-            let max_level = child_chunks.iter().map(|c| c.level).max().unwrap_or(0);
-            let start = child_chunks
-                .iter()
-                .map(|c| c.start_at)
-                .min_by_key(|t| interval_key(*t))
-                .unwrap();
-            let end = child_chunks
-                .iter()
-                .map(|c| c.end_at)
-                .max_by_key(|t| interval_key(*t))
-                .unwrap();
-            (max_level + 1, start, end)
+        // Infer time span.
+        let (start_at, end_at) = if let (Some(s), Some(e)) = (children_start, children_end) {
+            (s, e)
         } else if let Some((range_start, range_end)) = explicit_range {
             let start_val: Value<NsTAIInterval> = (range_start, range_start).to_value();
             let end_val: Value<NsTAIInterval> = (range_end, range_end).to_value();
-            (0u64, start_val, end_val)
+            (start_val, end_val)
         } else if let Some((_, time)) = about_exec {
-            (0u64, time, time)
+            (time, time)
         } else if let Some((_, time)) = about_archive {
-            (0u64, time, time)
+            (time, time)
         } else {
             let now = Epoch::now()
                 .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
             let t: Value<NsTAIInterval> = (now, now).to_value();
-            (0u64, t, t)
+            (t, t)
         };
 
         // Write chunk entity.
@@ -429,7 +412,6 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
 
         let summary_handle = ws.put(summary_text.clone());
         let chunk_id = ufoid();
-        let level_value: Value<U256BE> = level.to_value();
         let now = Epoch::now()
             .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
         let created_at: Value<NsTAIInterval> = (now, now).to_value();
@@ -437,8 +419,6 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         let mut change = TribleSet::new();
         change += entity! { &chunk_id @
             ctx::kind: KIND_CHUNK_ID,
-            ctx::lens_id: config.lens_id,
-            ctx::level: level_value,
             ctx::summary: summary_handle,
             ctx::created_at: created_at,
             ctx::start_at: start_at,
@@ -451,14 +431,14 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         if let Some((archive_id, _)) = about_archive {
             change += entity! { &chunk_id @ ctx::about_archive_message: archive_id };
         }
-        for child in &child_chunks {
-            change += entity! { &chunk_id @ ctx::child: child.id };
+        for child_id in &child_ids {
+            change += entity! { &chunk_id @ ctx::child: *child_id };
         }
 
         ws.commit(
             change,
             None,
-            Some(&format!("memory create {lens_name} lvl={level}")),
+            Some("memory create"),
         );
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push failed: {e:?}"))?;
@@ -467,25 +447,21 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             epoch_from_interval(start_at),
             epoch_end_from_interval(end_at),
         );
-        println!("{range_str}");
+        println!("range: {range_str}");
+        println!("id: {:x}", chunk_id.id);
         Ok(())
     })
 }
 
 struct CreateConfig {
     branch_id: Id,
-    lens_id: Id,
     exec_branch_id: Option<Id>,
     archive_branch_id: Option<Id>,
 }
 
-/// Read config from the config branch: context branch_id, lens_id matching
-/// the given name, and optional exec/archive branch IDs for reference
-/// resolution.
-fn load_create_config(
-    repo: &mut Repository<Pile<Blake3>>,
-    lens_name: &str,
-) -> Result<CreateConfig> {
+/// Read config from the config branch: context branch_id and optional
+/// exec/archive branch IDs for provenance resolution.
+fn load_create_config(repo: &mut Repository<Pile<Blake3>>) -> Result<CreateConfig> {
     let Some(_head) = repo
         .storage_mut()
         .head(CONFIG_BRANCH_ID)
@@ -546,55 +522,11 @@ fn load_create_config(
     .find(|(eid, _)| *eid == config_entity_id)
     .map(|(_, archive_bid)| Id::from_value(&archive_bid));
 
-    // Find lens entry matching the name → lens_id.
-    let mut lens_candidates: Vec<(Id, Id, i128)> = Vec::new();
-    for (entry_id, lens_id, updated_at) in find!(
-        (entry_id: Id, lens_id: Value<GenId>, updated_at: Value<NsTAIInterval>),
-        pattern!(&catalog, [{
-            ?entry_id @
-            config_schema::kind: &KIND_MEMORY_LENS_ID,
-            config_schema::updated_at: ?updated_at,
-            config_schema::memory_lens_id: ?lens_id,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        let lens_id = Id::from_value(&lens_id);
-        lens_candidates.push((entry_id, lens_id, key));
-    }
-
-    // Keep only the latest entry per lens_id.
-    lens_candidates.sort_by(|a, b| b.2.cmp(&a.2));
-    let mut seen_lens_ids = std::collections::HashSet::new();
-    let latest_entries: Vec<(Id, Id)> = lens_candidates
-        .into_iter()
-        .filter(|(_, lens_id, _)| seen_lens_ids.insert(*lens_id))
-        .map(|(entry_id, lens_id, _)| (entry_id, lens_id))
-        .collect();
-
-    // Match by name.
-    for (entry_id, lens_id) in &latest_entries {
-        let name_handles: Vec<_> = find!(
-            (eid: Id, name: Value<Handle<Blake3, LongString>>),
-            pattern!(&catalog, [{ ?eid @ metadata::name: ?name }])
-        )
-        .into_iter()
-        .filter(|(eid, _)| *eid == *entry_id)
-        .collect();
-
-        if let Some((_, name_handle)) = name_handles.into_iter().next() {
-            let view: View<str> = ws.get(name_handle).context("read lens name")?;
-            if view.as_ref() == lens_name {
-                return Ok(CreateConfig {
-                    branch_id,
-                    lens_id: *lens_id,
-                    exec_branch_id,
-                    archive_branch_id,
-                });
-            }
-        }
-    }
-
-    bail!("no memory lens named '{lens_name}' found in config")
+    Ok(CreateConfig {
+        branch_id,
+        exec_branch_id,
+        archive_branch_id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +541,7 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
     let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
 
     with_repo(pile_path, |repo| {
-        // Load config for branch IDs and lens name resolution.
+        // Load config for branch IDs and archive metadata resolution.
         let config_catalog = {
             let Some(_head) = repo
                 .storage_mut()
@@ -670,9 +602,6 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
                 .with_context(|| format!("missing chunk {raw}"))?
         };
 
-        // Resolve lens name from config.
-        let lens_name = resolve_lens_name(&mut ws, &config_catalog, chunk.lens_id);
-
         // Print structural metadata.
         let range = format_time_range(
             epoch_from_interval(chunk.start_at),
@@ -680,11 +609,6 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
         );
         println!("range: {}", range);
         println!("id: {:x}", chunk.id);
-        match lens_name {
-            Some(name) => println!("lens: {} ({:x})", name, chunk.lens_id),
-            None => println!("lens: {:x}", chunk.lens_id),
-        }
-        println!("level: {}", chunk.level);
 
         if !chunk.children.is_empty() {
             let child_ranges: Vec<String> = chunk
@@ -713,37 +637,6 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 
         Ok(())
     })
-}
-
-fn resolve_lens_name(
-    ws: &mut Workspace<Pile<Blake3>>,
-    config_catalog: &TribleSet,
-    lens_id: Id,
-) -> Option<String> {
-    // Find the config entry that maps to this lens_id, then look up its name.
-    for (entry_id, found_lens_id) in find!(
-        (entry_id: Id, found_lens_id: Value<GenId>),
-        pattern!(config_catalog, [{
-            ?entry_id @
-            config_schema::kind: &KIND_MEMORY_LENS_ID,
-            config_schema::memory_lens_id: ?found_lens_id,
-        }])
-    ) {
-        if Id::from_value(&found_lens_id) == lens_id {
-            // Look up name on this entry.
-            for (eid, name_handle) in find!(
-                (eid: Id, name: Value<Handle<Blake3, LongString>>),
-                pattern!(config_catalog, [{ ?eid @ metadata::name: ?name }])
-            ) {
-                if eid == entry_id {
-                    if let Ok(view) = ws.get::<View<str>, LongString>(name_handle) {
-                        return Some(view.as_ref().to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 fn print_archive_meta(
@@ -868,13 +761,6 @@ fn print_archive_meta(
 // ---------------------------------------------------------------------------
 // memory link scanning and time-range entity resolution
 // ---------------------------------------------------------------------------
-
-struct ResolvedChunk {
-    id: Id,
-    level: u64,
-    start_at: Value<NsTAIInterval>,
-    end_at: Value<NsTAIInterval>,
-}
 
 /// Scan text for `(memory:<range>)` patterns and return parsed time ranges.
 /// Each entry: (raw_range_text, start_epoch, end_epoch).
@@ -1001,22 +887,17 @@ fn load_core_branch_id(repo: &mut Repository<Pile<Blake3>>) -> Result<Id> {
 fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
     let mut chunks = HashMap::<Id, Chunk>::new();
 
-    for (chunk_id, lens_id, level, summary) in find!(
+    for (chunk_id, summary) in find!(
         (
             chunk_id: Id,
-            lens_id: Value<GenId>,
-            level: Value<U256BE>,
             summary: Value<Handle<Blake3, LongString>>
         ),
         pattern!(space, [{
             ?chunk_id @
             ctx::kind: &KIND_CHUNK_ID,
-            ctx::lens_id: ?lens_id,
-            ctx::level: ?level,
             ctx::summary: ?summary,
         }])
     ) {
-        let level = u256be_to_u64(level).unwrap_or_default();
         // start_at/end_at populated in a secondary pass below.
         let zero_epoch = Epoch::from_gregorian_tai(1970, 1, 1, 0, 0, 0, 0);
         let zero_interval: Value<NsTAIInterval> = (zero_epoch, zero_epoch).to_value();
@@ -1024,8 +905,6 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
             chunk_id,
             Chunk {
                 id: chunk_id,
-                lens_id: Id::from_value(&lens_id),
-                level,
                 summary,
                 start_at: zero_interval,
                 end_at: zero_interval,
@@ -1144,15 +1023,6 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
     chunks
 }
 
-fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
-    let raw = value.raw;
-    if raw[..24].iter().any(|byte| *byte != 0) {
-        return None;
-    }
-    let bytes: [u8; 8] = raw[24..32].try_into().ok()?;
-    Some(u64::from_be_bytes(bytes))
-}
-
 fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, chunk: &Chunk) -> Result<()> {
     let summary: View<str> = ws.get(chunk.summary).context("read chunk summary")?;
     print!("{}", summary.trim_end());
@@ -1220,7 +1090,13 @@ fn print_turn_facets(ws: &mut Workspace<Pile<Blake3>>, index: &HashMap<Id, Chunk
         .iter()
         .filter_map(|(_, chunk_id)| index.get(chunk_id))
         .collect();
-    chunks.sort_unstable_by(|a, b| a.level.cmp(&b.level).then(a.id.cmp(&b.id)));
+    chunks.sort_unstable_by(|a, b| {
+        let a_width = epoch_end_from_interval(a.end_at).to_tai_duration().total_nanoseconds()
+            - epoch_from_interval(a.start_at).to_tai_duration().total_nanoseconds();
+        let b_width = epoch_end_from_interval(b.end_at).to_tai_duration().total_nanoseconds()
+            - epoch_from_interval(b.start_at).to_tai_duration().total_nanoseconds();
+        a_width.cmp(&b_width).then(a.id.cmp(&b.id))
+    });
 
     println!(
         "turn {} has {} memory facet(s)",

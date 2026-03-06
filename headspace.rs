@@ -32,25 +32,11 @@ use triblespace::prelude::*;
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_STREAM: bool = false;
-const DEFAULT_REASONING_SUMMARY: LlmReasoningSummary = LlmReasoningSummary::Detailed;
+const DEFAULT_REASONING_SUMMARY: ModelReasoningSummary = ModelReasoningSummary::Detailed;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
-const DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS: u64 = 512;
-const DEFAULT_PROMPT_CHARS_PER_TOKEN: u64 = 4;
-const DEFAULT_MEMORY_LENS_FACTUAL_PROMPT: &str = include_str!("../prompts/memory_lens_factual.md");
-const DEFAULT_MEMORY_LENS_TECHNICAL_PROMPT: &str =
-    include_str!("../prompts/memory_lens_technical.md");
-const DEFAULT_MEMORY_LENS_EMOTIONAL_PROMPT: &str =
-    include_str!("../prompts/memory_lens_emotional.md");
-const DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_PROMPT: &str =
-    include_str!("../prompts/memory_lens_factual_compaction.md");
-const DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_PROMPT: &str =
-    include_str!("../prompts/memory_lens_technical_compaction.md");
-const DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_PROMPT: &str =
-    include_str!("../prompts/memory_lens_emotional_compaction.md");
-const DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS: u64 = 192;
-const DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS: u64 = 224;
-const DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS: u64 = 96;
+const DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS: u64 = 512;
+const DEFAULT_CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system_prompt.md");
 
 const DEFAULT_BRANCH: &str = "cognition";
@@ -69,11 +55,7 @@ const DEFAULT_POLL_MS: u64 = 1;
 const CONFIG_BRANCH: &str = "config";
 const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
 const KIND_CONFIG_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
-const KIND_LLM_PROFILE_ID: Id = id_hex!("B08E356C4B08F44AB7EC177D47129447");
-const KIND_MEMORY_LENS_ID: Id = id_hex!("D982F64C48F263A312D6E342D09554B0");
-const MEMORY_LENS_ID_FACTUAL: Id = id_hex!("E39414C1875CB127BC7E2F4C42CB3C17");
-const MEMORY_LENS_ID_TECHNICAL: Id = id_hex!("6D6BC80F284B56CAA2AFDE8C841EE894");
-const MEMORY_LENS_ID_EMOTIONAL: Id = id_hex!("1B7C34E5C9718DE01020CA3C0EF50387");
+const KIND_MODEL_PROFILE_ID: Id = id_hex!("B08E356C4B08F44AB7EC177D47129447");
 
 mod playground_config {
     use super::*;
@@ -95,27 +77,21 @@ mod playground_config {
         "F0F90572249284CD57E48580369DEB6D" as author: Handle<Blake3, LongString>;
         "98A194178CFD7CBB915C1BC9EB561A7F" as author_role: Handle<Blake3, LongString>;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: GenId;
-        "79E1B50756FB64A30916E9353225E179" as active_llm_profile_id: GenId;
-        "B919F28377B1241E4275808DBB1D423D" as active_llm_compaction_profile_id: GenId;
+        "79E1B50756FB64A30916E9353225E179" as active_model_profile_id: GenId;
         "698519DFB681FABC3F06160ACAC9DA8E" as poll_ms: U256BE;
-        "6691CF3F872C6107DCFAD0BCF7CDC1A0" as llm_profile_id: GenId;
-        "85BE7BDA465B3CB0F800F76EEF8FAC9B" as llm_model: Handle<Blake3, LongString>;
-        "B216CFBBF85AA1350B142D510E26268B" as llm_base_url: Handle<Blake3, LongString>;
-        "55F3FFD721AF7C1258E45BC91CDBF30F" as llm_api_key: Handle<Blake3, LongString>;
+        "6691CF3F872C6107DCFAD0BCF7CDC1A0" as model_profile_id: GenId;
+        "85BE7BDA465B3CB0F800F76EEF8FAC9B" as model_name: Handle<Blake3, LongString>;
+        "B216CFBBF85AA1350B142D510E26268B" as model_base_url: Handle<Blake3, LongString>;
+        "55F3FFD721AF7C1258E45BC91CDBF30F" as model_api_key: Handle<Blake3, LongString>;
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<Blake3, LongString>;
-        "BA4E05799CA2ACDCF3F9350FC8742F2F" as llm_reasoning_effort: Handle<Blake3, LongString>;
-        "73876213CFB8CF73CF0139E20B9770A1" as llm_reasoning_summary: Handle<Blake3, LongString>;
-        "5F04F7A0EB4EBBE6161022B336F83513" as llm_stream: U256BE;
-        "F9CEA1A2E81D738BB125B4D144B7A746" as llm_context_window_tokens: U256BE;
-        "4200F6746B36F2784DEBA1555595D6AC" as llm_max_output_tokens: U256BE;
-        "1FF004BB48F7A4F8F72541F4D4FA75FF" as llm_prompt_safety_margin_tokens: U256BE;
-        "095FAECDB8FF205DF591DF594E593B01" as llm_prompt_chars_per_token: U256BE;
-        "167BABF8DFCD69AB4DB69773AAB18C4B" as memory_compaction_arity: U256BE;
-        "24CF9D532E03C44CF719546DDE7E0493" as memory_lens_id: GenId;
-        "1F0A596CD677F732CD5C506F74C61F6B" as memory_lens_prompt: Handle<Blake3, LongString>;
-        "1067F34FE4517B058A74BC2118868DA4" as memory_lens_compaction_prompt: Handle<Blake3, LongString>;
-        "84F32838DC66B0FB6F774150854521F8" as memory_lens_max_output_tokens: U256BE;
+        "BA4E05799CA2ACDCF3F9350FC8742F2F" as model_reasoning_effort: Handle<Blake3, LongString>;
+        "73876213CFB8CF73CF0139E20B9770A1" as model_reasoning_summary: Handle<Blake3, LongString>;
+        "5F04F7A0EB4EBBE6161022B336F83513" as model_stream: U256BE;
+        "F9CEA1A2E81D738BB125B4D144B7A746" as model_context_window_tokens: U256BE;
+        "4200F6746B36F2784DEBA1555595D6AC" as model_max_output_tokens: U256BE;
+        "1FF004BB48F7A4F8F72541F4D4FA75FF" as model_context_safety_margin_tokens: U256BE;
+        "095FAECDB8FF205DF591DF594E593B01" as model_chars_per_token: U256BE;
         "120F9C6BBB103FAFFB31A66E2ABC15E6" as exec_default_cwd: Handle<Blake3, LongString>;
         "D18A351B6E03A460E4F400D97D285F96" as exec_sandbox_profile: GenId;
     }
@@ -125,7 +101,7 @@ mod playground_config {
 #[command(
     name = "headspace",
     bin_name = "headspace",
-    about = "Manage active LLM headspace (profile/model/reasoning)."
+    about = "Manage active headspace (profile/model/reasoning)."
 )]
 struct Cli {
     /// Path to the pile file to use
@@ -166,11 +142,6 @@ enum Command {
         #[arg(value_enum, value_name = "FIELD")]
         field: UnsetField,
     },
-    /// Manage memory lenses used by headspace/memory compaction
-    Lens {
-        #[command(subcommand)]
-        command: LensCommand,
-    },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -186,7 +157,7 @@ struct AddArgs {
     #[arg(long = "reasoning-effort")]
     reasoning_effort: Option<String>,
     #[arg(long = "reasoning-summary", value_enum)]
-    reasoning_summary: Option<LlmReasoningSummary>,
+    reasoning_summary: Option<ModelReasoningSummary>,
     #[arg(long)]
     stream: Option<bool>,
     #[arg(long = "context-window-tokens")]
@@ -194,9 +165,9 @@ struct AddArgs {
     #[arg(long = "max-output-tokens")]
     max_output_tokens: Option<u64>,
     #[arg(long = "prompt-safety-margin-tokens")]
-    prompt_safety_margin_tokens: Option<u64>,
+    context_safety_margin_tokens: Option<u64>,
     #[arg(long = "prompt-chars-per-token")]
-    prompt_chars_per_token: Option<u64>,
+    chars_per_token: Option<u64>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -212,7 +183,6 @@ enum SetField {
     MaxOutputTokens,
     PromptSafetyMarginTokens,
     PromptCharsPerToken,
-    CompactionProfileId,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -221,80 +191,18 @@ enum UnsetField {
     ApiKey,
     ReasoningEffort,
     ReasoningSummary,
-    CompactionProfileId,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-enum LensCommand {
-    /// List configured memory lenses
-    List,
-    /// Add a memory lens
-    Add(LensAddArgs),
-    /// Set one field on a memory lens
-    Set(LensSetArgs),
-    /// Reset one field (or all fields) to defaults for a memory lens
-    Reset(LensResetArgs),
-    /// Remove a memory lens
-    Remove {
-        #[arg(value_name = "NAME")]
-        name: String,
-    },
-}
-
-#[derive(Args, Debug, Clone)]
-struct LensAddArgs {
-    #[arg(value_name = "NAME")]
-    name: String,
-    #[arg(long, value_name = "ID")]
-    id: Option<String>,
-    #[arg(long, value_name = "PROMPT")]
-    prompt: Option<String>,
-    #[arg(long = "compaction-prompt", value_name = "PROMPT")]
-    compaction_prompt: Option<String>,
-    #[arg(long = "max-output-tokens", value_name = "TOKENS")]
-    max_output_tokens: Option<u64>,
-}
-
-#[derive(Args, Debug, Clone)]
-struct LensSetArgs {
-    #[arg(value_name = "NAME")]
-    name: String,
-    #[arg(value_enum, value_name = "FIELD")]
-    field: LensField,
-    #[arg(
-        value_name = "VALUE",
-        help = "Value to set. Use @path for file input or @- for stdin."
-    )]
-    value: String,
-}
-
-#[derive(Args, Debug, Clone)]
-struct LensResetArgs {
-    #[arg(value_name = "NAME")]
-    name: String,
-    #[arg(value_enum, value_name = "FIELD")]
-    field: Option<LensField>,
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy)]
-#[value(rename_all = "kebab-case")]
-enum LensField {
-    Id,
-    Prompt,
-    CompactionPrompt,
-    MaxOutputTokens,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 #[value(rename_all = "kebab-case")]
-enum LlmReasoningSummary {
+enum ModelReasoningSummary {
     Auto,
     Concise,
     Detailed,
     None,
 }
 
-impl LlmReasoningSummary {
+impl ModelReasoningSummary {
     fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -318,12 +226,9 @@ impl LlmReasoningSummary {
 #[derive(Clone, Debug)]
 struct Config {
     pile_path: PathBuf,
-    llm: LlmConfig,
-    llm_profile_id: Option<Id>,
-    llm_profile_name: String,
-    llm_compaction_profile_id: Option<Id>,
-    memory_compaction_arity: u64,
-    memory_lenses: Vec<MemoryLensConfig>,
+    model: ModelConfig,
+    model_profile_id: Option<Id>,
+    model_profile_name: String,
     tavily_api_key: Option<String>,
     exa_api_key: Option<String>,
     exec: ExecConfig,
@@ -346,17 +251,17 @@ struct Config {
 }
 
 #[derive(Clone, Debug)]
-struct LlmConfig {
+struct ModelConfig {
     model: String,
     base_url: String,
     api_key: Option<String>,
     reasoning_effort: Option<String>,
-    reasoning_summary: Option<LlmReasoningSummary>,
+    reasoning_summary: Option<ModelReasoningSummary>,
     stream: bool,
     context_window_tokens: u64,
     max_output_tokens: u64,
-    prompt_safety_margin_tokens: u64,
-    prompt_chars_per_token: u64,
+    context_safety_margin_tokens: u64,
+    chars_per_token: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -366,16 +271,7 @@ struct ExecConfig {
 }
 
 #[derive(Clone, Debug)]
-struct MemoryLensConfig {
-    id: Id,
-    name: String,
-    prompt: String,
-    compaction_prompt: String,
-    max_output_tokens: u64,
-}
-
-#[derive(Clone, Debug)]
-struct LlmProfileSummary {
+struct ModelProfileSummary {
     id: Id,
     name: String,
 }
@@ -401,20 +297,20 @@ fn main() -> Result<()> {
         Command::Use { profile } => {
             let mut config = load_config(cli.pile.as_path())?;
             let profile_id = resolve_profile_selector(cli.pile.as_path(), profile.as_str())?;
-            let Some((llm, name)) = load_llm_profile(cli.pile.as_path(), profile_id)? else {
+            let Some((model, name)) = load_model_profile(cli.pile.as_path(), profile_id)? else {
                 return Err(anyhow!("unknown profile {profile_id:x}"));
             };
-            config.llm_profile_id = Some(profile_id);
-            config.llm_profile_name = name;
-            config.llm = llm;
+            config.model_profile_id = Some(profile_id);
+            config.model_profile_name = name;
+            config.model = model;
             store_config_to_pile(config)?;
             let config = load_config(cli.pile.as_path())?;
             print_headspace(&config, false)?;
         }
         Command::Add(args) => {
             let mut config = load_config(cli.pile.as_path())?;
-            config.llm_profile_id = Some(*genid());
-            config.llm_profile_name = args.name.clone();
+            config.model_profile_id = Some(*genid());
+            config.model_profile_name = args.name.clone();
             apply_add_overrides(&mut config, args)?;
             store_config_to_pile(config)?;
             let config = load_config(cli.pile.as_path())?;
@@ -434,20 +330,6 @@ fn main() -> Result<()> {
             let config = load_config(cli.pile.as_path())?;
             print_headspace(&config, false)?;
         }
-        Command::Lens { command } => {
-            let mut config = load_config(cli.pile.as_path())?;
-            if let LensCommand::List = command {
-                let _ = apply_lens(&mut config, LensCommand::List)?;
-                return Ok(());
-            }
-            let changed = apply_lens(&mut config, command.clone())?;
-            if changed {
-                store_config_to_pile(config)?;
-            }
-            let config = load_config(cli.pile.as_path())?;
-            let mut config = config;
-            let _ = apply_lens(&mut config, LensCommand::List)?;
-        }
     }
 
     Ok(())
@@ -455,73 +337,69 @@ fn main() -> Result<()> {
 
 fn apply_add_overrides(config: &mut Config, args: &AddArgs) -> Result<()> {
     if let Some(value) = args.model.as_deref() {
-        config.llm.model = value.to_string();
+        config.model.model = value.to_string();
     }
     if let Some(value) = args.base_url.as_deref() {
-        config.llm.base_url = value.to_string();
+        config.model.base_url = value.to_string();
     }
     if let Some(value) = args.api_key.as_deref() {
-        config.llm.api_key = Some(value.trim().to_string());
+        config.model.api_key = Some(value.trim().to_string());
     }
     if let Some(value) = args.reasoning_effort.as_deref() {
-        config.llm.reasoning_effort = Some(value.trim().to_string());
+        config.model.reasoning_effort = Some(value.trim().to_string());
     }
     if let Some(value) = args.reasoning_summary {
-        config.llm.reasoning_summary = Some(value);
+        config.model.reasoning_summary = Some(value);
     }
     if let Some(value) = args.stream {
-        config.llm.stream = value;
+        config.model.stream = value;
     }
     if let Some(value) = args.context_window_tokens {
-        config.llm.context_window_tokens = value;
+        config.model.context_window_tokens = value;
     }
     if let Some(value) = args.max_output_tokens {
-        config.llm.max_output_tokens = value;
+        config.model.max_output_tokens = value;
     }
-    if let Some(value) = args.prompt_safety_margin_tokens {
-        config.llm.prompt_safety_margin_tokens = value;
+    if let Some(value) = args.context_safety_margin_tokens {
+        config.model.context_safety_margin_tokens = value;
     }
-    if let Some(value) = args.prompt_chars_per_token {
-        config.llm.prompt_chars_per_token = value;
+    if let Some(value) = args.chars_per_token {
+        config.model.chars_per_token = value;
     }
     Ok(())
 }
 
 fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
     match field {
-        SetField::Model => config.llm.model = load_value_or_file(value, "llm_model")?,
-        SetField::BaseUrl => config.llm.base_url = load_value_or_file(value, "llm_base_url")?,
+        SetField::Model => config.model.model = load_value_or_file(value, "model_name")?,
+        SetField::BaseUrl => config.model.base_url = load_value_or_file(value, "model_base_url")?,
         SetField::ApiKey => {
-            config.llm.api_key = Some(load_value_or_file_trimmed(value, "llm_api_key")?)
+            config.model.api_key = Some(load_value_or_file_trimmed(value, "model_api_key")?)
         }
         SetField::ReasoningEffort => {
-            config.llm.reasoning_effort =
-                Some(load_value_or_file_trimmed(value, "llm_reasoning_effort")?)
+            config.model.reasoning_effort =
+                Some(load_value_or_file_trimmed(value, "model_reasoning_effort")?)
         }
         SetField::ReasoningSummary => {
-            let raw = load_value_or_file_trimmed(value, "llm_reasoning_summary")?;
-            config.llm.reasoning_summary =
-                Some(LlmReasoningSummary::parse(raw.as_str()).ok_or_else(|| {
-                    anyhow!("llm_reasoning_summary must be one of: auto, concise, detailed, none")
+            let raw = load_value_or_file_trimmed(value, "model_reasoning_summary")?;
+            config.model.reasoning_summary =
+                Some(ModelReasoningSummary::parse(raw.as_str()).ok_or_else(|| {
+                    anyhow!("model_reasoning_summary must be one of: auto, concise, detailed, none")
                 })?);
         }
-        SetField::Stream => config.llm.stream = parse_bool(value, "llm_stream")?,
+        SetField::Stream => config.model.stream = parse_bool(value, "model_stream")?,
         SetField::ContextWindowTokens => {
-            config.llm.context_window_tokens = parse_u64(value, "llm_context_window_tokens")?
+            config.model.context_window_tokens = parse_u64(value, "model_context_window_tokens")?
         }
         SetField::MaxOutputTokens => {
-            config.llm.max_output_tokens = parse_u64(value, "llm_max_output_tokens")?
+            config.model.max_output_tokens = parse_u64(value, "model_max_output_tokens")?
         }
         SetField::PromptSafetyMarginTokens => {
-            config.llm.prompt_safety_margin_tokens =
-                parse_u64(value, "llm_prompt_safety_margin_tokens")?
+            config.model.context_safety_margin_tokens =
+                parse_u64(value, "model_context_safety_margin_tokens")?
         }
         SetField::PromptCharsPerToken => {
-            config.llm.prompt_chars_per_token = parse_u64(value, "llm_prompt_chars_per_token")?
-        }
-        SetField::CompactionProfileId => {
-            config.llm_compaction_profile_id =
-                Some(parse_hex_id(value, "llm_compaction_profile_id")?)
+            config.model.chars_per_token = parse_u64(value, "model_chars_per_token")?
         }
     }
     Ok(())
@@ -529,76 +407,11 @@ fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
 
 fn apply_unset(config: &mut Config, field: UnsetField) -> Result<()> {
     match field {
-        UnsetField::ApiKey => config.llm.api_key = None,
-        UnsetField::ReasoningEffort => config.llm.reasoning_effort = None,
-        UnsetField::ReasoningSummary => config.llm.reasoning_summary = None,
-        UnsetField::CompactionProfileId => config.llm_compaction_profile_id = None,
+        UnsetField::ApiKey => config.model.api_key = None,
+        UnsetField::ReasoningEffort => config.model.reasoning_effort = None,
+        UnsetField::ReasoningSummary => config.model.reasoning_summary = None,
     }
     Ok(())
-}
-
-fn apply_lens(config: &mut Config, command: LensCommand) -> Result<bool> {
-    match command {
-        LensCommand::List => {
-            sort_memory_lenses(config);
-            for lens in &config.memory_lenses {
-                println!(
-                    "{}\t{:x}\tmax_output_tokens={}",
-                    lens.name, lens.id, lens.max_output_tokens
-                );
-            }
-            Ok(false)
-        }
-        LensCommand::Add(args) => {
-            if config
-                .memory_lenses
-                .iter()
-                .any(|lens| lens.name.eq_ignore_ascii_case(args.name.as_str()))
-            {
-                return Err(anyhow!("memory lens '{}' already exists", args.name));
-            }
-            let mut lens = default_memory_lens_template(args.name.as_str())?;
-            if let Some(id) = args.id {
-                lens.id = parse_hex_id(id.as_str(), "memory_lens_id")?;
-            }
-            if let Some(prompt) = args.prompt {
-                lens.prompt = load_value_or_file(prompt.as_str(), "memory_lens_prompt")?;
-            }
-            if let Some(prompt) = args.compaction_prompt {
-                lens.compaction_prompt =
-                    load_value_or_file(prompt.as_str(), "memory_lens_compaction_prompt")?;
-            }
-            if let Some(tokens) = args.max_output_tokens {
-                lens.max_output_tokens = tokens;
-            }
-            config.memory_lenses.push(lens);
-            sort_memory_lenses(config);
-            Ok(true)
-        }
-        LensCommand::Set(args) => {
-            let lens = get_memory_lens_mut(config, args.name.as_str())?;
-            apply_memory_lens_set(lens, args.field, args.value.as_str())?;
-            Ok(true)
-        }
-        LensCommand::Reset(args) => {
-            let lens = get_memory_lens_mut(config, args.name.as_str())?;
-            apply_memory_lens_reset(lens, args.field)?;
-            Ok(true)
-        }
-        LensCommand::Remove { name } => {
-            if config.memory_lenses.len() <= 1 {
-                return Err(anyhow!("cannot remove the last memory lens"));
-            }
-            let before = config.memory_lenses.len();
-            config
-                .memory_lenses
-                .retain(|lens| !lens.name.eq_ignore_ascii_case(name.as_str()));
-            if config.memory_lenses.len() == before {
-                return Err(anyhow!("memory lens '{}' not configured", name));
-            }
-            Ok(true)
-        }
-    }
 }
 
 fn resolve_profile_selector(pile_path: &Path, raw: &str) -> Result<Id> {
@@ -607,7 +420,7 @@ fn resolve_profile_selector(pile_path: &Path, raw: &str) -> Result<Id> {
     }
 
     let needle = raw.trim().to_lowercase();
-    let profiles = list_llm_profiles(pile_path)?;
+    let profiles = list_model_profiles(pile_path)?;
     let mut matches = profiles
         .into_iter()
         .filter(|profile| profile.name.to_lowercase() == needle);
@@ -618,82 +431,6 @@ fn resolve_profile_selector(pile_path: &Path, raw: &str) -> Result<Id> {
         return Err(anyhow!("profile name '{raw}' is ambiguous; use the hex id"));
     }
     Ok(first.id)
-}
-
-fn default_memory_lens_template(name: &str) -> Result<MemoryLensConfig> {
-    if let Some(mut lens) = default_memory_lens_by_name(name) {
-        lens.id = *genid();
-        lens.name = name.to_string();
-        return Ok(lens);
-    }
-    let mut lens = default_memory_lens_by_name("factual")
-        .ok_or_else(|| anyhow!("missing default memory lens 'factual'"))?;
-    lens.id = *genid();
-    lens.name = name.to_string();
-    Ok(lens)
-}
-
-fn memory_lens_defaults(name: &str) -> Result<MemoryLensConfig> {
-    if let Some(lens) = default_memory_lens_by_name(name) {
-        return Ok(lens);
-    }
-    default_memory_lens_by_name("factual")
-        .ok_or_else(|| anyhow!("missing default memory lens 'factual'"))
-}
-
-fn get_memory_lens_mut<'a>(config: &'a mut Config, name: &str) -> Result<&'a mut MemoryLensConfig> {
-    config
-        .memory_lenses
-        .iter_mut()
-        .find(|lens| lens.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| anyhow!("memory lens '{name}' not configured"))
-}
-
-fn sort_memory_lenses(config: &mut Config) {
-    config.memory_lenses.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-fn apply_memory_lens_set(lens: &mut MemoryLensConfig, field: LensField, value: &str) -> Result<()> {
-    match field {
-        LensField::Id => {
-            lens.id = parse_hex_id(value, "memory_lens_id")?;
-        }
-        LensField::Prompt => {
-            lens.prompt = load_value_or_file(value, "memory_lens_prompt")?;
-        }
-        LensField::CompactionPrompt => {
-            lens.compaction_prompt = load_value_or_file(value, "memory_lens_compaction_prompt")?;
-        }
-        LensField::MaxOutputTokens => {
-            lens.max_output_tokens = parse_u64(value, "memory_lens_max_output_tokens")?;
-        }
-    }
-    Ok(())
-}
-
-fn apply_memory_lens_reset(lens: &mut MemoryLensConfig, field: Option<LensField>) -> Result<()> {
-    let defaults = memory_lens_defaults(lens.name.as_str())?;
-    match field {
-        None => {
-            lens.prompt = defaults.prompt;
-            lens.compaction_prompt = defaults.compaction_prompt;
-            lens.max_output_tokens = defaults.max_output_tokens;
-        }
-        Some(LensField::Prompt) => lens.prompt = defaults.prompt,
-        Some(LensField::CompactionPrompt) => lens.compaction_prompt = defaults.compaction_prompt,
-        Some(LensField::MaxOutputTokens) => lens.max_output_tokens = defaults.max_output_tokens,
-        Some(LensField::Id) => {
-            return Err(anyhow!(
-                "cannot reset lens id automatically; set it explicitly with `headspace lens set <name> id <hex>`"
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn format_option_quoted(value: Option<&str>) -> String {
@@ -714,53 +451,46 @@ fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
     println!(
         "  profile_id = {}",
         config
-            .llm_profile_id
+            .model_profile_id
             .map(|id| format!("\"{id:x}\""))
             .unwrap_or_else(|| "null".to_string())
     );
-    println!("  profile_name = \"{}\"", config.llm_profile_name);
-    println!("  model = \"{}\"", config.llm.model);
-    println!("  base_url = \"{}\"", config.llm.base_url);
+    println!("  profile_name = \"{}\"", config.model_profile_name);
+    println!("  model = \"{}\"", config.model.model);
+    println!("  base_url = \"{}\"", config.model.base_url);
     println!(
         "  api_key = {}",
         if show_secrets {
-            format_option_quoted(config.llm.api_key.as_deref())
+            format_option_quoted(config.model.api_key.as_deref())
         } else {
-            redact_option(config.llm.api_key.as_deref())
+            redact_option(config.model.api_key.as_deref())
         }
     );
     println!(
         "  reasoning_effort = {}",
-        format_option_quoted(config.llm.reasoning_effort.as_deref())
+        format_option_quoted(config.model.reasoning_effort.as_deref())
     );
     println!(
         "  reasoning_summary = {}",
         config
-            .llm
+            .model
             .reasoning_summary
             .map(|summary| format!("\"{}\"", summary.as_str()))
             .unwrap_or_else(|| "null".to_string())
     );
-    println!("  stream = {}", config.llm.stream);
+    println!("  stream = {}", config.model.stream);
     println!(
         "  context_window_tokens = {}",
-        config.llm.context_window_tokens
+        config.model.context_window_tokens
     );
-    println!("  max_output_tokens = {}", config.llm.max_output_tokens);
+    println!("  max_output_tokens = {}", config.model.max_output_tokens);
     println!(
-        "  prompt_safety_margin_tokens = {}",
-        config.llm.prompt_safety_margin_tokens
-    );
-    println!(
-        "  prompt_chars_per_token = {}",
-        config.llm.prompt_chars_per_token
+        "  context_safety_margin_tokens = {}",
+        config.model.context_safety_margin_tokens
     );
     println!(
-        "  compaction_profile_id = {}",
-        config
-            .llm_compaction_profile_id
-            .map(|id| format!("\"{id:x}\""))
-            .unwrap_or_else(|| "null".to_string())
+        "  chars_per_token = {}",
+        config.model.chars_per_token
     );
     println!();
     println!("profiles:");
@@ -768,9 +498,9 @@ fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
 }
 
 fn print_profile_list(config: &Config) -> Result<()> {
-    let profiles = list_llm_profiles(config.pile_path.as_path())?;
+    let profiles = list_model_profiles(config.pile_path.as_path())?;
     for profile in profiles {
-        let active = (config.llm_profile_id == Some(profile.id)).then_some("*");
+        let active = (config.model_profile_id == Some(profile.id)).then_some("*");
         let active = active.unwrap_or(" ");
         println!("{active} {}\t{:x}", profile.name, profile.id);
     }
@@ -890,8 +620,7 @@ fn load_config(pile_path: &Path) -> Result<Config> {
         };
 
         let ids_changed = ensure_registered_branch_ids(&mut config);
-        let lenses_missing = !has_memory_lens_entries(&catalog);
-        if ids_changed || lenses_missing {
+        if ids_changed {
             store_config(&mut ws, &config).context("store config with branch ids")?;
             push_workspace(&mut repo, &mut ws).context("push config with branch ids")?;
         }
@@ -930,9 +659,9 @@ fn store_config_to_pile(config: Config) -> Result<()> {
     result
 }
 
-fn list_llm_profiles(pile_path: &Path) -> Result<Vec<LlmProfileSummary>> {
+fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
     let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Vec<LlmProfileSummary>> {
+    let result = (|| -> Result<Vec<ModelProfileSummary>> {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
@@ -943,9 +672,9 @@ fn list_llm_profiles(pile_path: &Path) -> Result<Vec<LlmProfileSummary>> {
             (entry_id: Id, profile_id: Value<GenId>, updated_at: Value<NsTAIInterval>),
             pattern!(&catalog, [{
                 ?entry_id @
-                playground_config::kind: KIND_LLM_PROFILE_ID,
+                playground_config::kind: KIND_MODEL_PROFILE_ID,
                 playground_config::updated_at: ?updated_at,
-                playground_config::llm_profile_id: ?profile_id,
+                playground_config::model_profile_id: ?profile_id,
             }])
         ) {
             let profile_id = Id::from_value(&profile_id);
@@ -964,7 +693,7 @@ fn list_llm_profiles(pile_path: &Path) -> Result<Vec<LlmProfileSummary>> {
         for (profile_id, (entry_id, _updated_key)) in latest {
             let name = load_string_attr(&mut ws, &catalog, entry_id, metadata::name)?
                 .unwrap_or_else(|| format!("profile-{profile_id:x}"));
-            profiles.push(LlmProfileSummary {
+            profiles.push(ModelProfileSummary {
                 id: profile_id,
                 name,
             });
@@ -983,14 +712,14 @@ fn list_llm_profiles(pile_path: &Path) -> Result<Vec<LlmProfileSummary>> {
     result
 }
 
-fn load_llm_profile(pile_path: &Path, profile_id: Id) -> Result<Option<(LlmConfig, String)>> {
+fn load_model_profile(pile_path: &Path, profile_id: Id) -> Result<Option<(ModelConfig, String)>> {
     let (mut repo, branch_id) = open_config_repo(pile_path)?;
-    let result = (|| -> Result<Option<(LlmConfig, String)>> {
+    let result = (|| -> Result<Option<(ModelConfig, String)>> {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|err| anyhow!("pull config workspace: {err:?}"))?;
         let catalog = ws.checkout(..).context("checkout config workspace")?;
-        load_latest_llm_profile(&mut ws, &catalog, profile_id)
+        load_latest_model_profile(&mut ws, &catalog, profile_id)
     })();
 
     if let Err(err) = close_repo(repo).context("close config pile") {
@@ -1015,7 +744,7 @@ fn ensure_registered_branch_ids(config: &mut Config) -> bool {
     changed |= ensure_registered_branch_id(&mut config.archive_branch_id);
     changed |= ensure_registered_branch_id(&mut config.web_branch_id);
     changed |= ensure_registered_branch_id(&mut config.media_branch_id);
-    changed |= ensure_registered_llm_profile_id(&mut config.llm_profile_id);
+    changed |= ensure_registered_model_profile_id(&mut config.model_profile_id);
 
     changed
 }
@@ -1028,7 +757,7 @@ fn ensure_registered_branch_id(slot: &mut Option<Id>) -> bool {
     true
 }
 
-fn ensure_registered_llm_profile_id(slot: &mut Option<Id>) -> bool {
+fn ensure_registered_model_profile_id(slot: &mut Option<Id>) -> bool {
     if slot.is_some() {
         return false;
     }
@@ -1068,56 +797,6 @@ fn ensure_registered_branches_exist(
     Ok(())
 }
 
-fn has_memory_lens_entries(catalog: &TribleSet) -> bool {
-    find!(
-        (
-            entity_id: Id,
-            prompt: Value<Handle<Blake3, LongString>>,
-            compaction_prompt: Value<Handle<Blake3, LongString>>,
-            max_output_tokens: Value<U256BE>
-        ),
-        pattern!(catalog, [{
-            ?entity_id @
-            playground_config::kind: KIND_MEMORY_LENS_ID,
-            playground_config::memory_lens_prompt: ?prompt,
-            playground_config::memory_lens_compaction_prompt: ?compaction_prompt,
-            playground_config::memory_lens_max_output_tokens: ?max_output_tokens,
-        }])
-    )
-    .into_iter()
-    .next()
-    .is_some()
-}
-
-fn latest_memory_lens_entries(catalog: &TribleSet) -> HashMap<Id, (Id, i128)> {
-    let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
-    for (entry_id, lens_id, updated_at) in find!(
-        (
-            entry_id: Id,
-            lens_id: Value<GenId>,
-            updated_at: Value<NsTAIInterval>
-        ),
-        pattern!(catalog, [{
-            ?entry_id @
-            playground_config::kind: KIND_MEMORY_LENS_ID,
-            playground_config::updated_at: ?updated_at,
-            playground_config::memory_lens_id: ?lens_id,
-        }])
-    ) {
-        let lens_id = Id::from_value(&lens_id);
-        let key = interval_key(updated_at);
-        latest
-            .entry(lens_id)
-            .and_modify(|slot| {
-                if key > slot.1 || (key == slot.1 && entry_id > slot.0) {
-                    *slot = (entry_id, key);
-                }
-            })
-            .or_insert((entry_id, key));
-    }
-    latest
-}
-
 fn load_latest_config(
     ws: &mut Workspace<Pile<Blake3>>,
     catalog: &TribleSet,
@@ -1141,7 +820,7 @@ fn load_latest_config(
         }
     }
 
-    let Some((config_id, config_updated_key)) = latest else {
+    let Some((config_id, _)) = latest else {
         return Ok(None);
     };
 
@@ -1164,51 +843,44 @@ fn load_latest_config(
     if let Some(id) = load_id_attr(catalog, config_id, playground_config::persona_id) {
         config.persona_id = Some(id);
     }
-    if let Some(id) = load_id_attr(catalog, config_id, playground_config::active_llm_profile_id) {
-        config.llm_profile_id = Some(id);
+    if let Some(id) = load_id_attr(catalog, config_id, playground_config::active_model_profile_id) {
+        config.model_profile_id = Some(id);
     }
-    if let Some(id) = load_id_attr(
-        catalog,
-        config_id,
-        playground_config::active_llm_compaction_profile_id,
-    ) {
-        config.llm_compaction_profile_id = Some(id);
+    if let Some(model) = load_string_attr(ws, catalog, config_id, playground_config::model_name)? {
+        config.model.model = model;
     }
-    if let Some(model) = load_string_attr(ws, catalog, config_id, playground_config::llm_model)? {
-        config.llm.model = model;
-    }
-    if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::llm_base_url)? {
-        config.llm.base_url = url;
+    if let Some(url) = load_string_attr(ws, catalog, config_id, playground_config::model_base_url)? {
+        config.model.base_url = url;
     }
     if let Some(effort) = load_string_attr(
         ws,
         catalog,
         config_id,
-        playground_config::llm_reasoning_effort,
+        playground_config::model_reasoning_effort,
     )? {
-        config.llm.reasoning_effort = Some(effort);
+        config.model.reasoning_effort = Some(effort);
     }
     if let Some(summary) = load_string_attr(
         ws,
         catalog,
         config_id,
-        playground_config::llm_reasoning_summary,
+        playground_config::model_reasoning_summary,
     )? {
-        if let Some(parsed) = LlmReasoningSummary::parse(summary.as_str()) {
-            config.llm.reasoning_summary = Some(parsed);
+        if let Some(parsed) = ModelReasoningSummary::parse(summary.as_str()) {
+            config.model.reasoning_summary = Some(parsed);
         } else {
             eprintln!(
-                "warning: unsupported llm reasoning summary '{summary}', using {}",
+                "warning: unsupported model reasoning summary '{summary}', using {}",
                 config
-                    .llm
+                    .model
                     .reasoning_summary
-                    .map(LlmReasoningSummary::as_str)
+                    .map(ModelReasoningSummary::as_str)
                     .unwrap_or("null")
             );
         }
     }
-    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::llm_api_key)? {
-        config.llm.api_key = Some(key);
+    if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::model_api_key)? {
+        config.model.api_key = Some(key);
     }
     if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::tavily_api_key)?
     {
@@ -1266,82 +938,67 @@ fn load_latest_config(
         config.poll_ms = poll_ms;
     }
     if let Some(stream) =
-        load_u256_attr(catalog, config_id, playground_config::llm_stream).and_then(u256be_to_u64)
+        load_u256_attr(catalog, config_id, playground_config::model_stream).and_then(u256be_to_u64)
     {
-        config.llm.stream = stream != 0;
+        config.model.stream = stream != 0;
     }
     if let Some(tokens) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::llm_context_window_tokens,
+        playground_config::model_context_window_tokens,
     )
     .and_then(u256be_to_u64)
     {
-        config.llm.context_window_tokens = tokens;
+        config.model.context_window_tokens = tokens;
     }
     if let Some(tokens) =
-        load_u256_attr(catalog, config_id, playground_config::llm_max_output_tokens)
+        load_u256_attr(catalog, config_id, playground_config::model_max_output_tokens)
             .and_then(u256be_to_u64)
     {
-        config.llm.max_output_tokens = tokens;
+        config.model.max_output_tokens = tokens;
     }
     if let Some(tokens) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::llm_prompt_safety_margin_tokens,
+        playground_config::model_context_safety_margin_tokens,
     )
     .and_then(u256be_to_u64)
     {
-        config.llm.prompt_safety_margin_tokens = tokens;
+        config.model.context_safety_margin_tokens = tokens;
     }
     if let Some(chars) = load_u256_attr(
         catalog,
         config_id,
-        playground_config::llm_prompt_chars_per_token,
+        playground_config::model_chars_per_token,
     )
     .and_then(u256be_to_u64)
     {
-        config.llm.prompt_chars_per_token = chars;
+        config.model.chars_per_token = chars;
     }
-    if let Some(factor) = load_u256_attr(
-        catalog,
-        config_id,
-        playground_config::memory_compaction_arity,
-    )
-    .and_then(u256be_to_u64)
-    {
-        config.memory_compaction_arity = factor.max(2);
-    }
-
-    if let Some(profile_id) = config.llm_profile_id {
-        if let Some((llm, name)) = load_latest_llm_profile(ws, catalog, profile_id)? {
-            config.llm = llm;
-            config.llm_profile_name = name;
+    if let Some(profile_id) = config.model_profile_id {
+        if let Some((model, name)) = load_latest_model_profile(ws, catalog, profile_id)? {
+            config.model = model;
+            config.model_profile_name = name;
         }
-    }
-
-    let lenses = load_memory_lenses_for_snapshot(ws, catalog, config_updated_key)?;
-    if !lenses.is_empty() {
-        config.memory_lenses = lenses;
     }
 
     Ok(Some(config))
 }
 
-fn load_latest_llm_profile(
+fn load_latest_model_profile(
     ws: &mut Workspace<Pile<Blake3>>,
     catalog: &TribleSet,
     profile_id: Id,
-) -> Result<Option<(LlmConfig, String)>> {
+) -> Result<Option<(ModelConfig, String)>> {
     let mut latest: Option<(Id, i128)> = None;
 
     for (entry_id, updated_at) in find!(
         (entry_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(catalog, [{
             ?entry_id @
-            playground_config::kind: KIND_LLM_PROFILE_ID,
+            playground_config::kind: KIND_MODEL_PROFILE_ID,
             playground_config::updated_at: ?updated_at,
-            playground_config::llm_profile_id: profile_id,
+            playground_config::model_profile_id: profile_id,
         }])
     ) {
         let key = interval_key(updated_at);
@@ -1356,148 +1013,84 @@ fn load_latest_llm_profile(
         return Ok(None);
     };
 
-    let mut llm = LlmConfig::default();
-    if let Some(model) = load_string_attr(ws, catalog, entry_id, playground_config::llm_model)? {
-        llm.model = model;
+    let mut mc = ModelConfig::default();
+    if let Some(model) = load_string_attr(ws, catalog, entry_id, playground_config::model_name)? {
+        mc.model = model;
     }
-    if let Some(url) = load_string_attr(ws, catalog, entry_id, playground_config::llm_base_url)? {
-        llm.base_url = url;
+    if let Some(url) = load_string_attr(ws, catalog, entry_id, playground_config::model_base_url)? {
+        mc.base_url = url;
     }
     if let Some(effort) = load_string_attr(
         ws,
         catalog,
         entry_id,
-        playground_config::llm_reasoning_effort,
+        playground_config::model_reasoning_effort,
     )? {
-        llm.reasoning_effort = Some(effort);
+        mc.reasoning_effort = Some(effort);
     }
     if let Some(summary) = load_string_attr(
         ws,
         catalog,
         entry_id,
-        playground_config::llm_reasoning_summary,
+        playground_config::model_reasoning_summary,
     )? {
-        llm.reasoning_summary = Some(
-            LlmReasoningSummary::parse(summary.as_str())
-                .ok_or_else(|| anyhow!("unsupported llm reasoning summary '{summary}'"))?,
+        mc.reasoning_summary = Some(
+            ModelReasoningSummary::parse(summary.as_str())
+                .ok_or_else(|| anyhow!("unsupported model reasoning summary '{summary}'"))?,
         );
     }
-    if let Some(key) = load_string_attr(ws, catalog, entry_id, playground_config::llm_api_key)? {
-        llm.api_key = Some(key);
+    if let Some(key) = load_string_attr(ws, catalog, entry_id, playground_config::model_api_key)? {
+        mc.api_key = Some(key);
     }
     if let Some(stream) =
-        load_u256_attr(catalog, entry_id, playground_config::llm_stream).and_then(u256be_to_u64)
+        load_u256_attr(catalog, entry_id, playground_config::model_stream).and_then(u256be_to_u64)
     {
-        llm.stream = stream != 0;
+        mc.stream = stream != 0;
     }
     if let Some(tokens) = load_u256_attr(
         catalog,
         entry_id,
-        playground_config::llm_context_window_tokens,
+        playground_config::model_context_window_tokens,
     )
     .and_then(u256be_to_u64)
     {
-        llm.context_window_tokens = tokens;
+        mc.context_window_tokens = tokens;
     }
     if let Some(tokens) =
-        load_u256_attr(catalog, entry_id, playground_config::llm_max_output_tokens)
+        load_u256_attr(catalog, entry_id, playground_config::model_max_output_tokens)
             .and_then(u256be_to_u64)
     {
-        llm.max_output_tokens = tokens;
+        mc.max_output_tokens = tokens;
     }
     if let Some(tokens) = load_u256_attr(
         catalog,
         entry_id,
-        playground_config::llm_prompt_safety_margin_tokens,
+        playground_config::model_context_safety_margin_tokens,
     )
     .and_then(u256be_to_u64)
     {
-        llm.prompt_safety_margin_tokens = tokens;
+        mc.context_safety_margin_tokens = tokens;
     }
     if let Some(chars) = load_u256_attr(
         catalog,
         entry_id,
-        playground_config::llm_prompt_chars_per_token,
+        playground_config::model_chars_per_token,
     )
     .and_then(u256be_to_u64)
     {
-        llm.prompt_chars_per_token = chars;
+        mc.chars_per_token = chars;
     }
     let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
         .unwrap_or_else(|| format!("profile-{profile_id:x}"));
-    Ok(Some((llm, name)))
-}
-
-fn load_memory_lenses_for_snapshot(
-    ws: &mut Workspace<Pile<Blake3>>,
-    catalog: &TribleSet,
-    snapshot_key: i128,
-) -> Result<Vec<MemoryLensConfig>> {
-    let latest = latest_memory_lens_entries(catalog);
-    let mut lenses_by_name: HashMap<String, (MemoryLensConfig, i128)> = HashMap::new();
-    for (lens_id, (entry_id, updated_key)) in latest {
-        if updated_key != snapshot_key {
-            continue;
-        }
-        let name = load_string_attr(ws, catalog, entry_id, metadata::name)?
-            .unwrap_or_else(|| format!("lens-{lens_id:x}"));
-        let prompt =
-            load_string_attr(ws, catalog, entry_id, playground_config::memory_lens_prompt)?
-                .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing prompt"))?;
-        let compaction_prompt = load_string_attr(
-            ws,
-            catalog,
-            entry_id,
-            playground_config::memory_lens_compaction_prompt,
-        )?
-        .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing compaction_prompt"))?;
-        let max_output_tokens = load_u256_attr(
-            catalog,
-            entry_id,
-            playground_config::memory_lens_max_output_tokens,
-        )
-        .and_then(u256be_to_u64)
-        .ok_or_else(|| anyhow!("memory lens {lens_id:x} missing max_output_tokens"))?;
-        let lens = MemoryLensConfig {
-            id: lens_id,
-            name: name.clone(),
-            prompt,
-            compaction_prompt,
-            max_output_tokens,
-        };
-        let key = name.to_lowercase();
-        lenses_by_name
-            .entry(key)
-            .and_modify(|slot| {
-                if updated_key > slot.1 {
-                    *slot = (lens.clone(), updated_key);
-                }
-            })
-            .or_insert((lens, updated_key));
-    }
-    let mut lenses: Vec<MemoryLensConfig> =
-        lenses_by_name.into_values().map(|(lens, _)| lens).collect();
-    lenses.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-    Ok(lenses)
+    Ok(Some((mc, name)))
 }
 
 fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()> {
     let now = epoch_interval(now_epoch());
     let config_id = ufoid();
     let profile_id = config
-        .llm_profile_id
-        .ok_or_else(|| anyhow!("config missing active LLM profile id"))?;
-    let mut memory_lenses = if config.memory_lenses.is_empty() {
-        default_memory_lenses()
-    } else {
-        config.memory_lenses.clone()
-    };
-    memory_lenses.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.id.cmp(&b.id))
-    });
+        .model_profile_id
+        .ok_or_else(|| anyhow!("config missing active model profile id"))?;
 
     let system_prompt = ws.put(config.system_prompt.clone());
     let branch = ws.put(config.branch.clone());
@@ -1514,12 +1107,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
         playground_config::author: author,
         playground_config::author_role: author_role,
         playground_config::poll_ms: poll_ms,
-        playground_config::active_llm_profile_id: profile_id,
-    };
-
-    let memory_compaction_arity: Value<U256BE> = config.memory_compaction_arity.max(2).to_value();
-    change += entity! { &config_id @
-        playground_config::memory_compaction_arity: memory_compaction_arity,
+        playground_config::active_model_profile_id: profile_id,
     };
 
     if let Some(id) = config.branch_id {
@@ -1555,9 +1143,6 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     if let Some(id) = config.persona_id {
         change += entity! { &config_id @ playground_config::persona_id: id };
     }
-    if let Some(id) = config.llm_compaction_profile_id {
-        change += entity! { &config_id @ playground_config::active_llm_compaction_profile_id: id };
-    }
     if let Some(key) = config.tavily_api_key.as_ref() {
         let handle = ws.put(key.clone());
         change += entity! { &config_id @ playground_config::tavily_api_key: handle };
@@ -1575,58 +1160,41 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     }
 
     let profile_entry_id = ufoid();
-    let profile_name = ws.put(config.llm_profile_name.clone());
-    let llm_model = ws.put(config.llm.model.clone());
-    let llm_base_url = ws.put(config.llm.base_url.clone());
-    let llm_stream: Value<U256BE> = if config.llm.stream { 1u64 } else { 0u64 }.to_value();
-    let llm_context_window_tokens: Value<U256BE> = config.llm.context_window_tokens.to_value();
-    let llm_max_output_tokens: Value<U256BE> = config.llm.max_output_tokens.to_value();
-    let llm_prompt_safety_margin_tokens: Value<U256BE> =
-        config.llm.prompt_safety_margin_tokens.to_value();
-    let llm_prompt_chars_per_token: Value<U256BE> = config.llm.prompt_chars_per_token.to_value();
+    let profile_name = ws.put(config.model_profile_name.clone());
+    let model_name_handle = ws.put(config.model.model.clone());
+    let model_base_url = ws.put(config.model.base_url.clone());
+    let model_stream: Value<U256BE> = if config.model.stream { 1u64 } else { 0u64 }.to_value();
+    let model_context_window_tokens: Value<U256BE> = config.model.context_window_tokens.to_value();
+    let model_max_output_tokens: Value<U256BE> = config.model.max_output_tokens.to_value();
+    let model_context_safety_margin_tokens: Value<U256BE> =
+        config.model.context_safety_margin_tokens.to_value();
+    let model_chars_per_token: Value<U256BE> = config.model.chars_per_token.to_value();
 
     change += entity! { &profile_entry_id @
-        playground_config::kind: KIND_LLM_PROFILE_ID,
+        playground_config::kind: KIND_MODEL_PROFILE_ID,
         playground_config::updated_at: now,
-        playground_config::llm_profile_id: profile_id,
+        playground_config::model_profile_id: profile_id,
         metadata::name: profile_name,
-        playground_config::llm_model: llm_model,
-        playground_config::llm_base_url: llm_base_url,
-        playground_config::llm_stream: llm_stream,
-        playground_config::llm_context_window_tokens: llm_context_window_tokens,
-        playground_config::llm_max_output_tokens: llm_max_output_tokens,
-        playground_config::llm_prompt_safety_margin_tokens: llm_prompt_safety_margin_tokens,
-        playground_config::llm_prompt_chars_per_token: llm_prompt_chars_per_token,
+        playground_config::model_name: model_name_handle,
+        playground_config::model_base_url: model_base_url,
+        playground_config::model_stream: model_stream,
+        playground_config::model_context_window_tokens: model_context_window_tokens,
+        playground_config::model_max_output_tokens: model_max_output_tokens,
+        playground_config::model_context_safety_margin_tokens: model_context_safety_margin_tokens,
+        playground_config::model_chars_per_token: model_chars_per_token,
     };
 
-    if let Some(key) = config.llm.api_key.as_ref() {
+    if let Some(key) = config.model.api_key.as_ref() {
         let handle = ws.put(key.clone());
-        change += entity! { &profile_entry_id @ playground_config::llm_api_key: handle };
+        change += entity! { &profile_entry_id @ playground_config::model_api_key: handle };
     }
-    if let Some(effort) = config.llm.reasoning_effort.as_ref() {
+    if let Some(effort) = config.model.reasoning_effort.as_ref() {
         let handle = ws.put(effort.clone());
-        change += entity! { &profile_entry_id @ playground_config::llm_reasoning_effort: handle };
+        change += entity! { &profile_entry_id @ playground_config::model_reasoning_effort: handle };
     }
-    if let Some(summary) = config.llm.reasoning_summary {
+    if let Some(summary) = config.model.reasoning_summary {
         let handle = ws.put(summary.as_str().to_string());
-        change += entity! { &profile_entry_id @ playground_config::llm_reasoning_summary: handle };
-    }
-
-    for lens in &memory_lenses {
-        let lens_entry_id = ufoid();
-        let lens_name = ws.put(lens.name.clone());
-        let lens_prompt = ws.put(lens.prompt.clone());
-        let lens_compaction_prompt = ws.put(lens.compaction_prompt.clone());
-        let lens_max_output_tokens: Value<U256BE> = lens.max_output_tokens.to_value();
-        change += entity! { &lens_entry_id @
-            playground_config::kind: KIND_MEMORY_LENS_ID,
-            playground_config::updated_at: now,
-            playground_config::memory_lens_id: lens.id,
-            metadata::name: lens_name,
-            playground_config::memory_lens_prompt: lens_prompt,
-            playground_config::memory_lens_compaction_prompt: lens_compaction_prompt,
-            playground_config::memory_lens_max_output_tokens: lens_max_output_tokens,
-        };
+        change += entity! { &profile_entry_id @ playground_config::model_reasoning_summary: handle };
     }
 
     ws.commit(change, None, Some("playground config"));
@@ -1700,7 +1268,7 @@ impl Default for ExecConfig {
     }
 }
 
-impl Default for LlmConfig {
+impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             model: DEFAULT_MODEL.to_string(),
@@ -1711,8 +1279,8 @@ impl Default for LlmConfig {
             stream: DEFAULT_STREAM,
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
-            prompt_safety_margin_tokens: DEFAULT_PROMPT_SAFETY_MARGIN_TOKENS,
-            prompt_chars_per_token: DEFAULT_PROMPT_CHARS_PER_TOKEN,
+            context_safety_margin_tokens: DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
+            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
         }
     }
 }
@@ -1720,12 +1288,9 @@ impl Default for LlmConfig {
 fn default_config(pile_path: PathBuf) -> Config {
     Config {
         pile_path,
-        llm: LlmConfig::default(),
-        llm_profile_id: None,
-        llm_profile_name: "default".to_string(),
-        llm_compaction_profile_id: None,
-        memory_compaction_arity: 8,
-        memory_lenses: default_memory_lenses(),
+        model: ModelConfig::default(),
+        model_profile_id: None,
+        model_profile_name: "default".to_string(),
         tavily_api_key: None,
         exa_api_key: None,
         exec: ExecConfig::default(),
@@ -1746,38 +1311,6 @@ fn default_config(pile_path: PathBuf) -> Config {
         persona_id: None,
         poll_ms: DEFAULT_POLL_MS,
     }
-}
-
-fn default_memory_lenses() -> Vec<MemoryLensConfig> {
-    vec![
-        MemoryLensConfig {
-            id: MEMORY_LENS_ID_FACTUAL,
-            name: "factual".to_string(),
-            prompt: DEFAULT_MEMORY_LENS_FACTUAL_PROMPT.to_string(),
-            compaction_prompt: DEFAULT_MEMORY_LENS_FACTUAL_COMPACTION_PROMPT.to_string(),
-            max_output_tokens: DEFAULT_MEMORY_LENS_FACTUAL_MAX_OUTPUT_TOKENS,
-        },
-        MemoryLensConfig {
-            id: MEMORY_LENS_ID_TECHNICAL,
-            name: "technical".to_string(),
-            prompt: DEFAULT_MEMORY_LENS_TECHNICAL_PROMPT.to_string(),
-            compaction_prompt: DEFAULT_MEMORY_LENS_TECHNICAL_COMPACTION_PROMPT.to_string(),
-            max_output_tokens: DEFAULT_MEMORY_LENS_TECHNICAL_MAX_OUTPUT_TOKENS,
-        },
-        MemoryLensConfig {
-            id: MEMORY_LENS_ID_EMOTIONAL,
-            name: "emotional".to_string(),
-            prompt: DEFAULT_MEMORY_LENS_EMOTIONAL_PROMPT.to_string(),
-            compaction_prompt: DEFAULT_MEMORY_LENS_EMOTIONAL_COMPACTION_PROMPT.to_string(),
-            max_output_tokens: DEFAULT_MEMORY_LENS_EMOTIONAL_MAX_OUTPUT_TOKENS,
-        },
-    ]
-}
-
-fn default_memory_lens_by_name(name: &str) -> Option<MemoryLensConfig> {
-    default_memory_lenses()
-        .into_iter()
-        .find(|lens| lens.name.eq_ignore_ascii_case(name))
 }
 
 fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
