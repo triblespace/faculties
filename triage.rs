@@ -48,9 +48,9 @@ const KIND_CONFIG_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const KIND_EXEC_REQUEST_ID: Id = id_hex!("3D2512DAE86B14B9049930F3146A3188");
 const KIND_EXEC_IN_PROGRESS_ID: Id = id_hex!("2D81A8D840822CF082DE5DE569B53730");
 const KIND_EXEC_RESULT_ID: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
-const KIND_LLM_REQUEST_ID: Id = id_hex!("1524B4C030D4F10365D9DCEE801A09C8");
-const KIND_LLM_IN_PROGRESS_ID: Id = id_hex!("16C69FC4928D54BF93E6F3222B4685A7");
-const KIND_LLM_RESULT_ID: Id = id_hex!("DE498E4697F9F01219C75E7BC183DB91");
+const KIND_MODEL_REQUEST_ID: Id = id_hex!("1524B4C030D4F10365D9DCEE801A09C8");
+const KIND_MODEL_IN_PROGRESS_ID: Id = id_hex!("16C69FC4928D54BF93E6F3222B4685A7");
+const KIND_MODEL_RESULT_ID: Id = id_hex!("DE498E4697F9F01219C75E7BC183DB91");
 const KIND_REASON_EVENT_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
 const KIND_CONTEXT_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 const REPO_HEAD_ATTR: Id = id_hex!("272FBC56108F336C4D2E17289468C35F");
@@ -126,21 +126,11 @@ mod model_chat {
         "5F10520477A04E5FB322C85CC78C6762" as kind: valueschemas::GenId;
         "5A14A02113CE43A59881D0717726F465" as about_request: valueschemas::GenId;
         "DA8E31E47919337B3E00724EBE32D14E" as about_thought: valueschemas::GenId;
-        "238CF718317A94DB46B8D75E7CB6D609" as finished_at: valueschemas::NsTAIInterval;
-        "B1B904590F0FA70AD1BA247F3D23A6CC" as output_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "567E35DACDB00C799E75AEED0B6EFDF7" as reasoning_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "9E9B829C473E416E9150D4B94A6A2DC4" as error: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-    }
-}
-
-mod llm {
-    use super::*;
-    attributes! {
-        "5F10520477A04E5FB322C85CC78C6762" as kind: valueschemas::GenId;
-        "5A14A02113CE43A59881D0717726F465" as about_request: valueschemas::GenId;
         "0DA5DD275AA34F86B0297CC35F1B7395" as requested_at: valueschemas::NsTAIInterval;
         "1DE7C6BCE0223199368070A82EA23A7E" as started_at: valueschemas::NsTAIInterval;
         "238CF718317A94DB46B8D75E7CB6D609" as finished_at: valueschemas::NsTAIInterval;
+        "B1B904590F0FA70AD1BA247F3D23A6CC" as output_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "567E35DACDB00C799E75AEED0B6EFDF7" as reasoning_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "9E9B829C473E416E9150D4B94A6A2DC4" as error: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
     }
 }
@@ -228,7 +218,7 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         min_repeat: usize,
     },
-    /// Show an interleaved recent activity timeline (exec/llm/reason)
+    /// Show an interleaved recent activity timeline (exec/model/reason)
     Timeline {
         /// Max events to print (newest first)
         #[arg(long, default_value_t = 80)]
@@ -337,28 +327,28 @@ struct ExecState {
 }
 
 #[derive(Debug, Clone)]
-struct LlmRequestRow {
+struct ModelRequestRow {
     requested_at: Option<i128>,
 }
 
 #[derive(Debug, Clone)]
-struct LlmInProgressRow {
+struct ModelInProgressRow {
     about_request: Id,
     started_at: Option<i128>,
 }
 
 #[derive(Debug, Clone)]
-struct LlmResultRow {
+struct ModelResultRow {
     about_request: Id,
     finished_at: Option<i128>,
     error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct LlmState {
-    requests: HashMap<Id, LlmRequestRow>,
-    in_progress: Vec<LlmInProgressRow>,
-    results: Vec<LlmResultRow>,
+struct ModelChatState {
+    requests: HashMap<Id, ModelRequestRow>,
+    in_progress: Vec<ModelInProgressRow>,
+    results: Vec<ModelResultRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -1016,24 +1006,24 @@ fn collect_exec_state(
     Ok(state)
 }
 
-fn collect_llm_state(
+fn collect_model_chat_state(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     space: &TribleSet,
-) -> Result<LlmState> {
-    let mut state = LlmState::default();
+) -> Result<ModelChatState> {
+    let mut state = ModelChatState::default();
 
     for (request_id,) in find!(
         (request_id: Id),
-        pattern!(&space, [{ ?request_id @ llm::kind: &KIND_LLM_REQUEST_ID }])
+        pattern!(&space, [{ ?request_id @ model_chat::kind: &KIND_MODEL_REQUEST_ID }])
     ) {
         state
             .requests
-            .insert(request_id, LlmRequestRow { requested_at: None });
+            .insert(request_id, ModelRequestRow { requested_at: None });
     }
 
     for (request_id, requested_at) in find!(
         (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?request_id @ llm::requested_at: ?requested_at }])
+        pattern!(&space, [{ ?request_id @ model_chat::requested_at: ?requested_at }])
     ) {
         if let Some(entry) = state.requests.get_mut(&request_id) {
             entry.requested_at = Some(interval_key(requested_at));
@@ -1044,38 +1034,38 @@ fn collect_llm_state(
         (event_id: Id, about_request: Id),
         pattern!(&space, [{
             ?event_id @
-            llm::kind: &KIND_LLM_IN_PROGRESS_ID,
-            llm::about_request: ?about_request,
+            model_chat::kind: &KIND_MODEL_IN_PROGRESS_ID,
+            model_chat::about_request: ?about_request,
         }])
     ) {
         let mut started_at = None;
         for (id, value) in find!(
             (id: Id, value: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{ ?id @ llm::started_at: ?value }])
+            pattern!(&space, [{ ?id @ model_chat::started_at: ?value }])
         ) {
             if id == event_id {
                 started_at = Some(interval_key(value));
                 break;
             }
         }
-        state.in_progress.push(LlmInProgressRow {
+        state.in_progress.push(ModelInProgressRow {
             about_request,
             started_at,
         });
     }
 
-    let mut result_map: HashMap<Id, LlmResultRow> = HashMap::new();
+    let mut result_map: HashMap<Id, ModelResultRow> = HashMap::new();
     for (result_id, about_request) in find!(
         (result_id: Id, about_request: Id),
         pattern!(&space, [{
             ?result_id @
-            llm::kind: &KIND_LLM_RESULT_ID,
-            llm::about_request: ?about_request,
+            model_chat::kind: &KIND_MODEL_RESULT_ID,
+            model_chat::about_request: ?about_request,
         }])
     ) {
         result_map.insert(
             result_id,
-            LlmResultRow {
+            ModelResultRow {
                 about_request,
                 finished_at: None,
                 error: None,
@@ -1085,7 +1075,7 @@ fn collect_llm_state(
 
     for (result_id, value) in find!(
         (result_id: Id, value: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?result_id @ llm::finished_at: ?value }])
+        pattern!(&space, [{ ?result_id @ model_chat::finished_at: ?value }])
     ) {
         if let Some(entry) = result_map.get_mut(&result_id) {
             entry.finished_at = Some(interval_key(value));
@@ -1094,7 +1084,7 @@ fn collect_llm_state(
 
     for (result_id, handle) in find!(
         (result_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?result_id @ llm::error: ?handle }])
+        pattern!(&space, [{ ?result_id @ model_chat::error: ?handle }])
     ) {
         if let Some(entry) = result_map.get_mut(&result_id) {
             entry.error = Some(read_text(ws, handle)?);
@@ -1183,7 +1173,7 @@ fn pending_exec_count(state: &ExecState) -> usize {
         .count()
 }
 
-fn pending_llm_count(state: &LlmState) -> usize {
+fn pending_model_count(state: &ModelChatState) -> usize {
     let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
     let running: HashSet<Id> = state
         .in_progress
@@ -1209,7 +1199,7 @@ fn stale_exec_in_progress_count(state: &ExecState, now_key: i128, stale_ns: i128
         .count()
 }
 
-fn stale_llm_in_progress_count(state: &LlmState, now_key: i128, stale_ns: i128) -> usize {
+fn stale_model_in_progress_count(state: &ModelChatState, now_key: i128, stale_ns: i128) -> usize {
     let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
     state
         .in_progress
@@ -1231,7 +1221,7 @@ fn active_exec_running_count(state: &ExecState) -> usize {
         .len()
 }
 
-fn active_llm_running_count(state: &LlmState) -> usize {
+fn active_model_running_count(state: &ModelChatState) -> usize {
     let done: HashSet<Id> = state.results.iter().map(|row| row.about_request).collect();
     state
         .in_progress
@@ -1448,17 +1438,17 @@ fn cmd_scan(
         .checkout(..)
         .map_err(|e| anyhow!("checkout target workspace: {e:?}"))?;
     let exec_state = collect_exec_state(&mut ws, &space)?;
-    let llm_state = collect_llm_state(&mut ws, &space)?;
+    let model_state = collect_model_chat_state(&mut ws, &space)?;
 
     let now_key = now_epoch().to_tai_duration().total_nanoseconds();
     let stale_ns = (stale_min.max(0) as i128) * 60 * 1_000_000_000;
 
     let exec_pending = pending_exec_count(&exec_state);
-    let llm_pending = pending_llm_count(&llm_state);
+    let model_pending = pending_model_count(&model_state);
     let stale_exec = stale_exec_in_progress_count(&exec_state, now_key, stale_ns);
-    let stale_llm = stale_llm_in_progress_count(&llm_state, now_key, stale_ns);
+    let stale_model = stale_model_in_progress_count(&model_state, now_key, stale_ns);
     let exec_running = active_exec_running_count(&exec_state);
-    let llm_running = active_llm_running_count(&llm_state);
+    let model_running = active_model_running_count(&model_state);
     let loop_report = build_loop_report(&exec_state, recent, loop_min);
 
     let unread_local = if let Some(persona_id) = config.as_ref().and_then(|cfg| cfg.persona_id) {
@@ -1497,13 +1487,13 @@ fn cmd_scan(
         exec_state.results.len()
     );
     println!(
-        "- llm:  requests={} pending={} running={} results={}",
-        llm_state.requests.len(),
-        llm_pending,
-        llm_running,
-        llm_state.results.len()
+        "- model: requests={} pending={} running={} results={}",
+        model_state.requests.len(),
+        model_pending,
+        model_running,
+        model_state.results.len()
     );
-    println!("- stale in-progress (>{stale_min}m): exec={stale_exec}, llm={stale_llm}");
+    println!("- stale in-progress (>{stale_min}m): exec={stale_exec}, model={stale_model}");
     match unread_local {
         Some(count) => println!("- local unread (persona inbox): {count}"),
         None => println!("- local unread (persona inbox): unavailable"),
@@ -1531,13 +1521,13 @@ fn cmd_scan(
         println!("- no contiguous failure loop >= {loop_min} in recent exec results");
     }
 
-    let recent_llm_failures = collect_recent_llm_failures(&llm_state, recent);
+    let recent_model_failures = collect_recent_model_failures(&model_state, recent);
     println!();
-    println!("Recent LLM failures");
-    if recent_llm_failures.is_empty() {
+    println!("Recent model failures");
+    if recent_model_failures.is_empty() {
         println!("- none in recent window");
     } else {
-        for row in recent_llm_failures {
+        for row in recent_model_failures {
             let age = row
                 .finished_at
                 .map(|at| format_age(now_key, at))
@@ -1553,15 +1543,15 @@ fn cmd_scan(
 
     println!();
     println!("Suggested next checks");
-    if llm_pending > 0 && llm_state.in_progress.is_empty() {
-        println!("- LLM worker might be down: pending requests exist without in-progress events.");
+    if model_pending > 0 && model_state.in_progress.is_empty() {
+        println!("- Model worker might be down: pending requests exist without in-progress events.");
     }
     if exec_pending > 0 && exec_state.in_progress.is_empty() {
         println!(
             "- Exec worker might be down: pending command requests exist without in-progress events."
         );
     }
-    if stale_exec > 0 || stale_llm > 0 {
+    if stale_exec > 0 || stale_model > 0 {
         println!("- One or more workers appear stale; inspect service logs and process health.");
     }
     if let Some(head) = probable_pattern {
@@ -1592,10 +1582,10 @@ fn cmd_scan(
             );
         }
     }
-    if llm_pending == 0
+    if model_pending == 0
         && exec_pending == 0
         && stale_exec == 0
-        && stale_llm == 0
+        && stale_model == 0
         && unread_local.unwrap_or(0) == 0
     {
         println!("- system looks healthy; no obvious blockers detected.");
@@ -1604,8 +1594,8 @@ fn cmd_scan(
     Ok(())
 }
 
-fn collect_recent_llm_failures(state: &LlmState, recent: usize) -> Vec<LlmResultRow> {
-    let mut failures: Vec<LlmResultRow> = state
+fn collect_recent_model_failures(state: &ModelChatState, recent: usize) -> Vec<ModelResultRow> {
+    let mut failures: Vec<ModelResultRow> = state
         .results
         .iter()
         .filter(|row| row.error.is_some())
@@ -1881,7 +1871,7 @@ fn cmd_loops(
 
 fn build_timeline_rows(
     exec_state: &ExecState,
-    llm_state: &LlmState,
+    model_state: &ModelChatState,
     reason_rows: &[ReasonEventRow],
     recent: usize,
 ) -> Vec<TimelineRow> {
@@ -1942,22 +1932,22 @@ fn build_timeline_rows(
         });
     }
 
-    for request in llm_state.requests.keys() {
-        if let Some(entry) = llm_state.requests.get(request) {
+    for request in model_state.requests.keys() {
+        if let Some(entry) = model_state.requests.get(request) {
             if let Some(at) = entry.requested_at {
                 rows.push(TimelineRow {
                     at,
-                    source: "llm",
+                    source: "model",
                     detail: format!("[{}] request", id_prefix(*request)),
                 });
             }
         }
     }
-    for result in &llm_state.results {
+    for result in &model_state.results {
         if let Some(error) = result.error.as_ref() {
             rows.push(TimelineRow {
                 at: result.finished_at.unwrap_or(i128::MIN),
-                source: "llm-error",
+                source: "model-error",
                 detail: truncate_single_line(error, 130),
             });
         }
@@ -2003,9 +1993,9 @@ fn cmd_timeline(
         .checkout(..)
         .map_err(|e| anyhow!("checkout target workspace: {e:?}"))?;
     let exec_state = collect_exec_state(&mut ws, &space)?;
-    let llm_state = collect_llm_state(&mut ws, &space)?;
+    let model_state = collect_model_chat_state(&mut ws, &space)?;
     let reason_state = collect_reason_state(&mut ws, &space)?;
-    let rows = build_timeline_rows(&exec_state, &llm_state, &reason_state, recent);
+    let rows = build_timeline_rows(&exec_state, &model_state, &reason_state, recent);
     let now_key = now_epoch().to_tai_duration().total_nanoseconds();
 
     println!("Triage timeline");
@@ -3030,46 +3020,46 @@ fn cmd_turn(
             }
         }
 
-        // Find LLM result linked to this request (model_chat result -> about_request)
-        let mut llm_result_id: Option<Id> = None;
+        // Find model result linked to this request (model_chat result -> about_request)
+        let mut model_result_id: Option<Id> = None;
         for (mid, about_req) in find!(
             (mid: Id, about_req: Id),
             pattern!(&space, [{
                 ?mid @
-                model_chat::kind: &KIND_LLM_RESULT_ID,
+                model_chat::kind: &KIND_MODEL_RESULT_ID,
                 model_chat::about_request: ?about_req,
             }])
         ) {
             if about_req == request_id {
-                llm_result_id = Some(mid);
+                model_result_id = Some(mid);
                 break;
             }
         }
 
-        // Also try linking via about_thought on the LLM result
-        if llm_result_id.is_none() {
+        // Also try linking via about_thought on the model result
+        if model_result_id.is_none() {
             if let Some(tid) = thought_id {
                 for (mid, about_thought) in find!(
                     (mid: Id, about_thought: Id),
                     pattern!(&space, [{
                         ?mid @
-                        model_chat::kind: &KIND_LLM_RESULT_ID,
+                        model_chat::kind: &KIND_MODEL_RESULT_ID,
                         model_chat::about_thought: ?about_thought,
                     }])
                 ) {
                     if about_thought == tid {
-                        llm_result_id = Some(mid);
+                        model_result_id = Some(mid);
                         break;
                     }
                 }
             }
         }
 
-        if let Some(mid) = llm_result_id {
+        if let Some(mid) = model_result_id {
             let mut output_text: Option<String> = None;
             let mut reasoning_text: Option<String> = None;
-            let mut llm_error: Option<String> = None;
-            let mut llm_finished: Option<i128> = None;
+            let mut model_error: Option<String> = None;
+            let mut model_finished: Option<i128> = None;
 
             for (id, handle) in find!(
                 (id: Id, handle: TextHandle),
@@ -3094,7 +3084,7 @@ fn cmd_turn(
                 pattern!(&space, [{ ?id @ model_chat::error: ?handle }])
             ) {
                 if id == mid {
-                    llm_error = Some(read_text(&mut ws, handle)?);
+                    model_error = Some(read_text(&mut ws, handle)?);
                     break;
                 }
             }
@@ -3103,17 +3093,17 @@ fn cmd_turn(
                 pattern!(&space, [{ ?id @ model_chat::finished_at: ?value }])
             ) {
                 if id == mid {
-                    llm_finished = Some(interval_key(value));
+                    model_finished = Some(interval_key(value));
                     break;
                 }
             }
 
             println!();
             println!("Model result [{}]", id_prefix(mid));
-            if let Some(at) = llm_finished {
+            if let Some(at) = model_finished {
                 println!("- finished: {}", format_tai_ns(at));
             }
-            if let Some(ref err) = llm_error {
+            if let Some(ref err) = model_error {
                 println!("- error: {}", if full { err.clone() } else { truncate_single_line(err, 120) });
             }
             if let Some(ref reasoning) = reasoning_text {
