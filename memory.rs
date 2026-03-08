@@ -18,6 +18,7 @@ use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
@@ -33,7 +34,6 @@ const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 mod config_schema {
     use super::*;
     attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
         "4E2F9CA7A8456DED8C43A3BE741ADA58" as branch_id: GenId;
         "C188E12ABBDD83D283A23DBAD4B784AF" as exec_branch_id: GenId;
@@ -44,7 +44,6 @@ mod config_schema {
 mod exec_schema {
     use super::*;
     attributes! {
-        "AA2F34973589295FA70B538D92CD30F8" as kind: GenId;
         "B4B81B90EFB4D1F5EE62DDE9CB48025D" as finished_at: NsTAIInterval;
     }
 }
@@ -54,7 +53,6 @@ const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
 mod archive_schema {
     use super::*;
     attributes! {
-        "5F10520477A04E5FB322C85CC78C6762" as kind: GenId;
         "0DA5DD275AA34F86B0297CC35F1B7395" as created_at: NsTAIInterval;
         "838CC157FFDD37C6AC7CC5A472E43ADB" as author: GenId;
         "E63EE961ABDB1D1BEC0789FDAFFB9501" as author_name: Handle<Blake3, LongString>;
@@ -74,7 +72,6 @@ const KIND_ARCHIVE_MESSAGE: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
 mod ctx {
     use super::*;
     attributes! {
-        "81E520987033BE71EB0AFFA8297DE613" as kind: GenId;
         "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<Blake3, LongString>;
         "3D5865566AF5118471DA1FF7F87CB791" as created_at: NsTAIInterval;
         "4EAF7FE3122A0AE2D8309B79DCCB8D75" as start_at: NsTAIInterval;
@@ -418,7 +415,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
 
         let mut change = TribleSet::new();
         change += entity! { &chunk_id @
-            ctx::kind: KIND_CHUNK_ID,
+            metadata::tag: KIND_CHUNK_ID,
             ctx::summary: summary_handle,
             ctx::created_at: created_at,
             ctx::start_at: start_at,
@@ -483,7 +480,7 @@ fn load_create_config(repo: &mut Repository<Pile<Blake3>>) -> Result<CreateConfi
         (config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
         pattern!(&catalog, [{
             ?config_id @
-            config_schema::kind: &KIND_CONFIG_ID,
+            metadata::tag: &KIND_CONFIG_ID,
             config_schema::updated_at: ?updated_at,
             config_schema::branch_id: ?branch_id,
         }])
@@ -562,7 +559,7 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
                 (_config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
                 pattern!(&config_catalog, [{
                     ?_config_id @
-                    config_schema::kind: &KIND_CONFIG_ID,
+                    metadata::tag: &KIND_CONFIG_ID,
                     config_schema::updated_at: ?updated_at,
                     config_schema::branch_id: ?branch_id,
                 }])
@@ -651,7 +648,7 @@ fn print_archive_meta(
         (config_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(config_catalog, [{
             ?config_id @
-            config_schema::kind: &KIND_CONFIG_ID,
+            metadata::tag: &KIND_CONFIG_ID,
             config_schema::updated_at: ?updated_at,
         }])
     ) {
@@ -794,7 +791,7 @@ fn find_exec_by_time_range(
         (result_id: Id, finished_at: Value<NsTAIInterval>),
         pattern!(catalog, [{
             ?result_id @
-            exec_schema::kind: &KIND_EXEC_RESULT,
+            metadata::tag: &KIND_EXEC_RESULT,
             exec_schema::finished_at: ?finished_at,
         }])
     ) {
@@ -825,7 +822,7 @@ fn find_archive_by_time_range(
         (msg_id: Id, created_at: Value<NsTAIInterval>),
         pattern!(catalog, [{
             ?msg_id @
-            archive_schema::kind: &KIND_ARCHIVE_MESSAGE,
+            metadata::tag: &KIND_ARCHIVE_MESSAGE,
             archive_schema::created_at: ?created_at,
         }])
     ) {
@@ -864,7 +861,7 @@ fn load_core_branch_id(repo: &mut Repository<Pile<Blake3>>) -> Result<Id> {
         (config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
         pattern!(&space, [{
             ?config_id @
-            config_schema::kind: &KIND_CONFIG_ID,
+            metadata::tag: &KIND_CONFIG_ID,
             config_schema::updated_at: ?updated_at,
             config_schema::branch_id: ?branch_id,
         }])
@@ -894,7 +891,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         ),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::summary: ?summary,
         }])
     ) {
@@ -919,7 +916,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         (chunk_id: Id, child: Value<GenId>),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::child: ?child,
         }])
     ) {
@@ -932,7 +929,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         (chunk_id: Id, child: Value<GenId>),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::left: ?child,
         }])
     ) {
@@ -945,7 +942,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         (chunk_id: Id, child: Value<GenId>),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::right: ?child,
         }])
     ) {
@@ -958,7 +955,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         (chunk_id: Id, exec_id: Value<GenId>),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::about_exec_result: ?exec_id,
         }])
     ) {
@@ -971,7 +968,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         (chunk_id: Id, archive_id: Value<GenId>),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::about_archive_message: ?archive_id,
         }])
     ) {
@@ -984,7 +981,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         (chunk_id: Id, start_at: Value<NsTAIInterval>),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::start_at: ?start_at,
         }])
     ) {
@@ -997,7 +994,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         (chunk_id: Id, end_at: Value<NsTAIInterval>),
         pattern!(space, [{
             ?chunk_id @
-            ctx::kind: &KIND_CHUNK_ID,
+            metadata::tag: &KIND_CHUNK_ID,
             ctx::end_at: ?end_at,
         }])
     ) {

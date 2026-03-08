@@ -314,7 +314,7 @@ fn load_config_branches(repo: &mut Repository<Pile<valueschemas::Blake3>>) -> Re
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config_schema::kind: &CONFIG_KIND_ID,
+            metadata::tag: &CONFIG_KIND_ID,
             config_schema::updated_at: ?updated_at,
         }])
     ) {

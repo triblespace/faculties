@@ -284,7 +284,7 @@ fn load_config_snapshot(repo: &mut Repository<Pile<valueschemas::Blake3>>, branc
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config_schema::kind: &CONFIG_KIND_ID,
+            metadata::tag: &CONFIG_KIND_ID,
             config_schema::updated_at: ?updated_at,
         }])
     ) {
@@ -359,7 +359,7 @@ fn append_timeout_extension(
         let event_id = ufoid();
         let now = epoch_interval(now_epoch());
         let change = entity! { &event_id @
-            exec_schema::kind: KIND_TIMEOUT_EXTENSION_ID,
+            metadata::tag: KIND_TIMEOUT_EXTENSION_ID,
             exec_schema::about_request: request_id,
             exec_schema::worker: worker_id,
             exec_schema::timeout_ms: timeout_ms,

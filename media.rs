@@ -54,7 +54,6 @@ struct Cli {
 mod config_schema {
     use super::*;
     attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
         "229941B84503AAE4976A49E020D1282B" as media_branch_id: GenId;
     }
@@ -536,7 +535,7 @@ fn load_config_branches(repo: &mut Repository<Pile<Blake3>>) -> Result<ConfigBra
         (config_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config_schema::kind: &CONFIG_KIND_ID,
+            metadata::tag: &CONFIG_KIND_ID,
             config_schema::updated_at: ?updated_at,
         }])
     ) {

@@ -94,7 +94,6 @@ mod config_schema {
     use super::*;
 
     attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
         "A4DFF7BE658B1EA16F866E3039FFF8D6" as web_branch_id: GenId;
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
@@ -354,7 +353,7 @@ fn latest_config_id(space: &TribleSet) -> Result<Option<Id>> {
         (config_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(space, [{
             ?config_id @
-            config_schema::kind: CONFIG_KIND_ID,
+            metadata::tag: CONFIG_KIND_ID,
             config_schema::updated_at: ?updated_at,
         }])
     ) {

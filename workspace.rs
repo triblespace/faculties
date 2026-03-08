@@ -19,6 +19,7 @@ use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use triblespace::core::blob::{Blob, Bytes};
+use triblespace::core::metadata;
 use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{PushResult, Repository, Workspace};
@@ -34,7 +35,6 @@ const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 mod config_schema {
     use super::*;
     attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
         "20D37D92C2AEF5C98899C4C35AA1E35E" as workspace_branch_id: GenId;
     }
@@ -44,7 +44,6 @@ mod playground_workspace {
     use super::*;
 
     attributes! {
-        "E39FB34126FE01A32F1D4B3DAD0F1874" as pub kind: GenId;
         "A95E92FB35943C570BE45FF811B0BD07" as pub created_at: NsTAIInterval;
         "5D36AA8480B30F62394911A003F20DDF" as pub parent_snapshot: GenId;
         "B667B02CEB4493232632473ECB782287" as pub root_path: Handle<Blake3, LongString>;
@@ -518,7 +517,7 @@ fn load_config_branches(repo: &mut Repository<Pile<Blake3>>) -> Result<ConfigBra
         (config_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config_schema::kind: &CONFIG_KIND_ID,
+            metadata::tag: &CONFIG_KIND_ID,
             config_schema::updated_at: ?updated_at,
         }])
     ) {
@@ -600,7 +599,7 @@ fn write_snapshot(
         change += entry_set;
     }
     change += entity! { &snapshot_id @
-        playground_workspace::kind: playground_workspace::kind_snapshot,
+        metadata::tag: playground_workspace::kind_snapshot,
         playground_workspace::created_at: created_at,
         playground_workspace::root_path: root_handle,
         playground_workspace::state: state_handle,
@@ -663,7 +662,7 @@ fn compute_state_handle(
         state += entry_set;
     }
     state += entity! { _ @
-        playground_workspace::kind: playground_workspace::kind_snapshot,
+        metadata::tag: playground_workspace::kind_snapshot,
         playground_workspace::root_path: root_handle,
         playground_workspace::entry*: entry_ids,
     };
@@ -675,7 +674,7 @@ fn compute_state_handle(
 fn build_entry_entity(entry: &MaterializedEntry) -> Fragment {
     entity! { _ @
         playground_workspace::path: entry.path_handle,
-        playground_workspace::kind: entry.kind,
+        metadata::tag: entry.kind,
         playground_workspace::mode?: entry.mode,
         playground_workspace::bytes?: entry.bytes_handle,
         playground_workspace::link_target?: entry.link_target_handle,
@@ -878,7 +877,7 @@ fn list_snapshots(
         (snapshot_id: Id, created_at: Value<NsTAIInterval>),
         pattern!(&catalog, [{
             ?snapshot_id @
-            playground_workspace::kind: playground_workspace::kind_snapshot,
+            metadata::tag: playground_workspace::kind_snapshot,
             playground_workspace::created_at: ?created_at,
         }])
     ) {
@@ -963,7 +962,7 @@ fn latest_snapshot(catalog: &TribleSet) -> Result<Option<Id>> {
         (snapshot_id: Id, created_at: Value<NsTAIInterval>),
         pattern!(&catalog, [{
             ?snapshot_id @
-            playground_workspace::kind: playground_workspace::kind_snapshot,
+            metadata::tag: playground_workspace::kind_snapshot,
             playground_workspace::created_at: ?created_at,
         }])
     ) {
@@ -1086,7 +1085,7 @@ fn load_entry(
         (kind: Id),
         pattern!(catalog, [{
             entry_id @
-            playground_workspace::kind: ?kind,
+            metadata::tag: ?kind,
         }])
     )
     .into_iter()

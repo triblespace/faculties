@@ -81,7 +81,6 @@ mod common {
             use super::*;
 
             attributes! {
-                "5F10520477A04E5FB322C85CC78C6762" as pub kind: GenId;
 
                 "0D9195A7B1B20DE312A08ECE39168079" as pub reply_to: GenId;
                 "838CC157FFDD37C6AC7CC5A472E43ADB" as pub author: GenId;
@@ -160,7 +159,6 @@ mod common {
             metadata += <Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?;
             metadata += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
 
-            metadata += metadata::Describe::describe(&archive::kind, blobs)?;
             metadata += metadata::Describe::describe(&archive::reply_to, blobs)?;
             metadata += metadata::Describe::describe(&archive::author, blobs)?;
             metadata += metadata::Describe::describe(&archive::author_name, blobs)?;
@@ -195,7 +193,6 @@ mod common {
         use triblespace::prelude::*;
 
         attributes! {
-            "41F6FA1633D8CB6AC7B2741BA0E140F4" as pub kind: GenId;
             "891508CAD6E1430B221ADA937EFBD982" as pub conversation: GenId;
             "E997DCAAF43BAA04790FCB0FA0FBFE3A" as pub source_format: ShortString;
             "973FB59D3452D3A8276172F8E3272324" as pub source_raw_root: GenId;
@@ -218,19 +215,6 @@ mod common {
         #[allow(non_upper_case_globals)]
         pub const kind_conversation: Id = id_hex!("573E4291B63CBA1B5AE090B0C25A2D34");
 
-        /// Tag for import protocol metadata.
-        #[allow(non_upper_case_globals)]
-        pub const tag_protocol: Id = id_hex!("21395C6FE7F3EB9CEAF5CF221C0B22B8");
-        /// Tag for kind constants in the import protocol.
-        #[allow(non_upper_case_globals)]
-        pub const tag_kind: Id = id_hex!("F7DC8B6E0C34FC58677E84A40580F8C2");
-        /// Tag for attribute constants in the import protocol.
-        #[allow(non_upper_case_globals)]
-        pub const tag_attribute: Id = id_hex!("0C9208CE8629DAA77721307868356F88");
-        /// Tag for tag constants in the import protocol.
-        #[allow(non_upper_case_globals)]
-        pub const tag_tag: Id = id_hex!("821901A883028FA3C9F5DEB03A7CA27E");
-
         #[allow(dead_code)]
         pub fn describe<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
         where
@@ -238,69 +222,18 @@ mod common {
         {
             let mut tribles = TribleSet::new();
             let import_metadata_entity = super::aquire_or_force(import_metadata);
-            let tag_protocol_entity = super::aquire_or_force(tag_protocol);
-            let tag_kind_entity = super::aquire_or_force(tag_kind);
-            let tag_attribute_entity = super::aquire_or_force(tag_attribute);
-            let tag_tag_entity = super::aquire_or_force(tag_tag);
             let kind_conversation_entity = super::aquire_or_force(kind_conversation);
 
             tribles += entity! { &import_metadata_entity @
-                metadata::name: blobs.put("import_metadata".to_string())?,
-                metadata::description: blobs.put(
-                    "Root id for describing import metadata.".to_string(),
-                )?,
-                metadata::tag: tag_protocol,
-            };
-
-            tribles += entity! { &tag_protocol_entity @
-                metadata::name: blobs.put("tag_protocol".to_string())?,
-                metadata::description: blobs.put(
-                    "Tag for import protocol metadata.".to_string(),
-                )?,
-                metadata::tag: tag_tag,
-            };
-
-            tribles += entity! { &tag_kind_entity @
-                metadata::name: blobs.put("tag_kind".to_string())?,
-                metadata::description: blobs.put(
-                    "Tag for import protocol kind constants.".to_string(),
-                )?,
-                metadata::tag: tag_tag,
-                metadata::tag: kind_conversation,
-            };
-
-            tribles += entity! { &tag_attribute_entity @
-                metadata::name: blobs.put("tag_attribute".to_string())?,
-                metadata::description: blobs.put(
-                    "Tag for import protocol attributes.".to_string(),
-                )?,
-                metadata::tag: tag_tag,
-                metadata::tag: kind.id(),
-                metadata::tag: conversation.id(),
-                metadata::tag: source_format.id(),
-                metadata::tag: source_raw_root.id(),
-                metadata::tag: source_conversation_id.id(),
-                metadata::tag: source_message_id.id(),
-                metadata::tag: source_author.id(),
-                metadata::tag: source_role.id(),
-                metadata::tag: source_parent_id.id(),
-                metadata::tag: source_created_at.id(),
-            };
-
-            tribles += entity! { &tag_tag_entity @
-                metadata::name: blobs.put("tag_tag".to_string())?,
-                metadata::description: blobs.put(
-                    "Tag for import protocol tag constants.".to_string(),
-                )?,
-                metadata::tag: tag_tag,
-                metadata::tag: tag_protocol,
-                metadata::tag: tag_kind,
-                metadata::tag: tag_attribute,
+                metadata::name: blobs.put("import_metadata")?,
+                metadata::description: blobs.put("Root id for describing import metadata.")?,
+                metadata::tag: metadata::KIND_PROTOCOL,
             };
 
             tribles += entity! { &kind_conversation_entity @
-                metadata::name: blobs.put("kind_conversation".to_string())?,
-                metadata::description: blobs.put("Import conversation entity kind.".to_string())?,
+                metadata::name: blobs.put("kind_conversation")?,
+                metadata::description: blobs.put("Import conversation entity kind.")?,
+                metadata::tag: metadata::KIND_TAG,
             };
 
             Ok(tribles)
@@ -562,7 +495,7 @@ mod common {
             (config_id: Id, updated_at: Value<NsTAIInterval>),
             pattern!(&space, [{
                 ?config_id @
-                config_schema::kind: &CONFIG_KIND_ID,
+                metadata::tag: &CONFIG_KIND_ID,
                 config_schema::updated_at: ?updated_at,
             }])
         ) {
@@ -718,7 +651,7 @@ mod common {
         let role_handle = (!role.is_empty()).then(|| ws.put(role.to_owned()));
         let mut change = TribleSet::new();
         change += entity! { &author_id @
-            archive::kind: archive::kind_author,
+            metadata::tag: archive::kind_author,
             archive::author_name: name_handle,
             archive::author_role?: role_handle,
         };
@@ -734,7 +667,7 @@ mod common {
             (author: Id, author_name: Value<Handle<Blake3, LongString>>),
             pattern!(catalog, [{
                 ?author @
-                archive::kind: archive::kind_author,
+                metadata::tag: archive::kind_author,
                 archive::author_name: ?author_name,
             }])
         ) {
@@ -1233,7 +1166,7 @@ fn resolve_message_id(catalog: &TribleSet, prefix: &str) -> Result<Id> {
     for (message_id,) in find!(
         (message: Id),
         pattern!(catalog, [{
-            ?message @ common::archive::kind: common::archive::kind_message,
+            ?message @ common::metadata::tag: common::archive::kind_message,
         }])
     ) {
         if format!("{message_id:x}").starts_with(trimmed) {
@@ -1370,7 +1303,7 @@ fn main() -> Result<()> {
                     ),
                     pattern!(&catalog, [{
                         ?message @
-                            common::archive::kind: common::archive::kind_message,
+                            common::metadata::tag: common::archive::kind_message,
                             common::archive::author: ?author,
                             common::archive::content: ?content,
                             common::archive::created_at: ?created_at,
@@ -1531,7 +1464,7 @@ fn main() -> Result<()> {
                     ),
                     pattern!(&catalog, [{
                         ?message @
-                            common::archive::kind: common::archive::kind_message,
+                            common::metadata::tag: common::archive::kind_message,
                             common::archive::author: ?author,
                             common::archive::content: ?content,
                             common::archive::created_at: ?created_at,
@@ -1586,7 +1519,7 @@ fn main() -> Result<()> {
                     ),
                     pattern!(&catalog, [{
                         ?conversation @
-                            common::import_schema::kind: common::import_schema::kind_conversation,
+                            common::metadata::tag: common::import_schema::kind_conversation,
                             common::import_schema::source_format: ?format,
                             common::import_schema::source_conversation_id: ?source_conversation_id,
                     }])

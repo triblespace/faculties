@@ -733,7 +733,7 @@ fn load_latest_config_from_branch_id(
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config::kind: &KIND_CONFIG_ID,
+            metadata::tag: &KIND_CONFIG_ID,
             config::updated_at: ?updated_at,
         }])
     ) {
@@ -890,7 +890,7 @@ fn collect_exec_state(
 
     for (request_id,) in find!(
         (request_id: Id),
-        pattern!(&space, [{ ?request_id @ exec::kind: &KIND_EXEC_REQUEST_ID }])
+        pattern!(&space, [{ ?request_id @ metadata::tag: &KIND_EXEC_REQUEST_ID }])
     ) {
         state.requests.insert(
             request_id,
@@ -924,7 +924,7 @@ fn collect_exec_state(
         (event_id: Id, about_request: Id),
         pattern!(&space, [{
             ?event_id @
-            exec::kind: &KIND_EXEC_IN_PROGRESS_ID,
+            metadata::tag: &KIND_EXEC_IN_PROGRESS_ID,
             exec::about_request: ?about_request,
         }])
     ) {
@@ -949,7 +949,7 @@ fn collect_exec_state(
         (result_id: Id, about_request: Id),
         pattern!(&space, [{
             ?result_id @
-            exec::kind: &KIND_EXEC_RESULT_ID,
+            metadata::tag: &KIND_EXEC_RESULT_ID,
             exec::about_request: ?about_request,
         }])
     ) {
@@ -1014,7 +1014,7 @@ fn collect_model_chat_state(
 
     for (request_id,) in find!(
         (request_id: Id),
-        pattern!(&space, [{ ?request_id @ model_chat::kind: &KIND_MODEL_REQUEST_ID }])
+        pattern!(&space, [{ ?request_id @ metadata::tag: &KIND_MODEL_REQUEST_ID }])
     ) {
         state
             .requests
@@ -1034,7 +1034,7 @@ fn collect_model_chat_state(
         (event_id: Id, about_request: Id),
         pattern!(&space, [{
             ?event_id @
-            model_chat::kind: &KIND_MODEL_IN_PROGRESS_ID,
+            metadata::tag: &KIND_MODEL_IN_PROGRESS_ID,
             model_chat::about_request: ?about_request,
         }])
     ) {
@@ -1059,7 +1059,7 @@ fn collect_model_chat_state(
         (result_id: Id, about_request: Id),
         pattern!(&space, [{
             ?result_id @
-            model_chat::kind: &KIND_MODEL_RESULT_ID,
+            metadata::tag: &KIND_MODEL_RESULT_ID,
             model_chat::about_request: ?about_request,
         }])
     ) {
@@ -2314,7 +2314,7 @@ fn collect_context_chunks(
 
     for (chunk_id,) in find!(
         (chunk_id: Id),
-        pattern!(&space, [{ ?chunk_id @ context::kind: &KIND_CONTEXT_CHUNK_ID }])
+        pattern!(&space, [{ ?chunk_id @ metadata::tag: &KIND_CONTEXT_CHUNK_ID }])
     ) {
         chunks.insert(chunk_id, ContextChunkRow {
             id: chunk_id,
@@ -2411,7 +2411,7 @@ fn load_budget_from_config(
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            config::kind: &KIND_CONFIG_ID,
+            metadata::tag: &KIND_CONFIG_ID,
             config::updated_at: ?updated_at,
         }])
     ) {
@@ -2524,7 +2524,7 @@ fn load_turn_context(
         (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?request_id @
-            exec::kind: &KIND_EXEC_REQUEST_ID,
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
             exec::requested_at: ?requested_at,
         }])
     ) {
@@ -2559,7 +2559,7 @@ fn load_turn_context(
         (rid: Id, about_request: Id),
         pattern!(&space, [{
             ?rid @
-            exec::kind: &KIND_EXEC_RESULT_ID,
+            metadata::tag: &KIND_EXEC_RESULT_ID,
             exec::about_request: ?about_request,
         }])
     ) {
@@ -2873,7 +2873,7 @@ fn cmd_turn(
         (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?request_id @
-            exec::kind: &KIND_EXEC_REQUEST_ID,
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
             exec::requested_at: ?requested_at,
         }])
     ) {
@@ -2914,7 +2914,7 @@ fn cmd_turn(
         (rid: Id, about_request: Id),
         pattern!(&space, [{
             ?rid @
-            exec::kind: &KIND_EXEC_RESULT_ID,
+            metadata::tag: &KIND_EXEC_RESULT_ID,
             exec::about_request: ?about_request,
         }])
     ) {
@@ -3026,7 +3026,7 @@ fn cmd_turn(
             (mid: Id, about_req: Id),
             pattern!(&space, [{
                 ?mid @
-                model_chat::kind: &KIND_MODEL_RESULT_ID,
+                metadata::tag: &KIND_MODEL_RESULT_ID,
                 model_chat::about_request: ?about_req,
             }])
         ) {
@@ -3043,7 +3043,7 @@ fn cmd_turn(
                     (mid: Id, about_thought: Id),
                     pattern!(&space, [{
                         ?mid @
-                        model_chat::kind: &KIND_MODEL_RESULT_ID,
+                        metadata::tag: &KIND_MODEL_RESULT_ID,
                         model_chat::about_thought: ?about_thought,
                     }])
                 ) {

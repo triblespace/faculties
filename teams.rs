@@ -61,7 +61,6 @@ mod archive_schema {
         use super::*;
 
         attributes! {
-            "5F10520477A04E5FB322C85CC78C6762" as pub kind: GenId;
 
             "0D9195A7B1B20DE312A08ECE39168079" as pub reply_to: GenId;
             "838CC157FFDD37C6AC7CC5A472E43ADB" as pub author: GenId;
@@ -135,7 +134,6 @@ mod archive_schema {
         metadata += <Handle<Blake3, FileBytes> as metadata::ConstDescribe>::describe(blobs)?;
         metadata += <FileBytes as metadata::ConstDescribe>::describe(blobs)?;
 
-        metadata += metadata::Describe::describe(&archive::kind, blobs)?;
         metadata += metadata::Describe::describe(&archive::reply_to, blobs)?;
         metadata += metadata::Describe::describe(&archive::author, blobs)?;
         metadata += metadata::Describe::describe(&archive::author_name, blobs)?;
@@ -208,19 +206,6 @@ mod teams_schema {
         #[allow(non_upper_case_globals)]
         pub const kind_config: Id = id_hex!("0D7F4BBE36BD0D6FF4E6C651110D6E8B");
 
-        /// Tag for Teams protocol metadata.
-        #[allow(non_upper_case_globals)]
-        pub const tag_protocol: Id = id_hex!("B28EB02C0AED51F14291FB989FC03C96");
-        /// Tag for kind constants in the Teams protocol.
-        #[allow(non_upper_case_globals)]
-        pub const tag_kind: Id = id_hex!("DCB78D06E1E77B17B7097829DA395468");
-        /// Tag for attribute constants in the Teams protocol.
-        #[allow(non_upper_case_globals)]
-        pub const tag_attribute: Id = id_hex!("B61C10637614B1D63485C6518DD70C56");
-        /// Tag for tag constants in the Teams protocol.
-        #[allow(non_upper_case_globals)]
-        pub const tag_tag: Id = id_hex!("A0BBF05C642C2474D1574A67154D4F63");
-
         #[allow(dead_code)]
         pub fn describe<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
         where
@@ -229,86 +214,37 @@ mod teams_schema {
             let mut tribles = TribleSet::new();
 
             tribles += entity! { ExclusiveId::force_ref(&teams_metadata) @
-                metadata::name: blobs.put("teams_metadata".to_string())?,
-                metadata::description: blobs.put(
-                    "Root id for describing the Teams bridge protocol.".to_string(),
-                )?,
-                metadata::tag: tag_protocol,
-            };
-
-            tribles += entity! { ExclusiveId::force_ref(&tag_protocol) @
-                metadata::name: blobs.put("tag_protocol".to_string())?,
-                metadata::description: blobs.put("Tag for Teams protocol metadata.".to_string())?,
-                metadata::tag: tag_tag,
-            };
-
-            tribles += entity! { ExclusiveId::force_ref(&tag_kind) @
-                metadata::name: blobs.put("tag_kind".to_string())?,
-                metadata::description: blobs.put(
-                    "Tag for Teams protocol kind constants.".to_string(),
-                )?,
-                metadata::tag: tag_tag,
-                metadata::tag: kind_chat,
-                metadata::tag: kind_cursor,
-                metadata::tag: kind_token,
-                metadata::tag: kind_log,
-                metadata::tag: kind_config,
-            };
-
-            tribles += entity! { ExclusiveId::force_ref(&tag_attribute) @
-                metadata::name: blobs.put("tag_attribute".to_string())?,
-                metadata::description: blobs.put(
-                    "Tag for Teams protocol attributes.".to_string(),
-                )?,
-                metadata::tag: tag_tag,
-                metadata::tag: chat.id(),
-                metadata::tag: chat_id.id(),
-                metadata::tag: message_id.id(),
-                metadata::tag: message_raw.id(),
-                metadata::tag: user_id.id(),
-                metadata::tag: delta_link.id(),
-                metadata::tag: access_token.id(),
-                metadata::tag: refresh_token.id(),
-                metadata::tag: expires_at.id(),
-                metadata::tag: token_type.id(),
-                metadata::tag: scope.id(),
-                metadata::tag: tenant.id(),
-                metadata::tag: client_id.id(),
-                metadata::tag: client_secret.id(),
-            };
-
-            tribles += entity! { ExclusiveId::force_ref(&tag_tag) @
-                metadata::name: blobs.put("tag_tag".to_string())?,
-                metadata::description: blobs.put(
-                    "Tag for Teams protocol tag constants.".to_string(),
-                )?,
-                metadata::tag: tag_tag,
-                metadata::tag: tag_protocol,
-                metadata::tag: tag_kind,
-                metadata::tag: tag_attribute,
+                metadata::name: blobs.put("teams_metadata")?,
+                metadata::description: blobs.put("Root id for describing the Teams bridge protocol.")?,
+                metadata::tag: metadata::KIND_PROTOCOL,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_chat) @
-                metadata::name: blobs.put("kind_chat".to_string())?,
-                metadata::description: blobs.put("Teams chat entity kind.".to_string())?,
+                metadata::name: blobs.put("kind_chat")?,
+                metadata::description: blobs.put("Teams chat entity kind.")?,
+                metadata::tag: metadata::KIND_TAG,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_cursor) @
-                metadata::name: blobs.put("kind_cursor".to_string())?,
-                metadata::description: blobs.put("Teams delta cursor kind.".to_string())?,
+                metadata::name: blobs.put("kind_cursor")?,
+                metadata::description: blobs.put("Teams delta cursor kind.")?,
+                metadata::tag: metadata::KIND_TAG,
             };
 
             tribles += entity! { ExclusiveId::force_ref(&kind_token) @
-                metadata::name: blobs.put("kind_token".to_string())?,
-                metadata::description: blobs.put("Teams token cache kind.".to_string())?,
+                metadata::name: blobs.put("kind_token")?,
+                metadata::description: blobs.put("Teams token cache kind.")?,
+                metadata::tag: metadata::KIND_TAG,
             };
             tribles += entity! { ExclusiveId::force_ref(&kind_log) @
-                metadata::name: blobs.put("kind_log".to_string())?,
-                metadata::description: blobs.put("Teams log entry kind.".to_string())?,
+                metadata::name: blobs.put("kind_log")?,
+                metadata::description: blobs.put("Teams log entry kind.")?,
+                metadata::tag: metadata::KIND_TAG,
             };
             tribles += entity! { ExclusiveId::force_ref(&kind_config) @
-                metadata::name: blobs.put("kind_config".to_string())?,
-                metadata::description: blobs.put("Teams app configuration kind.".to_string())?,
+                metadata::name: blobs.put("kind_config")?,
+                metadata::description: blobs.put("Teams app configuration kind.")?,
+                metadata::tag: metadata::KIND_TAG,
             };
 
             Ok(tribles)
@@ -807,7 +743,7 @@ fn load_config_branches(repo: &mut Repository<Pile<Blake3>>) -> Result<ConfigBra
         (config_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            playground_config_schema::kind: &CONFIG_KIND_ID,
+            metadata::tag: &CONFIG_KIND_ID,
             playground_config_schema::updated_at: ?updated_at,
         }])
     ) {
@@ -884,7 +820,7 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
         let author_name = ws.put("teams".to_string());
         let author_role = ws.put("faculty".to_string());
         change += entity! { ExclusiveId::force_ref(&author_id) @
-            archive::kind: archive::kind_author,
+            metadata::tag: archive::kind_author,
             archive::author_name: author_name,
             archive::author_role: author_role,
         };
@@ -894,7 +830,7 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
         let content_handle = ws.put(content);
         let created_at = epoch_interval(now_epoch());
         change += entity! { &log_id @
-            archive::kind: teams::kind_log,
+            metadata::tag: teams::kind_log,
             archive::author: author_id,
             archive::created_at: created_at,
             archive::content: content_handle,
@@ -1246,7 +1182,7 @@ fn latest_token_state(catalog: &TribleSet) -> Option<TokenState> {
         ),
         pattern!(catalog, [{
             ?token @
-            archive::kind: teams::kind_token,
+            metadata::tag: teams::kind_token,
             teams::access_token: ?access,
             teams::expires_at: ?expires_at,
             archive::created_at: ?created_at,
@@ -1283,7 +1219,7 @@ fn latest_config_state(catalog: &TribleSet) -> Option<ConfigState> {
         (config: Id, created_at: Value<NsTAIInterval>),
         pattern!(catalog, [{
             ?config @
-            archive::kind: teams::kind_config,
+            metadata::tag: teams::kind_config,
             archive::created_at: ?created_at,
         }])
     ) {
@@ -1442,7 +1378,7 @@ fn build_token_change(
         .map(|scope| ws.put(scope.to_owned()));
 
     change += entity! { &token_id @
-        archive::kind: teams::kind_token,
+        metadata::tag: teams::kind_token,
         archive::created_at: created_at,
         teams::access_token: access_handle,
         teams::expires_at: expires_at,
@@ -1492,7 +1428,7 @@ fn build_config_change(
     let user_id_handle = data.user_id.as_ref().map(|value| ws.put(value.to_owned()));
 
     change += entity! { &config_id @
-        archive::kind: teams::kind_config,
+        metadata::tag: teams::kind_config,
         archive::created_at: created_at,
         teams::tenant?: tenant_handle,
         teams::client_id?: client_id_handle,
@@ -2201,7 +2137,7 @@ fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> 
             ),
             pattern!(&catalog, [{
                 ?message @
-                archive::kind: archive::kind_message,
+                metadata::tag: archive::kind_message,
                 archive::content: ?content,
                 archive::author: ?author,
                 archive::created_at: ?created_at,
@@ -2520,7 +2456,7 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
             ),
             pattern!(&catalog, [{
                 ?message @
-                archive::kind: archive::kind_message,
+                metadata::tag: archive::kind_message,
                 teams::chat: ?chat,
                 archive::created_at: ?created_at,
                 archive::content: ?content,
@@ -2971,7 +2907,7 @@ fn load_cursor_from_space(
         (cursor: Id, delta_link: Value<Handle<Blake3, LongString>>, created_at: Value<NsTAIInterval>),
         pattern!(catalog, [{
             ?cursor @
-            archive::kind: teams::kind_cursor,
+            metadata::tag: teams::kind_cursor,
             teams::delta_link: ?delta_link,
             archive::created_at: ?created_at,
         }])
@@ -3023,7 +2959,7 @@ fn build_cursor_change(
     let cursor_id = ufoid();
     let mut change = TribleSet::new();
     change += entity! { &cursor_id @
-        archive::kind: teams::kind_cursor,
+        metadata::tag: teams::kind_cursor,
         teams::delta_link: handle,
         archive::created_at: now,
     };
@@ -3243,7 +3179,7 @@ impl CatalogIndex {
             (message: Id),
             pattern!(catalog, [{
                 ?message @
-                archive::kind: archive::kind_message,
+                metadata::tag: archive::kind_message,
             }])
         )
         .into_iter()
@@ -3262,7 +3198,7 @@ impl CatalogIndex {
             (author: Id),
             pattern!(catalog, [{
                 ?author @
-                archive::kind: archive::kind_author,
+                metadata::tag: archive::kind_author,
             }])
         )
         .into_iter()
@@ -3271,7 +3207,7 @@ impl CatalogIndex {
 
         let chats = find!(
             (chat: Id),
-            pattern!(catalog, [{ ?chat @ archive::kind: teams::kind_chat }])
+            pattern!(catalog, [{ ?chat @ metadata::tag: teams::kind_chat }])
         )
         .into_iter()
         .map(|(chat,)| chat)
@@ -3281,7 +3217,7 @@ impl CatalogIndex {
             (attachment: Id),
             pattern!(catalog, [{
                 ?attachment @
-                archive::kind: archive::kind_attachment,
+                metadata::tag: archive::kind_attachment,
             }])
         )
         .into_iter()
@@ -3364,7 +3300,7 @@ impl CatalogIndex {
             (message: Id, chat: Id, created_at: Value<NsTAIInterval>),
             pattern!(catalog, [{
                 ?message @
-                archive::kind: archive::kind_message,
+                metadata::tag: archive::kind_message,
                 teams::chat: ?chat,
                 archive::created_at: ?created_at,
             }])
@@ -3437,7 +3373,7 @@ fn build_ingest_change(
         };
         if missing_chat_kind || chat_id_handle.is_some() {
             change += entity! { ExclusiveId::force_ref(&chat_id) @
-                archive::kind?: missing_chat_kind.then_some(teams::kind_chat),
+                metadata::tag?: missing_chat_kind.then_some(teams::kind_chat),
                 teams::chat_id?: chat_id_handle,
             };
         }
@@ -3473,7 +3409,7 @@ fn build_ingest_change(
                 let raw_handle = ws.put(message.raw_json);
                 let external_handle = ws.put(message.message_external_id);
                 change += entity! { ExclusiveId::force_ref(&message.message_id) @
-                    archive::kind: archive::kind_message,
+                    metadata::tag: archive::kind_message,
                     archive::author: message.author_id,
                     archive::created_at: message.created_at,
                     archive::content: content_handle,
@@ -3551,7 +3487,7 @@ fn ensure_author(
 
     if missing_author_kind || author_name.is_some() || author_user_id.is_some() {
         *change += entity! { ExclusiveId::force_ref(&author_id) @
-            archive::kind?: missing_author_kind.then_some(archive::kind_author),
+            metadata::tag?: missing_author_kind.then_some(archive::kind_author),
             archive::author_name?: author_name,
             teams::user_id?: author_user_id,
         };
@@ -3629,7 +3565,7 @@ fn ensure_attachments(
         let attachment_mime = shortstring_value(content_type.as_deref());
 
         *change += entity! { ExclusiveId::force_ref(&attachment_id) @
-            archive::kind: archive::kind_attachment,
+            metadata::tag: archive::kind_attachment,
             archive::attachment_source_id: source_id_handle,
             archive::attachment_data: data_handle,
             archive::attachment_size_bytes: size.to_value(),
