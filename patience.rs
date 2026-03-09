@@ -7,7 +7,7 @@
 //! hifitime = "4.2.3"
 //! humantime = "2.3.0"
 //! rand_core = "0.6.4"
-//! triblespace = "0.16.0"
+//! triblespace = "0.17.0"
 //! ```
 
 use anyhow::{Context, Result, anyhow, bail};

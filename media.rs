@@ -7,7 +7,7 @@
 //! hifitime = "4"
 //! rand_core = "0.6.4"
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-//! triblespace = "0.16.0"
+//! triblespace = "0.17.0"
 //! ```
 
 use std::fs;

@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"
-//! triblespace = "0.16.0"
+//! triblespace = "0.17.0"
 //! ```
 
 use std::fs;

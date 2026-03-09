@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.16.0"
+//! triblespace = "0.17.0"
 //! ```
 
 use std::collections::HashMap;
@@ -671,7 +671,7 @@ fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
             (entry_id: Id, profile_id: Value<GenId>, updated_at: Value<NsTAIInterval>),
             pattern!(&catalog, [{
                 ?entry_id @
-                playground_metadata::tag: KIND_MODEL_PROFILE_ID,
+                metadata::tag: KIND_MODEL_PROFILE_ID,
                 playground_config::updated_at: ?updated_at,
                 playground_config::model_profile_id: ?profile_id,
             }])
@@ -807,7 +807,7 @@ fn load_latest_config(
         (config_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(catalog, [{
             ?config_id @
-            playground_metadata::tag: KIND_CONFIG_ID,
+            metadata::tag: KIND_CONFIG_ID,
             playground_config::updated_at: ?updated_at,
         }])
     ) {
@@ -995,7 +995,7 @@ fn load_latest_model_profile(
         (entry_id: Id, updated_at: Value<NsTAIInterval>),
         pattern!(catalog, [{
             ?entry_id @
-            playground_metadata::tag: KIND_MODEL_PROFILE_ID,
+            metadata::tag: KIND_MODEL_PROFILE_ID,
             playground_config::updated_at: ?updated_at,
             playground_config::model_profile_id: profile_id,
         }])
@@ -1099,7 +1099,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
 
     let mut change = TribleSet::new();
     change += entity! { &config_id @
-        playground_metadata::tag: KIND_CONFIG_ID,
+        metadata::tag: KIND_CONFIG_ID,
         playground_config::updated_at: now,
         playground_config::system_prompt: system_prompt,
         playground_config::branch: branch,
@@ -1170,7 +1170,7 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
     let model_chars_per_token: Value<U256BE> = config.model.chars_per_token.to_value();
 
     change += entity! { &profile_entry_id @
-        playground_metadata::tag: KIND_MODEL_PROFILE_ID,
+        metadata::tag: KIND_MODEL_PROFILE_ID,
         playground_config::updated_at: now,
         playground_config::model_profile_id: profile_id,
         metadata::name: profile_name,

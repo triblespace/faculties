@@ -7,7 +7,7 @@
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! time = { version = "0.3.36", features = ["formatting", "macros"] }
-//! triblespace = "0.16.0"
+//! triblespace = "0.17.0"
 //! ```
 
 use anyhow::{Context, Result, bail};
