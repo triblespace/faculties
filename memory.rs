@@ -26,6 +26,7 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
+const DEFAULT_MEMORY_BRANCH: &str = "memory";
 const DEFAULT_COGNITION_BRANCH: &str = "cognition";
 const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
 
@@ -232,8 +233,8 @@ fn main() -> Result<()> {
         let branch_id = match explicit_branch_id {
             Some(id) => id,
             None => repo
-                .ensure_branch(DEFAULT_COGNITION_BRANCH, None)
-                .map_err(|e| anyhow!("ensure cognition branch: {e:?}"))?,
+                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
         };
 
         let mut ws = repo
@@ -319,10 +320,10 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
 
     with_repo(pile_path, |repo| {
         let branch_id = repo
-            .ensure_branch(DEFAULT_COGNITION_BRANCH, None)
-            .map_err(|e| anyhow!("ensure cognition branch: {e:?}"))?;
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
 
-        // Resolve memory: references against context branch chunks.
+        // Resolve memory: references against memory branch chunks.
         let mut child_ids: Vec<Id> = Vec::new();
         let mut children_start: Option<Value<NsTAIInterval>> = None;
         let mut children_end: Option<Value<NsTAIInterval>> = None;
@@ -333,8 +334,8 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             let ctx_catalog = {
                 let mut ws = repo
                     .pull(branch_id)
-                    .map_err(|e| anyhow!("pull cognition branch: {e:?}"))?;
-                ws.checkout(..).context("checkout cognition branch")?
+                    .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+                ws.checkout(..).context("checkout memory branch")?
             };
             let index = load_chunks(&ctx_catalog);
 
@@ -402,7 +403,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         // Write chunk entity.
         let mut ws = repo
             .pull(branch_id)
-            .map_err(|e| anyhow!("pull cognition branch for write: {e:?}"))?;
+            .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
 
         let summary_handle = ws.put(summary_text.clone());
         let chunk_id = ufoid();
@@ -458,11 +459,11 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
         let branch_id = match explicit_branch_id {
             Some(id) => id,
             None => repo
-                .ensure_branch(DEFAULT_COGNITION_BRANCH, None)
-                .map_err(|e| anyhow!("ensure cognition branch: {e:?}"))?,
+                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
         };
 
-        // Load context branch.
+        // Load memory branch.
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
