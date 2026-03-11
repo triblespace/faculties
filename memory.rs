@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use std::collections::HashMap;
@@ -26,20 +26,10 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
-const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
+const DEFAULT_COGNITION_BRANCH: &str = "cognition";
+const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
 
-const KIND_CONFIG_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
-
-mod config_schema {
-    use super::*;
-    attributes! {
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
-        "4E2F9CA7A8456DED8C43A3BE741ADA58" as branch_id: GenId;
-        "C188E12ABBDD83D283A23DBAD4B784AF" as exec_branch_id: GenId;
-        "047112FC535518D289E64FBE0B60F06E" as archive_branch_id: GenId;
-    }
-}
 
 mod exec_schema {
     use super::*;
@@ -99,7 +89,7 @@ struct Cli {
     /// Path to the pile file to use.
     #[arg(long, default_value = "self.pile", global = true)]
     pile: PathBuf,
-    /// Optional explicit branch id (hex) to read chunks from (defaults to config.branch_id).
+    /// Optional explicit branch id (hex) to read chunks from (defaults to cognition branch).
     #[arg(long, global = true)]
     branch_id: Option<String>,
     /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
@@ -241,7 +231,9 @@ fn main() -> Result<()> {
     with_repo(&cli.pile, |repo| {
         let branch_id = match explicit_branch_id {
             Some(id) => id,
-            None => load_core_branch_id(repo)?,
+            None => repo
+                .ensure_branch(DEFAULT_COGNITION_BRANCH, None)
+                .map_err(|e| anyhow!("ensure cognition branch: {e:?}"))?,
         };
 
         let mut ws = repo
@@ -297,8 +289,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             "usage: memory create [<from>..<to>] <summary...>\n\
              \n\
              Create a memory chunk and store it in the pile.\n\
-             Reads config from the config branch. Scans summary for\n\
-             (memory:<range>) links to infer children.\n\
+             Scans summary for (memory:<range>) links to infer children.\n\
              An optional time range as the first argument grounds the\n\
              memory in that period. Without it, defaults to now."
         );
@@ -327,7 +318,9 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
     let memory_refs = scan_memory_links(&summary_text);
 
     with_repo(pile_path, |repo| {
-        let config = load_create_config(repo)?;
+        let branch_id = repo
+            .ensure_branch(DEFAULT_COGNITION_BRANCH, None)
+            .map_err(|e| anyhow!("ensure cognition branch: {e:?}"))?;
 
         // Resolve memory: references against context branch chunks.
         let mut child_ids: Vec<Id> = Vec::new();
@@ -339,9 +332,9 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         if !memory_refs.is_empty() {
             let ctx_catalog = {
                 let mut ws = repo
-                    .pull(config.branch_id)
-                    .map_err(|e| anyhow!("pull context branch: {e:?}"))?;
-                ws.checkout(..).context("checkout context branch")?
+                    .pull(branch_id)
+                    .map_err(|e| anyhow!("pull cognition branch: {e:?}"))?;
+                ws.checkout(..).context("checkout cognition branch")?
             };
             let index = load_chunks(&ctx_catalog);
 
@@ -364,21 +357,25 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         // For memories without children and with a range, resolve provenance.
         if child_ids.is_empty() {
             if let Some((range_start, range_end)) = explicit_range {
-                if let Some(exec_catalog) = config.exec_branch_id.and_then(|bid| {
-                    repo.pull(bid)
+                // Try exec branch (cognition).
+                if let Ok(exec_bid) = repo.ensure_branch(DEFAULT_COGNITION_BRANCH, None) {
+                    if let Some(exec_catalog) = repo.pull(exec_bid)
                         .ok()
                         .and_then(|mut ws| ws.checkout(..).ok())
-                }) {
-                    about_exec = find_exec_by_time_range(&exec_catalog, range_start, range_end);
+                    {
+                        about_exec = find_exec_by_time_range(&exec_catalog, range_start, range_end);
+                    }
                 }
                 if about_exec.is_none() {
-                    if let Some(archive_catalog) = config.archive_branch_id.and_then(|bid| {
-                        repo.pull(bid)
+                    // Try archive branch.
+                    if let Ok(archive_bid) = repo.ensure_branch(DEFAULT_ARCHIVE_BRANCH, None) {
+                        if let Some(archive_catalog) = repo.pull(archive_bid)
                             .ok()
                             .and_then(|mut ws| ws.checkout(..).ok())
-                    }) {
-                        about_archive =
-                            find_archive_by_time_range(&archive_catalog, range_start, range_end);
+                        {
+                            about_archive =
+                                find_archive_by_time_range(&archive_catalog, range_start, range_end);
+                        }
                     }
                 }
             }
@@ -404,8 +401,8 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
 
         // Write chunk entity.
         let mut ws = repo
-            .pull(config.branch_id)
-            .map_err(|e| anyhow!("pull context branch for write: {e:?}"))?;
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull cognition branch for write: {e:?}"))?;
 
         let summary_handle = ws.put(summary_text.clone());
         let chunk_id = ufoid();
@@ -432,11 +429,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             change += entity! { &chunk_id @ ctx::child: *child_id };
         }
 
-        ws.commit(
-            change,
-            None,
-            Some("memory create"),
-        );
+        ws.commit(change, "memory create");
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push failed: {e:?}"))?;
 
@@ -447,82 +440,6 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         println!("range: {range_str}");
         println!("id: {:x}", chunk_id.id);
         Ok(())
-    })
-}
-
-struct CreateConfig {
-    branch_id: Id,
-    exec_branch_id: Option<Id>,
-    archive_branch_id: Option<Id>,
-}
-
-/// Read config from the config branch: context branch_id and optional
-/// exec/archive branch IDs for provenance resolution.
-fn load_create_config(repo: &mut Repository<Pile<Blake3>>) -> Result<CreateConfig> {
-    let Some(_head) = repo
-        .storage_mut()
-        .head(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("config branch head: {e:?}"))?
-    else {
-        bail!("config branch is empty; run `playground config ...` to initialize it");
-    };
-
-    let mut ws = repo
-        .pull(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
-    let catalog = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
-
-    // Find latest config entity → branch_id, config_entity_id.
-    let mut latest_config: Option<(i128, Id, Id)> = None;
-    for (config_id, updated_at, branch_id) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
-        pattern!(&catalog, [{
-            ?config_id @
-            metadata::tag: &KIND_CONFIG_ID,
-            config_schema::updated_at: ?updated_at,
-            config_schema::branch_id: ?branch_id,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        let branch_id = Id::from_value(&branch_id);
-        match latest_config {
-            Some((best_key, _, _)) if best_key >= key => {}
-            _ => latest_config = Some((key, config_id, branch_id)),
-        }
-    }
-    let (_, config_entity_id, branch_id) = latest_config
-        .ok_or_else(|| anyhow!("config missing branch_id"))?;
-
-    // Optional: exec_branch_id from the config entity.
-    let exec_branch_id = find!(
-        (eid: Id, exec_bid: Value<GenId>),
-        pattern!(&catalog, [{
-            ?eid @
-            config_schema::exec_branch_id: ?exec_bid,
-        }])
-    )
-    .into_iter()
-    .find(|(eid, _)| *eid == config_entity_id)
-    .map(|(_, exec_bid)| Id::from_value(&exec_bid));
-
-    // Optional: archive_branch_id from the config entity.
-    let archive_branch_id = find!(
-        (eid: Id, archive_bid: Value<GenId>),
-        pattern!(&catalog, [{
-            ?eid @
-            config_schema::archive_branch_id: ?archive_bid,
-        }])
-    )
-    .into_iter()
-    .find(|(eid, _)| *eid == config_entity_id)
-    .map(|(_, archive_bid)| Id::from_value(&archive_bid));
-
-    Ok(CreateConfig {
-        branch_id,
-        exec_branch_id,
-        archive_branch_id,
     })
 }
 
@@ -538,45 +455,12 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
     let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
 
     with_repo(pile_path, |repo| {
-        // Load config for branch IDs and archive metadata resolution.
-        let config_catalog = {
-            let Some(_head) = repo
-                .storage_mut()
-                .head(CONFIG_BRANCH_ID)
-                .map_err(|e| anyhow!("config branch head: {e:?}"))?
-            else {
-                bail!("config branch is empty");
-            };
-            let mut ws = repo
-                .pull(CONFIG_BRANCH_ID)
-                .map_err(|e| anyhow!("pull config: {e:?}"))?;
-            ws.checkout(..).context("checkout config")?
+        let branch_id = match explicit_branch_id {
+            Some(id) => id,
+            None => repo
+                .ensure_branch(DEFAULT_COGNITION_BRANCH, None)
+                .map_err(|e| anyhow!("ensure cognition branch: {e:?}"))?,
         };
-
-        let core_branch_id = {
-            let mut latest: Option<(i128, Id)> = None;
-            for (_config_id, updated_at, branch_id) in find!(
-                (_config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
-                pattern!(&config_catalog, [{
-                    ?_config_id @
-                    metadata::tag: &KIND_CONFIG_ID,
-                    config_schema::updated_at: ?updated_at,
-                    config_schema::branch_id: ?branch_id,
-                }])
-            ) {
-                let key = interval_key(updated_at);
-                let bid = Id::from_value(&branch_id);
-                match latest {
-                    Some((best, _)) if best >= key => {}
-                    _ => latest = Some((key, bid)),
-                }
-            }
-            latest
-                .map(|(_, bid)| bid)
-                .ok_or_else(|| anyhow!("config missing branch_id"))?
-        };
-
-        let branch_id = explicit_branch_id.unwrap_or(core_branch_id);
 
         // Load context branch.
         let mut ws = repo
@@ -629,7 +513,7 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
         if let Some(archive_id) = chunk.about_archive_message {
             println!("about_archive_message: {archive_id:x}");
             // Resolve archive metadata if archive branch is available.
-            print_archive_meta(repo, &mut ws, &config_catalog, archive_id)?;
+            print_archive_meta(repo, &mut ws, archive_id)?;
         }
 
         Ok(())
@@ -639,42 +523,11 @@ fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 fn print_archive_meta(
     repo: &mut Repository<Pile<Blake3>>,
     ws: &mut Workspace<Pile<Blake3>>,
-    config_catalog: &TribleSet,
     archive_msg_id: Id,
 ) -> Result<()> {
-    // Find archive_branch_id from config.
-    let mut latest_config: Option<(i128, Id)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
-        pattern!(config_catalog, [{
-            ?config_id @
-            metadata::tag: &KIND_CONFIG_ID,
-            config_schema::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        match latest_config {
-            Some((best, _)) if best >= key => {}
-            _ => latest_config = Some((key, config_id)),
-        }
-    }
-    let Some((_, config_entity_id)) = latest_config else {
-        return Ok(());
-    };
-
-    let archive_branch_id = find!(
-        (eid: Id, archive_bid: Value<GenId>),
-        pattern!(config_catalog, [{
-            ?eid @
-            config_schema::archive_branch_id: ?archive_bid,
-        }])
-    )
-    .into_iter()
-    .find(|(eid, _)| *eid == config_entity_id)
-    .map(|(_, bid)| Id::from_value(&bid));
-
-    let Some(archive_branch_id) = archive_branch_id else {
-        return Ok(());
+    let archive_branch_id = match repo.ensure_branch(DEFAULT_ARCHIVE_BRANCH, None) {
+        Ok(id) => id,
+        Err(_) => return Ok(()),
     };
 
     // Pull archive branch.
@@ -841,45 +694,6 @@ fn find_archive_by_time_range(
 // ---------------------------------------------------------------------------
 // show / turn subcommands
 // ---------------------------------------------------------------------------
-
-fn load_core_branch_id(repo: &mut Repository<Pile<Blake3>>) -> Result<Id> {
-    let Some(_head) = repo
-        .storage_mut()
-        .head(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("config branch head: {e:?}"))?
-    else {
-        bail!("config branch is empty; run `playground config ...` to initialize it");
-    };
-
-    let mut ws = repo
-        .pull(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
-    let space = ws.checkout(..).context("checkout config")?;
-
-    let mut latest: Option<(Id, i128, Id)> = None;
-    for (config_id, updated_at, branch_id) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>, branch_id: Value<GenId>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::tag: &KIND_CONFIG_ID,
-            config_schema::updated_at: ?updated_at,
-            config_schema::branch_id: ?branch_id,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        let branch_id = Id::from_value(&branch_id);
-        match latest {
-            Some((_id, best_key, _best_branch)) if best_key >= key => {}
-            _ => latest = Some((config_id, key, branch_id)),
-        }
-    }
-
-    latest
-        .map(|(_id, _key, branch_id)| branch_id)
-        .ok_or_else(|| {
-            anyhow!("config missing branch_id; set it with `playground config set branch-id <ID>`")
-        })
-}
 
 fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
     let mut chunks = HashMap::<Id, Chunk>::new();
@@ -1167,7 +981,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
         let _ = pile.close();
         return Err(anyhow!("restore pile {}: {err:?}", path.display()));
     }
-    Ok(Repository::new(pile, SigningKey::generate(&mut OsRng)))
+    Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
 fn with_repo<T>(

@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,18 +19,12 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use triblespace::core::metadata;
-use triblespace::core::repo::branch as branch_proto;
-use triblespace::core::repo::{PushResult, Repository};
-use triblespace::macros::{attributes, find, id_hex, pattern};
+use triblespace::core::repo::Repository;
+use triblespace::macros::{attributes, id_hex};
 use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "cognition";
-const FIXED_CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
-const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
-
 const KIND_REASON_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
-
-type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
 
 mod reason_schema {
     use super::*;
@@ -44,17 +38,6 @@ mod reason_schema {
     }
 }
 
-mod config_schema {
-    use super::*;
-
-    attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
-        "4E2F9CA7A8456DED8C43A3BE741ADA58" as branch_id: valueschemas::GenId;
-        "C188E12ABBDD83D283A23DBAD4B784AF" as exec_branch_id: valueschemas::GenId;
-    }
-}
-
 #[derive(Parser)]
 #[command(
     name = "reason",
@@ -64,13 +47,10 @@ struct Cli {
     /// Path to the pile file.
     #[arg(long, global = true)]
     pile: Option<PathBuf>,
-    /// Config branch id (hex). Defaults to $CONFIG_BRANCH_ID or fixed config branch id.
-    #[arg(long, global = true)]
-    config_branch_id: Option<String>,
     /// Target branch name for reason events.
     #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
     branch: String,
-    /// Target branch id for reason events (hex). Overrides config.
+    /// Target branch id for reason events (hex). Overrides ensure_branch.
     #[arg(long, global = true)]
     branch_id: Option<String>,
     /// Turn id to annotate (hex). Defaults to $TURN_ID.
@@ -92,23 +72,12 @@ struct Cli {
     command: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ConfigSnapshot {
-    branch_id: Option<Id>,
-    exec_branch_id: Option<Id>,
-}
-
 fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
 
 fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
     (epoch, epoch).to_value()
-}
-
-fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
-    lower.to_tai_duration().total_nanoseconds()
 }
 
 fn resolve_pile_path(cli: &Cli) -> PathBuf {
@@ -160,7 +129,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     }
 
     let signing_key = SigningKey::generate(&mut OsRng);
-    Ok(Repository::new(pile, signing_key))
+    Repository::new(pile, signing_key, TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
 fn with_repo<T>(
@@ -179,170 +149,32 @@ fn with_repo<T>(
     result
 }
 
-fn ensure_branch_with_id(
+fn resolve_branch_id(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_id: Id,
+    explicit_hex: Option<&str>,
     branch_name: &str,
-) -> Result<()> {
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let name_blob = branch_name.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
-    repo.storage_mut()
-        .put(name_blob)
-        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
-    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
-    let metadata_handle = repo
-        .storage_mut()
-        .put(metadata.to_blob())
-        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
-    let result = repo
-        .storage_mut()
-        .update(branch_id, None, Some(metadata_handle))
-        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
-    match result {
-        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
-    }
-}
-
-fn find_branch_by_name(
-    pile: &mut Pile<valueschemas::Blake3>,
-    branch_name: &str,
-) -> Result<Option<Id>> {
-    let name_handle = branch_name
-        .to_owned()
-        .to_blob()
-        .get_handle::<valueschemas::Blake3>();
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let iter = pile
-        .branches()
-        .map_err(|e| anyhow!("list branches: {e:?}"))?;
-
-    for branch in iter {
-        let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
-        let Some(head) = pile
-            .head(branch_id)
-            .map_err(|e| anyhow!("branch head: {e:?}"))?
-        else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader
-            .get(head)
-            .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
-        let mut names = find!(
-            (handle: TextHandle),
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some(name) = names.next().map(|(handle,)| handle) else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if name == name_handle {
-            return Ok(Some(branch_id));
-        }
-    }
-
-    Ok(None)
-}
-
-fn load_config_snapshot(repo: &mut Repository<Pile<valueschemas::Blake3>>, branch_id: Id) -> Result<ConfigSnapshot> {
-    let Some(_head) = repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("config branch head: {e:?}"))?
-    else {
-        return Ok(ConfigSnapshot::default());
-    };
-
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
-    let space = ws.checkout(..).context("checkout config workspace")?;
-
-    let mut latest: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::tag: &CONFIG_KIND_ID,
-            config_schema::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        if latest.is_none_or(|(_, current)| key > current) {
-            latest = Some((config_id, key));
-        }
-    }
-    let Some((config_id, _)) = latest else {
-        return Ok(ConfigSnapshot::default());
-    };
-
-    let branch_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
-    let exec_branch_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::exec_branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
-
-    Ok(ConfigSnapshot {
-        branch_id,
-        exec_branch_id,
-    })
-}
-
-fn resolve_target_branch_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_name: &str,
-    config_branch_id: Id,
-    explicit_branch_id: Option<Id>,
 ) -> Result<Id> {
-    if let Some(id) = explicit_branch_id {
-        return Ok(id);
+    if let Some(hex) = explicit_hex {
+        return Id::from_hex(hex.trim())
+            .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
     }
-
-    let snapshot = load_config_snapshot(repo, config_branch_id)?;
-    if let Some(id) = snapshot.exec_branch_id.or(snapshot.branch_id) {
-        return Ok(id);
+    if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
+        return Id::from_hex(hex.trim())
+            .ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID"));
     }
-
-    if let Some(id) = find_branch_by_name(repo.storage_mut(), branch_name)? {
-        return Ok(id);
-    }
-
-    Ok(*ufoid())
+    repo.ensure_branch(branch_name, None)
+        .map_err(|e| anyhow!("ensure {branch_name} branch: {e:?}"))
 }
 
 fn append_reason(
     pile: &Path,
-    branch_name: &str,
-    config_branch_id: Id,
-    explicit_branch_id: Option<Id>,
+    branch_id: Id,
     turn_id: Option<Id>,
     worker_id: Option<Id>,
     text: &str,
     command_text: Option<&str>,
 ) -> Result<Id> {
     with_repo(pile, |repo| {
-        let branch_id =
-            resolve_target_branch_id(repo, branch_name, config_branch_id, explicit_branch_id)?;
-        ensure_branch_with_id(repo, branch_id, branch_name)?;
-
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -359,7 +191,7 @@ fn append_reason(
             reason_schema::worker?: worker_id,
             reason_schema::command_text?: command_handle,
         };
-        ws.commit(change, None, Some("reason"));
+        ws.commit(change, "reason");
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push reason: {e:?}"))?;
         Ok(*reason_id)
@@ -409,21 +241,13 @@ fn main() -> Result<()> {
     };
     let text = load_value_or_file(text_raw, "reason text")?;
 
-    let env_config_branch_id = std::env::var("CONFIG_BRANCH_ID").ok();
     let env_turn_id = std::env::var("TURN_ID").ok();
     let env_worker_id = std::env::var("WORKER_ID").ok();
-    let env_branch_id = std::env::var("TRIBLESPACE_BRANCH_ID").ok();
 
-    let config_branch_id = parse_optional_hex_id(
-        cli.config_branch_id
-            .as_deref()
-            .or(env_config_branch_id.as_deref()),
-        "config branch id",
-    )?
-    .unwrap_or(FIXED_CONFIG_BRANCH_ID);
+    let branch_id = with_repo(&pile_path, |repo| {
+        resolve_branch_id(repo, cli.branch_id.as_deref(), &cli.branch)
+    })?;
 
-    let explicit_branch_id =
-        parse_optional_hex_id(cli.branch_id.as_deref().or(env_branch_id.as_deref()), "branch id")?;
     let turn_id = parse_optional_hex_id(cli.turn_id.as_deref().or(env_turn_id.as_deref()), "turn id")?;
     let worker_id =
         parse_optional_hex_id(cli.worker_id.as_deref().or(env_worker_id.as_deref()), "worker id")?;
@@ -435,9 +259,7 @@ fn main() -> Result<()> {
     if cli.command.is_empty() {
         let reason_id = append_reason(
             &pile_path,
-            &cli.branch,
-            config_branch_id,
-            explicit_branch_id,
+            branch_id,
             turn_id,
             worker_id,
             &text,
@@ -450,9 +272,7 @@ fn main() -> Result<()> {
     let command_text = render_command(&cli.command);
     let reason_id = append_reason(
         &pile_path,
-        &cli.branch,
-        config_branch_id,
-        explicit_branch_id,
+        branch_id,
         turn_id,
         worker_id,
         &text,
@@ -460,9 +280,7 @@ fn main() -> Result<()> {
     )?;
     let action_event_id = append_reason(
         &pile_path,
-        &cli.branch,
-        config_branch_id,
-        explicit_branch_id,
+        branch_id,
         turn_id,
         worker_id,
         command_text.as_str(),

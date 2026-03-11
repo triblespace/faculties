@@ -5,7 +5,7 @@
 //! clap = { version = "4.5.4", features = ["derive"] }
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use std::cmp::Ordering;
@@ -76,7 +76,9 @@ fn main() -> Result<()> {
 }
 
 fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
-    with_repo(pile, branch, |repo, branch_id| {
+    with_repo(pile, |repo| {
+        let branch_id = repo.ensure_branch(branch, None)
+            .map_err(|e| anyhow!("ensure atlas branch: {e:?}"))?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -134,7 +136,9 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
 }
 
 fn cmd_show(pile: &Path, branch: &str, prefix: &str) -> Result<()> {
-    with_repo(pile, branch, |repo, branch_id| {
+    with_repo(pile, |repo| {
+        let branch_id = repo.ensure_branch(branch, None)
+            .map_err(|e| anyhow!("ensure atlas branch: {e:?}"))?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -264,7 +268,7 @@ fn id_prefix(id: Id) -> String {
     hex[..8].to_string()
 }
 
-fn open_repo(pile_path: &Path, branch_name: &str) -> Result<(Repository<Pile<Blake3>>, Id)> {
+fn open_repo(pile_path: &Path) -> Result<Repository<Pile<Blake3>>> {
     if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
@@ -273,32 +277,21 @@ fn open_repo(pile_path: &Path, branch_name: &str) -> Result<(Repository<Pile<Bla
     let mut pile =
         Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
     if let Err(err) = pile.restore() {
-        // Avoid Drop warnings on early errors.
         let _ = pile.close();
         return Err(anyhow!("restore pile: {err:?}"));
     }
 
-    let existing = find_branch_by_name(&mut pile, branch_name)?;
     let signing_key = SigningKey::generate(&mut OsRng);
-    let mut repo = Repository::new(pile, signing_key);
-    let branch_id = match existing {
-        Some(id) => id,
-        None => repo
-            .create_branch(branch_name, None)
-            .map_err(|e| anyhow!("create branch: {e:?}"))?
-            .release(),
-    };
-
-    Ok((repo, branch_id))
+    Repository::new(pile, signing_key, TribleSet::new())
+        .map_err(|e| anyhow!("create repository: {e:?}"))
 }
 
 fn with_repo<T>(
     pile_path: &Path,
-    branch_name: &str,
-    f: impl FnOnce(&mut Repository<Pile<Blake3>>, Id) -> Result<T>,
+    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
 ) -> Result<T> {
-    let (mut repo, branch_id) = open_repo(pile_path, branch_name)?;
-    let result = f(&mut repo, branch_id);
+    let mut repo = open_repo(pile_path)?;
+    let result = f(&mut repo);
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
     if let Err(err) = close_res {
         if result.is_ok() {
@@ -307,42 +300,4 @@ fn with_repo<T>(
         eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
     result
-}
-
-fn find_branch_by_name(pile: &mut Pile<Blake3>, branch_name: &str) -> Result<Option<Id>> {
-    let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
-    let iter = pile.branches().map_err(|e| anyhow!("list branches: {e:?}"))?;
-    let expected = branch_name
-        .to_string()
-        .to_blob()
-        .get_handle::<Blake3>()
-        .to_value();
-
-    for branch in iter {
-        let branch_id = branch.map_err(|e| anyhow!("branch id: {e:?}"))?;
-        let Some(head) = pile
-            .head(branch_id)
-            .map_err(|e| anyhow!("branch head: {e:?}"))?
-        else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader
-            .get(head)
-            .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
-        let mut names = find!(
-            (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some((handle,)) = names.next() else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        }
-        if handle == expected {
-            return Ok(Some(branch_id));
-        }
-    }
-    Ok(None)
 }

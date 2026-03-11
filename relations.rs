@@ -4,28 +4,23 @@
 //! anyhow = "1.0"
 //! clap = { version = "4.5.4", features = ["derive"] }
 //! ed25519-dalek = "2.1.1"
-//! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
-use triblespace::core::repo::branch as branch_proto;
-use triblespace::core::repo::{PushResult, Repository, Workspace};
+use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
 const DEFAULT_BRANCH: &str = "relations";
-const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
-const CONFIG_KIND_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
 const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 
@@ -46,15 +41,6 @@ mod relations {
     }
 }
 
-mod config_schema {
-    use super::*;
-    attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
-        "D35F4F02E29825FBC790E324EFCD1B34" as relations_branch_id: valueschemas::GenId;
-    }
-}
-
 #[derive(Parser)]
 #[command(name = "relations", about = "Relationship/contacts faculty")]
 struct Cli {
@@ -64,7 +50,7 @@ struct Cli {
     /// Branch name for relations data
     #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
     branch: String,
-    /// Branch id for relations data (hex). Overrides config.
+    /// Branch id for relations data (hex). Overrides ensure_branch.
     #[arg(long, global = true)]
     branch_id: Option<String>,
     #[command(subcommand)]
@@ -160,11 +146,6 @@ struct PersonRecord {
     email: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ConfigBranches {
-    relations_branch_id: Option<Id>,
-}
-
 fn id_prefix(id: Id) -> String {
     let hex = format!("{id:x}");
     hex[..8].to_string()
@@ -209,25 +190,6 @@ fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
         bail!("{label} is empty");
     }
     Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))
-}
-
-fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("{label} is empty");
-    }
-    let Some(id) = Id::from_hex(trimmed) else {
-        bail!("invalid {label} '{trimmed}'");
-    };
-    Ok(Some(id))
-}
-
-fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.from_value();
-    lower.to_tai_duration().total_nanoseconds()
 }
 
 fn resolve_person_id(space: &TribleSet, raw: &str) -> Result<Id> {
@@ -293,7 +255,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
     }
 
     let signing_key = SigningKey::generate(&mut OsRng);
-    Ok(Repository::new(pile, signing_key))
+    Repository::new(pile, signing_key, TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
 fn with_repo<T>(
@@ -310,94 +273,6 @@ fn with_repo<T>(
         eprintln!("warning: failed to close pile cleanly: {err:#}");
     }
     result
-}
-
-fn ensure_branch_with_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_id: Id,
-    branch_name: &str,
-) -> Result<()> {
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let name_blob = branch_name.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
-    repo.storage_mut()
-        .put(name_blob)
-        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
-    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
-    let metadata_handle = repo
-        .storage_mut()
-        .put(metadata.to_blob())
-        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
-    let result = repo
-        .storage_mut()
-        .update(branch_id, None, Some(metadata_handle))
-        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
-    match result {
-        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
-    }
-}
-
-fn load_config_branches(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-) -> Result<ConfigBranches> {
-    let Some(_) = repo
-        .storage_mut()
-        .head(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("config branch head: {e:?}"))?
-    else {
-        return Ok(ConfigBranches::default());
-    };
-    let mut ws = repo
-        .pull(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
-    let mut latest: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::tag: &CONFIG_KIND_ID,
-            config_schema::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        if latest.is_none_or(|(_, current)| key > current) {
-            latest = Some((config_id, key));
-        }
-    }
-    let Some((config_id, _)) = latest else {
-        return Ok(ConfigBranches::default());
-    };
-
-    let relations_branch_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::relations_branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
-
-    Ok(ConfigBranches {
-        relations_branch_id,
-    })
-}
-
-fn resolve_branch_id(explicit_id: Option<Id>, configured_id: Option<Id>) -> Result<Id> {
-    if let Some(id) = explicit_id {
-        return Ok(id);
-    }
-    configured_id.ok_or_else(|| {
-        anyhow!("missing relations branch id in config (set via `playground config set relations-branch-id <hex-id>`)")
-    })
 }
 
 fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<TribleSet> {
@@ -597,7 +472,6 @@ fn cmd_add(
     };
 
     with_repo(pile, |repo| {
-        ensure_branch_with_id(repo, branch_id, branch_name)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -646,7 +520,7 @@ fn cmd_add(
             relations::alias_norm*: alias_lookup.iter().map(String::as_str),
         };
 
-        ws.commit(change, None, Some("relations add"));
+        ws.commit(change, "relations add");
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push person: {e:?}"))?;
         Ok(())
@@ -674,7 +548,6 @@ fn cmd_set(
     let label_lookup = label.as_deref().map(normalize_lookup_key).transpose()?;
 
     let person_id = with_repo(pile, |repo| {
-        ensure_branch_with_id(repo, branch_id, branch_name)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -740,7 +613,7 @@ fn cmd_set(
         }
 
         if !change.is_empty() {
-            ws.commit(change, None, Some("relations set"));
+            ws.commit(change, "relations set");
             repo.push(&mut ws)
                 .map_err(|e| anyhow!("push person: {e:?}"))?;
         }
@@ -752,7 +625,6 @@ fn cmd_set(
 
 fn cmd_list(pile: &Path, branch_name: &str, branch_id: Id, limit: usize) -> Result<()> {
     with_repo(pile, |repo| {
-        ensure_branch_with_id(repo, branch_id, branch_name)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -790,7 +662,6 @@ fn cmd_list(pile: &Path, branch_name: &str, branch_id: Id, limit: usize) -> Resu
 
 fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result<()> {
     with_repo(pile, |repo| {
-        ensure_branch_with_id(repo, branch_id, branch_name)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
@@ -846,9 +717,14 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref(), "branch id")?;
-    let cfg = with_repo(&cli.pile, load_config_branches)?;
-    let branch_id = resolve_branch_id(explicit_branch_id, cfg.relations_branch_id)?;
+    let branch_id = with_repo(&cli.pile, |repo| {
+        if let Some(hex) = cli.branch_id.as_deref() {
+            return Id::from_hex(hex.trim())
+                .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+        }
+        repo.ensure_branch(&cli.branch, None)
+            .map_err(|e| anyhow!("ensure relations branch: {e:?}"))
+    })?;
 
     match cmd {
         Command::Add {

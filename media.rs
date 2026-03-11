@@ -7,7 +7,7 @@
 //! hifitime = "4"
 //! rand_core = "0.6.4"
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use std::fs;
@@ -21,16 +21,11 @@ use rand_core::OsRng;
 use reqwest::blocking::Client;
 use triblespace::core::blob::Bytes;
 use triblespace::core::metadata;
-use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::Repository;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::PushResult;
 use triblespace::prelude::blobschemas::{FileBytes, LongString};
 use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, Hash, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
-
-const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
-const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 
 #[derive(Parser)]
 #[command(
@@ -49,19 +44,6 @@ struct Cli {
     branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
-}
-
-mod config_schema {
-    use super::*;
-    attributes! {
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: NsTAIInterval;
-        "229941B84503AAE4976A49E020D1282B" as media_branch_id: GenId;
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct ConfigBranches {
-    media_branch_id: Option<Id>,
 }
 
 #[derive(Subcommand)]
@@ -125,7 +107,18 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
-    let branch_id = resolve_store_branch_id(&cli)?;
+    let branch_id = with_repo(&cli.pile, |repo| {
+        if let Some(hex) = cli.branch_id.as_deref() {
+            return Id::from_hex(hex.trim())
+                .ok_or_else(|| anyhow!("invalid branch id '{hex}'"));
+        }
+        if let Ok(hex) = std::env::var("TRIBLESPACE_BRANCH_ID") {
+            return Id::from_hex(hex.trim())
+                .ok_or_else(|| anyhow!("invalid TRIBLESPACE_BRANCH_ID '{hex}'"));
+        }
+        repo.ensure_branch("media", None)
+            .map_err(|e| anyhow!("ensure media branch: {e:?}"))
+    })?;
 
     match cmd {
         Command::Capture {
@@ -249,7 +242,6 @@ fn store_media(
     alt: &str,
 ) -> Result<String> {
     with_repo(pile_path, |repo| {
-        ensure_branch_with_id(repo, branch_id, branch_name)?;
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull branch: {e:?}"))?;
@@ -284,7 +276,7 @@ fn store_media(
             media_schema::alt?: alt_handle,
         };
 
-        ws.commit(change, None, Some("media ingest"));
+        ws.commit(change, "media ingest");
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push media ingest: {e:?}"))?;
 
@@ -430,11 +422,6 @@ fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
     (epoch, epoch).to_value()
 }
 
-fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
-    let (lower, _upper): (Epoch, Epoch) = interval.from_value();
-    lower.to_tai_duration().total_nanoseconds()
-}
-
 fn now_epoch() -> Epoch {
     Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
 }
@@ -454,7 +441,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
     }
 
     let signing_key = SigningKey::generate(&mut OsRng);
-    Ok(Repository::new(pile, signing_key))
+    Repository::new(pile, signing_key, TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
 fn with_repo<T>(
@@ -473,108 +461,3 @@ fn with_repo<T>(
     result
 }
 
-fn ensure_branch_with_id(
-    repo: &mut Repository<Pile<Blake3>>,
-    branch_id: Id,
-    branch_name: &str,
-) -> Result<()> {
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-    let name_blob = branch_name.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<Blake3>();
-    repo.storage_mut()
-        .put(name_blob)
-        .map_err(|e| anyhow!("store branch name {branch_name}: {e:?}"))?;
-    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
-    let metadata_handle = repo
-        .storage_mut()
-        .put(metadata.to_blob())
-        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
-    let result = repo
-        .storage_mut()
-        .update(branch_id, None, Some(metadata_handle))
-        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
-    match result {
-        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
-    }
-}
-
-fn resolve_store_branch_id(cli: &Cli) -> Result<Id> {
-    let env_branch_id = std::env::var("TRIBLESPACE_BRANCH_ID").ok();
-    let explicit = parse_optional_hex_id_labeled(
-        cli.branch_id.as_deref().or(env_branch_id.as_deref()),
-        "branch id",
-    )?;
-    let config = with_repo(&cli.pile, load_config_branches)?;
-    resolve_branch_id(explicit, config.media_branch_id, cli.branch.as_str())
-}
-
-fn load_config_branches(repo: &mut Repository<Pile<Blake3>>) -> Result<ConfigBranches> {
-    let Some(_) = repo
-        .storage_mut()
-        .head(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("config branch head: {e:?}"))?
-    else {
-        return Ok(ConfigBranches::default());
-    };
-    let mut ws = repo
-        .pull(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("pull config workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout config workspace: {e:?}"))?;
-
-    let mut latest: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::tag: &CONFIG_KIND_ID,
-            config_schema::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        if latest.is_none_or(|(_, current)| key > current) {
-            latest = Some((config_id, key));
-        }
-    }
-    let Some((config_id, _)) = latest else {
-        return Ok(ConfigBranches::default());
-    };
-    let media_branch_id = find!(
-        (entity: Id, value: Value<GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::media_branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
-    Ok(ConfigBranches { media_branch_id })
-}
-
-fn resolve_branch_id(explicit: Option<Id>, configured: Option<Id>, branch_name: &str) -> Result<Id> {
-    if let Some(id) = explicit {
-        return Ok(id);
-    }
-    configured.ok_or_else(|| {
-        anyhow!(
-            "missing {branch_name} branch id in config (set via `playground config set media-branch-id <hex-id>`)"
-        )
-    })
-}
-
-fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let id = Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))?;
-    Ok(Some(id))
-}

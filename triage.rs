@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -22,29 +22,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::metadata;
-use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{BlobStoreMeta, PullError, PushResult, Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
-const DEFAULT_MAIN_BRANCH: &str = "main";
-const DEFAULT_CONFIG_BRANCH: &str = "config";
-const DEFAULT_LOCAL_BRANCH: &str = "local-messages";
-const DEFAULT_RELATIONS_BRANCH: &str = "relations";
-const DEFAULT_COMPASS_BRANCH: &str = "compass";
-const DEFAULT_EXEC_BRANCH: &str = "cognition";
-const DEFAULT_TEAMS_BRANCH: &str = "teams";
-const DEFAULT_WORKSPACE_BRANCH: &str = "workspace";
-const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
-const DEFAULT_WEB_BRANCH: &str = "web";
-const DEFAULT_MEDIA_BRANCH: &str = "media";
-const FIXED_CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
-
 const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 const KIND_LOCAL_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 const KIND_LOCAL_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
-const KIND_CONFIG_ID: Id = id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const KIND_EXEC_REQUEST_ID: Id = id_hex!("3D2512DAE86B14B9049930F3146A3188");
 const KIND_EXEC_IN_PROGRESS_ID: Id = id_hex!("2D81A8D840822CF082DE5DE569B53730");
 const KIND_EXEC_RESULT_ID: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
@@ -62,19 +47,7 @@ type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::
 mod config {
     use super::*;
     attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
-        "35E36AE7B60AD946661BD63B3CD64672" as branch: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "4E2F9CA7A8456DED8C43A3BE741ADA58" as branch_id: valueschemas::GenId;
-        "EDEFFF6AFF6318E44CCF6A602B012604" as compass_branch_id: valueschemas::GenId;
-        "C188E12ABBDD83D283A23DBAD4B784AF" as exec_branch_id: valueschemas::GenId;
-        "2ED6FF7EAB93CB5608555AE4B9664CF8" as local_messages_branch_id: valueschemas::GenId;
-        "D35F4F02E29825FBC790E324EFCD1B34" as relations_branch_id: valueschemas::GenId;
-        "22A0E76B8044311563369298306906E3" as teams_branch_id: valueschemas::GenId;
-        "20D37D92C2AEF5C98899C4C35AA1E35E" as workspace_branch_id: valueschemas::GenId;
-        "047112FC535518D289E64FBE0B60F06E" as archive_branch_id: valueschemas::GenId;
-        "A4DFF7BE658B1EA16F866E3039FFF8D6" as web_branch_id: valueschemas::GenId;
-        "229941B84503AAE4976A49E020D1282B" as media_branch_id: valueschemas::GenId;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
         "950B556A74F71AC7CB008AB23FBB6544" as system_prompt: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "79E1B50756FB64A30916E9353225E179" as active_model_profile_id: valueschemas::GenId;
@@ -178,21 +151,12 @@ struct Cli {
     /// Path to the pile file to inspect
     #[arg(long, default_value = "self.pile", global = true)]
     pile: PathBuf,
-    /// Main branch name (used when config has no branch id)
-    #[arg(long, default_value = DEFAULT_MAIN_BRANCH, global = true)]
+    /// Target branch name
+    #[arg(long, default_value = "cognition", global = true)]
     branch: String,
-    /// Optional explicit main branch id (hex)
+    /// Optional explicit target branch id (hex)
     #[arg(long, global = true)]
     branch_id: Option<String>,
-    /// Config branch name
-    #[arg(long, default_value = DEFAULT_CONFIG_BRANCH, global = true)]
-    config_branch: String,
-    /// Local messages branch name
-    #[arg(long, default_value = DEFAULT_LOCAL_BRANCH, global = true)]
-    local_branch: String,
-    /// Relations branch name
-    #[arg(long, default_value = DEFAULT_RELATIONS_BRANCH, global = true)]
-    relations_branch: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -279,20 +243,10 @@ enum RepairCommand {
     },
 }
 
+/// Lightweight config snapshot — only non-branch fields that triage still needs.
 #[derive(Debug, Clone, Default)]
 struct ConfigSnapshot {
     updated_at: Option<i128>,
-    branch_name: Option<String>,
-    branch_id: Option<Id>,
-    compass_branch_id: Option<Id>,
-    exec_branch_id: Option<Id>,
-    local_messages_branch_id: Option<Id>,
-    relations_branch_id: Option<Id>,
-    teams_branch_id: Option<Id>,
-    workspace_branch_id: Option<Id>,
-    archive_branch_id: Option<Id>,
-    web_branch_id: Option<Id>,
-    media_branch_id: Option<Id>,
     persona_id: Option<Id>,
 }
 
@@ -565,7 +519,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
         let _ = pile.close();
         return Err(anyhow!("restore pile {}: {err:?}", path.display()));
     }
-    Ok(Repository::new(pile, SigningKey::generate(&mut OsRng)))
+    Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
 fn pull_workspace(
@@ -599,15 +554,6 @@ fn pull_corrupt_valid_length<B: std::error::Error>(
         | PullError::BranchStorage(ReadError::CorruptPile { valid_length }) => Some(*valid_length),
         _ => None,
     }
-}
-
-fn find_branch_by_name(
-    pile: &mut Pile<valueschemas::Blake3>,
-    branch_name: &str,
-) -> Result<Option<Id>> {
-    Ok(find_branch_ids_by_name(pile, branch_name)?
-        .into_iter()
-        .next())
 }
 
 fn find_branch_ids_by_name(
@@ -660,39 +606,6 @@ fn find_branch_ids_by_name(
     Ok(matches.into_iter().map(|(id, _)| id).collect())
 }
 
-fn ensure_branch_with_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_id: Id,
-    branch_name: &str,
-) -> Result<()> {
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("read branch {branch_id:x} head: {e:?}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let name_blob = branch_name.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
-    repo.storage_mut()
-        .put(name_blob)
-        .map_err(|e| anyhow!("store branch name blob: {e:?}"))?;
-    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
-    let metadata_handle = repo
-        .storage_mut()
-        .put(metadata.to_blob())
-        .map_err(|e| anyhow!("store branch metadata: {e:?}"))?;
-    let result = repo
-        .storage_mut()
-        .update(branch_id, None, Some(metadata_handle))
-        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
-    match result {
-        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
-    }
-}
-
 fn push_workspace(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
@@ -709,20 +622,31 @@ fn push_workspace(
     Ok(())
 }
 
-fn load_latest_config(
+/// Use ensure_branch to resolve a named branch, creating it if absent.
+fn ensure_branch_id(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_name: &str,
-) -> Result<Option<ConfigSnapshot>> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? else {
-        return Ok(None);
-    };
-    load_latest_config_from_branch_id(repo, branch_id)
+    name: &str,
+) -> Result<Id> {
+    repo.ensure_branch(name, None)
+        .map_err(|e| anyhow!("ensure branch '{name}': {e:?}"))
 }
 
-fn load_latest_config_from_branch_id(
+/// Resolve target branch: explicit --branch-id wins, else ensure_branch by name.
+fn resolve_target_branch(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_id: Id,
+    cli: &Cli,
+) -> Result<Id> {
+    if let Some(raw_id) = cli.branch_id.as_ref() {
+        return parse_hex_id(raw_id, "branch-id");
+    }
+    ensure_branch_id(repo, &cli.branch)
+}
+
+/// Load lightweight config snapshot (persona_id + updated_at) from the config branch.
+fn load_latest_config(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
 ) -> Result<Option<ConfigSnapshot>> {
+    let branch_id = ensure_branch_id(repo, "config")?;
     let mut ws = pull_workspace(repo, branch_id, "pull config workspace")?;
     let space = ws
         .checkout(..)
@@ -733,7 +657,6 @@ fn load_latest_config_from_branch_id(
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            metadata::tag: &KIND_CONFIG_ID,
             config::updated_at: ?updated_at,
         }])
     ) {
@@ -755,96 +678,6 @@ fn load_latest_config_from_branch_id(
 
     for (entity, value) in find!(
         (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::compass_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.compass_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::exec_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.exec_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::local_messages_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.local_messages_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::relations_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.relations_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::teams_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.teams_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::workspace_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.workspace_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::archive_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.archive_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::web_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.web_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::media_branch_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.media_branch_id = Some(value.from_value());
-            break;
-        }
-    }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
         pattern!(&space, [{ ?entity @ config::persona_id: ?value }])
     ) {
         if entity == config_id {
@@ -852,34 +685,8 @@ fn load_latest_config_from_branch_id(
             break;
         }
     }
-    for (entity, value) in find!(
-        (entity: Id, value: TextHandle),
-        pattern!(&space, [{ ?entity @ config::branch: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.branch_name = Some(read_text(&mut ws, value)?);
-            break;
-        }
-    }
 
     Ok(Some(snapshot))
-}
-
-fn resolve_target_branch(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    cli: &Cli,
-    config: &Option<ConfigSnapshot>,
-) -> Result<Id> {
-    if let Some(raw_id) = cli.branch_id.as_ref() {
-        return parse_hex_id(raw_id, "branch-id");
-    }
-    if let Some(id) = config.as_ref().and_then(|cfg| cfg.branch_id) {
-        return Ok(id);
-    }
-    if let Some(id) = find_branch_by_name(repo.storage_mut(), cli.branch.as_str())? {
-        return Ok(id);
-    }
-    bail!("missing target branch '{}'", cli.branch);
 }
 
 fn collect_exec_state(
@@ -1326,11 +1133,8 @@ fn pattern_is_failure(pattern: &PatternSummary) -> bool {
 
 fn load_relation_terms(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_name: &str,
 ) -> Result<Vec<String>> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), branch_name)? else {
-        return Ok(Vec::new());
-    };
+    let branch_id = ensure_branch_id(repo, "relations")?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
@@ -1379,12 +1183,9 @@ fn extract_unknown_person_label(text: &str) -> Option<String> {
 
 fn count_unread_local_messages(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    local_branch: &str,
     reader_id: Id,
 ) -> Result<Option<usize>> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), local_branch)? else {
-        return Ok(None);
-    };
+    let branch_id = ensure_branch_id(repo, "local-messages")?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull local-messages workspace: {e:?}"))?;
@@ -1431,8 +1232,8 @@ fn cmd_scan(
     loop_min: usize,
     stale_min: i64,
 ) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let config = load_latest_config(repo)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
     let mut ws = pull_workspace(repo, branch_id, "pull target workspace")?;
     let space = ws
         .checkout(..)
@@ -1452,7 +1253,7 @@ fn cmd_scan(
     let loop_report = build_loop_report(&exec_state, recent, loop_min);
 
     let unread_local = if let Some(persona_id) = config.as_ref().and_then(|cfg| cfg.persona_id) {
-        count_unread_local_messages(repo, cli.local_branch.as_str(), persona_id)?
+        count_unread_local_messages(repo, persona_id)?
     } else {
         None
     };
@@ -1463,12 +1264,6 @@ fn cmd_scan(
     if let Some(cfg) = config.as_ref() {
         if let Some(updated_at) = cfg.updated_at {
             println!("- config age: {}", format_age(now_key, updated_at));
-        }
-        if let Some(branch_name) = cfg.branch_name.as_ref() {
-            println!("- config branch label: {branch_name}");
-        }
-        if let Some(config_branch_id) = cfg.branch_id {
-            println!("- config branch id: {config_branch_id:x}");
         }
         if let Some(persona_id) = cfg.persona_id {
             println!("- persona id: {persona_id:x}");
@@ -1556,7 +1351,7 @@ fn cmd_scan(
     }
     if let Some(head) = probable_pattern {
         if let Some(label) = extract_unknown_person_label(&head.fingerprint) {
-            let terms = load_relation_terms(repo, cli.relations_branch.as_str())?;
+            let terms = load_relation_terms(repo)?;
             if let Some(case_variant) = find_case_variant(&terms, label.as_str()) {
                 println!(
                     "- local_messages label mismatch: '{}' failed; try '{}' or add '{}' as alias in relations.",
@@ -1733,8 +1528,7 @@ fn verify_commit_chain(
 }
 
 fn cmd_chain(repo: &mut Repository<Pile<valueschemas::Blake3>>, cli: &Cli) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
     let Some(branch_meta_handle) = repo
         .storage_mut()
         .head(branch_id)
@@ -1806,8 +1600,7 @@ fn cmd_loops(
     recent: usize,
     min_repeat: usize,
 ) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull target workspace: {e:?}"))?;
@@ -1984,8 +1777,7 @@ fn cmd_timeline(
     cli: &Cli,
     recent: usize,
 ) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
     let mut ws = repo
         .pull(branch_id)
         .map_err(|e| anyhow!("pull target workspace: {e:?}"))?;
@@ -2077,10 +1869,6 @@ fn repair_named_duplicates(
     canonical_id: Id,
     dry_run: bool,
 ) -> Result<BranchRepairOutcome> {
-    if !dry_run {
-        ensure_branch_with_id(repo, canonical_id, branch_name)?;
-    }
-
     let duplicate_ids = find_branch_ids_by_name(repo.storage_mut(), branch_name)?
         .into_iter()
         .filter(|id| *id != canonical_id)
@@ -2145,7 +1933,7 @@ fn repair_named_duplicates(
             outcome.merged_facts += delta.len();
             outcome.merged_branches += 1;
             if !dry_run {
-                canonical_ws.commit(delta.clone(), None, Some("triage repair branch duplicates"));
+                canonical_ws.commit(delta.clone(), "triage repair branch duplicates");
                 push_workspace(repo, &mut canonical_ws)?;
                 canonical_data += delta;
             }
@@ -2167,68 +1955,35 @@ fn repair_named_duplicates(
     Ok(outcome)
 }
 
+/// All well-known branch names used across the system.
+const KNOWN_BRANCH_NAMES: &[&str] = &[
+    "archive",
+    "cognition",
+    "compass",
+    "config",
+    "exec",
+    "local-messages",
+    "media",
+    "relations",
+    "teams",
+    "web",
+    "workspace",
+];
+
 fn cmd_repair_branch_duplicates(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     cli: &Cli,
     dry_run: bool,
 ) -> Result<()> {
     let mut canonical = HashMap::<String, Id>::new();
-    insert_canonical_branch(
-        &mut canonical,
-        cli.config_branch.as_str(),
-        Some(FIXED_CONFIG_BRANCH_ID),
-    )?;
-
-    let config_branch_head = repo
-        .storage_mut()
-        .head(FIXED_CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow!("read fixed config branch head: {e:?}"))?;
-    let config_snapshot = if config_branch_head.is_some() {
-        load_latest_config_from_branch_id(repo, FIXED_CONFIG_BRANCH_ID)?
-    } else {
-        load_latest_config(repo, cli.config_branch.as_str())?
-    };
-
-    if let Some(cfg) = config_snapshot.as_ref() {
-        let core_name = cfg
-            .branch_name
-            .as_deref()
-            .unwrap_or(cli.branch.as_str())
-            .to_owned();
-        let core_id = match cfg.branch_id {
-            Some(id) => Some(id),
-            None => find_branch_by_name(repo.storage_mut(), core_name.as_str())?,
-        };
-        insert_canonical_branch(&mut canonical, core_name.as_str(), core_id)?;
-        insert_canonical_branch(&mut canonical, DEFAULT_EXEC_BRANCH, cfg.exec_branch_id)?;
-        insert_canonical_branch(
-            &mut canonical,
-            DEFAULT_COMPASS_BRANCH,
-            cfg.compass_branch_id,
-        )?;
-        insert_canonical_branch(
-            &mut canonical,
-            DEFAULT_LOCAL_BRANCH,
-            cfg.local_messages_branch_id,
-        )?;
-        insert_canonical_branch(
-            &mut canonical,
-            DEFAULT_RELATIONS_BRANCH,
-            cfg.relations_branch_id,
-        )?;
-        insert_canonical_branch(&mut canonical, DEFAULT_TEAMS_BRANCH, cfg.teams_branch_id)?;
-        insert_canonical_branch(
-            &mut canonical,
-            DEFAULT_WORKSPACE_BRANCH,
-            cfg.workspace_branch_id,
-        )?;
-        insert_canonical_branch(
-            &mut canonical,
-            DEFAULT_ARCHIVE_BRANCH,
-            cfg.archive_branch_id,
-        )?;
-        insert_canonical_branch(&mut canonical, DEFAULT_WEB_BRANCH, cfg.web_branch_id)?;
-        insert_canonical_branch(&mut canonical, DEFAULT_MEDIA_BRANCH, cfg.media_branch_id)?;
+    for &name in KNOWN_BRANCH_NAMES {
+        let id = ensure_branch_id(repo, name)?;
+        insert_canonical_branch(&mut canonical, name, Some(id))?;
+    }
+    // Also include the target branch if it differs from the well-known names.
+    if !canonical.contains_key(cli.branch.as_str()) {
+        let id = ensure_branch_id(repo, &cli.branch)?;
+        insert_canonical_branch(&mut canonical, &cli.branch, Some(id))?;
     }
 
     let mut names: Vec<String> = canonical.keys().cloned().collect();
@@ -2397,11 +2152,8 @@ fn find_root_chunks(chunks: &[ContextChunkRow]) -> Vec<usize> {
 
 fn load_budget_from_config(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    config_branch: &str,
 ) -> Result<Option<BudgetInfo>> {
-    let Some(branch_id) = find_branch_by_name(repo.storage_mut(), config_branch)? else {
-        return Ok(None);
-    };
+    let branch_id = ensure_branch_id(repo, "config")?;
     let mut ws = pull_workspace(repo, branch_id, "pull config for budget")?;
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout config: {e:?}"))?;
 
@@ -2411,7 +2163,6 @@ fn load_budget_from_config(
         (config_id: Id, updated_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?config_id @
-            metadata::tag: &KIND_CONFIG_ID,
             config::updated_at: ?updated_at,
         }])
     ) {
@@ -2617,8 +2368,7 @@ fn cmd_cover(
     full: bool,
     tree: bool,
 ) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
     let mut ws = pull_workspace(repo, branch_id, "pull target for cover")?;
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
@@ -2651,7 +2401,7 @@ fn cmd_cover(
     println!("- chunks: {} total, {} roots, max depth {depth}", chunks.len(), root_indices.len());
 
     // Budget
-    let budget = load_budget_from_config(repo, cli.config_branch.as_str())?;
+    let budget = load_budget_from_config(repo)?;
     if let Some(ref b) = budget {
         let cover_chars: usize = chunks.iter()
             .filter_map(|c| c.summary.as_ref())
@@ -2764,8 +2514,7 @@ fn cmd_chunk(
     cli: &Cli,
     id_prefix_str: &str,
 ) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
     let mut ws = pull_workspace(repo, branch_id, "pull target for chunk")?;
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
@@ -2862,8 +2611,7 @@ fn cmd_turn(
     turn_offset: usize,
     full: bool,
 ) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
     let mut ws = pull_workspace(repo, branch_id, "pull target for turn")?;
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
@@ -3186,8 +2934,7 @@ fn cmd_context(
     full: bool,
     raw: bool,
 ) -> Result<()> {
-    let config = load_latest_config(repo, cli.config_branch.as_str())?;
-    let branch_id = resolve_target_branch(repo, cli, &config)?;
+    let branch_id = resolve_target_branch(repo, cli)?;
 
     let result = load_turn_context(repo, branch_id, turn)?;
     let Some((request_id, command, messages)) = result else {
@@ -3207,7 +2954,7 @@ fn cmd_context(
 
     let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
 
-    let budget = load_budget_from_config(repo, cli.config_branch.as_str())?;
+    let budget = load_budget_from_config(repo)?;
     let fill_str = if let Some(ref b) = budget {
         if b.body_budget_chars > 0 {
             let pct = (total_chars as f64 / b.body_budget_chars as f64 * 100.0) as u32;

@@ -8,7 +8,7 @@
 //! hifitime = "4.2.3"
 //! humantime = "2.1.0"
 //! rand_core = "0.6.4"
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -23,17 +23,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::blob::schemas::simplearchive::SimpleArchive;
 use triblespace::core::metadata;
-use triblespace::core::repo::branch as branch_proto;
-use triblespace::core::repo::{PushResult, Repository, Workspace};
+use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{attributes, find, id_hex, pattern};
 use triblespace::prelude::*;
 
-const DEFAULT_COMPASS_BRANCH: &str = "compass";
-const DEFAULT_LOCAL_BRANCH: &str = "local-messages";
-const DEFAULT_RELATIONS_BRANCH: &str = "relations";
-const CONFIG_BRANCH_ID: Id = id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
-const ORIENT_STATE_BRANCH: &str = "orient";
-const ORIENT_STATE_BRANCH_ID: Id = id_hex!("68C108C793D53853A504478A5A2D6551");
+const CONFIG_BRANCH_ID: Id = id_hex!("6069A136254E1B87E4C0D2E0295DB382");
 
 const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
@@ -66,9 +60,6 @@ mod config_schema {
     attributes! {
         "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
         "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
-        "EDEFFF6AFF6318E44CCF6A602B012604" as compass_branch_id: valueschemas::GenId;
-        "2ED6FF7EAB93CB5608555AE4B9664CF8" as local_messages_branch_id: valueschemas::GenId;
-        "D35F4F02E29825FBC790E324EFCD1B34" as relations_branch_id: valueschemas::GenId;
         "D1DC11B303725409AB8A30C6B59DB2D7" as persona_id: valueschemas::GenId;
     }
 }
@@ -194,9 +185,6 @@ struct BoardState {
 #[derive(Debug, Clone, Default)]
 struct ConfigIdentity {
     persona_id: Option<Id>,
-    compass_branch_id: Option<Id>,
-    local_messages_branch_id: Option<Id>,
-    relations_branch_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,114 +460,22 @@ fn load_config_identity(
     .into_iter()
     .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
 
-    let local_messages_branch_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::local_messages_branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
-
-    let compass_branch_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::compass_branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
-
-    let relations_branch_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::relations_branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
-
     Ok(ConfigIdentity {
         persona_id,
-        compass_branch_id,
-        local_messages_branch_id,
-        relations_branch_id,
     })
-}
-
-fn ensure_branch_with_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    branch_id: Id,
-    branch_name: &str,
-) -> Result<()> {
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name} ({branch_id:x}): {e:?}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let name_blob = branch_name.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<valueschemas::Blake3>();
-    repo.storage_mut()
-        .put(name_blob)
-        .map_err(|e| anyhow!("store branch name blob {branch_name}: {e:?}"))?;
-    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
-    let metadata_handle = repo
-        .storage_mut()
-        .put(metadata.to_blob())
-        .map_err(|e| anyhow!("store branch metadata {branch_name}: {e:?}"))?;
-    let result = repo
-        .storage_mut()
-        .update(branch_id, None, Some(metadata_handle))
-        .map_err(|e| anyhow!("create branch {branch_name} ({branch_id:x}): {e:?}"))?;
-    match result {
-        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
-    }
-}
-
-fn resolve_configured_branch_id(
-    repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    configured_id: Option<Id>,
-    branch_name: &str,
-    create_if_missing: bool,
-) -> Result<Id> {
-    let branch_id = configured_id.ok_or_else(|| {
-        anyhow!("missing {branch_name} branch id in config (run `playground config set {branch_name}-branch-id <hex-id>`)")
-    })?;
-    if create_if_missing {
-        ensure_branch_with_id(repo, branch_id, branch_name)?;
-    } else if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|e| anyhow!("branch head {branch_name} ({branch_id:x}): {e:?}"))?
-        .is_none()
-    {
-        bail!(
-            "configured branch id {:x} missing for '{branch_name}'",
-            branch_id
-        );
-    }
-    Ok(branch_id)
 }
 
 fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: usize) -> Result<()> {
     with_repo(pile, |repo| {
         let config_identity = load_config_identity(repo)?;
-        let local_branch_id = resolve_configured_branch_id(
-            repo,
-            config_identity.local_messages_branch_id,
-            DEFAULT_LOCAL_BRANCH,
-            true,
-        )?;
-        let compass_branch_id = resolve_configured_branch_id(
-            repo,
-            config_identity.compass_branch_id,
-            DEFAULT_COMPASS_BRANCH,
-            true,
-        )?;
-        let relations_branch_id = resolve_configured_branch_id(
-            repo,
-            config_identity.relations_branch_id,
-            DEFAULT_RELATIONS_BRANCH,
-            false,
-        )?;
+        let compass_branch_id = repo.ensure_branch("compass", None)
+            .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
+        let local_branch_id = repo.ensure_branch("local-messages", None)
+            .map_err(|e| anyhow::anyhow!("ensure local-messages branch: {e:?}"))?;
+        let relations_branch_id = repo.ensure_branch("relations", None)
+            .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+        let orient_state_branch_id = repo.ensure_branch("orient-state", None)
+            .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
         let current_heads =
             load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
 
@@ -707,7 +603,7 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         }
 
         drop(compass_ws);
-        save_checkpoint_heads(repo, &current_heads)?;
+        save_checkpoint_heads(repo, orient_state_branch_id, &current_heads)?;
         Ok(())
     })
 }
@@ -728,17 +624,17 @@ fn load_watched_heads(
 
 fn load_checkpoint_heads(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    orient_state_branch_id: Id,
 ) -> Result<Option<WatchedHeads>> {
-    let Some(branch_id) = repo
+    let Some(_head) = repo
         .storage_mut()
-        .head(ORIENT_STATE_BRANCH_ID)
+        .head(orient_state_branch_id)
         .map_err(|e| anyhow!("orient state branch head: {e:?}"))?
-        .map(|_| ORIENT_STATE_BRANCH_ID)
     else {
         return Ok(None);
     };
     let mut ws = repo
-        .pull(branch_id)
+        .pull(orient_state_branch_id)
         .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
     let space = ws
         .checkout(..)
@@ -786,12 +682,11 @@ fn load_optional_commit_head(
 
 fn save_checkpoint_heads(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    orient_state_branch_id: Id,
     heads: &WatchedHeads,
 ) -> Result<()> {
-    ensure_branch_with_id(repo, ORIENT_STATE_BRANCH_ID, ORIENT_STATE_BRANCH)?;
-    let branch_id = ORIENT_STATE_BRANCH_ID;
     let mut ws = repo
-        .pull(branch_id)
+        .pull(orient_state_branch_id)
         .map_err(|e| anyhow!("pull orient state workspace: {e:?}"))?;
 
     let checkpoint_id = ufoid();
@@ -805,7 +700,7 @@ fn save_checkpoint_heads(
         orient_state::config_head?: heads.config,
     };
 
-    ws.commit(change, None, Some("orient checkpoint"));
+    ws.commit(change, "orient checkpoint");
     repo.push(&mut ws)
         .map_err(|e| anyhow!("push orient checkpoint: {e:?}"))?;
     Ok(())
@@ -935,29 +830,18 @@ fn cmd_wait(
 ) -> Result<()> {
     let timeout = parse_wait_target(target.as_ref())?;
     let (detected_change_before_wait, changed) = with_repo(pile, |repo| {
-        let config_identity = load_config_identity(repo)?;
-        let local_branch_id = resolve_configured_branch_id(
-            repo,
-            config_identity.local_messages_branch_id,
-            DEFAULT_LOCAL_BRANCH,
-            true,
-        )?;
-        let compass_branch_id = resolve_configured_branch_id(
-            repo,
-            config_identity.compass_branch_id,
-            DEFAULT_COMPASS_BRANCH,
-            true,
-        )?;
-        let relations_branch_id = resolve_configured_branch_id(
-            repo,
-            config_identity.relations_branch_id,
-            DEFAULT_RELATIONS_BRANCH,
-            false,
-        )?;
+        let compass_branch_id = repo.ensure_branch("compass", None)
+            .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
+        let local_branch_id = repo.ensure_branch("local-messages", None)
+            .map_err(|e| anyhow::anyhow!("ensure local-messages branch: {e:?}"))?;
+        let relations_branch_id = repo.ensure_branch("relations", None)
+            .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+        let orient_state_branch_id = repo.ensure_branch("orient-state", None)
+            .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
 
         let mut detected_change_before_wait = false;
         let baseline = load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
-        if let Some(last_seen) = load_checkpoint_heads(repo)? {
+        if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
             if baseline != last_seen {
                 detected_change_before_wait = true;
                 return Ok((detected_change_before_wait, true));
@@ -1031,7 +915,8 @@ fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
         return Err(anyhow!("restore pile {}: {err:?}", path.display()));
     }
     let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-    Ok(Repository::new(pile, signing_key))
+    Repository::new(pile, signing_key, TribleSet::new())
+        .map_err(|err| anyhow!("create repository: {err:?}"))
 }
 
 fn with_repo<T>(

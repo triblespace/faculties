@@ -11,7 +11,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
-//! triblespace = "0.17.0"
+//! triblespace = "0.18"
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -35,9 +35,8 @@ use serde_json::{Value as JsonValue, json};
 use serde::Deserialize;
 use triblespace::core::metadata;
 use triblespace::core::blob::Bytes;
-use triblespace::core::repo::branch as branch_proto;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{PushResult, Repository, Workspace};
+use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
@@ -95,7 +94,7 @@ mod archive_schema {
         pub const kind_attachment: Id = id_hex!("B465C85DD800633F58FE211B920AF2D9");
 
         #[allow(dead_code)]
-        pub fn describe<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+        pub fn describe_kinds<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
         where
             B: BlobStore<Blake3>,
         {
@@ -124,7 +123,7 @@ mod archive_schema {
     where
         B: BlobStore<Blake3>,
     {
-        let mut metadata = archive::describe(blobs)?;
+        let mut metadata = archive::describe_kinds(blobs)?;
 
         metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
         metadata += <ShortString as metadata::ConstDescribe>::describe(blobs)?;
@@ -207,7 +206,7 @@ mod teams_schema {
         pub const kind_config: Id = id_hex!("0D7F4BBE36BD0D6FF4E6C651110D6E8B");
 
         #[allow(dead_code)]
-        pub fn describe<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
+        pub fn describe_kinds<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
         where
             B: BlobStore<Blake3>,
         {
@@ -255,7 +254,7 @@ mod teams_schema {
     where
         B: BlobStore<Blake3>,
     {
-        let mut metadata = teams::describe(blobs)?;
+        let mut metadata = teams::describe_kinds(blobs)?;
 
         metadata += <GenId as metadata::ConstDescribe>::describe(blobs)?;
         metadata += <NsTAIInterval as metadata::ConstDescribe>::describe(blobs)?;
@@ -285,19 +284,8 @@ use teams_schema::{build_teams_metadata, teams};
 
 const DEFAULT_BRANCH: &str = "teams";
 const DEFAULT_LOG_BRANCH: &str = "logs";
-const CONFIG_BRANCH_ID: Id = triblespace::macros::id_hex!("4790808CF044F979FC7C2E47FCCB4A64");
-const CONFIG_KIND_ID: Id = triblespace::macros::id_hex!("A8DCBFD625F386AA7CDFD62A81183E82");
 const DEFAULT_DELTA_URL: &str =
     "https://graph.microsoft.com/v1.0/users/{user_id}/chats/getAllMessages/delta";
-
-mod playground_config_schema {
-    use super::*;
-    attributes! {
-        "79F990573A9DCC91EF08A5F8CBA7AA25" as kind: valueschemas::GenId;
-        "DDF83FEC915816ACAE7F3FEBB57E5137" as updated_at: valueschemas::NsTAIInterval;
-        "22A0E76B8044311563369298306906E3" as teams_branch_id: valueschemas::GenId;
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
@@ -563,15 +551,10 @@ struct TeamsBridgeConfig {
     pile_path: PathBuf,
     branch: String,
     branch_id: Id,
-    log_branch: String,
+    log_branch_id: Id,
     delta_url: String,
     token: Option<String>,
     token_command: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ConfigBranches {
-    teams_branch_id: Option<Id>,
 }
 
 fn main() -> Result<()> {
@@ -680,6 +663,16 @@ fn main() -> Result<()> {
     }
 }
 
+fn with_repo<T>(
+    pile_path: &PathBuf,
+    f: impl FnOnce(&mut Repository<Pile<Blake3>>) -> Result<T>,
+) -> Result<T> {
+    let pile = open_pile(pile_path)?;
+    let repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))?;
+    with_repo_close(repo, f)
+}
+
 fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
     let pile_path = cli
         .pile
@@ -687,17 +680,21 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
         .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("self.pile"));
     let branch = std::env::var("TRIBLESPACE_BRANCH").ok().unwrap_or_else(|| cli.branch.clone());
-    let env_branch_id = std::env::var("TRIBLESPACE_BRANCH_ID").ok();
-    let explicit_branch_id = parse_optional_hex_id_labeled(
-        cli.branch_id.as_deref().or(env_branch_id.as_deref()),
-        "branch id",
-    )?;
-    let config_repo = Repository::new(open_pile(&pile_path)?, SigningKey::generate(&mut OsRng));
-    let config_branches = with_repo_close(config_repo, |repo| load_config_branches(repo))?;
-    let branch_id = resolve_branch_id(explicit_branch_id, config_branches.teams_branch_id, &branch)?;
     let log_branch = std::env::var("TRIBLESPACE_LOG_BRANCH")
         .ok()
         .unwrap_or_else(|| DEFAULT_LOG_BRANCH.to_string());
+    let branch_id = with_repo(&pile_path, |repo| {
+        if let Some(hex) = cli.branch_id.as_deref() {
+            return Id::from_hex(hex.trim())
+                .ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"));
+        }
+        repo.ensure_branch(&branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure teams branch: {e:?}"))
+    })?;
+    let log_branch_id = with_repo(&pile_path, |repo| {
+        repo.ensure_branch(&log_branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure logs branch: {e:?}"))
+    })?;
     let delta_url = std::env::var("TEAMS_DELTA_URL")
         .ok()
         .unwrap_or_else(|| cli.delta_url.clone());
@@ -715,66 +712,10 @@ fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
         pile_path,
         branch,
         branch_id,
-        log_branch,
+        log_branch_id,
         delta_url,
         token,
         token_command,
-    })
-}
-
-fn load_config_branches(repo: &mut Repository<Pile<Blake3>>) -> Result<ConfigBranches> {
-    let Some(_) = repo
-        .storage_mut()
-        .head(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow::anyhow!("config branch head: {e:?}"))?
-    else {
-        return Ok(ConfigBranches::default());
-    };
-
-    let mut ws = repo
-        .pull(CONFIG_BRANCH_ID)
-        .map_err(|e| anyhow::anyhow!("pull config workspace: {e:?}"))?;
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout config workspace: {e:?}"))?;
-
-    let mut latest: Option<(Id, i128)> = None;
-    for (config_id, updated_at) in find!(
-        (config_id: Id, updated_at: Value<NsTAIInterval>),
-        pattern!(&space, [{
-            ?config_id @
-            metadata::tag: &CONFIG_KIND_ID,
-            playground_config_schema::updated_at: ?updated_at,
-        }])
-    ) {
-        let key = interval_key(updated_at);
-        if latest.is_none_or(|(_, current)| key > current) {
-            latest = Some((config_id, key));
-        }
-    }
-
-    let Some((config_id, _)) = latest else {
-        return Ok(ConfigBranches::default());
-    };
-
-    let teams_branch_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ playground_config_schema::teams_branch_id: ?value }])
-    )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(value.from_value()));
-
-    Ok(ConfigBranches { teams_branch_id })
-}
-
-fn resolve_branch_id(explicit_id: Option<Id>, configured_id: Option<Id>, branch_name: &str) -> Result<Id> {
-    if let Some(id) = explicit_id {
-        return Ok(id);
-    }
-    configured_id.ok_or_else(|| {
-        anyhow::anyhow!(
-            "missing {branch_name} branch id in config (set via `playground config set teams-branch-id <hex-id>`)"
-        )
     })
 }
 
@@ -810,7 +751,7 @@ where
 }
 
 fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<()> {
-    let (repo, branch_id) = open_repo_for_branch(&config.pile_path, &config.log_branch, true)?;
+    let (repo, branch_id) = open_repo_for_branch_id(&config.pile_path, config.log_branch_id, "logs")?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -840,7 +781,7 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
         if change.is_empty() {
             return Ok(());
         }
-        ws.commit(change, None, Some("teams log"));
+        ws.commit(change, "teams log");
         map_err_debug(repo.push(&mut ws), "push workspace")?;
         Ok(())
     })
@@ -852,7 +793,7 @@ fn pull_once_with_cache(
 ) -> Result<()> {
     let (token, app_config) = get_app_token(config, app_token_cache)?;
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -879,7 +820,7 @@ fn pull_once_with_cache(
             return Ok(());
         }
 
-        ws.commit(change, None, Some("teams ingest"));
+        ws.commit(change, "teams ingest");
         map_err_debug(repo.push(&mut ws), "push workspace")?;
         Ok(())
     })
@@ -1084,7 +1025,7 @@ fn now_epoch_secs() -> i64 {
 
 fn load_cached_token_from_pile(config: &TeamsBridgeConfig) -> Result<Option<String>> {
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -1137,7 +1078,7 @@ fn load_cached_token_from_pile(config: &TeamsBridgeConfig) -> Result<Option<Stri
 
 fn load_config_from_pile(config: &TeamsBridgeConfig) -> Result<Option<TeamsConfigData>> {
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -1335,20 +1276,20 @@ fn store_token_in_repo(
     if change.is_empty() {
         return Ok(());
     }
-    ws.commit(change, None, Some("teams token cache"));
+    ws.commit(change, "teams token cache");
     map_err_debug(repo.push(&mut ws), "push workspace")?;
     Ok(())
 }
 
 fn store_token_in_pile(config: &TeamsBridgeConfig, token: &TokenData) -> Result<()> {
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| store_token_in_repo(repo, branch_id, token))
 }
 
 fn store_config_in_pile(config: &TeamsBridgeConfig, data: &TeamsConfigData) -> Result<()> {
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| store_config_in_repo(repo, branch_id, data))
 }
 
@@ -1403,7 +1344,7 @@ fn store_config_in_repo(
     if change.is_empty() {
         return Ok(());
     }
-    ws.commit(change, None, Some("teams config cache"));
+    ws.commit(change, "teams config cache");
     map_err_debug(repo.push(&mut ws), "push workspace")?;
     Ok(())
 }
@@ -2101,7 +2042,7 @@ fn read_messages(config: TeamsBridgeConfig, options: ReadOptions) -> Result<()> 
     pull_once_with_cache(&config, &mut app_token_cache)?;
 
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -2234,21 +2175,13 @@ fn open_pile(path: &PathBuf) -> Result<Pile<Blake3>> {
     Ok(pile)
 }
 
-fn seed_default_metadata(repo: &mut Repository<Pile<Blake3>>) -> Result<()> {
-    let mut metadata = build_archive_metadata(repo.storage_mut())
-        .context("build archive metadata")?;
-    metadata += build_teams_metadata(repo.storage_mut()).context("build teams metadata")?;
-    repo.set_default_metadata(metadata)
-        .context("set repository default metadata")?;
-    Ok(())
-}
 
 fn list_attachments(config: TeamsBridgeConfig, options: AttachmentListOptions) -> Result<()> {
     let mut app_token_cache = None;
     pull_once_with_cache(&config, &mut app_token_cache)?;
 
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -2401,7 +2334,7 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
     pull_once_with_cache(&config, &mut app_token_cache)?;
 
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -2590,7 +2523,7 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
             return Ok(());
         }
 
-        ws.commit(change, None, Some("teams attachments backfill"));
+        ws.commit(change, "teams attachments backfill");
         map_err_debug(repo.push(&mut ws), "push workspace")?;
         println!("Backfilled attachments for {created} messages (scanned {scanned}).");
         Ok(())
@@ -2602,7 +2535,7 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
     pull_once_with_cache(&config, &mut app_token_cache)?;
 
     let (repo, branch_id) =
-        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch, true)?;
+        open_repo_for_branch_id(&config.pile_path, config.branch_id, &config.branch)?;
     with_repo_close(repo, |repo| {
         let mut ws = map_err_debug(repo.pull(branch_id), "pull workspace")?;
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?;
@@ -2748,148 +2681,24 @@ fn export_attachment(config: TeamsBridgeConfig, options: AttachmentExportOptions
     })
 }
 
-fn find_branch_id(pile: &mut Pile<Blake3>, name: &str) -> Result<Option<Id>, String> {
-    let reader = pile
-        .reader()
-        .map_err(|err| format!("pile reader: {err:?}"))?;
-    let iter = pile
-        .branches()
-        .map_err(|err| format!("list branches: {err:?}"))?;
-    let expected = name.to_owned().to_blob().get_handle::<Blake3>();
-
-    for branch in iter {
-        let branch_id = branch.map_err(|err| format!("branch id: {err:?}"))?;
-        let Some(head) = pile
-            .head(branch_id)
-            .map_err(|err| format!("branch head: {err:?}"))?
-        else {
-            continue;
-        };
-        let metadata_set: TribleSet = reader
-            .get(head)
-            .map_err(|err| format!("branch metadata: {err:?}"))?;
-        let mut names = find!(
-            (handle: Value<Handle<Blake3, LongString>>),
-            pattern!(&metadata_set, [{ metadata::name: ?handle }])
-        )
-        .into_iter();
-        let Some((handle,)) = names.next() else {
-            continue;
-        };
-        if names.next().is_some() {
-            continue;
-        };
-        if handle == expected {
-            return Ok(Some(branch_id));
-        }
-    }
-
-    Ok(None)
-}
-
-fn ensure_branch_with_id(
-    repo: &mut Repository<Pile<Blake3>>,
-    branch_id: Id,
-    branch_name: &str,
-) -> Result<()> {
-    if repo
-        .storage_mut()
-        .head(branch_id)
-        .map_err(|err| anyhow::anyhow!("branch head {branch_name}: {err:?}"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let name_blob = branch_name.to_owned().to_blob();
-    let name_handle = name_blob.get_handle::<Blake3>();
-    repo.storage_mut()
-        .put(name_blob)
-        .map_err(|err| anyhow::anyhow!("store branch name {branch_name}: {err:?}"))?;
-    let metadata = branch_proto::branch_unsigned(branch_id, name_handle, None);
-    let metadata_handle = repo
-        .storage_mut()
-        .put(metadata.to_blob())
-        .map_err(|err| anyhow::anyhow!("store branch metadata {branch_name}: {err:?}"))?;
-    let result = repo
-        .storage_mut()
-        .update(branch_id, None, Some(metadata_handle))
-        .map_err(|err| anyhow::anyhow!("create branch {branch_name} ({branch_id:x}): {err:?}"))?;
-    match result {
-        PushResult::Success() | PushResult::Conflict(_) => Ok(()),
-    }
-}
-
 fn open_repo_for_branch_id(
     path: &PathBuf,
     branch_id: Id,
     branch_name: &str,
-    create: bool,
 ) -> Result<(Repository<Pile<Blake3>>, Id)> {
-    let mut repo = Repository::new(open_pile(path)?, SigningKey::generate(&mut OsRng));
-    if create {
-        if let Err(err) = ensure_branch_with_id(&mut repo, branch_id, branch_name) {
-            let pile = repo.into_storage();
-            let _ = pile.close();
-            return Err(err);
-        }
-    } else if repo
-        .storage_mut()
+    let mut pile = open_pile(path)?;
+    if pile
         .head(branch_id)
         .map_err(|err| anyhow::anyhow!("branch head {branch_name}: {err:?}"))?
         .is_none()
     {
-        let pile = repo.into_storage();
         let _ = pile.close();
         return Err(anyhow::anyhow!(
             "unknown branch {branch_name} ({branch_id:x})"
         ));
     }
-    if let Err(err) = seed_default_metadata(&mut repo) {
-        let pile = repo.into_storage();
-        let _ = pile.close();
-        return Err(err);
-    }
-    Ok((repo, branch_id))
-}
-
-fn open_repo_for_branch(
-    path: &PathBuf,
-    branch: &str,
-    create: bool,
-) -> Result<(Repository<Pile<Blake3>>, Id)> {
-    let mut pile = open_pile(path)?;
-    let existing = match find_branch_id(&mut pile, branch) {
-        Ok(existing) => existing,
-        Err(err) => {
-            let _ = pile.close();
-            return Err(anyhow::anyhow!(err));
-        }
-    };
-    let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng));
-
-    let branch_id = match existing {
-        Some(id) => id,
-        None if create => match map_err_debug(repo.create_branch(branch, None), "create branch") {
-            Ok(branch_id) => *branch_id,
-            Err(err) => {
-                let pile = repo.into_storage();
-                let _ = pile.close();
-                return Err(err);
-            }
-        },
-        None => {
-            let pile = repo.into_storage();
-            let _ = pile.close();
-            return Err(anyhow::anyhow!("unknown branch {branch}"));
-        }
-    };
-
-    if let Err(err) = seed_default_metadata(&mut repo) {
-        let pile = repo.into_storage();
-        let _ = pile.close();
-        return Err(err);
-    }
+    let repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))?;
     Ok((repo, branch_id))
 }
 
@@ -3884,17 +3693,7 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
     Ok(load_value_or_file(raw, label)?.trim().to_string())
 }
 
-fn parse_optional_hex_id_labeled(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let id = Id::from_hex(trimmed).ok_or_else(|| anyhow::anyhow!("invalid {label} {trimmed}"))?;
-    Ok(Some(id))
-}
+
 
 fn u256_to_u128(value: Value<U256BE>) -> Option<u128> {
     let raw = value.raw;
