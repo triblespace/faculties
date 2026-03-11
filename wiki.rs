@@ -1038,6 +1038,19 @@ fn cmd_list(
                 tag_str,
                 ver_str,
             );
+
+            // Content preview: first non-empty line, truncated
+            if let Ok(view) = ws.get(version.content_handle) {
+                let view: View<str> = view;
+                if let Some(line) = view.as_ref().lines().find(|l| !l.trim().is_empty()) {
+                    let preview = line.trim();
+                    if preview.len() > 80 {
+                        println!("    {}...", &preview[..77]);
+                    } else {
+                        println!("    {preview}");
+                    }
+                }
+            }
         }
         Ok(())
     })
