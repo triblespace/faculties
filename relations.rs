@@ -146,9 +146,8 @@ struct PersonRecord {
     email: Option<String>,
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
 }
 
 fn normalize_label(label: &str) -> Result<String> {
@@ -485,7 +484,7 @@ fn cmd_add(
             if existing != person_id {
                 bail!(
                     "lookup key '{label_lookup}' already belongs to person {}",
-                    id_prefix(existing)
+                    fmt_id(existing)
                 );
             }
         }
@@ -494,7 +493,7 @@ fn cmd_add(
                 if existing != person_id {
                     bail!(
                         "lookup key '{key}' already belongs to person {}",
-                        id_prefix(existing)
+                        fmt_id(existing)
                     );
                 }
             }
@@ -564,7 +563,7 @@ fn cmd_set(
                 if existing != person_id {
                     bail!(
                         "lookup key '{key}' already belongs to person {}",
-                        id_prefix(existing)
+                        fmt_id(existing)
                     );
                 }
             }
@@ -574,7 +573,7 @@ fn cmd_set(
                 if existing != person_id {
                     bail!(
                         "lookup key '{key}' already belongs to person {}",
-                        id_prefix(existing)
+                        fmt_id(existing)
                     );
                 }
             }
@@ -639,7 +638,7 @@ fn cmd_list(pile: &Path, branch_name: &str, branch_id: Id, limit: usize) -> Resu
                     .label
                     .clone()
                     .unwrap_or_else(|| "<unnamed>".to_string());
-                let mut line = format!("[{}] {}", id_prefix(person.id), label);
+                let mut line = format!("[{}] {}", fmt_id(person.id), label);
                 let fallback_name = match (&person.first_name, &person.last_name) {
                     (Some(first), Some(last)) => Some(format!("{first} {last}")),
                     (Some(first), None) => Some(first.clone()),

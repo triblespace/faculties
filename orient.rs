@@ -222,9 +222,8 @@ fn format_age(now_key: i128, past_key: i128) -> String {
     }
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
 }
 
 fn load_relations_labels(
@@ -514,7 +513,7 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         let reader_label = party_names
             .get(&reader_id)
             .cloned()
-            .unwrap_or_else(|| id_prefix(reader_id));
+            .unwrap_or_else(|| fmt_id(reader_id));
         println!("Local messages (unread inbox for {}):", reader_label);
         if messages.is_empty() {
             println!("- None");
@@ -523,15 +522,15 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
                 let from_label = party_names
                     .get(&msg.from)
                     .cloned()
-                    .unwrap_or_else(|| id_prefix(msg.from));
+                    .unwrap_or_else(|| fmt_id(msg.from));
                 let to_label = party_names
                     .get(&msg.to)
                     .cloned()
-                    .unwrap_or_else(|| id_prefix(msg.to));
+                    .unwrap_or_else(|| fmt_id(msg.to));
                 let age = format_age(now_key, msg.created_at);
                 println!(
                     "- [{}] {} {} -> {} ({})",
-                    id_prefix(msg.id),
+                    fmt_id(msg.id),
                     age,
                     from_label,
                     to_label,
@@ -588,7 +587,7 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
             } else {
                 for (_key, task) in doing.into_iter().take(doing_limit) {
                     let tag_suffix = render_tags(&task.tags);
-                    println!("- [{}] {}{}", id_prefix(task.id), task.title, tag_suffix);
+                    println!("- [{}] {}{}", fmt_id(task.id), task.title, tag_suffix);
                 }
             }
             println!("Todo:");
@@ -597,7 +596,7 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
             } else {
                 for (_key, task) in todo.into_iter().take(todo_limit) {
                     let tag_suffix = render_tags(&task.tags);
-                    println!("- [{}] {}{}", id_prefix(task.id), task.title, tag_suffix);
+                    println!("- [{}] {}{}", fmt_id(task.id), task.title, tag_suffix);
                 }
             }
         }

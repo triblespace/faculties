@@ -411,9 +411,8 @@ fn interval_key(interval: Value<valueschemas::NsTAIInterval>) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
 }
 
 fn format_age(now_key: i128, past_key: i128) -> String {
@@ -1635,8 +1634,8 @@ fn cmd_loops(
     for row in &report.recent {
         println!(
             "- [{}:{}] {} | exit={} | {} | {}",
-            id_prefix(row.request_id),
-            id_prefix(row.result_id),
+            fmt_id(row.request_id),
+            fmt_id(row.result_id),
             format_age(now_key, row.finished_at),
             row.exit_code
                 .map(|code| code.to_string())
@@ -1664,7 +1663,7 @@ fn build_timeline_rows(
                 source: "exec",
                 detail: format!(
                     "[{}] {}",
-                    id_prefix(request.id),
+                    fmt_id(request.id),
                     truncate_single_line(command, 120)
                 ),
             });
@@ -1704,8 +1703,8 @@ fn build_timeline_rows(
             source: "exec-result",
             detail: format!(
                 "[{}:{}] {} | {}",
-                id_prefix(result.about_request),
-                id_prefix(result.id),
+                fmt_id(result.about_request),
+                fmt_id(result.id),
                 truncate_single_line(command.as_str(), 100),
                 status
             ),
@@ -1718,7 +1717,7 @@ fn build_timeline_rows(
                 rows.push(TimelineRow {
                     at,
                     source: "model",
-                    detail: format!("[{}] request", id_prefix(*request)),
+                    detail: format!("[{}] request", fmt_id(*request)),
                 });
             }
         }
@@ -1737,7 +1736,7 @@ fn build_timeline_rows(
         let text = row.text.as_deref().unwrap_or("<missing>");
         let mut detail = String::new();
         if let Some(turn_id) = row.about_turn {
-            detail.push_str(format!("[turn {}] ", id_prefix(turn_id)).as_str());
+            detail.push_str(format!("[turn {}] ", fmt_id(turn_id)).as_str());
         }
         detail.push_str(truncate_single_line(text, 120).as_str());
         if let Some(command) = row.command_text.as_ref() {
@@ -2446,7 +2445,7 @@ fn cmd_cover(
             };
             println!(
                 "{prefix}{}  {range}  {children_label}  \"{summary_text}\"",
-                id_prefix(chunk.id)
+                fmt_id(chunk.id)
             );
             let mut sorted_children: Vec<&ContextChunkRow> = chunk.children.iter()
                 .filter_map(|cid| map.get(cid).copied())
@@ -2488,7 +2487,7 @@ fn cmd_cover(
                 };
                 println!(
                     "  {}  {range}  {children_label}  \"{summary_text}\"",
-                    id_prefix(chunk.id)
+                    fmt_id(chunk.id)
                 );
             }
         }
@@ -2548,7 +2547,7 @@ fn cmd_chunk(
         println!("  created: {}", format_tai_ns(created));
     }
     if let Some(exec_id) = chunk.about_exec_result {
-        println!("  origin: exec:{}", id_prefix(exec_id));
+        println!("  origin: exec:{}", fmt_id(exec_id));
     }
     println!("  children: {}", chunk.children.len());
 
@@ -2584,7 +2583,7 @@ fn cmd_chunk(
             let summary = child.summary.as_deref().unwrap_or("<no summary>");
             println!(
                 "  {}  {range}  {kind}  \"{}\"",
-                id_prefix(child.id),
+                fmt_id(child.id),
                 truncate_single_line(summary, 60)
             );
         }
@@ -2640,7 +2639,7 @@ fn cmd_turn(
     let now_key = now_epoch().to_tai_duration().total_nanoseconds();
 
     println!("Turn #{turn_offset}");
-    println!("- request: {}", id_prefix(request_id));
+    println!("- request: {}", fmt_id(request_id));
     println!("- requested: {} ({})", format_tai_ns(requested_at), format_age(now_key, requested_at));
     println!("- command: {}", if full { command.clone() } else { truncate_single_line(&command, 100) });
 
@@ -2715,7 +2714,7 @@ fn cmd_turn(
         }
 
         println!();
-        println!("Exec result [{}]", id_prefix(rid));
+        println!("Exec result [{}]", fmt_id(rid));
         println!(
             "- exit: {}",
             exit_code.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string())
@@ -2835,7 +2834,7 @@ fn cmd_turn(
             }
 
             println!();
-            println!("Model result [{}]", id_prefix(mid));
+            println!("Model result [{}]", fmt_id(mid));
             if let Some(at) = model_finished {
                 println!("- finished: {}", format_tai_ns(at));
             }
@@ -2956,7 +2955,7 @@ fn cmd_context(
 
     println!(
         "Context for turn #{turn} [{}] ({})",
-        id_prefix(request_id),
+        fmt_id(request_id),
         truncate_single_line(&command, 60)
     );
     println!("- messages: {}", messages.len());

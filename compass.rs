@@ -166,9 +166,39 @@ fn normalize_status(status: String) -> String {
     status.trim().to_lowercase()
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
+}
+
+/// Extract `[text](faculty:<hex>)` markdown link references from text.
+/// Returns (faculty, hex_string) pairs.
+fn extract_references(text: &str) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    let mut rest = text;
+    while let Some(paren) = rest.find("](") {
+        let after = &rest[paren + 2..];
+        let end = after.find(')').unwrap_or(after.len());
+        let link = &after[..end];
+        if let Some(colon) = link.find(':') {
+            let faculty = &link[..colon];
+            let hex: String = link[colon + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit())
+                .collect();
+            if hex.len() >= 4
+                && !faculty.is_empty()
+                && faculty
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                refs.push((faculty.to_string(), hex));
+            }
+        }
+        rest = &after[end.min(after.len()).max(1)..];
+    }
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
@@ -432,7 +462,7 @@ fn render_board(state: &BoardState, status_filter: &[String], show_done: bool) {
             println!(
                 "{}- [{}] {}{}{}",
                 indent,
-                row.id_prefix,
+                row.id_hex,
                 row.title,
                 row.tag_suffix(),
                 row.note_suffix()
@@ -445,7 +475,7 @@ fn render_board(state: &BoardState, status_filter: &[String], show_done: bool) {
 #[derive(Debug, Clone)]
 struct TaskRow {
     id: Id,
-    id_prefix: String,
+    id_hex: String,
     title: String,
     tags: Vec<String>,
     created_at: String,
@@ -461,7 +491,7 @@ impl TaskRow {
         tags.dedup();
         Self {
             id: task.id,
-            id_prefix: id_prefix(task.id),
+            id_hex: fmt_id(task.id),
             title: task.title.clone(),
             tags,
             created_at: task.created_at.clone(),
@@ -791,12 +821,12 @@ fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result
             println!("Tags: {}", tags.join(", "));
         }
         if let Some(parent_id) = task.parent {
-            let parent_prefix = id_prefix(parent_id);
+            let parent_hex = fmt_id(parent_id);
             let parent_label = board
                 .tasks
                 .get(&parent_id)
-                .map(|parent| format!("{} ({parent_prefix})", parent.title))
-                .unwrap_or_else(|| parent_prefix.clone());
+                .map(|parent| format!("{} ({parent_hex})", parent.title))
+                .unwrap_or_else(|| parent_hex.clone());
             println!("Parent: {}", parent_label);
         }
 
@@ -815,8 +845,23 @@ fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result
             notes.sort_by(|a, b| a.at.cmp(&b.at));
             println!();
             println!("Notes:");
-            for ev in notes {
+            for ev in &notes {
                 println!("- {} {}", ev.at, ev.note);
+            }
+
+            // Collect references from all notes.
+            let mut all_refs = Vec::new();
+            for ev in &notes {
+                all_refs.extend(extract_references(&ev.note));
+            }
+            all_refs.sort();
+            all_refs.dedup();
+            if !all_refs.is_empty() {
+                println!();
+                println!("References:");
+                for (faculty, hex) in &all_refs {
+                    println!("  ⇢ {faculty}:{hex}");
+                }
             }
         }
         Ok(())

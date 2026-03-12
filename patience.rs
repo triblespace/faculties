@@ -81,9 +81,8 @@ fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
     (epoch, epoch).to_value()
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
 }
 
 fn resolve_pile_path(cli: &Cli) -> PathBuf {
@@ -275,7 +274,7 @@ fn main() -> Result<()> {
 
     eprintln!(
         "[{}] timeout extended by {} ms",
-        id_prefix(event_id),
+        fmt_id(event_id),
         timeout_ms
     );
 

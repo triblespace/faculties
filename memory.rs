@@ -339,9 +339,19 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             };
             let index = load_chunks(&ctx_catalog);
 
-            for (raw_range, start, end) in &memory_refs {
-                let chunk = find_chunk_by_time_range(&index, *start, *end)
-                    .ok_or_else(|| anyhow!("memory link (memory:{raw_range}) does not match any chunk"))?;
+            for link in &memory_refs {
+                let chunk = match link {
+                    MemoryLink::TimeRange(raw, start, end) => {
+                        find_chunk_by_time_range(&index, *start, *end)
+                            .ok_or_else(|| anyhow!("memory link (memory:{raw}) does not match any chunk"))?
+                    }
+                    MemoryLink::HexId(hex) => {
+                        let chunk_id = resolve_chunk_id(&index, hex)
+                            .map_err(|e| anyhow!("memory link (memory:{hex}): {e}"))?;
+                        index.get(&chunk_id)
+                            .ok_or_else(|| anyhow!("memory link (memory:{hex}) resolved but missing"))?
+                    }
+                };
                 child_ids.push(chunk.id);
                 // Track union time span of children.
                 match children_start {
@@ -613,21 +623,70 @@ fn print_archive_meta(
 // memory link scanning and time-range entity resolution
 // ---------------------------------------------------------------------------
 
-/// Scan text for `(memory:<range>)` patterns and return parsed time ranges.
-/// Each entry: (raw_range_text, start_epoch, end_epoch).
-fn scan_memory_links(text: &str) -> Vec<(String, Epoch, Epoch)> {
+/// A parsed memory link — either a time range or a hex ID prefix.
+enum MemoryLink {
+    TimeRange(String, Epoch, Epoch),
+    HexId(String),
+}
+
+/// Scan text for memory references in two formats:
+/// - `(memory:<value>)` — legacy parenthesized format
+/// - `[text](memory:<value>)` — markdown link format (preferred)
+/// Value can be a time range (`from..to`) or a hex ID prefix.
+fn scan_memory_links(text: &str) -> Vec<MemoryLink> {
     let mut refs = Vec::new();
     let mut remaining = text;
+
+    // Match both `](memory:` (markdown link) and `(memory:` (legacy).
+    // The markdown form `](memory:...)` is a superset — the `(memory:` scan
+    // catches both, since `](memory:` contains `(memory:`.
     while let Some(start) = remaining.find("(memory:") {
         let after = &remaining[start + 8..];
         if let Some(end) = after.find(')') {
-            let range_text = after[..end].trim();
-            if let Ok((from, to)) = parse_time_range(range_text) {
-                refs.push((range_text.to_string(), from, to));
+            let value = after[..end].trim();
+            if value.contains("..") {
+                if let Ok((from, to)) = parse_time_range(value) {
+                    refs.push(MemoryLink::TimeRange(value.to_string(), from, to));
+                }
+            } else if !value.is_empty()
+                && value.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                refs.push(MemoryLink::HexId(value.to_string()));
             }
         }
         remaining = &remaining[start + 8..];
     }
+    refs
+}
+
+/// Extract `[text](faculty:<hex>)` markdown link references from text.
+/// Returns (faculty, raw_value) pairs for non-memory faculties.
+/// Memory links are handled by `scan_memory_links` instead.
+#[allow(dead_code)]
+fn extract_references(text: &str) -> Vec<(String, String)> {
+    let mut refs = Vec::new();
+    let mut rest = text;
+    while let Some(paren) = rest.find("](") {
+        let after = &rest[paren + 2..];
+        let end = after.find(')').unwrap_or(after.len());
+        let link = &after[..end];
+        if let Some(colon) = link.find(':') {
+            let faculty = &link[..colon];
+            let value = &link[colon + 1..];
+            if !faculty.is_empty()
+                && faculty
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && faculty != "memory"  // memory links handled separately
+                && !value.is_empty()
+            {
+                refs.push((faculty.to_string(), value.to_string()));
+            }
+        }
+        rest = &after[end.min(after.len()).max(1)..];
+    }
+    refs.sort();
+    refs.dedup();
     refs
 }
 
@@ -842,9 +901,8 @@ fn print_chunk(ws: &mut Workspace<Pile<Blake3>>, chunk: &Chunk) -> Result<()> {
     Ok(())
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
 }
 
 fn resolve_chunk_id(index: &HashMap<Id, Chunk>, raw: &str) -> Result<Id> {
@@ -912,7 +970,7 @@ fn print_turn_facets(ws: &mut Workspace<Pile<Blake3>>, index: &HashMap<Id, Chunk
 
     println!(
         "turn {} has {} memory facet(s)",
-        id_prefix(first_turn),
+        fmt_id(first_turn),
         chunks.len()
     );
     for (i, chunk) in chunks.iter().enumerate() {

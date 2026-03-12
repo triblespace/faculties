@@ -2,7 +2,7 @@
 //! ```cargo
 //! [dependencies]
 //! anyhow = "1.0"
-//! clap = { version = "4.5.4", features = ["derive"] }
+//! clap = { version = "4.5.4", features = ["derive", "env"] }
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
@@ -64,7 +64,7 @@ mod wiki {
 #[command(name = "wiki", about = "A TribleSpace knowledge wiki faculty")]
 struct Cli {
     /// Path to the pile file
-    #[arg(long, default_value = "self.pile", global = true)]
+    #[arg(long, env = "PILE", default_value = "self.pile", global = true)]
     pile: PathBuf,
     /// Branch id (hex). Overrides name-based lookup.
     #[arg(long, global = true)]

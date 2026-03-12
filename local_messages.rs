@@ -201,9 +201,8 @@ fn render_list_body(text: &str) -> String {
     text.replace('\r', "").replace('\n', "\\n")
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
 }
 
 fn load_relations_space(
@@ -434,7 +433,7 @@ fn cmd_send(
         drop(ws);
         println!(
             "[{}] {} -> {}: {}",
-            id_prefix(*message_id),
+            fmt_id(*message_id),
             from_id,
             to_id,
             truncate_single_line(&text, 120)
@@ -477,7 +476,7 @@ fn cmd_ack(
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push read: {e:?}"))?;
         drop(ws);
-        println!("Marked {} as read by {}.", id_prefix(message_id), reader_id);
+        println!("Marked {} as read by {}.", fmt_id(message_id), reader_id);
         Ok(())
     })
 }
@@ -578,11 +577,11 @@ fn cmd_list(
             let from_label = party_names
                 .get(&msg.from)
                 .cloned()
-                .unwrap_or_else(|| id_prefix(msg.from));
+                .unwrap_or_else(|| fmt_id(msg.from));
             let to_label = party_names
                 .get(&msg.to)
                 .cloned()
-                .unwrap_or_else(|| id_prefix(msg.to));
+                .unwrap_or_else(|| fmt_id(msg.to));
             let status = if incoming {
                 if read.is_some() {
                     "read".to_string()
@@ -597,7 +596,7 @@ fn cmd_list(
             let age = format_age(now_key, msg.created_at);
             println!(
                 "[{}] {} {} -> {} ({}) {}",
-                id_prefix(msg.id),
+                fmt_id(msg.id),
                 age,
                 from_label,
                 to_label,

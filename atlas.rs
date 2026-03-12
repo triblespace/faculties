@@ -93,7 +93,7 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
         });
 
         for row in rows {
-            let short_id = id_prefix(row.id);
+            let short_id = fmt_id(row.id);
             let tags = if row.tags.is_empty() {
                 String::new()
             } else {
@@ -101,7 +101,7 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
                     " [tags: {}]",
                     row.tags
                         .iter()
-                        .map(|id| id_prefix(*id))
+                        .map(|id| fmt_id(*id))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -113,7 +113,7 @@ fn cmd_list(pile: &Path, branch: &str) -> Result<()> {
                     " [groups: {}]",
                     row.grouped_by
                         .iter()
-                        .map(|id| id_prefix(*id))
+                        .map(|id| fmt_id(*id))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -263,9 +263,8 @@ fn resolve_prefix(rows: Vec<MetaRow>, prefix: &str) -> Result<MetaRow> {
     }
 }
 
-fn id_prefix(id: Id) -> String {
-    let hex = format!("{id:x}");
-    hex[..8].to_string()
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
 }
 
 fn open_repo(pile_path: &Path) -> Result<Repository<Pile<Blake3>>> {
