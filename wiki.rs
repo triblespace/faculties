@@ -161,6 +161,14 @@ enum Command {
         #[command(subcommand)]
         command: TagCommand,
     },
+    /// Import a file or directory of .md files into the wiki
+    Import {
+        /// File or directory path
+        path: PathBuf,
+        /// Tags to apply to all imported fragments
+        #[arg(long)]
+        tag: Vec<String>,
+    },
     /// Search fragment titles and content (substring, case-insensitive)
     Search {
         /// Search query
@@ -1158,6 +1166,70 @@ fn cmd_tag_mint(pile: &Path, branch: Option<&str>, name: String) -> Result<()> {
     })
 }
 
+fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String>) -> Result<()> {
+    let files = if path.is_dir() {
+        let mut entries: Vec<PathBuf> = Vec::new();
+        collect_md_files(&path, &mut entries)?;
+        entries.sort();
+        entries
+    } else {
+        vec![path]
+    };
+
+    if files.is_empty() {
+        println!("no .md files found");
+        return Ok(());
+    }
+
+    with_wiki(pile, branch, |repo, ws| {
+        ensure_tag_vocabulary(repo, ws)?;
+        let mut tag_index = TagIndex::load(ws)?;
+
+        for file in &files {
+            let content = fs::read_to_string(file)
+                .with_context(|| format!("read {}", file.display()))?;
+
+            // Title: first # heading, or filename stem.
+            let title = content
+                .lines()
+                .find(|l| l.starts_with("# "))
+                .map(|l| l.trim_start_matches('#').trim().to_string())
+                .unwrap_or_else(|| {
+                    file.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                });
+
+            let mut change = TribleSet::new();
+            let tag_ids = tag_index.resolve_or_mint(&tags, &mut change, ws)?;
+            let fragment_id = ufoid();
+            let fragment_ref = fragment_id.id;
+            let content_handle = ws.put(content);
+            let vid = commit_version(
+                repo, ws, change, fragment_ref, &title, content_handle, &tag_ids, "wiki import",
+            )?;
+
+            println!("{}  {}  {}", id_prefix(fragment_ref), id_prefix(vid), file.display());
+        }
+
+        Ok(())
+    })
+}
+
+fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_md_files(&path, out)?;
+        } else if path.extension().is_some_and(|e| e == "md") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
 fn cmd_search(
     pile: &Path,
     branch: Option<&str>,
@@ -1349,6 +1421,7 @@ fn main() -> Result<()> {
             TagCommand::List => cmd_tag_list(&cli.pile, branch),
             TagCommand::Mint { name } => cmd_tag_mint(&cli.pile, branch, name),
         },
+        Command::Import { path, tag } => cmd_import(&cli.pile, branch, path, tag),
         Command::Search { query, context, all } => {
             cmd_search(&cli.pile, branch, query, context, all)
         }
