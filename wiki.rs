@@ -136,6 +136,14 @@ enum Command {
         /// Fragment id (prefix accepted)
         id: String,
     },
+    /// Revert a fragment to a previous version
+    Revert {
+        /// Fragment id (prefix accepted)
+        id: String,
+        /// Version number to revert to (1-based)
+        #[arg(long)]
+        to: usize,
+    },
     /// Show links from/to a fragment (extracted from content `id:<hex>` references)
     Links {
         /// Fragment id (prefix accepted)
@@ -912,6 +920,63 @@ fn cmd_restore(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
     })
 }
 
+fn cmd_revert(pile: &Path, branch: Option<&str>, id: String, to: usize) -> Result<()> {
+    if to == 0 {
+        bail!("version number is 1-based");
+    }
+
+    with_wiki(pile, branch, |repo, ws| {
+        let versions = load_versions(ws)?;
+        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
+
+        let mut frag_versions: Vec<&Version> = versions
+            .iter()
+            .filter(|v| v.fragment_id == fragment_id)
+            .collect();
+        frag_versions.sort_by_key(|v| v.created_at);
+
+        let idx = to - 1;
+        if idx >= frag_versions.len() {
+            bail!(
+                "fragment {} has {} version(s), cannot revert to v{to}",
+                id_prefix(fragment_id),
+                frag_versions.len(),
+            );
+        }
+
+        let target = frag_versions[idx];
+        let mut tag_ids = target.tags.clone();
+        tag_ids.push(KIND_VERSION_ID);
+        tag_ids.sort();
+        tag_ids.dedup();
+
+        let title_handle = ws.put(target.title.clone());
+        let now = now_tai();
+        let version_id = ufoid();
+
+        let mut change = TribleSet::new();
+        change += entity! { &version_id @
+            wiki::fragment: &fragment_id,
+            wiki::title: title_handle,
+            wiki::content: target.content_handle,
+            wiki::created_at: now,
+            metadata::tag*: tag_ids.iter(),
+        };
+
+        ws.commit(change, "wiki revert");
+        repo.push(ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+
+        println!(
+            "reverted {} ({}) to v{to}: {}",
+            id_prefix(fragment_id),
+            id_prefix(version_id.id),
+            target.title,
+        );
+        Ok(())
+    })
+}
+
 fn cmd_links(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
         let versions = load_versions(ws)?;
@@ -1435,6 +1500,7 @@ fn main() -> Result<()> {
         Command::Diff { id, from, to } => cmd_diff(&cli.pile, branch, id, from, to),
         Command::Archive { id } => cmd_archive(&cli.pile, branch, id),
         Command::Restore { id } => cmd_restore(&cli.pile, branch, id),
+        Command::Revert { id, to } => cmd_revert(&cli.pile, branch, id, to),
         Command::Links { id } => cmd_links(&cli.pile, branch, id),
         Command::List { tag, all } => cmd_list(&cli.pile, branch, tag, all),
         Command::History { id } => cmd_history(&cli.pile, branch, id),
