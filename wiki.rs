@@ -103,6 +103,9 @@ enum Command {
     Show {
         /// Fragment or version id (prefix accepted)
         id: String,
+        /// If id is a version, look up its fragment and show the latest version instead
+        #[arg(long)]
+        latest: bool,
     },
     /// Print raw content without metadata header
     Export {
@@ -138,7 +141,7 @@ enum Command {
         #[arg(long)]
         to: usize,
     },
-    /// Show links from/to a fragment (extracted from `[text](faculty:<hex>)` references)
+    /// Show links from/to a fragment (extracted from `[text](<faculty>:<hex>)` references)
     Links {
         /// Fragment id (prefix accepted)
         id: String,
@@ -206,18 +209,6 @@ enum TagCommand {
         /// Tag name
         name: String,
     },
-}
-
-// ── data types ─────────────────────────────────────────────────────────────
-#[derive(Debug, Clone)]
-struct Version {
-    id: Id,
-    fragment_id: Id,
-    title: String,
-    content_handle: TextHandle,
-    created_at: i128,
-    tags: Vec<Id>,
-    links_to: Vec<Id>,
 }
 
 /// Bidirectional tag name / id index.
@@ -291,6 +282,185 @@ impl TagIndex {
     }
 }
 
+// ── triblespace query helpers ──────────────────────────────────────────────
+
+/// Check if an ID is a version entity (has KIND_VERSION tag).
+fn is_version(space: &TribleSet, id: Id) -> bool {
+    find!(
+        (vid: Id),
+        pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
+    )
+    .any(|(vid,)| vid == id)
+}
+
+/// Get the fragment ID that a version belongs to.
+fn version_fragment(space: &TribleSet, version_id: Id) -> Option<Id> {
+    find!(
+        (vid: Id, frag: Id),
+        pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+    )
+    .find(|(vid, _)| *vid == version_id)
+    .map(|(_, frag)| frag)
+}
+
+/// Find the latest version ID for a fragment (by created_at).
+fn latest_version_of(space: &TribleSet, fragment_id: Id) -> Option<Id> {
+    find!(
+        (vid: Id, ts: Value<valueschemas::NsTAIInterval>),
+        pattern!(space, [{
+            ?vid @
+            metadata::tag: &KIND_VERSION_ID,
+            wiki::fragment: &fragment_id,
+            wiki::created_at: ?ts,
+        }])
+    )
+    .max_by_key(|(_, ts)| interval_key(*ts))
+    .map(|(vid, _)| vid)
+}
+
+/// All version IDs of a fragment, sorted oldest-first.
+fn version_history_of(space: &TribleSet, fragment_id: Id) -> Vec<Id> {
+    let mut versions: Vec<(Id, i128)> = find!(
+        (vid: Id, ts: Value<valueschemas::NsTAIInterval>),
+        pattern!(space, [{
+            ?vid @
+            metadata::tag: &KIND_VERSION_ID,
+            wiki::fragment: &fragment_id,
+            wiki::created_at: ?ts,
+        }])
+    )
+    .map(|(vid, ts)| (vid, interval_key(ts)))
+    .collect();
+    versions.sort_by_key(|(_, ts)| *ts);
+    versions.into_iter().map(|(vid, _)| vid).collect()
+}
+
+/// Read title string for a version entity.
+fn read_title(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    vid: Id,
+) -> Option<String> {
+    for (v, h) in find!(
+        (v: Id, h: TextHandle),
+        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::title: ?h }])
+    ) {
+        if v == vid {
+            if let Ok(view) = ws.get(h) {
+                let view: View<str> = view;
+                return Some(view.as_ref().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Get the content handle for a version entity.
+fn content_handle_of(space: &TribleSet, vid: Id) -> Option<TextHandle> {
+    find!(
+        (v: Id, h: TextHandle),
+        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::content: ?h }])
+    )
+    .find(|(v, _)| *v == vid)
+    .map(|(_, h)| h)
+}
+
+/// Get created_at timestamp for a version entity.
+fn created_at_of(space: &TribleSet, vid: Id) -> Option<i128> {
+    find!(
+        (v: Id, ts: Value<valueschemas::NsTAIInterval>),
+        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::created_at: ?ts }])
+    )
+    .find(|(v, _)| *v == vid)
+    .map(|(_, ts)| interval_key(ts))
+}
+
+/// Get tags for a version entity (excluding KIND_VERSION).
+fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
+    find!(
+        (v: Id, tag: Id),
+        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, metadata::tag: ?tag }])
+    )
+    .filter(|(v, t)| *v == vid && *t != KIND_VERSION_ID)
+    .map(|(_, t)| t)
+    .collect()
+}
+
+/// Get stored links_to targets for a version entity.
+fn links_of(space: &TribleSet, vid: Id) -> Vec<Id> {
+    find!(
+        (v: Id, target: Id),
+        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::links_to: ?target }])
+    )
+    .filter(|(v, _)| *v == vid)
+    .map(|(_, t)| t)
+    .collect()
+}
+
+/// Resolve a hex prefix to an ID. Matches both version and fragment IDs.
+fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
+    let needle = input.trim().to_lowercase();
+    let mut matches = Vec::new();
+    let mut seen_frags = std::collections::HashSet::new();
+    for (vid, frag) in find!(
+        (vid: Id, frag: Id),
+        pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+    ) {
+        let vid_hex = format!("{vid:x}");
+        let frag_hex = format!("{frag:x}");
+        if vid_hex.starts_with(&needle) {
+            matches.push(vid);
+        }
+        if seen_frags.insert(frag) && frag_hex.starts_with(&needle) {
+            matches.push(frag);
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => bail!("no id matches '{input}'"),
+        1 => Ok(matches[0]),
+        n => bail!("ambiguous id '{input}' ({n} matches)"),
+    }
+}
+
+/// Given an ID, resolve to the fragment it belongs to.
+/// Identity for fragment IDs, lookup for version IDs.
+fn to_fragment(space: &TribleSet, id: Id) -> Result<Id> {
+    // Check if it's a known fragment.
+    let is_frag = find!(
+        (frag: Id),
+        pattern!(space, [{ _?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+    )
+    .any(|(f,)| f == id);
+    if is_frag {
+        return Ok(id);
+    }
+    // Must be a version — get its fragment.
+    version_fragment(space, id)
+        .ok_or_else(|| anyhow::anyhow!("no fragment for id {}", fmt_id(id)))
+}
+
+/// Human-readable label for a link target (version or fragment).
+fn link_label(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    id: Id,
+) -> String {
+    if is_version(space, id) {
+        let title = read_title(space, ws, id).unwrap_or_else(|| "?".into());
+        let frag = version_fragment(space, id);
+        let frag_str = frag.map(|f| format!(" of {}", fmt_id(f))).unwrap_or_default();
+        format!("{title} [version {}{}]", fmt_id(id), frag_str)
+    } else {
+        // Fragment — show its latest version's title.
+        let title = latest_version_of(space, id)
+            .and_then(|vid| read_title(space, ws, vid))
+            .unwrap_or_else(|| "?".into());
+        format!("{title} ({})", fmt_id(id))
+    }
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 fn now_tai() -> Value<valueschemas::NsTAIInterval> {
     let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
@@ -331,26 +501,24 @@ fn format_date(tai_ns: i128) -> String {
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
 
-/// Extract `[text](faculty:<hex>)` markdown link references from content.
-/// Returns internal wiki links (resolved to fragment IDs) and external links (faculty + raw hex).
-fn extract_references(content: &str, versions: &[Version]) -> (Vec<Id>, Vec<(String, String)>) {
+/// Extract `[text](<faculty>:<hex>)` markdown link references from content.
+/// Wiki links resolve against the space — the stored ID is whatever matches
+/// (could be a fragment or version). External links return faculty + raw hex.
+fn extract_references(content: &str, space: &TribleSet) -> (Vec<Id>, Vec<(String, String)>) {
     let mut internal = Vec::new();
     let mut external = Vec::new();
     let mut rest = content;
-    // Match markdown links: [...](<faculty>:<hex>)
     while let Some(paren) = rest.find("](") {
         let after = &rest[paren + 2..];
-        // Find the closing paren
         let end = after.find(')').unwrap_or(after.len());
         let link = &after[..end];
-        // Parse <faculty>:<hex>
         if let Some(colon) = link.find(':') {
             let faculty = &link[..colon];
             let hex: String = link[colon + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
             if hex.len() >= 4 && !faculty.is_empty() && faculty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 if faculty == "wiki" {
-                    if let Ok(frag_id) = resolve_to_fragment_id(&hex, versions) {
-                        internal.push(frag_id);
+                    if let Ok(id) = resolve_prefix(space, &hex) {
+                        internal.push(id);
                     }
                 } else {
                     external.push((faculty.to_string(), hex));
@@ -455,7 +623,7 @@ fn commit_version(
     title: &str,
     content: TextHandle,
     tags: &[Id],
-    versions: &[Version],
+    space: &TribleSet,
     message: &str,
 ) -> Result<Id> {
     let mut tag_ids = tags.to_vec();
@@ -467,7 +635,7 @@ fn commit_version(
     let content_text: View<str> = ws
         .get(content)
         .map_err(|e| anyhow::anyhow!("read content for link extraction: {e:?}"))?;
-    let (internal_links, _external) = extract_references(content_text.as_ref(), versions);
+    let (internal_links, _external) = extract_references(content_text.as_ref(), space);
     let link_targets: Vec<Id> = internal_links
         .into_iter()
         .filter(|&id| id != fragment_id)
@@ -491,220 +659,96 @@ fn commit_version(
     Ok(version_id)
 }
 
-/// Versions of a single fragment, sorted oldest-first.
-fn fragment_history<'a>(versions: &'a [Version], fragment_id: Id) -> Vec<&'a Version> {
-    let mut history: Vec<&Version> = versions
-        .iter()
-        .filter(|v| v.fragment_id == fragment_id)
-        .collect();
-    history.sort_by_key(|v| v.created_at);
-    history
-}
-
-/// Outgoing and incoming links for a fragment, using stored `links_to` triples.
-/// Returns (outgoing wiki links, incoming wiki links, external references).
-/// External references are still parsed from content (not stored).
+/// Outgoing and incoming links for an ID (fragment or version).
+/// Returns (outgoing targets, incoming sources, external references).
 fn find_links(
+    space: &TribleSet,
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
-    fragment_id: Id,
-    versions: &[Version],
-    latest: &HashMap<Id, &Version>,
+    id: Id,
 ) -> Result<(Vec<Id>, Vec<Id>, Vec<(String, String)>)> {
-    let version = latest
-        .get(&fragment_id)
-        .ok_or_else(|| anyhow::anyhow!("no versions"))?;
+    // Determine the version to read outgoing links from.
+    let vid = if is_version(space, id) {
+        id
+    } else {
+        latest_version_of(space, id)
+            .ok_or_else(|| anyhow::anyhow!("no versions for {}", fmt_id(id)))?
+    };
 
-    // Outgoing: from stored links_to on this version.
-    let mut outgoing = version.links_to.clone();
-    // Fallback for versions created before links_to was stored:
-    // parse content if no stored links and content contains wiki: references.
+    // Outgoing: stored links_to on this version, with content-parse fallback.
+    let mut outgoing = links_of(space, vid);
     if outgoing.is_empty() {
-        let content: View<str> = ws
-            .get(version.content_handle)
-            .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-        let (internal, _) = extract_references(content.as_ref(), versions);
-        outgoing = internal.into_iter().filter(|&id| id != fragment_id).collect();
+        if let Some(ch) = content_handle_of(space, vid) {
+            let content: View<str> = ws.get(ch)
+                .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+            let (internal, _) = extract_references(content.as_ref(), space);
+            outgoing = internal.into_iter().filter(|&t| t != id).collect();
+        }
     }
     outgoing.sort();
     outgoing.dedup();
 
-    // Incoming: find all latest versions whose links_to contains this fragment.
-    let mut incoming = Vec::new();
-    for (&frag_id, &v) in latest {
-        if frag_id == fragment_id {
-            continue;
+    // Incoming: all entities that link_to this ID (direct conjunctive query).
+    let mut incoming: Vec<Id> = find!(
+        (source: Id),
+        pattern!(space, [{ ?source @ wiki::links_to: &id }])
+    )
+    .map(|(s,)| s)
+    .collect();
+    // Also check for links to the fragment if id is a version (or vice versa).
+    if is_version(space, id) {
+        if let Some(frag) = version_fragment(space, id) {
+            for (s,) in find!(
+                (source: Id),
+                pattern!(space, [{ ?source @ wiki::links_to: &frag }])
+            ) {
+                incoming.push(s);
+            }
         }
-        if v.links_to.contains(&fragment_id) {
-            incoming.push(frag_id);
-        } else if v.links_to.is_empty() {
-            // Fallback for pre-links_to versions: parse content.
-            let c: View<str> = ws
-                .get(v.content_handle)
-                .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-            let (refs, _) = extract_references(c.as_ref(), versions);
-            if refs.contains(&fragment_id) {
-                incoming.push(frag_id);
+    } else {
+        // id is a fragment — also collect links to any of its versions.
+        for vid in version_history_of(space, id) {
+            for (s,) in find!(
+                (source: Id),
+                pattern!(space, [{ ?source @ wiki::links_to: &vid }])
+            ) {
+                incoming.push(s);
             }
         }
     }
     incoming.sort();
     incoming.dedup();
 
-    // External references still parsed from content.
-    let content: View<str> = ws
-        .get(version.content_handle)
-        .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-    let (_, external) = extract_references(content.as_ref(), versions);
+    // External references parsed from content.
+    let mut external = Vec::new();
+    if let Some(ch) = content_handle_of(space, vid) {
+        let content: View<str> = ws.get(ch)
+            .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+        let (_, ext) = extract_references(content.as_ref(), space);
+        external = ext;
+    }
 
     Ok((outgoing, incoming, external))
 }
 
-/// Load all versions from the wiki branch.
-fn load_versions(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<Version>> {
-    let space = ws
-        .checkout(..)
-        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-
-    let mut versions: HashMap<Id, Version> = HashMap::new();
-
-    for (vid, frag, title_h, content_h, ts) in find!(
-        (vid: Id, frag: Id, title_h: TextHandle, content_h: TextHandle, ts: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{
-            ?vid @
-            metadata::tag: &KIND_VERSION_ID,
-            wiki::fragment: ?frag,
-            wiki::title: ?title_h,
-            wiki::content: ?content_h,
-            wiki::created_at: ?ts,
-        }])
-    ) {
-        let title: String = {
-            let view: View<str> = ws
-                .get(title_h)
-                .map_err(|e| anyhow::anyhow!("read title: {e:?}"))?;
-            view.as_ref().to_string()
-        };
-        versions.insert(
-            vid,
-            Version {
-                id: vid,
-                fragment_id: frag,
-                title,
-                content_handle: content_h,
-                created_at: interval_key(ts),
-                tags: Vec::new(),
-                links_to: Vec::new(),
-            },
-        );
-    }
-
-    // Tags (multi-valued)
-    for (vid, tag_id) in find!(
-        (vid: Id, tag_id: Id),
-        pattern!(&space, [{
-            ?vid @
-            metadata::tag: &KIND_VERSION_ID,
-            metadata::tag: ?tag_id,
-        }])
-    ) {
-        if let Some(v) = versions.get_mut(&vid) {
-            if tag_id != KIND_VERSION_ID {
-                v.tags.push(tag_id);
-            }
-        }
-    }
-
-    // Outgoing wiki links (multi-valued)
-    for (vid, target) in find!(
-        (vid: Id, target: Id),
-        pattern!(&space, [{
-            ?vid @
-            metadata::tag: &KIND_VERSION_ID,
-            wiki::links_to: ?target,
-        }])
-    ) {
-        if let Some(v) = versions.get_mut(&vid) {
-            v.links_to.push(target);
-        }
-    }
-
-    Ok(versions.into_values().collect())
-}
-
-/// Get the latest version for each fragment.
-fn latest_versions(versions: &[Version]) -> HashMap<Id, &Version> {
-    let mut latest: HashMap<Id, &Version> = HashMap::new();
-    for v in versions {
-        if let Some(current) = latest.get(&v.fragment_id) {
-            if v.created_at > current.created_at {
-                latest.insert(v.fragment_id, v);
-            }
+/// Resolve an id and determine the version to display.
+/// If `follow_latest` is true and id is a version, jump to the latest version
+/// of its fragment instead.
+fn resolve_to_show(space: &TribleSet, input: &str, follow_latest: bool) -> Result<Id> {
+    let id = resolve_prefix(space, input)?;
+    if is_version(space, id) {
+        if follow_latest {
+            let frag = version_fragment(space, id)
+                .ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
+            latest_version_of(space, frag)
+                .ok_or_else(|| anyhow::anyhow!("no versions for fragment"))
         } else {
-            latest.insert(v.fragment_id, v);
+            Ok(id)
         }
+    } else {
+        // Fragment — always show latest version.
+        latest_version_of(space, id)
+            .ok_or_else(|| anyhow::anyhow!("no versions for '{input}'"))
     }
-    latest
-}
-
-/// Resolve an id prefix, returning whichever ID matched (fragment or version).
-fn resolve_id(input: &str, versions: &[Version]) -> Result<Id> {
-    let needle = input.trim().to_lowercase();
-    let mut version_matches = Vec::new();
-    let mut fragment_matches = Vec::new();
-    for v in versions {
-        let vid_hex = format!("{:x}", v.id);
-        let fid_hex = format!("{:x}", v.fragment_id);
-        if vid_hex.starts_with(&needle) {
-            version_matches.push(v.id);
-        }
-        if fid_hex.starts_with(&needle) {
-            fragment_matches.push(v.fragment_id);
-        }
-    }
-    fragment_matches.sort();
-    fragment_matches.dedup();
-    if fragment_matches.len() == 1 {
-        return Ok(fragment_matches[0]);
-    }
-    if version_matches.len() == 1 {
-        return Ok(version_matches[0]);
-    }
-    let total = fragment_matches.len() + version_matches.len();
-    if total == 0 {
-        bail!("no id matches '{input}'");
-    }
-    bail!("ambiguous id '{input}' ({total} matches)");
-}
-
-/// Resolve an id prefix to a fragment ID (maps version IDs to their fragment).
-fn resolve_to_fragment_id(input: &str, versions: &[Version]) -> Result<Id> {
-    let id = resolve_id(input, versions)?;
-    if versions.iter().any(|v| v.fragment_id == id) {
-        return Ok(id);
-    }
-    if let Some(v) = versions.iter().find(|v| v.id == id) {
-        return Ok(v.fragment_id);
-    }
-    bail!("no fragment for '{input}'");
-}
-
-/// Resolve an id and pick the version to display (specific version if version
-/// ID matched, otherwise latest for the fragment).
-fn resolve_version_to_show<'a>(
-    input: &str,
-    versions: &'a [Version],
-) -> Result<&'a Version> {
-    let id = resolve_id(input, versions)?;
-    // Direct version match — show that exact version.
-    if let Some(v) = versions.iter().find(|v| v.id == id) {
-        return Ok(v);
-    }
-    // Fragment match — show latest.
-    let latest = latest_versions(versions);
-    latest
-        .get(&id)
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("no versions for '{input}'"))
 }
 
 // ── commands ───────────────────────────────────────────────────────────────
@@ -721,7 +765,7 @@ fn cmd_create(
 
     with_wiki(pile, branch, |repo, ws| {
         ensure_tag_vocabulary(repo, ws)?;
-        let versions = load_versions(ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let mut change = TribleSet::new();
         let mut tag_index = TagIndex::load(ws)?;
         let tag_ids = tag_index.resolve_or_mint(&tags, &mut change, ws)?;
@@ -729,7 +773,7 @@ fn cmd_create(
         let fragment_id = genid().id;
         let content_handle = ws.put(content);
         let vid = commit_version(
-            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &versions, "wiki create",
+            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki create",
         )?;
 
         println!("fragment {}", fmt_id(fragment_id));
@@ -753,28 +797,31 @@ fn cmd_edit(
     }
 
     with_wiki(pile, branch, |repo, ws| {
-        let versions = load_versions(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let prev = *latest_versions(&versions)
-            .get(&fragment_id)
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
 
         ensure_tag_vocabulary(repo, ws)?;
         let mut change = TribleSet::new();
         let mut tag_index = TagIndex::load(ws)?;
         let tag_ids = if tags.is_empty() {
-            prev.tags.clone()
+            tags_of(&space, prev_vid)
         } else {
             tag_index.resolve_or_mint(&tags, &mut change, ws)?
         };
 
-        let title = new_title.unwrap_or_else(|| prev.title.clone());
+        let title = new_title.unwrap_or_else(|| {
+            read_title(&space, ws, prev_vid).unwrap_or_default()
+        });
         let content_handle = match content {
             Some(text) => ws.put(text),
-            None => prev.content_handle,
+            None => content_handle_of(&space, prev_vid)
+                .ok_or_else(|| anyhow::anyhow!("no content on previous version"))?,
         };
         let vid = commit_version(
-            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &versions, "wiki edit",
+            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki edit",
         )?;
 
         println!("fragment {}", fmt_id(fragment_id));
@@ -783,43 +830,45 @@ fn cmd_edit(
     })
 }
 
-fn cmd_show(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
+fn cmd_show(pile: &Path, branch: Option<&str>, id: String, follow_latest: bool) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
-        let versions = load_versions(ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let version = resolve_version_to_show(&id, &versions)?;
-        let fragment_id = version.fragment_id;
+        let vid = resolve_to_show(&space, &id, follow_latest)?;
+        let fragment_id = version_fragment(&space, vid)
+            .ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
 
-        let content: View<str> = ws
-            .get(version.content_handle)
+        let content_h = content_handle_of(&space, vid)
+            .ok_or_else(|| anyhow::anyhow!("no content"))?;
+        let content: View<str> = ws.get(content_h)
             .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+        let title = read_title(&space, ws, vid).unwrap_or_default();
+        let tags = tags_of(&space, vid);
+        let created_at = created_at_of(&space, vid).unwrap_or(0);
 
-        println!("# {}", version.title);
+        println!("# {title}");
         println!(
             "fragment: {}  version: {}  date: {}",
-            fmt_id(fragment_id),
-            fmt_id(version.id),
-            format_date(version.created_at),
+            fmt_id(fragment_id), fmt_id(vid), format_date(created_at),
         );
-        let tag_str = tag_index.format_tags(&version.tags);
+        let tag_str = tag_index.format_tags(&tags);
         if !tag_str.is_empty() {
             println!("tags:{tag_str}");
         }
         println!();
         print!("{}", content.as_ref());
 
-        let latest = latest_versions(&versions);
-        let (outgoing, incoming, external) = find_links(ws, fragment_id, &versions, &latest)?;
+        let (outgoing, incoming, external) = find_links(&space, ws, fragment_id)?;
         if !outgoing.is_empty() || !incoming.is_empty() || !external.is_empty() {
             println!("\n---");
         }
         for target in &outgoing {
-            let title = latest.get(target).map(|v| v.title.as_str()).unwrap_or("?");
-            println!("→ {} ({})", title, fmt_id(*target));
+            let label = link_label(&space, ws, *target);
+            println!("→ {label}");
         }
         for source in &incoming {
-            let title = latest.get(source).map(|v| v.title.as_str()).unwrap_or("?");
-            println!("← {} ({})", title, fmt_id(*source));
+            let label = link_label(&space, ws, *source);
+            println!("← {label}");
         }
         for (faculty, hex) in &external {
             println!("⇢ {faculty}:{hex}");
@@ -831,11 +880,11 @@ fn cmd_show(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
 
 fn cmd_export(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
-        let versions = load_versions(ws)?;
-        let version = resolve_version_to_show(&id, &versions)?;
-
-        let content: View<str> = ws
-            .get(version.content_handle)
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let vid = resolve_to_show(&space, &id, false)?;
+        let ch = content_handle_of(&space, vid)
+            .ok_or_else(|| anyhow::anyhow!("no content"))?;
+        let content: View<str> = ws.get(ch)
             .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
         print!("{}", content.as_ref());
         Ok(())
@@ -850,11 +899,12 @@ fn cmd_diff(
     to: Option<usize>,
 ) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
-        let versions = load_versions(ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let frag_versions = fragment_history(&versions, fragment_id);
-        let n = frag_versions.len();
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let history = version_history_of(&space, fragment_id);
+        let n = history.len();
         if n < 2 {
             bail!(
                 "fragment {} has only {n} version(s), need at least 2 to diff",
@@ -868,31 +918,22 @@ fn cmd_diff(
             bail!("version index out of range (fragment has {n} versions)");
         }
 
-        let old = frag_versions[from_idx];
-        let new = frag_versions[to_idx];
+        let old_vid = history[from_idx];
+        let new_vid = history[to_idx];
 
-        let old_content: View<str> = ws
-            .get(old.content_handle)
-            .map_err(|e| anyhow::anyhow!("read old content: {e:?}"))?;
-        let new_content: View<str> = ws
-            .get(new.content_handle)
-            .map_err(|e| anyhow::anyhow!("read new content: {e:?}"))?;
+        let old_ch = content_handle_of(&space, old_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
+        let new_ch = content_handle_of(&space, new_vid).ok_or_else(|| anyhow::anyhow!("no content"))?;
+        let old_content: View<str> = ws.get(old_ch).map_err(|e| anyhow::anyhow!("read old content: {e:?}"))?;
+        let new_content: View<str> = ws.get(new_ch).map_err(|e| anyhow::anyhow!("read new content: {e:?}"))?;
 
-        println!(
-            "--- v{} {}  {}",
-            from_idx + 1,
-            fmt_id(old.id),
-            old.title,
-        );
-        println!(
-            "+++ v{} {}  {}",
-            to_idx + 1,
-            fmt_id(new.id),
-            new.title,
-        );
+        let old_title = read_title(&space, ws, old_vid).unwrap_or_default();
+        let new_title = read_title(&space, ws, new_vid).unwrap_or_default();
 
-        let old_tags = tag_index.format_tags(&old.tags);
-        let new_tags = tag_index.format_tags(&new.tags);
+        println!("--- v{} {}  {}", from_idx + 1, fmt_id(old_vid), old_title);
+        println!("+++ v{} {}  {}", to_idx + 1, fmt_id(new_vid), new_title);
+
+        let old_tags = tag_index.format_tags(&tags_of(&space, old_vid));
+        let new_tags = tag_index.format_tags(&tags_of(&space, new_vid));
         if old_tags != new_tags {
             println!("- tags:{old_tags}");
             println!("+ tags:{new_tags}");
@@ -902,7 +943,7 @@ fn cmd_diff(
         let new_lines: Vec<&str> = new_content.as_ref().lines().collect();
         let hunks = unified_diff(&old_lines, &new_lines, 3);
 
-        if hunks.is_empty() && old_tags == new_tags && old.title == new.title {
+        if hunks.is_empty() && old_tags == new_tags && old_title == new_title {
             println!("(no changes)");
         }
         for line in hunks {
@@ -915,50 +956,58 @@ fn cmd_diff(
 
 fn cmd_archive(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
     with_wiki(pile, branch, |repo, ws| {
-        let versions = load_versions(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let prev = *latest_versions(&versions)
-            .get(&fragment_id)
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
+        let prev_tags = tags_of(&space, prev_vid);
+        let prev_title = read_title(&space, ws, prev_vid).unwrap_or_default();
 
-        if prev.tags.contains(&TAG_ARCHIVED_ID) {
-            println!("already archived: {} ({})", prev.title, fmt_id(fragment_id));
+        if prev_tags.contains(&TAG_ARCHIVED_ID) {
+            println!("already archived: {} ({})", prev_title, fmt_id(fragment_id));
             return Ok(());
         }
 
         ensure_tag_vocabulary(repo, ws)?;
-        let mut tags = prev.tags.clone();
+        let mut tags = prev_tags;
         tags.push(TAG_ARCHIVED_ID);
+        let prev_ch = content_handle_of(&space, prev_vid)
+            .ok_or_else(|| anyhow::anyhow!("no content"))?;
         commit_version(
-            repo, ws, TribleSet::new(), fragment_id, &prev.title, prev.content_handle, &tags,
-            &versions, "wiki archive",
+            repo, ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
+            &space, "wiki archive",
         )?;
 
-        println!("archived: {} ({})", prev.title, fmt_id(fragment_id));
+        println!("archived: {} ({})", prev_title, fmt_id(fragment_id));
         Ok(())
     })
 }
 
 fn cmd_restore(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
     with_wiki(pile, branch, |repo, ws| {
-        let versions = load_versions(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let prev = *latest_versions(&versions)
-            .get(&fragment_id)
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
+        let prev_tags = tags_of(&space, prev_vid);
+        let prev_title = read_title(&space, ws, prev_vid).unwrap_or_default();
 
-        if !prev.tags.contains(&TAG_ARCHIVED_ID) {
-            println!("not archived: {} ({})", prev.title, fmt_id(fragment_id));
+        if !prev_tags.contains(&TAG_ARCHIVED_ID) {
+            println!("not archived: {} ({})", prev_title, fmt_id(fragment_id));
             return Ok(());
         }
 
-        let tags: Vec<Id> = prev.tags.iter().copied().filter(|t| *t != TAG_ARCHIVED_ID).collect();
+        let tags: Vec<Id> = prev_tags.into_iter().filter(|t| *t != TAG_ARCHIVED_ID).collect();
+        let prev_ch = content_handle_of(&space, prev_vid)
+            .ok_or_else(|| anyhow::anyhow!("no content"))?;
         commit_version(
-            repo, ws, TribleSet::new(), fragment_id, &prev.title, prev.content_handle, &tags,
-            &versions, "wiki restore",
+            repo, ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
+            &space, "wiki restore",
         )?;
 
-        println!("restored: {} ({})", prev.title, fmt_id(fragment_id));
+        println!("restored: {} ({})", prev_title, fmt_id(fragment_id));
         Ok(())
     })
 }
@@ -969,9 +1018,10 @@ fn cmd_revert(pile: &Path, branch: Option<&str>, id: String, to: usize) -> Resul
     }
 
     with_wiki(pile, branch, |repo, ws| {
-        let versions = load_versions(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let history = fragment_history(&versions, fragment_id);
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let history = version_history_of(&space, fragment_id);
 
         let idx = to - 1;
         if idx >= history.len() {
@@ -981,39 +1031,46 @@ fn cmd_revert(pile: &Path, branch: Option<&str>, id: String, to: usize) -> Resul
             );
         }
 
-        let target = history[idx];
+        let target_vid = history[idx];
+        let target_title = read_title(&space, ws, target_vid).unwrap_or_default();
+        let target_ch = content_handle_of(&space, target_vid)
+            .ok_or_else(|| anyhow::anyhow!("no content"))?;
+        let target_tags = tags_of(&space, target_vid);
         let vid = commit_version(
-            repo, ws, TribleSet::new(), fragment_id, &target.title, target.content_handle,
-            &target.tags, &versions, "wiki revert",
+            repo, ws, TribleSet::new(), fragment_id, &target_title, target_ch,
+            &target_tags, &space, "wiki revert",
         )?;
 
-        println!("reverted {} ({}) to v{to}: {}", fmt_id(fragment_id), fmt_id(vid), target.title);
+        println!("reverted {} ({}) to v{to}: {}", fmt_id(fragment_id), fmt_id(vid), target_title);
         Ok(())
     })
 }
 
 fn cmd_links(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
-        let versions = load_versions(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let latest = latest_versions(&versions);
-        let frag_title = latest.get(&fragment_id).map(|v| v.title.as_str()).unwrap_or("?");
-        let (outgoing, incoming, external) = find_links(ws, fragment_id, &versions, &latest)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let resolved = resolve_prefix(&space, &id)?;
+        let title = if is_version(&space, resolved) {
+            read_title(&space, ws, resolved).unwrap_or_else(|| "?".into())
+        } else {
+            latest_version_of(&space, resolved)
+                .and_then(|vid| read_title(&space, ws, vid))
+                .unwrap_or_else(|| "?".into())
+        };
+        let (outgoing, incoming, external) = find_links(&space, ws, resolved)?;
 
-        println!("# Links for: {} ({})", frag_title, fmt_id(fragment_id));
+        println!("# Links for: {} ({})", title, fmt_id(resolved));
 
         if !outgoing.is_empty() {
             println!("\n→ outgoing:");
             for target in &outgoing {
-                let title = latest.get(target).map(|v| v.title.as_str()).unwrap_or("?");
-                println!("  → {} ({})", title, fmt_id(*target));
+                println!("  → {}", link_label(&space, ws, *target));
             }
         }
         if !incoming.is_empty() {
             println!("\n← incoming:");
             for source in &incoming {
-                let title = latest.get(source).map(|v| v.title.as_str()).unwrap_or("?");
-                println!("  ← {} ({})", title, fmt_id(*source));
+                println!("  ← {}", link_label(&space, ws, *source));
             }
         }
         if !external.is_empty() {
@@ -1037,9 +1094,8 @@ fn cmd_list(
     show_all: bool,
 ) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
-        let versions = load_versions(ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let latest = latest_versions(&versions);
 
         let filter_ids: Vec<Id> = filter_tags
             .iter()
@@ -1049,19 +1105,38 @@ fn cmd_list(
             })
             .collect();
 
-        let mut entries: Vec<(Id, &Version)> = latest.iter().map(|(&k, &v)| (k, v)).collect();
-        entries.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
+        // Build latest version per fragment in a single pass.
+        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new(); // frag -> (vid, created_at)
+        for (vid, frag, ts) in find!(
+            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{
+                ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag, wiki::created_at: ?ts,
+            }])
+        ) {
+            let ts_key = interval_key(ts);
+            let entry = latest.entry(frag).or_insert((vid, ts_key));
+            if ts_key > entry.1 {
+                *entry = (vid, ts_key);
+            }
+        }
 
-        for (frag_id, version) in entries {
-            if !show_all && version.tags.contains(&TAG_ARCHIVED_ID) {
+        let mut entries: Vec<(Id, Id, i128)> = latest.into_iter()
+            .map(|(frag, (vid, ts))| (frag, vid, ts))
+            .collect();
+        entries.sort_by(|a, b| b.2.cmp(&a.2));
+
+        for (frag_id, vid, created_at) in &entries {
+            let tags = tags_of(&space, *vid);
+            if !show_all && tags.contains(&TAG_ARCHIVED_ID) {
                 continue;
             }
-            if !filter_ids.is_empty() && !filter_ids.iter().all(|ft| version.tags.contains(ft)) {
+            if !filter_ids.is_empty() && !filter_ids.iter().all(|ft| tags.contains(ft)) {
                 continue;
             }
 
-            let tag_str = tag_index.format_tags(&version.tags);
-            let n_versions = versions.iter().filter(|v| v.fragment_id == frag_id).count();
+            let title = read_title(&space, ws, *vid).unwrap_or_default();
+            let tag_str = tag_index.format_tags(&tags);
+            let n_versions = version_history_of(&space, *frag_id).len();
             let ver_str = if n_versions > 1 {
                 format!(" (v{})", n_versions)
             } else {
@@ -1070,22 +1145,20 @@ fn cmd_list(
 
             println!(
                 "{}  {}  {}{}{}",
-                fmt_id(frag_id),
-                format_date(version.created_at),
-                version.title,
-                tag_str,
-                ver_str,
+                fmt_id(*frag_id), format_date(*created_at), title, tag_str, ver_str,
             );
 
-            // Content preview: first non-empty line, truncated
-            if let Ok(view) = ws.get(version.content_handle) {
-                let view: View<str> = view;
-                if let Some(line) = view.as_ref().lines().find(|l| !l.trim().is_empty()) {
-                    let preview = line.trim();
-                    if preview.len() > 80 {
-                        println!("    {}...", &preview[..77]);
-                    } else {
-                        println!("    {preview}");
+            if let Some(ch) = content_handle_of(&space, *vid) {
+                if let Ok(view) = ws.get(ch) {
+                    let view: View<str> = view;
+                    if let Some(line) = view.as_ref().lines().find(|l| !l.trim().is_empty()) {
+                        let preview = line.trim();
+                        let truncated: String = preview.chars().take(77).collect();
+                        if truncated.len() < preview.len() {
+                            println!("    {truncated}...");
+                        } else {
+                            println!("    {preview}");
+                        }
                     }
                 }
             }
@@ -1096,23 +1169,25 @@ fn cmd_list(
 
 fn cmd_history(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
-        let versions = load_versions(ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let history = fragment_history(&versions, fragment_id);
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let history = version_history_of(&space, fragment_id);
 
-        let latest_title = history.last().map(|v| v.title.as_str()).unwrap_or("?");
+        let latest_title = history.last()
+            .and_then(|vid| read_title(&space, ws, *vid))
+            .unwrap_or_else(|| "?".into());
         println!("# History: {} ({})", latest_title, fmt_id(fragment_id));
         println!();
 
-        for (i, v) in history.iter().enumerate() {
+        for (i, vid) in history.iter().enumerate() {
+            let title = read_title(&space, ws, *vid).unwrap_or_default();
+            let ts = created_at_of(&space, *vid).unwrap_or(0);
+            let tags = tags_of(&space, *vid);
             println!(
                 "  v{}  {}  {}  {}{}",
-                i + 1,
-                fmt_id(v.id),
-                format_date(v.created_at),
-                v.title,
-                tag_index.format_tags(&v.tags),
+                i + 1, fmt_id(*vid), format_date(ts), title, tag_index.format_tags(&tags),
             );
         }
         Ok(())
@@ -1126,10 +1201,10 @@ fn cmd_tag_add(pile: &Path, branch: Option<&str>, id: String, name: String) -> R
     }
 
     with_wiki(pile, branch, |repo, ws| {
-        let versions = load_versions(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let prev = *latest_versions(&versions)
-            .get(&fragment_id)
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
 
         ensure_tag_vocabulary(repo, ws)?;
@@ -1137,19 +1212,23 @@ fn cmd_tag_add(pile: &Path, branch: Option<&str>, id: String, name: String) -> R
         let mut tag_index = TagIndex::load(ws)?;
         let new_tag = tag_index.resolve_or_mint(&[name.clone()], &mut change, ws)?[0];
 
-        if prev.tags.contains(&new_tag) {
+        let prev_tags = tags_of(&space, prev_vid);
+        if prev_tags.contains(&new_tag) {
             println!("already tagged: #{name}");
             return Ok(());
         }
 
-        let mut tags = prev.tags.clone();
+        let mut tags = prev_tags;
         tags.push(new_tag);
+        let prev_title = read_title(&space, ws, prev_vid).unwrap_or_default();
+        let prev_ch = content_handle_of(&space, prev_vid)
+            .ok_or_else(|| anyhow::anyhow!("no content"))?;
         commit_version(
-            repo, ws, change, fragment_id, &prev.title, prev.content_handle, &tags,
-            &versions, "wiki tag add",
+            repo, ws, change, fragment_id, &prev_title, prev_ch, &tags,
+            &space, "wiki tag add",
         )?;
 
-        println!("added #{name} to {} ({})", prev.title, fmt_id(fragment_id));
+        println!("added #{name} to {} ({})", prev_title, fmt_id(fragment_id));
         Ok(())
     })
 }
@@ -1161,40 +1240,47 @@ fn cmd_tag_remove(pile: &Path, branch: Option<&str>, id: String, name: String) -
     }
 
     with_wiki(pile, branch, |repo, ws| {
-        let versions = load_versions(ws)?;
-        let fragment_id = resolve_to_fragment_id(&id, &versions)?;
-        let prev = *latest_versions(&versions)
-            .get(&fragment_id)
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let resolved = resolve_prefix(&space, &id)?;
+        let fragment_id = to_fragment(&space, resolved)?;
+        let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
 
         let tag_index = TagIndex::load(ws)?;
         let tag_id = tag_index.by_name.get(&name)
             .ok_or_else(|| anyhow::anyhow!("unknown tag '{name}'"))?;
-        if !prev.tags.contains(tag_id) {
+        let prev_tags = tags_of(&space, prev_vid);
+        if !prev_tags.contains(tag_id) {
             println!("not tagged: #{name}");
             return Ok(());
         }
 
-        let tags: Vec<Id> = prev.tags.iter().copied().filter(|t| t != tag_id).collect();
+        let tags: Vec<Id> = prev_tags.into_iter().filter(|t| t != tag_id).collect();
+        let prev_title = read_title(&space, ws, prev_vid).unwrap_or_default();
+        let prev_ch = content_handle_of(&space, prev_vid)
+            .ok_or_else(|| anyhow::anyhow!("no content"))?;
         commit_version(
-            repo, ws, TribleSet::new(), fragment_id, &prev.title, prev.content_handle, &tags,
-            &versions, "wiki tag remove",
+            repo, ws, TribleSet::new(), fragment_id, &prev_title, prev_ch, &tags,
+            &space, "wiki tag remove",
         )?;
 
-        println!("removed #{name} from {} ({})", prev.title, fmt_id(fragment_id));
+        println!("removed #{name} from {} ({})", prev_title, fmt_id(fragment_id));
         Ok(())
     })
 }
 
 fn cmd_tag_list(pile: &Path, branch: Option<&str>) -> Result<()> {
     with_wiki(pile, branch, |_repo, ws| {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let versions = load_versions(ws)?;
 
         let mut counts: HashMap<Id, usize> = HashMap::new();
-        for v in &versions {
-            for t in &v.tags {
-                *counts.entry(*t).or_default() += 1;
+        for (tag_id,) in find!(
+            (tag_id: Id),
+            pattern!(&space, [{ _?vid @ metadata::tag: &KIND_VERSION_ID, metadata::tag: ?tag_id }])
+        ) {
+            if tag_id != KIND_VERSION_ID {
+                *counts.entry(tag_id).or_default() += 1;
             }
         }
 
@@ -1258,13 +1344,12 @@ fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String
     with_wiki(pile, branch, |repo, ws| {
         ensure_tag_vocabulary(repo, ws)?;
         let mut tag_index = TagIndex::load(ws)?;
-        let versions = load_versions(ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
         for file in &files {
             let content = fs::read_to_string(file)
                 .with_context(|| format!("read {}", file.display()))?;
 
-            // Title: first # heading, or filename stem.
             let title = content
                 .lines()
                 .find(|l| l.starts_with("# "))
@@ -1281,7 +1366,7 @@ fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String
             let fragment_id = genid().id;
             let content_handle = ws.put(content);
             let vid = commit_version(
-                repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &versions, "wiki import",
+                repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &space, "wiki import",
             )?;
 
             println!("{}  {}  {}", fmt_id(fragment_id), fmt_id(vid), file.display());
@@ -1314,22 +1399,41 @@ fn cmd_search(
     let query_lower = query.to_lowercase();
 
     with_wiki(pile, branch, |_repo, ws| {
-        let versions = load_versions(ws)?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let latest = latest_versions(&versions);
 
-        let mut hits: Vec<(Id, &Version, Vec<String>)> = Vec::new();
+        // Build latest version per fragment.
+        let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
+        for (vid, frag, ts) in find!(
+            (vid: Id, frag: Id, ts: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{
+                ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag, wiki::created_at: ?ts,
+            }])
+        ) {
+            let ts_key = interval_key(ts);
+            let entry = latest.entry(frag).or_insert((vid, ts_key));
+            if ts_key > entry.1 {
+                *entry = (vid, ts_key);
+            }
+        }
 
-        for (&frag_id, &version) in &latest {
-            if !show_all && version.tags.contains(&TAG_ARCHIVED_ID) {
+        let mut hits: Vec<(Id, Id, i128, String, Vec<Id>, Vec<String>)> = Vec::new();
+
+        for (&frag_id, &(vid, created_at)) in &latest {
+            let tags = tags_of(&space, vid);
+            if !show_all && tags.contains(&TAG_ARCHIVED_ID) {
                 continue;
             }
-            let content: View<str> = ws
-                .get(version.content_handle)
+            let title = read_title(&space, ws, vid).unwrap_or_default();
+            let ch = match content_handle_of(&space, vid) {
+                Some(ch) => ch,
+                None => continue,
+            };
+            let content: View<str> = ws.get(ch)
                 .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
             let content_str = content.as_ref();
 
-            let title_match = version.title.to_lowercase().contains(&query_lower);
+            let title_match = title.to_lowercase().contains(&query_lower);
             let content_lower = content_str.to_lowercase();
             let content_match = content_lower.contains(&query_lower);
 
@@ -1342,24 +1446,21 @@ fn cmd_search(
                         }
                     }
                 }
-                hits.push((frag_id, version, context_lines));
+                hits.push((frag_id, vid, created_at, title, tags, context_lines));
             }
         }
 
-        hits.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
+        hits.sort_by(|a, b| b.2.cmp(&a.2));
 
         if hits.is_empty() {
             println!("no matches for '{query}'");
             return Ok(());
         }
 
-        for (frag_id, version, context_lines) in &hits {
+        for (frag_id, _vid, created_at, title, tags, context_lines) in &hits {
             println!(
                 "{}  {}  {}{}",
-                fmt_id(*frag_id),
-                format_date(version.created_at),
-                version.title,
-                tag_index.format_tags(&version.tags),
+                fmt_id(*frag_id), format_date(*created_at), title, tag_index.format_tags(tags),
             );
             for line in context_lines {
                 println!("    {}", line.trim());
@@ -1480,7 +1581,7 @@ fn main() -> Result<()> {
             title,
             tag,
         } => cmd_edit(&cli.pile, branch, id, content, title, tag),
-        Command::Show { id } => cmd_show(&cli.pile, branch, id),
+        Command::Show { id, latest } => cmd_show(&cli.pile, branch, id, latest),
         Command::Export { id } => cmd_export(&cli.pile, branch, id),
         Command::Diff { id, from, to } => cmd_diff(&cli.pile, branch, id, from, to),
         Command::Archive { id } => cmd_archive(&cli.pile, branch, id),
