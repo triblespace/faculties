@@ -154,9 +154,6 @@ struct Cli {
     /// Target branch name
     #[arg(long, default_value = "cognition", global = true)]
     branch: String,
-    /// Optional explicit target branch id (hex)
-    #[arg(long, global = true)]
-    branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -483,14 +480,6 @@ fn format_tai_ns(ns: i128) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
 }
 
-fn parse_hex_id(raw: &str, label: &str) -> Result<Id> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("{label} is empty");
-    }
-    Id::from_hex(trimmed).ok_or_else(|| anyhow!("invalid {label} {trimmed}"))
-}
-
 fn u256be_to_u64(value: Value<valueschemas::U256BE>) -> Option<u64> {
     let raw = value.raw;
     if raw[..24].iter().any(|byte| *byte != 0) {
@@ -631,14 +620,12 @@ fn ensure_branch_id(
         .map_err(|e| anyhow!("ensure branch '{name}': {e:?}"))
 }
 
-/// Resolve target branch: explicit --branch-id wins, else ensure_branch by name.
+/// Resolve target branch: explicit --branch-id wins, then config branch_id,
+/// then ensure_branch by name as last resort.
 fn resolve_target_branch(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     cli: &Cli,
 ) -> Result<Id> {
-    if let Some(raw_id) = cli.branch_id.as_ref() {
-        return parse_hex_id(raw_id, "branch-id");
-    }
     ensure_branch_id(repo, &cli.branch)
 }
 
@@ -2368,7 +2355,8 @@ fn cmd_cover(
     full: bool,
     tree: bool,
 ) -> Result<()> {
-    let branch_id = resolve_target_branch(repo, cli)?;
+    // Memory chunks live on the "memory" branch, not cognition.
+    let branch_id = ensure_branch_id(repo, "memory")?;
     let mut ws = pull_workspace(repo, branch_id, "pull target for cover")?;
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
@@ -2511,10 +2499,10 @@ fn cmd_cover(
 
 fn cmd_chunk(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
-    cli: &Cli,
+    _cli: &Cli,
     id_prefix_str: &str,
 ) -> Result<()> {
-    let branch_id = resolve_target_branch(repo, cli)?;
+    let branch_id = ensure_branch_id(repo, "memory")?;
     let mut ws = pull_workspace(repo, branch_id, "pull target for chunk")?;
     let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
