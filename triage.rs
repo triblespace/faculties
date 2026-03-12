@@ -105,6 +105,10 @@ mod model_chat {
         "B1B904590F0FA70AD1BA247F3D23A6CC" as output_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "567E35DACDB00C799E75AEED0B6EFDF7" as reasoning_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "9E9B829C473E416E9150D4B94A6A2DC4" as error: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "115637F43C28E6ABE3A1B0C4095CAC03" as input_tokens: valueschemas::U256BE;
+        "F17EB3EABC10A0210403B807BEB25D08" as output_tokens: valueschemas::U256BE;
+        "B680DCFAB2E8D1413E450C89AB156197" as cache_creation_input_tokens: valueschemas::U256BE;
+        "0A9C7D70295A65413375842916821032" as cache_read_input_tokens: valueschemas::U256BE;
     }
 }
 
@@ -2795,6 +2799,10 @@ fn cmd_turn(
             let mut reasoning_text: Option<String> = None;
             let mut model_error: Option<String> = None;
             let mut model_finished: Option<i128> = None;
+            let mut input_tokens: Option<u64> = None;
+            let mut output_tokens: Option<u64> = None;
+            let mut cache_creation_tokens: Option<u64> = None;
+            let mut cache_read_tokens: Option<u64> = None;
 
             for (id, handle) in find!(
                 (id: Id, handle: TextHandle),
@@ -2832,6 +2840,30 @@ fn cmd_turn(
                     break;
                 }
             }
+            for (id, value) in find!(
+                (id: Id, value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ ?id @ model_chat::input_tokens: ?value }])
+            ) {
+                if id == mid { input_tokens = u256be_to_u64(value); break; }
+            }
+            for (id, value) in find!(
+                (id: Id, value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ ?id @ model_chat::output_tokens: ?value }])
+            ) {
+                if id == mid { output_tokens = u256be_to_u64(value); break; }
+            }
+            for (id, value) in find!(
+                (id: Id, value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ ?id @ model_chat::cache_creation_input_tokens: ?value }])
+            ) {
+                if id == mid { cache_creation_tokens = u256be_to_u64(value); break; }
+            }
+            for (id, value) in find!(
+                (id: Id, value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ ?id @ model_chat::cache_read_input_tokens: ?value }])
+            ) {
+                if id == mid { cache_read_tokens = u256be_to_u64(value); break; }
+            }
 
             println!();
             println!("Model result [{}]", fmt_id(mid));
@@ -2840,6 +2872,12 @@ fn cmd_turn(
             }
             if let Some(ref err) = model_error {
                 println!("- error: {}", if full { err.clone() } else { truncate_single_line(err, 120) });
+            }
+            if input_tokens.is_some() || output_tokens.is_some() {
+                let f = |v: Option<u64>| -> String { v.map_or("-".into(), |n| n.to_string()) };
+                println!("- tokens: in={} out={} cache_create={} cache_read={}",
+                    f(input_tokens), f(output_tokens),
+                    f(cache_creation_tokens), f(cache_read_tokens));
             }
             if let Some(ref reasoning) = reasoning_text {
                 if full {
