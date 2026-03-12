@@ -56,6 +56,7 @@ mod wiki {
         "6DBBE746B7DD7A4793CA098AB882F553" as content: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "476F6E26FCA65A0B49E38CC44CF31467" as created_at: valueschemas::NsTAIInterval;
         "78BABEF1792531A2E51A372D96FE5F3E" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: valueschemas::GenId;
     }
 }
 
@@ -216,6 +217,7 @@ struct Version {
     content_handle: TextHandle,
     created_at: i128,
     tags: Vec<Id>,
+    links_to: Vec<Id>,
 }
 
 /// Bidirectional tag name / id index.
@@ -453,12 +455,23 @@ fn commit_version(
     title: &str,
     content: TextHandle,
     tags: &[Id],
+    versions: &[Version],
     message: &str,
 ) -> Result<Id> {
     let mut tag_ids = tags.to_vec();
     tag_ids.push(KIND_VERSION_ID);
     tag_ids.sort();
     tag_ids.dedup();
+
+    // Read content text to extract outgoing wiki links.
+    let content_text: View<str> = ws
+        .get(content)
+        .map_err(|e| anyhow::anyhow!("read content for link extraction: {e:?}"))?;
+    let (internal_links, _external) = extract_references(content_text.as_ref(), versions);
+    let link_targets: Vec<Id> = internal_links
+        .into_iter()
+        .filter(|&id| id != fragment_id)
+        .collect();
 
     let title_handle = ws.put(title.to_owned());
 
@@ -468,6 +481,7 @@ fn commit_version(
         wiki::content: content,
         wiki::created_at: now_tai(),
         metadata::tag*: tag_ids.iter(),
+        wiki::links_to*: link_targets.iter(),
     };
     let version_id = version.root().expect("version should be rooted");
     change += version;
@@ -487,40 +501,60 @@ fn fragment_history<'a>(versions: &'a [Version], fragment_id: Id) -> Vec<&'a Ver
     history
 }
 
-/// Outgoing and incoming content-derived links for a fragment.
+/// Outgoing and incoming links for a fragment, using stored `links_to` triples.
 /// Returns (outgoing wiki links, incoming wiki links, external references).
+/// External references are still parsed from content (not stored).
 fn find_links(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     fragment_id: Id,
     versions: &[Version],
     latest: &HashMap<Id, &Version>,
 ) -> Result<(Vec<Id>, Vec<Id>, Vec<(String, String)>)> {
-    let content: View<str> = ws
-        .get(
-            latest
-                .get(&fragment_id)
-                .ok_or_else(|| anyhow::anyhow!("no versions"))?
-                .content_handle,
-        )
-        .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-    let (internal, external) = extract_references(content.as_ref(), versions);
-    let outgoing: Vec<Id> = internal.into_iter().filter(|&id| id != fragment_id).collect();
+    let version = latest
+        .get(&fragment_id)
+        .ok_or_else(|| anyhow::anyhow!("no versions"))?;
 
+    // Outgoing: from stored links_to on this version.
+    let mut outgoing = version.links_to.clone();
+    // Fallback for versions created before links_to was stored:
+    // parse content if no stored links and content contains wiki: references.
+    if outgoing.is_empty() {
+        let content: View<str> = ws
+            .get(version.content_handle)
+            .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+        let (internal, _) = extract_references(content.as_ref(), versions);
+        outgoing = internal.into_iter().filter(|&id| id != fragment_id).collect();
+    }
+    outgoing.sort();
+    outgoing.dedup();
+
+    // Incoming: find all latest versions whose links_to contains this fragment.
     let mut incoming = Vec::new();
     for (&frag_id, &v) in latest {
         if frag_id == fragment_id {
             continue;
         }
-        let c: View<str> = ws
-            .get(v.content_handle)
-            .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-        let (refs, _) = extract_references(c.as_ref(), versions);
-        if refs.contains(&fragment_id) {
+        if v.links_to.contains(&fragment_id) {
             incoming.push(frag_id);
+        } else if v.links_to.is_empty() {
+            // Fallback for pre-links_to versions: parse content.
+            let c: View<str> = ws
+                .get(v.content_handle)
+                .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+            let (refs, _) = extract_references(c.as_ref(), versions);
+            if refs.contains(&fragment_id) {
+                incoming.push(frag_id);
+            }
         }
     }
     incoming.sort();
     incoming.dedup();
+
+    // External references still parsed from content.
+    let content: View<str> = ws
+        .get(version.content_handle)
+        .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
+    let (_, external) = extract_references(content.as_ref(), versions);
 
     Ok((outgoing, incoming, external))
 }
@@ -559,6 +593,7 @@ fn load_versions(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<V
                 content_handle: content_h,
                 created_at: interval_key(ts),
                 tags: Vec::new(),
+                links_to: Vec::new(),
             },
         );
     }
@@ -576,6 +611,20 @@ fn load_versions(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<Vec<V
             if tag_id != KIND_VERSION_ID {
                 v.tags.push(tag_id);
             }
+        }
+    }
+
+    // Outgoing wiki links (multi-valued)
+    for (vid, target) in find!(
+        (vid: Id, target: Id),
+        pattern!(&space, [{
+            ?vid @
+            metadata::tag: &KIND_VERSION_ID,
+            wiki::links_to: ?target,
+        }])
+    ) {
+        if let Some(v) = versions.get_mut(&vid) {
+            v.links_to.push(target);
         }
     }
 
@@ -672,6 +721,7 @@ fn cmd_create(
 
     with_wiki(pile, branch, |repo, ws| {
         ensure_tag_vocabulary(repo, ws)?;
+        let versions = load_versions(ws)?;
         let mut change = TribleSet::new();
         let mut tag_index = TagIndex::load(ws)?;
         let tag_ids = tag_index.resolve_or_mint(&tags, &mut change, ws)?;
@@ -679,7 +729,7 @@ fn cmd_create(
         let fragment_id = genid().id;
         let content_handle = ws.put(content);
         let vid = commit_version(
-            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, "wiki create",
+            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &versions, "wiki create",
         )?;
 
         println!("fragment {}", fmt_id(fragment_id));
@@ -724,7 +774,7 @@ fn cmd_edit(
             None => prev.content_handle,
         };
         let vid = commit_version(
-            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, "wiki edit",
+            repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &versions, "wiki edit",
         )?;
 
         println!("fragment {}", fmt_id(fragment_id));
@@ -881,7 +931,7 @@ fn cmd_archive(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
         tags.push(TAG_ARCHIVED_ID);
         commit_version(
             repo, ws, TribleSet::new(), fragment_id, &prev.title, prev.content_handle, &tags,
-            "wiki archive",
+            &versions, "wiki archive",
         )?;
 
         println!("archived: {} ({})", prev.title, fmt_id(fragment_id));
@@ -905,7 +955,7 @@ fn cmd_restore(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
         let tags: Vec<Id> = prev.tags.iter().copied().filter(|t| *t != TAG_ARCHIVED_ID).collect();
         commit_version(
             repo, ws, TribleSet::new(), fragment_id, &prev.title, prev.content_handle, &tags,
-            "wiki restore",
+            &versions, "wiki restore",
         )?;
 
         println!("restored: {} ({})", prev.title, fmt_id(fragment_id));
@@ -934,7 +984,7 @@ fn cmd_revert(pile: &Path, branch: Option<&str>, id: String, to: usize) -> Resul
         let target = history[idx];
         let vid = commit_version(
             repo, ws, TribleSet::new(), fragment_id, &target.title, target.content_handle,
-            &target.tags, "wiki revert",
+            &target.tags, &versions, "wiki revert",
         )?;
 
         println!("reverted {} ({}) to v{to}: {}", fmt_id(fragment_id), fmt_id(vid), target.title);
@@ -1096,7 +1146,7 @@ fn cmd_tag_add(pile: &Path, branch: Option<&str>, id: String, name: String) -> R
         tags.push(new_tag);
         commit_version(
             repo, ws, change, fragment_id, &prev.title, prev.content_handle, &tags,
-            "wiki tag add",
+            &versions, "wiki tag add",
         )?;
 
         println!("added #{name} to {} ({})", prev.title, fmt_id(fragment_id));
@@ -1128,7 +1178,7 @@ fn cmd_tag_remove(pile: &Path, branch: Option<&str>, id: String, name: String) -
         let tags: Vec<Id> = prev.tags.iter().copied().filter(|t| t != tag_id).collect();
         commit_version(
             repo, ws, TribleSet::new(), fragment_id, &prev.title, prev.content_handle, &tags,
-            "wiki tag remove",
+            &versions, "wiki tag remove",
         )?;
 
         println!("removed #{name} from {} ({})", prev.title, fmt_id(fragment_id));
@@ -1208,6 +1258,7 @@ fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String
     with_wiki(pile, branch, |repo, ws| {
         ensure_tag_vocabulary(repo, ws)?;
         let mut tag_index = TagIndex::load(ws)?;
+        let versions = load_versions(ws)?;
 
         for file in &files {
             let content = fs::read_to_string(file)
@@ -1230,7 +1281,7 @@ fn cmd_import(pile: &Path, branch: Option<&str>, path: PathBuf, tags: Vec<String
             let fragment_id = genid().id;
             let content_handle = ws.put(content);
             let vid = commit_version(
-                repo, ws, change, fragment_id, &title, content_handle, &tag_ids, "wiki import",
+                repo, ws, change, fragment_id, &title, content_handle, &tag_ids, &versions, "wiki import",
             )?;
 
             println!("{}  {}  {}", fmt_id(fragment_id), fmt_id(vid), file.display());
