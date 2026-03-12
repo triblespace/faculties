@@ -137,7 +137,7 @@ enum Command {
         #[arg(long)]
         to: usize,
     },
-    /// Show links from/to a fragment (extracted from content `id:<hex>` references)
+    /// Show links from/to a fragment (extracted from `[text](faculty:<hex>)` references)
     Links {
         /// Fragment id (prefix accepted)
         id: String,
@@ -329,23 +329,39 @@ fn format_date(tai_ns: i128) -> String {
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
 
-/// Extract `id:<hex>` references from content, resolving prefixes to fragment IDs.
-fn extract_references(content: &str, versions: &[Version]) -> Vec<Id> {
-    let mut refs = Vec::new();
+/// Extract `[text](faculty:<hex>)` markdown link references from content.
+/// Returns internal wiki links (resolved to fragment IDs) and external links (faculty + raw hex).
+fn extract_references(content: &str, versions: &[Version]) -> (Vec<Id>, Vec<(String, String)>) {
+    let mut internal = Vec::new();
+    let mut external = Vec::new();
     let mut rest = content;
-    while let Some(pos) = rest.find("id:") {
-        let after = &rest[pos + 3..];
-        let hex: String = after.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-        if hex.len() >= 4 {
-            if let Ok(frag_id) = resolve_to_fragment_id(&hex, versions) {
-                refs.push(frag_id);
+    // Match markdown links: [...](<faculty>:<hex>)
+    while let Some(paren) = rest.find("](") {
+        let after = &rest[paren + 2..];
+        // Find the closing paren
+        let end = after.find(')').unwrap_or(after.len());
+        let link = &after[..end];
+        // Parse <faculty>:<hex>
+        if let Some(colon) = link.find(':') {
+            let faculty = &link[..colon];
+            let hex: String = link[colon + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            if hex.len() >= 4 && !faculty.is_empty() && faculty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                if faculty == "wiki" {
+                    if let Ok(frag_id) = resolve_to_fragment_id(&hex, versions) {
+                        internal.push(frag_id);
+                    }
+                } else {
+                    external.push((faculty.to_string(), hex));
+                }
             }
         }
-        rest = &after[hex.len().max(1)..];
+        rest = &after[end.min(after.len()).max(1)..];
     }
-    refs.sort();
-    refs.dedup();
-    refs
+    internal.sort();
+    internal.dedup();
+    external.sort();
+    external.dedup();
+    (internal, external)
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
@@ -472,12 +488,13 @@ fn fragment_history<'a>(versions: &'a [Version], fragment_id: Id) -> Vec<&'a Ver
 }
 
 /// Outgoing and incoming content-derived links for a fragment.
+/// Returns (outgoing wiki links, incoming wiki links, external references).
 fn find_links(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     fragment_id: Id,
     versions: &[Version],
     latest: &HashMap<Id, &Version>,
-) -> Result<(Vec<Id>, Vec<Id>)> {
+) -> Result<(Vec<Id>, Vec<Id>, Vec<(String, String)>)> {
     let content: View<str> = ws
         .get(
             latest
@@ -486,10 +503,8 @@ fn find_links(
                 .content_handle,
         )
         .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-    let outgoing: Vec<Id> = extract_references(content.as_ref(), versions)
-        .into_iter()
-        .filter(|&id| id != fragment_id)
-        .collect();
+    let (internal, external) = extract_references(content.as_ref(), versions);
+    let outgoing: Vec<Id> = internal.into_iter().filter(|&id| id != fragment_id).collect();
 
     let mut incoming = Vec::new();
     for (&frag_id, &v) in latest {
@@ -499,14 +514,15 @@ fn find_links(
         let c: View<str> = ws
             .get(v.content_handle)
             .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-        if extract_references(c.as_ref(), versions).contains(&fragment_id) {
+        let (refs, _) = extract_references(c.as_ref(), versions);
+        if refs.contains(&fragment_id) {
             incoming.push(frag_id);
         }
     }
     incoming.sort();
     incoming.dedup();
 
-    Ok((outgoing, incoming))
+    Ok((outgoing, incoming, external))
 }
 
 /// Load all versions from the wiki branch.
@@ -743,8 +759,8 @@ fn cmd_show(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
         print!("{}", content.as_ref());
 
         let latest = latest_versions(&versions);
-        let (outgoing, incoming) = find_links(ws, fragment_id, &versions, &latest)?;
-        if !outgoing.is_empty() || !incoming.is_empty() {
+        let (outgoing, incoming, external) = find_links(ws, fragment_id, &versions, &latest)?;
+        if !outgoing.is_empty() || !incoming.is_empty() || !external.is_empty() {
             println!("\n---");
         }
         for target in &outgoing {
@@ -754,6 +770,9 @@ fn cmd_show(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
         for source in &incoming {
             let title = latest.get(source).map(|v| v.title.as_str()).unwrap_or("?");
             println!("← {} ({})", title, fmt_id(*source));
+        }
+        for (faculty, hex) in &external {
+            println!("⇢ {faculty}:{hex}");
         }
 
         Ok(())
@@ -929,7 +948,7 @@ fn cmd_links(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
         let fragment_id = resolve_to_fragment_id(&id, &versions)?;
         let latest = latest_versions(&versions);
         let frag_title = latest.get(&fragment_id).map(|v| v.title.as_str()).unwrap_or("?");
-        let (outgoing, incoming) = find_links(ws, fragment_id, &versions, &latest)?;
+        let (outgoing, incoming, external) = find_links(ws, fragment_id, &versions, &latest)?;
 
         println!("# Links for: {} ({})", frag_title, fmt_id(fragment_id));
 
@@ -947,7 +966,13 @@ fn cmd_links(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
                 println!("  ← {} ({})", title, fmt_id(*source));
             }
         }
-        if outgoing.is_empty() && incoming.is_empty() {
+        if !external.is_empty() {
+            println!("\n⇢ external:");
+            for (faculty, hex) in &external {
+                println!("  ⇢ {faculty}:{hex}");
+            }
+        }
+        if outgoing.is_empty() && incoming.is_empty() && external.is_empty() {
             println!("\n(no links)");
         }
 
