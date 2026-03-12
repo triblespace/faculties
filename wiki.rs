@@ -287,20 +287,21 @@ impl TagIndex {
 /// Check if an ID is a version entity (has KIND_VERSION tag).
 fn is_version(space: &TribleSet, id: Id) -> bool {
     find!(
-        (vid: Id),
-        pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
+        (frag: Id),
+        pattern!(space, [{ id @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
     )
-    .any(|(vid,)| vid == id)
+    .next()
+    .is_some()
 }
 
 /// Get the fragment ID that a version belongs to.
 fn version_fragment(space: &TribleSet, version_id: Id) -> Option<Id> {
     find!(
-        (vid: Id, frag: Id),
-        pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+        (frag: Id),
+        pattern!(space, [{ version_id @ wiki::fragment: ?frag }])
     )
-    .find(|(vid, _)| *vid == version_id)
-    .map(|(_, frag)| frag)
+    .next()
+    .map(|(frag,)| frag)
 }
 
 /// Find the latest version ID for a fragment (by created_at).
@@ -341,59 +342,53 @@ fn read_title(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     vid: Id,
 ) -> Option<String> {
-    for (v, h) in find!(
-        (v: Id, h: TextHandle),
-        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::title: ?h }])
-    ) {
-        if v == vid {
-            if let Ok(view) = ws.get(h) {
-                let view: View<str> = view;
-                return Some(view.as_ref().to_string());
-            }
-        }
-    }
-    None
+    let (h,) = find!(
+        (h: TextHandle),
+        pattern!(space, [{ vid @ wiki::title: ?h }])
+    )
+    .next()?;
+    let view: View<str> = ws.get(h).ok()?;
+    Some(view.as_ref().to_string())
 }
 
 /// Get the content handle for a version entity.
 fn content_handle_of(space: &TribleSet, vid: Id) -> Option<TextHandle> {
     find!(
-        (v: Id, h: TextHandle),
-        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::content: ?h }])
+        (h: TextHandle),
+        pattern!(space, [{ vid @ wiki::content: ?h }])
     )
-    .find(|(v, _)| *v == vid)
-    .map(|(_, h)| h)
+    .next()
+    .map(|(h,)| h)
 }
 
 /// Get created_at timestamp for a version entity.
 fn created_at_of(space: &TribleSet, vid: Id) -> Option<i128> {
     find!(
-        (v: Id, ts: Value<valueschemas::NsTAIInterval>),
-        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::created_at: ?ts }])
+        (ts: Value<valueschemas::NsTAIInterval>),
+        pattern!(space, [{ vid @ wiki::created_at: ?ts }])
     )
-    .find(|(v, _)| *v == vid)
-    .map(|(_, ts)| interval_key(ts))
+    .next()
+    .map(|(ts,)| interval_key(ts))
 }
 
 /// Get tags for a version entity (excluding KIND_VERSION).
 fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     find!(
-        (v: Id, tag: Id),
-        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, metadata::tag: ?tag }])
+        (tag: Id),
+        pattern!(space, [{ vid @ metadata::tag: ?tag }])
     )
-    .filter(|(v, t)| *v == vid && *t != KIND_VERSION_ID)
-    .map(|(_, t)| t)
+    .filter(|(t,)| *t != KIND_VERSION_ID)
+    .map(|(t,)| t)
     .collect()
 }
 
 /// Get stored links_to targets for a version entity.
 fn links_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     find!(
-        (v: Id, target: Id),
-        pattern!(space, [{ ?v @ metadata::tag: &KIND_VERSION_ID, wiki::links_to: ?target }])
+        (target: Id),
+        pattern!(space, [{ vid @ wiki::links_to: ?target }])
     )
-    .filter(|(v, _)| *v == vid)
-    .map(|(_, t)| t)
+    .map(|(t,)| t)
     .collect()
 }
 
@@ -427,18 +422,21 @@ fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
 /// Given an ID, resolve to the fragment it belongs to.
 /// Identity for fragment IDs, lookup for version IDs.
 fn to_fragment(space: &TribleSet, id: Id) -> Result<Id> {
-    // Check if it's a known fragment.
+    // Try as version first (direct entity lookup, O(1)).
+    if let Some(frag) = version_fragment(space, id) {
+        return Ok(frag);
+    }
+    // Check if it's a known fragment (reverse lookup via value index).
     let is_frag = find!(
-        (frag: Id),
-        pattern!(space, [{ _?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+        (vid: Id),
+        pattern!(space, [{ ?vid @ wiki::fragment: &id }])
     )
-    .any(|(f,)| f == id);
+    .next()
+    .is_some();
     if is_frag {
         return Ok(id);
     }
-    // Must be a version — get its fragment.
-    version_fragment(space, id)
-        .ok_or_else(|| anyhow::anyhow!("no fragment for id {}", fmt_id(id)))
+    bail!("no fragment for id {}", fmt_id(id))
 }
 
 /// Human-readable label for a link target (version or fragment).
