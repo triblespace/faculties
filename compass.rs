@@ -95,6 +95,9 @@ enum Command {
         /// Show done goals too
         #[arg(long)]
         all: bool,
+        /// Filter by tag (repeatable, shows goals matching any)
+        #[arg(long)]
+        tag: Vec<String>,
         #[arg(value_name = "STATUS")]
         status: Vec<String>,
     },
@@ -405,7 +408,7 @@ fn notes_by_task(events: &[NoteEvent]) -> HashMap<Id, Vec<NoteEvent>> {
     notes
 }
 
-fn render_board(state: &BoardState, status_filter: &[String], show_done: bool) {
+fn render_board(state: &BoardState, status_filter: &[String], tag_filter: &[String], show_done: bool) {
     let status_map = latest_status(&state.status_events);
     let note_map = notes_by_task(&state.note_events);
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
@@ -421,6 +424,10 @@ fn render_board(state: &BoardState, status_filter: &[String], show_done: bool) {
                 continue;
             }
         } else if !status_filter.iter().any(|s| s == &status) {
+            continue;
+        }
+
+        if !tag_filter.is_empty() && !task.tags.iter().any(|t| tag_filter.contains(t)) {
             continue;
         }
 
@@ -696,6 +703,7 @@ fn cmd_list(
     branch_name: &str,
     branch_id: Id,
     status_filter: Vec<String>,
+    tag_filter: Vec<String>,
     show_done: bool,
 ) -> Result<()> {
     let status_filter: Vec<String> = status_filter.into_iter().map(normalize_status).collect();
@@ -708,7 +716,7 @@ fn cmd_list(
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
-        render_board(&board, &status_filter, show_done);
+        render_board(&board, &status_filter, &tag_filter, show_done);
         Ok(())
     })
 }
@@ -909,7 +917,7 @@ fn main() -> Result<()> {
                 note,
             )
         }
-        Command::List { status, all } => cmd_list(&cli.pile, &cli.branch, branch_id, status, all),
+        Command::List { status, tag, all } => cmd_list(&cli.pile, &cli.branch, branch_id, status, tag, all),
         Command::Move { id, status } => cmd_move(&cli.pile, &cli.branch, branch_id, id, status),
         Command::Note { id, note } => {
             let note = load_value_or_file(&note, "goal note")?;
