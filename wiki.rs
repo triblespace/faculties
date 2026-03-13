@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.18"
+//! triblespace = "0.19"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -286,12 +286,10 @@ impl TagIndex {
 
 /// Check if an ID is a version entity (has KIND_VERSION tag).
 fn is_version(space: &TribleSet, id: Id) -> bool {
-    find!(
+    exists!(
         (frag: Id),
         pattern!(space, [{ id @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
     )
-    .next()
-    .is_some()
 }
 
 /// Get the fragment ID that a version belongs to.
@@ -427,12 +425,10 @@ fn to_fragment(space: &TribleSet, id: Id) -> Result<Id> {
         return Ok(frag);
     }
     // Check if it's a known fragment (reverse lookup via value index).
-    let is_frag = find!(
+    let is_frag = exists!(
         (vid: Id),
         pattern!(space, [{ ?vid @ wiki::fragment: &id }])
-    )
-    .next()
-    .is_some();
+    );
     if is_frag {
         return Ok(id);
     }
