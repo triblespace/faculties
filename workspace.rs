@@ -2,7 +2,7 @@
 //! ```cargo
 //! [dependencies]
 //! anyhow = "1.0"
-//! clap = { version = "4.5.4", features = ["derive"] }
+//! clap = { version = "4.5.4", features = ["derive", "env"] }
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4"
 //! rand_core = "0.6.4"

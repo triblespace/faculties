@@ -3,7 +3,7 @@
 //! [dependencies]
 //! anyhow = "1.0"
 //! chrono = { version = "0.4.39", features = ["clock"] }
-//! clap = { version = "4.5.4", features = ["derive"] }
+//! clap = { version = "4.5.4", features = ["derive", "env"] }
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! humantime = "2.1.0"
