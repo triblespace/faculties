@@ -86,6 +86,9 @@ enum Command {
         /// Add tags to the import (repeatable)
         #[arg(long)]
         tag: Vec<String>,
+        /// Preview what would be imported without committing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List all imported files
     List {
@@ -433,6 +436,60 @@ struct TreeStats {
 /// Build a Merkle tree from a filesystem path, bottom-up.
 /// Returns a Fragment whose root is the top-level entity and whose
 /// facts contain the entire tree.
+fn print_fs_tree(
+    path: &Path,
+    prefix: &str,
+    child_prefix: &str,
+    stats: &mut TreeStats,
+) -> Result<()> {
+    let meta = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
+
+    if meta.is_file() {
+        let size = meta.len();
+        stats.bytes += size;
+        stats.files += 1;
+        let mime = infer_mime(path);
+        println!("{prefix}{name}  ({mime}, {})", human_size(size));
+    } else if meta.is_dir() {
+        stats.dirs += 1;
+        let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(path)
+            .with_context(|| format!("read dir {}", path.display()))?
+        {
+            let entry = entry?;
+            let ename = entry.file_name().to_string_lossy().to_string();
+            if ename.starts_with('.') {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                dirs.push((ename, entry.path()));
+            } else {
+                files.push((ename, entry.path()));
+            }
+        }
+        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        println!("{prefix}{name}/");
+        let all: Vec<_> = dirs.into_iter().chain(files).collect();
+        for (i, (_, child_path)) in all.iter().enumerate() {
+            let last = i == all.len() - 1;
+            let connector = if last { "└── " } else { "├── " };
+            let continuation = if last { "    " } else { "│   " };
+            print_fs_tree(
+                child_path,
+                &format!("{child_prefix}{connector}"),
+                &format!("{child_prefix}{continuation}"),
+                stats,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn build_tree(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     path: &Path,
@@ -501,9 +558,25 @@ fn cmd_add(
     path: &Path,
     mime_override: Option<&str>,
     tags: &[String],
+    dry_run: bool,
 ) -> Result<()> {
     let abs_path = fs::canonicalize(path)
         .with_context(|| format!("canonicalize {}", path.display()))?;
+
+    if dry_run {
+        let mut stats = TreeStats { files: 0, dirs: 0, bytes: 0 };
+        print_fs_tree(&abs_path, "", "", &mut stats)?;
+        println!();
+        println!(
+            "Would import: {} files, {} dirs, {}",
+            stats.files, stats.dirs, human_size(stats.bytes),
+        );
+        if !tags.is_empty() {
+            println!("Tags: {}", tags.join(", "));
+        }
+        return Ok(());
+    }
+
     let source = abs_path.to_string_lossy().to_string();
 
     let mut stats = TreeStats { files: 0, dirs: 0, bytes: 0 };
@@ -1145,9 +1218,9 @@ fn main() -> Result<()> {
     let branch = cli.branch_id.as_deref();
 
     match command {
-        Command::Add { path, mime, tag } => {
+        Command::Add { path, mime, tag, dry_run } => {
             with_files(pile, branch, |repo, ws| {
-                cmd_add(repo, ws, &path, mime.as_deref(), &tag)
+                cmd_add(repo, ws, &path, mime.as_deref(), &tag, dry_run)
             })
         }
         Command::List { tag, mime } => {
