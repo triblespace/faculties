@@ -84,7 +84,7 @@ fn resolve_pile_path(cli: &Cli) -> PathBuf {
     cli.pile
         .clone()
         .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("self.pile"))
+        .expect("--pile argument or PILE env var required")
 }
 
 fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {

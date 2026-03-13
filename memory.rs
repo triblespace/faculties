@@ -88,7 +88,7 @@ mod ctx {
 )]
 struct Cli {
     /// Path to the pile file to use.
-    #[arg(long, default_value = "self.pile", global = true)]
+    #[arg(long, env = "PILE", global = true)]
     pile: PathBuf,
     /// Optional explicit branch id (hex) to read chunks from (defaults to cognition branch).
     #[arg(long, global = true)]

@@ -97,7 +97,7 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 )]
 struct Cli {
     /// Path to the pile file to use
-    #[arg(long, default_value = "self.pile", global = true)]
+    #[arg(long, env = "PILE", global = true)]
     pile: PathBuf,
     /// Branch name for local messages
     #[arg(long, default_value = DEFAULT_BRANCH, global = true)]

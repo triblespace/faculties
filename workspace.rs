@@ -59,7 +59,7 @@ mod playground_workspace {
 #[command(name = "workspace", about = "Workspace snapshot faculty")]
 struct Cli {
     /// Path to the pile file to use
-    #[arg(long, default_value = "self.pile", global = true)]
+    #[arg(long, env = "PILE", global = true)]
     pile: PathBuf,
     /// Branch name for workspace snapshots
     #[arg(long, default_value = DEFAULT_WORKSPACE_BRANCH, global = true)]

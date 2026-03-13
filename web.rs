@@ -46,7 +46,7 @@ enum Provider {
 #[command(name = "web", about = "Web search/browsing faculty (Tavily/Exa)")]
 struct Cli {
     /// Path to the pile file to use.
-    #[arg(long, default_value = "self.pile", global = true)]
+    #[arg(long, env = "PILE", global = true)]
     pile: PathBuf,
     /// Branch id to store web events into (hex). Overrides ensure_branch/env branch id.
     #[arg(long, global = true)]

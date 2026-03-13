@@ -276,10 +276,6 @@ mod common {
         id.aquire().unwrap_or_else(|| ExclusiveId::force(id))
     }
 
-    pub fn default_pile_path() -> PathBuf {
-        PathBuf::from("self.pile")
-    }
-
     pub fn parse_paths_parallel<T, F>(
         label: &str,
         paths: &[PathBuf],
@@ -1121,7 +1117,11 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.trace, cli.trace_filter.as_deref());
-    let pile_path = cli.pile.clone().unwrap_or_else(common::default_pile_path);
+    let pile_path = cli
+        .pile
+        .clone()
+        .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
+        .expect("--pile argument or PILE env var required");
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;
