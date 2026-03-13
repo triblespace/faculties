@@ -328,7 +328,7 @@ mod common {
     pub fn open_repo_for_write(
         pile_path: &Path,
         branch_id: Id,
-        branch_name: &str,
+        _branch_name: &str,
     ) -> Result<(Repo, Id)> {
         if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)

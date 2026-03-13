@@ -233,7 +233,7 @@ fn cmd_fetch(
 #[allow(clippy::too_many_arguments)]
 fn store_media(
     pile_path: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     bytes: &[u8],
     mime: &str,

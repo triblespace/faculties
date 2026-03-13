@@ -119,6 +119,7 @@ mod archive_schema {
         }
     }
 
+    #[allow(dead_code)]
     pub fn build_archive_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -250,6 +251,7 @@ mod teams_schema {
         }
     }
 
+    #[allow(dead_code)]
     pub fn build_teams_metadata<B>(blobs: &mut B) -> std::result::Result<TribleSet, B::PutError>
     where
         B: BlobStore<Blake3>,
@@ -279,8 +281,8 @@ mod teams_schema {
     }
 }
 
-use archive_schema::{archive, build_archive_metadata, FileBytes};
-use teams_schema::{build_teams_metadata, teams};
+use archive_schema::{archive, FileBytes};
+use teams_schema::teams;
 
 const DEFAULT_BRANCH: &str = "teams";
 const DEFAULT_LOG_BRANCH: &str = "logs";

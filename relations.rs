@@ -450,7 +450,7 @@ fn find_people_by_lookup_key(space: &TribleSet, key: &str) -> HashSet<Id> {
 
 fn cmd_add(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     label: String,
     id: Option<String>,
@@ -530,7 +530,7 @@ fn cmd_add(
 
 fn cmd_set(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     id: String,
     label: Option<String>,
@@ -622,7 +622,7 @@ fn cmd_set(
     Ok(())
 }
 
-fn cmd_list(pile: &Path, branch_name: &str, branch_id: Id, limit: usize) -> Result<()> {
+fn cmd_list(pile: &Path, _branch_name: &str, branch_id: Id, limit: usize) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
@@ -659,7 +659,7 @@ fn cmd_list(pile: &Path, branch_name: &str, branch_id: Id, limit: usize) -> Resu
     })
 }
 
-fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result<()> {
+fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)

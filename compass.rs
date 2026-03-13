@@ -630,7 +630,7 @@ fn ensure_kind_entities(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Resul
 
 fn cmd_add(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     title: String,
     status: String,
@@ -700,7 +700,7 @@ fn cmd_add(
 
 fn cmd_list(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     status_filter: Vec<String>,
     tag_filter: Vec<String>,
@@ -723,7 +723,7 @@ fn cmd_list(
 
 fn cmd_move(
     pile: &Path,
-    branch_name: &str,
+    _branch_name: &str,
     branch_id: Id,
     id: String,
     status: String,
@@ -758,7 +758,7 @@ fn cmd_move(
     Ok(())
 }
 
-fn cmd_note(pile: &Path, branch_name: &str, branch_id: Id, id: String, note: String) -> Result<()> {
+fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: String) -> Result<()> {
     let task_id = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
@@ -786,7 +786,7 @@ fn cmd_note(pile: &Path, branch_name: &str, branch_id: Id, id: String, note: Str
     Ok(())
 }
 
-fn cmd_show(pile: &Path, branch_name: &str, branch_id: Id, id: String) -> Result<()> {
+fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)

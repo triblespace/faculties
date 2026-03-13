@@ -232,7 +232,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_capture(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceCaptureArgs) -> Result<()> {
+fn cmd_capture(pile: &Path, _branch: &str, branch_id: Id, args: WorkspaceCaptureArgs) -> Result<()> {
     let mappings = build_mappings(&args.paths)?;
     let snapshot_id = with_repo(pile, |repo| {
         capture_snapshot(repo, branch_id, &mappings, args.label.as_deref())
@@ -241,7 +241,7 @@ fn cmd_capture(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceCaptureA
     Ok(())
 }
 
-fn cmd_list(pile: &Path, branch: &str, branch_id: Id) -> Result<()> {
+fn cmd_list(pile: &Path, _branch: &str, branch_id: Id) -> Result<()> {
     let snapshots = with_repo(pile, |repo| {
         list_snapshots(repo, branch_id)
     })?;
@@ -249,7 +249,7 @@ fn cmd_list(pile: &Path, branch: &str, branch_id: Id) -> Result<()> {
     Ok(())
 }
 
-fn cmd_diff(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceDiffArgs) -> Result<()> {
+fn cmd_diff(pile: &Path, _branch: &str, branch_id: Id, args: WorkspaceDiffArgs) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
@@ -309,7 +309,7 @@ fn cmd_diff(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceDiffArgs) -
     })
 }
 
-fn cmd_merge(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceMergeArgs) -> Result<()> {
+fn cmd_merge(pile: &Path, _branch: &str, branch_id: Id, args: WorkspaceMergeArgs) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
@@ -398,7 +398,7 @@ fn cmd_merge(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceMergeArgs)
     })
 }
 
-fn cmd_restore(pile: &Path, branch: &str, branch_id: Id, args: WorkspaceRestoreArgs) -> Result<()> {
+fn cmd_restore(pile: &Path, _branch: &str, branch_id: Id, args: WorkspaceRestoreArgs) -> Result<()> {
     let snapshot_id = parse_optional_hex_id(args.snapshot.as_deref())?;
     let target = args.target.unwrap_or_else(|| PathBuf::from("."));
     let restored = with_repo(pile, |repo| {

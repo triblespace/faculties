@@ -572,6 +572,7 @@ struct TavilyExtractResponse {
 
 #[derive(Deserialize)]
 struct TavilyExtractResult {
+    #[allow(dead_code)]
     url: String,
     #[serde(default)]
     raw_content: String,
@@ -658,6 +659,7 @@ struct ExaContentsResponse {
 
 #[derive(Deserialize)]
 struct ExaContentsResult {
+    #[allow(dead_code)]
     url: String,
     #[serde(default)]
     text: String,
