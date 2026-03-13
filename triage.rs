@@ -2747,123 +2747,71 @@ fn cmd_turn(
             }
         }
 
-        // Find thought via result -> about_thought
-        let mut thought_id: Option<Id> = None;
-        for (id, tid) in find!(
-            (id: Id, tid: Id),
-            pattern!(&space, [{ ?id @ exec::about_thought: ?tid }])
-        ) {
-            if id == rid {
-                thought_id = Some(tid);
-                break;
-            }
-        }
+        // Find thought via exec result -> about_thought
+        let thought_id: Option<Id> = find!(
+            (tid: Id),
+            pattern!(&space, [{ &rid @ exec::about_thought: ?tid }])
+        ).next().map(|(tid,)| tid);
 
-        // Find model result linked to this request (model_chat result -> about_request)
-        let mut model_result_id: Option<Id> = None;
-        for (mid, about_req) in find!(
-            (mid: Id, about_req: Id),
-            pattern!(&space, [{
-                ?mid @
-                metadata::tag: &KIND_MODEL_RESULT_ID,
-                model_chat::about_request: ?about_req,
-            }])
-        ) {
-            if about_req == request_id {
-                model_result_id = Some(mid);
-                break;
-            }
-        }
-
-        // Also try linking via about_thought on the model result
-        if model_result_id.is_none() {
-            if let Some(tid) = thought_id {
-                for (mid, about_thought) in find!(
-                    (mid: Id, about_thought: Id),
-                    pattern!(&space, [{
-                        ?mid @
-                        metadata::tag: &KIND_MODEL_RESULT_ID,
-                        model_chat::about_thought: ?about_thought,
-                    }])
-                ) {
-                    if about_thought == tid {
-                        model_result_id = Some(mid);
-                        break;
-                    }
-                }
-            }
-        }
+        // Find model result via: thought -> model request -> model result
+        let model_result_id: Option<Id> = thought_id
+            .and_then(|tid| find!(
+                (mreq: Id),
+                pattern!(&space, [{
+                    ?mreq @
+                    metadata::tag: &KIND_MODEL_REQUEST_ID,
+                    model_chat::about_thought: &tid,
+                }])
+            ).next().map(|(mreq,)| mreq))
+            .and_then(|mreq_id| find!(
+                (mid: Id),
+                pattern!(&space, [{
+                    ?mid @
+                    metadata::tag: &KIND_MODEL_RESULT_ID,
+                    model_chat::about_request: &mreq_id,
+                }])
+            ).next().map(|(mid,)| mid));
 
         if let Some(mid) = model_result_id {
-            let mut output_text: Option<String> = None;
-            let mut reasoning_text: Option<String> = None;
-            let mut model_error: Option<String> = None;
-            let mut model_finished: Option<i128> = None;
-            let mut input_tokens: Option<u64> = None;
-            let mut output_tokens: Option<u64> = None;
-            let mut cache_creation_tokens: Option<u64> = None;
-            let mut cache_read_tokens: Option<u64> = None;
+            let output_text: Option<String> = find!(
+                (handle: TextHandle),
+                pattern!(&space, [{ &mid @ model_chat::output_text: ?handle }])
+            ).next().map(|(h,)| read_text(&mut ws, h)).transpose()?;
 
-            for (id, handle) in find!(
-                (id: Id, handle: TextHandle),
-                pattern!(&space, [{ ?id @ model_chat::output_text: ?handle }])
-            ) {
-                if id == mid {
-                    output_text = Some(read_text(&mut ws, handle)?);
-                    break;
-                }
-            }
-            for (id, handle) in find!(
-                (id: Id, handle: TextHandle),
-                pattern!(&space, [{ ?id @ model_chat::reasoning_text: ?handle }])
-            ) {
-                if id == mid {
-                    reasoning_text = Some(read_text(&mut ws, handle)?);
-                    break;
-                }
-            }
-            for (id, handle) in find!(
-                (id: Id, handle: TextHandle),
-                pattern!(&space, [{ ?id @ model_chat::error: ?handle }])
-            ) {
-                if id == mid {
-                    model_error = Some(read_text(&mut ws, handle)?);
-                    break;
-                }
-            }
-            for (id, value) in find!(
-                (id: Id, value: Value<valueschemas::NsTAIInterval>),
-                pattern!(&space, [{ ?id @ model_chat::finished_at: ?value }])
-            ) {
-                if id == mid {
-                    model_finished = Some(interval_key(value));
-                    break;
-                }
-            }
-            for (id, value) in find!(
-                (id: Id, value: Value<valueschemas::U256BE>),
-                pattern!(&space, [{ ?id @ model_chat::input_tokens: ?value }])
-            ) {
-                if id == mid { input_tokens = u256be_to_u64(value); break; }
-            }
-            for (id, value) in find!(
-                (id: Id, value: Value<valueschemas::U256BE>),
-                pattern!(&space, [{ ?id @ model_chat::output_tokens: ?value }])
-            ) {
-                if id == mid { output_tokens = u256be_to_u64(value); break; }
-            }
-            for (id, value) in find!(
-                (id: Id, value: Value<valueschemas::U256BE>),
-                pattern!(&space, [{ ?id @ model_chat::cache_creation_input_tokens: ?value }])
-            ) {
-                if id == mid { cache_creation_tokens = u256be_to_u64(value); break; }
-            }
-            for (id, value) in find!(
-                (id: Id, value: Value<valueschemas::U256BE>),
-                pattern!(&space, [{ ?id @ model_chat::cache_read_input_tokens: ?value }])
-            ) {
-                if id == mid { cache_read_tokens = u256be_to_u64(value); break; }
-            }
+            let reasoning_text: Option<String> = find!(
+                (handle: TextHandle),
+                pattern!(&space, [{ &mid @ model_chat::reasoning_text: ?handle }])
+            ).next().map(|(h,)| read_text(&mut ws, h)).transpose()?;
+
+            let model_error: Option<String> = find!(
+                (handle: TextHandle),
+                pattern!(&space, [{ &mid @ model_chat::error: ?handle }])
+            ).next().map(|(h,)| read_text(&mut ws, h)).transpose()?;
+
+            let model_finished: Option<i128> = find!(
+                (value: Value<valueschemas::NsTAIInterval>),
+                pattern!(&space, [{ &mid @ model_chat::finished_at: ?value }])
+            ).next().map(|(v,)| interval_key(v));
+
+            let input_tokens: Option<u64> = find!(
+                (value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ &mid @ model_chat::input_tokens: ?value }])
+            ).next().and_then(|(v,)| u256be_to_u64(v));
+
+            let output_tokens: Option<u64> = find!(
+                (value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ &mid @ model_chat::output_tokens: ?value }])
+            ).next().and_then(|(v,)| u256be_to_u64(v));
+
+            let cache_creation_tokens: Option<u64> = find!(
+                (value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ &mid @ model_chat::cache_creation_input_tokens: ?value }])
+            ).next().and_then(|(v,)| u256be_to_u64(v));
+
+            let cache_read_tokens: Option<u64> = find!(
+                (value: Value<valueschemas::U256BE>),
+                pattern!(&space, [{ &mid @ model_chat::cache_read_input_tokens: ?value }])
+            ).next().and_then(|(v,)| u256be_to_u64(v));
 
             println!();
             println!("Model result [{}]", fmt_id(mid));
