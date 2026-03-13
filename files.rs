@@ -127,6 +127,9 @@ enum Command {
     Tree {
         /// Import or directory id prefix
         id: String,
+        /// Maximum depth to display (0 = root only, 1 = immediate children, etc.)
+        #[arg(long, short)]
+        depth: Option<usize>,
     },
     /// Compare two imports, directories, or files
     Diff {
@@ -369,14 +372,6 @@ fn resolve_entity(space: &TribleSet, input: &str) -> Result<Id> {
     }
 }
 
-/// Resolve a prefix specifically to a file entity.
-fn resolve_file(space: &TribleSet, input: &str) -> Result<Id> {
-    let id = resolve_entity(space, input)?;
-    if !is_file(space, id) {
-        bail!("'{}' is not a file entity", input);
-    }
-    Ok(id)
-}
 
 // ── repo helpers ─────────────────────────────────────────────────────────
 
@@ -860,6 +855,7 @@ fn cmd_imports(
 fn cmd_tree(
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     id: &str,
+    max_depth: Option<usize>,
 ) -> Result<()> {
     let space = ws
         .checkout(..)
@@ -873,7 +869,7 @@ fn cmd_tree(
         eid
     };
 
-    print_tree(&space, ws, root, "", "");
+    print_tree(&space, ws, root, "", "", max_depth, 0);
     Ok(())
 }
 
@@ -883,6 +879,8 @@ fn print_tree(
     id: Id,
     prefix: &str,
     child_prefix: &str,
+    max_depth: Option<usize>,
+    depth: usize,
 ) {
     let name = read_name(space, ws, id).unwrap_or_else(|| fmt_id(id));
 
@@ -894,8 +892,12 @@ fn print_tree(
             .unwrap_or_else(|| "?".into());
         println!("{prefix}{name}  ({mime}, {size_str})");
     } else if is_directory(space, id) {
-        println!("{prefix}{name}/");
         let children = children_of(space, id);
+        if max_depth.is_some_and(|d| depth >= d) {
+            println!("{prefix}{name}/  ({} children)", children.len());
+            return;
+        }
+        println!("{prefix}{name}/");
         let mut dirs: Vec<(String, Id)> = Vec::new();
         let mut files: Vec<(String, Id)> = Vec::new();
         for &cid in &children {
@@ -918,6 +920,7 @@ fn print_tree(
                 space, ws, cid,
                 &format!("{child_prefix}{connector}"),
                 &format!("{child_prefix}{continuation}"),
+                max_depth, depth + 1,
             );
         }
     } else {
@@ -1169,8 +1172,8 @@ fn main() -> Result<()> {
         Command::Imports => {
             with_files(pile, branch, |_repo, ws| cmd_imports(ws))
         }
-        Command::Tree { id } => {
-            with_files(pile, branch, |_repo, ws| cmd_tree(ws, &id))
+        Command::Tree { id, depth } => {
+            with_files(pile, branch, |_repo, ws| cmd_tree(ws, &id, depth))
         }
         Command::Diff { left, right } => {
             with_files(pile, branch, |_repo, ws| cmd_diff(ws, &left, &right))
