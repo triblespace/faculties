@@ -27,19 +27,25 @@ use triblespace::prelude::*;
 const KIND_GOAL_LABEL: &str = "goal";
 const KIND_STATUS_LABEL: &str = "status";
 const KIND_NOTE_LABEL: &str = "note";
+const KIND_PRIORITIZE_LABEL: &str = "prioritize";
+const KIND_DEPRIORITIZE_LABEL: &str = "deprioritize";
 
 const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
 const KIND_NOTE_ID: Id = id_hex!("D4E49A6F02A14E66B62076AE4C01715F");
+const KIND_PRIORITIZE_ID: Id = id_hex!("6907A81922DA6DF79966616EA60DEC70");
+const KIND_DEPRIORITIZE_ID: Id = id_hex!("86C4621538FB0E30CD63BB7A3B847E8B");
 
 const DEFAULT_STATUSES: [&str; 4] = ["todo", "doing", "blocked", "done"];
 
 type TextHandle = Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>;
 
-const KIND_SPECS: [(Id, &str); 3] = [
+const KIND_SPECS: [(Id, &str); 5] = [
     (KIND_GOAL_ID, KIND_GOAL_LABEL),
     (KIND_STATUS_ID, KIND_STATUS_LABEL),
     (KIND_NOTE_ID, KIND_NOTE_LABEL),
+    (KIND_PRIORITIZE_ID, KIND_PRIORITIZE_LABEL),
+    (KIND_DEPRIORITIZE_ID, KIND_DEPRIORITIZE_LABEL),
 ];
 
 mod board {
@@ -55,6 +61,8 @@ mod board {
         "61C44E0F8A73443ED592A713151E99A4" as status: valueschemas::ShortString;
         "8200ADEDC8D4D3D6D01CDC7396DF9AEC" as at: valueschemas::ShortString;
         "47351DF00B3DDA96CB305157CD53D781" as note: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
+        "B88842D9D00361A0F2728C478C79D75C" as higher: valueschemas::GenId;
+        "18F3446C9E9281A248D370A56395A3F0" as lower: valueschemas::GenId;
     }
 }
 
@@ -116,6 +124,22 @@ enum Command {
     Show {
         id: String,
     },
+    /// Mark a goal as more important than another
+    Prioritize {
+        /// The more important goal
+        higher: String,
+        /// The less important goal
+        #[arg(long)]
+        over: String,
+    },
+    /// Remove a priority relationship
+    Deprioritize {
+        /// The goal that was marked more important
+        higher: String,
+        /// The goal it was prioritized over
+        #[arg(long)]
+        over: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -142,10 +166,19 @@ struct NoteEvent {
 }
 
 #[derive(Debug, Clone)]
+struct PriorityEvent {
+    higher: Id,
+    lower: Id,
+    at: String,
+    active: bool,
+}
+
+#[derive(Debug, Clone)]
 struct BoardState {
     tasks: HashMap<Id, Task>,
     status_events: Vec<StatusEvent>,
     note_events: Vec<NoteEvent>,
+    priority_events: Vec<PriorityEvent>,
 }
 
 fn now_stamp() -> String {
@@ -348,10 +381,37 @@ fn load_board(ws: &mut Workspace<Pile<valueschemas::Blake3>>) -> Result<BoardSta
         });
     }
 
+    let mut priority_events = Vec::new();
+    for (higher, lower, at) in find!(
+        (higher: Id, lower: Id, at: String),
+        pattern!(&space, [{
+            _?evt @
+                metadata::tag: &KIND_PRIORITIZE_ID,
+                board::higher: ?higher,
+                board::lower: ?lower,
+                board::at: ?at
+        }])
+    ) {
+        priority_events.push(PriorityEvent { higher, lower, at, active: true });
+    }
+    for (higher, lower, at) in find!(
+        (higher: Id, lower: Id, at: String),
+        pattern!(&space, [{
+            _?evt @
+                metadata::tag: &KIND_DEPRIORITIZE_ID,
+                board::higher: ?higher,
+                board::lower: ?lower,
+                board::at: ?at
+        }])
+    ) {
+        priority_events.push(PriorityEvent { higher, lower, at, active: false });
+    }
+
     Ok(BoardState {
         tasks,
         status_events,
         note_events,
+        priority_events,
     })
 }
 
@@ -408,9 +468,108 @@ fn notes_by_task(events: &[NoteEvent]) -> HashMap<Id, Vec<NoteEvent>> {
     notes
 }
 
+/// Compute active priority edges from the event log.
+fn active_priority_edges(events: &[PriorityEvent]) -> HashSet<(Id, Id)> {
+    let mut latest: HashMap<(Id, Id), &PriorityEvent> = HashMap::new();
+    for event in events {
+        let key = (event.higher, event.lower);
+        latest
+            .entry(key)
+            .and_modify(|current| {
+                if event.at > current.at {
+                    *current = event;
+                }
+            })
+            .or_insert(event);
+    }
+    latest
+        .into_iter()
+        .filter(|(_, ev)| ev.active)
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// Check if `to` is an ancestor of `from` in the parent tree.
+fn is_ancestor(tasks: &HashMap<Id, Task>, from: Id, to: Id) -> bool {
+    let mut current = from;
+    loop {
+        if current == to {
+            return true;
+        }
+        match tasks.get(&current).and_then(|t| t.parent) {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+}
+
+/// Check if adding (higher, lower) would create a cycle in the priority DAG.
+fn would_create_cycle(edges: &HashSet<(Id, Id)>, higher: Id, lower: Id) -> bool {
+    let mut visited = HashSet::new();
+    let mut queue = vec![lower];
+    while let Some(node) = queue.pop() {
+        if node == higher {
+            return true;
+        }
+        if !visited.insert(node) {
+            continue;
+        }
+        for &(h, l) in edges {
+            if h == node && !visited.contains(&l) {
+                queue.push(l);
+            }
+        }
+    }
+    false
+}
+
+/// Topological rank of tasks by priority edges (lower rank = more important).
+fn priority_ranks(task_ids: &[Id], edges: &HashSet<(Id, Id)>) -> HashMap<Id, usize> {
+    let id_set: HashSet<Id> = task_ids.iter().copied().collect();
+    let mut adj: HashMap<Id, Vec<Id>> = HashMap::new();
+    let mut in_degree: HashMap<Id, usize> = HashMap::new();
+    for &id in task_ids {
+        in_degree.entry(id).or_insert(0);
+    }
+    for &(h, l) in edges {
+        if id_set.contains(&h) && id_set.contains(&l) {
+            adj.entry(h).or_default().push(l);
+            *in_degree.entry(l).or_insert(0) += 1;
+        }
+    }
+    let mut queue: Vec<Id> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    queue.sort_by(|a, b| a.cmp(b));
+    let mut ranks = HashMap::new();
+    let mut rank = 0;
+    while let Some(node) = queue.pop() {
+        ranks.insert(node, rank);
+        rank += 1;
+        if let Some(neighbors) = adj.get(&node) {
+            for &next in neighbors {
+                if let Some(deg) = in_degree.get_mut(&next) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push(next);
+                        queue.sort_by(|a, b| a.cmp(b));
+                    }
+                }
+            }
+        }
+    }
+    for &id in task_ids {
+        ranks.entry(id).or_insert(rank);
+    }
+    ranks
+}
+
 fn render_board(state: &BoardState, status_filter: &[String], tag_filter: &[String], show_done: bool) {
     let status_map = latest_status(&state.status_events);
     let note_map = notes_by_task(&state.note_events);
+    let priority_edges = active_priority_edges(&state.priority_events);
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
 
     for task in state.tasks.values() {
@@ -463,7 +622,7 @@ fn render_board(state: &BoardState, status_filter: &[String], tag_filter: &[Stri
         let rows = columns.remove(&status).unwrap_or_default();
         println!();
         println!("== {} ({}) ==", status.to_uppercase(), rows.len());
-        let ordered = order_rows(rows);
+        let ordered = order_rows(rows, &priority_edges);
         for (row, depth) in ordered {
             let indent = "  ".repeat(depth);
             println!(
@@ -533,7 +692,7 @@ impl TaskRow {
     }
 }
 
-fn order_rows(rows: Vec<TaskRow>) -> Vec<(TaskRow, usize)> {
+fn order_rows(rows: Vec<TaskRow>, priority_edges: &HashSet<(Id, Id)>) -> Vec<(TaskRow, usize)> {
     let mut by_id: HashMap<Id, TaskRow> = HashMap::new();
     for row in rows {
         by_id.insert(row.id, row);
@@ -552,11 +711,22 @@ fn order_rows(rows: Vec<TaskRow>) -> Vec<(TaskRow, usize)> {
         roots.push(*id);
     }
 
+    let all_ids: Vec<Id> = by_id.keys().copied().collect();
+    let ranks = priority_ranks(&all_ids, priority_edges);
+
     let sort_ids = |items: &mut Vec<Id>| {
         items.sort_by(|a, b| {
-            let a_key = by_id.get(a).map(|row| row.sort_key()).unwrap_or("");
-            let b_key = by_id.get(b).map(|row| row.sort_key()).unwrap_or("");
-            b_key.cmp(a_key)
+            let a_rank = ranks.get(a).copied().unwrap_or(usize::MAX);
+            let b_rank = ranks.get(b).copied().unwrap_or(usize::MAX);
+            match a_rank.cmp(&b_rank) {
+                std::cmp::Ordering::Equal => {
+                    // Fall back to timestamp (most recent first)
+                    let a_key = by_id.get(a).map(|row| row.sort_key()).unwrap_or("");
+                    let b_key = by_id.get(b).map(|row| row.sort_key()).unwrap_or("");
+                    b_key.cmp(a_key)
+                }
+                other => other,
+            }
         });
     };
 
@@ -876,6 +1046,103 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
     })
 }
 
+fn cmd_prioritize(
+    pile: &Path,
+    _branch_name: &str,
+    branch_id: Id,
+    higher_input: String,
+    lower_input: String,
+) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let board = load_board(&mut ws)?;
+        let higher_id = resolve_task_id(&higher_input, &board.tasks)?;
+        let lower_id = resolve_task_id(&lower_input, &board.tasks)?;
+
+        if higher_id == lower_id {
+            bail!("cannot prioritize a goal over itself");
+        }
+
+        // Reject if they're in the same ancestor chain
+        if is_ancestor(&board.tasks, higher_id, lower_id) {
+            bail!("cannot prioritize a goal over its own ancestor — the parent subsumes its children");
+        }
+        if is_ancestor(&board.tasks, lower_id, higher_id) {
+            bail!("cannot prioritize a goal over its own descendant — the parent subsumes its children");
+        }
+
+        // Reject if this would create a cycle
+        let edges = active_priority_edges(&board.priority_events);
+        if would_create_cycle(&edges, higher_id, lower_id) {
+            bail!("would create a priority cycle");
+        }
+
+        let now = now_stamp();
+        let evt_id = ufoid();
+        let mut change = TribleSet::new();
+        change += ensure_kind_entities(&mut ws)?;
+        change += entity! { &evt_id @
+            metadata::tag: &KIND_PRIORITIZE_ID,
+            board::higher: &higher_id,
+            board::lower: &lower_id,
+            board::at: now.as_str(),
+        };
+
+        ws.commit(change, "prioritize goal");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+
+        let h_title = board.tasks.get(&higher_id).map(|t| t.title.as_str()).unwrap_or("?");
+        let l_title = board.tasks.get(&lower_id).map(|t| t.title.as_str()).unwrap_or("?");
+        println!("{h_title} > {l_title}");
+        Ok(())
+    })
+}
+
+fn cmd_deprioritize(
+    pile: &Path,
+    _branch_name: &str,
+    branch_id: Id,
+    higher_input: String,
+    lower_input: String,
+) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let board = load_board(&mut ws)?;
+        let higher_id = resolve_task_id(&higher_input, &board.tasks)?;
+        let lower_id = resolve_task_id(&lower_input, &board.tasks)?;
+
+        let edges = active_priority_edges(&board.priority_events);
+        if !edges.contains(&(higher_id, lower_id)) {
+            bail!("no active priority relationship between these goals");
+        }
+
+        let now = now_stamp();
+        let evt_id = ufoid();
+        let mut change = TribleSet::new();
+        change += ensure_kind_entities(&mut ws)?;
+        change += entity! { &evt_id @
+            metadata::tag: &KIND_DEPRIORITIZE_ID,
+            board::higher: &higher_id,
+            board::lower: &lower_id,
+            board::at: now.as_str(),
+        };
+
+        ws.commit(change, "deprioritize goal");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+
+        let h_title = board.tasks.get(&higher_id).map(|t| t.title.as_str()).unwrap_or("?");
+        let l_title = board.tasks.get(&lower_id).map(|t| t.title.as_str()).unwrap_or("?");
+        println!("Removed: {h_title} > {l_title}");
+        Ok(())
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
@@ -924,5 +1191,11 @@ fn main() -> Result<()> {
             cmd_note(&cli.pile, &cli.branch, branch_id, id, note)
         }
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
+        Command::Prioritize { higher, over } => {
+            cmd_prioritize(&cli.pile, &cli.branch, branch_id, higher, over)
+        }
+        Command::Deprioritize { higher, over } => {
+            cmd_deprioritize(&cli.pile, &cli.branch, branch_id, higher, over)
+        }
     }
 }
