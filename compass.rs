@@ -569,7 +569,13 @@ fn priority_ranks(task_ids: &[Id], edges: &HashSet<(Id, Id)>) -> HashMap<Id, usi
 fn render_board(state: &BoardState, status_filter: &[String], tag_filter: &[String], show_done: bool) {
     let status_map = latest_status(&state.status_events);
     let note_map = notes_by_task(&state.note_events);
-    let priority_edges = active_priority_edges(&state.priority_events);
+    let mut priority_edges = active_priority_edges(&state.priority_events);
+    // Implicit: children must be done before parents → child > parent
+    for task in state.tasks.values() {
+        if let Some(parent) = task.parent {
+            priority_edges.insert((task.id, parent));
+        }
+    }
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
 
     for task in state.tasks.values() {
@@ -1065,17 +1071,22 @@ fn cmd_prioritize(
             bail!("cannot prioritize a goal over itself");
         }
 
-        // Reject if they're in the same ancestor chain
-        if is_ancestor(&board.tasks, higher_id, lower_id) {
-            bail!("cannot prioritize a goal over its own ancestor — the parent subsumes its children");
-        }
-        if is_ancestor(&board.tasks, lower_id, higher_id) {
-            bail!("cannot prioritize a goal over its own descendant — the parent subsumes its children");
+        // Build full edge set (explicit + implicit child→parent)
+        let mut edges = active_priority_edges(&board.priority_events);
+        for task in board.tasks.values() {
+            if let Some(parent) = task.parent {
+                edges.insert((task.id, parent));
+            }
         }
 
-        // Reject if this would create a cycle
-        let edges = active_priority_edges(&board.priority_events);
+        // Reject if this would create a cycle (covers ancestor-chain violations too,
+        // since implicit child→parent edges make parent>child a cycle)
         if would_create_cycle(&edges, higher_id, lower_id) {
+            if is_ancestor(&board.tasks, higher_id, lower_id)
+                || is_ancestor(&board.tasks, lower_id, higher_id)
+            {
+                bail!("children are implicitly prioritized over their parents");
+            }
             bail!("would create a priority cycle");
         }
 
