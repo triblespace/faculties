@@ -30,7 +30,6 @@ use triblespace::prelude::*;
 const DEFAULT_MODEL: &str = "gpt-oss:120b";
 const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_STREAM: bool = false;
-const DEFAULT_REASONING_SUMMARY: ModelReasoningSummary = ModelReasoningSummary::Detailed;
 const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS: u64 = 512;
@@ -63,7 +62,6 @@ mod playground_config {
         "328B29CE81665EE719C5A6E91695D4D4" as tavily_api_key: Handle<Blake3, LongString>;
         "AB0DF9F03F28A27A6DB95B693CC0EC53" as exa_api_key: Handle<Blake3, LongString>;
         "BA4E05799CA2ACDCF3F9350FC8742F2F" as model_reasoning_effort: Handle<Blake3, LongString>;
-        "73876213CFB8CF73CF0139E20B9770A1" as model_reasoning_summary: Handle<Blake3, LongString>;
         "5F04F7A0EB4EBBE6161022B336F83513" as model_stream: U256BE;
         "F9CEA1A2E81D738BB125B4D144B7A746" as model_context_window_tokens: U256BE;
         "4200F6746B36F2784DEBA1555595D6AC" as model_max_output_tokens: U256BE;
@@ -133,8 +131,6 @@ struct AddArgs {
     api_key: Option<String>,
     #[arg(long = "reasoning-effort")]
     reasoning_effort: Option<String>,
-    #[arg(long = "reasoning-summary", value_enum)]
-    reasoning_summary: Option<ModelReasoningSummary>,
     #[arg(long)]
     stream: Option<bool>,
     #[arg(long = "context-window-tokens")]
@@ -154,7 +150,6 @@ enum SetField {
     BaseUrl,
     ApiKey,
     ReasoningEffort,
-    ReasoningSummary,
     Stream,
     ContextWindowTokens,
     MaxOutputTokens,
@@ -167,37 +162,6 @@ enum SetField {
 enum UnsetField {
     ApiKey,
     ReasoningEffort,
-    ReasoningSummary,
-}
-
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-#[value(rename_all = "kebab-case")]
-enum ModelReasoningSummary {
-    Auto,
-    Concise,
-    Detailed,
-    None,
-}
-
-impl ModelReasoningSummary {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Concise => "concise",
-            Self::Detailed => "detailed",
-            Self::None => "none",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "auto" => Some(Self::Auto),
-            "concise" => Some(Self::Concise),
-            "detailed" => Some(Self::Detailed),
-            "none" => Some(Self::None),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -223,7 +187,6 @@ struct ModelConfig {
     base_url: String,
     api_key: Option<String>,
     reasoning_effort: Option<String>,
-    reasoning_summary: Option<ModelReasoningSummary>,
     stream: bool,
     context_window_tokens: u64,
     max_output_tokens: u64,
@@ -315,9 +278,6 @@ fn apply_add_overrides(config: &mut Config, args: &AddArgs) -> Result<()> {
     if let Some(value) = args.reasoning_effort.as_deref() {
         config.model.reasoning_effort = Some(value.trim().to_string());
     }
-    if let Some(value) = args.reasoning_summary {
-        config.model.reasoning_summary = Some(value);
-    }
     if let Some(value) = args.stream {
         config.model.stream = value;
     }
@@ -347,13 +307,6 @@ fn apply_set(config: &mut Config, field: SetField, value: &str) -> Result<()> {
             config.model.reasoning_effort =
                 Some(load_value_or_file_trimmed(value, "model_reasoning_effort")?)
         }
-        SetField::ReasoningSummary => {
-            let raw = load_value_or_file_trimmed(value, "model_reasoning_summary")?;
-            config.model.reasoning_summary =
-                Some(ModelReasoningSummary::parse(raw.as_str()).ok_or_else(|| {
-                    anyhow!("model_reasoning_summary must be one of: auto, concise, detailed, none")
-                })?);
-        }
         SetField::Stream => config.model.stream = parse_bool(value, "model_stream")?,
         SetField::ContextWindowTokens => {
             config.model.context_window_tokens = parse_u64(value, "model_context_window_tokens")?
@@ -376,7 +329,6 @@ fn apply_unset(config: &mut Config, field: UnsetField) -> Result<()> {
     match field {
         UnsetField::ApiKey => config.model.api_key = None,
         UnsetField::ReasoningEffort => config.model.reasoning_effort = None,
-        UnsetField::ReasoningSummary => config.model.reasoning_summary = None,
     }
     Ok(())
 }
@@ -436,14 +388,6 @@ fn print_headspace(config: &Config, show_secrets: bool) -> Result<()> {
     println!(
         "  reasoning_effort = {}",
         format_option_quoted(config.model.reasoning_effort.as_deref())
-    );
-    println!(
-        "  reasoning_summary = {}",
-        config
-            .model
-            .reasoning_summary
-            .map(|summary| format!("\"{}\"", summary.as_str()))
-            .unwrap_or_else(|| "null".to_string())
     );
     println!("  stream = {}", config.model.stream);
     println!(
@@ -713,25 +657,6 @@ fn load_latest_config(
     )? {
         config.model.reasoning_effort = Some(effort);
     }
-    if let Some(summary) = load_string_attr(
-        ws,
-        catalog,
-        config_id,
-        playground_config::model_reasoning_summary,
-    )? {
-        if let Some(parsed) = ModelReasoningSummary::parse(summary.as_str()) {
-            config.model.reasoning_summary = Some(parsed);
-        } else {
-            eprintln!(
-                "warning: unsupported model reasoning summary '{summary}', using {}",
-                config
-                    .model
-                    .reasoning_summary
-                    .map(ModelReasoningSummary::as_str)
-                    .unwrap_or("null")
-            );
-        }
-    }
     if let Some(key) = load_string_attr(ws, catalog, config_id, playground_config::model_api_key)? {
         config.model.api_key = Some(key);
     }
@@ -846,17 +771,6 @@ fn load_latest_model_profile(
         playground_config::model_reasoning_effort,
     )? {
         mc.reasoning_effort = Some(effort);
-    }
-    if let Some(summary) = load_string_attr(
-        ws,
-        catalog,
-        entry_id,
-        playground_config::model_reasoning_summary,
-    )? {
-        mc.reasoning_summary = Some(
-            ModelReasoningSummary::parse(summary.as_str())
-                .ok_or_else(|| anyhow!("unsupported model reasoning summary '{summary}'"))?,
-        );
     }
     if let Some(key) = load_string_attr(ws, catalog, entry_id, playground_config::model_api_key)? {
         mc.api_key = Some(key);
@@ -981,10 +895,6 @@ fn store_config(ws: &mut Workspace<Pile<Blake3>>, config: &Config) -> Result<()>
         let handle = ws.put(effort.clone());
         change += entity! { &profile_entry_id @ playground_config::model_reasoning_effort: handle };
     }
-    if let Some(summary) = config.model.reasoning_summary {
-        let handle = ws.put(summary.as_str().to_string());
-        change += entity! { &profile_entry_id @ playground_config::model_reasoning_summary: handle };
-    }
 
     ws.commit(change, "playground config");
     Ok(())
@@ -1064,7 +974,6 @@ impl Default for ModelConfig {
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: None,
             reasoning_effort: None,
-            reasoning_summary: Some(DEFAULT_REASONING_SUMMARY),
             stream: DEFAULT_STREAM,
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
