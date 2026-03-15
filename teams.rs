@@ -293,26 +293,25 @@ const DEFAULT_DELTA_URL: &str =
 #[command(name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
 struct Cli {
     /// Path to the pile file to write into.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pile: Option<PathBuf>,
     /// Branch name to write into (created if missing).
-    #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
+    #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
     /// Branch id to write into (hex). Overrides config/env branch id.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     /// Microsoft Graph delta endpoint.
-    #[arg(long, default_value = DEFAULT_DELTA_URL, global = true)]
+    #[arg(long, default_value = DEFAULT_DELTA_URL)]
     delta_url: String,
     /// OAuth bearer token (optional; otherwise use token command). Use @path for file input or @- for stdin.
-    #[arg(long, global = true)]
+    #[arg(long)]
     token: Option<String>,
     /// Command that outputs a bearer token. Use @path for file input or @- for stdin.
     #[arg(
         long,
         default_value =
-            "az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv",
-        global = true
+            "az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv"
     )]
     token_command: String,
     #[command(subcommand)]

@@ -65,10 +65,10 @@ mod file {
 #[command(name = "files", about = "Content-addressed file storage in a TribleSpace pile")]
 struct Cli {
     /// Path to the pile file
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch id (hex). Overrides name-based lookup.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,

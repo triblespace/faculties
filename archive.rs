@@ -548,19 +548,19 @@ mod common {
 #[command(name = "archive", about = "Query imported archives in TribleSpace")]
 struct Cli {
     /// Path to the pile file to query.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pile: Option<PathBuf>,
     /// Branch name to query.
-    #[arg(long, default_value = "archive", global = true)]
+    #[arg(long, default_value = "archive")]
     branch: String,
     /// Branch id to query (hex). Overrides config/env branch id.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     /// Enable tracing spans for importer profiling.
-    #[arg(long, global = true)]
+    #[arg(long)]
     trace: bool,
     /// Optional tracing filter (defaults to `info`).
-    #[arg(long, global = true)]
+    #[arg(long)]
     trace_filter: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,

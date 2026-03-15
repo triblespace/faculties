@@ -46,19 +46,19 @@ enum Provider {
 #[command(name = "web", about = "Web search/browsing faculty (Tavily/Exa)")]
 struct Cli {
     /// Path to the pile file to use.
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch id to store web events into (hex). Overrides ensure_branch/env branch id.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     /// Override Tavily API key (otherwise loaded from config.tavily_api_key). Use @path for file input or @- for stdin.
-    #[arg(long, global = true)]
+    #[arg(long)]
     tavily_api_key: Option<String>,
     /// Override Exa API key (otherwise loaded from config.exa_api_key). Use @path for file input or @- for stdin.
-    #[arg(long, global = true)]
+    #[arg(long)]
     exa_api_key: Option<String>,
     /// Do not write events to the pile; only print results.
-    #[arg(long, global = true)]
+    #[arg(long)]
     no_store: bool,
     #[command(subcommand)]
     command: Option<Command>,

@@ -97,19 +97,19 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 )]
 struct Cli {
     /// Path to the pile file to use
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch name for local messages
-    #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
+    #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
     /// Explicit branch id for local messages (hex). Overrides name-based lookup.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     /// Branch name for relations
-    #[arg(long, default_value = DEFAULT_RELATIONS_BRANCH, global = true)]
+    #[arg(long, default_value = DEFAULT_RELATIONS_BRANCH)]
     relations_branch: String,
     /// Explicit branch id for relations (hex). Overrides name-based lookup.
-    #[arg(long, global = true)]
+    #[arg(long)]
     relations_branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,

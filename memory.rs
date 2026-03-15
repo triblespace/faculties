@@ -88,10 +88,10 @@ mod ctx {
 )]
 struct Cli {
     /// Path to the pile file to use.
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Optional explicit branch id (hex) to read chunks from (defaults to cognition branch).
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
     #[arg(value_name = "ID")]

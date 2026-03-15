@@ -45,19 +45,19 @@ mod reason_schema {
 )]
 struct Cli {
     /// Path to the pile file.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pile: Option<PathBuf>,
     /// Target branch name for reason events.
-    #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
+    #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
     /// Target branch id for reason events (hex). Overrides ensure_branch.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     /// Turn id to annotate (hex). Defaults to $TURN_ID.
-    #[arg(long, global = true)]
+    #[arg(long)]
     turn_id: Option<String>,
     /// Worker id to annotate (hex). Defaults to $WORKER_ID.
-    #[arg(long, global = true)]
+    #[arg(long)]
     worker_id: Option<String>,
     /// Free-form reasoning text.
     #[arg(value_name = "TEXT", help = "Free-form reasoning text. Use @path for file input or @- for stdin.")]

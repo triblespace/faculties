@@ -80,7 +80,7 @@ mod playground_config {
 )]
 struct Cli {
     /// Path to the pile file to use
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,

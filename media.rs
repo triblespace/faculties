@@ -34,13 +34,13 @@ use triblespace::prelude::*;
 )]
 struct Cli {
     /// Path to the pile file to use.
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch name to store media entities into (created if missing).
-    #[arg(long, default_value = "media", global = true)]
+    #[arg(long, default_value = "media")]
     branch: String,
     /// Branch id to store media entities into (hex). Overrides config/env branch id.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,

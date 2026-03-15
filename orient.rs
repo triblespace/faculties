@@ -98,7 +98,7 @@ mod orient_state {
 )]
 struct Cli {
     /// Path to the pile file to use
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
@@ -123,16 +123,16 @@ enum Command {
         #[command(subcommand)]
         target: Option<WaitTarget>,
         /// Max local messages to show
-        #[arg(long, default_value_t = 10, global = true)]
+        #[arg(long, default_value_t = 10)]
         message_limit: usize,
         /// Max doing goals to show
-        #[arg(long, default_value_t = 5, global = true)]
+        #[arg(long, default_value_t = 5)]
         doing_limit: usize,
         /// Max todo goals to show
-        #[arg(long, default_value_t = 5, global = true)]
+        #[arg(long, default_value_t = 5)]
         todo_limit: usize,
         /// Poll interval while waiting for branch changes
-        #[arg(long, default_value_t = 1000, global = true)]
+        #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
     },
 }

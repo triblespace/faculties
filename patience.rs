@@ -46,19 +46,19 @@ mod exec_schema {
 )]
 struct Cli {
     /// Path to the pile file.
-    #[arg(long, global = true)]
+    #[arg(long)]
     pile: Option<PathBuf>,
     /// Target branch name for timeout extension events.
-    #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
+    #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
     /// Target branch id for timeout extension events (hex). Overrides ensure_branch.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     /// Turn id to annotate (hex). Defaults to $TURN_ID.
-    #[arg(long, global = true)]
+    #[arg(long)]
     turn_id: Option<String>,
     /// Worker id to annotate (hex). Defaults to $WORKER_ID.
-    #[arg(long, global = true)]
+    #[arg(long)]
     worker_id: Option<String>,
     /// Timeout extension duration (e.g. 5m, 90s, 1h).
     #[arg(value_name = "DURATION")]

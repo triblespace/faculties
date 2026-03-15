@@ -153,10 +153,10 @@ mod cog {
 )]
 struct Cli {
     /// Path to the pile file to inspect
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Target branch name
-    #[arg(long, default_value = "cognition", global = true)]
+    #[arg(long, default_value = "cognition")]
     branch: String,
     #[command(subcommand)]
     command: Option<Command>,

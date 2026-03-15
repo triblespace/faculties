@@ -45,13 +45,13 @@ mod relations {
 #[command(name = "relations", about = "Relationship/contacts faculty")]
 struct Cli {
     /// Path to the pile file to use
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch name for relations data
-    #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
+    #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
     /// Branch id for relations data (hex). Overrides ensure_branch.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,

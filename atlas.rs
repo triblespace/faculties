@@ -29,10 +29,10 @@ const DEFAULT_BRANCH: &str = "atlas";
 #[command(name = "atlas", about = "Schema metadata inspection faculty")]
 struct Cli {
     /// Path to the pile file to use.
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch name for schema metadata.
-    #[arg(long, default_value = DEFAULT_BRANCH, global = true)]
+    #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
     #[command(subcommand)]
     command: Option<Command>,

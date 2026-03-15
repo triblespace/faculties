@@ -70,13 +70,13 @@ mod board {
 #[command(name = "compass", about = "A small TribleSpace kanban faculty")]
 struct Cli {
     /// Path to the pile file to use
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch name for the board
-    #[arg(long, default_value = "compass", global = true)]
+    #[arg(long, default_value = "compass")]
     branch: String,
     /// Branch id for the board (hex). Overrides config.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,

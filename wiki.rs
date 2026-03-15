@@ -65,10 +65,10 @@ mod wiki {
 #[command(name = "wiki", about = "A TribleSpace knowledge wiki faculty")]
 struct Cli {
     /// Path to the pile file
-    #[arg(long, env = "PILE", global = true)]
+    #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Branch id (hex). Overrides name-based lookup.
-    #[arg(long, global = true)]
+    #[arg(long)]
     branch_id: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
