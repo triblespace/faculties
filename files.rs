@@ -6,6 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
+//! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 //! anybytes = "0.20"
 //! triblespace = "0.19"
 //! ```
@@ -118,6 +119,23 @@ enum Command {
         id: String,
         /// Tag to add
         name: String,
+    },
+    /// Fetch a URL and import it as a file
+    Fetch {
+        /// URL to fetch
+        url: String,
+        /// Override MIME type
+        #[arg(long)]
+        mime: Option<String>,
+        /// Override filename
+        #[arg(long)]
+        name: Option<String>,
+        /// Add tags to the import (repeatable)
+        #[arg(long)]
+        tag: Vec<String>,
+        /// Maximum response size in bytes (default 8 MiB)
+        #[arg(long, default_value_t = 8 * 1024 * 1024)]
+        max_bytes: usize,
     },
     /// Search files by name or tag
     Search {
@@ -616,16 +634,88 @@ fn cmd_add(
         );
     } else {
         // Single file — show the content hash.
-        let h = content_handle_of(
-            &ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?,
-            root_id,
-        )
-        .ok_or_else(|| anyhow::anyhow!("missing content handle"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let h = content_handle_of(&space, root_id)
+            .ok_or_else(|| anyhow::anyhow!("missing content handle"))?;
+        let hash = handle_hex(h);
         let name = abs_path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-        println!("{}  {}  ({})", handle_hex(h), name, human_size(stats.bytes));
+        let mime = read_mime(&space, root_id).unwrap_or_default();
+        println!("{}  {}  ({})", hash, name, human_size(stats.bytes));
+        if mime.starts_with("image/") {
+            println!("![{name}](files:{hash})");
+        }
     }
     println!("Import: {}", fmt_id(import_id));
     Ok(())
+}
+
+fn cmd_fetch(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    url: &str,
+    mime_override: Option<&str>,
+    name_override: Option<&str>,
+    tags: &[String],
+    max_bytes: usize,
+) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("playground-files-faculty/0")
+        .build()
+        .context("build http client")?;
+    let response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("fetch {url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetch {url}"))?;
+
+    let header_mime = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let bytes = response.bytes().context("read response body")?;
+    if bytes.len() > max_bytes {
+        bail!(
+            "response too large: {} bytes (limit {})",
+            bytes.len(),
+            max_bytes
+        );
+    }
+
+    let guessed_name = name_override
+        .map(str::to_owned)
+        .or_else(|| {
+            let before_query = url.split('?').next().unwrap_or(url);
+            let last = before_query.rsplit('/').next()?.trim();
+            if last.is_empty() { None } else { Some(last.to_owned()) }
+        });
+    let mime = mime_override
+        .map(str::to_owned)
+        .or(header_mime)
+        .unwrap_or_else(|| {
+            guessed_name
+                .as_deref()
+                .map(|n| infer_mime(Path::new(n)))
+                .unwrap_or("application/octet-stream")
+                .to_string()
+        });
+    let fname = guessed_name.unwrap_or_else(|| "fetched".to_string());
+
+    // Write to a temp file so we can reuse build_tree / cmd_add flow.
+    let tmp_dir = std::env::temp_dir().join("files-fetch");
+    fs::create_dir_all(&tmp_dir).context("create temp dir")?;
+    let tmp_path = tmp_dir.join(&fname);
+    fs::write(&tmp_path, bytes.as_ref())
+        .with_context(|| format!("write temp file {}", tmp_path.display()))?;
+
+    let result = cmd_add(repo, ws, &tmp_path, Some(mime.as_str()), tags, false);
+    let _ = fs::remove_file(&tmp_path);
+    let _ = fs::remove_dir(&tmp_dir);
+    result
 }
 
 fn cmd_list(
@@ -1238,6 +1328,11 @@ fn main() -> Result<()> {
         }
         Command::Tag { id, name } => {
             with_files(pile, branch, |repo, ws| cmd_tag(repo, ws, &id, &name))
+        }
+        Command::Fetch { url, mime, name, tag, max_bytes } => {
+            with_files(pile, branch, |repo, ws| {
+                cmd_fetch(repo, ws, &url, mime.as_deref(), name.as_deref(), &tag, max_bytes)
+            })
         }
         Command::Search { query } => {
             with_files(pile, branch, |_repo, ws| cmd_search(ws, &query))
