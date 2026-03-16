@@ -241,10 +241,6 @@ fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle)
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
-    }
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {

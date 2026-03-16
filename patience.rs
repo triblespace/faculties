@@ -126,11 +126,6 @@ fn parse_timeout_ms(raw: &str) -> Result<u64> {
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("create pile directory {}: {e}", parent.display()))?;
-    }
-
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {

@@ -529,10 +529,6 @@ fn extract_references(content: &str, space: &TribleSet) -> (Vec<Id>, Vec<(String
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<valueschemas::Blake3>>> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("create pile dir {}: {e}", parent.display()))?;
-    }
     let mut pile = Pile::<valueschemas::Blake3>::open(path)
         .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore() {

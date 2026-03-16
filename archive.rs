@@ -330,10 +330,6 @@ mod common {
         branch_id: Id,
         _branch_name: &str,
     ) -> Result<(Repo, Id)> {
-        if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
-        }
         let mut pile =
             Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
         if let Err(err) = pile.restore() {
@@ -371,11 +367,6 @@ mod common {
     }
 
     fn open_repo(pile_path: &Path) -> Result<Repo> {
-        if let Some(parent) = pile_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)
-                .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
-        }
-
         let mut pile = Pile::<Blake3>::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
         if let Err(err) = pile.restore() {
             // Avoid Drop warnings on early errors.

@@ -693,11 +693,6 @@ fn exa_contents(client: &Client, api_key: &str, url: &str, max_characters: usize
 // --- Pile helpers ---
 
 fn open_repo(path: &Path) -> Result<Repository<Pile<Blake3>>> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("create pile dir {}: {e}", parent.display()))?;
-    }
-
     let mut pile = Pile::<Blake3>::open(path)
         .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))?;
     if let Err(err) = pile.restore().map_err(|e| anyhow!("restore pile {}: {e:?}", path.display())) {

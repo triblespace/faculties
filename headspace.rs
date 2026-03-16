@@ -452,10 +452,6 @@ fn close_repo(repo: Repository<Pile<Blake3>>) -> Result<()> {
 }
 
 fn open_config_repo(pile_path: &Path) -> Result<(Repository<Pile<Blake3>>, Id)> {
-    if let Some(parent) = pile_path.parent() {
-        fs::create_dir_all(parent).context("create pile directory")?;
-    }
-
     let mut pile = Pile::<Blake3>::open(pile_path).context("open pile")?;
     if let Err(err) = pile.restore().context("restore pile") {
         let close_res = pile.close().context("close pile after restore failure");
