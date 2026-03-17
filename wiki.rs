@@ -6,6 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
+//! regex = "1"
 //! triblespace = "0.19"
 //! ```
 
@@ -499,27 +500,22 @@ fn format_date(tai_ns: i128) -> String {
 /// Wiki links resolve against the space — the stored ID is whatever matches
 /// (could be a fragment or version). External links return faculty + raw hex.
 fn extract_references(content: &str, space: &TribleSet) -> (Vec<Id>, Vec<(String, String)>) {
+    use regex::Regex;
+    // Matches both markdown [text](scheme:hex) and typst #link("scheme:hex")
+    let re = Regex::new(r#"(?:\]\(|#link\(")([a-zA-Z_][a-zA-Z0-9_]*):([0-9a-fA-F]{4,})"#).unwrap();
+
     let mut internal = Vec::new();
     let mut external = Vec::new();
-    let mut rest = content;
-    while let Some(paren) = rest.find("](") {
-        let after = &rest[paren + 2..];
-        let end = after.find(')').unwrap_or(after.len());
-        let link = &after[..end];
-        if let Some(colon) = link.find(':') {
-            let faculty = &link[..colon];
-            let hex: String = link[colon + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
-            if hex.len() >= 4 && !faculty.is_empty() && faculty.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                if faculty == "wiki" {
-                    if let Ok(id) = resolve_prefix(space, &hex) {
-                        internal.push(id);
-                    }
-                } else {
-                    external.push((faculty.to_string(), hex));
-                }
+    for caps in re.captures_iter(content) {
+        let faculty = &caps[1];
+        let hex = &caps[2];
+        if faculty == "wiki" {
+            if let Ok(id) = resolve_prefix(space, hex) {
+                internal.push(id);
             }
+        } else {
+            external.push((faculty.to_string(), hex.to_string()));
         }
-        rest = &after[end.min(after.len()).max(1)..];
     }
     internal.sort();
     internal.dedup();
