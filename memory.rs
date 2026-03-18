@@ -551,64 +551,50 @@ fn print_archive_meta(
     };
 
     // Author (as id prefix).
-    for (_msg_id, author_id) in find!(
-        (msg_id: Id, author_id: Id),
+    if let Some((author_id,)) = find!(
+        (author_id: Id),
         pattern!(&archive_catalog, [{
-            ?msg_id @
+            archive_msg_id @
             archive_schema::author: ?author_id,
         }])
-    ) {
-        if _msg_id == archive_msg_id {
-            // Try to resolve author name.
-            let mut author_name: Option<String> = None;
-            for (_aid, name_handle) in find!(
-                (aid: Id, name: Value<Handle<Blake3, LongString>>),
-                pattern!(&archive_catalog, [{
-                    ?aid @
-                    archive_schema::author_name: ?name,
-                }])
-            ) {
-                if _aid == archive_msg_id {
-                    if let Ok(view) = ws.get::<View<str>, LongString>(name_handle) {
-                        author_name = Some(view.as_ref().to_string());
-                    }
-                }
-            }
-            match author_name {
-                Some(name) => println!("  author: {} ({:x})", name, author_id),
-                None => println!("  author: {:x}", author_id),
-            }
-            break;
+    ).next() {
+        // Try to resolve author name.
+        let author_name: Option<String> = find!(
+            (name: Value<Handle<Blake3, LongString>>),
+            pattern!(&archive_catalog, [{
+                archive_msg_id @
+                archive_schema::author_name: ?name,
+            }])
+        ).next().and_then(|(name_handle,)| {
+            ws.get::<View<str>, LongString>(name_handle).ok().map(|v| v.as_ref().to_string())
+        });
+        match author_name {
+            Some(name) => println!("  author: {} ({:x})", name, author_id),
+            None => println!("  author: {:x}", author_id),
         }
     }
 
     // Source format.
-    for (_msg_id, fmt) in find!(
-        (msg_id: Id, fmt: String),
+    if let Some((fmt,)) = find!(
+        (fmt: String),
         pattern!(&archive_catalog, [{
-            ?msg_id @
+            archive_msg_id @
             archive_import_schema::source_format: ?fmt,
         }])
-    ) {
-        if _msg_id == archive_msg_id {
-            println!("  source_format: {}", fmt);
-            break;
-        }
+    ).next() {
+        println!("  source_format: {}", fmt);
     }
 
     // Source conversation id.
-    for (_msg_id, conv_handle) in find!(
-        (msg_id: Id, conv: Value<Handle<Blake3, LongString>>),
+    if let Some((conv_handle,)) = find!(
+        (conv: Value<Handle<Blake3, LongString>>),
         pattern!(&archive_catalog, [{
-            ?msg_id @
+            archive_msg_id @
             archive_import_schema::source_conversation_id: ?conv,
         }])
-    ) {
-        if _msg_id == archive_msg_id {
-            if let Ok(view) = ws.get::<View<str>, LongString>(conv_handle) {
-                println!("  conversation: {}", view.as_ref());
-            }
-            break;
+    ).next() {
+        if let Ok(view) = ws.get::<View<str>, LongString>(conv_handle) {
+            println!("  conversation: {}", view.as_ref());
         }
     }
 
