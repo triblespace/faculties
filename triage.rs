@@ -718,16 +718,10 @@ fn collect_exec_state(
             exec::about_request: ?about_request,
         }])
     ) {
-        let mut started_at = None;
-        for (id, value) in find!(
-            (id: Id, value: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{ ?id @ exec::started_at: ?value }])
-        ) {
-            if id == event_id {
-                started_at = Some(interval_key(value));
-                break;
-            }
-        }
+        let started_at = find!(
+            (value: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{ event_id @ exec::started_at: ?value }])
+        ).next().map(|(value,)| interval_key(value));
         state.in_progress.push(ExecInProgressRow {
             about_request,
             started_at,
@@ -828,16 +822,10 @@ fn collect_model_chat_state(
             model_chat::about_request: ?about_request,
         }])
     ) {
-        let mut started_at = None;
-        for (id, value) in find!(
-            (id: Id, value: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{ ?id @ model_chat::started_at: ?value }])
-        ) {
-            if id == event_id {
-                started_at = Some(interval_key(value));
-                break;
-            }
-        }
+        let started_at = find!(
+            (value: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{ event_id @ model_chat::started_at: ?value }])
+        ).next().map(|(value,)| interval_key(value));
         state.in_progress.push(ModelInProgressRow {
             about_request,
             started_at,
@@ -2646,50 +2634,35 @@ fn cmd_turn(
         let mut stderr_text: Option<String> = None;
         let mut error_text: Option<String> = None;
 
-        for (id, value) in find!(
-            (id: Id, value: Value<valueschemas::U256BE>),
-            pattern!(&space, [{ ?id @ exec::exit_code: ?value }])
-        ) {
-            if id == rid {
-                exit_code = u256be_to_u64(value).map(|n| n as i64);
-                break;
-            }
+        if let Some((value,)) = find!(
+            (value: Value<valueschemas::U256BE>),
+            pattern!(&space, [{ rid @ exec::exit_code: ?value }])
+        ).next() {
+            exit_code = u256be_to_u64(value).map(|n| n as i64);
         }
-        for (id, value) in find!(
-            (id: Id, value: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{ ?id @ exec::finished_at: ?value }])
-        ) {
-            if id == rid {
-                finished_at = Some(interval_key(value));
-                break;
-            }
+        if let Some((value,)) = find!(
+            (value: Value<valueschemas::NsTAIInterval>),
+            pattern!(&space, [{ rid @ exec::finished_at: ?value }])
+        ).next() {
+            finished_at = Some(interval_key(value));
         }
-        for (id, handle) in find!(
-            (id: Id, handle: TextHandle),
-            pattern!(&space, [{ ?id @ exec::stdout_text: ?handle }])
-        ) {
-            if id == rid {
-                stdout_text = Some(read_text(&mut ws, handle)?);
-                break;
-            }
+        if let Some((handle,)) = find!(
+            (handle: TextHandle),
+            pattern!(&space, [{ rid @ exec::stdout_text: ?handle }])
+        ).next() {
+            stdout_text = Some(read_text(&mut ws, handle)?);
         }
-        for (id, handle) in find!(
-            (id: Id, handle: TextHandle),
-            pattern!(&space, [{ ?id @ exec::stderr_text: ?handle }])
-        ) {
-            if id == rid {
-                stderr_text = Some(read_text(&mut ws, handle)?);
-                break;
-            }
+        if let Some((handle,)) = find!(
+            (handle: TextHandle),
+            pattern!(&space, [{ rid @ exec::stderr_text: ?handle }])
+        ).next() {
+            stderr_text = Some(read_text(&mut ws, handle)?);
         }
-        for (id, handle) in find!(
-            (id: Id, handle: TextHandle),
-            pattern!(&space, [{ ?id @ exec::error: ?handle }])
-        ) {
-            if id == rid {
-                error_text = Some(read_text(&mut ws, handle)?);
-                break;
-            }
+        if let Some((handle,)) = find!(
+            (handle: TextHandle),
+            pattern!(&space, [{ rid @ exec::error: ?handle }])
+        ).next() {
+            error_text = Some(read_text(&mut ws, handle)?);
         }
 
         println!();
@@ -2829,16 +2802,14 @@ fn cmd_turn(
 
         // Context summary
         if let Some(tid) = thought_id {
-            let mut context_json: Option<String> = None;
-            for (id, handle) in find!(
-                (id: Id, handle: TextHandle),
-                pattern!(&space, [{ ?id @ cog::context: ?handle }])
-            ) {
-                if id == tid {
-                    context_json = Some(read_text(&mut ws, handle)?);
-                    break;
-                }
-            }
+            let context_json: Option<String> = if let Some((handle,)) = find!(
+                (handle: TextHandle),
+                pattern!(&space, [{ tid @ cog::context: ?handle }])
+            ).next() {
+                Some(read_text(&mut ws, handle)?)
+            } else {
+                None
+            };
             if let Some(ref json) = context_json {
                 let messages: Vec<ChatMessage> = serde_json::from_str(json)
                     .unwrap_or_default();
