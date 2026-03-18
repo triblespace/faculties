@@ -254,8 +254,8 @@ struct ConfigSnapshot {
 #[derive(Debug, Clone)]
 struct ExecRequestRow {
     id: Id,
-    command: Option<String>,
-    requested_at: Option<i128>,
+    command: String,
+    requested_at: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -678,36 +678,23 @@ fn collect_exec_state(
 ) -> Result<ExecState> {
     let mut state = ExecState::default();
 
-    for (request_id,) in find!(
-        (request_id: Id),
-        pattern!(&space, [{ ?request_id @ metadata::tag: &KIND_EXEC_REQUEST_ID }])
+    for (request_id, handle, requested_at) in find!(
+        (request_id: Id, handle: TextHandle, requested_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?request_id @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            exec::command_text: ?handle,
+            exec::requested_at: ?requested_at,
+        }])
     ) {
         state.requests.insert(
             request_id,
             ExecRequestRow {
                 id: request_id,
-                command: None,
-                requested_at: None,
+                command: read_text(ws, handle)?,
+                requested_at: interval_key(requested_at),
             },
         );
-    }
-
-    for (request_id, handle) in find!(
-        (request_id: Id, handle: TextHandle),
-        pattern!(&space, [{ ?request_id @ exec::command_text: ?handle }])
-    ) {
-        if let Some(entry) = state.requests.get_mut(&request_id) {
-            entry.command = Some(read_text(ws, handle)?);
-        }
-    }
-
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?request_id @ exec::requested_at: ?requested_at }])
-    ) {
-        if let Some(entry) = state.requests.get_mut(&request_id) {
-            entry.requested_at = Some(interval_key(requested_at));
-        }
     }
 
     for (event_id, about_request) in find!(
@@ -1017,7 +1004,7 @@ fn collect_exec_attempts(state: &ExecState, recent: usize) -> Vec<ExecAttempt> {
         .filter_map(|result| {
             let finished_at = result.finished_at?;
             let request = state.requests.get(&result.about_request)?;
-            let command = request.command.clone()?;
+            let command = request.command.clone();
             let fingerprint = result
                 .error
                 .as_ref()
@@ -1641,7 +1628,8 @@ fn build_timeline_rows(
     let mut rows = Vec::<TimelineRow>::new();
 
     for request in exec_state.requests.values() {
-        if let (Some(at), Some(command)) = (request.requested_at, request.command.as_ref()) {
+        {
+            let (at, command) = (request.requested_at, &request.command);
             rows.push(TimelineRow {
                 at,
                 source: "exec",
@@ -1657,7 +1645,7 @@ fn build_timeline_rows(
     let request_commands: HashMap<Id, String> = exec_state
         .requests
         .values()
-        .filter_map(|request| request.command.clone().map(|command| (request.id, command)))
+        .map(|request| (request.id, request.command.clone()))
         .collect();
 
     for result in &exec_state.results {
