@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
 //! time = { version = "0.3.36", features = ["formatting", "macros"] }
-//! triblespace = "0.21"
+//! triblespace = "0.22"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -90,7 +90,7 @@ enum Command {
         title: String,
         #[arg(long, default_value = "todo")]
         status: String,
-        /// Parent goal id (prefix accepted)
+        /// Parent goal id (full 64-char hex id; use `compass resolve` to look up by prefix)
         #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
@@ -111,34 +111,42 @@ enum Command {
     },
     /// Move a goal to a new status
     Move {
+        /// Full 64-char hex id
         id: String,
         status: String,
     },
     /// Add a note to a goal
     Note {
+        /// Full 64-char hex id
         id: String,
         #[arg(help = "Note text. Use @path for file input or @- for stdin.")]
         note: String,
     },
     /// Show a goal with history and notes
     Show {
+        /// Full 64-char hex id
         id: String,
     },
     /// Mark a goal as more important than another
     Prioritize {
-        /// The more important goal
+        /// The more important goal (full 64-char hex id)
         higher: String,
-        /// The less important goal
+        /// The less important goal (full 64-char hex id)
         #[arg(long)]
         over: String,
     },
     /// Remove a priority relationship
     Deprioritize {
-        /// The goal that was marked more important
+        /// The goal that was marked more important (full 64-char hex id)
         higher: String,
-        /// The goal it was prioritized over
+        /// The goal it was prioritized over (full 64-char hex id)
         #[arg(long)]
         over: String,
+    },
+    /// Resolve a hex prefix to a full 64-char goal id
+    Resolve {
+        /// Hex prefix to search for
+        prefix: String,
     },
 }
 
@@ -415,6 +423,18 @@ fn read_text(ws: &mut Workspace<Pile<valueschemas::Blake3>>, handle: TextHandle)
         .get::<View<str>, blobschemas::LongString>(handle)
         .map_err(|e| anyhow::anyhow!("load longstring: {e:?}"))?;
     Ok(view.to_string())
+}
+
+/// Parse a full 64-char hex ID. Returns a helpful error pointing to `compass resolve` on failure.
+fn parse_full_id(input: &str) -> Result<Id> {
+    let trimmed = input.trim();
+    Id::from_hex(trimmed).ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid goal id '{}': expected a full 64-char hex id\n\
+             Hint: use `compass resolve <prefix>` to look up the full id from a short prefix",
+            trimmed
+        )
+    })
 }
 
 fn resolve_task_id(input: &str, tasks: &HashMap<Id, Task>) -> Result<Id> {
@@ -816,17 +836,12 @@ fn cmd_add(
         validate_short("tag", tag)?;
     }
 
+    let parent_id = parent.as_deref().map(parse_full_id).transpose()?;
+
     let task_ref = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let parent_id = match parent {
-            Some(parent_input) => {
-                let board = load_board(&mut ws)?;
-                Some(resolve_task_id(&parent_input, &board.tasks)?)
-            }
-            None => None,
-        };
         let task_id = ufoid();
         let task_ref = task_id.id;
         let now = now_stamp();
@@ -901,13 +916,12 @@ fn cmd_move(
 ) -> Result<()> {
     let status = normalize_status(status);
     validate_short("status", &status)?;
+    let task_id = parse_full_id(&id)?;
 
-    let task_id = with_repo(pile, |repo| {
+    with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let board = load_board(&mut ws)?;
-        let task_id = resolve_task_id(&id, &board.tasks)?;
         let now = now_stamp();
 
         let status_id = ufoid();
@@ -923,19 +937,19 @@ fn cmd_move(
         ws.commit(change, "move goal");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push status: {e:?}"))?;
-        Ok(task_id)
+        Ok(())
     })?;
     println!("Moved goal {:x} to {}", task_id, status);
     Ok(())
 }
 
 fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: String) -> Result<()> {
-    let task_id = with_repo(pile, |repo| {
+    let task_id = parse_full_id(&id)?;
+
+    with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
-        let board = load_board(&mut ws)?;
-        let task_id = resolve_task_id(&id, &board.tasks)?;
         let now = now_stamp();
 
         let note_id = ufoid();
@@ -951,19 +965,20 @@ fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: St
         ws.commit(change, "add goal note");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push note: {e:?}"))?;
-        Ok(task_id)
+        Ok(())
     })?;
     println!("Noted goal {:x}", task_id);
     Ok(())
 }
 
 fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
+    let task_id = parse_full_id(&id)?;
+
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
-        let task_id = resolve_task_id(&id, &board.tasks)?;
 
         let task = board
             .tasks
@@ -1054,13 +1069,14 @@ fn cmd_prioritize(
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
+    let higher_id = parse_full_id(&higher_input)?;
+    let lower_id = parse_full_id(&lower_input)?;
+
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
-        let higher_id = resolve_task_id(&higher_input, &board.tasks)?;
-        let lower_id = resolve_task_id(&lower_input, &board.tasks)?;
 
         if higher_id == lower_id {
             bail!("cannot prioritize a goal over itself");
@@ -1114,13 +1130,14 @@ fn cmd_deprioritize(
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
+    let higher_id = parse_full_id(&higher_input)?;
+    let lower_id = parse_full_id(&lower_input)?;
+
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let board = load_board(&mut ws)?;
-        let higher_id = resolve_task_id(&higher_input, &board.tasks)?;
-        let lower_id = resolve_task_id(&lower_input, &board.tasks)?;
 
         let edges = active_priority_edges(&board.priority_events);
         if !edges.contains(&(higher_id, lower_id)) {
@@ -1145,6 +1162,18 @@ fn cmd_deprioritize(
         let h_title = board.tasks.get(&higher_id).map(|t| t.title.as_str()).unwrap_or("?");
         let l_title = board.tasks.get(&lower_id).map(|t| t.title.as_str()).unwrap_or("?");
         println!("Removed: {h_title} > {l_title}");
+        Ok(())
+    })
+}
+
+fn cmd_resolve(pile: &Path, _branch_name: &str, branch_id: Id, prefix: String) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let board = load_board(&mut ws)?;
+        let id = resolve_task_id(&prefix, &board.tasks)?;
+        println!("{:x}", id);
         Ok(())
     })
 }
@@ -1203,5 +1232,6 @@ fn main() -> Result<()> {
         Command::Deprioritize { higher, over } => {
             cmd_deprioritize(&cli.pile, &cli.branch, branch_id, higher, over)
         }
+        Command::Resolve { prefix } => cmd_resolve(&cli.pile, &cli.branch, branch_id, prefix),
     }
 }

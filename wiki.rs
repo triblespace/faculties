@@ -89,7 +89,7 @@ enum Command {
     },
     /// Create a new version of an existing fragment
     Edit {
-        /// Fragment or version id (prefix accepted)
+        /// Fragment or version id (full 64-char hex id)
         id: String,
         /// New content (optional; inherits previous if omitted). Use @path for file input or @- for stdin.
         content: Option<String>,
@@ -102,7 +102,7 @@ enum Command {
     },
     /// Show a fragment (latest version) or a specific version
     Show {
-        /// Fragment or version id (prefix accepted)
+        /// Fragment or version id (full 64-char hex id)
         id: String,
         /// If id is a version, look up its fragment and show the latest version instead
         #[arg(long)]
@@ -110,12 +110,12 @@ enum Command {
     },
     /// Print raw content without metadata header
     Export {
-        /// Fragment or version id (prefix accepted)
+        /// Fragment or version id (full 64-char hex id)
         id: String,
     },
     /// Compare two versions of a fragment
     Diff {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
         /// First version number (1-based, default: second-to-last)
         #[arg(long)]
@@ -126,17 +126,17 @@ enum Command {
     },
     /// Soft-delete a fragment (adds #archived tag)
     Archive {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
     },
     /// Restore an archived fragment (removes #archived tag)
     Restore {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
     },
     /// Revert a fragment to a previous version
     Revert {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
         /// Version number to revert to (1-based)
         #[arg(long)]
@@ -144,7 +144,7 @@ enum Command {
     },
     /// Show links from/to a fragment (extracted from `[text](<faculty>:<hex>)` references)
     Links {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
     },
     /// List fragments, optionally filtered by tag
@@ -158,7 +158,7 @@ enum Command {
     },
     /// Show version history for a fragment
     History {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
     },
     /// Tag management: add, remove, list, mint
@@ -185,20 +185,25 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Resolve a hex prefix to a full 64-character entity id
+    Resolve {
+        /// Hex prefix (any length)
+        prefix: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum TagCommand {
     /// Add a tag to a fragment (creates a new version)
     Add {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
         /// Tag name
         name: String,
     },
     /// Remove a tag from a fragment (creates a new version)
     Remove {
-        /// Fragment id (prefix accepted)
+        /// Fragment id (full 64-char hex id)
         id: String,
         /// Tag name
         name: String,
@@ -414,6 +419,13 @@ fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
         1 => Ok(matches[0]),
         n => bail!("ambiguous id '{input}' ({n} matches)"),
     }
+}
+
+/// Parse a full 64-character hex ID. Returns an error for any other input.
+fn parse_full_id(input: &str) -> Result<Id> {
+    let trimmed = input.trim();
+    Id::from_hex(trimmed)
+        .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}': expected a full 64-char hex id (use `wiki resolve` to expand a prefix)"))
 }
 
 /// Given an ID, resolve to the fragment it belongs to.
@@ -713,11 +725,10 @@ fn find_links(
     Ok((outgoing, incoming, external))
 }
 
-/// Resolve an id and determine the version to display.
+/// Determine the version to display for a given ID.
 /// If `follow_latest` is true and id is a version, jump to the latest version
 /// of its fragment instead.
-fn resolve_to_show(space: &TribleSet, input: &str, follow_latest: bool) -> Result<Id> {
-    let id = resolve_prefix(space, input)?;
+fn resolve_to_show(space: &TribleSet, id: Id, follow_latest: bool) -> Result<Id> {
     if is_version(space, id) {
         if follow_latest {
             let frag = version_fragment(space, id)
@@ -730,11 +741,20 @@ fn resolve_to_show(space: &TribleSet, input: &str, follow_latest: bool) -> Resul
     } else {
         // Fragment — always show latest version.
         latest_version_of(space, id)
-            .ok_or_else(|| anyhow::anyhow!("no versions for '{input}'"))
+            .ok_or_else(|| anyhow::anyhow!("no versions for {}", fmt_id(id)))
     }
 }
 
 // ── commands ───────────────────────────────────────────────────────────────
+
+fn cmd_resolve(pile: &Path, branch: Option<&str>, prefix: String) -> Result<()> {
+    with_wiki(pile, branch, |_repo, ws| {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let id = resolve_prefix(&space, &prefix)?;
+        println!("{}", fmt_id(id));
+        Ok(())
+    })
+}
 
 fn cmd_create(
     pile: &Path,
@@ -779,9 +799,9 @@ fn cmd_edit(
         bail!("nothing to change — provide content, --title, or --tag");
     }
 
+    let resolved = parse_full_id(&id)?;
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
@@ -814,10 +834,11 @@ fn cmd_edit(
 }
 
 fn cmd_show(pile: &Path, branch: Option<&str>, id: String, follow_latest: bool) -> Result<()> {
+    let parsed_id = parse_full_id(&id)?;
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let vid = resolve_to_show(&space, &id, follow_latest)?;
+        let vid = resolve_to_show(&space, parsed_id, follow_latest)?;
         let fragment_id = version_fragment(&space, vid)
             .ok_or_else(|| anyhow::anyhow!("version has no fragment"))?;
 
@@ -862,9 +883,10 @@ fn cmd_show(pile: &Path, branch: Option<&str>, id: String, follow_latest: bool) 
 }
 
 fn cmd_export(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
+    let parsed_id = parse_full_id(&id)?;
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let vid = resolve_to_show(&space, &id, false)?;
+        let vid = resolve_to_show(&space, parsed_id, false)?;
         let ch = content_handle_of(&space, vid)
             .ok_or_else(|| anyhow::anyhow!("no content"))?;
         let content: View<str> = ws.get(ch)
@@ -881,10 +903,10 @@ fn cmd_diff(
     from: Option<usize>,
     to: Option<usize>,
 ) -> Result<()> {
+    let resolved = parse_full_id(&id)?;
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let history = version_history_of(&space, fragment_id);
         let n = history.len();
@@ -938,9 +960,9 @@ fn cmd_diff(
 }
 
 fn cmd_archive(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
+    let resolved = parse_full_id(&id)?;
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
@@ -968,9 +990,9 @@ fn cmd_archive(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
 }
 
 fn cmd_restore(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
+    let resolved = parse_full_id(&id)?;
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
@@ -1000,9 +1022,9 @@ fn cmd_revert(pile: &Path, branch: Option<&str>, id: String, to: usize) -> Resul
         bail!("version number is 1-based");
     }
 
+    let resolved = parse_full_id(&id)?;
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let history = version_history_of(&space, fragment_id);
 
@@ -1030,9 +1052,9 @@ fn cmd_revert(pile: &Path, branch: Option<&str>, id: String, to: usize) -> Resul
 }
 
 fn cmd_links(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
+    let resolved = parse_full_id(&id)?;
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let resolved = resolve_prefix(&space, &id)?;
         let title = if is_version(&space, resolved) {
             read_title(&space, ws, resolved).unwrap_or_else(|| "?".into())
         } else {
@@ -1151,10 +1173,10 @@ fn cmd_list(
 }
 
 fn cmd_history(pile: &Path, branch: Option<&str>, id: String) -> Result<()> {
+    let resolved = parse_full_id(&id)?;
     with_wiki(pile, branch, |_repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let tag_index = TagIndex::load(ws)?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let history = version_history_of(&space, fragment_id);
 
@@ -1182,10 +1204,10 @@ fn cmd_tag_add(pile: &Path, branch: Option<&str>, id: String, name: String) -> R
     if name.is_empty() {
         bail!("tag name cannot be empty");
     }
+    let resolved = parse_full_id(&id)?;
 
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
@@ -1221,10 +1243,10 @@ fn cmd_tag_remove(pile: &Path, branch: Option<&str>, id: String, name: String) -
     if name.is_empty() {
         bail!("tag name cannot be empty");
     }
+    let resolved = parse_full_id(&id)?;
 
     with_wiki(pile, branch, |repo, ws| {
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let resolved = resolve_prefix(&space, &id)?;
         let fragment_id = to_fragment(&space, resolved)?;
         let prev_vid = latest_version_of(&space, fragment_id)
             .ok_or_else(|| anyhow::anyhow!("no versions for fragment {}", fmt_id(fragment_id)))?;
@@ -1583,5 +1605,6 @@ fn main() -> Result<()> {
         Command::Search { query, context, all } => {
             cmd_search(&cli.pile, branch, query, context, all)
         }
+        Command::Resolve { prefix } => cmd_resolve(&cli.pile, branch, prefix),
     }
 }
