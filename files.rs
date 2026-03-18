@@ -258,7 +258,7 @@ fn read_mime(space: &TribleSet, eid: Id) -> Option<String> {
         pattern!(space, [{ eid @ file::mime: ?m }])
     )
     .next()
-    .map(|(m,)| m.from_value::<&str>().to_string())
+    .map(|(m,)| m.try_from_value::<&str>().expect("invalid utf8 in mime").to_string())
 }
 
 fn content_handle_of(space: &TribleSet, eid: Id) -> Option<FileHandle> {
@@ -337,7 +337,7 @@ fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
         (t: Value<_>),
         pattern!(space, [{ eid @ file::tag: ?t }])
     )
-    .map(|(t,)| t.from_value::<&str>().to_string())
+    .map(|(t,)| t.try_from_value::<&str>().expect("invalid utf8 in tag").to_string())
     .collect()
 }
 
