@@ -7,7 +7,7 @@
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! regex = "1"
-//! triblespace = "0.21"
+//! triblespace = "0.22"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -373,21 +373,19 @@ fn created_at_of(space: &TribleSet, vid: Id) -> Option<i128> {
 /// Get tags for a version entity (excluding KIND_VERSION).
 fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     find!(
-        (tag: Id),
+        tag: Id,
         pattern!(space, [{ vid @ metadata::tag: ?tag }])
     )
-    .filter(|(t,)| *t != KIND_VERSION_ID)
-    .map(|(t,)| t)
+    .filter(|t| *t != KIND_VERSION_ID)
     .collect()
 }
 
 /// Get stored links_to targets for a version entity.
 fn links_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     find!(
-        (target: Id),
+        target: Id,
         pattern!(space, [{ vid @ wiki::links_to: ?target }])
     )
-    .map(|(t,)| t)
     .collect()
 }
 
@@ -675,16 +673,15 @@ fn find_links(
 
     // Incoming: all entities that link_to this ID (direct conjunctive query).
     let mut incoming: Vec<Id> = find!(
-        (source: Id),
+        source: Id,
         pattern!(space, [{ ?source @ wiki::links_to: &id }])
     )
-    .map(|(s,)| s)
     .collect();
     // Also check for links to the fragment if id is a version (or vice versa).
     if is_version(space, id) {
         if let Some(frag) = version_fragment(space, id) {
-            for (s,) in find!(
-                (source: Id),
+            for s in find!(
+                source: Id,
                 pattern!(space, [{ ?source @ wiki::links_to: &frag }])
             ) {
                 incoming.push(s);
@@ -693,8 +690,8 @@ fn find_links(
     } else {
         // id is a fragment — also collect links to any of its versions.
         for vid in version_history_of(space, id) {
-            for (s,) in find!(
-                (source: Id),
+            for s in find!(
+                source: Id,
                 pattern!(space, [{ ?source @ wiki::links_to: &vid }])
             ) {
                 incoming.push(s);

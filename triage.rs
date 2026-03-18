@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
-//! triblespace = "0.21"
+//! triblespace = "0.22"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -569,11 +569,11 @@ fn find_branch_ids_by_name(
             .get(head)
             .map_err(|e| anyhow!("branch metadata: {e:?}"))?;
         let mut names = find!(
-            (handle: TextHandle),
+            handle: TextHandle,
             pattern!(&metadata_set, [{ metadata::name: ?handle }])
         )
         .into_iter();
-        let Some(name) = names.next().map(|(handle,)| handle) else {
+        let Some(name) = names.next() else {
             continue;
         };
         if names.next().is_some() {
@@ -662,8 +662,8 @@ fn load_latest_config(
         ..Default::default()
     };
 
-    if let Some((value,)) = find!(
-        (value: Id),
+    if let Some(value) = find!(
+        value: Id,
         pattern!(&space, [{ config_id @ config::persona_id: ?value }])
     ).next() {
         snapshot.persona_id = Some(value);
@@ -839,8 +839,8 @@ fn collect_reason_state(
 ) -> Result<Vec<ReasonEventRow>> {
     let mut rows: HashMap<Id, ReasonEventRow> = HashMap::new();
 
-    for (reason_id,) in find!(
-        (reason_id: Id),
+    for reason_id in find!(
+        reason_id: Id,
         pattern!(&space, [{ ?reason_id @ metadata::tag: &KIND_REASON_EVENT_ID }])
     ) {
         rows.insert(
@@ -1082,8 +1082,8 @@ fn load_relation_terms(
     ) {
         terms.insert(read_text(&mut ws, handle)?);
     }
-    for (alias,) in find!(
-        (alias: String),
+    for alias in find!(
+        alias: String,
         pattern!(&space, [{ relations::alias: ?alias }])
     ) {
         terms.insert(alias);
@@ -1989,8 +1989,8 @@ fn collect_context_chunks(
 ) -> Result<Vec<ContextChunkRow>> {
     let mut chunks: HashMap<Id, ContextChunkRow> = HashMap::new();
 
-    for (chunk_id,) in find!(
-        (chunk_id: Id),
+    for chunk_id in find!(
+        chunk_id: Id,
         pattern!(&space, [{ ?chunk_id @ metadata::tag: &KIND_CONTEXT_CHUNK_ID }])
     ) {
         chunks.insert(chunk_id, ContextChunkRow {
@@ -2100,16 +2100,16 @@ fn load_budget_from_config(
 
     // Get active model profile id
     let mut active_profile_id: Option<Id> = None;
-    if let Some((value,)) = find!(
-        (value: Id),
+    if let Some(value) = find!(
+        value: Id,
         pattern!(&space, [{ config_id @ config::active_model_profile_id: ?value }])
     ).next() {
         active_profile_id = Some(value);
     }
 
     // Get system prompt length
-    let system_prompt_chars: usize = if let Some((handle,)) = find!(
-        (handle: TextHandle),
+    let system_prompt_chars: usize = if let Some(handle) = find!(
+        handle: TextHandle,
         pattern!(&space, [{ config_id @ config::system_prompt: ?handle }])
     ).next() {
         read_text(&mut ws, handle)?.len()
@@ -2127,26 +2127,26 @@ fn load_budget_from_config(
     let mut safety_margin: u64 = 0;
     let mut chars_per_token: u64 = 4;
 
-    if let Some((value,)) = find!(
-        (value: Value<valueschemas::U256BE>),
+    if let Some(value) = find!(
+        value: Value<valueschemas::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_context_window_tokens: ?value }])
     ).next() {
         context_window = u256be_to_u64(value).unwrap_or(0);
     }
-    if let Some((value,)) = find!(
-        (value: Value<valueschemas::U256BE>),
+    if let Some(value) = find!(
+        value: Value<valueschemas::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_max_output_tokens: ?value }])
     ).next() {
         max_output = u256be_to_u64(value).unwrap_or(0);
     }
-    if let Some((value,)) = find!(
-        (value: Value<valueschemas::U256BE>),
+    if let Some(value) = find!(
+        value: Value<valueschemas::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_context_safety_margin_tokens: ?value }])
     ).next() {
         safety_margin = u256be_to_u64(value).unwrap_or(0);
     }
-    if let Some((value,)) = find!(
-        (value: Value<valueschemas::U256BE>),
+    if let Some(value) = find!(
+        value: Value<valueschemas::U256BE>,
         pattern!(&space, [{ profile_id @ config::model_chars_per_token: ?value }])
     ).next() {
         chars_per_token = u256be_to_u64(value).unwrap_or(4).max(1);
@@ -2586,32 +2586,32 @@ fn cmd_turn(
         let mut stderr_text: Option<String> = None;
         let mut error_text: Option<String> = None;
 
-        if let Some((value,)) = find!(
-            (value: Value<valueschemas::U256BE>),
+        if let Some(value) = find!(
+            value: Value<valueschemas::U256BE>,
             pattern!(&space, [{ rid @ exec::exit_code: ?value }])
         ).next() {
             exit_code = u256be_to_u64(value).map(|n| n as i64);
         }
-        if let Some((value,)) = find!(
-            (value: Value<valueschemas::NsTAIInterval>),
+        if let Some(value) = find!(
+            value: Value<valueschemas::NsTAIInterval>,
             pattern!(&space, [{ rid @ exec::finished_at: ?value }])
         ).next() {
             finished_at = Some(interval_key(value));
         }
-        if let Some((handle,)) = find!(
-            (handle: TextHandle),
+        if let Some(handle) = find!(
+            handle: TextHandle,
             pattern!(&space, [{ rid @ exec::stdout_text: ?handle }])
         ).next() {
             stdout_text = Some(read_text(&mut ws, handle)?);
         }
-        if let Some((handle,)) = find!(
-            (handle: TextHandle),
+        if let Some(handle) = find!(
+            handle: TextHandle,
             pattern!(&space, [{ rid @ exec::stderr_text: ?handle }])
         ).next() {
             stderr_text = Some(read_text(&mut ws, handle)?);
         }
-        if let Some((handle,)) = find!(
-            (handle: TextHandle),
+        if let Some(handle) = find!(
+            handle: TextHandle,
             pattern!(&space, [{ rid @ exec::error: ?handle }])
         ).next() {
             error_text = Some(read_text(&mut ws, handle)?);
@@ -2649,69 +2649,69 @@ fn cmd_turn(
 
         // Find thought via exec result -> about_thought
         let thought_id: Option<Id> = find!(
-            (tid: Id),
+            tid: Id,
             pattern!(&space, [{ &rid @ exec::about_thought: ?tid }])
-        ).next().map(|(tid,)| tid);
+        ).next();
 
         // Find model result via: thought -> model request -> model result
         let model_result_id: Option<Id> = thought_id
             .and_then(|tid| find!(
-                (mreq: Id),
+                mreq: Id,
                 pattern!(&space, [{
                     ?mreq @
                     metadata::tag: &KIND_MODEL_REQUEST_ID,
                     model_chat::about_thought: &tid,
                 }])
-            ).next().map(|(mreq,)| mreq))
+            ).next())
             .and_then(|mreq_id| find!(
-                (mid: Id),
+                mid: Id,
                 pattern!(&space, [{
                     ?mid @
                     metadata::tag: &KIND_MODEL_RESULT_ID,
                     model_chat::about_request: &mreq_id,
                 }])
-            ).next().map(|(mid,)| mid));
+            ).next());
 
         if let Some(mid) = model_result_id {
             let output_text: Option<String> = find!(
-                (handle: TextHandle),
+                handle: TextHandle,
                 pattern!(&space, [{ &mid @ model_chat::output_text: ?handle }])
-            ).next().map(|(h,)| read_text(&mut ws, h)).transpose()?;
+            ).next().map(|h| read_text(&mut ws, h)).transpose()?;
 
             let reasoning_text: Option<String> = find!(
-                (handle: TextHandle),
+                handle: TextHandle,
                 pattern!(&space, [{ &mid @ model_chat::reasoning_text: ?handle }])
-            ).next().map(|(h,)| read_text(&mut ws, h)).transpose()?;
+            ).next().map(|h| read_text(&mut ws, h)).transpose()?;
 
             let model_error: Option<String> = find!(
-                (handle: TextHandle),
+                handle: TextHandle,
                 pattern!(&space, [{ &mid @ model_chat::error: ?handle }])
-            ).next().map(|(h,)| read_text(&mut ws, h)).transpose()?;
+            ).next().map(|h| read_text(&mut ws, h)).transpose()?;
 
             let model_finished: Option<i128> = find!(
-                (value: Value<valueschemas::NsTAIInterval>),
+                value: Value<valueschemas::NsTAIInterval>,
                 pattern!(&space, [{ &mid @ model_chat::finished_at: ?value }])
-            ).next().map(|(v,)| interval_key(v));
+            ).next().map(interval_key);
 
             let input_tokens: Option<u64> = find!(
-                (value: Value<valueschemas::U256BE>),
+                value: Value<valueschemas::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::input_tokens: ?value }])
-            ).next().and_then(|(v,)| u256be_to_u64(v));
+            ).next().and_then(u256be_to_u64);
 
             let output_tokens: Option<u64> = find!(
-                (value: Value<valueschemas::U256BE>),
+                value: Value<valueschemas::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::output_tokens: ?value }])
-            ).next().and_then(|(v,)| u256be_to_u64(v));
+            ).next().and_then(u256be_to_u64);
 
             let cache_creation_tokens: Option<u64> = find!(
-                (value: Value<valueschemas::U256BE>),
+                value: Value<valueschemas::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::cache_creation_input_tokens: ?value }])
-            ).next().and_then(|(v,)| u256be_to_u64(v));
+            ).next().and_then(u256be_to_u64);
 
             let cache_read_tokens: Option<u64> = find!(
-                (value: Value<valueschemas::U256BE>),
+                value: Value<valueschemas::U256BE>,
                 pattern!(&space, [{ &mid @ model_chat::cache_read_input_tokens: ?value }])
-            ).next().and_then(|(v,)| u256be_to_u64(v));
+            ).next().and_then(u256be_to_u64);
 
             println!();
             println!("Model result [{}]", fmt_id(mid));
@@ -2754,8 +2754,8 @@ fn cmd_turn(
 
         // Context summary
         if let Some(tid) = thought_id {
-            let context_json: Option<String> = if let Some((handle,)) = find!(
-                (handle: TextHandle),
+            let context_json: Option<String> = if let Some(handle) = find!(
+                handle: TextHandle,
                 pattern!(&space, [{ tid @ cog::context: ?handle }])
             ).next() {
                 Some(read_text(&mut ws, handle)?)

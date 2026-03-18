@@ -8,7 +8,7 @@
 //! hifitime = "4.2.3"
 //! humantime = "2.1.0"
 //! rand_core = "0.6.4"
-//! triblespace = "0.21"
+//! triblespace = "0.22"
 //! ```
 
 use anyhow::{Result, anyhow, bail};
@@ -453,11 +453,10 @@ fn load_config_identity(
     };
 
     let persona_id = find!(
-        (value: Id),
+        value: Id,
         pattern!(&space, [{ config_id @ config_schema::persona_id: ?value }])
     )
-    .next()
-    .map(|(value,)| value);
+    .next();
 
     Ok(ConfigIdentity {
         persona_id,
@@ -672,11 +671,10 @@ fn load_optional_commit_head(
     attr: Attribute<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
 ) -> Option<CommitHandle> {
     find!(
-        (value: CommitHandle),
+        value: CommitHandle,
         pattern!(space, [{ checkpoint_id @ attr: ?value }])
     )
     .next()
-    .map(|(value,)| value)
 }
 
 fn save_checkpoint_heads(

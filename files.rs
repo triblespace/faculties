@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 //! anybytes = "0.20"
-//! triblespace = "0.21"
+//! triblespace = "0.22"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -254,11 +254,10 @@ fn read_name(
 
 fn read_mime(space: &TribleSet, eid: Id) -> Option<String> {
     find!(
-        (m: String),
+        m: String,
         pattern!(space, [{ eid @ file::mime: ?m }])
     )
     .next()
-    .map(|(m,)| m)
 }
 
 fn content_handle_of(space: &TribleSet, eid: Id) -> Option<FileHandle> {
@@ -334,10 +333,9 @@ fn source_path_of(
 
 fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
     find!(
-        (t: String),
+        t: String,
         pattern!(space, [{ eid @ file::tag: ?t }])
     )
-    .map(|(t,)| t)
     .collect()
 }
 

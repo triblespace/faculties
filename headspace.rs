@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.21"
+//! triblespace = "0.22"
 //! ```
 
 use std::collections::HashMap;
@@ -922,11 +922,10 @@ fn load_string_attr(
 
 fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
     find!(
-        (value: Id),
+        value: Id,
         pattern!(catalog, [{ entity_id @ attr: ?value }])
     )
     .next()
-    .map(|(value,)| value)
 }
 
 fn load_u256_attr(
@@ -935,11 +934,10 @@ fn load_u256_attr(
     attr: Attribute<U256BE>,
 ) -> Option<Value<U256BE>> {
     find!(
-        (value: Value<U256BE>),
+        value: Value<U256BE>,
         pattern!(catalog, [{ entity_id @ attr: ?value }])
     )
     .next()
-    .map(|(value,)| value)
 }
 
 fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {
