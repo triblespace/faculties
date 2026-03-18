@@ -90,7 +90,7 @@ enum Command {
         title: String,
         #[arg(long, default_value = "todo")]
         status: String,
-        /// Parent goal id (full 64-char hex id; use `compass resolve` to look up by prefix)
+        /// Parent goal id (full 32-char hex id; use `compass resolve` to look up by prefix)
         #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
@@ -111,35 +111,35 @@ enum Command {
     },
     /// Move a goal to a new status
     Move {
-        /// Full 64-char hex id
+        /// Full 32-char hex id
         id: String,
         status: String,
     },
     /// Add a note to a goal
     Note {
-        /// Full 64-char hex id
+        /// Full 32-char hex id
         id: String,
         #[arg(help = "Note text. Use @path for file input or @- for stdin.")]
         note: String,
     },
     /// Show a goal with history and notes
     Show {
-        /// Full 64-char hex id
+        /// Full 32-char hex id
         id: String,
     },
     /// Mark a goal as more important than another
     Prioritize {
-        /// The more important goal (full 64-char hex id)
+        /// The more important goal (full 32-char hex id)
         higher: String,
-        /// The less important goal (full 64-char hex id)
+        /// The less important goal (full 32-char hex id)
         #[arg(long)]
         over: String,
     },
     /// Remove a priority relationship
     Deprioritize {
-        /// The goal that was marked more important (full 64-char hex id)
+        /// The goal that was marked more important (full 32-char hex id)
         higher: String,
-        /// The goal it was prioritized over (full 64-char hex id)
+        /// The goal it was prioritized over (full 32-char hex id)
         #[arg(long)]
         over: String,
     },
@@ -430,7 +430,7 @@ fn parse_full_id(input: &str) -> Result<Id> {
     let trimmed = input.trim();
     Id::from_hex(trimmed).ok_or_else(|| {
         anyhow::anyhow!(
-            "invalid goal id '{}': expected a full 64-char hex id\n\
+            "invalid goal id '{}': expected a full 32-char hex id\n\
              Hint: use `compass resolve <prefix>` to look up the full id from a short prefix",
             trimmed
         )

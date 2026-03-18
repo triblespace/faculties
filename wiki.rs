@@ -89,7 +89,7 @@ enum Command {
     },
     /// Create a new version of an existing fragment
     Edit {
-        /// Fragment or version id (full 64-char hex id)
+        /// Fragment or version id (full 32-char hex id)
         id: String,
         /// New content (optional; inherits previous if omitted). Use @path for file input or @- for stdin.
         content: Option<String>,
@@ -102,7 +102,7 @@ enum Command {
     },
     /// Show a fragment (latest version) or a specific version
     Show {
-        /// Fragment or version id (full 64-char hex id)
+        /// Fragment or version id (full 32-char hex id)
         id: String,
         /// If id is a version, look up its fragment and show the latest version instead
         #[arg(long)]
@@ -110,12 +110,12 @@ enum Command {
     },
     /// Print raw content without metadata header
     Export {
-        /// Fragment or version id (full 64-char hex id)
+        /// Fragment or version id (full 32-char hex id)
         id: String,
     },
     /// Compare two versions of a fragment
     Diff {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
         /// First version number (1-based, default: second-to-last)
         #[arg(long)]
@@ -126,17 +126,17 @@ enum Command {
     },
     /// Soft-delete a fragment (adds #archived tag)
     Archive {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
     },
     /// Restore an archived fragment (removes #archived tag)
     Restore {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
     },
     /// Revert a fragment to a previous version
     Revert {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
         /// Version number to revert to (1-based)
         #[arg(long)]
@@ -144,7 +144,7 @@ enum Command {
     },
     /// Show links from/to a fragment (extracted from `[text](<faculty>:<hex>)` references)
     Links {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
     },
     /// List fragments, optionally filtered by tag
@@ -158,7 +158,7 @@ enum Command {
     },
     /// Show version history for a fragment
     History {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
     },
     /// Tag management: add, remove, list, mint
@@ -196,14 +196,14 @@ enum Command {
 enum TagCommand {
     /// Add a tag to a fragment (creates a new version)
     Add {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
         /// Tag name
         name: String,
     },
     /// Remove a tag from a fragment (creates a new version)
     Remove {
-        /// Fragment id (full 64-char hex id)
+        /// Fragment id (full 32-char hex id)
         id: String,
         /// Tag name
         name: String,
@@ -425,7 +425,7 @@ fn resolve_prefix(space: &TribleSet, input: &str) -> Result<Id> {
 fn parse_full_id(input: &str) -> Result<Id> {
     let trimmed = input.trim();
     Id::from_hex(trimmed)
-        .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}': expected a full 64-char hex id (use `wiki resolve` to expand a prefix)"))
+        .ok_or_else(|| anyhow::anyhow!("invalid id '{trimmed}': expected a full 32-char hex id (use `wiki resolve` to expand a prefix)"))
 }
 
 /// Given an ID, resolve to the fragment it belongs to.
