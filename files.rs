@@ -102,12 +102,12 @@ enum Command {
     },
     /// Show metadata for a file, directory, or import
     Show {
-        /// Hash prefix or entity id prefix
+        /// Entity id (32 hex chars) or content hash (64 hex chars)
         id: String,
     },
     /// Extract a file, directory, or import to disk
     Get {
-        /// Hash prefix or entity id prefix (file, directory, or import)
+        /// Entity id (32 hex chars) or content hash (64 hex chars) (file, directory, or import)
         id: String,
         /// Output path (default: original name in current directory)
         #[arg(long, short)]
@@ -115,7 +115,7 @@ enum Command {
     },
     /// Add a tag to a file
     Tag {
-        /// Hash prefix or entity id prefix
+        /// Entity id (32 hex chars) or content hash (64 hex chars)
         id: String,
         /// Tag to add
         name: String,
@@ -341,53 +341,33 @@ fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
 
 /// Resolve a hex prefix to any entity (file, directory, or import).
 /// For files, also matches the content Blake3 hash.
+/// Parse a full entity ID (32 hex chars) or content hash (64 hex chars).
+/// - 32 hex chars: treated as an entity ID (direct lookup)
+/// - 64 hex chars: treated as a Blake3 content hash (find the file entity with that hash)
 fn resolve_entity(space: &TribleSet, input: &str) -> Result<Id> {
-    let needle = input.trim().to_lowercase();
-    if needle.len() < 4 {
-        bail!("prefix too short (need at least 4 hex chars)");
-    }
-    let mut matches = Vec::new();
-
-    // Search files (by entity id and content hash).
-    for (eid, h) in find!(
-        (eid: Id, h: FileHandle),
-        pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
-    ) {
-        let eid_hex = format!("{eid:x}");
-        let hash_hex = handle_hex(h).to_lowercase();
-        if eid_hex.starts_with(&needle) || hash_hex.starts_with(&needle) {
-            matches.push(eid);
+    let trimmed = input.trim();
+    match trimmed.len() {
+        32 => {
+            // Entity ID — direct parse
+            Id::from_hex(trimmed)
+                .ok_or_else(|| anyhow::anyhow!("invalid 32-char hex id '{trimmed}'"))
         }
-    }
-
-    // Search directories (by entity id).
-    for (eid,) in find!(
-        (eid: Id),
-        pattern!(space, [{ ?eid @ metadata::tag: &KIND_DIRECTORY }])
-    ) {
-        let hex = format!("{eid:x}");
-        if hex.starts_with(&needle) && !matches.contains(&eid) {
-            matches.push(eid);
+        64 => {
+            // Content hash — find the file entity with this hash
+            let hash: Value<valueschemas::Hash<valueschemas::Blake3>> =
+                valueschemas::Hash::<valueschemas::Blake3>::from_hex(trimmed)
+                    .map_err(|_| anyhow::anyhow!("invalid 64-char hex hash '{trimmed}'"))?;
+            let handle: FileHandle = valueschemas::Handle::from_hash(hash);
+            find!(
+                eid: Id,
+                pattern!(space, [{ ?eid @ file::content: &handle }])
+            )
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no file with content hash '{trimmed}'"))
         }
-    }
-
-    // Search imports (by entity id).
-    for (eid,) in find!(
-        (eid: Id),
-        pattern!(space, [{ ?eid @ metadata::tag: &KIND_IMPORT }])
-    ) {
-        let hex = format!("{eid:x}");
-        if hex.starts_with(&needle) && !matches.contains(&eid) {
-            matches.push(eid);
-        }
-    }
-
-    matches.sort();
-    matches.dedup();
-    match matches.len() {
-        0 => bail!("no entity matches '{input}'"),
-        1 => Ok(matches[0]),
-        n => bail!("ambiguous prefix '{input}' ({n} matches)"),
+        n => bail!(
+            "expected 32-char hex id or 64-char hex hash, got {n} chars: '{trimmed}'"
+        ),
     }
 }
 
