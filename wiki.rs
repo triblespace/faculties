@@ -7,7 +7,7 @@
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! regex = "1"
-//! triblespace = "0.19"
+//! triblespace = "0.21"
 //! ```
 
 use anyhow::{Context, Result, bail};

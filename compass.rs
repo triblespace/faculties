@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
 //! time = { version = "0.3.36", features = ["formatting", "macros"] }
-//! triblespace = "0.18"
+//! triblespace = "0.21"
 //! ```
 
 use anyhow::{Context, Result, bail};
