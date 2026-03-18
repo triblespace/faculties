@@ -261,14 +261,14 @@ struct ExecRequestRow {
 #[derive(Debug, Clone)]
 struct ExecInProgressRow {
     about_request: Id,
-    started_at: Option<i128>,
+    started_at: i128,
 }
 
 #[derive(Debug, Clone)]
 struct ExecResultRow {
     id: Id,
     about_request: Id,
-    finished_at: Option<i128>,
+    finished_at: i128,
     exit_code: Option<i64>,
     stderr_text: Option<String>,
     error: Option<String>,
@@ -283,19 +283,19 @@ struct ExecState {
 
 #[derive(Debug, Clone)]
 struct ModelRequestRow {
-    requested_at: Option<i128>,
+    requested_at: i128,
 }
 
 #[derive(Debug, Clone)]
 struct ModelInProgressRow {
     about_request: Id,
-    started_at: Option<i128>,
+    started_at: i128,
 }
 
 #[derive(Debug, Clone)]
 struct ModelResultRow {
     about_request: Id,
-    finished_at: Option<i128>,
+    finished_at: i128,
     error: Option<String>,
 }
 
@@ -697,31 +697,29 @@ fn collect_exec_state(
         );
     }
 
-    for (event_id, about_request) in find!(
-        (event_id: Id, about_request: Id),
+    for (about_request, started_at) in find!(
+        (about_request: Id, started_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
-            ?event_id @
+            _?event_id @
             metadata::tag: &KIND_EXEC_IN_PROGRESS_ID,
             exec::about_request: ?about_request,
+            exec::started_at: ?started_at,
         }])
     ) {
-        let started_at = find!(
-            (value: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{ event_id @ exec::started_at: ?value }])
-        ).next().map(|(value,)| interval_key(value));
         state.in_progress.push(ExecInProgressRow {
             about_request,
-            started_at,
+            started_at: interval_key(started_at),
         });
     }
 
     let mut result_map: HashMap<Id, ExecResultRow> = HashMap::new();
-    for (result_id, about_request) in find!(
-        (result_id: Id, about_request: Id),
+    for (result_id, about_request, finished_at) in find!(
+        (result_id: Id, about_request: Id, finished_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?result_id @
             metadata::tag: &KIND_EXEC_RESULT_ID,
             exec::about_request: ?about_request,
+            exec::finished_at: ?finished_at,
         }])
     ) {
         result_map.insert(
@@ -729,21 +727,12 @@ fn collect_exec_state(
             ExecResultRow {
                 id: result_id,
                 about_request,
-                finished_at: None,
+                finished_at: interval_key(finished_at),
                 exit_code: None,
                 stderr_text: None,
                 error: None,
             },
         );
-    }
-
-    for (result_id, value) in find!(
-        (result_id: Id, value: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?result_id @ exec::finished_at: ?value }])
-    ) {
-        if let Some(entry) = result_map.get_mut(&result_id) {
-            entry.finished_at = Some(interval_key(value));
-        }
     }
 
     for (result_id, value) in find!(
@@ -783,68 +772,52 @@ fn collect_model_chat_state(
 ) -> Result<ModelChatState> {
     let mut state = ModelChatState::default();
 
-    for (request_id,) in find!(
-        (request_id: Id),
-        pattern!(&space, [{ ?request_id @ metadata::tag: &KIND_MODEL_REQUEST_ID }])
+    for (request_id, requested_at) in find!(
+        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
+        pattern!(&space, [{
+            ?request_id @
+            metadata::tag: &KIND_MODEL_REQUEST_ID,
+            model_chat::requested_at: ?requested_at,
+        }])
     ) {
         state
             .requests
-            .insert(request_id, ModelRequestRow { requested_at: None });
+            .insert(request_id, ModelRequestRow { requested_at: interval_key(requested_at) });
     }
 
-    for (request_id, requested_at) in find!(
-        (request_id: Id, requested_at: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?request_id @ model_chat::requested_at: ?requested_at }])
-    ) {
-        if let Some(entry) = state.requests.get_mut(&request_id) {
-            entry.requested_at = Some(interval_key(requested_at));
-        }
-    }
-
-    for (event_id, about_request) in find!(
-        (event_id: Id, about_request: Id),
+    for (about_request, started_at) in find!(
+        (about_request: Id, started_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
-            ?event_id @
+            _?event_id @
             metadata::tag: &KIND_MODEL_IN_PROGRESS_ID,
             model_chat::about_request: ?about_request,
+            model_chat::started_at: ?started_at,
         }])
     ) {
-        let started_at = find!(
-            (value: Value<valueschemas::NsTAIInterval>),
-            pattern!(&space, [{ event_id @ model_chat::started_at: ?value }])
-        ).next().map(|(value,)| interval_key(value));
         state.in_progress.push(ModelInProgressRow {
             about_request,
-            started_at,
+            started_at: interval_key(started_at),
         });
     }
 
     let mut result_map: HashMap<Id, ModelResultRow> = HashMap::new();
-    for (result_id, about_request) in find!(
-        (result_id: Id, about_request: Id),
+    for (result_id, about_request, finished_at) in find!(
+        (result_id: Id, about_request: Id, finished_at: Value<valueschemas::NsTAIInterval>),
         pattern!(&space, [{
             ?result_id @
             metadata::tag: &KIND_MODEL_RESULT_ID,
             model_chat::about_request: ?about_request,
+            model_chat::finished_at: ?finished_at,
         }])
     ) {
         result_map.insert(
             result_id,
             ModelResultRow {
                 about_request,
-                finished_at: None,
+                finished_at: interval_key(finished_at),
                 error: None,
             },
         );
-    }
-
-    for (result_id, value) in find!(
-        (result_id: Id, value: Value<valueschemas::NsTAIInterval>),
-        pattern!(&space, [{ ?result_id @ model_chat::finished_at: ?value }])
-    ) {
-        if let Some(entry) = result_map.get_mut(&result_id) {
-            entry.finished_at = Some(interval_key(value));
-        }
     }
 
     for (result_id, handle) in find!(
@@ -959,8 +932,7 @@ fn stale_exec_in_progress_count(state: &ExecState, now_key: i128, stale_ns: i128
         .in_progress
         .iter()
         .filter(|row| !done.contains(&row.about_request))
-        .filter_map(|row| row.started_at)
-        .filter(|started| now_key.saturating_sub(*started) >= stale_ns)
+        .filter(|row| now_key.saturating_sub(row.started_at) >= stale_ns)
         .count()
 }
 
@@ -970,8 +942,7 @@ fn stale_model_in_progress_count(state: &ModelChatState, now_key: i128, stale_ns
         .in_progress
         .iter()
         .filter(|row| !done.contains(&row.about_request))
-        .filter_map(|row| row.started_at)
-        .filter(|started| now_key.saturating_sub(*started) >= stale_ns)
+        .filter(|row| now_key.saturating_sub(row.started_at) >= stale_ns)
         .count()
 }
 
@@ -1002,7 +973,7 @@ fn collect_exec_attempts(state: &ExecState, recent: usize) -> Vec<ExecAttempt> {
         .results
         .iter()
         .filter_map(|result| {
-            let finished_at = result.finished_at?;
+            let finished_at = result.finished_at;
             let request = state.requests.get(&result.about_request)?;
             let command = request.command.clone();
             let fingerprint = result
@@ -1280,10 +1251,7 @@ fn cmd_scan(
         println!("- none in recent window");
     } else {
         for row in recent_model_failures {
-            let age = row
-                .finished_at
-                .map(|at| format_age(now_key, at))
-                .unwrap_or_else(|| "-".to_string());
+            let age = format_age(now_key, row.finished_at);
             let detail = row
                 .error
                 .as_deref()
@@ -1353,7 +1321,7 @@ fn collect_recent_model_failures(state: &ModelChatState, recent: usize) -> Vec<M
         .filter(|row| row.error.is_some())
         .cloned()
         .collect();
-    failures.sort_by_key(|row| row.finished_at.unwrap_or(i128::MIN));
+    failures.sort_by_key(|row| row.finished_at);
     failures.reverse();
     failures.into_iter().take(recent.min(5)).collect()
 }
@@ -1649,7 +1617,7 @@ fn build_timeline_rows(
         .collect();
 
     for result in &exec_state.results {
-        let at = result.finished_at.unwrap_or(i128::MIN);
+        let at = result.finished_at;
         let command = request_commands
             .get(&result.about_request)
             .cloned()
@@ -1683,21 +1651,17 @@ fn build_timeline_rows(
         });
     }
 
-    for request in model_state.requests.keys() {
-        if let Some(entry) = model_state.requests.get(request) {
-            if let Some(at) = entry.requested_at {
-                rows.push(TimelineRow {
-                    at,
-                    source: "model",
-                    detail: format!("[{}] request", fmt_id(*request)),
-                });
-            }
-        }
+    for (request_id, entry) in &model_state.requests {
+        rows.push(TimelineRow {
+            at: entry.requested_at,
+            source: "model",
+            detail: format!("[{}] request", fmt_id(*request_id)),
+        });
     }
     for result in &model_state.results {
         if let Some(error) = result.error.as_ref() {
             rows.push(TimelineRow {
-                at: result.finished_at.unwrap_or(i128::MIN),
+                at: result.finished_at,
                 source: "model-error",
                 detail: truncate_single_line(error, 130),
             });
