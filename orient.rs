@@ -453,11 +453,11 @@ fn load_config_identity(
     };
 
     let persona_id = find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config_schema::persona_id: ?value }])
+        (value: Id),
+        pattern!(&space, [{ config_id @ config_schema::persona_id: ?value }])
     )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == config_id).then_some(Id::from_value(&value)));
+    .next()
+    .map(|(value,)| value);
 
     Ok(ConfigIdentity {
         persona_id,
@@ -672,11 +672,11 @@ fn load_optional_commit_head(
     attr: Attribute<valueschemas::Handle<valueschemas::Blake3, blobschemas::SimpleArchive>>,
 ) -> Option<CommitHandle> {
     find!(
-        (entity: Id, value: CommitHandle),
-        pattern!(space, [{ ?entity @ attr: ?value }])
+        (value: CommitHandle),
+        pattern!(space, [{ checkpoint_id @ attr: ?value }])
     )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == checkpoint_id).then_some(value))
+    .next()
+    .map(|(value,)| value)
 }
 
 fn save_checkpoint_heads(

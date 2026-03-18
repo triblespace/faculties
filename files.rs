@@ -254,11 +254,11 @@ fn read_name(
 
 fn read_mime(space: &TribleSet, eid: Id) -> Option<String> {
     find!(
-        (m: Value<_>),
+        (m: String),
         pattern!(space, [{ eid @ file::mime: ?m }])
     )
     .next()
-    .map(|(m,)| m.try_from_value::<&str>().expect("invalid utf8 in mime").to_string())
+    .map(|(m,)| m)
 }
 
 fn content_handle_of(space: &TribleSet, eid: Id) -> Option<FileHandle> {
@@ -334,10 +334,10 @@ fn source_path_of(
 
 fn tags_of(space: &TribleSet, eid: Id) -> Vec<String> {
     find!(
-        (t: Value<_>),
+        (t: String),
         pattern!(space, [{ eid @ file::tag: ?t }])
     )
-    .map(|(t,)| t.try_from_value::<&str>().expect("invalid utf8 in tag").to_string())
+    .map(|(t,)| t)
     .collect()
 }
 

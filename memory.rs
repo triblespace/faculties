@@ -552,14 +552,13 @@ fn print_archive_meta(
 
     // Author (as id prefix).
     for (_msg_id, author_id) in find!(
-        (msg_id: Id, author_id: Value<GenId>),
+        (msg_id: Id, author_id: Id),
         pattern!(&archive_catalog, [{
             ?msg_id @
             archive_schema::author: ?author_id,
         }])
     ) {
         if _msg_id == archive_msg_id {
-            let author_id = Id::from_value(&author_id);
             // Try to resolve author name.
             let mut author_name: Option<String> = None;
             for (_aid, name_handle) in find!(
@@ -585,17 +584,14 @@ fn print_archive_meta(
 
     // Source format.
     for (_msg_id, fmt) in find!(
-        (msg_id: Id, fmt: Value<ShortString>),
+        (msg_id: Id, fmt: String),
         pattern!(&archive_catalog, [{
             ?msg_id @
             archive_import_schema::source_format: ?fmt,
         }])
     ) {
         if _msg_id == archive_msg_id {
-            let fmt_str = std::str::from_utf8(&fmt.raw)
-                .unwrap_or("<invalid utf8>")
-                .trim_end_matches('\0');
-            println!("  source_format: {}", fmt_str);
+            println!("  source_format: {}", fmt);
             break;
         }
     }
@@ -787,7 +783,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
     }
 
     for (chunk_id, child) in find!(
-        (chunk_id: Id, child: Value<GenId>),
+        (chunk_id: Id, child: Id),
         pattern!(space, [{
             ?chunk_id @
             metadata::tag: &KIND_CHUNK_ID,
@@ -795,12 +791,12 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.children.push(Id::from_value(&child));
+            chunk.children.push(child);
         }
     }
 
     for (chunk_id, child) in find!(
-        (chunk_id: Id, child: Value<GenId>),
+        (chunk_id: Id, child: Id),
         pattern!(space, [{
             ?chunk_id @
             metadata::tag: &KIND_CHUNK_ID,
@@ -808,12 +804,12 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.children.push(Id::from_value(&child));
+            chunk.children.push(child);
         }
     }
 
     for (chunk_id, child) in find!(
-        (chunk_id: Id, child: Value<GenId>),
+        (chunk_id: Id, child: Id),
         pattern!(space, [{
             ?chunk_id @
             metadata::tag: &KIND_CHUNK_ID,
@@ -821,12 +817,12 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.children.push(Id::from_value(&child));
+            chunk.children.push(child);
         }
     }
 
     for (chunk_id, exec_id) in find!(
-        (chunk_id: Id, exec_id: Value<GenId>),
+        (chunk_id: Id, exec_id: Id),
         pattern!(space, [{
             ?chunk_id @
             metadata::tag: &KIND_CHUNK_ID,
@@ -834,12 +830,12 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.about_exec_result = Some(Id::from_value(&exec_id));
+            chunk.about_exec_result = Some(exec_id);
         }
     }
 
     for (chunk_id, archive_id) in find!(
-        (chunk_id: Id, archive_id: Value<GenId>),
+        (chunk_id: Id, archive_id: Id),
         pattern!(space, [{
             ?chunk_id @
             metadata::tag: &KIND_CHUNK_ID,
@@ -847,7 +843,7 @@ fn load_chunks(space: &TribleSet) -> HashMap<Id, Chunk> {
         }])
     ) {
         if let Some(chunk) = chunks.get_mut(&chunk_id) {
-            chunk.about_archive_message = Some(Id::from_value(&archive_id));
+            chunk.about_archive_message = Some(archive_id);
         }
     }
 

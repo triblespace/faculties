@@ -527,7 +527,7 @@ fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
 
         let mut latest: HashMap<Id, (Id, i128)> = HashMap::new();
         for (entry_id, profile_id, updated_at) in find!(
-            (entry_id: Id, profile_id: Value<GenId>, updated_at: Value<NsTAIInterval>),
+            (entry_id: Id, profile_id: Id, updated_at: Value<NsTAIInterval>),
             pattern!(&catalog, [{
                 ?entry_id @
                 metadata::tag: KIND_MODEL_PROFILE_ID,
@@ -535,7 +535,6 @@ fn list_model_profiles(pile_path: &Path) -> Result<Vec<ModelProfileSummary>> {
                 playground_config::model_profile_id: ?profile_id,
             }])
         ) {
-            let profile_id = Id::from_value(&profile_id);
             let key = interval_key(updated_at);
             latest
                 .entry(profile_id)
@@ -903,13 +902,11 @@ fn load_string_attr(
     attr: Attribute<Handle<Blake3, LongString>>,
 ) -> Result<Option<String>> {
     let mut handles = find!(
-        (entity: Id, handle: Value<Handle<Blake3, LongString>>),
-        pattern!(catalog, [{ ?entity @ attr: ?handle }])
-    )
-    .into_iter()
-    .filter(|(entity, _)| *entity == entity_id);
+        (handle: Value<Handle<Blake3, LongString>>),
+        pattern!(catalog, [{ entity_id @ attr: ?handle }])
+    );
 
-    let Some((_, handle)) = handles.next() else {
+    let Some((handle,)) = handles.next() else {
         return Ok(None);
     };
     if handles.next().is_some() {
@@ -925,11 +922,11 @@ fn load_string_attr(
 
 fn load_id_attr(catalog: &TribleSet, entity_id: Id, attr: Attribute<GenId>) -> Option<Id> {
     find!(
-        (entity: Id, value: Value<GenId>),
-        pattern!(catalog, [{ ?entity @ attr: ?value }])
+        (value: Id),
+        pattern!(catalog, [{ entity_id @ attr: ?value }])
     )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == entity_id).then_some(Id::from_value(&value)))
+    .next()
+    .map(|(value,)| value)
 }
 
 fn load_u256_attr(
@@ -938,11 +935,11 @@ fn load_u256_attr(
     attr: Attribute<U256BE>,
 ) -> Option<Value<U256BE>> {
     find!(
-        (entity: Id, value: Value<U256BE>),
-        pattern!(catalog, [{ ?entity @ attr: ?value }])
+        (value: Value<U256BE>),
+        pattern!(catalog, [{ entity_id @ attr: ?value }])
     )
-    .into_iter()
-    .find_map(|(entity, value)| (entity == entity_id).then_some(value))
+    .next()
+    .map(|(value,)| value)
 }
 
 fn u256be_to_u64(value: Value<U256BE>) -> Option<u64> {

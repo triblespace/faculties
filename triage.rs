@@ -662,14 +662,11 @@ fn load_latest_config(
         ..Default::default()
     };
 
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::persona_id: ?value }])
-    ) {
-        if entity == config_id {
-            snapshot.persona_id = Some(value.from_value());
-            break;
-        }
+    if let Some((value,)) = find!(
+        (value: Id),
+        pattern!(&space, [{ config_id @ config::persona_id: ?value }])
+    ).next() {
+        snapshot.persona_id = Some(value);
     }
 
     Ok(Some(snapshot))
@@ -1140,10 +1137,9 @@ fn load_relation_terms(
         terms.insert(read_text(&mut ws, handle)?);
     }
     for (alias,) in find!(
-        (alias: Value<valueschemas::ShortString>),
+        (alias: String),
         pattern!(&space, [{ relations::alias: ?alias }])
     ) {
-        let alias: String = alias.from_value();
         terms.insert(alias);
     }
 
@@ -2164,27 +2160,22 @@ fn load_budget_from_config(
 
     // Get active model profile id
     let mut active_profile_id: Option<Id> = None;
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::GenId>),
-        pattern!(&space, [{ ?entity @ config::active_model_profile_id: ?value }])
-    ) {
-        if entity == config_id {
-            active_profile_id = Some(value.from_value());
-            break;
-        }
+    if let Some((value,)) = find!(
+        (value: Id),
+        pattern!(&space, [{ config_id @ config::active_model_profile_id: ?value }])
+    ).next() {
+        active_profile_id = Some(value);
     }
 
     // Get system prompt length
-    let mut system_prompt_chars: usize = 0;
-    for (entity, handle) in find!(
-        (entity: Id, handle: TextHandle),
-        pattern!(&space, [{ ?entity @ config::system_prompt: ?handle }])
-    ) {
-        if entity == config_id {
-            system_prompt_chars = read_text(&mut ws, handle)?.len();
-            break;
-        }
-    }
+    let system_prompt_chars: usize = if let Some((handle,)) = find!(
+        (handle: TextHandle),
+        pattern!(&space, [{ config_id @ config::system_prompt: ?handle }])
+    ).next() {
+        read_text(&mut ws, handle)?.len()
+    } else {
+        0
+    };
 
     // Find model profile
     let Some(profile_id) = active_profile_id else {
@@ -2196,41 +2187,29 @@ fn load_budget_from_config(
     let mut safety_margin: u64 = 0;
     let mut chars_per_token: u64 = 4;
 
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::U256BE>),
-        pattern!(&space, [{ ?entity @ config::model_context_window_tokens: ?value }])
-    ) {
-        if entity == profile_id {
-            context_window = u256be_to_u64(value).unwrap_or(0);
-            break;
-        }
+    if let Some((value,)) = find!(
+        (value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ profile_id @ config::model_context_window_tokens: ?value }])
+    ).next() {
+        context_window = u256be_to_u64(value).unwrap_or(0);
     }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::U256BE>),
-        pattern!(&space, [{ ?entity @ config::model_max_output_tokens: ?value }])
-    ) {
-        if entity == profile_id {
-            max_output = u256be_to_u64(value).unwrap_or(0);
-            break;
-        }
+    if let Some((value,)) = find!(
+        (value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ profile_id @ config::model_max_output_tokens: ?value }])
+    ).next() {
+        max_output = u256be_to_u64(value).unwrap_or(0);
     }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::U256BE>),
-        pattern!(&space, [{ ?entity @ config::model_context_safety_margin_tokens: ?value }])
-    ) {
-        if entity == profile_id {
-            safety_margin = u256be_to_u64(value).unwrap_or(0);
-            break;
-        }
+    if let Some((value,)) = find!(
+        (value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ profile_id @ config::model_context_safety_margin_tokens: ?value }])
+    ).next() {
+        safety_margin = u256be_to_u64(value).unwrap_or(0);
     }
-    for (entity, value) in find!(
-        (entity: Id, value: Value<valueschemas::U256BE>),
-        pattern!(&space, [{ ?entity @ config::model_chars_per_token: ?value }])
-    ) {
-        if entity == profile_id {
-            chars_per_token = u256be_to_u64(value).unwrap_or(4).max(1);
-            break;
-        }
+    if let Some((value,)) = find!(
+        (value: Value<valueschemas::U256BE>),
+        pattern!(&space, [{ profile_id @ config::model_chars_per_token: ?value }])
+    ).next() {
+        chars_per_token = u256be_to_u64(value).unwrap_or(4).max(1);
     }
 
     let body_budget_chars = ((context_window as i64) - (max_output as i64) - (safety_margin as i64))
