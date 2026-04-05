@@ -1307,71 +1307,129 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
 }
 
 fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<()> {
-    let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let latest = latest_versions(&space);
+    // Dry-run and check modes: single pull, no commits.
+    if !do_fix {
+        let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let latest = latest_versions(&space);
 
-    let mut changed = 0u32;
-    let mut errors = 0u32;
-    let mut checked = 0u32;
+        let mut changed = 0u32;
+        let mut checked = 0u32;
 
-    for (&frag_id, &(vid, _ts)) in &latest {
-        let Some(ch) = content_handle_of(&space, vid) else { continue; };
-        let Ok(content) = ws.get::<View<str>, _>(ch) else { continue; };
-        let original = content.as_ref().to_string();
-        checked += 1;
+        for (&frag_id, &(vid, _ts)) in &latest {
+            let Some(ch) = content_handle_of(&space, vid) else { continue; };
+            let Ok(content) = ws.get::<View<str>, _>(ch) else { continue; };
+            let original = content.as_ref().to_string();
+            checked += 1;
 
-        let fixed = lint_fix(&original, &space);
-
-        if fixed != original {
-            changed += 1;
-            let title = read_title(&space, &mut ws, vid).unwrap_or_default();
-
-            if check_only {
-                eprintln!("LINT {:x} — {title}", frag_id);
-                errors += 1;
-            } else if do_fix {
-                // Validate typst on the fixed version
-                if let Err(e) = validate_typst(&fixed) {
-                    eprintln!("LINT_TYPST_ERROR {:x} — {title}: {e}", frag_id);
-                    errors += 1;
-                    continue;
-                }
-                let tag_ids = tags_of(&space, vid);
-                let content_handle = ws.put(fixed);
-                let change = TribleSet::new();
-                match commit_version(
-                    repo, &mut ws, change, frag_id, &title, content_handle,
-                    &tag_ids, &space, "wiki lint --fix", true,
-                ) {
-                    Ok(new_vid) => println!("FIXED {:x} — {title} → {new_vid}", frag_id),
-                    Err(e) => {
-                        eprintln!("LINT_COMMIT_ERROR {:x} — {title}: {e}", frag_id);
-                        errors += 1;
-                    }
-                }
-            } else {
-                // Dry-run: show what would change
-                println!("WOULD FIX {:x} — {title}", frag_id);
-                // Show a compact summary of changes
-                let orig_lines: Vec<&str> = original.lines().collect();
-                let fixed_lines: Vec<&str> = fixed.lines().collect();
-                for (i, (o, f)) in orig_lines.iter().zip(fixed_lines.iter()).enumerate() {
-                    if o != f {
-                        println!("  L{}: - {}", i + 1, o);
-                        println!("  L{}: + {}", i + 1, f);
+            let fixed = lint_fix(&original, &space);
+            if fixed != original {
+                changed += 1;
+                let title = read_title(&space, &mut ws, vid).unwrap_or_default();
+                if check_only {
+                    eprintln!("LINT {:x} — {title}", frag_id);
+                } else {
+                    println!("WOULD FIX {:x} — {title}", frag_id);
+                    let orig_lines: Vec<&str> = original.lines().collect();
+                    let fixed_lines: Vec<&str> = fixed.lines().collect();
+                    for (i, (o, f)) in orig_lines.iter().zip(fixed_lines.iter()).enumerate() {
+                        if o != f {
+                            println!("  L{}: - {}", i + 1, o);
+                            println!("  L{}: + {}", i + 1, f);
+                        }
                     }
                 }
             }
         }
+
+        println!();
+        println!("Checked: {checked}, Changed: {changed}");
+        if check_only && changed > 0 {
+            bail!("{changed} fragments need lint fixes");
+        }
+        return Ok(());
     }
 
-    println!();
-    println!("Checked: {checked}, Changed: {changed}, Errors: {errors}");
-    if check_only && changed > 0 {
-        bail!("{changed} fragments need lint fixes");
+    // Fix mode: CAS loop like cmd_import_all. Accumulate all changes, try_push
+    // once, retry on conflict. No new tags needed — lint preserves existing tags.
+    let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+
+    loop {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let latest = latest_versions(&space);
+
+        let mut change = TribleSet::new();
+        let mut fixed_count = 0u32;
+        let mut error_count = 0u32;
+        let mut checked = 0u32;
+
+        for (&frag_id, &(vid, _ts)) in &latest {
+            let Some(ch) = content_handle_of(&space, vid) else { continue; };
+            let Ok(content) = ws.get::<View<str>, _>(ch) else { continue; };
+            let original = content.as_ref().to_string();
+            checked += 1;
+
+            let fixed = lint_fix(&original, &space);
+            if fixed == original { continue; }
+
+            let title = read_title(&space, &mut ws, vid).unwrap_or_default();
+
+            if let Err(e) = validate_typst(&fixed) {
+                eprintln!("LINT_TYPST_ERROR {:x} — {title}: {e}", frag_id);
+                error_count += 1;
+                continue;
+            }
+
+            // Build new version entity directly (same pattern as cmd_import_all).
+            let tag_ids = tags_of(&space, vid);
+            let content_handle = ws.put(fixed);
+            let content_text: View<str> = match ws.get(content_handle) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("LINT_READ_ERROR {:x}: {e:?}", frag_id);
+                    error_count += 1;
+                    continue;
+                }
+            };
+            let (internal_links, _) = extract_references(content_text.as_ref(), &space);
+            let link_targets: Vec<Id> = internal_links
+                .into_iter().map(|l| l.target).filter(|&id| id != frag_id).collect();
+            let mut all_tags = tag_ids;
+            all_tags.push(KIND_VERSION_ID);
+            all_tags.sort(); all_tags.dedup();
+            let title_handle = ws.put(title.clone());
+            let version = entity! { _ @
+                wiki::fragment: &frag_id,
+                wiki::title: title_handle,
+                wiki::content: content_handle,
+                metadata::created_at: now_tai(),
+                metadata::tag*: all_tags.iter(),
+                wiki::links_to*: link_targets.iter(),
+            };
+            change += version;
+            fixed_count += 1;
+            println!("FIXED {:x} — {title}", frag_id);
+        }
+
+        if fixed_count == 0 {
+            println!("Checked: {checked}, Changed: 0, Errors: {error_count}");
+            return Ok(());
+        }
+
+        ws.commit(change, "wiki lint --fix");
+        match repo.try_push(&mut ws) {
+            Ok(None) => {
+                println!();
+                println!("Checked: {checked}, Fixed: {fixed_count}, Errors: {error_count}");
+                return Ok(());
+            }
+            Ok(Some(conflict_ws)) => {
+                eprintln!("Push conflict — retrying...");
+                ws = conflict_ws;
+            }
+            Err(e) => bail!("push failed: {e:?}"),
+        }
     }
-    Ok(())
 }
 
 fn cmd_export_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
