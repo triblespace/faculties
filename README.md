@@ -12,13 +12,17 @@ sessions.
 Each faculty is a single `.rs` file you can run directly:
 
 ```sh
-compass.rs --pile ./self.pile list
-wiki.rs --pile ./self.pile search "typst"
-orient.rs --pile ./self.pile
+export PILE=./self.pile        # set once per shell
+compass.rs list
+wiki.rs search "typst"
+orient.rs show
 ```
 
-No compilation step, no framework to set up. Drop the file into any agent's
-workspace, put the directory on PATH, and the tool is available.
+No compilation step, no framework to set up. Drop the files into any
+agent's workspace, put the directory on `PATH`, set `PILE`, and the
+tools are available. Every faculty honors the `PILE` environment
+variable — you can still pass `--pile <path>` explicitly if you need
+to operate on a different pile for a single call.
 
 ## Why
 
@@ -61,18 +65,26 @@ telling the tool what to show you next, and the history falls out naturally.
 ## Using
 
 ```sh
-# Direct invocation (files are executable with a rust-script shebang)
-./compass.rs --pile ./self.pile list
+# Point all faculties at a pile once per shell session.
+export PILE=./self.pile
 
-# Or add the directory to PATH
+# Put the faculties on PATH.
 export PATH="$(pwd):$PATH"
-compass.rs --pile ./self.pile list
+
+# Now invoke faculties directly — no --pile ceremony on every call.
+compass.rs list
+wiki.rs search "typst"
+orient.rs show
 ```
 
-Most faculties accept `--pile` (defaulting to `./self.pile`) and operate on
-a named branch of that pile. They're designed to coexist — multiple
-faculties on the same pile, each owning its own branch, all rooted in the
-same content-addressed blob store.
+Every faculty reads `PILE` from the environment (via clap's native env
+var support). You can still pass `--pile <path>` explicitly to override
+the env var for a single call — useful when you want to operate on a
+different pile temporarily.
+
+Faculties operate on named branches of the pile and are designed to
+coexist — multiple faculties on the same pile, each owning its own
+branch, all rooted in the same content-addressed blob store.
 
 ## Contributing
 
