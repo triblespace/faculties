@@ -34,7 +34,10 @@ const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32 * 1024;
 const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 1024;
 const DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS: u64 = 512;
 const DEFAULT_CHARS_PER_TOKEN: u64 = 4;
-const DEFAULT_SYSTEM_PROMPT: &str = include_str!("../prompts/system_prompt.md");
+/// Minimal starting prompt used when no system prompt has been configured.
+/// Intentionally short and generic — specific agent runtimes should override
+/// this with their own prompt via `headspace set system-prompt @<file>`.
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a terminal-based agent. Respond with exactly one shell command per turn. You can include an optional leading comment block for context. Faculties are executable helper scripts in ./faculties; run them with no arguments to see usage and prefer them over ad-hoc commands when applicable.";
 
 const DEFAULT_BRANCH: &str = "cognition";
 const DEFAULT_AUTHOR: &str = "agent";
