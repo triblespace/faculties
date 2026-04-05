@@ -387,10 +387,9 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         let relations_space = relations_ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
 
         // Verify persona exists in relations.
-        let reader_exists = find!(
-            _id: Id,
+        let reader_exists = exists!(
             pattern!(&relations_space, [{ reader_id @ metadata::tag: &KIND_PERSON_ID }])
-        ).next().is_some();
+        );
         if !reader_exists {
             bail!(
                 "persona_id {:x} missing from relations (add via relations faculty)",

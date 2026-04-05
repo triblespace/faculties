@@ -46,8 +46,8 @@ mod exec_schema {
 )]
 struct Cli {
     /// Path to the pile file.
-    #[arg(long)]
-    pile: Option<PathBuf>,
+    #[arg(long, env = "PILE")]
+    pile: PathBuf,
     /// Target branch name for timeout extension events.
     #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
@@ -83,13 +83,6 @@ fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
-}
-
-fn resolve_pile_path(cli: &Cli) -> PathBuf {
-    cli.pile
-        .clone()
-        .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
-        .expect("--pile argument or PILE env var required")
 }
 
 fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
@@ -232,7 +225,7 @@ fn run_command(command: &[String]) -> Result<i32> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pile_path = resolve_pile_path(&cli);
+    let pile_path = cli.pile.clone();
     let Some(duration_raw) = cli.duration.as_ref() else {
         let mut cmd = Cli::command();
         cmd.print_help()?;

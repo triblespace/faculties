@@ -1815,7 +1815,8 @@ fn repair_named_duplicates(
         .map_err(|err| anyhow!("pull canonical branch {canonical_id:x}: {err:?}"))?;
     let mut canonical_data = canonical_ws
         .checkout(..)
-        .map_err(|err| anyhow!("checkout canonical branch {canonical_id:x}: {err:?}"))?;
+        .map_err(|err| anyhow!("checkout canonical branch {canonical_id:x}: {err:?}"))?
+        .into_facts();
 
     for duplicate_id in duplicate_ids {
         let mut duplicate_ws = match repo.pull(duplicate_id) {
@@ -1829,7 +1830,7 @@ fn repair_named_duplicates(
             }
         };
         let duplicate_data = match duplicate_ws.checkout(..) {
-            Ok(set) => set,
+            Ok(set) => set.into_facts(),
             Err(err) => {
                 outcome.skipped_branches += 1;
                 eprintln!(

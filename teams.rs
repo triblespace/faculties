@@ -312,8 +312,8 @@ const DEFAULT_DELTA_URL: &str =
 #[command(name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
 struct Cli {
     /// Path to the pile file to write into.
-    #[arg(long)]
-    pile: Option<PathBuf>,
+    #[arg(long, env = "PILE")]
+    pile: PathBuf,
     /// Branch name to write into (created if missing).
     #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
@@ -694,11 +694,7 @@ fn with_repo<T>(
 }
 
 fn build_config(cli: &Cli) -> Result<TeamsBridgeConfig> {
-    let pile_path = cli
-        .pile
-        .clone()
-        .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
-        .expect("--pile argument or PILE env var required");
+    let pile_path = cli.pile.clone();
     let branch = std::env::var("TRIBLESPACE_BRANCH").ok().unwrap_or_else(|| cli.branch.clone());
     let log_branch = std::env::var("TRIBLESPACE_LOG_BRANCH")
         .ok()

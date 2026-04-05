@@ -30,15 +30,15 @@ use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
-#[path = "../importers/archive_import_chatgpt.rs"]
+#[path = "importers/archive_import_chatgpt.rs"]
 mod archive_import_chatgpt;
-#[path = "../importers/archive_import_codex.rs"]
+#[path = "importers/archive_import_codex.rs"]
 mod archive_import_codex;
-#[path = "../importers/archive_import_copilot.rs"]
+#[path = "importers/archive_import_copilot.rs"]
 mod archive_import_copilot;
-#[path = "../importers/archive_import_gemini.rs"]
+#[path = "importers/archive_import_gemini.rs"]
 mod archive_import_gemini;
-#[path = "../importers/archive_import_claude_code.rs"]
+#[path = "importers/archive_import_claude_code.rs"]
 mod archive_import_claude_code;
 mod common {
     #![allow(dead_code)]
@@ -535,8 +535,8 @@ mod common {
 #[command(name = "archive", about = "Query imported archives in TribleSpace")]
 struct Cli {
     /// Path to the pile file to query.
-    #[arg(long)]
-    pile: Option<PathBuf>,
+    #[arg(long, env = "PILE")]
+    pile: PathBuf,
     /// Branch name to query.
     #[arg(long, default_value = "archive")]
     branch: String,
@@ -1129,11 +1129,7 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.trace, cli.trace_filter.as_deref());
-    let pile_path = cli
-        .pile
-        .clone()
-        .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
-        .expect("--pile argument or PILE env var required");
+    let pile_path = cli.pile.clone();
     let Some(cmd) = cli.command else {
         let mut command = Cli::command();
         command.print_help()?;

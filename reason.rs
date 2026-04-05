@@ -44,8 +44,8 @@ mod reason_schema {
 )]
 struct Cli {
     /// Path to the pile file.
-    #[arg(long)]
-    pile: Option<PathBuf>,
+    #[arg(long, env = "PILE")]
+    pile: PathBuf,
     /// Target branch name for reason events.
     #[arg(long, default_value = DEFAULT_BRANCH)]
     branch: String,
@@ -77,13 +77,6 @@ fn now_epoch() -> Epoch {
 
 fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
     (epoch, epoch).try_to_value().unwrap()
-}
-
-fn resolve_pile_path(cli: &Cli) -> PathBuf {
-    cli.pile
-        .clone()
-        .or_else(|| std::env::var("PILE").ok().map(PathBuf::from))
-        .expect("--pile argument or PILE env var required")
 }
 
 fn parse_optional_hex_id(raw: Option<&str>, label: &str) -> Result<Option<Id>> {
@@ -225,7 +218,7 @@ fn run_command(command: &[String]) -> Result<i32> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let pile_path = resolve_pile_path(&cli);
+    let pile_path = cli.pile.clone();
 
     let Some(text_raw) = cli.text.as_ref() else {
         let mut cmd = Cli::command();
