@@ -827,9 +827,46 @@ fn lint_fix(content: &str, space: &TribleSet) -> String {
 }
 
 /// Transform a single line: headings, bold, links.
+/// Bare `[wiki:HEX]` or `[files:HEX]` (no parenthesized URL, not inside #link) → `#link("scheme:hex")[scheme:hex]`
+/// Must run BEFORE lint_links (which handles the markdown `[text](scheme:hex)` form).
+fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
+    use regex::Regex;
+    // Match [wiki:HEX] or [files:HEX] NOT followed by ( and NOT preceded by ") (which would be inside a #link)
+    let re_bare = Regex::new(r"\[(wiki|files):([0-9a-fA-F]+)\]([^(]|$)").unwrap();
+    let mut result = String::new();
+    let mut last_end = 0;
+    for caps in re_bare.captures_iter(line) {
+        let m = caps.get(0).unwrap();
+        // Skip if preceded by ") — this is the [text] part of an existing #link("...")[text]
+        if m.start() > 0 && &line[m.start()-1..m.start()] == ")" {
+            continue;
+        }
+        // Skip if preceded by a quote — inside #link("scheme:hex")
+        if m.start() > 1 && &line[m.start()-1..m.start()] == "\"" {
+            continue;
+        }
+        let scheme = &caps[1];
+        let hex = &caps[2];
+        let after = &caps[3];
+        let full_hex = match try_expand_id(hex, space) {
+            Ok(id) => format!("{:x}", id),
+            Err(_) => hex.to_lowercase(),
+        };
+        result.push_str(&line[last_end..m.start()]);
+        result.push_str(&format!("#link(\"{scheme}:{full_hex}\")[{scheme}:{hex}]{after}"));
+        last_end = m.end();
+    }
+    result.push_str(&line[last_end..]);
+    if result.is_empty() { line.to_string() } else { result }
+}
+
 fn lint_line(line: &str, space: &TribleSet) -> String {
     let mut s = lint_headings(line);
     s = lint_bold(&s);
+    s = lint_bare_brackets(&s, space);
+    // NOTE: lint_snumbers removed — it was project-specific (resolving S122-style
+    // fragment names to hex IDs via title lookup). The one-time migration has been
+    // run. The bare bracket and markdown link lints below are generic.
     s = lint_links(&s, space);
     s = lint_horizontal_rule(&s);
     s
