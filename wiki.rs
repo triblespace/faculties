@@ -860,6 +860,17 @@ fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
     if result.is_empty() { line.to_string() } else { result }
 }
 
+/// `[text](https://url)` → `#link("https://url")[text]` — markdown web links to typst
+fn lint_web_links(line: &str) -> String {
+    use regex::Regex;
+    let re = Regex::new(r"\[([^\]]+)\]\((https?://[^\)]+)\)").unwrap();
+    re.replace_all(line, |caps: &regex::Captures| {
+        let text = &caps[1];
+        let url = &caps[2];
+        format!("#link(\"{url}\")[{text}]")
+    }).to_string()
+}
+
 fn lint_line(line: &str, space: &TribleSet) -> String {
     let mut s = lint_headings(line);
     s = lint_bold(&s);
@@ -868,6 +879,7 @@ fn lint_line(line: &str, space: &TribleSet) -> String {
     // fragment names to hex IDs via title lookup). The one-time migration has been
     // run. The bare bracket and markdown link lints below are generic.
     s = lint_links(&s, space);
+    s = lint_web_links(&s);
     s = lint_horizontal_rule(&s);
     s
 }
