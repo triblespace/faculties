@@ -1617,6 +1617,11 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
                 error_count += 1;
                 continue;
             }
+            if let Err(e) = validate_wiki_links(&fixed, &space) {
+                eprintln!("LINT_LINK_ERROR {:x} — {title}: {e}", frag_id);
+                error_count += 1;
+                continue;
+            }
 
             // Build new version entity directly (same pattern as cmd_import_all).
             let tag_ids = tags_of(&space, vid);
