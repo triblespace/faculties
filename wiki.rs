@@ -62,6 +62,10 @@ mod wiki {
         "6DBBE746B7DD7A4793CA098AB882F553" as content: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "78BABEF1792531A2E51A372D96FE5F3E" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
         "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: valueschemas::GenId;
+        // Content-hash reference: `files:<64-char-blake3>` points to file bytes directly.
+        "C61CA2F2A70103FD79E97C2F88B854D8" as references_file_content: valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>;
+        // File-entity reference: `files:<32-char-id>` points to a file entity with metadata.
+        "C98FE0EF9151F196D8F7D816ABBBCC49" as references_file: valueschemas::GenId;
     }
 }
 
@@ -228,8 +232,10 @@ enum Command {
         input: String,
     },
     /// Apply lint transforms (markdown→typst, expand short IDs) to all latest versions.
+    /// Also rebuilds the `links_to` index when the stored edges drift from what the
+    /// current extract_references regex would parse (e.g. after a lint rule change).
     Lint {
-        /// Actually write fixed versions (default: dry-run)
+        /// Actually write fixed versions and link updates (default: dry-run)
         #[arg(long)]
         fix: bool,
         /// Only check for issues, don't show diffs (CI mode)
@@ -640,58 +646,82 @@ fn format_date(ts: Lower) -> String {
     Formatter::new(epoch, ISO8601_DATE).to_string()
 }
 
-/// A resolved wiki link with an optional type.
-struct WikiLink {
-    target: Id,
-    /// Link type name (e.g. "reviews", "cites"). None for untyped mentions.
-    link_type: Option<String>,
-}
 
-/// Extract `#link("<faculty>:<hex>")` and `#link("<faculty>:<type>:<hex>")` references.
-/// Wiki links resolve against the space. External links return faculty + raw hex.
-fn extract_references(content: &str, space: &TribleSet) -> (Vec<WikiLink>, Vec<(String, String)>) {
+/// Extract outgoing link facts from a version's content and return them as a
+/// TribleSet rooted at `source_vid`. Everything — wiki edges, typed edges,
+/// file-entity refs, and file-content refs — goes into the returned set.
+///
+/// STRICT: only matches `#link("<faculty>:...")` typst form with a full-length
+/// hex (32 chars for GenIds, 64 chars for Blake3 content hashes). Markdown,
+/// bare refs, and prefixes are NOT treated as links — lint is responsible for
+/// repairing them first.
+///
+/// Edge kinds produced:
+///   wiki:HEX32             → `wiki::links_to` (GenId)
+///   wiki:<type>:HEX32      → `wiki::links_to` + derived attribute named `<type>`
+///   files:HEX32            → `wiki::references_file` (GenId, points to a file entity)
+///   files:HEX64            → `wiki::references_file_content` (Blake3 content handle)
+fn extract_references(
+    content: &str,
+    space: &TribleSet,
+    source_vid: Id,
+) -> TribleSet {
     use regex::Regex;
-    // Matches:
-    //   wiki:hex                    (untyped)
-    //   wiki:reviews:hex            (typed)
-    //   files:hex                   (external)
-    //   legacy markdown [text](scheme:hex)
     let re = Regex::new(
-        r#"(?:\]\(|#link\(")([a-zA-Z_][a-zA-Z0-9_]*):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]{4,})"#
+        r#"#link\("([a-zA-Z_][a-zA-Z0-9_]*):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?)([0-9a-fA-F]{64}|[0-9a-fA-F]{32})"\)"#
     ).unwrap();
 
-    let mut internal = Vec::new();
-    let mut external = Vec::new();
+    let mut edges = TribleSet::new();
     for caps in re.captures_iter(content) {
         let faculty = &caps[1];
-        let rest = &caps[2];
-        if faculty == "wiki" {
-            // Check for typed link: "type:hex" vs just "hex"
-            let (link_type, hex) = if let Some(colon) = rest.find(':') {
-                let t = &rest[..colon];
-                let h = &rest[colon + 1..];
-                // Only treat as typed if the part before : is not all hex
-                if t.chars().all(|c| c.is_ascii_hexdigit()) {
-                    (None, rest) // it's just a long hex string
-                } else {
-                    (Some(t.to_string()), h)
+        let type_prefix = &caps[2];
+        let hex = caps[3].to_lowercase();
+
+        match (faculty, hex.len()) {
+            ("wiki", 32) => {
+                let Some(target) = Id::from_hex(&hex) else { continue; };
+                if !is_version(space, target) && !is_fragment(space, target) { continue; }
+                if target == source_vid { continue; }
+                let eid = ExclusiveId::force_ref(&source_vid);
+                edges += entity! { eid @ wiki::links_to: &target };
+                if !type_prefix.is_empty() {
+                    let type_name = &type_prefix[..type_prefix.len() - 1];
+                    let attr = triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(type_name);
+                    let eid = ExclusiveId::force_ref(&source_vid);
+                    edges += entity! { eid @ attr: &target };
                 }
-            } else {
-                (None, rest)
-            };
-            if let Ok(id) = resolve_fragment_prefix(space, hex) {
-                internal.push(WikiLink { target: id, link_type });
             }
-        } else {
-            external.push((faculty.to_string(), rest.to_string()));
+            ("wiki", 64) => {
+                // 64-char is a Blake3 hash; wiki targets are GenIds, not content
+                // hashes, so ignore.
+                continue;
+            }
+            ("files", 32) => {
+                let Some(target) = Id::from_hex(&hex) else { continue; };
+                let eid = ExclusiveId::force_ref(&source_vid);
+                edges += entity! { eid @ wiki::references_file: &target };
+            }
+            ("files", 64) => {
+                let Ok(hash) = valueschemas::Hash::<valueschemas::Blake3>::from_hex(&hex) else {
+                    continue;
+                };
+                let handle: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>> =
+                    valueschemas::Handle::from_hash(hash);
+                let eid = ExclusiveId::force_ref(&source_vid);
+                edges += entity! { eid @ wiki::references_file_content: handle };
+            }
+            _ => {}
         }
     }
-    // Dedup by target (keep first occurrence's type).
-    internal.sort_by_key(|l| l.target);
-    internal.dedup_by_key(|l| l.target);
-    external.sort();
-    external.dedup();
-    (internal, external)
+    edges
+}
+
+/// Check whether an ID is a known fragment (has at least one version pointing to it).
+fn is_fragment(space: &TribleSet, id: Id) -> bool {
+    find!(
+        (vid: Id),
+        pattern!(space, [{ ?vid @ wiki::fragment: id }])
+    ).next().is_some()
 }
 
 type Repo = Repository<Pile<valueschemas::Blake3>>;
@@ -827,12 +857,15 @@ fn lint_fix(content: &str, space: &TribleSet) -> String {
 }
 
 /// Transform a single line: headings, bold, links.
-/// Bare `[wiki:HEX]` or `[files:HEX]` (no parenthesized URL, not inside #link) → `#link("scheme:hex")[scheme:hex]`
+/// Bare `[wiki:HEX]`, `[wiki:<type>:HEX]` or `[files:HEX]` (no parenthesized URL, not
+/// inside #link) → `#link("scheme:hex")[scheme:hex]`.
 /// Must run BEFORE lint_links (which handles the markdown `[text](scheme:hex)` form).
 fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
     use regex::Regex;
-    // Match [wiki:HEX] or [files:HEX] NOT followed by ( and NOT preceded by ") (which would be inside a #link)
-    let re_bare = Regex::new(r"\[(wiki|files):([0-9a-fA-F]+)\]([^(]|$)").unwrap();
+    // Match [wiki:HEX], [wiki:type:HEX], or [files:HEX] NOT followed by ( and NOT preceded by ") (inside a #link)
+    let re_bare = Regex::new(
+        r"\[(wiki|files):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+)\]([^(]|$)"
+    ).unwrap();
     let mut result = String::new();
     let mut last_end = 0;
     for caps in re_bare.captures_iter(line) {
@@ -846,14 +879,73 @@ fn lint_bare_brackets(line: &str, space: &TribleSet) -> String {
             continue;
         }
         let scheme = &caps[1];
-        let hex = &caps[2];
+        let rest = &caps[2];
         let after = &caps[3];
+        // Split optional type prefix: "reviews:HEX" vs "HEX"
+        let (type_prefix, hex) = split_typed(rest);
         let full_hex = match try_expand_id(hex, space) {
             Ok(id) => format!("{:x}", id),
             Err(_) => hex.to_lowercase(),
         };
         result.push_str(&line[last_end..m.start()]);
-        result.push_str(&format!("#link(\"{scheme}:{full_hex}\")[{scheme}:{hex}]{after}"));
+        result.push_str(&format!(
+            "#link(\"{scheme}:{type_prefix}{full_hex}\")[{scheme}:{type_prefix}{hex}]{after}"
+        ));
+        last_end = m.end();
+    }
+    result.push_str(&line[last_end..]);
+    if result.is_empty() { line.to_string() } else { result }
+}
+
+/// Split a reference tail into (type_prefix_with_colon, hex). For `reviews:HEX`
+/// returns `("reviews:", "HEX")`; for plain `HEX` returns `("", "HEX")`.
+fn split_typed(rest: &str) -> (String, &str) {
+    if let Some(colon) = rest.find(':') {
+        let t = &rest[..colon];
+        let h = &rest[colon + 1..];
+        // Only treat as typed if the part before : is NOT all hex
+        if !t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return (format!("{t}:"), h);
+        }
+    }
+    (String::new(), rest)
+}
+
+/// Convert bare `wiki:HEX` / `wiki:<type>:HEX` references in prose to proper typst
+/// `#link("wiki:HEX")[wiki:HEX]` form. Requires full-length (32+ char) hex to avoid
+/// false positives on tag values or ambiguous prefixes. Skips matches already inside
+/// `#link("…")` quotes or `[…]` brackets.
+///
+/// Must run AFTER lint_links / lint_bare_brackets so that any remaining bare reference
+/// is definitely not part of an existing link construct.
+fn lint_bare_refs(line: &str, space: &TribleSet) -> String {
+    use regex::Regex;
+    let re = Regex::new(
+        r"\bwiki:((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]{32,})\b"
+    ).unwrap();
+    let mut result = String::new();
+    let mut last_end = 0;
+    for caps in re.captures_iter(line) {
+        let m = caps.get(0).unwrap();
+        let start = m.start();
+        // Skip if inside #link("…") quotes
+        if start > 0 && &line[start-1..start] == "\"" {
+            continue;
+        }
+        // Skip if inside [wiki:HEX] brackets (typically the [text] of an existing #link)
+        if start > 0 && &line[start-1..start] == "[" {
+            continue;
+        }
+        let rest = &caps[1];
+        let (type_prefix, hex) = split_typed(rest);
+        let full_hex = match try_expand_id(hex, space) {
+            Ok(id) => format!("{:x}", id),
+            Err(_) => hex.to_lowercase(),
+        };
+        result.push_str(&line[last_end..start]);
+        result.push_str(&format!(
+            "#link(\"wiki:{type_prefix}{full_hex}\")[wiki:{type_prefix}{hex}]"
+        ));
         last_end = m.end();
     }
     result.push_str(&line[last_end..]);
@@ -875,11 +967,12 @@ fn lint_line(line: &str, space: &TribleSet) -> String {
     let mut s = lint_headings(line);
     s = lint_bold(&s);
     s = lint_bare_brackets(&s, space);
-    // NOTE: lint_snumbers removed — it was project-specific (resolving S122-style
-    // fragment names to hex IDs via title lookup). The one-time migration has been
-    // run. The bare bracket and markdown link lints below are generic.
     s = lint_links(&s, space);
     s = lint_web_links(&s);
+    // Run bare-ref repair LAST so that any remaining bare `wiki:HEX` in prose is
+    // definitely not inside a link construct that the earlier passes built or
+    // rewrote.
+    s = lint_bare_refs(&s, space);
     s = lint_horizontal_rule(&s);
     s
 }
@@ -897,20 +990,36 @@ fn lint_headings(line: &str) -> String {
     }
 }
 
-/// `**text**` → `*text*` (double-star bold only)
+/// `**text**` → `*text*` (double-star bold only). Respects `\*` escapes so
+/// that typst-escaped asterisks adjacent to real bold markers (e.g. `\**` at
+/// the end of a table cell) are not mistaken for a markdown `**` pair.
 fn lint_bold(line: &str) -> String {
-    // Replace **...** with *...* but avoid already-correct *...* (single star)
     let mut result = String::with_capacity(line.len());
     let mut chars = line.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
+        // Backslash escape: emit the backslash and the next char literally.
+        if c == '\\' {
+            result.push('\\');
+            if let Some((_, next)) = chars.next() {
+                result.push(next);
+            }
+            continue;
+        }
         if c == '*' {
             if let Some(&(_, '*')) = chars.peek() {
-                // Found **, look for closing **
+                // Found **, look for closing ** while respecting escapes.
                 chars.next(); // consume second *
                 if chars.peek().is_none() { break; }
                 let mut found_close = false;
                 let mut inner = String::new();
                 while let Some((_, ic)) = chars.next() {
+                    if ic == '\\' {
+                        inner.push('\\');
+                        if let Some((_, next)) = chars.next() {
+                            inner.push(next);
+                        }
+                        continue;
+                    }
                     if ic == '*' {
                         if let Some(&(_, '*')) = chars.peek() {
                             chars.next(); // consume closing **
@@ -939,21 +1048,23 @@ fn lint_bold(line: &str) -> String {
     result
 }
 
-/// `[text](wiki:ID)` → `#link("wiki:ID")[text]` and same for `files:`
+/// `[text](wiki:ID)` → `#link("wiki:ID")[text]`; also handles `wiki:<type>:ID`
+/// and `files:ID`. Expands short ID prefixes to full 32-char hex.
 fn lint_links(line: &str, space: &TribleSet) -> String {
     use regex::Regex;
-    // Match [text](wiki:HEX) or [text](files:HEX)
-    let re = Regex::new(r"\[([^\]]+)\]\((wiki|files):([0-9a-fA-F]+)\)").unwrap();
+    let re = Regex::new(
+        r"\[([^\]]+)\]\((wiki|files):((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+)\)"
+    ).unwrap();
     re.replace_all(line, |caps: &regex::Captures| {
         let text = &caps[1];
         let scheme = &caps[2];
-        let hex = &caps[3];
-        // Try to expand short ID
+        let rest = &caps[3];
+        let (type_prefix, hex) = split_typed(rest);
         let full_hex = match try_expand_id(hex, space) {
             Ok(id) => format!("{:x}", id),
-            Err(_) => hex.to_lowercase(), // Keep as-is if can't resolve
+            Err(_) => hex.to_lowercase(),
         };
-        format!("#link(\"{scheme}:{full_hex}\")[{text}]")
+        format!("#link(\"{scheme}:{type_prefix}{full_hex}\")[{text}]")
     }).to_string()
 }
 
@@ -995,6 +1106,46 @@ fn validate_typst(content: &str) -> Result<()> {
     }
 }
 
+/// Validate that every `wiki:HEX` link in the content points at an existing
+/// fragment or version. Rejects truncated links (hex != 32 chars) and links
+/// to IDs that don't exist in the current wiki space. This prevents
+/// hallucinated IDs and stale references from being committed.
+fn validate_wiki_links(content: &str, space: &TribleSet) -> Result<()> {
+    use regex::Regex;
+    let re = Regex::new(r"wiki:([0-9a-fA-F]+)").unwrap();
+
+    let known_frags: std::collections::HashSet<Id> = find!(
+        frag: Id,
+        pattern!(space, [{ _?vid @ metadata::tag: &KIND_VERSION_ID, wiki::fragment: ?frag }])
+    ).collect();
+    let known_versions: std::collections::HashSet<Id> = find!(
+        vid: Id,
+        pattern!(space, [{ ?vid @ metadata::tag: &KIND_VERSION_ID }])
+    ).collect();
+
+    let mut errors = Vec::new();
+    for caps in re.captures_iter(content) {
+        let hex = &caps[1];
+        if hex.len() != 32 {
+            errors.push(format!("truncated link wiki:{hex} ({} chars, expected 32)", hex.len()));
+            continue;
+        }
+        let Some(id) = Id::from_hex(hex) else {
+            errors.push(format!("invalid hex in wiki:{hex}"));
+            continue;
+        };
+        if !known_frags.contains(&id) && !known_versions.contains(&id) {
+            errors.push(format!("broken link wiki:{hex} (target does not exist)"));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("wiki link validation failed:\n  {}", errors.join("\n  "))
+    }
+}
+
 fn commit_version(
     repo: &mut Repo,
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
@@ -1012,24 +1163,33 @@ fn commit_version(
     tag_ids.sort();
     tag_ids.dedup();
 
-    // Read content text to extract outgoing wiki links.
+    // Read content text for link extraction.
     let content_text: View<str> = ws
         .get(content)
         .map_err(|e| anyhow::anyhow!("read content for link extraction: {e:?}"))?;
-    let (internal_links, _external) = extract_references(content_text.as_ref(), space);
-    let wiki_links: Vec<WikiLink> = internal_links
-        .into_iter()
-        .filter(|l| l.target != fragment_id)
-        .collect();
+
+    let title_handle = ws.put(title.to_owned());
+
+    // Create the version entity. Edges (links_to + derived typed attrs) are
+    // added separately after we know the version's ID.
+    let version = entity! { _ @
+        wiki::fragment: &fragment_id,
+        wiki::title: title_handle,
+        wiki::content: content,
+        metadata::created_at: now_tai(),
+        metadata::tag*: tag_ids.iter(),
+    };
+    let version_id = version.root().expect("version should be rooted");
+    change += version;
+
+    let edges = extract_references(content_text.as_ref(), space, version_id);
 
     // Reject links to fragments (should target versions for stable references).
     if !force_fragment_links {
-        let bad_links: Vec<Id> = wiki_links.iter()
-            .filter(|link| {
-                !is_version(space, link.target)
-            })
-            .map(|link| link.target)
-            .collect();
+        let bad_links: Vec<Id> = find!(
+            target: Id,
+            pattern!(&edges, [{ version_id @ wiki::links_to: ?target }])
+        ).filter(|t| !is_version(space, *t)).collect();
         if !bad_links.is_empty() {
             let ids: Vec<String> = bad_links.iter().map(|id| format!("{:x}", id)).collect();
             bail!("link targets are fragments, not versions: {}. \
@@ -1038,30 +1198,7 @@ fn commit_version(
         }
     }
 
-    // All links go into links_to (generic backlink index).
-    let link_targets: Vec<Id> = wiki_links.iter().map(|l| l.target).collect();
-
-    let title_handle = ws.put(title.to_owned());
-
-    let version = entity! { _ @
-        wiki::fragment: &fragment_id,
-        wiki::title: title_handle,
-        wiki::content: content,
-        metadata::created_at: now_tai(),
-        metadata::tag*: tag_ids.iter(),
-        wiki::links_to*: link_targets.iter(),
-    };
-    let version_id = version.root().expect("version should be rooted");
-    change += version;
-
-    // Typed links: write derived attributes alongside links_to.
-    for link in &wiki_links {
-        if let Some(ref type_name) = link.link_type {
-            let attr = triblespace::core::attribute::Attribute::<valueschemas::GenId>::from_name(type_name);
-            let eid = ExclusiveId::force_ref(&version_id);
-            change += entity! { eid @ attr: &link.target };
-        }
-    }
+    change += edges;
 
     ws.commit(change, message);
     repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
@@ -1089,8 +1226,11 @@ fn find_links(
         if let Some(ch) = content_handle_of(space, vid) {
             let content: View<str> = ws.get(ch)
                 .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-            let (internal, _) = extract_references(content.as_ref(), space);
-            outgoing = internal.into_iter().map(|l| l.target).filter(|&t| t != id).collect();
+            let edges = extract_references(content.as_ref(), space, vid);
+            outgoing = find!(
+                target: Id,
+                pattern!(&edges, [{ vid @ wiki::links_to: ?target }])
+            ).filter(|&t| t != id).collect();
         }
     }
     outgoing.sort();
@@ -1131,14 +1271,30 @@ fn find_links(
     incoming.sort();
     incoming.dedup();
 
-    // External references parsed from content.
-    let mut external = Vec::new();
-    if let Some(ch) = content_handle_of(space, vid) {
-        let content: View<str> = ws.get(ch)
-            .map_err(|e| anyhow::anyhow!("read content: {e:?}"))?;
-        let (_, ext) = extract_references(content.as_ref(), space);
-        external = ext;
+    // File references: stored as tribles on the version. Query both the
+    // entity-reference index (references_file) and the content-hash index
+    // (references_file_content) and return them in a uniform (faculty, hex) shape
+    // for display.
+    let mut external: Vec<(String, String)> = Vec::new();
+    for (target,) in find!(
+        (t: Id),
+        pattern!(space, [{ vid @ wiki::references_file: ?t }])
+    ) {
+        external.push(("files".to_string(), format!("{:x}", target)));
     }
+    for (handle,) in find!(
+        (h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::FileBytes>>),
+        pattern!(space, [{ vid @ wiki::references_file_content: ?h }])
+    ) {
+        let hash: Value<valueschemas::Hash<valueschemas::Blake3>> =
+            valueschemas::Handle::to_hash(handle);
+        external.push((
+            "files".to_string(),
+            valueschemas::Hash::<valueschemas::Blake3>::to_hex(&hash),
+        ));
+    }
+    external.sort();
+    external.dedup();
 
     Ok((outgoing, incoming, external))
 }
@@ -1363,6 +1519,7 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
         let latest = latest_versions(&space);
 
         let mut changed = 0u32;
+        let mut relinked = 0u32;
         let mut checked = 0u32;
 
         for (&frag_id, &(vid, _ts)) in &latest {
@@ -1388,13 +1545,27 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
                         }
                     }
                 }
+            } else {
+                // Text unchanged: compute desired edges and subtract stored.
+                let desired = extract_references(&original, &space, vid);
+                let missing = desired.difference(&space);
+                if !missing.is_empty() {
+                    relinked += 1;
+                    let title = read_title(&space, &mut ws, vid).unwrap_or_default();
+                    let n = missing.len();
+                    if check_only {
+                        eprintln!("RELINK {:x} +{n} edges — {title}", frag_id);
+                    } else {
+                        println!("WOULD RELINK {:x} +{n} edges — {title}", frag_id);
+                    }
+                }
             }
         }
 
         println!();
-        println!("Checked: {checked}, Changed: {changed}");
-        if check_only && changed > 0 {
-            bail!("{changed} fragments need lint fixes");
+        println!("Checked: {checked}, Changed: {changed}, Relinked: {relinked}");
+        if check_only && (changed > 0 || relinked > 0) {
+            bail!("{changed} fragments need lint fixes; {relinked} need relink");
         }
         return Ok(());
     }
@@ -1409,6 +1580,8 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
 
         let mut change = TribleSet::new();
         let mut fixed_count = 0u32;
+        let mut relinked_count = 0u32;
+        let mut new_links_count = 0u32;
         let mut error_count = 0u32;
         let mut checked = 0u32;
 
@@ -1419,7 +1592,23 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
             checked += 1;
 
             let fixed = lint_fix(&original, &space);
-            if fixed == original { continue; }
+            if fixed == original {
+                // Text already clean: rebuild the desired link tribles and subtract
+                // what's already in the space — add only the missing ones.
+                let desired = extract_references(&original, &space, vid);
+                let missing = desired.difference(&space);
+                if missing.is_empty() {
+                    continue;
+                }
+
+                let title = read_title(&space, &mut ws, vid).unwrap_or_default();
+                let added = missing.len();
+                change += missing;
+                relinked_count += 1;
+                new_links_count += added as u32;
+                println!("RELINKED {:x} +{} edges — {title}", frag_id, added);
+                continue;
+            }
 
             let title = read_title(&space, &mut ws, vid).unwrap_or_default();
 
@@ -1440,9 +1629,6 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
                     continue;
                 }
             };
-            let (internal_links, _) = extract_references(content_text.as_ref(), &space);
-            let link_targets: Vec<Id> = internal_links
-                .into_iter().map(|l| l.target).filter(|&id| id != frag_id).collect();
             let mut all_tags = tag_ids;
             all_tags.push(KIND_VERSION_ID);
             all_tags.sort(); all_tags.dedup();
@@ -1453,14 +1639,15 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
                 wiki::content: content_handle,
                 metadata::created_at: now_tai(),
                 metadata::tag*: all_tags.iter(),
-                wiki::links_to*: link_targets.iter(),
             };
+            let version_id = version.root().expect("version should be rooted");
             change += version;
+            change += extract_references(content_text.as_ref(), &space, version_id);
             fixed_count += 1;
             println!("FIXED {:x} — {title}", frag_id);
         }
 
-        if fixed_count == 0 {
+        if fixed_count == 0 && relinked_count == 0 {
             println!("Checked: {checked}, Changed: 0, Errors: {error_count}");
             return Ok(());
         }
@@ -1469,7 +1656,9 @@ fn cmd_lint(repo: &mut Repo, bid: Id, do_fix: bool, check_only: bool) -> Result<
         match repo.try_push(&mut ws) {
             Ok(None) => {
                 println!();
-                println!("Checked: {checked}, Fixed: {fixed_count}, Errors: {error_count}");
+                println!(
+                    "Checked: {checked}, Fixed: {fixed_count}, Relinked: {relinked_count} (+{new_links_count} links), Errors: {error_count}"
+                );
                 return Ok(());
             }
             Ok(Some(conflict_ws)) => {
@@ -1587,13 +1776,10 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
             let tag_ids = tags_of(&space, *exported_vid);
             let title = read_title(&space, &mut ws, *exported_vid).unwrap_or_default();
             let content_handle = ws.put(new_content);
-            let (internal_links, _) = extract_references(
-                &ws.get::<View<str>, _>(content_handle)
-                    .map_err(|e| anyhow::anyhow!("read: {e:?}"))?.as_ref(),
-                &space,
-            );
-            let link_targets: Vec<Id> = internal_links
-                .into_iter().map(|l| l.target).filter(|&id| id != *frag_id).collect();
+            let content_text = ws.get::<View<str>, _>(content_handle)
+                .map_err(|e| anyhow::anyhow!("read: {e:?}"))?
+                .as_ref()
+                .to_string();
             let mut all_tags = tag_ids;
             all_tags.push(KIND_VERSION_ID);
             all_tags.sort(); all_tags.dedup();
@@ -1604,9 +1790,10 @@ fn cmd_import_all(repo: &mut Repo, bid: Id, dir: PathBuf) -> Result<()> {
                 wiki::content: content_handle,
                 metadata::created_at: now_tai(),
                 metadata::tag*: all_tags.iter(),
-                wiki::links_to*: link_targets.iter(),
             };
+            let version_id = version.root().expect("version should be rooted");
             change += version;
+            change += extract_references(&content_text, &space, version_id);
             updated += 1;
         }
 
@@ -1647,9 +1834,10 @@ fn cmd_create(
     let mut change = TribleSet::new();
     let tag_ids = resolve_tags(&space, &mut ws, &tags, &mut change);
 
-    // Lint-fix then validate typst compilation
+    // Lint-fix then validate typst compilation and link targets.
     let content = lint_fix(&content, &space);
     validate_typst(&content)?;
+    validate_wiki_links(&content, &space)?;
 
     let fragment_id = genid().id;
     let content_handle = ws.put(content);
@@ -1698,9 +1886,10 @@ fn cmd_edit(
     // Validate typst if tagged (either explicitly or inherited)
     let content_handle = match &content {
         Some(text) => {
-            // Lint-fix then validate typst compilation
+            // Lint-fix then validate typst compilation and link targets.
             let fixed = lint_fix(text, &space);
             validate_typst(&fixed)?;
+            validate_wiki_links(&fixed, &space)?;
             ws.put(fixed)
         }
         None => content_handle_of(&space, prev_vid)
@@ -2025,25 +2214,29 @@ fn cmd_list(
             continue;
         }
 
-        // Backlink tag filter: check tags of latest versions that link TO this version.
+        // Backlink tag filter: check tags of latest versions that link TO any
+        // version of this fragment (or the fragment ID itself).
         if has_backlink_filter {
-            let mut backlink_tags: Vec<Id> = Vec::new();
-            // Check backlinks to both the version and the fragment ID,
-            // since existing data may reference either.
+            // Targets = {frag_id} ∪ {every version of frag_id}. A single
+            // pattern with `SortedSlice::has(target)` constrains the target
+            // slot to any of these — one constraint, one pattern, no union.
+            let mut targets: Vec<Id> = version_history_of(&space, *frag_id);
+            targets.push(*frag_id);
+            targets.sort();
+            targets.dedup();
+            let targets_slice = triblespace::core::query::sortedsliceconstraint::SortedSlice::new_unchecked(&targets);
+
             let all_backlinks: Vec<Id> = find!(
                 src: Id,
-                or!(
-                    pattern!(&space, [{ ?src @ wiki::links_to: vid }]),
-                    pattern!(&space, [{ ?src @ wiki::links_to: frag_id }])
+                temp!((target),
+                    and!(
+                        pattern!(&space, [{ ?src @ wiki::links_to: ?target }]),
+                        targets_slice.has(target),
+                    )
                 )
             ).collect();
-            let latest_backlinks: Vec<&Id> = all_backlinks.iter().filter(|s| latest_vids.contains(*s)).collect();
-            if !all_backlinks.is_empty() || !latest_backlinks.is_empty() {
-                static DBG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if DBG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
-                    eprintln!("DEBUG: vid={vid:x} all_backlinks={} latest={}", all_backlinks.len(), latest_backlinks.len());
-                }
-            }
+
+            let mut backlink_tags: Vec<Id> = Vec::new();
             for &source_vid in &all_backlinks {
                 if latest_vids.contains(&source_vid) {
                     backlink_tags.extend(tags_of(&space, source_vid));
@@ -2061,24 +2254,29 @@ fn cmd_list(
                 continue;
             }
 
-            // Typed backlink filter: check if any latest version has a
-            // derived-attribute link of the given type pointing to this version.
+            // Typed backlink filter: does any latest-version entity have a
+            // derived-attribute edge of the given type pointing to *any* version
+            // of this fragment (or to the fragment id itself)? Same single-pattern
+            // trick — target constrained to the sorted target slice.
+            let check_type_target = |attr: &triblespace::core::attribute::Attribute<valueschemas::GenId>| -> bool {
+                find!(
+                    src: Id,
+                    temp!((target),
+                        and!(
+                            pattern!(&space, [{ ?src @ attr: ?target }]),
+                            targets_slice.has(target),
+                        )
+                    )
+                ).any(|src| latest_vids.contains(&src))
+            };
             if !with_bl_type_attrs.is_empty() {
-                let all_present = with_bl_type_attrs.iter().all(|(_, attr)| {
-                    find!(
-                        src: Id,
-                        pattern!(&space, [{ ?src @ attr: vid }])
-                    ).any(|src| latest_vids.contains(&src))
-                });
+                let all_present = with_bl_type_attrs.iter()
+                    .all(|(_, attr)| check_type_target(attr));
                 if !all_present { continue; }
             }
             if !without_bl_type_attrs.is_empty() {
-                let any_present = without_bl_type_attrs.iter().any(|(_, attr)| {
-                    find!(
-                        src: Id,
-                        pattern!(&space, [{ ?src @ attr: vid }])
-                    ).any(|src| latest_vids.contains(&src))
-                });
+                let any_present = without_bl_type_attrs.iter()
+                    .any(|(_, attr)| check_type_target(attr));
                 if any_present { continue; }
             }
         }
