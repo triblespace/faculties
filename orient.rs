@@ -11,7 +11,7 @@
 //! triblespace = "0.34.1"
 //! ```
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
 };
@@ -160,7 +160,6 @@ struct MessageRow {
     created_at: i128,
 }
 
-
 #[derive(Debug, Clone, Default)]
 struct ConfigIdentity {
     persona_id: Option<Id>,
@@ -182,7 +181,6 @@ fn epoch_interval(epoch: Epoch) -> Value<valueschemas::NsTAIInterval> {
     (epoch, epoch).try_to_value().unwrap()
 }
 
-
 fn format_age(now_key: i128, past_key: i128) -> String {
     let delta_ns = now_key.saturating_sub(past_key);
     let delta_s = (delta_ns / 1_000_000_000).max(0) as i64;
@@ -201,7 +199,11 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn person_label(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, person_id: Id) -> String {
+fn person_label(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+    person_id: Id,
+) -> String {
     find!(h: TextHandle, pattern!(space, [{ person_id @ metadata::name: ?h }]))
         .next()
         .and_then(|h| read_text(ws, h).ok())
@@ -228,7 +230,10 @@ fn load_message_ids(space: &TribleSet) -> Vec<MessageRow> {
         }])
     )
     .map(|(id, from, to, created_at)| MessageRow {
-        id, from, to, created_at: interval_key(created_at),
+        id,
+        from,
+        to,
+        created_at: interval_key(created_at),
     })
     .collect();
     messages.sort_by_key(|msg| std::cmp::Reverse(msg.created_at));
@@ -277,7 +282,11 @@ fn load_reads(space: &TribleSet) -> HashMap<(Id, Id), i128> {
     reads
 }
 
-fn task_title(ws: &mut Workspace<Pile<valueschemas::Blake3>>, space: &TribleSet, task_id: Id) -> String {
+fn task_title(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+    task_id: Id,
+) -> String {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
         .and_then(|h| read_text(ws, h).ok())
@@ -288,7 +297,8 @@ fn task_tags(space: &TribleSet, task_id: Id) -> Vec<String> {
     let mut tags: Vec<String> = find!(
         tag: String,
         pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
-    ).collect();
+    )
+    .collect();
     tags.sort();
     tags.dedup();
     tags
@@ -351,24 +361,35 @@ fn load_config_identity(
     )
     .next();
 
-    Ok(ConfigIdentity {
-        persona_id,
-    })
+    Ok(ConfigIdentity { persona_id })
 }
 
-fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: usize) -> Result<()> {
+fn cmd_show(
+    pile: &Path,
+    message_limit: usize,
+    doing_limit: usize,
+    todo_limit: usize,
+) -> Result<()> {
     with_repo(pile, |repo| {
         let config_identity = load_config_identity(repo)?;
-        let compass_branch_id = repo.ensure_branch("compass", None)
+        let compass_branch_id = repo
+            .ensure_branch("compass", None)
             .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
-        let local_branch_id = repo.ensure_branch("local-messages", None)
+        let local_branch_id = repo
+            .ensure_branch("local-messages", None)
             .map_err(|e| anyhow::anyhow!("ensure local-messages branch: {e:?}"))?;
-        let relations_branch_id = repo.ensure_branch("relations", None)
+        let relations_branch_id = repo
+            .ensure_branch("relations", None)
             .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
-        let orient_state_branch_id = repo.ensure_branch("orient-state", None)
+        let orient_state_branch_id = repo
+            .ensure_branch("orient-state", None)
             .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
-        let current_heads =
-            load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
+        let current_heads = load_watched_heads(
+            repo,
+            local_branch_id,
+            compass_branch_id,
+            relations_branch_id,
+        )?;
 
         let mut local_ws = repo
             .pull(local_branch_id)
@@ -384,12 +405,13 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         let mut relations_ws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-        let relations_space = relations_ws.checkout(..).map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
 
         // Verify persona exists in relations.
-        let reader_exists = exists!(
-            pattern!(&relations_space, [{ reader_id @ metadata::tag: &KIND_PERSON_ID }])
-        );
+        let reader_exists =
+            exists!(pattern!(&relations_space, [{ reader_id @ metadata::tag: &KIND_PERSON_ID }]));
         if !reader_exists {
             bail!(
                 "persona_id {:x} missing from relations (add via relations faculty)",
@@ -443,11 +465,15 @@ fn cmd_show(pile: &Path, message_limit: usize, doing_limit: usize, todo_limit: u
         let mut compass_ws = repo
             .pull(compass_branch_id)
             .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
-        let compass_space = compass_ws.checkout(..).map_err(|e| anyhow!("checkout compass: {e:?}"))?;
+        let compass_space = compass_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
 
         let mut doing: Vec<(i128, Id)> = Vec::new();
         let mut todo: Vec<(i128, Id)> = Vec::new();
-        for task_id in find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
+        for task_id in
+            find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
+        {
             let (status, status_at) = task_latest_status(&compass_space, task_id)
                 .map(|(s, at)| (s.to_lowercase(), Some(interval_key(at))))
                 .unwrap_or_else(|| ("todo".to_string(), None));
@@ -718,17 +744,26 @@ fn cmd_wait(
 ) -> Result<()> {
     let timeout = parse_wait_target(target.as_ref())?;
     let (detected_change_before_wait, changed) = with_repo(pile, |repo| {
-        let compass_branch_id = repo.ensure_branch("compass", None)
+        let compass_branch_id = repo
+            .ensure_branch("compass", None)
             .map_err(|e| anyhow::anyhow!("ensure compass branch: {e:?}"))?;
-        let local_branch_id = repo.ensure_branch("local-messages", None)
+        let local_branch_id = repo
+            .ensure_branch("local-messages", None)
             .map_err(|e| anyhow::anyhow!("ensure local-messages branch: {e:?}"))?;
-        let relations_branch_id = repo.ensure_branch("relations", None)
+        let relations_branch_id = repo
+            .ensure_branch("relations", None)
             .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
-        let orient_state_branch_id = repo.ensure_branch("orient-state", None)
+        let orient_state_branch_id = repo
+            .ensure_branch("orient-state", None)
             .map_err(|e| anyhow::anyhow!("ensure orient-state branch: {e:?}"))?;
 
         let mut detected_change_before_wait = false;
-        let baseline = load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
+        let baseline = load_watched_heads(
+            repo,
+            local_branch_id,
+            compass_branch_id,
+            relations_branch_id,
+        )?;
         if let Some(last_seen) = load_checkpoint_heads(repo, orient_state_branch_id)? {
             if baseline != last_seen {
                 detected_change_before_wait = true;
@@ -746,7 +781,12 @@ fn cmd_wait(
                 }
             }
             std::thread::sleep(poll);
-            let current = load_watched_heads(repo, local_branch_id, compass_branch_id, relations_branch_id)?;
+            let current = load_watched_heads(
+                repo,
+                local_branch_id,
+                compass_branch_id,
+                relations_branch_id,
+            )?;
             if current != baseline {
                 return Ok((detected_change_before_wait, true));
             }
@@ -758,12 +798,7 @@ fn cmd_wait(
     if !changed {
         println!("No change detected since wait started; showing current snapshot.");
     }
-    cmd_show(
-        pile,
-        message_limit,
-        doing_limit,
-        todo_limit,
-    )
+    cmd_show(pile, message_limit, doing_limit, todo_limit)
 }
 
 fn render_tags(tags: &[String]) -> String {

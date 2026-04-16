@@ -41,7 +41,10 @@ type Lower = i128;
 
 // ── CLI ─────────────────────────────────────────────────────────────────
 #[derive(Parser)]
-#[command(name = "gauge", about = "Research quality gauge — reads wiki tag metadata")]
+#[command(
+    name = "gauge",
+    about = "Research quality gauge — reads wiki tag metadata"
+)]
 struct Cli {
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -90,15 +93,20 @@ fn main() -> Result<()> {
 
     let bid = if let Some(hex_str) = &cli.branch_id {
         let raw = hex::decode(hex_str)?;
-        Id::new(raw.try_into().map_err(|_| anyhow::anyhow!("bad branch id"))?)
-            .ok_or_else(|| anyhow::anyhow!("nil branch id"))?
+        Id::new(
+            raw.try_into()
+                .map_err(|_| anyhow::anyhow!("bad branch id"))?,
+        )
+        .ok_or_else(|| anyhow::anyhow!("nil branch id"))?
     } else {
         repo.ensure_branch(WIKI_BRANCH_NAME, None)
             .map_err(|e| anyhow::anyhow!("ensure wiki branch: {e:?}"))?
     };
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
 
     match cli.command.unwrap() {
         Commands::Health => cmd_health(&space, &mut ws),
@@ -126,7 +134,10 @@ fn latest_versions(space: &TribleSet) -> HashMap<Id, (Id, Lower)> {
         let ts = lower.to_tai_duration().total_nanoseconds();
         best.entry(frag)
             .and_modify(|(old_vid, old_ts)| {
-                if ts > *old_ts { *old_vid = vid; *old_ts = ts; }
+                if ts > *old_ts {
+                    *old_vid = vid;
+                    *old_ts = ts;
+                }
             })
             .or_insert((vid, ts));
     }
@@ -137,14 +148,20 @@ fn tags_of(space: &TribleSet, vid: Id) -> Vec<Id> {
     find!(
         tag: Id,
         pattern!(space, [{ &vid @ metadata::tag: ?tag }])
-    ).collect()
+    )
+    .collect()
 }
 
-fn tag_name(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, tag_id: Id) -> String {
+fn tag_name(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    tag_id: Id,
+) -> String {
     let results: Vec<_> = find!(
         h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
         pattern!(space, [{ &tag_id @ metadata::name: ?h }])
-    ).collect();
+    )
+    .collect();
     if let Some(handle) = results.into_iter().next() {
         if let Ok(view) = ws.get::<View<str>, _>(handle) {
             let s: &str = view.as_ref();
@@ -175,7 +192,8 @@ fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>)
         let links: Vec<Id> = find!(
             target: Id,
             pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        ).collect();
+        )
+        .collect();
         if links.is_empty() {
             orphan_count += 1;
         }
@@ -196,8 +214,14 @@ fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>)
     println!("=== GAUGE: Research Health ===");
     println!();
     println!("Versions: {total}");
-    println!("Links: {link_count} ({:.1} per version)", link_count as f64 / total as f64);
-    println!("Orphans: {orphan_count} ({:.0}%)", 100.0 * orphan_count as f64 / total as f64);
+    println!(
+        "Links: {link_count} ({:.1} per version)",
+        link_count as f64 / total as f64
+    );
+    println!(
+        "Orphans: {orphan_count} ({:.0}%)",
+        100.0 * orphan_count as f64 / total as f64
+    );
     println!();
     println!("--- Epistemic Status ---");
     println!("  Published:      {published:>4}");
@@ -215,25 +239,33 @@ fn cmd_health(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>)
     println!();
     println!("--- Ratios ---");
     if published + refuted > 0 {
-        println!("  Survival rate:  {:.0}% ({published} published / {} tested)",
+        println!(
+            "  Survival rate:  {:.0}% ({published} published / {} tested)",
             100.0 * published as f64 / (published + refuted) as f64,
-            published + refuted);
+            published + refuted
+        );
     }
     if synthesis > 0 {
-        println!("  Theory grounding: {:.1}% ({published} published / {synthesis} synthesis)",
-            100.0 * published as f64 / synthesis as f64);
+        println!(
+            "  Theory grounding: {:.1}% ({published} published / {synthesis} synthesis)",
+            100.0 * published as f64 / synthesis as f64
+        );
     }
     if hypothesis > 0 {
         let tested = evidence + finding;
-        println!("  Hypothesis coverage: {tested} evidence+findings / {hypothesis} hypotheses ({:.0}%)",
-            100.0 * tested as f64 / hypothesis as f64);
+        println!(
+            "  Hypothesis coverage: {tested} evidence+findings / {hypothesis} hypotheses ({:.0}%)",
+            100.0 * tested as f64 / hypothesis as f64
+        );
     }
     if prediction > 0 {
         println!("  Predictions: {prediction} made ({refuted} refuted, track outcomes!)");
     }
     if review > 0 {
-        println!("  Review density: {:.1} reviews per published finding",
-            review as f64 / published.max(1) as f64);
+        println!(
+            "  Review density: {:.1} reviews per published finding",
+            review as f64 / published.max(1) as f64
+        );
     }
     println!();
     Ok(())
@@ -270,18 +302,20 @@ fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>
 
     for (_frag, (vid, _ts)) in &latest {
         let tags = tags_of(space, *vid);
-        let tag_names: Vec<String> = tags.iter()
-            .map(|t| tag_name(space, ws, *t))
-            .collect();
+        let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
 
         // Get title
         let title: String = find!(
             h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
             pattern!(space, [{ vid @ wiki::title: ?h }])
-        ).next()
-            .and_then(|h| ws.get::<View<str>, _>(h).ok())
-            .map(|v| { let s: &str = v.as_ref(); s.to_string() })
-            .unwrap_or_else(|| "untitled".to_string());
+        )
+        .next()
+        .and_then(|h| ws.get::<View<str>, _>(h).ok())
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
+        .unwrap_or_else(|| "untitled".to_string());
 
         let short_title: String = title.chars().take(60).collect();
 
@@ -307,22 +341,31 @@ fn cmd_quality(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>
     println!();
     if !published_frags.is_empty() || !refuted_frags.is_empty() {
         let total = published_frags.len() + refuted_frags.len();
-        println!("Survival: {}/{} ({:.0}%)",
-            published_frags.len(), total,
-            100.0 * published_frags.len() as f64 / total as f64);
+        println!(
+            "Survival: {}/{} ({:.0}%)",
+            published_frags.len(),
+            total,
+            100.0 * published_frags.len() as f64 / total as f64
+        );
     }
     println!();
     Ok(())
 }
 
-fn cmd_hubs(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, top: usize) -> Result<()> {
+fn cmd_hubs(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    top: usize,
+) -> Result<()> {
     let latest = latest_versions(space);
 
     // Build version->fragment and fragment->title maps
-    let vid_to_frag: HashMap<Id, Id> = latest.iter()
+    let vid_to_frag: HashMap<Id, Id> = latest
+        .iter()
         .map(|(frag, (vid, _))| (*vid, *frag))
         .collect();
-    let frag_to_vid: HashMap<Id, Id> = latest.iter()
+    let frag_to_vid: HashMap<Id, Id> = latest
+        .iter()
         .map(|(frag, (vid, _))| (*frag, *vid))
         .collect();
 
@@ -332,7 +375,8 @@ fn cmd_hubs(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, t
         let targets: Vec<Id> = find!(
             target: Id,
             pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        ).collect();
+        )
+        .collect();
         for target in targets {
             // Normalize: if target is a version, map to its fragment
             let canonical = vid_to_frag.get(&target).copied().unwrap_or(target);
@@ -352,10 +396,14 @@ fn cmd_hubs(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, t
         let title: String = find!(
             h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
             pattern!(space, [{ &lookup_vid @ wiki::title: ?h }])
-        ).next()
-            .and_then(|h| ws.get::<View<str>, _>(h).ok())
-            .map(|v| { let s: &str = v.as_ref(); s.to_string() })
-            .unwrap_or_else(|| format!("(unknown {:X?})", &id[..4]));
+        )
+        .next()
+        .and_then(|h| ws.get::<View<str>, _>(h).ok())
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
+        .unwrap_or_else(|| format!("(unknown {:X?})", &id[..4]));
 
         let short: String = title.chars().take(65).collect();
         println!("  {count:>3} links <- {short}");
@@ -371,18 +419,24 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
     let mut flagged: HashMap<Id, (String, Vec<String>)> = HashMap::new(); // frag -> (title, [tags])
     for (frag, (vid, _ts)) in &latest {
         let tags = tags_of(space, *vid);
-        let tag_names: Vec<String> = tags.iter()
-            .map(|t| tag_name(space, ws, *t))
-            .collect();
-        if tag_names.iter().any(|t| t == "refuted" || t == "audit-warning") {
+        let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
+        if tag_names
+            .iter()
+            .any(|t| t == "refuted" || t == "audit-warning")
+        {
             let title: String = find!(
                 h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
                 pattern!(space, [{ vid @ wiki::title: ?h }])
-            ).next()
-                .and_then(|h| ws.get::<View<str>, _>(h).ok())
-                .map(|v| { let s: &str = v.as_ref(); s.to_string() })
-                .unwrap_or_else(|| "untitled".to_string());
-            let risk_tags: Vec<String> = tag_names.into_iter()
+            )
+            .next()
+            .and_then(|h| ws.get::<View<str>, _>(h).ok())
+            .map(|v| {
+                let s: &str = v.as_ref();
+                s.to_string()
+            })
+            .unwrap_or_else(|| "untitled".to_string());
+            let risk_tags: Vec<String> = tag_names
+                .into_iter()
                 .filter(|t| t == "refuted" || t == "audit-warning")
                 .collect();
             flagged.insert(*frag, (title, risk_tags));
@@ -395,7 +449,8 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
     }
 
     // Build version->fragment map
-    let vid_to_frag: HashMap<Id, Id> = latest.iter()
+    let vid_to_frag: HashMap<Id, Id> = latest
+        .iter()
         .map(|(frag, (vid, _))| (*vid, *frag))
         .collect();
 
@@ -412,12 +467,15 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
 
     let mut contaminated: Vec<(String, Vec<String>)> = Vec::new(); // (title, [flagged sources cited])
     for (frag, (vid, _ts)) in &latest {
-        if flagged.contains_key(frag) { continue; } // skip the flagged ones themselves
+        if flagged.contains_key(frag) {
+            continue;
+        } // skip the flagged ones themselves
 
         let targets: Vec<Id> = find!(
             target: Id,
             pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        ).collect();
+        )
+        .collect();
 
         let mut cited_flagged: Vec<String> = Vec::new();
         for target in &targets {
@@ -433,17 +491,24 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
             let title: String = find!(
                 h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
                 pattern!(space, [{ vid @ wiki::title: ?h }])
-            ).next()
-                .and_then(|h| ws.get::<View<str>, _>(h).ok())
-                .map(|v| { let s: &str = v.as_ref(); s.to_string() })
-                .unwrap_or_else(|| "untitled".to_string());
+            )
+            .next()
+            .and_then(|h| ws.get::<View<str>, _>(h).ok())
+            .map(|v| {
+                let s: &str = v.as_ref();
+                s.to_string()
+            })
+            .unwrap_or_else(|| "untitled".to_string());
             contaminated.push((title, cited_flagged));
         }
     }
 
     contaminated.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-    println!("Potentially contaminated fragments ({}):", contaminated.len());
+    println!(
+        "Potentially contaminated fragments ({}):",
+        contaminated.len()
+    );
     for (title, sources) in &contaminated {
         let short: String = title.chars().take(55).collect();
         println!("  {short}");
@@ -456,7 +521,11 @@ fn cmd_risk(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) -
     Ok(())
 }
 
-fn cmd_orphans(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>, top: usize) -> Result<()> {
+fn cmd_orphans(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    top: usize,
+) -> Result<()> {
     let latest = latest_versions(space);
     let mut orphans: Vec<(String, Vec<String>)> = Vec::new();
 
@@ -464,21 +533,24 @@ fn cmd_orphans(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>
         let links: Vec<Id> = find!(
             target: Id,
             pattern!(space, [{ vid @ wiki::links_to: ?target }])
-        ).collect();
+        )
+        .collect();
 
         if links.is_empty() {
             let title: String = find!(
                 h: Value<valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>>,
                 pattern!(space, [{ vid @ wiki::title: ?h }])
-            ).next()
-                .and_then(|h| ws.get::<View<str>, _>(h).ok())
-                .map(|v| { let s: &str = v.as_ref(); s.to_string() })
-                .unwrap_or_else(|| "untitled".to_string());
+            )
+            .next()
+            .and_then(|h| ws.get::<View<str>, _>(h).ok())
+            .map(|v| {
+                let s: &str = v.as_ref();
+                s.to_string()
+            })
+            .unwrap_or_else(|| "untitled".to_string());
 
             let tags = tags_of(space, *vid);
-            let tag_names: Vec<String> = tags.iter()
-                .map(|t| tag_name(space, ws, *t))
-                .collect();
+            let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
 
             orphans.push((title, tag_names));
         }
@@ -489,12 +561,17 @@ fn cmd_orphans(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>
 
     println!("=== GAUGE: Orphan Fragments (no outgoing links) ===");
     println!();
-    println!("Total orphans: {} / {} ({:.0}%)", orphans.len(), latest.len(),
-        100.0 * orphans.len() as f64 / latest.len() as f64);
+    println!(
+        "Total orphans: {} / {} ({:.0}%)",
+        orphans.len(),
+        latest.len(),
+        100.0 * orphans.len() as f64 / latest.len() as f64
+    );
     println!();
     for (title, tags) in orphans.iter().take(top) {
         let short: String = title.chars().take(60).collect();
-        let tag_str: String = tags.iter()
+        let tag_str: String = tags
+            .iter()
             .filter(|t| *t != "version" && *t != "typst" && *t != "markdown")
             .take(3)
             .cloned()
@@ -516,31 +593,32 @@ fn cmd_drift(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) 
     let latest = latest_versions(space);
 
     // Bucket fragments by date (YYYY-MM)
-    let mut buckets: std::collections::BTreeMap<String, HashMap<String, usize>> = std::collections::BTreeMap::new();
+    let mut buckets: std::collections::BTreeMap<String, HashMap<String, usize>> =
+        std::collections::BTreeMap::new();
 
     for (_frag, (vid, ts_ns)) in &latest {
         // Convert TAI nanoseconds to approximate date
-        let epoch = Epoch::from_tai_duration(hifitime::Duration::from_parts(0, (*ts_ns).max(0) as u64));
+        let epoch =
+            Epoch::from_tai_duration(hifitime::Duration::from_parts(0, (*ts_ns).max(0) as u64));
         let (year, month, _, _, _, _, _) = epoch.to_gregorian_utc();
 
         // Skip obviously broken dates (far future)
-        if year > 2030 || year < 2020 { continue; }
+        if year > 2030 || year < 2020 {
+            continue;
+        }
 
         let bucket = format!("{year:04}-{month:02}");
 
         let tags = tags_of(space, *vid);
-        let tag_names: Vec<String> = tags.iter()
-            .map(|t| tag_name(space, ws, *t))
-            .collect();
+        let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
 
         let entry = buckets.entry(bucket).or_insert_with(HashMap::new);
         *entry.entry("total".to_string()).or_insert(0) += 1;
 
         for name in &tag_names {
             match name.as_str() {
-                "published" | "refuted" | "preprint" | "hypothesis" |
-                "evidence" | "review" | "synthesis" | "finding" |
-                "prediction" | "audit-warning" | "experiment" => {
+                "published" | "refuted" | "preprint" | "hypothesis" | "evidence" | "review"
+                | "synthesis" | "finding" | "prediction" | "audit-warning" | "experiment" => {
                     *entry.entry(name.clone()).or_insert(0) += 1;
                 }
                 _ => {}
@@ -550,8 +628,10 @@ fn cmd_drift(space: &TribleSet, ws: &mut Workspace<Pile<valueschemas::Blake3>>) 
 
     println!("=== GAUGE: Research Drift Over Time ===");
     println!();
-    println!("{:<10} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
-        "Month", "Total", "Synth", "Evid", "Hypo", "Rev", "Pub", "Ref", "Pred");
+    println!(
+        "{:<10} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5} {:>5}",
+        "Month", "Total", "Synth", "Evid", "Hypo", "Rev", "Pub", "Ref", "Pred"
+    );
     println!("{}", "-".repeat(75));
 
     for (month, counts) in &buckets {
