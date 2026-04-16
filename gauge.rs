@@ -77,6 +77,9 @@ enum Commands {
         /// Number to show
         #[arg(short, long, default_value = "20")]
         top: usize,
+        /// Print fragment IDs only (one per line, pipe-friendly)
+        #[arg(long)]
+        ids: bool,
     },
 }
 
@@ -115,7 +118,7 @@ fn main() -> Result<()> {
         Commands::Hubs { top } => cmd_hubs(&space, &mut ws, top),
         Commands::Risk => cmd_risk(&space, &mut ws),
         Commands::Drift => cmd_drift(&space, &mut ws),
-        Commands::Orphans { top } => cmd_orphans(&space, &mut ws, top),
+        Commands::Orphans { top, ids } => cmd_orphans(&space, &mut ws, top, ids),
     }
 }
 
@@ -525,11 +528,12 @@ fn cmd_orphans(
     space: &TribleSet,
     ws: &mut Workspace<Pile<valueschemas::Blake3>>,
     top: usize,
+    ids_only: bool,
 ) -> Result<()> {
     let latest = latest_versions(space);
-    let mut orphans: Vec<(String, Vec<String>)> = Vec::new();
+    let mut orphans: Vec<(Id, String, Vec<String>)> = Vec::new();
 
-    for (_frag, (vid, _ts)) in &latest {
+    for (frag, (vid, _ts)) in &latest {
         let links: Vec<Id> = find!(
             target: Id,
             pattern!(space, [{ vid @ wiki::links_to: ?target }])
@@ -552,12 +556,19 @@ fn cmd_orphans(
             let tags = tags_of(space, *vid);
             let tag_names: Vec<String> = tags.iter().map(|t| tag_name(space, ws, *t)).collect();
 
-            orphans.push((title, tag_names));
+            orphans.push((*frag, title, tag_names));
         }
     }
 
     // Sort alphabetically for browsability
-    orphans.sort_by(|a, b| a.0.cmp(&b.0));
+    orphans.sort_by(|a, b| a.1.cmp(&b.1));
+
+    if ids_only {
+        for (frag, _, _) in orphans.iter().take(top) {
+            println!("{}", hex::encode(**frag));
+        }
+        return Ok(());
+    }
 
     println!("=== GAUGE: Orphan Fragments (no outgoing links) ===");
     println!();
@@ -568,7 +579,7 @@ fn cmd_orphans(
         100.0 * orphans.len() as f64 / latest.len() as f64
     );
     println!();
-    for (title, tags) in orphans.iter().take(top) {
+    for (_, title, tags) in orphans.iter().take(top) {
         let short: String = title.chars().take(60).collect();
         let tag_str: String = tags
             .iter()

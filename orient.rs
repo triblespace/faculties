@@ -30,8 +30,6 @@ const CONFIG_BRANCH_ID: Id = id_hex!("6069A136254E1B87E4C0D2E0295DB382");
 
 const KIND_MESSAGE_ID: Id = id_hex!("A3556A66B00276797FCE8A2742AB850F");
 const KIND_READ_ID: Id = id_hex!("B663C15BB6F2BF591EA870386DD48537");
-const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
-
 const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
 const KIND_ORIENT_CHECKPOINT_ID: Id = id_hex!("163114E5F2272D15F21E1994EF418A31");
@@ -397,66 +395,62 @@ fn cmd_show(
         let local_space = local_ws
             .checkout(..)
             .map_err(|e| anyhow!("checkout local: {e:?}"))?;
-        let reader_id = config_identity.persona_id.ok_or_else(|| {
-            anyhow!(
-                "missing persona_id in config (set via `playground config set persona-id <hex-id>`)"
-            )
-        })?;
-        let mut relations_ws = repo
-            .pull(relations_branch_id)
-            .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-        let relations_space = relations_ws
-            .checkout(..)
-            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-
-        // Verify persona exists in relations.
-        let reader_exists =
-            exists!(pattern!(&relations_space, [{ reader_id @ metadata::tag: &KIND_PERSON_ID }]));
-        if !reader_exists {
-            bail!(
-                "persona_id {:x} missing from relations (add via relations faculty)",
-                reader_id
-            );
-        }
-
         let reads = load_reads(&local_space);
         let all_messages = load_message_ids(&local_space);
-
-        let unread: Vec<&MessageRow> = all_messages
-            .iter()
-            .filter(|msg| msg.to == reader_id && !reads.contains_key(&(msg.id, reader_id)))
-            .take(message_limit)
-            .collect();
 
         let now_key = interval_key(epoch_interval(now_epoch()));
 
         println!("Orient");
-        let reader_label = person_label(&mut relations_ws, &relations_space, reader_id);
-        println!("Local messages (unread inbox for {}):", reader_label);
-        if unread.is_empty() {
-            println!("- None");
-        } else {
-            for msg in &unread {
-                let from_label = person_label(&mut relations_ws, &relations_space, msg.from);
-                let to_label = person_label(&mut relations_ws, &relations_space, msg.to);
-                let age = format_age(now_key, msg.created_at);
-                println!(
-                    "- [{}] {} {} -> {} ({})",
-                    fmt_id(msg.id),
-                    age,
-                    from_label,
-                    to_label,
-                    "unread",
-                );
-                // Resolve body lazily — only for displayed messages.
-                let body = resolve_message_body(&mut local_ws, &local_space, msg.id);
-                if body.is_empty() {
-                    println!("    ");
+        match config_identity.persona_id {
+            Some(reader_id) => {
+                let mut relations_ws = repo
+                    .pull(relations_branch_id)
+                    .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
+                let relations_space = relations_ws
+                    .checkout(..)
+                    .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+
+                let unread: Vec<&MessageRow> = all_messages
+                    .iter()
+                    .filter(|msg| msg.to == reader_id && !reads.contains_key(&(msg.id, reader_id)))
+                    .take(message_limit)
+                    .collect();
+
+                let reader_label = person_label(&mut relations_ws, &relations_space, reader_id);
+                println!("Local messages (unread inbox for {}):", reader_label);
+                if unread.is_empty() {
+                    println!("- None");
                 } else {
-                    for line in body.lines() {
-                        println!("    {}", line.trim_end_matches('\r'));
+                    for msg in &unread {
+                        let from_label =
+                            person_label(&mut relations_ws, &relations_space, msg.from);
+                        let to_label = person_label(&mut relations_ws, &relations_space, msg.to);
+                        let age = format_age(now_key, msg.created_at);
+                        println!(
+                            "- [{}] {} {} -> {} ({})",
+                            fmt_id(msg.id),
+                            age,
+                            from_label,
+                            to_label,
+                            "unread",
+                        );
+                        // Resolve body lazily — only for displayed messages.
+                        let body = resolve_message_body(&mut local_ws, &local_space, msg.id);
+                        if body.is_empty() {
+                            println!("    ");
+                        } else {
+                            for line in body.lines() {
+                                println!("    {}", line.trim_end_matches('\r'));
+                            }
+                        }
                     }
                 }
+            }
+            None => {
+                println!("Local messages:");
+                println!(
+                    "- Unavailable: missing persona_id in config (set via `playground config set persona-id <hex-id>`)"
+                );
             }
         }
 
