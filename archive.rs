@@ -117,9 +117,9 @@ mod common {
                 B: BlobStore<Blake3>,
             {
                 let mut tribles = TribleSet::new();
-                let kind_message_entity = super::super::aquire_or_force(kind_message);
-                let kind_author_entity = super::super::aquire_or_force(kind_author);
-                let kind_attachment_entity = super::super::aquire_or_force(kind_attachment);
+                let kind_message_entity = super::super::acquire_or_force(kind_message);
+                let kind_author_entity = super::super::acquire_or_force(kind_author);
+                let kind_attachment_entity = super::super::acquire_or_force(kind_attachment);
 
                 tribles += entity! { &kind_message_entity @
                     metadata::name: blobs.put("kind_message".to_string())?,
@@ -216,8 +216,8 @@ mod common {
             B: BlobStore<Blake3>,
         {
             let mut tribles = TribleSet::new();
-            let import_metadata_entity = super::aquire_or_force(import_metadata);
-            let kind_conversation_entity = super::aquire_or_force(kind_conversation);
+            let import_metadata_entity = super::acquire_or_force(import_metadata);
+            let kind_conversation_entity = super::acquire_or_force(kind_conversation);
 
             tribles += entity! { &import_metadata_entity @
                 metadata::name: blobs.put("import_metadata")?,
@@ -268,8 +268,8 @@ mod common {
     pub type Ws = Workspace<Pile<Blake3>>;
     pub type CommitHandle = Value<Handle<Blake3, SimpleArchive>>;
 
-    fn aquire_or_force(id: Id) -> ExclusiveId {
-        id.aquire().unwrap_or_else(|| ExclusiveId::force(id))
+    fn acquire_or_force(id: Id) -> ExclusiveId {
+        id.acquire().unwrap_or_else(|| ExclusiveId::force(id))
     }
 
     pub fn parse_paths_parallel<T, F>(
@@ -474,7 +474,7 @@ mod common {
             let mut change = TribleSet::new();
             if author_role_handle(catalog, author_id).is_none() && !role.is_empty() {
                 let handle = ws.put(role.to_owned());
-                let author_entity = aquire_or_force(author_id);
+                let author_entity = acquire_or_force(author_id);
                 change += entity! { &author_entity @
                     archive::author_role: handle
                 };
