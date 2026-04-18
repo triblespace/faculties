@@ -669,6 +669,23 @@ impl CompassBoard {
         self
     }
 
+    /// Retarget at a different pile. No-op if the path is unchanged.
+    pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        if path == self.pile_path {
+            return;
+        }
+        self.pile_path = path;
+        self.live = None;
+        self.error = None;
+        self.expanded_goal = None;
+        self.collapsed.clear();
+        self.note_inputs.clear();
+        self.status_menu = None;
+        self.compose.clear();
+        self.toast = None;
+    }
+
     /// Render the board into a GORBIE card context.
     pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
         // Lazy pile open on first render.

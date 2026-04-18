@@ -1084,9 +1084,6 @@ struct OpenPage {
 /// ```
 pub struct WikiViewer {
     pile_path: PathBuf,
-    /// Editable pile path for the top-bar text field. Initialized from
-    /// `pile_path.display()`; the user can retarget with the "Open" button.
-    pile_path_text: String,
     search_query: String,
     // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's
     // `NotebookCtx::state` requires that for cross-thread state storage.
@@ -1105,11 +1102,8 @@ impl WikiViewer {
     /// Build a viewer pointing at a pile on disk. The pile is not opened
     /// until the first [`render`](Self::render) call.
     pub fn new(pile_path: impl Into<PathBuf>) -> Self {
-        let pile_path = pile_path.into();
-        let pile_path_text = pile_path.to_string_lossy().into_owned();
         Self {
-            pile_path,
-            pile_path_text,
+            pile_path: pile_path.into(),
             search_query: String::new(),
             live: None,
             graph: None,
@@ -1119,6 +1113,22 @@ impl WikiViewer {
         }
     }
 
+    /// Retarget the viewer at a different pile. If the path has changed,
+    /// the current live state is dropped and the new pile is opened on
+    /// the next render.
+    pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        if path == self.pile_path {
+            return;
+        }
+        self.pile_path = path;
+        self.live = None;
+        self.graph = None;
+        self.open_pages.clear();
+        self.error = None;
+        self.auto_loaded = false;
+    }
+
     /// Attempt to open (or re-open) the pile. Updates `live` and `error`.
     fn load(&mut self) {
         // Any previously-built graph refers to the old WikiLive's fact
@@ -1126,7 +1136,6 @@ impl WikiViewer {
         self.graph = None;
         self.open_pages.clear();
         self.error = None;
-        self.pile_path = PathBuf::from(self.pile_path_text.trim());
         match WikiLive::open(&self.pile_path) {
             Ok(live) => self.live = Some(Mutex::new(live)),
             Err(e) => {
@@ -1145,23 +1154,16 @@ impl WikiViewer {
             self.load();
         }
 
-        // ── top bar: pile path + reopen ──────────────────────────────
-        ctx.grid(|g| {
-            g.place(10, |ctx| {
-                ctx.text_field(&mut self.pile_path_text);
-            });
-            g.place(2, |ctx| {
-                if ctx.button("Open").clicked() {
-                    self.load();
-                }
-            });
-            if let Some(err) = &self.error {
+        // Error banner — pile path is now managed by the parent
+        // (PileInspector / host notebook).
+        if let Some(err) = &self.error {
+            ctx.grid(|g| {
                 g.full(|ctx| {
                     let color = ctx.visuals().error_fg_color;
                     ctx.label(egui::RichText::new(err.as_str()).color(color).monospace());
                 });
-            }
-        });
+            });
+        }
 
         let Some(live_lock) = self.live.as_ref() else {
             return;

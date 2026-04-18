@@ -679,6 +679,26 @@ impl MessagesPanel {
         self
     }
 
+    /// Retarget at a different pile. No-op if the path is unchanged.
+    pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        if path == self.pile_path {
+            return;
+        }
+        self.pile_path = path;
+        self.live = None;
+        self.error = None;
+        self.toast = None;
+        self.compose_draft.clear();
+        self.compose_recipient = None;
+        self.last_message_count = 0;
+        self.scroll_to_bottom = false;
+        self.user_scrolled_up = false;
+        self.pending_new = 0;
+        self.read_sent.clear();
+        self.first_render = true;
+    }
+
     /// Render the panel into a GORBIE card context.
     pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
         // Lazy pile open on first render.
