@@ -1,32 +1,47 @@
-//! Minimal GORBIE-embeddable branch timeline.
+//! GORBIE-embeddable branch timeline.
 //!
-//! Shows a pan/zoom time axis for a single branch of a triblespace pile.
-//! Commits on the branch are enumerated (following ancestors from HEAD)
-//! and painted as small horizontal ticks at their `metadata::created_at`
-//! position on the time axis.
+//! A pan/zoom time axis that overlays events from one or more pile
+//! branches on a single vertical timeline (newest at top, oldest at
+//! bottom). v1 painted opaque "commit happened" bars for a single
+//! branch; v2 adds per-event-type decoration for the most visible
+//! daily activity branches:
 //!
-//! Scope is intentionally tight: v1 renders commit dots only. It does
-//! not decorate with event-type-specific overlays, filter, or support
-//! click-to-select. Progressive history loading is not yet implemented —
-//! the full branch is walked on open.
+//! * Compass — goal status changes (pill + goal title)
+//! * Local messages — body preview with sender/recipient pills
+//! * Wiki — fragment-version commits with title
+//! * Commits — generic commit-bar rendering for arbitrary branches
 //!
-//! Input handling mirrors the playground dashboard timeline:
+//! The widget is `Send + Sync` (GORBIE's state storage requires it
+//! across threads), so the live connection lives behind a
+//! `parking_lot::Mutex`.
+//!
+//! ```ignore
+//! // Single-branch: generic commit bars (v1 behavior).
+//! let mut timeline = BranchTimeline::new("./self.pile", "wiki");
+//! // Inside a GORBIE card:
+//! timeline.render(ctx);
+//!
+//! // Multi-branch: decorated overlay.
+//! let mut timeline = BranchTimeline::multi("./self.pile", vec![
+//!     TimelineSource::Compass { branch: "compass".into() },
+//!     TimelineSource::LocalMessages { branch: "local-messages".into() },
+//!     TimelineSource::Wiki { branch: "wiki".into() },
+//! ]);
+//! timeline.render(ctx);
+//! ```
+//!
+//! Input handling:
 //! * scroll = pan (vertical)
 //! * ctrl+scroll or horizontal scroll = zoom
 //! * drag = pan
 //! * double-click = jump to "now"
-//!
-//! ```ignore
-//! let mut timeline = BranchTimeline::new("./self.pile", "wiki");
-//! // Inside a GORBIE card:
-//! timeline.render(ctx);
-//! ```
 //!
 //! The ruler is a "four-sine" design: overlapping cosines at the natural
 //! time periods (minute, hour, day) that produce constructive interference
 //! at nice times. Labels are placed independently at the coarsest interval
 //! that gives ~6-10 labels per viewport.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use hifitime::{Duration as HifiDuration, Epoch};
@@ -47,7 +62,13 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobschemas::{LongString, SimpleArchive};
 use triblespace::prelude::View;
 
-/// Handle to a long-string blob (for branch names).
+use crate::schemas::compass::{
+    board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
+};
+use crate::schemas::local_messages::{local as local_attrs, KIND_MESSAGE_ID};
+use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
+
+/// Handle to a long-string blob (branch names, titles, bodies, notes).
 type TextHandle = Value<Handle<Blake3, LongString>>;
 /// A commit blob handle (SimpleArchive of its metadata tribles).
 type CommitHandleValue = Value<Handle<Blake3, SimpleArchive>>;
@@ -96,28 +117,169 @@ fn now_key() -> i128 {
         .unwrap_or(0)
 }
 
-// ── Live branch connection ───────────────────────────────────────────
-
-/// Opened pile + workspace for the target branch, plus the enumerated
-/// list of commits on that branch.
-struct TimelineLive {
-    ws: Workspace<Pile<Blake3>>,
-    /// Cached commits. Each entry is `(commit_entity_id, created_at_ns)`.
-    /// Sorted by timestamp ascending. Lifted eagerly on open — good
-    /// enough for small branches; progressive loading is future work.
-    commits: Vec<CommitEntry>,
+/// First 8 hex chars of an Id — compact label for pills / hover.
+fn id_prefix(id: Id) -> String {
+    let s = format!("{id:x}");
+    if s.len() > 8 { s[..8].to_string() } else { s }
 }
 
+/// Trim a string to `max` chars on a single line, replacing inner
+/// newlines with spaces. Used for body/title previews on event rows.
+fn preview(text: &str, max: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
+    let trimmed = flat.trim();
+    if trimmed.chars().count() <= max {
+        trimmed.to_string()
+    } else {
+        let take: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+        format!("{take}…")
+    }
+}
+
+/// Pick black or white text color for good contrast on `fill`.
+fn text_on(fill: egui::Color32) -> egui::Color32 {
+    let r = fill.r() as f32 / 255.0;
+    let g = fill.g() as f32 / 255.0;
+    let b = fill.b() as f32 / 255.0;
+    let lin = |c: f32| {
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let l = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    if l > 0.4 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
+// ── Source descriptions & styling ────────────────────────────────────
+
+/// Branch + decoration description for the multi-branch constructor.
 #[derive(Clone, Debug)]
-struct CommitEntry {
-    /// The commit entity id (derived from its signed metadata).
-    commit_id: Id,
-    /// TAI nanoseconds (lower bound of the interval).
-    ts_ns: i128,
+pub enum TimelineSource {
+    /// Just paint commits as plain bars (useful for arbitrary branches).
+    Commits {
+        branch: String,
+        label: String,
+        color: egui::Color32,
+    },
+    /// Compass branch — render goal status changes with the goal title
+    /// and status-color pill.
+    Compass { branch: String },
+    /// Local-messages branch — render each message with sender/body
+    /// preview.
+    LocalMessages { branch: String },
+    /// Wiki branch — render fragment-version commits with title.
+    Wiki { branch: String },
 }
 
-impl TimelineLive {
-    fn open(path: &Path, branch_name: &str) -> Result<Self, String> {
+/// Coarse kind used on the widget's `selected_event` and as a color key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    Commits,
+    Compass,
+    LocalMessages,
+    Wiki,
+}
+
+impl TimelineSource {
+    fn branch(&self) -> &str {
+        match self {
+            TimelineSource::Commits { branch, .. } => branch,
+            TimelineSource::Compass { branch } => branch,
+            TimelineSource::LocalMessages { branch } => branch,
+            TimelineSource::Wiki { branch } => branch,
+        }
+    }
+
+    /// A short (≤6 char) source label used in the pill.
+    fn label(&self) -> String {
+        match self {
+            TimelineSource::Commits { label, .. } => label.clone(),
+            TimelineSource::Compass { .. } => "goals".to_string(),
+            TimelineSource::LocalMessages { .. } => "local".to_string(),
+            TimelineSource::Wiki { .. } => "wiki".to_string(),
+        }
+    }
+
+    fn color(&self) -> egui::Color32 {
+        match self {
+            TimelineSource::Commits { color, .. } => *color,
+            // RAL 1012 lemon yellow — matches playground color_goals.
+            TimelineSource::Compass { .. } => egui::Color32::from_rgb(0xd9, 0xc2, 0x2e),
+            // RAL 6032 signal green — matches playground color_local_msg.
+            TimelineSource::LocalMessages { .. } => egui::Color32::from_rgb(0x23, 0x7f, 0x52),
+            // RAL 3012 beige red — matches playground color_wiki.
+            TimelineSource::Wiki { .. } => egui::Color32::from_rgb(0xc1, 0x87, 0x6b),
+        }
+    }
+}
+
+/// Kanban status color — reused for the inline pill on Compass events.
+fn status_color(status: &str) -> egui::Color32 {
+    match status {
+        // RAL 6018 yellow green
+        "todo" => egui::Color32::from_rgb(0x57, 0xa6, 0x39),
+        // RAL 1003 signal yellow
+        "doing" => egui::Color32::from_rgb(0xf7, 0xba, 0x0b),
+        // RAL 3020 traffic red
+        "blocked" => egui::Color32::from_rgb(0xcc, 0x0a, 0x17),
+        // RAL 5005 signal blue
+        "done" => egui::Color32::from_rgb(0x15, 0x4e, 0xa1),
+        // RAL 7012 basalt grey (muted)
+        _ => egui::Color32::from_rgb(0x4d, 0x55, 0x59),
+    }
+}
+
+// ── Event model ──────────────────────────────────────────────────────
+
+/// A single point on the timeline. Flat enough that we can sort and
+/// paint without re-querying per frame. Per-kind fields live as
+/// optional extras on the row so the painter can decorate without
+/// re-reading the fact space.
+#[derive(Clone, Debug)]
+struct Event {
+    source_idx: usize,
+    kind: SourceKind,
+    entity_id: Id,
+    ts_ns: i128,
+    /// Primary one-line preview (goal title, message body, wiki title,
+    /// or short commit id for generic sources).
+    summary: String,
+    /// Optional kanban-status pill label (Compass).
+    status: Option<String>,
+    /// Optional sender pill label (LocalMessages — "<from_prefix> → <to_prefix>").
+    from_to: Option<String>,
+}
+
+// ── Live connection ──────────────────────────────────────────────────
+
+/// Opened pile + per-source workspaces and cached fact spaces.
+///
+/// All sources share a single `Repository`/`Pile` handle for efficiency.
+/// Each requested branch is pulled once; its checked-out `TribleSet`
+/// feeds the event query, and the `Workspace` stays live so blob reads
+/// (bodies, titles, notes) resolve against the correct branch.
+struct MultiLive {
+    sources: Vec<SourceLive>,
+    events: Vec<Event>,
+}
+
+struct SourceLive {
+    source: TimelineSource,
+    ws: Workspace<Pile<Blake3>>,
+    space: TribleSet,
+}
+
+impl MultiLive {
+    fn open(path: &Path, sources: &[TimelineSource]) -> Result<Self, String> {
         let mut pile = Pile::<Blake3>::open(path).map_err(|e| format!("open pile: {e:?}"))?;
         if let Err(err) = pile.restore() {
             let _ = pile.close();
@@ -130,63 +292,277 @@ impl TimelineLive {
             .refresh()
             .map_err(|e| format!("refresh: {e:?}"))?;
 
-        let bid = find_branch(&mut repo, branch_name)
-            .ok_or_else(|| format!("no '{branch_name}' branch found"))?;
-        let mut ws = repo.pull(bid).map_err(|e| format!("pull: {e:?}"))?;
-
-        let commits = enumerate_commits(&mut ws)?;
-
-        Ok(TimelineLive { ws, commits })
+        let mut live = MultiLive {
+            sources: Vec::with_capacity(sources.len()),
+            events: Vec::new(),
+        };
+        for src in sources {
+            let bid = find_branch(&mut repo, src.branch())
+                .ok_or_else(|| format!("no '{}' branch found", src.branch()))?;
+            let mut ws = repo.pull(bid).map_err(|e| format!("pull: {e:?}"))?;
+            // For commit-only rendering we do NOT need a checked-out
+            // fact space; skip the work for that case.
+            let space = match src {
+                TimelineSource::Commits { .. } => TribleSet::new(),
+                _ => ws
+                    .checkout(..)
+                    .map_err(|e| format!("checkout: {e:?}"))?
+                    .into_facts(),
+            };
+            live.sources.push(SourceLive {
+                source: src.clone(),
+                ws,
+                space,
+            });
+        }
+        live.refresh_events();
+        Ok(live)
     }
 
-    /// Re-enumerate commits from HEAD. Cheap enough for v1; a future
-    /// version should do incremental delta via `checkout(prev..)`.
-    fn refresh(&mut self) {
-        if let Ok(cs) = enumerate_commits(&mut self.ws) {
-            self.commits = cs;
+    /// Re-enumerate events from every source. Eager — good enough for
+    /// v1; progressive loading is future work.
+    fn refresh_events(&mut self) {
+        let mut out: Vec<Event> = Vec::new();
+        for (idx, s) in self.sources.iter_mut().enumerate() {
+            match s.source.clone() {
+                TimelineSource::Commits { .. } => {
+                    collect_commit_events(idx, s, &mut out);
+                }
+                TimelineSource::Compass { .. } => {
+                    collect_compass_events(idx, s, &mut out);
+                }
+                TimelineSource::LocalMessages { .. } => {
+                    collect_local_events(idx, s, &mut out);
+                }
+                TimelineSource::Wiki { .. } => {
+                    collect_wiki_events(idx, s, &mut out);
+                }
+            }
         }
+        out.sort_by_key(|e| e.ts_ns);
+        self.events = out;
     }
 }
 
-/// Follow ancestors from `ws.head()` and read each commit blob to extract
-/// `(entity_id, created_at_ns)`. Commits without `created_at` (e.g. merge
-/// commits) are skipped — they carry no author-time bits by design.
-fn enumerate_commits(
-    ws: &mut Workspace<Pile<Blake3>>,
-) -> Result<Vec<CommitEntry>, String> {
-    let Some(head) = ws.head() else {
-        return Ok(Vec::new());
+/// Walk every commit reachable from HEAD and emit one Event per commit.
+/// Commits without `created_at` are skipped — they're merge commits by
+/// design and carry no author-time bits.
+fn collect_commit_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
+    let Some(head) = s.ws.head() else {
+        return;
     };
-
-    // `ancestors(head)` walks every commit reachable from HEAD through
-    // parent links. Selecting it gives us the full CommitSet.
-    let set: CommitSet = ancestors(head)
-        .select(ws)
-        .map_err(|e| format!("ancestors select: {e:?}"))?;
-
-    let mut out: Vec<CommitEntry> = Vec::new();
+    let Ok(set): Result<CommitSet, _> = ancestors(head).select(&mut s.ws) else {
+        return;
+    };
     for raw in set.iter() {
         let handle: CommitHandleValue = Value::new(*raw);
-        let Ok(meta) = ws.get::<TribleSet, SimpleArchive>(handle) else {
+        let Ok(meta) = s.ws.get::<TribleSet, SimpleArchive>(handle) else {
             continue;
         };
-        // Each commit blob is a TribleSet containing the commit entity.
-        // The entity id is derived intrinsically from the metadata, and
-        // `metadata::created_at` is present on authored commits only.
         if let Some((cid, ts)) = find!(
             (cid: Id, ts: (i128, i128)),
             pattern!(&meta, [{ ?cid @ metadata::created_at: ?ts }])
         )
         .next()
         {
-            out.push(CommitEntry {
-                commit_id: cid,
+            out.push(Event {
+                source_idx: idx,
+                kind: SourceKind::Commits,
+                entity_id: cid,
                 ts_ns: ts.0,
+                summary: id_prefix(cid),
+                status: None,
+                from_to: None,
             });
         }
     }
-    out.sort_by_key(|c| c.ts_ns);
-    Ok(out)
+}
+
+/// Emit a Compass event per status-change entity. Status events carry
+/// `compass::task` → goal, `compass::status` → text, plus `created_at`.
+/// We also record a plain "goal created" event for each goal so an
+/// otherwise-quiet board still paints something.
+fn collect_compass_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
+    // Cache titles per goal id so repeated status changes don't re-read
+    // the same blob N times.
+    let mut title_by_goal: HashMap<Id, String> = HashMap::new();
+
+    // Goal creations — useful even when no status transition exists yet.
+    let goal_rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
+        (gid: Id, title: TextHandle, ts: (i128, i128)),
+        pattern!(&s.space, [{
+            ?gid @
+            metadata::tag: &KIND_GOAL_ID,
+            compass_attrs::title: ?title,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .collect();
+
+    for (gid, title_h, ts) in goal_rows {
+        let title = s
+            .ws
+            .get::<View<str>, LongString>(title_h)
+            .map(|v| {
+                let s: &str = v.as_ref();
+                s.to_string()
+            })
+            .unwrap_or_default();
+        title_by_goal.insert(gid, title.clone());
+        out.push(Event {
+            source_idx: idx,
+            kind: SourceKind::Compass,
+            entity_id: gid,
+            ts_ns: ts.0,
+            summary: preview(&title, 80),
+            status: Some("created".to_string()),
+            from_to: None,
+        });
+    }
+
+    // Status transitions.
+    let status_rows: Vec<(Id, Id, String, (i128, i128))> = find!(
+        (event_id: Id, gid: Id, status: String, ts: (i128, i128)),
+        pattern!(&s.space, [{
+            ?event_id @
+            metadata::tag: &KIND_STATUS_ID,
+            compass_attrs::task: ?gid,
+            compass_attrs::status: ?status,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .collect();
+
+    for (event_id, gid, status, ts) in status_rows {
+        let title = title_by_goal
+            .get(&gid)
+            .cloned()
+            .unwrap_or_else(|| id_prefix(gid));
+        out.push(Event {
+            source_idx: idx,
+            kind: SourceKind::Compass,
+            entity_id: event_id,
+            ts_ns: ts.0,
+            summary: preview(&title, 80),
+            status: Some(status),
+            from_to: None,
+        });
+    }
+
+    // Notes — painted as a small "note" pill so activity on goals is
+    // visible on the timeline even when the status hasn't moved.
+    let note_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
+        (event_id: Id, gid: Id, note: TextHandle, ts: (i128, i128)),
+        pattern!(&s.space, [{
+            ?event_id @
+            metadata::tag: &KIND_NOTE_ID,
+            compass_attrs::task: ?gid,
+            compass_attrs::note: ?note,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .collect();
+
+    for (event_id, gid, note_h, ts) in note_rows {
+        let body = s
+            .ws
+            .get::<View<str>, LongString>(note_h)
+            .map(|v| {
+                let s: &str = v.as_ref();
+                s.to_string()
+            })
+            .unwrap_or_default();
+        let title = title_by_goal
+            .get(&gid)
+            .cloned()
+            .unwrap_or_else(|| id_prefix(gid));
+        let summary = if body.is_empty() {
+            preview(&title, 80)
+        } else {
+            preview(&format!("{title} — {body}"), 80)
+        };
+        out.push(Event {
+            source_idx: idx,
+            kind: SourceKind::Compass,
+            entity_id: event_id,
+            ts_ns: ts.0,
+            summary,
+            status: Some("note".to_string()),
+            from_to: None,
+        });
+    }
+}
+
+/// Emit a LocalMessages event per message. The "sender → recipient"
+/// prefix is shown as a pill; the body preview is the summary.
+fn collect_local_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
+    let rows: Vec<(Id, Id, Id, TextHandle, (i128, i128))> = find!(
+        (mid: Id, from: Id, to: Id, body: TextHandle, ts: (i128, i128)),
+        pattern!(&s.space, [{
+            ?mid @
+            metadata::tag: &KIND_MESSAGE_ID,
+            local_attrs::from: ?from,
+            local_attrs::to: ?to,
+            local_attrs::body: ?body,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .collect();
+
+    for (mid, from, to, body_h, ts) in rows {
+        let body = s
+            .ws
+            .get::<View<str>, LongString>(body_h)
+            .map(|v| {
+                let s: &str = v.as_ref();
+                s.to_string()
+            })
+            .unwrap_or_default();
+        out.push(Event {
+            source_idx: idx,
+            kind: SourceKind::LocalMessages,
+            entity_id: mid,
+            ts_ns: ts.0,
+            summary: preview(&body, 80),
+            status: None,
+            from_to: Some(format!("{} → {}", id_prefix(from), id_prefix(to))),
+        });
+    }
+}
+
+/// Emit a Wiki event per fragment-version. The title blob is pulled
+/// eagerly so we don't need per-frame blob I/O during paint.
+fn collect_wiki_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
+    let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
+        (vid: Id, title: TextHandle, ts: (i128, i128)),
+        pattern!(&s.space, [{
+            ?vid @
+            metadata::tag: &KIND_VERSION_ID,
+            wiki_attrs::title: ?title,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .collect();
+
+    for (vid, title_h, ts) in rows {
+        let title = s
+            .ws
+            .get::<View<str>, LongString>(title_h)
+            .map(|v| {
+                let s: &str = v.as_ref();
+                s.to_string()
+            })
+            .unwrap_or_default();
+        out.push(Event {
+            source_idx: idx,
+            kind: SourceKind::Wiki,
+            entity_id: vid,
+            ts_ns: ts.0,
+            summary: preview(&title, 80),
+            status: None,
+            from_to: None,
+        });
+    }
 }
 
 /// Find a branch by name in a pile-backed repository.
@@ -216,7 +592,7 @@ fn find_branch(repo: &mut Repository<Pile<Blake3>>, name: &str) -> Option<Id> {
 
 // ── Widget ───────────────────────────────────────────────────────────
 
-/// GORBIE-embeddable pan/zoom timeline for a single pile branch.
+/// GORBIE-embeddable pan/zoom timeline for one or more pile branches.
 ///
 /// Paints a full-width vertical time axis (newest at top, oldest at
 /// bottom) with:
@@ -224,19 +600,20 @@ fn find_branch(repo: &mut Repository<Pile<Blake3>>, name: &str) -> Option<Id> {
 /// * a four-sine ruler (constructive interference at minute / hour /
 ///   day boundaries)
 /// * time labels at the coarsest interval that fits
-/// * one horizontal tick per commit at its `metadata::created_at`
-///   position
+/// * per-source event chips with source-specific decoration
 ///
-/// The pile + target branch are opened lazily on first render, in the
-/// same pattern as [`WikiViewer`](crate::widgets::WikiViewer).
+/// The pile + all requested source branches are opened lazily on the
+/// first render, in the same pattern as [`WikiViewer`](crate::widgets::WikiViewer).
 pub struct BranchTimeline {
     pile_path: PathBuf,
-    branch_name: String,
+    /// One entry per requested source. Single-branch constructor builds
+    /// a single `TimelineSource::Commits` entry with a default label.
+    sources: Vec<TimelineSource>,
     viewport_height: f32,
     // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's state
     // storage requires that across threads, and `Workspace<Pile<Blake3>>`
     // uses interior-mutability types (Cell/RefCell) that aren't Sync.
-    live: Option<Mutex<TimelineLive>>,
+    live: Option<Mutex<MultiLive>>,
     error: Option<String>,
     /// Top edge of viewport, in TAI ns. Newest visible time.
     timeline_start: i128,
@@ -245,22 +622,48 @@ pub struct BranchTimeline {
     /// Tracks the first render so we can initialize `timeline_start` to
     /// "now" before painting.
     first_render: bool,
+    /// The most-recently-clicked event, if any. Hosts can read this to
+    /// drive floating detail cards.
+    pub selected_event: Option<(SourceKind, Id)>,
 }
 
 impl BranchTimeline {
-    /// Build a timeline pointing at a pile on disk and a named branch.
-    /// The pile is not opened until the first [`render`](Self::render)
-    /// call.
+    /// Single-branch timeline — renders commits on `branch_name` as
+    /// generic commit bars. Matches v1 behavior.
     pub fn new(pile_path: impl Into<PathBuf>, branch_name: impl Into<String>) -> Self {
+        let branch = branch_name.into();
+        // Default commit-bar color: muted amber (matches v1 "commit_color").
+        let color = egui::Color32::from_rgb(0xff, 0xc8, 0x3a);
         Self {
             pile_path: pile_path.into(),
-            branch_name: branch_name.into(),
+            sources: vec![TimelineSource::Commits {
+                label: branch.clone(),
+                branch,
+                color,
+            }],
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
             live: None,
             error: None,
             timeline_start: 0,
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             first_render: true,
+            selected_event: None,
+        }
+    }
+
+    /// Multi-branch overlay — each source paints its own events on the
+    /// shared axis.
+    pub fn multi(pile_path: impl Into<PathBuf>, sources: Vec<TimelineSource>) -> Self {
+        Self {
+            pile_path: pile_path.into(),
+            sources,
+            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+            live: None,
+            error: None,
+            timeline_start: 0,
+            timeline_scale: TIMELINE_DEFAULT_SCALE,
+            first_render: true,
+            selected_event: None,
         }
     }
 
@@ -274,7 +677,7 @@ impl BranchTimeline {
     pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
         // Lazy pile open on first render.
         if self.live.is_none() && self.error.is_none() {
-            match TimelineLive::open(&self.pile_path, &self.branch_name) {
+            match MultiLive::open(&self.pile_path, &self.sources) {
                 Ok(live) => self.live = Some(Mutex::new(live)),
                 Err(e) => self.error = Some(e),
             }
@@ -294,20 +697,30 @@ impl BranchTimeline {
         if self.first_render {
             self.timeline_start = now;
             self.first_render = false;
-            // Opportunistically refresh on first render in case commits
+            // Opportunistically refresh on first render in case events
             // were added between construction and first paint.
-            live_lock.lock().refresh();
+            live_lock.lock().refresh_events();
         }
 
-        // Snapshot commits so we don't hold the mutex across egui calls.
-        let commits: Vec<CommitEntry> = live_lock.lock().commits.clone();
+        // Snapshot events + source descriptors so we don't hold the
+        // mutex across egui calls.
+        let (events, sources): (Vec<Event>, Vec<TimelineSource>) = {
+            let guard = live_lock.lock();
+            (guard.events.clone(), guard.sources.iter().map(|s| s.source.clone()).collect())
+        };
 
-        let branch_name = self.branch_name.clone();
         let viewport_height = self.viewport_height;
 
-        ctx.section(&format!("Branch: {branch_name}"), |ctx| {
-            ctx.label(format!("{} commits", commits.len()));
-            self.paint_viewport(ctx, viewport_height, now, &commits);
+        ctx.section("Activity", |ctx| {
+            // Source legend — one chip per source with count.
+            let ui = ctx.ui_mut();
+            ui.horizontal_wrapped(|ui| {
+                for (i, s) in sources.iter().enumerate() {
+                    let count = events.iter().filter(|e| e.source_idx == i).count();
+                    render_pill(ui, &format!("{} · {count}", s.label()), s.color());
+                }
+            });
+            self.paint_viewport(ctx, viewport_height, now, &events, &sources);
         });
     }
 
@@ -317,7 +730,8 @@ impl BranchTimeline {
         ctx: &mut CardCtx<'_>,
         viewport_height: f32,
         now: i128,
-        commits: &[CommitEntry],
+        events: &[Event],
+        sources: &[TimelineSource],
     ) {
         let ui = ctx.ui_mut();
         let scroll_speed = 3.0;
@@ -401,18 +815,13 @@ impl BranchTimeline {
 
         let painter = ui.painter_at(viewport_rect);
 
-        // Background. Use a neutral dark grey — palette matching is the
+        // Background. Neutral dark grey — palette matching is the
         // caller's concern.
-        painter.rect_filled(
-            viewport_rect,
-            0.0,
-            egui::Color32::from_rgb(0x29, 0x2c, 0x2f),
-        );
+        let frame_color = egui::Color32::from_rgb(0x29, 0x2c, 0x2f);
+        painter.rect_filled(viewport_rect, 0.0, frame_color);
 
-        // Four-sine ruler: one cosine per natural time period. Periods
-        // whose wavelength is < 2× tick spacing fade out smoothly.
+        // Four-sine ruler: one cosine per natural time period.
         let muted = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
-        let axis_color = egui::Color32::from_rgb(0xbd, 0xbd, 0xbd);
         let max_len = 80.0;
         let tick_spacing_px = GRID_ROW_MODULE;
         let tau = std::f64::consts::TAU;
@@ -487,58 +896,197 @@ impl BranchTimeline {
             }
         }
 
-        // Commit markers: short horizontal tick per commit, plus a small
-        // filled circle on the axis. Tooltip on hover shows id + time.
-        let commit_color = egui::Color32::from_rgb(0xff, 0xc8, 0x3a);
-        let axis_x = viewport_rect.right() - 40.0;
-        // A faint vertical axis line on the right side anchors the commits.
-        painter.line_segment(
-            [
-                egui::pos2(axis_x, viewport_rect.top()),
-                egui::pos2(axis_x, viewport_rect.bottom()),
-            ],
-            egui::Stroke::new(0.5, axis_color),
-        );
+        // Per-source event rendering.
+        //
+        // Two layouts depending on source count:
+        //   1 source, all Commits → v1 ribbon-on-right style (short
+        //      horizontal tick + dot on a thin vertical axis line).
+        //   Otherwise → chip-style rows: wide chip with source pill +
+        //      per-kind decoration + summary text.
+        let only_commits = sources.len() == 1
+            && matches!(sources[0], TimelineSource::Commits { .. });
 
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
         let mut hover_label: Option<(egui::Pos2, String)> = None;
+        let mut clicked_event: Option<(SourceKind, Id)> = None;
+        let mut hover_rect: Option<(egui::Rect, egui::Color32)> = None;
 
-        for c in commits {
-            if c.ts_ns < view_end || c.ts_ns > view_start {
-                continue;
-            }
-            let y = viewport_rect.top() + ((view_start - c.ts_ns) as f64 / ns_per_px) as f32;
-            let x1 = axis_x - 8.0;
-            let x2 = axis_x + 8.0;
+        if only_commits {
+            // v1 compact ribbon.
+            let commit_color = sources[0].color();
+            let axis_color = egui::Color32::from_rgb(0xbd, 0xbd, 0xbd);
+            let axis_x = viewport_rect.right() - 40.0;
             painter.line_segment(
-                [egui::pos2(x1, y), egui::pos2(x2, y)],
-                egui::Stroke::new(1.5, commit_color),
+                [
+                    egui::pos2(axis_x, viewport_rect.top()),
+                    egui::pos2(axis_x, viewport_rect.bottom()),
+                ],
+                egui::Stroke::new(0.5, axis_color),
             );
-            painter.circle_filled(egui::pos2(axis_x, y), 2.5, commit_color);
 
-            if let Some(p) = pointer_pos {
-                if viewport_rect.contains(p) && (p.y - y).abs() <= 4.0 && (p.x - axis_x).abs() <= 40.0
-                {
-                    let short = format!("{:x}", c.commit_id);
-                    let short = if short.len() > 8 {
-                        short[..8].to_string()
-                    } else {
-                        short
-                    };
-                    let label = format!("{}  {}", short, format_time_marker(c.ts_ns));
-                    hover_label = Some((egui::pos2(axis_x - 12.0, y), label));
+            for ev in events {
+                if ev.ts_ns < view_end || ev.ts_ns > view_start {
+                    continue;
+                }
+                let y =
+                    viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
+                let x1 = axis_x - 8.0;
+                let x2 = axis_x + 8.0;
+                painter.line_segment(
+                    [egui::pos2(x1, y), egui::pos2(x2, y)],
+                    egui::Stroke::new(1.5, commit_color),
+                );
+                painter.circle_filled(egui::pos2(axis_x, y), 2.5, commit_color);
+
+                if let Some(p) = pointer_pos {
+                    if viewport_rect.contains(p)
+                        && (p.y - y).abs() <= 4.0
+                        && (p.x - axis_x).abs() <= 40.0
+                    {
+                        let label =
+                            format!("{}  {}", ev.summary, format_time_marker(ev.ts_ns));
+                        hover_label = Some((egui::pos2(axis_x - 12.0, y), label));
+                        if viewport_response.clicked() {
+                            clicked_event = Some((ev.kind, ev.entity_id));
+                        }
+                    }
                 }
             }
+
+            if let Some((pos, label)) = hover_label {
+                painter.text(
+                    pos,
+                    egui::Align2::RIGHT_CENTER,
+                    label,
+                    egui::FontId::monospace(10.0),
+                    axis_color,
+                );
+            }
+        } else {
+            // Multi-source chip layout.
+            let event_left = viewport_rect.left() + max_len + 110.0;
+            let event_right_margin = 8.0;
+            let event_width = (viewport_rect.right() - event_left - event_right_margin).max(80.0);
+            let chip_h = 16.0;
+            let text_color = egui::Color32::from_rgb(0xe6, 0xe6, 0xe6);
+
+            for ev in events {
+                if ev.ts_ns < view_end || ev.ts_ns > view_start {
+                    continue;
+                }
+                let y =
+                    viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
+                let src = &sources[ev.source_idx];
+                let src_color = src.color();
+                let src_label = src.label();
+
+                let chip_rect = egui::Rect::from_min_size(
+                    egui::pos2(event_left, y - chip_h * 0.5),
+                    egui::vec2(event_width, chip_h),
+                );
+
+                // Chip background.
+                painter.rect_filled(chip_rect, 3.0, frame_color);
+
+                // Source pill (left).
+                let src_pill_w = 42.0;
+                let src_pill = egui::Rect::from_min_size(
+                    egui::pos2(event_left + 2.0, y - chip_h * 0.5 + 1.0),
+                    egui::vec2(src_pill_w, chip_h - 2.0),
+                );
+                painter.rect_filled(src_pill, 3.0, src_color);
+                painter.text(
+                    src_pill.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &src_label,
+                    egui::FontId::proportional(9.0),
+                    text_on(src_color),
+                );
+
+                // Optional secondary pill (status / from→to).
+                let mut text_x = event_left + src_pill_w + 6.0;
+                if let Some(status) = &ev.status {
+                    let pill_color = match ev.kind {
+                        SourceKind::Compass => status_color(status),
+                        _ => src_color,
+                    };
+                    let pill_w = 40.0 + (status.len() as f32 * 4.0).min(40.0);
+                    let pill = egui::Rect::from_min_size(
+                        egui::pos2(text_x, y - chip_h * 0.5 + 1.0),
+                        egui::vec2(pill_w, chip_h - 2.0),
+                    );
+                    painter.rect_filled(pill, 3.0, pill_color);
+                    painter.text(
+                        pill.center(),
+                        egui::Align2::CENTER_CENTER,
+                        status,
+                        egui::FontId::proportional(9.0),
+                        text_on(pill_color),
+                    );
+                    text_x = pill.right() + 6.0;
+                }
+                if let Some(fromto) = &ev.from_to {
+                    painter.text(
+                        egui::pos2(text_x, y),
+                        egui::Align2::LEFT_CENTER,
+                        fromto,
+                        egui::FontId::monospace(9.0),
+                        muted,
+                    );
+                    text_x += (fromto.len() as f32 * 6.5).min(140.0);
+                }
+
+                // Summary text — clipped against the chip's right edge.
+                let text_rect = egui::Rect::from_min_max(
+                    egui::pos2(text_x, chip_rect.top()),
+                    egui::pos2(chip_rect.right() - 4.0, chip_rect.bottom()),
+                );
+                let text_painter = painter.with_clip_rect(text_rect);
+                text_painter.text(
+                    egui::pos2(text_x, y),
+                    egui::Align2::LEFT_CENTER,
+                    &ev.summary,
+                    egui::FontId::monospace(10.0),
+                    text_color,
+                );
+
+                // Interaction: hover highlight + click.
+                if let Some(p) = pointer_pos {
+                    if chip_rect.contains(p) {
+                        hover_rect = Some((chip_rect, src_color));
+                        if viewport_response.clicked() {
+                            clicked_event = Some((ev.kind, ev.entity_id));
+                        }
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                }
+            }
+
+            if let Some((rect, color)) = hover_rect {
+                painter.rect_stroke(
+                    rect,
+                    3.0,
+                    egui::Stroke::new(1.0, color),
+                    egui::StrokeKind::Outside,
+                );
+            }
         }
 
-        if let Some((pos, label)) = hover_label {
-            painter.text(
-                pos,
-                egui::Align2::RIGHT_CENTER,
-                label,
-                egui::FontId::monospace(10.0),
-                axis_color,
-            );
+        if let Some(sel) = clicked_event {
+            self.selected_event = Some(sel);
         }
     }
+}
+
+/// Draw a small rounded pill label. Used by the source legend above the
+/// viewport.
+fn render_pill(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
+    let text = text_on(fill);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().monospace().color(text));
+        });
 }

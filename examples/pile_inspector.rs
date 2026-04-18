@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use faculties::widgets::timeline::TimelineSource;
 use faculties::widgets::{BranchTimeline, CompassBoard, MessagesPanel, WikiViewer};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
@@ -38,7 +39,20 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state(
         "timeline",
-        BranchTimeline::new(pile_path.clone(), "compass"),
+        BranchTimeline::multi(
+            pile_path.clone(),
+            vec![
+                TimelineSource::Compass {
+                    branch: "compass".to_string(),
+                },
+                TimelineSource::LocalMessages {
+                    branch: "local-messages".to_string(),
+                },
+                TimelineSource::Wiki {
+                    branch: "wiki".to_string(),
+                },
+            ],
+        ),
         |ctx, w| w.render(ctx),
     );
 
