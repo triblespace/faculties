@@ -1119,6 +1119,7 @@ impl WikiViewer {
 
     /// Render the viewer into a GORBIE card context.
     pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
+        ctx.section("Wiki", |ctx| {
         // Lazy pile open on first render.
         if !self.auto_loaded {
             self.auto_loaded = true;
@@ -1353,5 +1354,6 @@ impl WikiViewer {
         for hex in to_open_file {
             live.open_file(&hex);
         }
+        });
     }
 }
