@@ -1,0 +1,17 @@
+[package]
+name = "faculties"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Shared schemas, helpers, and widgets for triblespace-backed faculties."
+repository = "https://github.com/triblespace/faculties"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+widgets = []
+
+[dependencies]
+triblespace = "0.36"
