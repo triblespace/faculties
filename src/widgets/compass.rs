@@ -743,7 +743,6 @@ impl CompassBoard {
         // Pull scalars out of `self` before the closure so we don't end up
         // with conflicting borrows.
         let column_height = self.column_height;
-        let branch_name = self.branch_name.clone();
         let total_goals: usize = column_data.iter().map(|(_, r)| r.len()).sum();
 
         // Write intents collected during render (applied after the UI closure
@@ -760,11 +759,11 @@ impl CompassBoard {
         let status_menu = &mut self.status_menu;
         let toast = &mut self.toast;
 
-        ctx.section(&format!("Compass: {branch_name}"), |ctx| {
+        ctx.section("Compass", |ctx| {
             ctx.label(format!("{total_goals} goals"));
 
             if let Some(msg) = toast.as_ref() {
-                let color = ctx.ctx().style().visuals.error_fg_color;
+                let color = ctx.ctx().global_style().visuals.error_fg_color;
                 ctx.label(
                     egui::RichText::new(msg.as_str())
                         .color(color)

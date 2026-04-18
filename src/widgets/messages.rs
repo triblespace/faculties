@@ -790,7 +790,7 @@ impl MessagesPanel {
             ctx.label(count_label);
 
             if let Some(msg) = self.toast.as_ref() {
-                let color = ctx.ctx().style().visuals.error_fg_color;
+                let color = ctx.ctx().global_style().visuals.error_fg_color;
                 ctx.label(
                     egui::RichText::new(msg.as_str())
                         .color(color)

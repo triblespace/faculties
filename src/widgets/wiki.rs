@@ -875,9 +875,13 @@ impl WikiGraph {
 
     fn show(&self, ui: &mut egui::Ui) -> Option<Id> {
         let available = ui.available_size();
+        // Click-only sense — drag is implemented manually below. Avoids
+        // egui's hit_test unwrap panic that fires when a drag-sensing
+        // widget coexists with a nearby click-sensing one (the section
+        // header above us).
         let (response, painter) = ui.allocate_painter(
             egui::vec2(available.x, available.y.max(400.0)),
-            egui::Sense::click_and_drag(),
+            egui::Sense::click(),
         );
         let rect = response.rect;
         let center = rect.center();
@@ -885,6 +889,7 @@ impl WikiGraph {
         let view_id = ui.id().with("wiki_graph_view");
         let pan_id = view_id.with("pan");
         let zoom_id = view_id.with("zoom");
+        let drag_id = view_id.with("drag_last");
 
         let mut pan: egui::Vec2 = ui.ctx().memory_mut(|m| {
             *m.data
@@ -921,9 +926,23 @@ impl WikiGraph {
             }
         }
 
-        if response.dragged() {
-            pan += response.drag_delta();
-            ui.ctx().memory_mut(|m| m.data.insert_temp(pan_id, pan));
+        // Manual drag-to-pan — tracks last pointer pos in egui memory so
+        // it persists across frames without needing `Sense::drag`.
+        let (primary_down, pointer_pos) =
+            ui.input(|i| (i.pointer.primary_down(), i.pointer.hover_pos()));
+        let in_rect = pointer_pos.map(|p| rect.contains(p)).unwrap_or(false);
+        if primary_down && in_rect {
+            let last: Option<egui::Pos2> =
+                ui.ctx().memory(|m| m.data.get_temp(drag_id));
+            if let Some(p) = pointer_pos {
+                if let Some(last_p) = last {
+                    pan += p - last_p;
+                    ui.ctx().memory_mut(|m| m.data.insert_temp(pan_id, pan));
+                }
+                ui.ctx().memory_mut(|m| m.data.insert_temp(drag_id, p));
+            }
+        } else {
+            ui.ctx().memory_mut(|m| m.data.remove_temp::<egui::Pos2>(drag_id));
         }
 
         let to_screen =
