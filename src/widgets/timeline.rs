@@ -622,6 +622,11 @@ pub struct BranchTimeline {
     /// Tracks the first render so we can initialize `timeline_start` to
     /// "now" before painting.
     first_render: bool,
+    /// Manual drag tracking — avoids registering `Sense::drag` on the
+    /// viewport, which would trigger an egui 0.33/0.34 hit_test panic
+    /// when the section header above us has `Sense::click`. Holds the
+    /// pointer y from the previous frame while a drag is in progress.
+    drag_last_y: Option<f32>,
     /// The most-recently-clicked event, if any. Hosts can read this to
     /// drive floating detail cards.
     pub selected_event: Option<(SourceKind, Id)>,
@@ -647,6 +652,7 @@ impl BranchTimeline {
             timeline_start: 0,
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             first_render: true,
+            drag_last_y: None,
             selected_event: None,
         }
     }
@@ -663,6 +669,7 @@ impl BranchTimeline {
             timeline_start: 0,
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             first_render: true,
+            drag_last_y: None,
             selected_event: None,
         }
     }
@@ -743,9 +750,14 @@ impl BranchTimeline {
         let ui = ctx.ui_mut();
         let scroll_speed = 3.0;
         let viewport_width = ui.available_width();
+        // Click-only sense. We implement drag-to-pan manually below via
+        // raw pointer state to sidestep egui's hit_test unwrap panic that
+        // fires when a click-sensing widget (like the section header) and
+        // a drag-sensing widget (what this viewport would be) both land
+        // close to the cursor.
         let (viewport_rect, viewport_response) = ui.allocate_exact_size(
             egui::vec2(viewport_width, viewport_height),
-            egui::Sense::click_and_drag(),
+            egui::Sense::click(),
         );
 
         // Input handling — compute ns_per_px from CURRENT scale.
@@ -803,10 +815,23 @@ impl BranchTimeline {
                 });
             }
 
-            if viewport_response.dragged() {
-                let drag_delta = viewport_response.drag_delta().y;
-                let pan_ns = (drag_delta as f64 * ns_per_px) as i128;
-                self.timeline_start += pan_ns;
+            // Manual drag-to-pan (see comment on the allocate_exact_size
+            // sense choice above for why we don't use `Sense::drag`).
+            let (primary_down, pointer_pos) = ui
+                .input(|i| (i.pointer.primary_down(), i.pointer.hover_pos()));
+            let in_viewport =
+                pointer_pos.map(|p| viewport_rect.contains(p)).unwrap_or(false);
+            if primary_down && in_viewport {
+                if let Some(p) = pointer_pos {
+                    if let Some(last_y) = self.drag_last_y {
+                        let drag_delta = p.y - last_y;
+                        let pan_ns = (drag_delta as f64 * ns_per_px) as i128;
+                        self.timeline_start += pan_ns;
+                    }
+                    self.drag_last_y = Some(p.y);
+                }
+            } else {
+                self.drag_last_y = None;
             }
 
             if viewport_response.double_clicked() {
