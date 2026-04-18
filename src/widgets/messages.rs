@@ -815,7 +815,16 @@ impl MessagesPanel {
             let mut scroll = egui::ScrollArea::vertical()
                 .id_salt(("messages_panel", self.branch_name.as_str()))
                 .max_height(viewport_height)
-                .auto_shrink([false, false]);
+                .auto_shrink([false, false])
+                // Disable drag-to-scroll — see note on compass.rs; prevents
+                // an egui hit_test unwrap panic when clickable message cards
+                // overlap the drag-sense the scroll area would otherwise
+                // register.
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    scroll_bar: true,
+                    drag: false,
+                    mouse_wheel: true,
+                });
             if scroll_to_bottom {
                 scroll = scroll.vertical_scroll_offset(f32::MAX);
             }

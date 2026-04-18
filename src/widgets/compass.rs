@@ -961,6 +961,15 @@ fn render_column(
                 .id_salt(("compass_column", status))
                 .max_height(height)
                 .auto_shrink([false, false])
+                // Disable drag-to-scroll — it registers a content-wide
+                // `Sense::drag()` that collides with nested click-senses
+                // on cards/triangles and trips an `unwrap()` in egui's
+                // hit_test under some layouts (egui 0.33.x / 0.34.x).
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    scroll_bar: true,
+                    drag: false,
+                    mouse_wheel: true,
+                })
                 .show(ui, |ui| {
                     if rows.is_empty() && !form.open {
                         ui.small("(empty)");
