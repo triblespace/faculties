@@ -902,8 +902,13 @@ fn render_column(
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
+            // Force vertical layout inside the column — the parent ui is
+            // `horizontal_top` (to lay columns side-by-side), which Frame
+            // inherits by default, so without this all the rows inside the
+            // column would stack left-to-right.
             ui.set_width(width);
             ui.set_min_height(height);
+            ui.vertical(|ui| {
 
             // Column header + "+ Add" toggle.
             ui.horizontal(|ui| {
@@ -985,6 +990,7 @@ fn render_column(
                         ui.add_space(6.0);
                     }
                 });
+            });
         });
 }
 
