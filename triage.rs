@@ -9,7 +9,7 @@
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
 //! triblespace = "0.36"
-//! faculties = "0.1"
+//! faculties = "0.2"
 //! ```
 
 use anyhow::{Result, anyhow, bail};

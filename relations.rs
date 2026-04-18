@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
 //! triblespace = "0.36"
-//! faculties = "0.1"
+//! faculties = "0.2"
 //! ```
 
 use anyhow::{Result, anyhow, bail};

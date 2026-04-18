@@ -9,7 +9,7 @@
 //! reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 //! anybytes = "0.20"
 //! triblespace = "0.36"
-//! faculties = "0.1"
+//! faculties = "0.2"
 //! ```
 
 use anyhow::{Context, Result, bail};

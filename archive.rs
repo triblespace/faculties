@@ -12,7 +12,7 @@
 //! tracing = "0.1"
 //! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 //! triblespace = "0.36"
-//! faculties = "0.1"
+//! faculties = "0.2"
 //! ```
 
 use std::collections::{HashMap, HashSet};
