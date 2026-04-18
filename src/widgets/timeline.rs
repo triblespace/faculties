@@ -712,15 +712,22 @@ impl BranchTimeline {
         let viewport_height = self.viewport_height;
 
         ctx.section("Activity", |ctx| {
-            // Source legend — one chip per source with count.
-            let ui = ctx.ui_mut();
-            ui.horizontal_wrapped(|ui| {
-                for (i, s) in sources.iter().enumerate() {
-                    let count = events.iter().filter(|e| e.source_idx == i).count();
-                    render_pill(ui, &format!("{} · {count}", s.label()), s.color());
-                }
+            ctx.grid(|g| {
+                // Source legend — one chip per source with count.
+                g.full(|ctx| {
+                    let ui = ctx.ui_mut();
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, s) in sources.iter().enumerate() {
+                            let count = events.iter().filter(|e| e.source_idx == i).count();
+                            render_pill(ui, &format!("{} · {count}", s.label()), s.color());
+                        }
+                    });
+                });
+                // Viewport spans the whole grid row.
+                g.full(|ctx| {
+                    self.paint_viewport(ctx, viewport_height, now, &events, &sources);
+                });
             });
-            self.paint_viewport(ctx, viewport_height, now, &events, &sources);
         });
     }
 

@@ -1211,7 +1211,12 @@ impl WikiViewer {
             if !graph.is_bundled() {
                 graph.step();
             }
-            let clicked_node = graph.show(ctx.ui_mut());
+            let mut clicked_node: Option<Id> = None;
+            ctx.grid(|g| {
+                g.full(|ctx| {
+                    clicked_node = graph.show(ctx.ui_mut());
+                });
+            });
             if let Some(frag_id) = clicked_node {
                 if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
                     self.open_pages.push(OpenPage {

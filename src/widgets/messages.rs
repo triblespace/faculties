@@ -799,6 +799,8 @@ impl MessagesPanel {
                 );
             }
 
+            let mut send_intent: Option<(Id, String)> = None;
+            ctx.grid(|g| g.full(|ctx| {
             let ui = ctx.ui_mut();
             if messages.is_empty() && self.me.is_none() {
                 ui.label("No messages yet.");
@@ -867,7 +869,6 @@ impl MessagesPanel {
             }
 
             // Compose UI.
-            let mut send_intent: Option<(Id, String)> = None;
             if let Some(me) = self.me {
                 ui.separator();
                 render_composer(
@@ -881,6 +882,7 @@ impl MessagesPanel {
                     &mut send_intent,
                 );
             }
+            }));
 
             // Apply writes after UI closure.
             if !to_mark_read.is_empty() || send_intent.is_some() {
