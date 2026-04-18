@@ -7,7 +7,8 @@
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! hex = "0.4"
-//! triblespace = "0.34.1"
+//! triblespace = "0.36"
+//! faculties = "0.1"
 //! ```
 //!
 //! Research quality gauge: reads wiki tag metadata to measure research health.
@@ -16,6 +17,7 @@
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::schemas::gauge::{WIKI_BRANCH_NAME, wiki};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::HashMap;
@@ -23,18 +25,6 @@ use std::path::PathBuf;
 use triblespace::core::metadata;
 use triblespace::core::repo::Workspace;
 use triblespace::prelude::*;
-
-// ── reuse wiki schemas ──────────────────────────────────────────────────
-mod wiki {
-    use triblespace::prelude::*;
-    attributes! {
-        "EBFC56D50B748E38A14F5FC768F1B9C1" as fragment: valueschemas::GenId;
-        "78BABEF1792531A2E51A372D96FE5F3E" as title: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "DEAFB7E307DF72389AD95A850F24BAA5" as links_to: valueschemas::GenId;
-    }
-}
-
-const WIKI_BRANCH_NAME: &str = "wiki";
 
 type Repo = Repository<Pile<valueschemas::Blake3>>;
 type Lower = i128;

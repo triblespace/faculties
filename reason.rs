@@ -6,12 +6,14 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.34.1"
+//! triblespace = "0.36"
+//! faculties = "0.1"
 //! ```
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
+use faculties::schemas::reason::{DEFAULT_BRANCH, KIND_REASON_ID, reason_schema};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::fs;
@@ -20,22 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use triblespace::core::metadata;
 use triblespace::core::repo::Repository;
-use triblespace::macros::{attributes, id_hex};
 use triblespace::prelude::*;
-
-const DEFAULT_BRANCH: &str = "cognition";
-const KIND_REASON_ID: Id = id_hex!("9D43BB36D8B4A6275CAF38A1D5DACF36");
-
-mod reason_schema {
-    use super::*;
-
-    attributes! {
-        "B10329D5D1087D15A3DAFF7A7CC50696" as text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-        "E6B1C728F1AE9F46CAB4DBB60D1A9528" as about_turn: valueschemas::GenId;
-        "721DED6DA776F2CF4FB91C54D9F82358" as worker: valueschemas::GenId;
-        "514F4FE9F560FB155450462C8CF50749" as command_text: valueschemas::Handle<valueschemas::Blake3, blobschemas::LongString>;
-    }
-}
 
 #[derive(Parser)]
 #[command(

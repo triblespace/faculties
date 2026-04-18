@@ -6,7 +6,8 @@
 //! ed25519-dalek = "2.1.1"
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
-//! triblespace = "0.34.1"
+//! triblespace = "0.36"
+//! faculties = "0.1"
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -14,55 +15,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
+use faculties::schemas::memory::{
+    DEFAULT_ARCHIVE_BRANCH, DEFAULT_COGNITION_BRANCH, DEFAULT_MEMORY_BRANCH, KIND_ARCHIVE_MESSAGE,
+    KIND_CHUNK_ID, KIND_EXEC_RESULT, archive_import_schema, archive_schema, ctx,
+};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::macros::{attributes, find, id_hex, pattern};
+use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobschemas::LongString;
-use triblespace::prelude::valueschemas::{Blake3, GenId, Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
-
-const DEFAULT_MEMORY_BRANCH: &str = "memory";
-const DEFAULT_COGNITION_BRANCH: &str = "cognition";
-const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
-
-const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
-
-const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
-
-mod archive_schema {
-    use super::*;
-    attributes! {
-        "838CC157FFDD37C6AC7CC5A472E43ADB" as author: GenId;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" as author_name: Handle<Blake3, LongString>;
-    }
-}
-
-mod archive_import_schema {
-    use super::*;
-    attributes! {
-        "E997DCAAF43BAA04790FCB0FA0FBFE3A" as source_format: ShortString;
-        "87B587A3906056038FD767F4225274F9" as source_conversation_id: Handle<Blake3, LongString>;
-    }
-}
-
-const KIND_ARCHIVE_MESSAGE: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");
-
-mod ctx {
-    use super::*;
-    attributes! {
-        "3292CF0B3B6077991D8ECE6E2973D4B6" as summary: Handle<Blake3, LongString>;
-        "502F7D33822A90366F0F0ADA0556177F" as start_at: NsTAIInterval;
-        "DF84E872EB68FBFCA63D760F27FD8A6F" as end_at: NsTAIInterval;
-        "9B83D68AECD6888AA9CE95E754494768" as child: GenId;
-        "CB97C36A32DEC70E0D1149E7C5D88588" as left: GenId;
-        "087D07E3D9D94F0C4E96813C7BC5E74C" as right: GenId;
-        "316834CC6B0EA6F073BF5362D67AC530" as about_exec_result: GenId;
-        "A4E2B712CA28AB1EED76C34DE72AFA39" as about_archive_message: GenId;
-    }
-}
 
 #[derive(Parser)]
 #[command(
