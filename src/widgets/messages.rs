@@ -975,17 +975,51 @@ fn render_message(
                     .wrap_mode(egui::TextWrapMode::Wrap),
             );
 
-            // Read receipts (if any).
+            // Read receipts — compact "✓✓ NameA · NameB · 2h" line in
+            // the may-green accent. Newest receipt's age is used as the
+            // overall age; individual ages show on hover.
             if !msg.reads.is_empty() {
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.label(
+                        egui::RichText::new("\u{2713}\u{2713}")
+                            .small()
+                            .color(color_read()),
+                    );
+                    let mut first = true;
                     for (reader, ts) in &msg.reads {
+                        if !first {
+                            ui.label(
+                                egui::RichText::new("\u{00b7}")
+                                    .small()
+                                    .color(color_muted()),
+                            );
+                        }
+                        first = false;
                         let name = names
                             .get(reader)
                             .cloned()
                             .unwrap_or_else(|| id_prefix(*reader));
-                        let label = format!("read by {} ({})", name, format_age_key(now, *ts));
-                        render_chip(ui, &label, color_read());
+                        let response = ui.label(
+                            egui::RichText::new(name)
+                                .small()
+                                .color(color_read()),
+                        );
+                        response.on_hover_text(format_age_key(now, *ts));
+                    }
+                    // Newest-reader age as a trailing muted suffix.
+                    if let Some((_, newest_ts)) =
+                        msg.reads.iter().max_by_key(|(_, t)| *t)
+                    {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "\u{00b7} {}",
+                                format_age_key(now, *newest_ts)
+                            ))
+                            .small()
+                            .color(color_muted()),
+                        );
                     }
                 });
             }
