@@ -833,7 +833,20 @@ fn render_composer(
             let to_name = names.get(&to).cloned().unwrap_or_else(|| id_prefix(to));
             render_chip(ui, &to_name, person_color(to));
         } else {
-            // Recipient picker.
+            // Recipient picker. A small color-swatch dot shows the
+            // chosen recipient's person-color to echo the chip style
+            // used everywhere else.
+            if let Some(pid) = *compose_recipient {
+                let (dot_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(8.0, 8.0),
+                    egui::Sense::hover(),
+                );
+                ui.painter().circle_filled(
+                    dot_rect.center(),
+                    4.0,
+                    person_color(pid),
+                );
+            }
             let selected_text = match *compose_recipient {
                 Some(id) => names
                     .get(&id)
@@ -849,12 +862,27 @@ fn render_composer(
                             continue;
                         }
                         let is_sel = *compose_recipient == Some(*pid);
-                        if ui
-                            .selectable_label(is_sel, format!("{name} ({})", id_prefix(*pid)))
-                            .clicked()
-                        {
-                            *compose_recipient = Some(*pid);
-                        }
+                        // Prefix each entry with a person-color dot.
+                        ui.horizontal(|ui| {
+                            let (dot, _) = ui.allocate_exact_size(
+                                egui::vec2(8.0, 8.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(
+                                dot.center(),
+                                4.0,
+                                person_color(*pid),
+                            );
+                            if ui
+                                .selectable_label(
+                                    is_sel,
+                                    format!("{name} ({})", id_prefix(*pid)),
+                                )
+                                .clicked()
+                            {
+                                *compose_recipient = Some(*pid);
+                            }
+                        });
                     }
                     if people.is_empty() {
                         ui.small("(no people in relations branch)");
