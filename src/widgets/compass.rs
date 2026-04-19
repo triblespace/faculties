@@ -712,87 +712,65 @@ impl CompassBoard {
                 );
             }
 
-            // Fixed-width kanban columns in a horizontal scroll area.
-            // The 12-col grid breaks down for >6 statuses (a real pile
-            // accumulates custom statuses: "answered", "dissolved", etc.),
-            // so we escape to a horizontal scroller with each column at
-            // a readable fixed width.
-            const COLUMN_WIDTH: f32 = 240.0;
-            const COLUMN_GAP: f32 = 8.0;
-
-            ctx.grid(|g| {
-                g.full(|ctx| {
-                    egui::ScrollArea::horizontal()
-                        .id_salt(("compass_columns", "root"))
-                        .auto_shrink([false, true])
-                        // Drag-scroll would collide with the click-sensing
-                        // goal cards inside each column (egui hit_test bug).
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            scroll_bar: true,
-                            drag: false,
-                            mouse_wheel: true,
-                        })
-                        .show(ctx.ui_mut(), |ui| {
-                            // Collect every goal-card screen rect so we
-                            // can paint priority edges between cards in
-                            // different columns after the layout pass.
-                            let mut card_rects: HashMap<Id, egui::Rect> =
-                                HashMap::new();
-                            ui.horizontal_top(|ui| {
-                                ui.spacing_mut().item_spacing.x = COLUMN_GAP;
-                                for (status, rows) in &column_data {
-                                    let form = compose.entry(status.clone()).or_default();
-                                    render_column(
-                                        ui,
-                                        status,
-                                        rows,
-                                        COLUMN_WIDTH,
-                                        column_height,
-                                        expanded_goal,
-                                        expanded_notes.as_ref(),
-                                        collapsed,
-                                        note_inputs,
-                                        status_menu,
-                                        form,
-                                        &title_by_id,
-                                        &mut card_rects,
-                                        &mut add_intent,
-                                        &mut move_intent,
-                                        &mut note_intent,
-                                    );
-                                }
-                            });
-
-                            // Overlay priority edges: for each
-                            // (higher → lower) pair where both cards
-                            // are currently visible, paint an
-                            // orthogonal arrow tinted with the source
-                            // card's status color. The tint lets
-                            // viewers see at a glance which status
-                            // "owns" each priority edge.
-                            let painter = ui.painter();
-                            for row in column_data.iter().flat_map(|(_, rs)| rs) {
-                                let (src_row, _depth) = row;
-                                let Some(from_rect) = card_rects.get(&src_row.id) else {
-                                    continue;
-                                };
-                                let base = status_color(&src_row.status);
-                                let edge_color = egui::Color32::from_rgba_unmultiplied(
-                                    base.r(),
-                                    base.g(),
-                                    base.b(),
-                                    200,
-                                );
-                                for lower in &src_row.higher_over {
-                                    let Some(to_rect) = card_rects.get(lower) else {
-                                        continue;
-                                    };
-                                    draw_priority_edge(painter, *from_rect, *to_rect, edge_color);
-                                }
-                            }
-                        });
-                });
+            // Vertically-stacked swim lanes: each status gets a full-
+            // width lane, stacked top-to-bottom. Replaces the earlier
+            // side-by-side kanban columns — lets card titles/tags
+            // breathe on wide screens and uses the notebook's
+            // natural vertical scroll instead of a nested horizontal
+            // scroller.
+            const LANE_GAP: f32 = 10.0;
+            let ui = ctx.ui_mut();
+            // Card-rect collection for the priority-edge overlay.
+            let mut card_rects: HashMap<Id, egui::Rect> = HashMap::new();
+            let lane_width = ui.available_width();
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = LANE_GAP;
+                for (status, rows) in &column_data {
+                    let form = compose.entry(status.clone()).or_default();
+                    render_column(
+                        ui,
+                        status,
+                        rows,
+                        lane_width,
+                        column_height,
+                        expanded_goal,
+                        expanded_notes.as_ref(),
+                        collapsed,
+                        note_inputs,
+                        status_menu,
+                        form,
+                        &title_by_id,
+                        &mut card_rects,
+                        &mut add_intent,
+                        &mut move_intent,
+                        &mut note_intent,
+                    );
+                }
             });
+
+            // Priority-edge overlay — same tinting as before, but
+            // now edges typically run top-to-bottom between lanes
+            // instead of across the horizontal kanban.
+            let painter = ui.painter();
+            for row in column_data.iter().flat_map(|(_, rs)| rs) {
+                let (src_row, _depth) = row;
+                let Some(from_rect) = card_rects.get(&src_row.id) else {
+                    continue;
+                };
+                let base = status_color(&src_row.status);
+                let edge_color = egui::Color32::from_rgba_unmultiplied(
+                    base.r(),
+                    base.g(),
+                    base.b(),
+                    200,
+                );
+                for lower in &src_row.higher_over {
+                    let Some(to_rect) = card_rects.get(lower) else {
+                        continue;
+                    };
+                    draw_priority_edge(painter, *from_rect, *to_rect, edge_color);
+                }
+            }
         });
 
         // Apply writes after the UI closure. Each helper does a
