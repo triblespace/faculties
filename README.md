@@ -117,23 +117,30 @@ in your own GORBIE notebook) are in `examples/`:
 `compass_board.rs`, `wiki_viewer.rs`, `messages_panel.rs`,
 `branch_timeline.rs`, `pile_inspector.rs`.
 
-### Creating a demo pile
+### Creating a pile
 
-If you don't already have a `./self.pile`, create one by seeding a
-few faculties against a fresh path:
+A pile is just an append-only file — `touch` it and any faculty
+(or the viewer) can open it:
+
+```sh
+touch ./demo.pile
+```
+
+That's the whole seed command. The file starts empty; the first
+faculty call writes the schema headers, and everything grows from
+there as you use the tools. To give the viewer something to show
+from the start, run a few CLI faculties against it first:
 
 ```sh
 export PILE=./demo.pile
 compass.rs add "ship the demo" --status doing
-compass.rs add "write the README" --status done
 wiki.rs create --title "Hello" --body "First *typst* fragment."
-local_messages.rs send --to <peer-id> "heyyy"
 ```
 
-Then point the viewer at the new pile:
+Then point the viewer at the pile:
 
 ```sh
-cargo run --release --example pile_inspector --features widgets -- ./demo.pile
+faculties-viewer ./demo.pile
 ```
 
 ## Contributing
