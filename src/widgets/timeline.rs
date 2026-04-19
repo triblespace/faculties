@@ -760,40 +760,46 @@ impl BranchTimeline {
             }
 
             // Manual drag-to-pan with a 4-px dead-zone so a short
-            // press+release (a click) doesn't pan at all — otherwise
-            // sub-pixel frame-to-frame drift would shift event chips
-            // between press and release and eat the click.
-            let (primary_down, pointer_pos) = ui
-                .input(|i| (i.pointer.primary_down(), i.pointer.hover_pos()));
+            // press+release (a click) doesn't pan at all. We only
+            // latch onto a drag whose press *started* inside the
+            // viewport — otherwise something else (e.g. a floating
+            // wiki-page card being dragged across the screen) would
+            // also pan the timeline when its pointer crossed us.
+            let (primary_down, primary_pressed, pointer_pos) = ui.input(|i| {
+                (
+                    i.pointer.primary_down(),
+                    i.pointer.primary_pressed(),
+                    i.pointer.hover_pos(),
+                )
+            });
             let in_viewport =
                 pointer_pos.map(|p| viewport_rect.contains(p)).unwrap_or(false);
             const DRAG_THRESHOLD_PX: f32 = 4.0;
-            if primary_down && in_viewport {
+            if primary_pressed && in_viewport {
                 if let Some(p) = pointer_pos {
-                    // Remember press-down position on the first frame.
-                    if self.drag_start_y.is_none() {
-                        self.drag_start_y = Some(p.y);
-                    }
-                    // Only start panning once we've moved more than
-                    // the threshold from the press point.
-                    if !self.dragging {
-                        if let Some(start) = self.drag_start_y {
-                            if (p.y - start).abs() > DRAG_THRESHOLD_PX {
-                                self.dragging = true;
-                                self.drag_last_y = Some(p.y);
-                            }
-                        }
-                    } else if let Some(last_y) = self.drag_last_y {
-                        let drag_delta = p.y - last_y;
-                        let pan_ns = (drag_delta as f64 * ns_per_px) as i128;
-                        self.timeline_start += pan_ns;
-                        self.drag_last_y = Some(p.y);
-                    }
+                    self.drag_start_y = Some(p.y);
                 }
-            } else {
+            }
+            if !primary_down {
                 self.drag_last_y = None;
                 self.drag_start_y = None;
                 self.dragging = false;
+            } else if let Some(p) = pointer_pos {
+                // `drag_start_y.is_some()` means the press happened
+                // inside us; ignore drags that started elsewhere.
+                if !self.dragging {
+                    if let Some(start) = self.drag_start_y {
+                        if (p.y - start).abs() > DRAG_THRESHOLD_PX {
+                            self.dragging = true;
+                            self.drag_last_y = Some(p.y);
+                        }
+                    }
+                } else if let Some(last_y) = self.drag_last_y {
+                    let drag_delta = p.y - last_y;
+                    let pan_ns = (drag_delta as f64 * ns_per_px) as i128;
+                    self.timeline_start += pan_ns;
+                    self.drag_last_y = Some(p.y);
+                }
             }
 
             if viewport_response.double_clicked() {

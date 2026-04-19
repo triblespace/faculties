@@ -959,23 +959,40 @@ impl WikiGraph {
             }
         }
 
-        // Manual drag-to-pan — tracks last pointer pos in egui memory so
-        // it persists across frames without needing `Sense::drag`.
-        let (primary_down, pointer_pos) =
-            ui.input(|i| (i.pointer.primary_down(), i.pointer.hover_pos()));
+        // Manual drag-to-pan — tracks last pointer pos in egui memory
+        // so it persists across frames without needing `Sense::drag`.
+        // The drag is gated on the press *starting* inside this rect:
+        // `drag_id` in memory is only set on `primary_pressed` while
+        // the cursor was in-rect, and cleared on release. This stops
+        // the graph from stealing a drag when something else (e.g. a
+        // floating wiki-page card) is being dragged across the
+        // viewport.
+        let (primary_down, primary_pressed, pointer_pos) = ui.input(|i| {
+            (
+                i.pointer.primary_down(),
+                i.pointer.primary_pressed(),
+                i.pointer.hover_pos(),
+            )
+        });
         let in_rect = pointer_pos.map(|p| rect.contains(p)).unwrap_or(false);
-        if primary_down && in_rect {
-            let last: Option<egui::Pos2> =
-                ui.ctx().memory(|m| m.data.get_temp(drag_id));
+        if primary_pressed && in_rect {
             if let Some(p) = pointer_pos {
-                if let Some(last_p) = last {
-                    pan += p - last_p;
-                    ui.ctx().memory_mut(|m| m.data.insert_temp(pan_id, pan));
-                }
                 ui.ctx().memory_mut(|m| m.data.insert_temp(drag_id, p));
             }
-        } else {
+        } else if !primary_down {
             ui.ctx().memory_mut(|m| m.data.remove_temp::<egui::Pos2>(drag_id));
+        }
+        if primary_down {
+            if let (Some(last_p), Some(p)) = (
+                ui.ctx().memory(|m| m.data.get_temp::<egui::Pos2>(drag_id)),
+                pointer_pos,
+            ) {
+                pan += p - last_p;
+                ui.ctx().memory_mut(|m| {
+                    m.data.insert_temp(pan_id, pan);
+                    m.data.insert_temp(drag_id, p);
+                });
+            }
         }
 
         let to_screen =
