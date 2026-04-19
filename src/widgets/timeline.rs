@@ -688,7 +688,15 @@ impl BranchTimeline {
         {
             let ns_per_px = 60_000_000_000.0 / self.timeline_scale as f64;
 
-            if viewport_response.hovered() {
+            // Check hover via direct rect-contains-pointer test rather
+            // than `viewport_response.hovered()`, because the outer
+            // notebook ScrollArea claims hover priority and makes
+            // the widget-level hovered() unreliable for scroll capture.
+            let pointer_in_viewport = ui
+                .input(|i| i.pointer.hover_pos())
+                .map(|p| viewport_rect.contains(p))
+                .unwrap_or(false);
+            if pointer_in_viewport {
                 let (scroll_y, scroll_x, ctrl, pointer_pos) = ui.input(|i| {
                     (
                         i.smooth_scroll_delta.y,
