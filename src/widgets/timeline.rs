@@ -967,8 +967,8 @@ impl BranchTimeline {
                 painter.text(
                     src_pill.center(),
                     egui::Align2::CENTER_CENTER,
-                    &src_label,
-                    egui::FontId::proportional(9.0),
+                    &src_label.to_uppercase(),
+                    egui::FontId::monospace(9.0),
                     text_on(src_color),
                 );
 
@@ -988,8 +988,8 @@ impl BranchTimeline {
                     painter.text(
                         pill.center(),
                         egui::Align2::CENTER_CENTER,
-                        status,
-                        egui::FontId::proportional(9.0),
+                        &status.to_uppercase(),
+                        egui::FontId::monospace(9.0),
                         text_on(pill_color),
                     );
                     text_x = pill.right() + 6.0;
