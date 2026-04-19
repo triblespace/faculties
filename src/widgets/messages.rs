@@ -117,19 +117,33 @@ fn format_timestamp_key(key: i128) -> String {
 
 // ── Color palette (reuses compass.rs conventions) ────────────────────
 
-fn color_frame() -> egui::Color32 {
-    // RAL 7016 anthracite grey — matches compass column frame.
-    egui::Color32::from_rgb(0x29, 0x32, 0x36)
+// Theme-adaptive neutrals (mirror of compass.rs). The accent /
+// read / person colors are legible on both themes, but the
+// frame / bubble / muted greys need to flip so theme-aware text
+// doesn't land dark-on-dark in light mode.
+
+fn color_frame(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x29, 0x32, 0x36) // RAL 7016
+    } else {
+        egui::Color32::from_rgb(0xec, 0xec, 0xec)
+    }
 }
 
-fn color_bubble() -> egui::Color32 {
-    // Slightly lighter than the frame so message bubbles stand out.
-    egui::Color32::from_rgb(0x33, 0x3b, 0x40)
+fn color_bubble(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x33, 0x3b, 0x40)
+    } else {
+        egui::Color32::from_rgb(0xfa, 0xfa, 0xfa)
+    }
 }
 
-fn color_muted() -> egui::Color32 {
-    // RAL 7012 basalt grey.
-    egui::Color32::from_rgb(0x4d, 0x55, 0x59)
+fn color_muted(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x9a, 0x9a, 0x9a)
+    } else {
+        egui::Color32::from_rgb(0x6a, 0x6a, 0x6a)
+    }
 }
 
 fn color_accent() -> egui::Color32 {
@@ -694,14 +708,14 @@ impl MessagesPanel {
                             .monospace()
                             .strong()
                             .small()
-                            .color(color_muted()),
+                            .color(color_muted(ui)),
                     );
                     if let (Some(me_id), Some(me_name)) = (me_opt, me_name_opt) {
                         ui.label(
                             egui::RichText::new("\u{00b7} AS")
                                 .small()
                                 .monospace()
-                                .color(color_muted()),
+                                .color(color_muted(ui)),
                         );
                         render_chip(ui, &me_name, person_color(me_id));
                     } else {
@@ -709,7 +723,7 @@ impl MessagesPanel {
                             egui::RichText::new("\u{00b7} READ-ONLY")
                                 .small()
                                 .monospace()
-                                .color(color_muted()),
+                                .color(color_muted(ui)),
                         );
                     }
                     if let Some(age) = latest_age {
@@ -724,7 +738,7 @@ impl MessagesPanel {
                                     .monospace()
                                     .small()
                                     .strong()
-                                    .color(color_muted()),
+                                    .color(color_muted(ui)),
                                 );
                             },
                         );
@@ -889,7 +903,7 @@ fn render_composer(
             egui::RichText::new("\u{2192}")
                 .monospace()
                 .small()
-                .color(color_muted()),
+                .color(color_muted(ui)),
         );
         if let Some(to) = default_recipient {
             let to_name = names.get(&to).cloned().unwrap_or_else(|| id_prefix(to));
@@ -963,7 +977,7 @@ fn render_composer(
 
     let accent = color_accent();
     egui::Frame::NONE
-        .stroke(egui::Stroke::new(1.0, color_muted()))
+        .stroke(egui::Stroke::new(1.0, color_muted(ui)))
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::same(4))
         .show(ui, |ui| {
@@ -1008,7 +1022,7 @@ fn render_composer(
                 egui::RichText::new("CLEAR")
                     .small()
                     .monospace()
-                    .color(color_muted()),
+                    .color(color_muted(ui)),
             ))
             .clicked()
         {
@@ -1031,7 +1045,7 @@ fn render_message(
         // Tint our own messages toward the accent.
         egui::Color32::from_rgb(0x2b, 0x44, 0x3b)
     } else {
-        color_bubble()
+        color_bubble(ui)
     };
 
     // Cap bubble width so the alignment is visible and bubbles don't
@@ -1056,7 +1070,7 @@ fn render_message(
     ui.with_layout(alignment, |ui| {
     egui::Frame::NONE
         .fill(bubble_fill)
-        .stroke(egui::Stroke::new(1.0, color_frame()))
+        .stroke(egui::Stroke::new(1.0, color_frame(ui)))
         .corner_radius(corners)
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
@@ -1077,7 +1091,7 @@ fn render_message(
                     egui::RichText::new("\u{2192}")
                         .monospace()
                         .small()
-                        .color(color_muted()),
+                        .color(color_muted(ui)),
                 );
                 render_chip(ui, &to_name, person_color(msg.to));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1091,7 +1105,7 @@ fn render_message(
                         egui::RichText::new(age)
                             .monospace()
                             .small()
-                            .color(color_muted()),
+                            .color(color_muted(ui)),
                     );
                     if let Some(h) = hover {
                         resp.on_hover_text(h);
@@ -1125,7 +1139,7 @@ fn render_message(
                             ui.label(
                                 egui::RichText::new("\u{00b7}")
                                     .small()
-                                    .color(color_muted()),
+                                    .color(color_muted(ui)),
                             );
                         }
                         first = false;
@@ -1157,7 +1171,7 @@ fn render_message(
                                 format_age_key(now, *newest_ts)
                             ))
                             .small()
-                            .color(color_muted()),
+                            .color(color_muted(ui)),
                         );
                     }
                 });
@@ -1169,7 +1183,7 @@ fn render_message(
                     egui::RichText::new(id_prefix(msg.id))
                         .monospace()
                         .small()
-                        .color(color_muted()),
+                        .color(color_muted(ui)),
                 );
             });
         });
@@ -1185,7 +1199,7 @@ fn render_messages_empty_state(ui: &mut egui::Ui, headline: &str, hint: Option<&
         ui.label(
             egui::RichText::new("\u{2709}")
                 .size(32.0)
-                .color(color_muted()),
+                .color(color_muted(ui)),
         );
         ui.add_space(6.0);
         ui.label(
@@ -1193,14 +1207,14 @@ fn render_messages_empty_state(ui: &mut egui::Ui, headline: &str, hint: Option<&
                 .monospace()
                 .small()
                 .strong()
-                .color(color_muted()),
+                .color(color_muted(ui)),
         );
         if let Some(h) = hint {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(h)
                     .small()
-                    .color(color_muted()),
+                    .color(color_muted(ui)),
             );
         }
     });

@@ -110,14 +110,39 @@ fn color_blocked() -> egui::Color32 {
 fn color_done() -> egui::Color32 {
     egui::Color32::from_rgb(0x15, 0x4e, 0xa1) // RAL 5005
 }
-fn color_muted() -> egui::Color32 {
-    egui::Color32::from_rgb(0x4d, 0x55, 0x59) // RAL 7012
+// Theme-adaptive neutrals. The status colors (todo/doing/blocked/
+// done) are legible on both light and dark backgrounds, but the
+// frame / card / muted colors need to flip with the theme — hard-
+// coded dark shades turned into "dark on dark" (body text uses
+// egui's theme-aware color, which is dark in light mode).
+
+/// Muted mid-grey for secondary labels, borders, and separators.
+fn color_muted(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x9a, 0x9a, 0x9a)
+    } else {
+        egui::Color32::from_rgb(0x6a, 0x6a, 0x6a)
+    }
 }
-fn color_frame() -> egui::Color32 {
-    egui::Color32::from_rgb(0x29, 0x32, 0x36) // RAL 7016
+
+/// Lane / container background — slightly offset from the notebook
+/// panel fill so the lane reads as a distinct region.
+fn color_frame(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x29, 0x32, 0x36) // RAL 7016 (dark)
+    } else {
+        egui::Color32::from_rgb(0xec, 0xec, 0xec) // near-white grey
+    }
 }
-fn card_bg() -> egui::Color32 {
-    egui::Color32::from_rgb(0x33, 0x3b, 0x40)
+
+/// Goal-card background — slightly lighter/darker than the lane so
+/// cards pop out of the lane backdrop.
+fn card_bg(ui: &egui::Ui) -> egui::Color32 {
+    if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x33, 0x3b, 0x40)
+    } else {
+        egui::Color32::from_rgb(0xfa, 0xfa, 0xfa)
+    }
 }
 
 fn status_color(status: &str) -> egui::Color32 {
@@ -126,7 +151,9 @@ fn status_color(status: &str) -> egui::Color32 {
         "doing" => color_doing(),
         "blocked" => color_blocked(),
         "done" => color_done(),
-        _ => color_muted(),
+        // Mid-grey fallback — legible on both light and dark panels
+        // without needing a `&Ui` argument.
+        _ => egui::Color32::from_rgb(0x80, 0x80, 0x80),
     }
 }
 
@@ -668,12 +695,12 @@ impl CompassBoard {
                         .monospace()
                         .strong()
                         .small()
-                        .color(color_muted()),
+                        .color(color_muted(ui)),
                 );
                 ui.label(
                     egui::RichText::new("\u{00b7}")
                         .small()
-                        .color(color_muted()),
+                        .color(color_muted(ui)),
                 );
                 for (status, rows) in &column_data {
                     if rows.is_empty() {
@@ -698,7 +725,7 @@ impl CompassBoard {
                         egui::RichText::new(rows.len().to_string())
                             .monospace()
                             .small()
-                            .color(color_muted()),
+                            .color(color_muted(ui)),
                     );
                 }
             });
@@ -838,7 +865,7 @@ fn render_column(
 ) {
     let status_col = status_color(status);
     let frame_response = egui::Frame::NONE
-        .fill(color_frame())
+        .fill(color_frame(ui))
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin {
             left: 12,  // extra left padding for the accent stripe
@@ -871,7 +898,7 @@ fn render_column(
                         .strong()
                         .color(status_col),
                 );
-                render_chip(ui, &rows.len().to_string(), color_muted());
+                render_chip(ui, &rows.len().to_string(), color_muted(ui));
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
@@ -957,7 +984,7 @@ fn render_column(
                                 ))
                                 .monospace()
                                 .small()
-                                .color(color_muted()),
+                                .color(color_muted(ui)),
                             );
                         });
                         ui.add_space(8.0);
@@ -1013,7 +1040,7 @@ fn render_compose_form(
     add_intent: &mut Option<AddIntent>,
 ) {
     egui::Frame::NONE
-        .fill(card_bg())
+        .fill(card_bg(ui))
         .corner_radius(egui::CornerRadius::same(4))
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
@@ -1026,7 +1053,7 @@ fn render_compose_form(
                         .small()
                         .monospace()
                         .strong()
-                        .color(color_muted()),
+                        .color(color_muted(ui)),
                 );
                 ui.label(
                     egui::RichText::new(status.to_uppercase())
@@ -1093,7 +1120,7 @@ fn render_compose_form(
                         egui::RichText::new("CANCEL")
                             .small()
                             .monospace()
-                            .color(color_muted()),
+                            .color(color_muted(ui)),
                     ))
                     .clicked()
                 {
@@ -1152,7 +1179,7 @@ fn render_goal_card(
     let is_collapsed = collapsed.contains(&row.id);
 
     let card_response = egui::Frame::NONE
-        .fill(card_bg())
+        .fill(card_bg(ui))
         .corner_radius(egui::CornerRadius::same(4))
         .outer_margin(egui::Margin {
             left: dep_indent as i8,
@@ -1175,7 +1202,7 @@ fn render_goal_card(
                 if ui
                     .add(
                         egui::Label::new(
-                            egui::RichText::new(tri).monospace().color(color_muted()),
+                            egui::RichText::new(tri).monospace().color(color_muted(ui)),
                         )
                         .sense(egui::Sense::click()),
                     )
@@ -1208,7 +1235,7 @@ fn render_goal_card(
                     egui::RichText::new(id_text)
                         .monospace()
                         .small()
-                        .color(color_muted()),
+                        .color(color_muted(ui)),
                 );
                 if row.note_count > 0 {
                     ui.with_layout(
@@ -1217,7 +1244,7 @@ fn render_goal_card(
                             render_chip(
                                 ui,
                                 &format!("{}n", row.note_count),
-                                color_muted(),
+                                color_muted(ui),
                             );
                         },
                     );
@@ -1287,7 +1314,7 @@ fn render_goal_card(
                         .small()
                         .monospace()
                         .strong()
-                        .color(color_muted()),
+                        .color(color_muted(ui)),
                 );
                 for status in DEFAULT_STATUSES {
                     if status == row.status {
@@ -1316,7 +1343,7 @@ fn render_goal_card(
                         egui::RichText::new("CANCEL")
                             .small()
                             .monospace()
-                            .color(color_muted()),
+                            .color(color_muted(ui)),
                     ))
                     .clicked()
                 {
@@ -1331,7 +1358,7 @@ fn render_goal_card(
             .map(|(_, n)| n.as_slice())
             .unwrap_or(&[]);
         egui::Frame::NONE
-            .stroke(egui::Stroke::new(1.0, color_muted()))
+            .stroke(egui::Stroke::new(1.0, color_muted(ui)))
             .outer_margin(egui::Margin {
                 left: dep_indent as i8,
                 right: 0,
@@ -1350,7 +1377,7 @@ fn render_goal_card(
                             .small()
                             .monospace()
                             .strong()
-                            .color(color_muted()),
+                            .color(color_muted(ui)),
                     );
                     for status in DEFAULT_STATUSES {
                         if status == row.status {
@@ -1387,7 +1414,7 @@ fn render_goal_card(
                             egui::RichText::new("NO NOTES YET")
                                 .monospace()
                                 .small()
-                                .color(color_muted()),
+                                .color(color_muted(ui)),
                         );
                     });
                     ui.add_space(4.0);
@@ -1395,7 +1422,7 @@ fn render_goal_card(
                     let status_col = status_color(&row.status);
                     for note in notes {
                         let note_resp = egui::Frame::NONE
-                            .fill(card_bg())
+                            .fill(card_bg(ui))
                             .corner_radius(egui::CornerRadius::same(3))
                             .inner_margin(egui::Margin {
                                 left: 8,
@@ -1409,7 +1436,7 @@ fn render_goal_card(
                                     egui::RichText::new(format_age(now, note.at))
                                         .small()
                                         .monospace()
-                                        .color(color_muted()),
+                                        .color(color_muted(ui)),
                                 );
                                 ui.add(
                                     egui::Label::new(
@@ -1462,7 +1489,7 @@ fn render_goal_card(
     let rect = card_response.rect;
     card_rects.insert(row.id, rect);
     let painter = ui.painter();
-    let stroke = egui::Stroke::new(1.2, color_muted());
+    let stroke = egui::Stroke::new(1.2, color_muted(ui));
     for idx in 0..dep_lines {
         let x = rect.left() - dep_indent + 4.0 + (idx as f32 * DEP_LINE_STEP);
         let y1 = rect.top() + 0.5;
@@ -1533,7 +1560,7 @@ fn render_empty_state(ui: &mut egui::Ui, glyph: &str, headline: &str, hint: Opti
         ui.label(
             egui::RichText::new(glyph)
                 .size(28.0)
-                .color(color_muted()),
+                .color(color_muted(ui)),
         );
         ui.add_space(4.0);
         ui.label(
@@ -1541,14 +1568,14 @@ fn render_empty_state(ui: &mut egui::Ui, glyph: &str, headline: &str, hint: Opti
                 .monospace()
                 .small()
                 .strong()
-                .color(color_muted()),
+                .color(color_muted(ui)),
         );
         if let Some(h) = hint {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new(h)
                     .small()
-                    .color(color_muted()),
+                    .color(color_muted(ui)),
             );
         }
     });
