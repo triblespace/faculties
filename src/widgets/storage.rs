@@ -187,43 +187,89 @@ impl StorageState {
         let is_open = self.repo.is_some();
         let has_error = self.error.is_some();
         let mut reopen = false;
-        ctx.grid(|g| {
-            // 1 cell: status indicator (●) — green when open, red when
-            // the last open attempt failed, muted gray otherwise.
-            g.place(1, |ctx| {
-                let ui = ctx.ui_mut();
-                let (dot_rect, _) = ui.allocate_exact_size(
-                    egui::vec2(10.0, 10.0),
-                    egui::Sense::hover(),
-                );
-                let color = if has_error {
-                    egui::Color32::from_rgb(0xcc, 0x0a, 0x17) // RAL 3020
-                } else if is_open {
-                    egui::Color32::from_rgb(0x23, 0x7f, 0x52) // RAL 6032
-                } else {
-                    egui::Color32::from_rgb(0x4d, 0x55, 0x59) // RAL 7012
-                };
-                ui.painter().circle_filled(
-                    dot_rect.center(),
-                    4.0,
-                    color,
-                );
-                ui.label(
-                    egui::RichText::new("PILE")
-                        .small()
-                        .monospace()
-                        .strong(),
-                );
+        let status_color = if has_error {
+            egui::Color32::from_rgb(0xcc, 0x0a, 0x17) // RAL 3020
+        } else if is_open {
+            egui::Color32::from_rgb(0x23, 0x7f, 0x52) // RAL 6032
+        } else {
+            egui::Color32::from_rgb(0x4d, 0x55, 0x59) // RAL 7012
+        };
+        let panel_fill = ctx.ctx().global_style().visuals.panel_fill;
+        let bar_bg = egui::Color32::from_rgba_unmultiplied(
+            panel_fill.r().saturating_sub(6),
+            panel_fill.g().saturating_sub(6),
+            panel_fill.b().saturating_sub(6),
+            255,
+        );
+        let muted = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
+        let ui = ctx.ui_mut();
+        egui::Frame::NONE
+            .fill(bar_bg)
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_black_alpha(40),
+            ))
+            .corner_radius(egui::CornerRadius::same(4))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    // Status dot.
+                    let (dot_rect, _) = ui.allocate_exact_size(
+                        egui::vec2(10.0, 10.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().circle_filled(dot_rect.center(), 4.0, status_color);
+                    ui.label(
+                        egui::RichText::new("PILE")
+                            .small()
+                            .monospace()
+                            .strong()
+                            .color(status_color),
+                    );
+                    // Subtle divider glyph between label and field.
+                    ui.label(egui::RichText::new("│").small().color(muted));
+                    // Path field expands to fill remaining width; the
+                    // OPEN button is placed after via right-to-left.
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let open_btn = ui.add(
+                                egui::Button::new(
+                                    egui::RichText::new("OPEN")
+                                        .small()
+                                        .monospace()
+                                        .strong(),
+                                )
+                                .min_size(egui::vec2(52.0, 22.0)),
+                            );
+                            if open_btn.clicked() {
+                                reopen = true;
+                            }
+                            // The field fills whatever is left to the
+                            // left of the OPEN button.
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let avail = ui.available_width();
+                                    let resp = ui.add_sized(
+                                        egui::vec2(avail, 22.0),
+                                        egui::TextEdit::singleline(&mut self.pile_path_text)
+                                            .font(egui::TextStyle::Monospace)
+                                            .hint_text("./self.pile")
+                                            .desired_width(avail),
+                                    );
+                                    if resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    {
+                                        reopen = true;
+                                    }
+                                },
+                            );
+                        },
+                    );
+                });
             });
-            g.place(9, |ctx| {
-                ctx.text_field(&mut self.pile_path_text);
-            });
-            g.place(2, |ctx| {
-                if ctx.button("Open").clicked() {
-                    reopen = true;
-                }
-            });
-        });
         if reopen {
             let trimmed = self.pile_path_text.trim().to_string();
             self.set_pile_path(PathBuf::from(trimmed));
