@@ -184,9 +184,38 @@ impl StorageState {
     /// notebook.
     pub fn top_bar(&mut self, ctx: &mut CardCtx<'_>) {
         self.ensure_open();
+        let is_open = self.repo.is_some();
+        let has_error = self.error.is_some();
         let mut reopen = false;
         ctx.grid(|g| {
-            g.place(10, |ctx| {
+            // 1 cell: status indicator (●) — green when open, red when
+            // the last open attempt failed, muted gray otherwise.
+            g.place(1, |ctx| {
+                let ui = ctx.ui_mut();
+                let (dot_rect, _) = ui.allocate_exact_size(
+                    egui::vec2(10.0, 10.0),
+                    egui::Sense::hover(),
+                );
+                let color = if has_error {
+                    egui::Color32::from_rgb(0xcc, 0x0a, 0x17) // RAL 3020
+                } else if is_open {
+                    egui::Color32::from_rgb(0x23, 0x7f, 0x52) // RAL 6032
+                } else {
+                    egui::Color32::from_rgb(0x4d, 0x55, 0x59) // RAL 7012
+                };
+                ui.painter().circle_filled(
+                    dot_rect.center(),
+                    4.0,
+                    color,
+                );
+                ui.label(
+                    egui::RichText::new("PILE")
+                        .small()
+                        .monospace()
+                        .strong(),
+                );
+            });
+            g.place(9, |ctx| {
                 ctx.text_field(&mut self.pile_path_text);
             });
             g.place(2, |ctx| {
