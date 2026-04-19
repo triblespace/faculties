@@ -1418,12 +1418,11 @@ impl WikiViewer {
             if !graph.is_bundled() {
                 graph.step();
             }
-            let mut clicked_node: Option<Id> = None;
-            ctx.grid(|g| {
-                g.full(|ctx| {
-                    clicked_node = graph.show(ctx.ui_mut());
-                });
-            });
+            // Graph is rendered OUTSIDE the grid so it uses the full
+            // section width without the grid cell's edge padding —
+            // visually the force-directed view becomes edge-to-edge
+            // like the timeline viewport.
+            let clicked_node: Option<Id> = graph.show(ctx.ui_mut());
             if let Some(frag_id) = clicked_node {
                 if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
                     self.open_pages.push(OpenPage {
