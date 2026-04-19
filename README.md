@@ -98,6 +98,8 @@ write — compass kanban, wiki graph, local-messages thread, and a
 multi-source activity timeline — inside a single [GORBIE] notebook
 window.
 
+![faculties-viewer composing activity, wiki, compass, and messages widgets](preview.png)
+
 [GORBIE]: https://github.com/triblespace/GORBIE
 
 ```sh
