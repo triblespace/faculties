@@ -656,14 +656,12 @@ impl BranchTimeline {
         // knows what range they're looking at without manually
         // reading the tick marks.
         ctx.section("Activity", |ctx| {
-            // Legend removed — each event chip already carries its
-            // source pill, so the row of dot-swatches was redundant.
-            // SPAN + zoom-hint affordance lives inside the viewport.
-            ctx.grid(|g| {
-                g.full(|ctx| {
-                    self.paint_viewport(ctx, viewport_height, now, &events, &sources);
-                });
-            });
+            // Paint the viewport directly on the section ctx (no
+            // grid wrapper) so it runs edge-to-edge inside the
+            // section, matching the wiki graph's treatment. Legend
+            // + SPAN + zoom-hint all live as overlays inside the
+            // viewport itself.
+            self.paint_viewport(ctx, viewport_height, now, &events, &sources);
         });
     }
 
