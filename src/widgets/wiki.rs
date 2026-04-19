@@ -888,7 +888,15 @@ impl WikiGraph {
             .ctx()
             .memory_mut(|m| *m.data.get_temp_mut_or_insert_with(zoom_id, || 1.0f32));
 
-        if response.hovered() {
+        // Direct rect-contains-pointer hover check — the outer
+        // notebook ScrollArea otherwise claims hover priority and
+        // `response.hovered()` returns false, so wheel events fall
+        // through to the notebook instead of the graph.
+        let pointer_in_graph = ui
+            .input(|i| i.pointer.hover_pos())
+            .map(|p| rect.contains(p))
+            .unwrap_or(false);
+        if pointer_in_graph {
             // Pinch-to-zoom (trackpad) and scroll-to-zoom (mouse wheel).
             let pinch = ui.input(|i| i.zoom_delta());
             let scroll = ui.input(|i| i.smooth_scroll_delta.x);
