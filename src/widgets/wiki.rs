@@ -948,6 +948,14 @@ impl WikiGraph {
         let mut clicked = None;
         let hover_pos = response.hover_pos();
         let show_labels = zoom > 0.3;
+        // Slightly-translucent background behind each label so text
+        // stays readable over crossing edges. Use a dark tint of the
+        // panel fill; fall back to near-black when the theme is light.
+        let panel_fill = ui.visuals().panel_fill;
+        let label_bg = {
+            let (r, g, b) = (panel_fill.r(), panel_fill.g(), panel_fill.b());
+            egui::Color32::from_rgba_unmultiplied(r, g, b, 220)
+        };
         for node in &self.nodes {
             let pos = to_screen(node.pos);
             if !rect.expand(20.0).contains(pos) {
@@ -956,13 +964,22 @@ impl WikiGraph {
 
             painter.circle(pos, node_radius, node_fill, node_stroke);
             if show_labels {
-                painter.text(
-                    pos + egui::vec2(node_radius + 4.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    &node.label,
+                let label_anchor = pos + egui::vec2(node_radius + 4.0, 0.0);
+                // Measure the label, paint a pill behind it, then the text.
+                let galley = painter.layout_no_wrap(
+                    node.label.clone(),
                     font_id.clone(),
                     label_color,
                 );
+                let label_rect = egui::Align2::LEFT_CENTER.anchor_rect(
+                    egui::Rect::from_min_size(label_anchor, galley.size()),
+                );
+                painter.rect_filled(
+                    label_rect.expand2(egui::vec2(3.0, 1.0)),
+                    2.0,
+                    label_bg,
+                );
+                painter.galley(label_rect.min, galley, label_color);
             }
 
             if let Some(hp) = hover_pos {
