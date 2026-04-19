@@ -123,18 +123,6 @@ Then point the viewer at the new pile:
 cargo run --release --example pile_inspector --features widgets -- ./demo.pile
 ```
 
-### Known limitations
-
-- Requires a working `egui 0.34.1`. There is an open upstream panic
-  ([emilk/egui#7870]) in `hit_test.rs:365` that can fire when a
-  click-sensing and drag-sensing widget overlap. We've routed around
-  it in every faculty widget (manual drag on timeline, wiki graph,
-  floating cards), but the underlying bug is still latent in any
-  other egui app you compose with these. Watch that issue for the
-  upstream fix.
-
-[emilk/egui#7870]: https://github.com/emilk/egui/issues/7870
-
 ## Contributing
 
 Faculties are deliberately simple. If you find yourself adding abstraction
