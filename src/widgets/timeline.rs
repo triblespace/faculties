@@ -906,6 +906,33 @@ impl BranchTimeline {
             }
         }
 
+        // NOW marker — a dashed horizontal guideline at current time
+        // so the viewer can orient immediately. Only painted when
+        // `now` falls inside the visible window.
+        if now >= view_end && now <= view_start {
+            let y = viewport_rect.top()
+                + ((view_start - now) as f64 / ns_per_px) as f32;
+            let now_color = egui::Color32::from_rgb(0xf7, 0xba, 0x0b); // RAL 1003
+            // Dashed line: short segments every 10px.
+            let mut x = viewport_rect.left();
+            let x_end = viewport_rect.right();
+            while x < x_end {
+                let seg_end = (x + 6.0).min(x_end);
+                painter.line_segment(
+                    [egui::pos2(x, y), egui::pos2(seg_end, y)],
+                    egui::Stroke::new(1.0, now_color),
+                );
+                x += 10.0;
+            }
+            painter.text(
+                egui::pos2(viewport_rect.right() - 4.0, y - 6.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "NOW",
+                egui::FontId::monospace(9.0),
+                now_color,
+            );
+        }
+
         // Per-source event rendering.
         //
         // Two layouts depending on source count:
