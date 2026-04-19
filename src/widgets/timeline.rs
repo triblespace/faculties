@@ -656,21 +656,10 @@ impl BranchTimeline {
         // knows what range they're looking at without manually
         // reading the tick marks.
         ctx.section("Activity", |ctx| {
+            // Legend removed — each event chip already carries its
+            // source pill, so the row of dot-swatches was redundant.
+            // SPAN + zoom-hint affordance lives inside the viewport.
             ctx.grid(|g| {
-                // Source legend — SPAN + zoom hint are now painted as
-                // an overlay inside the viewport itself (see
-                // paint_viewport) so the legend row stays clean.
-                g.full(|ctx| {
-                    let ui = ctx.ui_mut();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
-                        for (i, s) in sources.iter().enumerate() {
-                            let count = events.iter().filter(|e| e.source_idx == i).count();
-                            render_legend_swatch(ui, &s.label(), count, s.color());
-                        }
-                    });
-                });
-                // Viewport spans the whole grid row.
                 g.full(|ctx| {
                     self.paint_viewport(ctx, viewport_height, now, &events, &sources);
                 });
@@ -822,10 +811,11 @@ impl BranchTimeline {
 
         let painter = ui.painter_at(viewport_rect);
 
-        // Background. Neutral dark grey — palette matching is the
-        // caller's concern.
+        // No viewport background — the timeline blends into the
+        // notebook panel so the ruler and event chips read directly
+        // against the section fill. `frame_color` is still used by
+        // the event chips themselves below.
         let frame_color = egui::Color32::from_rgb(0x29, 0x2c, 0x2f);
-        painter.rect_filled(viewport_rect, 0.0, frame_color);
 
         // Four-sine ruler: one cosine per natural time period.
         let muted = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
@@ -1259,33 +1249,3 @@ fn format_span(secs: f64) -> String {
     }
 }
 
-/// Legend swatch: a filled color dot, uppercase monospace label, and
-/// event count. Rendered at the top of the Activity section.
-fn render_legend_swatch(
-    ui: &mut egui::Ui,
-    label: &str,
-    count: usize,
-    color: egui::Color32,
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let dot_size = 8.0;
-        let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(dot_size, dot_size),
-            egui::Sense::hover(),
-        );
-        ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
-        ui.label(
-            egui::RichText::new(label.to_uppercase())
-                .small()
-                .monospace()
-                .strong(),
-        );
-        ui.label(
-            egui::RichText::new(count.to_string())
-                .small()
-                .monospace()
-                .color(egui::Color32::from_rgb(0x8a, 0x8a, 0x8a)),
-        );
-    });
-}
