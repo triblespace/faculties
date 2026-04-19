@@ -928,6 +928,34 @@ impl BranchTimeline {
                 egui::Stroke::new(0.5, axis_color),
             );
 
+            // Empty state: when there are no events at all, paint a
+            // centered hourglass + muted hint over the ruler so the
+            // viewport isn't a blank scrubbing surface.
+            if events.is_empty() {
+                let center = viewport_rect.center();
+                painter.text(
+                    egui::pos2(center.x, center.y - 14.0),
+                    egui::Align2::CENTER_CENTER,
+                    "\u{231b}",
+                    egui::FontId::proportional(28.0),
+                    muted,
+                );
+                painter.text(
+                    egui::pos2(center.x, center.y + 12.0),
+                    egui::Align2::CENTER_CENTER,
+                    "NO EVENTS IN RANGE",
+                    egui::FontId::monospace(11.0),
+                    muted,
+                );
+                painter.text(
+                    egui::pos2(center.x, center.y + 28.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Drag to pan · ⌘+scroll to zoom",
+                    egui::FontId::proportional(11.0),
+                    muted,
+                );
+            }
+
             for ev in events {
                 if ev.ts_ns < view_end || ev.ts_ns > view_start {
                     continue;
