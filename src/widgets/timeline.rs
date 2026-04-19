@@ -1006,7 +1006,9 @@ impl BranchTimeline {
                     text_color,
                 );
 
-                // Interaction: hover highlight + click.
+                // Interaction: hover highlight + click + tooltip with
+                // full summary + absolute timestamp (truncated chip text
+                // often hides context, so surface it on hover).
                 if let Some(p) = pointer_pos {
                     if chip_rect.contains(p) {
                         hover_rect = Some((chip_rect, src_color));
@@ -1014,6 +1016,47 @@ impl BranchTimeline {
                             clicked_event = Some((ev.kind, ev.entity_id));
                         }
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        let time_str = format_time_marker(ev.ts_ns);
+                        let summary = ev.summary.clone();
+                        let src_label = src_label.clone();
+                        let status_label = ev.status.clone();
+                        let fromto_label = ev.from_to.clone();
+                        egui::show_tooltip_at_pointer(
+                            ui.ctx(),
+                            ui.layer_id(),
+                            egui::Id::new(("timeline_event_tip", ev.entity_id)),
+                            |tip| {
+                                tip.label(
+                                    egui::RichText::new(src_label.to_uppercase())
+                                        .small()
+                                        .monospace()
+                                        .strong(),
+                                );
+                                tip.label(
+                                    egui::RichText::new(time_str)
+                                        .small()
+                                        .monospace()
+                                        .weak(),
+                                );
+                                if let Some(st) = status_label {
+                                    tip.label(
+                                        egui::RichText::new(st.to_uppercase())
+                                            .small()
+                                            .monospace(),
+                                    );
+                                }
+                                if let Some(ft) = fromto_label {
+                                    tip.label(
+                                        egui::RichText::new(ft)
+                                            .small()
+                                            .monospace()
+                                            .weak(),
+                                    );
+                                }
+                                tip.separator();
+                                tip.label(summary);
+                            },
+                        );
                     }
                 }
             }
