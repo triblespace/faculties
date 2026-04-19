@@ -44,8 +44,8 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("compass", CompassBoard::default(), move |ctx, board| {
         let mut st = storage.read_mut(ctx);
-        let Some(ws) = st.ensure_workspace(&branch) else { return };
-        board.render(ctx, ws);
-        st.push_if_dirty(&branch);
+        let Some(mut ws) = st.workspace(&branch) else { return };
+        board.render(ctx, &mut ws);
+        st.push(&mut ws);
     });
 }

@@ -44,9 +44,9 @@ fn main(nb: &mut NotebookCtx) {
     let branch_for_render = branch.clone();
     nb.state("timeline", BranchTimeline::new(branch), move |ctx, tl| {
         let mut st = storage.read_mut(ctx);
-        let Some(ws) = st.ensure_workspace(&branch_for_render) else {
+        let Some(mut ws) = st.workspace(&branch_for_render) else {
             return;
         };
-        tl.render(ctx, &mut [(branch_for_render.as_str(), ws)]);
+        tl.render(ctx, &mut [(branch_for_render.as_str(), &mut ws)]);
     });
 }

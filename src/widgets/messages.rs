@@ -761,7 +761,7 @@ impl MessagesPanel {
 
             // Apply writes after UI closure. Each helper does a
             // `ws.commit(..)`; the host pushes between frames via
-            // `StorageState::push_if_dirty`.
+            // `StorageState::push` when the workspace head advanced.
             let mut did_write = false;
             for mid in to_mark_read {
                 if let Some(me) = self.me {

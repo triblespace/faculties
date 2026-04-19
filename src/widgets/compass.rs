@@ -6,7 +6,7 @@
 //! responsible for pulling the compass branch and passing the workspace
 //! in at render time. Writes go through `Workspace::commit(..)`; pushing
 //! is the host's responsibility (e.g. via
-//! [`StorageState::push_if_dirty`](crate::widgets::StorageState::push_if_dirty)).
+//! [`StorageState::push`](crate::widgets::StorageState::push)).
 //!
 //! Features beyond read-only display:
 //!
@@ -709,7 +709,7 @@ impl CompassBoard {
 
         // Apply writes after the UI closure. Each helper does a
         // `ws.commit(..)`; the host pushes between frames via
-        // `StorageState::push_if_dirty`.
+        // `StorageState::push` when the workspace head advanced.
         if let Some(intent) = add_intent {
             let status = intent.status.clone();
             let _ = CompassLive::add_goal(ws, intent.title, status.clone(), intent.parent, intent.tags);

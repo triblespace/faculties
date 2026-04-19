@@ -45,18 +45,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
-        let _ = st.ensure_workspace(&branch);
-        let _ = st.ensure_workspace("relations");
-        let names: &[&str] = &[branch.as_str(), "relations"];
-        let mut pulled = st.workspace_many(names);
-        let (relations_slot, msgs_slot) = {
-            let mut it = pulled.drain(..);
-            let msgs_slot = it.next().flatten();
-            let relations_slot = it.next().flatten();
-            (relations_slot, msgs_slot)
-        };
-        let Some(ws) = msgs_slot else { return };
-        panel.render(ctx, ws, relations_slot);
-        st.push_if_dirty(&branch);
+        let Some(mut ws) = st.workspace(&branch) else { return };
+        let mut relations = st.workspace("relations");
+        panel.render(ctx, &mut ws, relations.as_mut());
+        st.push(&mut ws);
     });
 }

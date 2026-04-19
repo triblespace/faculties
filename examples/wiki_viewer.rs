@@ -38,17 +38,9 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state("wiki", WikiViewer::default(), move |ctx, viewer| {
         let mut st = storage.read_mut(ctx);
-        let _ = st.ensure_workspace("wiki");
-        let _ = st.ensure_workspace("files");
-        let mut pair = st.workspace_many(&["wiki", "files"]);
-        let (files_slot, wiki_slot) = {
-            let mut it = pair.drain(..);
-            let wiki_slot = it.next().flatten();
-            let files_slot = it.next().flatten();
-            (files_slot, wiki_slot)
-        };
-        let Some(wiki_ws) = wiki_slot else { return };
-        viewer.render(ctx, wiki_ws, files_slot);
-        st.push_if_dirty("wiki");
+        let Some(mut ws) = st.workspace("wiki") else { return };
+        let mut files = st.workspace("files");
+        viewer.render(ctx, &mut ws, files.as_mut());
+        st.push(&mut ws);
     });
 }
