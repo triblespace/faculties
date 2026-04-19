@@ -886,7 +886,7 @@ fn render_composer(
                     .get(&id)
                     .cloned()
                     .unwrap_or_else(|| id_prefix(id)),
-                None => "choose recipient…".to_string(),
+                None => "TO · CHOOSE RECIPIENT".to_string(),
             };
             egui::ComboBox::from_id_salt(("messages_recipient_picker",))
                 .selected_text(selected_text)
@@ -896,7 +896,9 @@ fn render_composer(
                             continue;
                         }
                         let is_sel = *compose_recipient == Some(*pid);
-                        // Prefix each entry with a person-color dot.
+                        // Prefix each entry with a person-color dot;
+                        // name wears the person's color so the picker
+                        // row matches the chip style everywhere else.
                         ui.horizontal(|ui| {
                             let (dot, _) = ui.allocate_exact_size(
                                 egui::vec2(8.0, 8.0),
@@ -910,7 +912,11 @@ fn render_composer(
                             if ui
                                 .selectable_label(
                                     is_sel,
-                                    format!("{name} ({})", id_prefix(*pid)),
+                                    egui::RichText::new(format!(
+                                        "{name} · {}",
+                                        id_prefix(*pid)
+                                    ))
+                                    .color(person_color(*pid)),
                                 )
                                 .clicked()
                             {
