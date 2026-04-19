@@ -1392,10 +1392,17 @@ impl WikiViewer {
                             );
                             if n_versions > 1 {
                                 let vi = current_idx.unwrap_or(0);
+                                // Subtle dot separator between id and
+                                // version chip.
+                                ui.label(
+                                    egui::RichText::new("·")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(0x8a, 0x8a, 0x8a)),
+                                );
                                 let ver_label = if pinned.is_some() {
                                     format!("v{}/{}", n_versions - vi, n_versions)
                                 } else {
-                                    format!("v{} · latest", n_versions)
+                                    format!("v{} · LATEST", n_versions)
                                 };
                                 ui.label(
                                     egui::RichText::new(ver_label)
@@ -1403,10 +1410,31 @@ impl WikiViewer {
                                         .small()
                                         .strong(),
                                 );
-                                if ui.small_button("◀").clicked() && vi + 1 < n_versions {
-                                    version_nav = Some((frag_id, Some(history[vi + 1])));
+                                // Back to older version. Disabled at
+                                // the tail of history.
+                                let back_enabled = vi + 1 < n_versions;
+                                if ui
+                                    .add_enabled(
+                                        back_enabled,
+                                        egui::Button::new("◀").small(),
+                                    )
+                                    .on_hover_text("Older version")
+                                    .clicked()
+                                {
+                                    version_nav =
+                                        Some((frag_id, Some(history[vi + 1])));
                                 }
-                                if ui.small_button("▶").clicked() {
+                                // Forward to newer version (or jump to
+                                // latest when pinned to an old one).
+                                let fwd_enabled = vi > 0 || pinned.is_some();
+                                if ui
+                                    .add_enabled(
+                                        fwd_enabled,
+                                        egui::Button::new("▶").small(),
+                                    )
+                                    .on_hover_text("Newer version")
+                                    .clicked()
+                                {
                                     if vi > 0 {
                                         version_nav =
                                             Some((frag_id, Some(history[vi - 1])));
@@ -1414,7 +1442,14 @@ impl WikiViewer {
                                         version_nav = Some((frag_id, None));
                                     }
                                 }
-                                if pinned.is_some() && ui.small_button("↻").clicked() {
+                                // Jump to latest (only meaningful when
+                                // we're pinned to an older version).
+                                if pinned.is_some()
+                                    && ui
+                                        .add(egui::Button::new("↻").small())
+                                        .on_hover_text("Jump to latest")
+                                        .clicked()
+                                {
                                     version_nav = Some((frag_id, None));
                                 }
                             }
