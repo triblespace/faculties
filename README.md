@@ -86,6 +86,63 @@ Faculties operate on named branches of the pile and are designed to
 coexist — multiple faculties on the same pile, each owning its own
 branch, all rooted in the same content-addressed blob store.
 
+## GORBIE viewer (experimental)
+
+A GUI inspector that renders the same pile branches the CLI faculties
+write — compass kanban, wiki graph, local-messages thread, and a
+multi-source activity timeline — inside a single [GORBIE] notebook
+window.
+
+[GORBIE]: https://github.com/triblespace/GORBIE
+
+```sh
+# From the faculties/ checkout:
+cargo run --release --example pile_inspector --features widgets -- ./self.pile
+```
+
+Standalone per-widget demos are also in `examples/`:
+`compass_board.rs`, `wiki_viewer.rs`, `messages_panel.rs`,
+`branch_timeline.rs`.
+
+### Creating a demo pile
+
+If you don't already have a `./self.pile`, create one by seeding a
+few faculties against a fresh path:
+
+```sh
+export PILE=./demo.pile
+compass.rs add "ship the demo" --status doing
+compass.rs add "write the README" --status done
+wiki.rs create --title "Hello" --body "First *typst* fragment."
+local_messages.rs send --to <peer-id> "heyyy"
+```
+
+Then point the viewer at the new pile:
+
+```sh
+cargo run --release --example pile_inspector --features widgets -- ./demo.pile
+```
+
+### Building from a checkout
+
+The viewer depends on [GORBIE]. If you're iterating on both, clone
+GORBIE as a sibling directory — the repo's `Cargo.toml` has
+`[patch.crates-io] GORBIE = { path = "../GORBIE" }` for local
+development. Users who just want to build against the published
+crate can remove that patch line after cloning.
+
+### Known limitations
+
+- Requires a working `egui 0.34.1`. There is an open upstream panic
+  ([emilk/egui#7870]) in `hit_test.rs:365` that can fire when a
+  click-sensing and drag-sensing widget overlap. We've routed around
+  it in every faculty widget (manual drag on timeline, wiki graph,
+  floating cards), but the underlying bug is still latent in any
+  other egui app you compose with these. Watch that issue for the
+  upstream fix.
+
+[emilk/egui#7870]: https://github.com/emilk/egui/issues/7870
+
 ## Contributing
 
 Faculties are deliberately simple. If you find yourself adding abstraction
