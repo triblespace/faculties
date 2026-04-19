@@ -736,7 +736,7 @@ impl MessagesPanel {
             ctx.grid(|g| g.full(|ctx| {
             let ui = ctx.ui_mut();
             if messages.is_empty() && self.me.is_none() {
-                ui.label("No messages yet.");
+                render_messages_empty_state(ui, "No messages yet.", None);
                 return;
             }
 
@@ -764,7 +764,11 @@ impl MessagesPanel {
             let out = scroll.show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 if messages.is_empty() {
-                    ui.label("No messages yet.");
+                    render_messages_empty_state(
+                        ui,
+                        "No messages yet.",
+                        Some("Type below to start the conversation."),
+                    );
                 }
                 for msg in &messages {
                     render_message(ui, msg, now, &names, self.me);
@@ -1170,6 +1174,37 @@ fn render_message(
             });
         });
     });
+}
+
+/// Centered empty-state block with an envelope glyph, a headline
+/// message, and an optional muted sub-line. Used whenever the
+/// messages panel has nothing to show.
+fn render_messages_empty_state(ui: &mut egui::Ui, headline: &str, hint: Option<&str>) {
+    ui.add_space(24.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new("\u{2709}")
+                .size(32.0)
+                .color(color_muted()),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(headline)
+                .monospace()
+                .small()
+                .strong()
+                .color(color_muted()),
+        );
+        if let Some(h) = hint {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(h)
+                    .small()
+                    .color(color_muted()),
+            );
+        }
+    });
+    ui.add_space(24.0);
 }
 
 fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
