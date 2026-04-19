@@ -774,6 +774,7 @@ impl WikiGraph {
         self.nodes.len()
     }
 
+    #[allow(dead_code)]
     fn edge_count(&self) -> usize {
         self.edges.len()
     }

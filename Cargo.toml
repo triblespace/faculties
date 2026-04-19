@@ -11,6 +11,13 @@ readme = "README.md"
 keywords = ["triblespace", "ai-agent", "kanban", "wiki", "notebook"]
 categories = ["command-line-utilities", "data-structures"]
 
+# docs.rs should render all public API, including the optional
+# `widgets` module (WikiViewer / CompassBoard / etc.) that depends
+# on egui/GORBIE/cubecl.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lib]
 path = "src/lib.rs"
 

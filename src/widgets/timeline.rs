@@ -1151,11 +1151,14 @@ impl BranchTimeline {
                         let status_label = ev.status.clone();
                         let fromto_label = ev.from_to.clone();
                         let src_color_tip = src_color;
-                        egui::show_tooltip_at_pointer(
-                            ui.ctx(),
+                        egui::Tooltip::always_open(
+                            ui.ctx().clone(),
                             ui.layer_id(),
                             egui::Id::new(("timeline_event_tip", ev.entity_id)),
-                            |tip| {
+                            egui::PopupAnchor::Pointer,
+                        )
+                        .gap(12.0)
+                        .show(|tip| {
                                 tip.set_max_width(360.0);
                                 // Header: colored source dot + source
                                 // label + timestamp on a single line.
@@ -1213,8 +1216,7 @@ impl BranchTimeline {
                                 }
                                 tip.separator();
                                 tip.add(egui::Label::new(summary).wrap());
-                            },
-                        );
+                            });
                     }
                 }
             }
