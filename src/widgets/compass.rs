@@ -1215,10 +1215,13 @@ fn render_goal_card(
                 ui.set_width(ui.available_width());
 
                 // Move-status row (inline, as an alternative to the popup).
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     ui.label(
-                        egui::RichText::new("move to")
+                        egui::RichText::new("MOVE TO")
                             .small()
+                            .monospace()
+                            .strong()
                             .color(color_muted()),
                     );
                     for status in DEFAULT_STATUSES {
@@ -1226,10 +1229,15 @@ fn render_goal_card(
                             continue;
                         }
                         let fill = status_color(status);
+                        let text = colorhash::text_color_on(fill);
                         if ui
                             .add(egui::Button::new(
-                                egui::RichText::new(status).color(fill).small(),
-                            ))
+                                egui::RichText::new(status.to_uppercase())
+                                    .small()
+                                    .monospace()
+                                    .strong()
+                                    .color(text),
+                            ).fill(fill))
                             .clicked()
                         {
                             *move_intent = Some((row.id, status.to_string()));
