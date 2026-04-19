@@ -1263,7 +1263,42 @@ impl WikiViewer {
         if self.graph.is_none() {
             self.graph = Some(WikiGraph::from_wiki(live, wiki_ws));
         }
+        // Empty state when the wiki branch has no fragments at all —
+        // otherwise the graph is a blank canvas.
+        let graph_is_empty = self
+            .graph
+            .as_ref()
+            .map(|g| g.node_count() == 0)
+            .unwrap_or(true);
+        if graph_is_empty {
+            let ui = ctx.ui_mut();
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                let muted = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
+                ui.label(egui::RichText::new("\u{1f4d6}").size(28.0).color(muted));
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("No fragments in this wiki branch")
+                        .monospace()
+                        .small()
+                        .strong()
+                        .color(muted),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Create one via `faculties/wiki.rs create` and reopen the pile.",
+                    )
+                    .small()
+                    .color(muted),
+                );
+            });
+            ui.add_space(16.0);
+        }
         if let Some(graph) = self.graph.as_mut() {
+            if graph.node_count() == 0 {
+                return;
+            }
             // Compact header: GRAPH · N fragments · M links · [Bundle|Straight]
             let bundled = graph.is_bundled();
             let n_nodes = graph.node_count();
