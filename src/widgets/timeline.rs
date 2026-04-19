@@ -931,9 +931,9 @@ impl BranchTimeline {
         }
 
         // Top-right overlay: visible-window span + interaction hint.
-        // Painted as semi-transparent pills over the ruler so the
-        // viewer always sees current zoom and how to control it
-        // without crowding the legend row above.
+        // Painted as plain text over the ruler — no pill background,
+        // relies on the muted colors to recede against both the
+        // viewport fill and the event chips.
         {
             let visible_secs =
                 viewport_height as f64 * 60.0 / self.timeline_scale as f64;
@@ -941,36 +941,20 @@ impl BranchTimeline {
             let hint_label = "PINCH/\u{2318}+SCROLL \u{2192} ZOOM · DBL-CLICK \u{2192} NOW";
             let span_font = egui::FontId::monospace(10.0);
             let hint_font = egui::FontId::monospace(9.0);
-            let span_color = egui::Color32::from_rgb(0xe6, 0xe6, 0xe6);
-            let hint_color = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
-            let pill_bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160);
-            let pad_x = 6.0;
-            let pad_y = 2.0;
-            let gap = 4.0;
+            let span_color = egui::Color32::from_rgb(0xc8, 0xc8, 0xc8);
+            let hint_color = egui::Color32::from_rgb(0x7a, 0x7a, 0x7a);
             let top = viewport_rect.top() + 6.0;
             let right = viewport_rect.right() - 8.0;
-            // Lay out right-to-left: hint first, then span to its left.
-            let span_galley =
-                painter.layout_no_wrap(span_label, span_font, span_color);
+            let gap = 12.0;
             let hint_galley =
                 painter.layout_no_wrap(hint_label.to_string(), hint_font, hint_color);
+            let span_galley =
+                painter.layout_no_wrap(span_label, span_font, span_color);
             let hint_pos = egui::pos2(right - hint_galley.size().x, top);
-            painter.rect_filled(
-                egui::Rect::from_min_size(hint_pos, hint_galley.size())
-                    .expand2(egui::vec2(pad_x, pad_y)),
-                2.0,
-                pill_bg,
-            );
             painter.galley(hint_pos, hint_galley, hint_color);
             let span_pos = egui::pos2(
-                hint_pos.x - gap * 2.0 - pad_x * 2.0 - span_galley.size().x,
+                hint_pos.x - gap - span_galley.size().x,
                 top,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(span_pos, span_galley.size())
-                    .expand2(egui::vec2(pad_x, pad_y)),
-                2.0,
-                pill_bg,
             );
             painter.galley(span_pos, span_galley, span_color);
         }
