@@ -9,7 +9,7 @@
 //! serde = { version = "1.0", features = ["derive"] }
 //! serde_json = "1.0"
 //! triblespace = "0.36"
-//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
+//! faculties = "0.11"
 //! ```
 
 use anyhow::{Result, anyhow, bail};

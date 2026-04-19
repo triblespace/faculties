@@ -7,7 +7,7 @@
 //! hifitime = "4.2.3"
 //! rand_core = "0.6.4"
 //! triblespace = "0.36"
-//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
+//! faculties = "0.11"
 //! ```
 
 use std::path::{Path, PathBuf};

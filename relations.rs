@@ -6,7 +6,7 @@
 //! ed25519-dalek = "2.1.1"
 //! rand_core = "0.6.4"
 //! triblespace = "0.36"
-//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
+//! faculties = "0.11"
 //! ```
 
 use anyhow::{Result, anyhow, bail};

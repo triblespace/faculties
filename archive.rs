@@ -12,7 +12,7 @@
 //! tracing = "0.1"
 //! tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 //! triblespace = "0.36"
-//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
+//! faculties = "0.11"
 //! ```
 
 use std::collections::{HashMap, HashSet};

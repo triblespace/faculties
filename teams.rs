@@ -12,7 +12,7 @@
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! triblespace = "0.36"
-//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
+//! faculties = "0.11"
 //! ```
 
 use std::collections::{HashMap, HashSet};
