@@ -1055,6 +1055,53 @@ impl WikiGraph {
                     if response.clicked() {
                         clicked = Some(node.frag_id);
                     }
+                    // Rich hover tooltip — full title (labels can
+                    // overlap or be clipped on dense graphs) + the
+                    // fragment id tinted with its colorhash, plus
+                    // neighbour-count chip. Mirrors the per-page
+                    // colored dot treatment above.
+                    let frag_id = node.frag_id;
+                    let title = node.label.clone();
+                    let degree = node.degree;
+                    let col = colorhash::ral_categorical(frag_id.as_ref());
+                    egui::show_tooltip_at_pointer(
+                        ui.ctx(),
+                        ui.layer_id(),
+                        egui::Id::new(("wiki_graph_node", frag_id)),
+                        |tip| {
+                            tip.set_max_width(320.0);
+                            tip.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let (dot_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(
+                                    dot_rect.center(),
+                                    4.0,
+                                    col,
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("wiki:{frag_id:x}"))
+                                        .monospace()
+                                        .small()
+                                        .color(col),
+                                );
+                            });
+                            tip.add(egui::Label::new(
+                                egui::RichText::new(&title).strong(),
+                            ).wrap());
+                            tip.label(
+                                egui::RichText::new(format!(
+                                    "{degree} LINK{}",
+                                    if degree == 1 { "" } else { "S" }
+                                ))
+                                .monospace()
+                                .small()
+                                .color(egui::Color32::from_rgb(0x8a, 0x8a, 0x8a)),
+                            );
+                        },
+                    );
                 }
             }
         }
