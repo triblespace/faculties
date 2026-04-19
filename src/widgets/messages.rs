@@ -997,11 +997,20 @@ fn render_message(
     } else {
         egui::Layout::left_to_right(egui::Align::Min)
     };
+    // Asymmetric bubble corners — classic chat visual idiom. The
+    // "tail" corner (top-right for outbound / top-left for inbound)
+    // stays sharp (2px) so the bubble points back toward the sender;
+    // the remaining three corners keep the full 6px rounding.
+    let corners = if from_is_me {
+        egui::CornerRadius { nw: 6, ne: 2, sw: 6, se: 6 }
+    } else {
+        egui::CornerRadius { nw: 2, ne: 6, sw: 6, se: 6 }
+    };
     ui.with_layout(alignment, |ui| {
     egui::Frame::NONE
         .fill(bubble_fill)
         .stroke(egui::Stroke::new(1.0, color_frame()))
-        .corner_radius(egui::CornerRadius::same(6))
+        .corner_radius(corners)
         .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.set_max_width(bubble_max);
