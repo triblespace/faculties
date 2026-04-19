@@ -135,6 +135,16 @@ fn tag_color(tag: &str) -> egui::Color32 {
     colorhash::ral_categorical(tag.as_bytes())
 }
 
+/// Truncate `s` at char boundary to `max` chars, appending `…` if cut.
+/// Char-aware so multibyte sequences don't panic on slice.
+fn truncate_inline(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let take: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{take}…")
+}
+
 // ── Row structs ──────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -1065,29 +1075,27 @@ fn render_goal_card(
                 }
             });
 
-            // Row 3: priority edges + tags.
+            // Row 3: priority edges + tags. Tags and priority badges
+            // share a tight horizontal_wrapped row — long names get
+            // truncated so a single chip can't overflow the column.
             let has_prio = !row.higher_over.is_empty();
             if has_prio || !row.tags.is_empty() {
                 ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
                     for lower in &row.higher_over {
                         let target_label = title_by_id
                             .get(lower)
-                            .map(|t| {
-                                if t.len() > 20 {
-                                    format!("{}…", &t[..20])
-                                } else {
-                                    t.clone()
-                                }
-                            })
+                            .map(|t| truncate_inline(t, 16))
                             .unwrap_or_else(|| id_prefix(*lower));
                         render_chip(
                             ui,
-                            &format!("▲ over {target_label}"),
+                            &format!("▲ {target_label}"),
                             egui::Color32::from_rgb(0x55, 0x3f, 0x7f),
                         );
                     }
                     for tag in &row.tags {
-                        render_chip(ui, &format!("#{tag}"), tag_color(tag));
+                        let tag_label = truncate_inline(tag, 18);
+                        render_chip(ui, &format!("#{tag_label}"), tag_color(tag));
                     }
                 });
             }
