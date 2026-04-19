@@ -59,8 +59,13 @@ telling the tool what to show you next, and the history falls out naturally.
 
 ## Requirements
 
-- [`rust-script`](https://rust-script.org/) on PATH
-- Network access for the first run of each faculty (dependency fetch + compile)
+- [Rust](https://rustup.rs/) (stable). `rustup` is the easiest
+  install: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
+  Provides `cargo`, which you need for both paths below.
+- [`rust-script`](https://rust-script.org/) on PATH, for the CLI
+  faculties. Install with `cargo install rust-script`.
+- Network access on the first run of each faculty — cargo fetches
+  and compiles the dependencies. Subsequent runs are instant.
 
 ## Using
 
