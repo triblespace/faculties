@@ -1275,10 +1275,20 @@ impl WikiViewer {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let (label, hint) = if bundled {
+                                    ("STRAIGHT", "Revert to straight edges")
+                                } else {
+                                    ("BUNDLE", "Bundle edges via FDEB")
+                                };
                                 if ui
-                                    .small_button(
-                                        if bundled { "STRAIGHT" } else { "BUNDLE" },
-                                    )
+                                    .add(egui::Button::new(
+                                        egui::RichText::new(label)
+                                            .small()
+                                            .monospace()
+                                            .strong(),
+                                    ))
+                                    .on_hover_text(hint)
                                     .clicked()
                                 {
                                     if bundled {
@@ -1287,6 +1297,23 @@ impl WikiViewer {
                                         graph.bundle_edges();
                                     }
                                 }
+                                ui.label(
+                                    egui::RichText::new("\u{00b7}")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(
+                                            0x6a, 0x6a, 0x6a,
+                                        )),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "DRAG TO PAN · PINCH OR \u{2318}+SCROLL TO ZOOM",
+                                    )
+                                    .small()
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(
+                                        0x6a, 0x6a, 0x6a,
+                                    )),
+                                );
                             },
                         );
                     });
