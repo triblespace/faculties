@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.11.2 — 2026-04-19
+
+- **Theme-adaptive compass + messages.** `color_frame`, `card_bg`,
+  `color_bubble`, `color_muted` now branch on `ui.visuals().dark_mode`
+  so light-mode notebooks don't end up with dark-on-dark text.
+- **Drags don't fight.** Both the wiki graph and the activity
+  timeline only latch onto a drag whose press *started* inside
+  their viewport — dragging a floating card across them no longer
+  yanks the graph pan or the timeline offset.
+- **Release hygiene.** LICENSE-MIT + LICENSE-APACHE committed,
+  Cargo.toml gains authors/homepage/readme/keywords/categories,
+  `.gitignore` excludes `*.pile` and `.bak-*` backups.
+
 ## 0.11.1 — 2026-04-19
 
 - **`faculties-viewer` binary.** `cargo install faculties --features widgets`
