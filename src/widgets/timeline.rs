@@ -29,7 +29,7 @@
 //!
 //! Input handling:
 //! * scroll = pan (vertical)
-//! * cmd/ctrl + scroll = zoom (horizontal trackpad drift no longer zooms)
+//! * pinch or cmd/ctrl + scroll = zoom (horizontal trackpad drift no longer zooms)
 //! * drag = pan
 //! * double-click = jump to "now"
 //!
@@ -665,12 +665,14 @@ impl BranchTimeline {
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(
-                                    egui::RichText::new("\u{2318}+SCROLL TO ZOOM")
-                                        .small()
-                                        .monospace()
-                                        .color(egui::Color32::from_rgb(
-                                            0x6a, 0x6a, 0x6a,
-                                        )),
+                                    egui::RichText::new(
+                                        "PINCH OR \u{2318}+SCROLL TO ZOOM",
+                                    )
+                                    .small()
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(
+                                        0x6a, 0x6a, 0x6a,
+                                    )),
                                 );
                                 ui.label(
                                     egui::RichText::new("\u{00b7}")
@@ -732,11 +734,12 @@ impl BranchTimeline {
                 .map(|p| viewport_rect.contains(p))
                 .unwrap_or(false);
             if pointer_in_viewport {
-                let (scroll_y, ctrl, pointer_pos) = ui.input(|i| {
+                let (scroll_y, ctrl, pointer_pos, pinch) = ui.input(|i| {
                     (
                         i.smooth_scroll_delta.y,
                         i.modifiers.command || i.modifiers.ctrl,
                         i.pointer.hover_pos(),
+                        i.zoom_delta(),
                     )
                 });
 
@@ -748,9 +751,10 @@ impl BranchTimeline {
                     self.timeline_start - (cursor_rel_y as f64 * ns_per_px) as i128;
 
                 // Scroll without a modifier → pan the timeline.
-                // Cmd/Ctrl + scroll → zoom around the cursor row.
-                // Horizontal scroll no longer zooms — trackpad sideways
-                // drift was triggering unintended zoom on every swipe.
+                // Cmd/Ctrl + scroll OR native trackpad pinch → zoom
+                // around the cursor row. Horizontal scroll no longer
+                // zooms — trackpad sideways drift was triggering
+                // unintended zoom on every swipe.
                 let mut consumed_scroll = false;
                 if scroll_y != 0.0 && !ctrl {
                     let pan_ns = (scroll_y as f64 * scroll_speed * ns_per_px) as i128;
@@ -758,7 +762,9 @@ impl BranchTimeline {
                     consumed_scroll = true;
                 }
 
-                let zoom_factor = if ctrl && scroll_y != 0.0 {
+                let zoom_factor = if pinch != 1.0 {
+                    pinch
+                } else if ctrl && scroll_y != 0.0 {
                     if scroll_y > 0.0 {
                         1.15
                     } else {
@@ -950,7 +956,7 @@ impl BranchTimeline {
                 painter.text(
                     egui::pos2(center.x, center.y + 28.0),
                     egui::Align2::CENTER_CENTER,
-                    "Drag to pan · ⌘+scroll to zoom",
+                    "Drag to pan · pinch or ⌘+scroll to zoom",
                     egui::FontId::proportional(11.0),
                     muted,
                 );
