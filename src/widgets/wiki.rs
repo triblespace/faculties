@@ -871,13 +871,21 @@ impl WikiGraph {
     }
 
     fn show(&self, ui: &mut egui::Ui) -> Option<Id> {
-        let available = ui.available_size();
+        // Fixed graph viewport height — we explicitly clamp to
+        // GRAPH_HEIGHT_PX rather than `available.y.max(400)` because
+        // inside the notebook's auto_shrink ScrollArea `available.y`
+        // is `f32::INFINITY`, which would allocate an infinite-tall
+        // click-sensing rect that covers every widget rendered below
+        // the wiki section (compass, messages, etc.) and eats all
+        // their clicks.
+        const GRAPH_HEIGHT_PX: f32 = 600.0;
+        let available_x = ui.available_width();
         // Click-only sense — drag is implemented manually below. Avoids
         // egui's hit_test unwrap panic that fires when a drag-sensing
         // widget coexists with a nearby click-sensing one (the section
         // header above us).
         let (response, painter) = ui.allocate_painter(
-            egui::vec2(available.x, available.y.max(400.0)),
+            egui::vec2(available_x, GRAPH_HEIGHT_PX),
             egui::Sense::click(),
         );
         let rect = response.rect;
