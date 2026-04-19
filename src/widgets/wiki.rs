@@ -24,7 +24,7 @@
 //! ```
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
@@ -34,7 +34,7 @@ use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BranchStore, Repository, Workspace};
+use triblespace::core::repo::Workspace;
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{TryToValue, Value};
@@ -44,6 +44,7 @@ use triblespace::prelude::View;
 
 use crate::schemas::files::{file, FILES_BRANCH_NAME, KIND_FILE};
 use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID, WIKI_BRANCH_NAME};
+use crate::widgets::live::SharedPile;
 
 /// Handle to a long-string blob living in a pile.
 type TextHandle = Value<Handle<Blake3, LongString>>;
@@ -67,43 +68,33 @@ struct WikiLive {
 }
 
 impl WikiLive {
-    fn open(path: &Path) -> Result<Self, String> {
-        let mut pile = Pile::<Blake3>::open(path).map_err(|e| format!("open pile: {e:?}"))?;
-        if let Err(err) = pile.restore() {
-            let _ = pile.close();
-            return Err(format!("restore: {err:?}"));
-        }
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core06::OsRng);
-        let mut repo = Repository::new(pile, signing_key, TribleSet::new())
-            .map_err(|e| format!("repo: {e:?}"))?;
-        repo.storage_mut()
-            .refresh()
-            .map_err(|e| format!("refresh: {e:?}"))?;
-
-        let wiki_bid = find_branch(&mut repo, WIKI_BRANCH_NAME)
-            .ok_or_else(|| format!("no '{WIKI_BRANCH_NAME}' branch found"))?;
-        let mut wiki_ws = repo
-            .pull(wiki_bid)
-            .map_err(|e| format!("pull wiki: {e:?}"))?;
+    fn open(pile: SharedPile) -> Result<Self, String> {
+        let mut wiki_ws = pile.pull_branch(WIKI_BRANCH_NAME)?;
         let wiki_space = wiki_ws
             .checkout(..)
             .map_err(|e| format!("checkout wiki: {e:?}"))?
             .into_facts();
 
-        let (files_space, files_ws) =
-            if let Some(files_bid) = find_branch(&mut repo, FILES_BRANCH_NAME) {
-                let mut files_ws = repo
-                    .pull(files_bid)
-                    .map_err(|e| format!("pull files: {e:?}"))?;
-                let fs = files_ws
-                    .checkout(..)
-                    .map_err(|e| format!("checkout files: {e:?}"))?
-                    .into_facts();
-                (fs, Some(files_ws))
-            } else {
-                eprintln!("[files] no '{FILES_BRANCH_NAME}' branch found — file links will not resolve");
+        let (files_space, files_ws) = match pile.pull_branch(FILES_BRANCH_NAME) {
+            Ok(mut files_ws) => match files_ws.checkout(..) {
+                Ok(co) => (co.into_facts(), Some(files_ws)),
+                Err(e) => {
+                    eprintln!("[files] checkout {FILES_BRANCH_NAME}: {e:?}");
+                    (TribleSet::new(), None)
+                }
+            },
+            Err(e) => {
+                // Only print if it's not just a missing branch.
+                if !e.contains(&format!("no '{FILES_BRANCH_NAME}' branch")) {
+                    eprintln!("[files] pull {FILES_BRANCH_NAME}: {e}");
+                } else {
+                    eprintln!(
+                        "[files] no '{FILES_BRANCH_NAME}' branch found — file links will not resolve"
+                    );
+                }
                 (TribleSet::new(), None)
-            };
+            }
+        };
 
         Ok(WikiLive {
             wiki_space,
@@ -347,31 +338,6 @@ impl WikiLive {
             Err(e) => eprintln!("[files] error: {e}"),
         }
     }
-}
-
-/// Find a branch by name in a pile-backed repository.
-fn find_branch(repo: &mut Repository<Pile<Blake3>>, name: &str) -> Option<Id> {
-    let reader = repo.storage_mut().reader().ok()?;
-    for item in repo.storage_mut().branches().ok()? {
-        let bid = item.ok()?;
-        let head = repo.storage_mut().head(bid).ok()??;
-        let meta: TribleSet = reader.get(head).ok()?;
-        let branch_name = find!(
-            (h: TextHandle),
-            pattern!(&meta, [{ metadata::name: ?h }])
-        )
-        .into_iter()
-        .next()
-        .and_then(|(h,)| reader.get::<View<str>, LongString>(h).ok())
-        .map(|v: View<str>| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        });
-        if branch_name.as_deref() == Some(name) {
-            return Some(bid);
-        }
-    }
-    None
 }
 
 // ── GPU force-directed layout kernel ──────────────────────────────────
@@ -1085,6 +1051,9 @@ struct OpenPage {
 pub struct WikiViewer {
     pile_path: PathBuf,
     search_query: String,
+    /// Optional shared pile supplied by a parent widget. `None` = we
+    /// open our own pile from `pile_path` on first render.
+    shared_pile: Option<SharedPile>,
     // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's
     // `NotebookCtx::state` requires that for cross-thread state storage.
     // `WikiLive` holds a `Workspace<Pile<Blake3>>` which uses `Cell`
@@ -1105,6 +1074,22 @@ impl WikiViewer {
         Self {
             pile_path: pile_path.into(),
             search_query: String::new(),
+            shared_pile: None,
+            live: None,
+            graph: None,
+            open_pages: Vec::new(),
+            error: None,
+            auto_loaded: false,
+        }
+    }
+
+    /// Build a viewer that shares a pile with sibling widgets (e.g.
+    /// inside a [`PileInspector`](crate::widgets::PileInspector)).
+    pub fn with_shared(pile: SharedPile) -> Self {
+        Self {
+            pile_path: pile.path(),
+            search_query: String::new(),
+            shared_pile: Some(pile),
             live: None,
             graph: None,
             open_pages: Vec::new(),
@@ -1122,6 +1107,19 @@ impl WikiViewer {
             return;
         }
         self.pile_path = path;
+        self.shared_pile = None;
+        self.live = None;
+        self.graph = None;
+        self.open_pages.clear();
+        self.error = None;
+        self.auto_loaded = false;
+    }
+
+    /// Replace the shared pile handle (e.g. when the parent
+    /// [`PileInspector`](crate::widgets::PileInspector) reopens).
+    pub fn set_shared_pile(&mut self, pile: SharedPile) {
+        self.pile_path = pile.path();
+        self.shared_pile = Some(pile);
         self.live = None;
         self.graph = None;
         self.open_pages.clear();
@@ -1136,7 +1134,20 @@ impl WikiViewer {
         self.graph = None;
         self.open_pages.clear();
         self.error = None;
-        match WikiLive::open(&self.pile_path) {
+        if self.shared_pile.is_none() {
+            match SharedPile::open(&self.pile_path) {
+                Ok(p) => self.shared_pile = Some(p),
+                Err(e) => {
+                    self.live = None;
+                    self.error = Some(e);
+                    return;
+                }
+            }
+        }
+        let Some(pile) = self.shared_pile.clone() else {
+            return;
+        };
+        match WikiLive::open(pile) {
             Ok(live) => self.live = Some(Mutex::new(live)),
             Err(e) => {
                 self.live = None;

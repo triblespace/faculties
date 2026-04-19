@@ -26,7 +26,7 @@
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use parking_lot::Mutex;
 use GORBIE::prelude::CardCtx;
@@ -34,7 +34,7 @@ use GORBIE::themes::colorhash;
 use triblespace::core::id::{ufoid, ExclusiveId, Id};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BranchStore, Repository, Workspace};
+use triblespace::core::repo::Workspace;
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{TryToValue, Value};
@@ -47,6 +47,7 @@ use crate::schemas::compass::{
     board as compass, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
     KIND_STATUS_ID,
 };
+use crate::widgets::live::SharedPile;
 
 /// Default branch name the compass faculty writes to.
 pub const COMPASS_BRANCH_NAME: &str = "compass";
@@ -174,36 +175,19 @@ struct NoteRow {
 
 // ── Live compass connection (read + write) ───────────────────────────
 
-/// Owns the open pile, repository handle, and the active workspace for
-/// the compass branch. Queries run against the cached `space`; writes
-/// build a change tribleset, call `ws.commit(..)`, and push.
+/// Holds a shared pile handle plus the active workspace for the compass
+/// branch. Queries run against the cached `space`; writes build a change
+/// tribleset, call `ws.commit(..)`, and push via the shared pile.
 struct CompassLive {
     branch_name: String,
-    branch_id: Id,
     space: TribleSet,
-    repo: Repository<Pile<Blake3>>,
+    pile: SharedPile,
     ws: Workspace<Pile<Blake3>>,
 }
 
 impl CompassLive {
-    fn open(path: &Path, branch_name: &str) -> Result<Self, String> {
-        let mut pile = Pile::<Blake3>::open(path).map_err(|e| format!("open pile: {e:?}"))?;
-        if let Err(err) = pile.restore() {
-            let _ = pile.close();
-            return Err(format!("restore: {err:?}"));
-        }
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core06::OsRng);
-        let mut repo = Repository::new(pile, signing_key, TribleSet::new())
-            .map_err(|e| format!("repo: {e:?}"))?;
-        repo.storage_mut()
-            .refresh()
-            .map_err(|e| format!("refresh: {e:?}"))?;
-
-        let branch_id = find_branch(&mut repo, branch_name)
-            .ok_or_else(|| format!("no '{branch_name}' branch found"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| format!("pull {branch_name}: {e:?}"))?;
+    fn open(pile: SharedPile, branch_name: &str) -> Result<Self, String> {
+        let mut ws = pile.pull_branch(branch_name)?;
         let space = ws
             .checkout(..)
             .map_err(|e| format!("checkout {branch_name}: {e:?}"))?
@@ -211,9 +195,8 @@ impl CompassLive {
 
         Ok(CompassLive {
             branch_name: branch_name.to_string(),
-            branch_id,
             space,
-            repo,
+            pile,
             ws,
         })
     }
@@ -222,14 +205,7 @@ impl CompassLive {
     /// re-pull the branch (cheap: just re-fetches head metadata and
     /// rebuilds the workspace) and re-checkout to pick up the new commit.
     fn refresh(&mut self) -> Result<(), String> {
-        self.repo
-            .storage_mut()
-            .refresh()
-            .map_err(|e| format!("refresh: {e:?}"))?;
-        let mut ws = self
-            .repo
-            .pull(self.branch_id)
-            .map_err(|e| format!("pull {}: {e:?}", self.branch_name))?;
+        let mut ws = self.pile.pull_branch(&self.branch_name)?;
         let space = ws
             .checkout(..)
             .map_err(|e| format!("checkout {}: {e:?}", self.branch_name))?
@@ -243,7 +219,7 @@ impl CompassLive {
     /// error string — the caller is expected to surface it as a toast.
     fn commit_and_push(&mut self, change: TribleSet, message: &str) -> Result<(), String> {
         self.ws.commit(change, message);
-        match self.repo.try_push(&mut self.ws) {
+        match self.pile.try_push(&mut self.ws) {
             Ok(None) => self.refresh(),
             Ok(Some(_conflict_ws)) => {
                 // CAS conflict. Drop our local workspace state by re-pulling,
@@ -486,31 +462,6 @@ impl CompassLive {
     }
 }
 
-/// Find a branch by name in a pile-backed repository.
-fn find_branch(repo: &mut Repository<Pile<Blake3>>, name: &str) -> Option<Id> {
-    let reader = repo.storage_mut().reader().ok()?;
-    for item in repo.storage_mut().branches().ok()? {
-        let bid = item.ok()?;
-        let head = repo.storage_mut().head(bid).ok()??;
-        let meta: TribleSet = reader.get(head).ok()?;
-        let branch_name = find!(
-            (h: TextHandle),
-            pattern!(&meta, [{ metadata::name: ?h }])
-        )
-        .into_iter()
-        .next()
-        .and_then(|(h,)| reader.get::<View<str>, LongString>(h).ok())
-        .map(|v: View<str>| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        });
-        if branch_name.as_deref() == Some(name) {
-            return Some(bid);
-        }
-    }
-    None
-}
-
 // ── Tree layout ──────────────────────────────────────────────────────
 
 /// Depth-first walk through parent/child forest, yielding (row, depth).
@@ -621,6 +572,11 @@ struct ComposeForm {
 pub struct CompassBoard {
     pile_path: PathBuf,
     branch_name: String,
+    /// Optional shared pile supplied by a parent widget (e.g. the
+    /// [`PileInspector`](crate::widgets::PileInspector)). When `None`,
+    /// the widget opens its own `SharedPile` from `pile_path` on first
+    /// render.
+    shared_pile: Option<SharedPile>,
     // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's state
     // storage requires that across threads, and `Workspace<Pile<Blake3>>`
     // uses interior-mutability types (Cell/RefCell) that aren't Sync.
@@ -643,9 +599,31 @@ impl CompassBoard {
     /// Build a board pointing at a pile on disk and a named branch. The
     /// pile is not opened until the first [`render`](Self::render) call.
     pub fn new(pile_path: impl Into<PathBuf>, branch_name: impl Into<String>) -> Self {
+        let mut s = Self::with_shared_deferred(branch_name);
+        s.pile_path = pile_path.into();
+        s
+    }
+
+    /// Build a board pointing at the conventional `compass` branch.
+    pub fn new_default(pile_path: impl Into<PathBuf>) -> Self {
+        Self::new(pile_path, COMPASS_BRANCH_NAME)
+    }
+
+    /// Build a board that shares a pile with sibling widgets (e.g. inside
+    /// a [`PileInspector`](crate::widgets::PileInspector)). No pile is
+    /// opened here — the widget pulls its branch on first render.
+    pub fn with_shared(pile: SharedPile, branch_name: impl Into<String>) -> Self {
+        let mut s = Self::with_shared_deferred(branch_name);
+        s.pile_path = pile.path();
+        s.shared_pile = Some(pile);
+        s
+    }
+
+    fn with_shared_deferred(branch_name: impl Into<String>) -> Self {
         Self {
-            pile_path: pile_path.into(),
+            pile_path: PathBuf::new(),
             branch_name: branch_name.into(),
+            shared_pile: None,
             live: None,
             error: None,
             toast: None,
@@ -656,11 +634,6 @@ impl CompassBoard {
             status_menu: None,
             column_height: 500.0,
         }
-    }
-
-    /// Build a board pointing at the conventional `compass` branch.
-    pub fn new_default(pile_path: impl Into<PathBuf>) -> Self {
-        Self::new(pile_path, COMPASS_BRANCH_NAME)
     }
 
     /// Override the per-column scroll-area height (pixels). Default 500.
@@ -676,6 +649,24 @@ impl CompassBoard {
             return;
         }
         self.pile_path = path;
+        self.shared_pile = None;
+        self.live = None;
+        self.error = None;
+        self.expanded_goal = None;
+        self.collapsed.clear();
+        self.note_inputs.clear();
+        self.status_menu = None;
+        self.compose.clear();
+        self.toast = None;
+    }
+
+    /// Replace the shared pile handle (e.g. when the parent
+    /// [`PileInspector`](crate::widgets::PileInspector) reopens). Drops
+    /// any cached `CompassLive`; the next render will re-pull against
+    /// the new pile.
+    pub fn set_shared_pile(&mut self, pile: SharedPile) {
+        self.pile_path = pile.path();
+        self.shared_pile = Some(pile);
         self.live = None;
         self.error = None;
         self.expanded_goal = None;
@@ -690,9 +681,17 @@ impl CompassBoard {
     pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
         // Lazy pile open on first render.
         if self.live.is_none() && self.error.is_none() {
-            match CompassLive::open(&self.pile_path, &self.branch_name) {
-                Ok(live) => self.live = Some(Mutex::new(live)),
-                Err(e) => self.error = Some(e),
+            if self.shared_pile.is_none() {
+                match SharedPile::open(&self.pile_path) {
+                    Ok(p) => self.shared_pile = Some(p),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            if let Some(pile) = self.shared_pile.clone() {
+                match CompassLive::open(pile, &self.branch_name) {
+                    Ok(live) => self.live = Some(Mutex::new(live)),
+                    Err(e) => self.error = Some(e),
+                }
             }
         }
 

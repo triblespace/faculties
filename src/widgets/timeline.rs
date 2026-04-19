@@ -42,7 +42,7 @@
 //! that gives ~6-10 labels per viewport.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use hifitime::{Duration as HifiDuration, Epoch};
 use parking_lot::Mutex;
@@ -52,8 +52,7 @@ use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{
-    ancestors, BlobStore, BlobStoreGet, BranchStore, CommitSelector, CommitSet, Repository,
-    Workspace,
+    ancestors, CommitSelector, CommitSet, Workspace,
 };
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
@@ -67,6 +66,7 @@ use crate::schemas::compass::{
 };
 use crate::schemas::local_messages::{local as local_attrs, KIND_MESSAGE_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
+use crate::widgets::live::SharedPile;
 
 /// Handle to a long-string blob (branch names, titles, bodies, notes).
 type TextHandle = Value<Handle<Blake3, LongString>>;
@@ -279,27 +279,13 @@ struct SourceLive {
 }
 
 impl MultiLive {
-    fn open(path: &Path, sources: &[TimelineSource]) -> Result<Self, String> {
-        let mut pile = Pile::<Blake3>::open(path).map_err(|e| format!("open pile: {e:?}"))?;
-        if let Err(err) = pile.restore() {
-            let _ = pile.close();
-            return Err(format!("restore: {err:?}"));
-        }
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core06::OsRng);
-        let mut repo = Repository::new(pile, signing_key, TribleSet::new())
-            .map_err(|e| format!("repo: {e:?}"))?;
-        repo.storage_mut()
-            .refresh()
-            .map_err(|e| format!("refresh: {e:?}"))?;
-
+    fn open(pile: SharedPile, sources: &[TimelineSource]) -> Result<Self, String> {
         let mut live = MultiLive {
             sources: Vec::with_capacity(sources.len()),
             events: Vec::new(),
         };
         for src in sources {
-            let bid = find_branch(&mut repo, src.branch())
-                .ok_or_else(|| format!("no '{}' branch found", src.branch()))?;
-            let mut ws = repo.pull(bid).map_err(|e| format!("pull: {e:?}"))?;
+            let mut ws = pile.pull_branch(src.branch())?;
             // For commit-only rendering we do NOT need a checked-out
             // fact space; skip the work for that case.
             let space = match src {
@@ -565,31 +551,6 @@ fn collect_wiki_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
     }
 }
 
-/// Find a branch by name in a pile-backed repository.
-fn find_branch(repo: &mut Repository<Pile<Blake3>>, name: &str) -> Option<Id> {
-    let reader = repo.storage_mut().reader().ok()?;
-    for item in repo.storage_mut().branches().ok()? {
-        let bid = item.ok()?;
-        let head = repo.storage_mut().head(bid).ok()??;
-        let meta: TribleSet = reader.get(head).ok()?;
-        let branch_name = find!(
-            (h: TextHandle),
-            pattern!(&meta, [{ metadata::name: ?h }])
-        )
-        .into_iter()
-        .next()
-        .and_then(|(h,)| reader.get::<View<str>, LongString>(h).ok())
-        .map(|v: View<str>| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        });
-        if branch_name.as_deref() == Some(name) {
-            return Some(bid);
-        }
-    }
-    None
-}
-
 // ── Widget ───────────────────────────────────────────────────────────
 
 /// GORBIE-embeddable pan/zoom timeline for one or more pile branches.
@@ -610,6 +571,9 @@ pub struct BranchTimeline {
     /// a single `TimelineSource::Commits` entry with a default label.
     sources: Vec<TimelineSource>,
     viewport_height: f32,
+    /// Optional shared pile supplied by a parent widget. `None` = we
+    /// open our own pile from `pile_path` on first render.
+    shared_pile: Option<SharedPile>,
     // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's state
     // storage requires that across threads, and `Workspace<Pile<Blake3>>`
     // uses interior-mutability types (Cell/RefCell) that aren't Sync.
@@ -647,6 +611,7 @@ impl BranchTimeline {
                 color,
             }],
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+            shared_pile: None,
             live: None,
             error: None,
             timeline_start: 0,
@@ -664,6 +629,25 @@ impl BranchTimeline {
             pile_path: pile_path.into(),
             sources,
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+            shared_pile: None,
+            live: None,
+            error: None,
+            timeline_start: 0,
+            timeline_scale: TIMELINE_DEFAULT_SCALE,
+            first_render: true,
+            drag_last_y: None,
+            selected_event: None,
+        }
+    }
+
+    /// Multi-branch timeline that shares a pile with sibling widgets
+    /// (e.g. inside a [`PileInspector`](crate::widgets::PileInspector)).
+    pub fn multi_with_shared(pile: SharedPile, sources: Vec<TimelineSource>) -> Self {
+        Self {
+            pile_path: pile.path(),
+            sources,
+            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
+            shared_pile: Some(pile),
             live: None,
             error: None,
             timeline_start: 0,
@@ -687,6 +671,19 @@ impl BranchTimeline {
             return;
         }
         self.pile_path = path;
+        self.shared_pile = None;
+        self.live = None;
+        self.error = None;
+        self.first_render = true;
+        self.drag_last_y = None;
+        self.selected_event = None;
+    }
+
+    /// Replace the shared pile handle (e.g. when the parent
+    /// [`PileInspector`](crate::widgets::PileInspector) reopens).
+    pub fn set_shared_pile(&mut self, pile: SharedPile) {
+        self.pile_path = pile.path();
+        self.shared_pile = Some(pile);
         self.live = None;
         self.error = None;
         self.first_render = true;
@@ -698,9 +695,17 @@ impl BranchTimeline {
     pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
         // Lazy pile open on first render.
         if self.live.is_none() && self.error.is_none() {
-            match MultiLive::open(&self.pile_path, &self.sources) {
-                Ok(live) => self.live = Some(Mutex::new(live)),
-                Err(e) => self.error = Some(e),
+            if self.shared_pile.is_none() {
+                match SharedPile::open(&self.pile_path) {
+                    Ok(p) => self.shared_pile = Some(p),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            if let Some(pile) = self.shared_pile.clone() {
+                match MultiLive::open(pile, &self.sources) {
+                    Ok(live) => self.live = Some(Mutex::new(live)),
+                    Err(e) => self.error = Some(e),
+                }
             }
         }
 

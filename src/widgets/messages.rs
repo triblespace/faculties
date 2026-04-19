@@ -28,7 +28,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use parking_lot::Mutex;
 use GORBIE::prelude::CardCtx;
@@ -36,7 +36,7 @@ use GORBIE::themes::colorhash;
 use triblespace::core::id::{ufoid, ExclusiveId, Id};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BranchStore, Repository, Workspace};
+use triblespace::core::repo::Workspace;
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{TryToValue, Value};
@@ -47,6 +47,7 @@ use triblespace::prelude::View;
 
 use crate::schemas::local_messages::{local, KIND_MESSAGE_ID, KIND_READ_ID};
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
+use crate::widgets::live::SharedPile;
 
 /// Default branch name the local-messages faculty writes to.
 pub const LOCAL_MESSAGES_BRANCH_NAME: &str = "local-messages";
@@ -199,44 +200,26 @@ impl Person {
 
 // ── Live messages connection (read + write) ──────────────────────────
 
-/// Owns the open pile, repository handle, and active workspaces for the
+/// Holds the shared pile handle and active workspaces for the
 /// local-messages + (optional) relations branches. Queries run against
 /// the cached `space`s; writes build a change tribleset, call
 /// `ws.commit(..)`, push via `try_push`, then `refresh`.
 struct MessagesLive {
     branch_name: String,
-    branch_id: Id,
     space: TribleSet,
     ws: Workspace<Pile<Blake3>>,
-    repo: Repository<Pile<Blake3>>,
+    pile: SharedPile,
 
-    /// Cached people lookup from the relations branch. `None` if the
-    /// branch doesn't exist on this pile.
-    relations_branch_id: Option<Id>,
+    /// `true` if the relations branch exists on this pile.
+    has_relations: bool,
     relations_space: TribleSet,
     relations_ws: Option<Workspace<Pile<Blake3>>>,
     people: HashMap<Id, Person>,
 }
 
 impl MessagesLive {
-    fn open(path: &Path, branch_name: &str) -> Result<Self, String> {
-        let mut pile = Pile::<Blake3>::open(path).map_err(|e| format!("open pile: {e:?}"))?;
-        if let Err(err) = pile.restore() {
-            let _ = pile.close();
-            return Err(format!("restore: {err:?}"));
-        }
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core06::OsRng);
-        let mut repo = Repository::new(pile, signing_key, TribleSet::new())
-            .map_err(|e| format!("repo: {e:?}"))?;
-        repo.storage_mut()
-            .refresh()
-            .map_err(|e| format!("refresh: {e:?}"))?;
-
-        let branch_id = find_branch(&mut repo, branch_name)
-            .ok_or_else(|| format!("no '{branch_name}' branch found"))?;
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| format!("pull {branch_name}: {e:?}"))?;
+    fn open(pile: SharedPile, branch_name: &str) -> Result<Self, String> {
+        let mut ws = pile.pull_branch(branch_name)?;
         let space = ws
             .checkout(..)
             .map_err(|e| format!("checkout {branch_name}: {e:?}"))?
@@ -244,31 +227,31 @@ impl MessagesLive {
 
         // Relations branch is best-effort: absence just means we show
         // hex prefixes instead of friendly names.
-        let (relations_branch_id, relations_space, relations_ws) =
-            match find_branch(&mut repo, RELATIONS_BRANCH_NAME) {
-                Some(rid) => match repo.pull(rid) {
-                    Ok(mut rws) => match rws.checkout(..) {
-                        Ok(co) => (Some(rid), co.into_facts(), Some(rws)),
-                        Err(e) => {
-                            eprintln!("[messages] relations checkout: {e:?}");
-                            (None, TribleSet::new(), None)
-                        }
-                    },
+        let (has_relations, relations_space, relations_ws) =
+            match pile.pull_branch(RELATIONS_BRANCH_NAME) {
+                Ok(mut rws) => match rws.checkout(..) {
+                    Ok(co) => (true, co.into_facts(), Some(rws)),
                     Err(e) => {
-                        eprintln!("[messages] relations pull: {e:?}");
-                        (None, TribleSet::new(), None)
+                        eprintln!("[messages] relations checkout: {e:?}");
+                        (false, TribleSet::new(), None)
                     }
                 },
-                None => (None, TribleSet::new(), None),
+                Err(e) => {
+                    // No relations branch is the common case; only log
+                    // if it's not a plain missing-branch error.
+                    if !e.contains("no 'relations' branch") {
+                        eprintln!("[messages] relations pull: {e}");
+                    }
+                    (false, TribleSet::new(), None)
+                }
             };
 
         let mut live = MessagesLive {
             branch_name: branch_name.to_string(),
-            branch_id,
             space,
             ws,
-            repo,
-            relations_branch_id,
+            pile,
+            has_relations,
             relations_space,
             relations_ws,
             people: HashMap::new(),
@@ -280,15 +263,7 @@ impl MessagesLive {
     /// Re-pull both the local-messages and relations branches and
     /// rebuild the people map. Called after each successful commit.
     fn refresh(&mut self) -> Result<(), String> {
-        self.repo
-            .storage_mut()
-            .refresh()
-            .map_err(|e| format!("refresh: {e:?}"))?;
-
-        let mut ws = self
-            .repo
-            .pull(self.branch_id)
-            .map_err(|e| format!("pull {}: {e:?}", self.branch_name))?;
+        let mut ws = self.pile.pull_branch(&self.branch_name)?;
         let space = ws
             .checkout(..)
             .map_err(|e| format!("checkout {}: {e:?}", self.branch_name))?
@@ -296,8 +271,8 @@ impl MessagesLive {
         self.ws = ws;
         self.space = space;
 
-        if let Some(rid) = self.relations_branch_id {
-            match self.repo.pull(rid) {
+        if self.has_relations {
+            match self.pile.pull_branch(RELATIONS_BRANCH_NAME) {
                 Ok(mut rws) => match rws.checkout(..) {
                     Ok(co) => {
                         self.relations_space = co.into_facts();
@@ -305,7 +280,7 @@ impl MessagesLive {
                     }
                     Err(e) => eprintln!("[messages] relations checkout on refresh: {e:?}"),
                 },
-                Err(e) => eprintln!("[messages] relations pull on refresh: {e:?}"),
+                Err(e) => eprintln!("[messages] relations pull on refresh: {e}"),
             }
         }
         self.rebuild_people();
@@ -316,7 +291,7 @@ impl MessagesLive {
     /// error string so the caller can surface it as a toast.
     fn commit_and_push(&mut self, change: TribleSet, message: &str) -> Result<(), String> {
         self.ws.commit(change, message);
-        match self.repo.try_push(&mut self.ws) {
+        match self.pile.try_push(&mut self.ws) {
             Ok(None) => self.refresh(),
             Ok(Some(_conflict_ws)) => {
                 let _ = self.refresh();
@@ -556,31 +531,6 @@ impl MessagesLive {
     }
 }
 
-/// Find a branch by name in a pile-backed repository.
-fn find_branch(repo: &mut Repository<Pile<Blake3>>, name: &str) -> Option<Id> {
-    let reader = repo.storage_mut().reader().ok()?;
-    for item in repo.storage_mut().branches().ok()? {
-        let bid = item.ok()?;
-        let head = repo.storage_mut().head(bid).ok()??;
-        let meta: TribleSet = reader.get(head).ok()?;
-        let branch_name = find!(
-            (h: TextHandle),
-            pattern!(&meta, [{ metadata::name: ?h }])
-        )
-        .into_iter()
-        .next()
-        .and_then(|(h,)| reader.get::<View<str>, LongString>(h).ok())
-        .map(|v: View<str>| {
-            let s: &str = v.as_ref();
-            s.to_string()
-        });
-        if branch_name.as_deref() == Some(name) {
-            return Some(bid);
-        }
-    }
-    None
-}
-
 // ── Widget ───────────────────────────────────────────────────────────
 
 /// GORBIE-embeddable local-messages panel with compose, relations
@@ -597,6 +547,9 @@ pub struct MessagesPanel {
     /// Preset recipient for composed messages. If `None`, the compose
     /// UI shows a picker populated from the relations branch.
     default_recipient: Option<Id>,
+    /// Optional shared pile supplied by a parent widget. `None` = we
+    /// open our own pile from `pile_path` on first render.
+    shared_pile: Option<SharedPile>,
     // Wrapped in a Mutex so the widget is `Send + Sync`. GORBIE's state
     // storage requires that across threads, and `Workspace<Pile<Blake3>>`
     // uses interior-mutability types (Cell/RefCell) that aren't Sync.
@@ -633,24 +586,9 @@ impl MessagesPanel {
     /// Read-only panel (anonymous — shows names but no compose UI,
     /// no read-receipts).
     pub fn new(pile_path: impl Into<PathBuf>, branch_name: impl Into<String>) -> Self {
-        Self {
-            pile_path: pile_path.into(),
-            branch_name: branch_name.into(),
-            me: None,
-            default_recipient: None,
-            live: None,
-            error: None,
-            toast: None,
-            viewport_height: 500.0,
-            compose_draft: String::new(),
-            compose_recipient: None,
-            last_message_count: 0,
-            scroll_to_bottom: false,
-            user_scrolled_up: false,
-            pending_new: 0,
-            read_sent: HashSet::new(),
-            first_render: true,
-        }
+        let mut s = Self::with_shared_deferred(branch_name);
+        s.pile_path = pile_path.into();
+        s
     }
 
     /// Interactive panel — composer is active, and inbound messages
@@ -664,6 +602,37 @@ impl MessagesPanel {
         let mut s = Self::new(pile_path, branch_name);
         s.me = Some(me);
         s
+    }
+
+    /// Build a read-only panel that shares a pile with sibling widgets
+    /// (e.g. inside a [`PileInspector`](crate::widgets::PileInspector)).
+    pub fn with_shared(pile: SharedPile, branch_name: impl Into<String>) -> Self {
+        let mut s = Self::with_shared_deferred(branch_name);
+        s.pile_path = pile.path();
+        s.shared_pile = Some(pile);
+        s
+    }
+
+    fn with_shared_deferred(branch_name: impl Into<String>) -> Self {
+        Self {
+            pile_path: PathBuf::new(),
+            branch_name: branch_name.into(),
+            me: None,
+            default_recipient: None,
+            shared_pile: None,
+            live: None,
+            error: None,
+            toast: None,
+            viewport_height: 500.0,
+            compose_draft: String::new(),
+            compose_recipient: None,
+            last_message_count: 0,
+            scroll_to_bottom: false,
+            user_scrolled_up: false,
+            pending_new: 0,
+            read_sent: HashSet::new(),
+            first_render: true,
+        }
     }
 
     /// Address the next composed message to a specific recipient. If
@@ -686,6 +655,25 @@ impl MessagesPanel {
             return;
         }
         self.pile_path = path;
+        self.shared_pile = None;
+        self.live = None;
+        self.error = None;
+        self.toast = None;
+        self.compose_draft.clear();
+        self.compose_recipient = None;
+        self.last_message_count = 0;
+        self.scroll_to_bottom = false;
+        self.user_scrolled_up = false;
+        self.pending_new = 0;
+        self.read_sent.clear();
+        self.first_render = true;
+    }
+
+    /// Replace the shared pile handle (e.g. when the parent
+    /// [`PileInspector`](crate::widgets::PileInspector) reopens).
+    pub fn set_shared_pile(&mut self, pile: SharedPile) {
+        self.pile_path = pile.path();
+        self.shared_pile = Some(pile);
         self.live = None;
         self.error = None;
         self.toast = None;
@@ -703,9 +691,17 @@ impl MessagesPanel {
     pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
         // Lazy pile open on first render.
         if self.live.is_none() && self.error.is_none() {
-            match MessagesLive::open(&self.pile_path, &self.branch_name) {
-                Ok(live) => self.live = Some(Mutex::new(live)),
-                Err(e) => self.error = Some(e),
+            if self.shared_pile.is_none() {
+                match SharedPile::open(&self.pile_path) {
+                    Ok(p) => self.shared_pile = Some(p),
+                    Err(e) => self.error = Some(e),
+                }
+            }
+            if let Some(pile) = self.shared_pile.clone() {
+                match MessagesLive::open(pile, &self.branch_name) {
+                    Ok(live) => self.live = Some(Mutex::new(live)),
+                    Err(e) => self.error = Some(e),
+                }
             }
         }
 
