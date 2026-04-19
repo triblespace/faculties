@@ -777,7 +777,12 @@ impl CompassBoard {
         let toast = &mut self.toast;
 
         ctx.section("Compass", |ctx| {
-            ctx.label(format!("{total_goals} goals"));
+            ctx.label(
+                egui::RichText::new(format!("{total_goals} GOALS"))
+                    .monospace()
+                    .small()
+                    .color(color_muted()),
+            );
 
             if let Some(msg) = toast.as_ref() {
                 let color = ctx.ctx().global_style().visuals.error_fg_color;
@@ -793,35 +798,52 @@ impl CompassBoard {
                 ctx.label("No goals yet. Click + Add in a column below to start.");
             }
 
-            // Lay columns out on GORBIE's 12-col grid. For the default
-            // four statuses this is 4 × 3 cells; five or six statuses fall
-            // back to 2 cells each; anything denser wraps automatically.
-            let col_count = column_data.len().max(1);
-            let span = (12u32 / col_count as u32).max(1);
+            // Fixed-width kanban columns in a horizontal scroll area.
+            // The 12-col grid breaks down for >6 statuses (a real pile
+            // accumulates custom statuses: "answered", "dissolved", etc.),
+            // so we escape to a horizontal scroller with each column at
+            // a readable fixed width.
+            const COLUMN_WIDTH: f32 = 240.0;
+            const COLUMN_GAP: f32 = 8.0;
 
             ctx.grid(|g| {
-                for (status, rows) in &column_data {
-                    let form = compose.entry(status.clone()).or_default();
-                    g.place(span, |ctx| {
-                        let ui = ctx.ui_mut();
-                        render_column(
-                            ui,
-                            status,
-                            rows,
-                            column_height,
-                            expanded_goal,
-                            expanded_notes.as_ref(),
-                            collapsed,
-                            note_inputs,
-                            status_menu,
-                            form,
-                            &title_by_id,
-                            &mut add_intent,
-                            &mut move_intent,
-                            &mut note_intent,
-                        );
-                    });
-                }
+                g.full(|ctx| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt(("compass_columns", "root"))
+                        .auto_shrink([false, true])
+                        // Drag-scroll would collide with the click-sensing
+                        // goal cards inside each column (egui hit_test bug).
+                        .scroll_source(egui::scroll_area::ScrollSource {
+                            scroll_bar: true,
+                            drag: false,
+                            mouse_wheel: true,
+                        })
+                        .show(ctx.ui_mut(), |ui| {
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = COLUMN_GAP;
+                                for (status, rows) in &column_data {
+                                    let form = compose.entry(status.clone()).or_default();
+                                    render_column(
+                                        ui,
+                                        status,
+                                        rows,
+                                        COLUMN_WIDTH,
+                                        column_height,
+                                        expanded_goal,
+                                        expanded_notes.as_ref(),
+                                        collapsed,
+                                        note_inputs,
+                                        status_menu,
+                                        form,
+                                        &title_by_id,
+                                        &mut add_intent,
+                                        &mut move_intent,
+                                        &mut note_intent,
+                                    );
+                                }
+                            });
+                        });
+                });
             });
         });
 
@@ -898,6 +920,7 @@ fn render_column(
     ui: &mut egui::Ui,
     status: &str,
     rows: &[(GoalRow, usize)],
+    width: f32,
     height: f32,
     expanded_goal: &mut Option<Id>,
     expanded_notes: Option<&(Id, Vec<NoteRow>)>,
@@ -916,9 +939,10 @@ fn render_column(
         .corner_radius(egui::CornerRadius::same(6))
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
-            // Fill the grid cell we were placed in; force vertical layout
-            // (Frame inherits its parent's direction by default).
-            ui.set_width(ui.available_width());
+            // Fixed column width; force vertical layout (Frame inherits
+            // its parent's direction by default, and the parent here is
+            // `horizontal_top` so nested rows would otherwise stack L→R).
+            ui.set_width(width);
             ui.set_min_height(height);
             ui.vertical(|ui| {
 
