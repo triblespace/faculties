@@ -873,7 +873,10 @@ impl WikiGraph {
         self.polylines = Some(polylines);
     }
 
-    fn show(&self, ui: &mut egui::Ui) -> Option<Id> {
+    /// Paint the force-directed graph. Returns both the clicked node
+    /// (if any) and the viewport rect so callers can overlay
+    /// additional widgets (search bar, etc.) inside it.
+    fn show(&self, ui: &mut egui::Ui) -> (Option<Id>, egui::Rect) {
         // Bounded viewport height. Inside the notebook's auto_shrink
         // ScrollArea `ui.available_height()` is f32::INFINITY, and
         // allocating a vec2(x, INF) rect here doesn't just swallow
@@ -1101,7 +1104,7 @@ impl WikiGraph {
             painter.galley(meta_pos, meta_galley, meta_color);
         }
 
-        clicked
+        (clicked, rect)
     }
 }
 
@@ -1232,111 +1235,9 @@ impl WikiViewer {
             None => return,
         };
 
-        // ── search bar ───────────────────────────────────────────────
-        // Search bar with a small label prefix and a hint inside the
-        // text field. Also submits on Enter for keyboard-driven use.
+        // Search-bar UI is overlaid inside the graph viewport —
+        // rendered after graph.show below using the viewport rect.
         let mut submit_query: Option<String> = None;
-        ctx.grid(|g| {
-            g.place(1, |ctx| {
-                ctx.label(
-                    egui::RichText::new("FIND")
-                        .monospace()
-                        .strong()
-                        .small(),
-                );
-            });
-            g.place(9, |ctx| {
-                let ui = ctx.ui_mut();
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text("hex prefix or title substring…")
-                        .desired_width(f32::INFINITY),
-                );
-                // Clear stale "no match" as soon as the user edits.
-                if resp.changed() {
-                    self.search_miss = None;
-                }
-                if resp.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && !self.search_query.trim().is_empty()
-                {
-                    submit_query = Some(self.search_query.trim().to_string());
-                }
-            });
-            g.place(2, |ctx| {
-                let ui = ctx.ui_mut();
-                let go_enabled = !self.search_query.trim().is_empty();
-                if ui
-                    .add_enabled(
-                        go_enabled,
-                        egui::Button::new(
-                            egui::RichText::new("GO")
-                                .small()
-                                .monospace()
-                                .strong(),
-                        )
-                        .min_size(egui::vec2(52.0, 22.0)),
-                    )
-                    .on_hover_text("Open fragment by hex prefix or title substring (Enter)")
-                    .clicked()
-                {
-                    submit_query = Some(self.search_query.trim().to_string());
-                }
-            });
-        });
-
-        if let Some(q) = submit_query {
-            let is_hex = !q.is_empty() && q.chars().all(|c| c.is_ascii_hexdigit());
-            let found = if is_hex {
-                live.resolve_prefix(&q)
-            } else {
-                let q_lower = q.to_lowercase();
-                let frags = live.fragments_sorted(wiki_ws);
-                frags
-                    .iter()
-                    .find(|(_, vid)| live.title(wiki_ws, *vid).to_lowercase().contains(&q_lower))
-                    .map(|(frag_id, _)| *frag_id)
-            };
-            if let Some(frag_id) = found {
-                if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
-                    self.open_pages.push(OpenPage {
-                        frag_id,
-                        pinned_version: None,
-                    });
-                }
-                self.search_query.clear();
-                self.search_miss = None;
-            } else {
-                self.search_miss = Some(q);
-            }
-        }
-
-        // Search miss banner — muted warn style, auto-dismisses when
-        // the user edits the query or makes a successful search.
-        if let Some(miss) = self.search_miss.clone() {
-            let ui = ctx.ui_mut();
-            let warn_fg = egui::Color32::from_rgb(0xf7, 0xba, 0x0b);
-            egui::Frame::NONE
-                .stroke(egui::Stroke::new(1.0, warn_fg))
-                .corner_radius(egui::CornerRadius::same(3))
-                .inner_margin(egui::Margin::symmetric(8, 3))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(
-                            egui::RichText::new("\u{26a0}").small().color(warn_fg),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "No match for \"{miss}\""
-                            ))
-                            .monospace()
-                            .small()
-                            .color(warn_fg),
-                        );
-                    });
-                });
-        }
 
         // ── force-directed graph ─────────────────────────────────────
         if self.graph.is_none() {
@@ -1388,7 +1289,7 @@ impl WikiViewer {
             // section width without the grid cell's edge padding —
             // visually the force-directed view becomes edge-to-edge
             // like the timeline viewport.
-            let clicked_node: Option<Id> = graph.show(ctx.ui_mut());
+            let (clicked_node, graph_rect) = graph.show(ctx.ui_mut());
             if let Some(frag_id) = clicked_node {
                 if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
                     self.open_pages.push(OpenPage {
@@ -1398,6 +1299,155 @@ impl WikiViewer {
                 }
             }
             ctx.ctx().request_repaint();
+
+            // ── Search-bar overlay inside the top-left of the graph.
+            // Uses a scope_builder with an explicit max_rect so the
+            // interactive widgets land on top of the painted graph
+            // (later-added widgets win egui's hit-test). Field takes
+            // whatever width is left after the FIND label and GO
+            // button; fixed height matches the button.
+            {
+                let bar_top = graph_rect.top() + 6.0;
+                let bar_left = graph_rect.left() + 8.0;
+                let bar_width = (graph_rect.width() * 0.5).clamp(260.0, 480.0);
+                let bar_height = 26.0;
+                let bar_rect = egui::Rect::from_min_size(
+                    egui::pos2(bar_left, bar_top),
+                    egui::vec2(bar_width, bar_height),
+                );
+                let ui = ctx.ui_mut();
+                ui.scope_builder(
+                    egui::UiBuilder::new().max_rect(bar_rect),
+                    |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                egui::RichText::new("FIND")
+                                    .monospace()
+                                    .strong()
+                                    .small(),
+                            );
+                            let go_enabled =
+                                !self.search_query.trim().is_empty();
+                            // Place GO on the right; field fills what's
+                            // left.
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            go_enabled,
+                                            egui::Button::new(
+                                                egui::RichText::new("GO")
+                                                    .small()
+                                                    .monospace()
+                                                    .strong(),
+                                            )
+                                            .min_size(egui::vec2(44.0, 22.0)),
+                                        )
+                                        .on_hover_text(
+                                            "Open fragment by hex prefix or title (Enter)",
+                                        )
+                                        .clicked()
+                                    {
+                                        submit_query = Some(
+                                            self.search_query.trim().to_string(),
+                                        );
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(
+                                            egui::Align::Center,
+                                        ),
+                                        |ui| {
+                                            let resp = ui.add(
+                                                GORBIE::widgets::TextField::singleline(
+                                                    &mut self.search_query,
+                                                ),
+                                            );
+                                            if resp.changed() {
+                                                self.search_miss = None;
+                                            }
+                                            if resp.lost_focus()
+                                                && ui.input(|i| {
+                                                    i.key_pressed(egui::Key::Enter)
+                                                })
+                                                && !self
+                                                    .search_query
+                                                    .trim()
+                                                    .is_empty()
+                                            {
+                                                submit_query = Some(
+                                                    self.search_query
+                                                        .trim()
+                                                        .to_string(),
+                                                );
+                                            }
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                    },
+                );
+            }
+        }
+
+        // Search-submit handling (the overlay above populates
+        // `submit_query` on GO click or Enter). Resolves hex prefixes
+        // against the wiki index or falls back to title-substring
+        // search; opens a floating page on match, shows a
+        // "No match" banner under the viewport on miss.
+        if let Some(q) = submit_query {
+            let is_hex = !q.is_empty() && q.chars().all(|c| c.is_ascii_hexdigit());
+            let found = if is_hex {
+                live.resolve_prefix(&q)
+            } else {
+                let q_lower = q.to_lowercase();
+                let frags = live.fragments_sorted(wiki_ws);
+                frags
+                    .iter()
+                    .find(|(_, vid)| live.title(wiki_ws, *vid).to_lowercase().contains(&q_lower))
+                    .map(|(frag_id, _)| *frag_id)
+            };
+            if let Some(frag_id) = found {
+                if !self.open_pages.iter().any(|p| p.frag_id == frag_id) {
+                    self.open_pages.push(OpenPage {
+                        frag_id,
+                        pinned_version: None,
+                    });
+                }
+                self.search_query.clear();
+                self.search_miss = None;
+            } else {
+                self.search_miss = Some(q);
+            }
+        }
+
+        // Search miss banner — muted warn style, auto-dismisses on
+        // the user's next edit or successful search.
+        if let Some(miss) = self.search_miss.clone() {
+            let ui = ctx.ui_mut();
+            let warn_fg = egui::Color32::from_rgb(0xf7, 0xba, 0x0b);
+            egui::Frame::NONE
+                .stroke(egui::Stroke::new(1.0, warn_fg))
+                .corner_radius(egui::CornerRadius::same(3))
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            egui::RichText::new("\u{26a0}").small().color(warn_fg),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "No match for \"{miss}\""
+                            ))
+                            .monospace()
+                            .small()
+                            .color(warn_fg),
+                        );
+                    });
+                });
         }
 
         // ── floating wiki page cards ─────────────────────────────────
