@@ -765,6 +765,7 @@ impl WikiGraph {
         }
     }
 
+    #[allow(dead_code)]
     fn is_bundled(&self) -> bool {
         self.polylines.is_some()
     }
@@ -777,6 +778,7 @@ impl WikiGraph {
         self.edges.len()
     }
 
+    #[allow(dead_code)]
     fn clear_bundling(&mut self) {
         self.polylines = None;
     }
@@ -787,6 +789,7 @@ impl WikiGraph {
     /// electrostatic attraction from *compatible* edges (matching
     /// angle, scale, and midpoint proximity). Compatibility prevents
     /// edges from detouring through unrelated bundles.
+    #[allow(dead_code)]
     fn bundle_edges(&mut self) {
         const K: u32 = 17;
         const CYCLES: usize = 5;
@@ -1068,6 +1071,36 @@ impl WikiGraph {
             }
         }
 
+        // Top-right overlay: node/edge counts + interaction hint.
+        // Matches the timeline viewport's SPAN + zoom-hint treatment
+        // so the two big viewports share a visual idiom.
+        {
+            let meta_label = format!(
+                "{} FRAGMENTS · {} LINKS",
+                self.nodes.len(),
+                self.edges.len()
+            );
+            let hint_label = "DRAG \u{2192} PAN · PINCH/\u{2318}+SCROLL \u{2192} ZOOM";
+            let meta_font = egui::FontId::monospace(10.0);
+            let hint_font = egui::FontId::monospace(9.0);
+            let meta_color = egui::Color32::from_rgb(0xc8, 0xc8, 0xc8);
+            let hint_color = egui::Color32::from_rgb(0x7a, 0x7a, 0x7a);
+            let top = rect.top() + 6.0;
+            let right = rect.right() - 8.0;
+            let gap = 12.0;
+            let hint_galley =
+                painter.layout_no_wrap(hint_label.to_string(), hint_font, hint_color);
+            let meta_galley =
+                painter.layout_no_wrap(meta_label, meta_font, meta_color);
+            let hint_pos = egui::pos2(right - hint_galley.size().x, top);
+            painter.galley(hint_pos, hint_galley, hint_color);
+            let meta_pos = egui::pos2(
+                hint_pos.x - gap - meta_galley.size().x,
+                top,
+            );
+            painter.galley(meta_pos, meta_galley, meta_color);
+        }
+
         clicked
     }
 }
@@ -1345,79 +1378,12 @@ impl WikiViewer {
             if graph.node_count() == 0 {
                 return;
             }
-            // Compact header: GRAPH · N fragments · M links · [Bundle|Straight]
-            let bundled = graph.is_bundled();
-            let n_nodes = graph.node_count();
-            let n_edges = graph.edge_count();
-            ctx.grid(|g| {
-                g.full(|ctx| {
-                    let ui = ctx.ui_mut();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(
-                            egui::RichText::new("GRAPH")
-                                .monospace()
-                                .strong()
-                                .small(),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "\u{00b7} {n_nodes} FRAGMENTS \u{00b7} {n_edges} LINKS"
-                            ))
-                            .monospace()
-                            .small()
-                            .color(egui::Color32::from_rgb(0x8a, 0x8a, 0x8a)),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                let (label, hint) = if bundled {
-                                    ("STRAIGHT", "Revert to straight edges")
-                                } else {
-                                    ("BUNDLE", "Bundle edges via FDEB")
-                                };
-                                if ui
-                                    .add(egui::Button::new(
-                                        egui::RichText::new(label)
-                                            .small()
-                                            .monospace()
-                                            .strong(),
-                                    ))
-                                    .on_hover_text(hint)
-                                    .clicked()
-                                {
-                                    if bundled {
-                                        graph.clear_bundling();
-                                    } else {
-                                        graph.bundle_edges();
-                                    }
-                                }
-                                ui.label(
-                                    egui::RichText::new("\u{00b7}")
-                                        .small()
-                                        .color(egui::Color32::from_rgb(
-                                            0x6a, 0x6a, 0x6a,
-                                        )),
-                                );
-                                ui.label(
-                                    egui::RichText::new(
-                                        "DRAG TO PAN · PINCH OR \u{2318}+SCROLL TO ZOOM",
-                                    )
-                                    .small()
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(
-                                        0x6a, 0x6a, 0x6a,
-                                    )),
-                                );
-                            },
-                        );
-                    });
-                });
-            });
-            if !graph.is_bundled() {
-                graph.step();
-            }
+            // Advance the force layout every frame. Bundle toggle is
+            // gone (graph.bundle_edges / clear_bundling are still
+            // available for a future reintroduction); the meta info
+            // is overlaid inside the viewport itself — see
+            // WikiGraph::show.
+            graph.step();
             // Graph is rendered OUTSIDE the grid so it uses the full
             // section width without the grid cell's edge padding —
             // visually the force-directed view becomes edge-to-edge
