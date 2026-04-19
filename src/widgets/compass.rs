@@ -956,11 +956,25 @@ fn render_compose_form(
         .inner_margin(egui::Margin::symmetric(8, 6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                egui::RichText::new(format!("New goal → {status}"))
-                    .small()
-                    .color(color_muted()),
-            );
+            // Header: "NEW GOAL →" muted + status keyword in its status color.
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    egui::RichText::new("NEW GOAL \u{2192}")
+                        .small()
+                        .monospace()
+                        .strong()
+                        .color(color_muted()),
+                );
+                ui.label(
+                    egui::RichText::new(status.to_uppercase())
+                        .small()
+                        .monospace()
+                        .strong()
+                        .color(status_color(status)),
+                );
+            });
+            ui.add_space(2.0);
             ui.add(
                 egui::TextEdit::singleline(&mut form.title)
                     .hint_text("title")
