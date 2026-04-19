@@ -1356,15 +1356,18 @@ impl WikiViewer {
                                             egui::Align::Center,
                                         ),
                                         |ui| {
-                                            let avail = ui.available_width();
-                                            let resp = ui.add_sized(
-                                                egui::vec2(avail, 22.0),
-                                                egui::TextEdit::singleline(
+                                            // GORBIE LCD-style field;
+                                            // auto-sizes to the
+                                            // available width. No
+                                            // hint_text (GORBIE's
+                                            // field doesn't support
+                                            // one) — the GO button
+                                            // next to it signals
+                                            // intent.
+                                            let resp = ui.add(
+                                                GORBIE::widgets::TextField::singleline(
                                                     &mut self.search_query,
-                                                )
-                                                .font(egui::TextStyle::Monospace)
-                                                .hint_text("find fragment…")
-                                                .desired_width(avail),
+                                                ),
                                             );
                                             if resp.changed() {
                                                 self.search_miss = None;
