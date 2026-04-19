@@ -1187,6 +1187,9 @@ struct OpenPage {
 #[derive(Default)]
 pub struct WikiViewer {
     search_query: String,
+    /// Last search miss (for the "no match" chip). Cleared whenever
+    /// the query text is edited.
+    search_miss: Option<String>,
     /// Rebuilt when the wiki workspace's head advances.
     live: Option<WikiLive>,
     /// Lazily-initialized once `live` is populated (needs queries to
@@ -1254,6 +1257,10 @@ impl WikiViewer {
                         .hint_text("hex prefix or title substring…")
                         .desired_width(f32::INFINITY),
                 );
+                // Clear stale "no match" as soon as the user edits.
+                if resp.changed() {
+                    self.search_miss = None;
+                }
                 if resp.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter))
                     && !self.search_query.trim().is_empty()
@@ -1302,8 +1309,38 @@ impl WikiViewer {
                         pinned_version: None,
                     });
                 }
+                self.search_query.clear();
+                self.search_miss = None;
+            } else {
+                self.search_miss = Some(q);
             }
-            self.search_query.clear();
+        }
+
+        // Search miss banner — muted warn style, auto-dismisses when
+        // the user edits the query or makes a successful search.
+        if let Some(miss) = self.search_miss.clone() {
+            let ui = ctx.ui_mut();
+            let warn_fg = egui::Color32::from_rgb(0xf7, 0xba, 0x0b);
+            egui::Frame::NONE
+                .stroke(egui::Stroke::new(1.0, warn_fg))
+                .corner_radius(egui::CornerRadius::same(3))
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            egui::RichText::new("\u{26a0}").small().color(warn_fg),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "No match for \"{miss}\""
+                            ))
+                            .monospace()
+                            .small()
+                            .color(warn_fg),
+                        );
+                    });
+                });
         }
 
         // ── force-directed graph ─────────────────────────────────────
