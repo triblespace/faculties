@@ -84,7 +84,12 @@ impl StorageState {
     }
 
     fn open_current_path(&mut self) {
-        self.repo = None;
+        // Cleanly close the existing repo before replacing it, so the
+        // old pile's drop path doesn't emit a "dropped without close()"
+        // warning.
+        if let Some(repo) = self.repo.take() {
+            let _ = repo.close();
+        }
         self.error = None;
         let mut pile = match Pile::<Blake3>::open(&self.pile_path) {
             Ok(p) => p,
@@ -196,6 +201,25 @@ impl StorageState {
                     .small(),
             );
         }
+    }
+
+    /// Cleanly close the underlying pile. Called automatically on drop
+    /// but exposed so callers can surface close failures.
+    pub fn close(&mut self) -> Result<(), String> {
+        if let Some(repo) = self.repo.take() {
+            repo.close()
+                .map_err(|e| format!("close pile: {e:?}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StorageState {
+    fn drop(&mut self) {
+        // Take the repo out so `close` can consume it. Swallow errors on
+        // drop — nothing to do with them here; callers who care should
+        // call `close()` explicitly before dropping.
+        let _ = self.close();
     }
 }
 
