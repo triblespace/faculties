@@ -9,20 +9,40 @@ their state in a [TribleSpace](https://github.com/triblespace/triblespace-rs)
 pile — typically `./self.pile` — so the agent owns its own history across
 sessions.
 
-Each faculty is a single `.rs` file you can run directly:
+![faculties-viewer composing activity, wiki, compass, and messages widgets](preview.png)
+
+## Getting started
+
+Install a Rust toolchain (if you don't have one):
 
 ```sh
-export PILE=./self.pile        # set once per shell
-compass.rs list
-wiki.rs search "typst"
-orient.rs show
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-No compilation step, no framework to set up. Drop the files into any
-agent's workspace, put the directory on `PATH`, set `PILE`, and the
-tools are available. Every faculty honors the `PILE` environment
-variable — you can still pass `--pile <path>` explicitly if you need
-to operate on a different pile for a single call.
+Install the GUI viewer and `rust-script` (for the CLI tools):
+
+```sh
+cargo install faculties --features widgets     # gives you `faculties-viewer`
+cargo install rust-script                      # needed to run *.rs faculties
+```
+
+Clone the repo, put it on PATH, and create an empty pile:
+
+```sh
+git clone https://github.com/triblespace/faculties
+cd faculties
+export PATH="$(pwd):$PATH"
+touch ./self.pile
+export PILE=./self.pile
+```
+
+Add a few things through the CLI faculties, then open the viewer:
+
+```sh
+compass.rs add "ship the demo" --status doing
+wiki.rs create --title "Hello" --body "First *typst* fragment."
+faculties-viewer               # picks up PILE from the environment
+```
 
 ## Why
 
@@ -57,56 +77,21 @@ telling the tool what to show you next, and the history falls out naturally.
 | `archive.rs` | Import external archives (chats, exports) into the pile |
 | `web.rs` | Web search and fetch with results recorded |
 
-## Requirements
+## Notes on pile & branches
 
-- [Rust](https://rustup.rs/) (stable). `rustup` is the easiest
-  install: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`.
-  Provides `cargo`, which you need for both paths below.
-- [`rust-script`](https://rust-script.org/) on PATH, for the CLI
-  faculties. Install with `cargo install rust-script`.
-- Network access on the first run of each faculty — cargo fetches
-  and compiles the dependencies. Subsequent runs are instant.
+Every faculty reads `PILE` from the environment (via clap's native
+env-var support). You can pass `--pile <path>` to override it for a
+single call. A pile is an append-only file — `touch new.pile` is
+literally the whole seed. Faculties operate on named branches of
+the pile and are designed to coexist; multiple faculties on the
+same pile each own their own branch, all rooted in the same
+content-addressed blob store.
 
-## Using
+## GORBIE viewer
 
-```sh
-# Point all faculties at a pile once per shell session.
-export PILE=./self.pile
-
-# Put the faculties on PATH.
-export PATH="$(pwd):$PATH"
-
-# Now invoke faculties directly — no --pile ceremony on every call.
-compass.rs list
-wiki.rs search "typst"
-orient.rs show
-```
-
-Every faculty reads `PILE` from the environment (via clap's native env
-var support). You can still pass `--pile <path>` explicitly to override
-the env var for a single call — useful when you want to operate on a
-different pile temporarily.
-
-Faculties operate on named branches of the pile and are designed to
-coexist — multiple faculties on the same pile, each owning its own
-branch, all rooted in the same content-addressed blob store.
-
-## GORBIE viewer (experimental)
-
-A GUI inspector that renders the same pile branches the CLI faculties
-write — compass kanban, wiki graph, local-messages thread, and a
-multi-source activity timeline — inside a single [GORBIE] notebook
-window.
-
-![faculties-viewer composing activity, wiki, compass, and messages widgets](preview.png)
-
-[GORBIE]: https://github.com/triblespace/GORBIE
-
-```sh
-cargo install faculties --features widgets
-faculties-viewer ./self.pile
-# or: PILE=./self.pile faculties-viewer
-```
+The installed `faculties-viewer` binary composes all four widgets
+(activity timeline, wiki graph, compass kanban, local-messages
+thread) against a single pile — see the screenshot above.
 
 From a checkout:
 
@@ -115,35 +100,11 @@ cargo run --release --features widgets --bin faculties-viewer -- ./self.pile
 ```
 
 Standalone per-widget demos (showing how to embed a single widget
-in your own GORBIE notebook) are in `examples/`:
-`compass_board.rs`, `wiki_viewer.rs`, `messages_panel.rs`,
-`branch_timeline.rs`, `pile_inspector.rs`.
+in your own [GORBIE] notebook) are in `examples/`: `compass_board.rs`,
+`wiki_viewer.rs`, `messages_panel.rs`, `branch_timeline.rs`, and
+`pile_inspector.rs` (source for the binary above).
 
-### Creating a pile
-
-A pile is just an append-only file — `touch` it and any faculty
-(or the viewer) can open it:
-
-```sh
-touch ./demo.pile
-```
-
-That's the whole seed command. The file starts empty; the first
-faculty call writes the schema headers, and everything grows from
-there as you use the tools. To give the viewer something to show
-from the start, run a few CLI faculties against it first:
-
-```sh
-export PILE=./demo.pile
-compass.rs add "ship the demo" --status doing
-wiki.rs create --title "Hello" --body "First *typst* fragment."
-```
-
-Then point the viewer at the pile:
-
-```sh
-faculties-viewer ./demo.pile
-```
+[GORBIE]: https://github.com/triblespace/GORBIE
 
 ## Contributing
 
