@@ -1255,6 +1255,15 @@ fn render_goal_card(
     // Whole card is clickable to toggle note expansion.
     let click_id = ui.make_persistent_id(("compass_goal", row.id));
     let response = ui.interact(card_response.rect, click_id, egui::Sense::click());
+    // PointingHand cursor + hover tooltip so the interaction model is
+    // discoverable. The card looks like a card; without this it
+    // doesn't look clickable.
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        response
+            .clone()
+            .on_hover_text("Click to expand · Shift+click or right-click to move");
+    }
     if response.clicked() {
         if *expanded_goal == Some(row.id) {
             *expanded_goal = None;
