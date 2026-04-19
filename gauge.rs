@@ -8,7 +8,7 @@
 //! rand_core = "0.6.4"
 //! hex = "0.4"
 //! triblespace = "0.36"
-//! faculties = "0.2"
+//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
 //! ```
 //!
 //! Research quality gauge: reads wiki tag metadata to measure research health.

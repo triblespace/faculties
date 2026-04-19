@@ -10,7 +10,7 @@
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
 //! triblespace = "0.36"
-//! faculties = "0.2"
+//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
 //! ```
 
 use std::fs;

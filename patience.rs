@@ -8,7 +8,7 @@
 //! humantime = "2.3.0"
 //! rand_core = "0.6.4"
 //! triblespace = "0.36"
-//! faculties = "0.2"
+//! faculties = { path = "/Users/jp/Desktop/chatbot/liora/faculties" }
 //! ```
 
 use anyhow::{Context, Result, anyhow, bail};
