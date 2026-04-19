@@ -721,19 +721,24 @@ impl CompassBoard {
 
                             // Overlay priority edges: for each
                             // (higher → lower) pair where both cards
-                            // are currently visible, paint a dashed
-                            // accent line from the higher card's right
-                            // edge to the lower card's left edge with
-                            // a small arrowhead.
+                            // are currently visible, paint an
+                            // orthogonal arrow tinted with the source
+                            // card's status color. The tint lets
+                            // viewers see at a glance which status
+                            // "owns" each priority edge.
                             let painter = ui.painter();
-                            let edge_color = egui::Color32::from_rgba_unmultiplied(
-                                0x8a, 0x6c, 0xc6, 180,
-                            );
                             for row in column_data.iter().flat_map(|(_, rs)| rs) {
                                 let (src_row, _depth) = row;
                                 let Some(from_rect) = card_rects.get(&src_row.id) else {
                                     continue;
                                 };
+                                let base = status_color(&src_row.status);
+                                let edge_color = egui::Color32::from_rgba_unmultiplied(
+                                    base.r(),
+                                    base.g(),
+                                    base.b(),
+                                    200,
+                                );
                                 for lower in &src_row.higher_over {
                                     let Some(to_rect) = card_rects.get(lower) else {
                                         continue;
