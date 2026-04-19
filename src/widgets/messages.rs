@@ -1086,12 +1086,19 @@ fn render_message(
                             .get(reader)
                             .cloned()
                             .unwrap_or_else(|| id_prefix(*reader));
+                        // Tint each reader name with its own person
+                        // color so the reader list matches the
+                        // sender/recipient chips above.
                         let response = ui.label(
                             egui::RichText::new(name)
                                 .small()
-                                .color(color_read()),
+                                .color(person_color(*reader)),
                         );
-                        response.on_hover_text(format_age_key(now, *ts));
+                        response.on_hover_text(format!(
+                            "read {} · {}",
+                            format_age_key(now, *ts),
+                            format_timestamp_key(*ts),
+                        ));
                     }
                     // Newest-reader age as a trailing muted suffix.
                     if let Some((_, newest_ts)) =
