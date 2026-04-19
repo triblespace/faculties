@@ -106,6 +106,15 @@ fn format_age_key(now_key: i128, past_key: i128) -> String {
     format_age(now_key, Some(past_key))
 }
 
+/// Absolute timestamp from a TAI ns key. Used for hover tooltips so the
+/// compact age chips can still surface precise times on demand.
+fn format_timestamp_key(key: i128) -> String {
+    let ns = hifitime::Duration::from_total_nanoseconds(key);
+    let epoch = hifitime::Epoch::from_tai_duration(ns);
+    let (y, m, d, h, min, s, _) = epoch.to_gregorian_utc();
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02} UTC")
+}
+
 // ── Color palette (reuses compass.rs conventions) ────────────────────
 
 fn color_frame() -> egui::Color32 {
@@ -954,16 +963,21 @@ fn render_message(
                 );
                 render_chip(ui, &to_name, person_color(msg.to));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let age = match msg.created_at {
-                        Some(k) => format_age_key(now, k),
-                        None => "-".to_string(),
+                    let (age, hover) = match msg.created_at {
+                        Some(k) => {
+                            (format_age_key(now, k), Some(format_timestamp_key(k)))
+                        }
+                        None => ("-".to_string(), None),
                     };
-                    ui.label(
+                    let resp = ui.label(
                         egui::RichText::new(age)
                             .monospace()
                             .small()
                             .color(color_muted()),
                     );
+                    if let Some(h) = hover {
+                        resp.on_hover_text(h);
+                    }
                 });
             });
 
