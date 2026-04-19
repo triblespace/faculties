@@ -1399,7 +1399,16 @@ fn render_goal_card(
                 // like a timeline of annotations on this goal.
                 let now = now_tai_ns();
                 if notes.is_empty() {
-                    ui.small("(no notes)");
+                    ui.add_space(4.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("NO NOTES YET")
+                                .monospace()
+                                .small()
+                                .color(color_muted()),
+                        );
+                    });
+                    ui.add_space(4.0);
                 } else {
                     let status_col = status_color(&row.status);
                     for note in notes {
