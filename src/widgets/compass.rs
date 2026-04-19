@@ -689,6 +689,11 @@ impl CompassBoard {
                             mouse_wheel: true,
                         })
                         .show(ctx.ui_mut(), |ui| {
+                            // Collect every goal-card screen rect so we
+                            // can paint priority edges between cards in
+                            // different columns after the layout pass.
+                            let mut card_rects: HashMap<Id, egui::Rect> =
+                                HashMap::new();
                             ui.horizontal_top(|ui| {
                                 ui.spacing_mut().item_spacing.x = COLUMN_GAP;
                                 for (status, rows) in &column_data {
@@ -706,12 +711,36 @@ impl CompassBoard {
                                         status_menu,
                                         form,
                                         &title_by_id,
+                                        &mut card_rects,
                                         &mut add_intent,
                                         &mut move_intent,
                                         &mut note_intent,
                                     );
                                 }
                             });
+
+                            // Overlay priority edges: for each
+                            // (higher → lower) pair where both cards
+                            // are currently visible, paint a dashed
+                            // accent line from the higher card's right
+                            // edge to the lower card's left edge with
+                            // a small arrowhead.
+                            let painter = ui.painter();
+                            let edge_color = egui::Color32::from_rgba_unmultiplied(
+                                0x8a, 0x6c, 0xc6, 180,
+                            );
+                            for row in column_data.iter().flat_map(|(_, rs)| rs) {
+                                let (src_row, _depth) = row;
+                                let Some(from_rect) = card_rects.get(&src_row.id) else {
+                                    continue;
+                                };
+                                for lower in &src_row.higher_over {
+                                    let Some(to_rect) = card_rects.get(lower) else {
+                                        continue;
+                                    };
+                                    draw_priority_edge(painter, *from_rect, *to_rect, edge_color);
+                                }
+                            }
                         });
                 });
             });
@@ -775,6 +804,7 @@ fn render_column(
     status_menu: &mut Option<Id>,
     form: &mut ComposeForm,
     title_by_id: &HashMap<Id, String>,
+    card_rects: &mut HashMap<Id, egui::Rect>,
     add_intent: &mut Option<AddIntent>,
     move_intent: &mut Option<(Id, String)>,
     note_intent: &mut Option<(Id, String)>,
@@ -880,6 +910,7 @@ fn render_column(
                             note_inputs,
                             status_menu,
                             title_by_id,
+                            card_rects,
                             move_intent,
                             note_intent,
                         );
@@ -999,6 +1030,7 @@ fn render_goal_card(
     note_inputs: &mut HashMap<Id, String>,
     status_menu: &mut Option<Id>,
     title_by_id: &HashMap<Id, String>,
+    card_rects: &mut HashMap<Id, egui::Rect>,
     move_intent: &mut Option<(Id, String)>,
     note_intent: &mut Option<(Id, String)>,
 ) {
@@ -1233,6 +1265,7 @@ fn render_goal_card(
 
     // Draw dependency gutter lines to the left of the card.
     let rect = card_response.rect;
+    card_rects.insert(row.id, rect);
     let painter = ui.painter();
     let stroke = egui::Stroke::new(1.2, color_muted());
     for idx in 0..dep_lines {
@@ -1241,6 +1274,50 @@ fn render_goal_card(
         let y2 = rect.bottom() - 0.5;
         painter.line_segment([egui::pos2(x, y1), egui::pos2(x, y2)], stroke);
     }
+}
+
+/// Paint a priority edge between two goal cards: cubic-bezier-ish
+/// curve from the higher card's right edge to the lower card's left
+/// edge, with a small filled arrowhead at the target.
+fn draw_priority_edge(
+    painter: &egui::Painter,
+    from: egui::Rect,
+    to: egui::Rect,
+    color: egui::Color32,
+) {
+    // Start / end anchors on the nearest card edges — left-to-right
+    // if the target is right of the source, right-to-left otherwise.
+    let (start, end) = if from.center().x < to.center().x {
+        (
+            egui::pos2(from.right(), from.center().y),
+            egui::pos2(to.left() - 6.0, to.center().y),
+        )
+    } else {
+        (
+            egui::pos2(from.left(), from.center().y),
+            egui::pos2(to.right() + 6.0, to.center().y),
+        )
+    };
+    let stroke = egui::Stroke::new(1.5, color);
+    // Simple 3-segment curve: horizontal exit, diagonal bridge, horizontal entry.
+    let bridge_x = (start.x + end.x) * 0.5;
+    let mid1 = egui::pos2(bridge_x, start.y);
+    let mid2 = egui::pos2(bridge_x, end.y);
+    painter.line_segment([start, mid1], stroke);
+    painter.line_segment([mid1, mid2], stroke);
+    painter.line_segment([mid2, end], stroke);
+    // Arrowhead — small filled triangle pointing at `end`.
+    let dir = if end.x > start.x { -1.0 } else { 1.0 };
+    let head_len = 6.0;
+    let tip = end;
+    let back = egui::pos2(end.x + dir * head_len, end.y);
+    let wing_up = egui::pos2(end.x + dir * head_len, end.y - 3.5);
+    let wing_dn = egui::pos2(end.x + dir * head_len, end.y + 3.5);
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, wing_up, back, wing_dn],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
