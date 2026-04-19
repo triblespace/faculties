@@ -981,43 +981,28 @@ impl WikiGraph {
             ui.ctx().memory_mut(|m| m.data.remove_temp::<egui::Pos2>(drag_id));
         }
 
-        // Safety: if the persisted pan/zoom would put every node off
-        // the current rect (happens when the viewport dimensions
-        // changed since last session), recenter + autofit so the
-        // user isn't staring at an empty gray canvas.
+        // DEBUG: unconditionally autofit every frame so we can
+        // confirm the basic rendering path works. (Revert to
+        // conditional autofit once we know the graph paints.)
         if !self.nodes.is_empty() {
-            let any_visible = self.nodes.iter().any(|n| {
-                let p = center
-                    + pan
-                    + egui::vec2(n.pos.x * zoom, n.pos.y * zoom);
-                rect.expand(20.0).contains(p)
-            });
-            if !any_visible {
-                // Autofit: find node bbox in world space, pick zoom
-                // that fits it in rect with margin, center pan.
-                let (mut min_x, mut min_y, mut max_x, mut max_y) =
-                    (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-                for n in &self.nodes {
-                    min_x = min_x.min(n.pos.x);
-                    min_y = min_y.min(n.pos.y);
-                    max_x = max_x.max(n.pos.x);
-                    max_y = max_y.max(n.pos.y);
-                }
-                let bbox_w = (max_x - min_x).max(1.0);
-                let bbox_h = (max_y - min_y).max(1.0);
-                let margin = 40.0;
-                let fit_zoom = ((rect.width() - margin * 2.0) / bbox_w)
-                    .min((rect.height() - margin * 2.0) / bbox_h)
-                    .clamp(0.05, 1.0);
-                let bbox_cx = (min_x + max_x) * 0.5;
-                let bbox_cy = (min_y + max_y) * 0.5;
-                zoom = fit_zoom;
-                pan = -egui::vec2(bbox_cx * fit_zoom, bbox_cy * fit_zoom);
-                ui.ctx().memory_mut(|m| {
-                    m.data.insert_temp(zoom_id, zoom);
-                    m.data.insert_temp(pan_id, pan);
-                });
+            let (mut min_x, mut min_y, mut max_x, mut max_y) =
+                (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for n in &self.nodes {
+                min_x = min_x.min(n.pos.x);
+                min_y = min_y.min(n.pos.y);
+                max_x = max_x.max(n.pos.x);
+                max_y = max_y.max(n.pos.y);
             }
+            let bbox_w = (max_x - min_x).max(1.0);
+            let bbox_h = (max_y - min_y).max(1.0);
+            let margin = 40.0;
+            let fit_zoom = ((rect.width() - margin * 2.0) / bbox_w)
+                .min((rect.height() - margin * 2.0) / bbox_h)
+                .clamp(0.05, 4.0);
+            let bbox_cx = (min_x + max_x) * 0.5;
+            let bbox_cy = (min_y + max_y) * 0.5;
+            zoom = fit_zoom;
+            pan = -egui::vec2(bbox_cx * fit_zoom, bbox_cy * fit_zoom);
         }
 
         let to_screen =
