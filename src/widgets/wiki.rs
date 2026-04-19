@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, HashSet};
 use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use GORBIE::prelude::CardCtx;
+use GORBIE::themes::colorhash;
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::metadata;
@@ -52,6 +53,13 @@ type FileHandle = Value<Handle<Blake3, FileBytes>>;
 /// Format an Id as a lowercase hex string.
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
+}
+
+/// Deterministic per-fragment color via GORBIE's colorhash palette.
+/// Gives each wiki fragment a stable identity color so the same
+/// fragment shows up consistently across open pages.
+fn frag_color(id: Id) -> egui::Color32 {
+    colorhash::ral_categorical(id.as_ref())
 }
 
 // ── cached wiki query state ──────────────────────────────────────────
@@ -1312,8 +1320,8 @@ impl WikiViewer {
                             ctx.label(
                                 egui::RichText::new(format!("wiki:{frag_id:x}"))
                                     .monospace()
-                                    .weak()
-                                    .small(),
+                                    .small()
+                                    .color(frag_color(frag_id)),
                             );
                             ctx.separator();
                             ctx.label(
@@ -1322,9 +1330,24 @@ impl WikiViewer {
                             );
                             return;
                         }
-                        ctx.add(
-                            egui::Label::new(egui::RichText::new(&title).heading()).wrap(),
-                        );
+                        let frag_col = frag_color(frag_id);
+                        // Heading row: identity-colored dot swatch + title.
+                        ctx.ui_mut().horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let (dot_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(10.0, 10.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(
+                                dot_rect.center(),
+                                5.0,
+                                frag_col,
+                            );
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&title).heading())
+                                    .wrap(),
+                            );
+                        });
 
                         // Compact meta row: wiki:<frag_id> · version badge
                         // · inline prev/next/latest controls when history
@@ -1335,8 +1358,8 @@ impl WikiViewer {
                             ui.label(
                                 egui::RichText::new(format!("wiki:{frag_id:x}"))
                                     .monospace()
-                                    .weak()
-                                    .small(),
+                                    .small()
+                                    .color(frag_col),
                             );
                             if n_versions > 1 {
                                 let vi = current_idx.unwrap_or(0);
