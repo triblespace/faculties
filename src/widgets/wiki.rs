@@ -574,6 +574,9 @@ struct GraphNode {
     frag_id: Id,
     label: String,
     pos: egui::Vec2,
+    /// Total incident edges (in + out). Used to scale the node
+    /// radius so hub fragments visually dominate.
+    degree: u32,
 }
 
 impl WikiGraph {
@@ -596,6 +599,7 @@ impl WikiGraph {
                     title
                 },
                 pos: egui::vec2(angle.cos() * radius, angle.sin() * radius),
+                degree: 0,
             });
         }
 
@@ -631,6 +635,12 @@ impl WikiGraph {
             eprintln!(
                 "[wiki] graph: {unresolved} link targets could not be resolved to fragments"
             );
+        }
+
+        // Compute per-node degree for size scaling in the render pass.
+        for &(from, to) in &edges {
+            nodes[from].degree = nodes[from].degree.saturating_add(1);
+            nodes[to].degree = nodes[to].degree.saturating_add(1);
         }
 
         let gpu = Self::init_gpu(&nodes, &edges);
@@ -970,9 +980,13 @@ impl WikiGraph {
                 continue;
             }
 
-            painter.circle(pos, node_radius, node_fill, node_stroke);
+            // Scale node radius by degree: isolated nodes at the base
+            // size, hub fragments grow logarithmically. Caps at 3×.
+            let deg_scale = (1.0 + (node.degree as f32 + 1.0).ln() * 0.4).min(3.0);
+            let r = node_radius * deg_scale;
+            painter.circle(pos, r, node_fill, node_stroke);
             if show_labels {
-                let label_anchor = pos + egui::vec2(node_radius + 4.0, 0.0);
+                let label_anchor = pos + egui::vec2(r + 4.0, 0.0);
                 // Measure the label, paint a pill behind it, then the text.
                 let galley = painter.layout_no_wrap(
                     node.label.clone(),
@@ -991,7 +1005,7 @@ impl WikiGraph {
             }
 
             if let Some(hp) = hover_pos {
-                if (hp - pos).length() < node_radius + 8.0 {
+                if (hp - pos).length() < r + 8.0 {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     if response.clicked() {
                         clicked = Some(node.frag_id);
