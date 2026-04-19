@@ -117,6 +117,18 @@ fn id_prefix(id: Id) -> String {
     if s.len() > 8 { s[..8].to_string() } else { s }
 }
 
+/// Truncate `s` to fit in `max_px` at `char_px` per char, appending
+/// "…" if truncated. Char-aware so multibyte sequences don't panic
+/// on slice.
+fn truncate_to_chip_width(s: &str, max_px: f32, char_px: f32) -> String {
+    let max_chars = (max_px / char_px).max(3.0) as usize;
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let take: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{take}…")
+}
+
 /// Trim a string to `max` chars on a single line, replacing inner
 /// newlines with spaces. Used for body/title previews on event rows.
 fn preview(text: &str, max: usize) -> String {
@@ -980,16 +992,16 @@ impl BranchTimeline {
                     text_x += (fromto.len() as f32 * 6.5).min(140.0);
                 }
 
-                // Summary text — clipped against the chip's right edge.
-                let text_rect = egui::Rect::from_min_max(
-                    egui::pos2(text_x, chip_rect.top()),
-                    egui::pos2(chip_rect.right() - 4.0, chip_rect.bottom()),
-                );
-                let text_painter = painter.with_clip_rect(text_rect);
-                text_painter.text(
+                // Summary text — char-truncated to fit the available
+                // chip width with a trailing "…". Cleaner than a hard
+                // clip-rect cutoff because it always ends at a char
+                // boundary with a visible overflow indicator.
+                let available_px = (chip_rect.right() - text_x - 4.0).max(0.0);
+                let truncated = truncate_to_chip_width(&ev.summary, available_px, 6.0);
+                painter.text(
                     egui::pos2(text_x, y),
                     egui::Align2::LEFT_CENTER,
-                    &ev.summary,
+                    &truncated,
                     egui::FontId::monospace(10.0),
                     text_color,
                 );
