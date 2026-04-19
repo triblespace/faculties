@@ -567,6 +567,14 @@ pub struct BranchTimeline {
     /// when the section header above us has `Sense::click`. Holds the
     /// pointer y from the previous frame while a drag is in progress.
     drag_last_y: Option<f32>,
+    /// Pointer y at press-down. Used with a 4px dead-zone so a short
+    /// press+release (a click) doesn't pan the viewport at all —
+    /// sub-pixel per-frame motion during a click otherwise shifts the
+    /// event chips between press and release and eats the click.
+    drag_start_y: Option<f32>,
+    /// True once the gesture has exceeded the drag threshold and is
+    /// committed to panning (i.e. it's no longer a pending click).
+    dragging: bool,
     /// The most-recently-clicked event, if any. Hosts can read this to
     /// drive floating detail cards.
     pub selected_event: Option<(SourceKind, Id)>,
@@ -594,6 +602,8 @@ impl BranchTimeline {
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             first_render: true,
             drag_last_y: None,
+            drag_start_y: None,
+            dragging: false,
             selected_event: None,
         }
     }
@@ -793,23 +803,41 @@ impl BranchTimeline {
                 }
             }
 
-            // Manual drag-to-pan (see comment on the allocate_exact_size
-            // sense choice above for why we don't use `Sense::drag`).
+            // Manual drag-to-pan with a 4-px dead-zone so a short
+            // press+release (a click) doesn't pan at all — otherwise
+            // sub-pixel frame-to-frame drift would shift event chips
+            // between press and release and eat the click.
             let (primary_down, pointer_pos) = ui
                 .input(|i| (i.pointer.primary_down(), i.pointer.hover_pos()));
             let in_viewport =
                 pointer_pos.map(|p| viewport_rect.contains(p)).unwrap_or(false);
+            const DRAG_THRESHOLD_PX: f32 = 4.0;
             if primary_down && in_viewport {
                 if let Some(p) = pointer_pos {
-                    if let Some(last_y) = self.drag_last_y {
+                    // Remember press-down position on the first frame.
+                    if self.drag_start_y.is_none() {
+                        self.drag_start_y = Some(p.y);
+                    }
+                    // Only start panning once we've moved more than
+                    // the threshold from the press point.
+                    if !self.dragging {
+                        if let Some(start) = self.drag_start_y {
+                            if (p.y - start).abs() > DRAG_THRESHOLD_PX {
+                                self.dragging = true;
+                                self.drag_last_y = Some(p.y);
+                            }
+                        }
+                    } else if let Some(last_y) = self.drag_last_y {
                         let drag_delta = p.y - last_y;
                         let pan_ns = (drag_delta as f64 * ns_per_px) as i128;
                         self.timeline_start += pan_ns;
+                        self.drag_last_y = Some(p.y);
                     }
-                    self.drag_last_y = Some(p.y);
                 }
             } else {
                 self.drag_last_y = None;
+                self.drag_start_y = None;
+                self.dragging = false;
             }
 
             if viewport_response.double_clicked() {
