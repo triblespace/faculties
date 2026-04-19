@@ -631,13 +631,14 @@ impl BranchTimeline {
 
         ctx.section("Activity", |ctx| {
             ctx.grid(|g| {
-                // Source legend — one chip per source with count.
+                // Source legend — one dot-swatch per source with label + count.
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
                     ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
                         for (i, s) in sources.iter().enumerate() {
                             let count = events.iter().filter(|e| e.source_idx == i).count();
-                            render_pill(ui, &format!("{} · {count}", s.label()), s.color());
+                            render_legend_swatch(ui, &s.label(), count, s.color());
                         }
                     });
                 });
@@ -1021,15 +1022,33 @@ impl BranchTimeline {
     }
 }
 
-/// Draw a small rounded pill label. Used by the source legend above the
-/// viewport.
-fn render_pill(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
-    let text = text_on(fill);
-    egui::Frame::NONE
-        .fill(fill)
-        .corner_radius(egui::CornerRadius::same(3))
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(label).small().monospace().color(text));
-        });
+/// Legend swatch: a filled color dot, uppercase monospace label, and
+/// event count. Rendered at the top of the Activity section.
+fn render_legend_swatch(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: usize,
+    color: egui::Color32,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let dot_size = 8.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(dot_size, dot_size),
+            egui::Sense::hover(),
+        );
+        ui.painter().circle_filled(rect.center(), dot_size / 2.0, color);
+        ui.label(
+            egui::RichText::new(label.to_uppercase())
+                .small()
+                .monospace()
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new(count.to_string())
+                .small()
+                .monospace()
+                .color(egui::Color32::from_rgb(0x8a, 0x8a, 0x8a)),
+        );
+    });
 }
