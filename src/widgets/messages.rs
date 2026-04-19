@@ -671,8 +671,42 @@ impl MessagesPanel {
                 }
             }
 
-            let count_label = format!("{} messages", messages.len());
-            ctx.label(count_label);
+            // Header row: message count + "me" chip so the user can
+            // confirm which identity they're composing from at a
+            // glance. Matches the compass / timeline header style.
+            {
+                let me_opt = self.me;
+                let me_name_opt = me_opt
+                    .map(|id| names.get(&id).cloned().unwrap_or_else(|| id_prefix(id)));
+                let count = messages.len();
+                let ui = ctx.ui_mut();
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(
+                        egui::RichText::new(format!("{count} MESSAGES"))
+                            .monospace()
+                            .strong()
+                            .small()
+                            .color(color_muted()),
+                    );
+                    if let (Some(me_id), Some(me_name)) = (me_opt, me_name_opt) {
+                        ui.label(
+                            egui::RichText::new("\u{00b7} AS")
+                                .small()
+                                .monospace()
+                                .color(color_muted()),
+                        );
+                        render_chip(ui, &me_name, person_color(me_id));
+                    } else {
+                        ui.label(
+                            egui::RichText::new("\u{00b7} READ-ONLY")
+                                .small()
+                                .monospace()
+                                .color(color_muted()),
+                        );
+                    }
+                });
+            }
 
             let mut send_intent: Option<(Id, String)> = None;
             ctx.grid(|g| g.full(|ctx| {
