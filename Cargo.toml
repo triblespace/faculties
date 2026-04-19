@@ -23,7 +23,7 @@ widgets = [
 
 [dependencies]
 triblespace = "0.36"
-GORBIE = { version = "0.11", default-features = false, features = ["typst", "markdown"], optional = true }
+GORBIE = { version = "0.10", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
 ed25519-dalek = { version = "2.1.1", optional = true }
