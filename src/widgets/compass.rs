@@ -1247,22 +1247,53 @@ fn render_goal_card(
 
                 ui.separator();
 
-                // Notes.
+                // Notes — rendered as their own small framed cards
+                // with an age-chip header and a thin left-accent in
+                // the goal's status color, so the note stream reads
+                // like a timeline of annotations on this goal.
                 let now = now_tai_ns();
                 if notes.is_empty() {
                     ui.small("(no notes)");
                 } else {
+                    let status_col = status_color(&row.status);
                     for note in notes {
-                        ui.label(
-                            egui::RichText::new(format_age(now, note.at))
-                                .small()
-                                .color(color_muted()),
+                        let note_resp = egui::Frame::NONE
+                            .fill(card_bg())
+                            .corner_radius(egui::CornerRadius::same(3))
+                            .inner_margin(egui::Margin {
+                                left: 8,
+                                right: 6,
+                                top: 4,
+                                bottom: 4,
+                            })
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.label(
+                                    egui::RichText::new(format_age(now, note.at))
+                                        .small()
+                                        .monospace()
+                                        .color(color_muted()),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&note.body).small(),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                );
+                            });
+                        // Paint a 2-px status-colored accent on the
+                        // note's left edge after layout.
+                        let r = note_resp.response.rect;
+                        let painter = ui.painter();
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                r.min,
+                                egui::vec2(2.0, r.height()),
+                            ),
+                            0.0,
+                            status_col,
                         );
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(&note.body))
-                                .wrap_mode(egui::TextWrapMode::Wrap),
-                        );
-                        ui.add_space(4.0);
+                        ui.add_space(3.0);
                     }
                 }
 
