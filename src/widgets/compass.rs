@@ -996,7 +996,7 @@ fn render_goal_card(
 
             // Row 1: status chip · title · collapse triangle · short id.
             ui.horizontal(|ui| {
-                render_chip(ui, &row.status, status_color(&row.status));
+                render_status_chip(ui, &row.status, status_color(&row.status));
                 // Collapse-subtree triangle, only shown when there are
                 // visible children (we don't know here without the tree
                 // snapshot, so show it always at depth=0 or higher — the
@@ -1220,5 +1220,25 @@ fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
         .inner_margin(egui::Margin::symmetric(6, 1))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).small().color(text));
+        });
+}
+
+/// Same as [`render_chip`] but with the playbook's "label" styling:
+/// monospace + strong + uppercase. Used for status pills where the
+/// label is a short keyword (`todo`, `doing`, `blocked`, `done`).
+fn render_status_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
+    let text = colorhash::text_color_on(fill);
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(6, 2))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(label.to_uppercase())
+                    .small()
+                    .monospace()
+                    .strong()
+                    .color(text),
+            );
         });
 }
