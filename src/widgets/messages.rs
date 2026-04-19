@@ -673,14 +673,21 @@ impl MessagesPanel {
 
             // Header row: message count + "me" chip so the user can
             // confirm which identity they're composing from at a
-            // glance. Matches the compass / timeline header style.
+            // glance. Right side shows age of most recent message as
+            // an at-a-glance recency indicator. Matches the compass /
+            // timeline header style.
             {
                 let me_opt = self.me;
                 let me_name_opt = me_opt
                     .map(|id| names.get(&id).cloned().unwrap_or_else(|| id_prefix(id)));
                 let count = messages.len();
+                let latest_age = messages
+                    .iter()
+                    .filter_map(|m| m.created_at)
+                    .max()
+                    .map(|k| format_age_key(now, k));
                 let ui = ctx.ui_mut();
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.label(
                         egui::RichText::new(format!("{count} MESSAGES"))
@@ -703,6 +710,23 @@ impl MessagesPanel {
                                 .small()
                                 .monospace()
                                 .color(color_muted()),
+                        );
+                    }
+                    if let Some(age) = latest_age {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "LAST {}",
+                                        age.to_uppercase()
+                                    ))
+                                    .monospace()
+                                    .small()
+                                    .strong()
+                                    .color(color_muted()),
+                                );
+                            },
                         );
                     }
                 });
