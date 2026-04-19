@@ -1049,9 +1049,25 @@ fn render_compose_form(
                     .desired_width(f32::INFINITY),
             );
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
                 let submit_enabled = !form.title.trim().is_empty() && add_intent.is_none();
+                // CREATE button tinted with the column's status color
+                // — reinforces "this goal will land in this column" at
+                // submit time.
+                let fill = status_color(status);
+                let text = colorhash::text_color_on(fill);
                 if ui
-                    .add_enabled(submit_enabled, egui::Button::new("Create"))
+                    .add_enabled(
+                        submit_enabled,
+                        egui::Button::new(
+                            egui::RichText::new("CREATE")
+                                .small()
+                                .monospace()
+                                .strong()
+                                .color(text),
+                        )
+                        .fill(fill),
+                    )
                     .clicked()
                 {
                     let parent = resolve_prefix_hack(&form.parent_prefix);
@@ -1068,7 +1084,15 @@ fn render_compose_form(
                         tags,
                     });
                 }
-                if ui.small_button("Cancel").clicked() {
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("CANCEL")
+                            .small()
+                            .monospace()
+                            .color(color_muted()),
+                    ))
+                    .clicked()
+                {
                     form.open = false;
                     form.title.clear();
                     form.tags.clear();
