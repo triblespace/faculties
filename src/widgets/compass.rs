@@ -1147,7 +1147,10 @@ fn render_goal_card(
                 );
             });
 
-            // Row 2: id prefix · optional parent pointer · note count chip.
+            // Row 2: id prefix · optional parent pointer (left) · note
+            // count chip (right). Note count lives on the right edge so
+            // it reads like a metadata badge, not a continuation of the
+            // id string.
             ui.horizontal(|ui| {
                 let id_text = if let Some(parent) = row.parent {
                     format!("^{} {}", id_prefix(parent), row.id_prefix)
@@ -1161,7 +1164,16 @@ fn render_goal_card(
                         .color(color_muted()),
                 );
                 if row.note_count > 0 {
-                    render_chip(ui, &format!("{}n", row.note_count), color_muted());
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            render_chip(
+                                ui,
+                                &format!("{}n", row.note_count),
+                                color_muted(),
+                            );
+                        },
+                    );
                 }
             });
 
