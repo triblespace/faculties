@@ -770,10 +770,15 @@ fn render_column(
     note_intent: &mut Option<(Id, String)>,
 ) {
     let status_col = status_color(status);
-    egui::Frame::NONE
+    let frame_response = egui::Frame::NONE
         .fill(color_frame())
         .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::same(8))
+        .inner_margin(egui::Margin {
+            left: 12,  // extra left padding for the accent stripe
+            right: 8,
+            top: 8,
+            bottom: 8,
+        })
         .show(ui, |ui| {
             // Fixed column width; force vertical layout (Frame inherits
             // its parent's direction by default, and the parent here is
@@ -873,6 +878,24 @@ fn render_column(
                 });
             });
         });
+
+    // Kanban-style left accent stripe in the status color. Painted on top
+    // of the frame after layout so we know the exact rect.
+    let frame_rect = frame_response.response.rect;
+    let accent = egui::Rect::from_min_size(
+        frame_rect.min,
+        egui::vec2(4.0, frame_rect.height()),
+    );
+    ui.painter().rect_filled(
+        accent,
+        egui::CornerRadius {
+            nw: 6,
+            sw: 6,
+            ne: 0,
+            se: 0,
+        },
+        status_col,
+    );
 }
 
 fn render_compose_form(
