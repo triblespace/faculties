@@ -871,19 +871,38 @@ fn render_column(
             ui.set_min_height(height);
             ui.vertical(|ui| {
 
-            // Column header + "+ Add" toggle.
+            // Column header: STATUS label + count chip on the left,
+            // +ADD / × toggle on the right. Count sits in a muted
+            // playbook-style chip instead of "(N)" parentheses so the
+            // status name stays prominent and the count reads as a
+            // metadata badge.
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
                 ui.label(
-                    egui::RichText::new(format!("{} ({})", status.to_uppercase(), rows.len()))
+                    egui::RichText::new(status.to_uppercase())
                         .monospace()
                         .strong()
                         .color(status_col),
                 );
+                render_chip(ui, &rows.len().to_string(), color_muted());
                 ui.with_layout(
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
+                        let (label, hint) = if form.open {
+                            ("×", "Close compose form")
+                        } else {
+                            ("+ ADD", "New goal in this column")
+                        };
                         if ui
-                            .small_button(if form.open { "×" } else { "+ Add" })
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(label)
+                                        .small()
+                                        .monospace()
+                                        .strong(),
+                                ),
+                            )
+                            .on_hover_text(hint)
                             .clicked()
                         {
                             form.open = !form.open;
