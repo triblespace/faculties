@@ -1215,7 +1215,22 @@ impl WikiViewer {
                 }
             });
             g.place(2, |ctx| {
-                if ctx.button("Go").clicked() && !self.search_query.trim().is_empty() {
+                let ui = ctx.ui_mut();
+                let go_enabled = !self.search_query.trim().is_empty();
+                if ui
+                    .add_enabled(
+                        go_enabled,
+                        egui::Button::new(
+                            egui::RichText::new("GO")
+                                .small()
+                                .monospace()
+                                .strong(),
+                        )
+                        .min_size(egui::vec2(52.0, 22.0)),
+                    )
+                    .on_hover_text("Open fragment by hex prefix or title substring (Enter)")
+                    .clicked()
+                {
                     submit_query = Some(self.search_query.trim().to_string());
                 }
             });
