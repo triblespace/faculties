@@ -230,22 +230,50 @@ impl StorageState {
         }
 
         if let Some(err) = self.error.as_ref() {
-            let color = ctx.ctx().global_style().visuals.error_fg_color;
-            ctx.label(
-                egui::RichText::new(format!("pile open error: {err}"))
-                    .color(color)
-                    .monospace()
-                    .small(),
+            render_banner(
+                ctx,
+                "\u{26a0}",
+                &format!("pile open error: {err}"),
+                ctx.ctx().global_style().visuals.error_fg_color,
             );
         }
+        let mut dismiss_toast = false;
         if let Some(toast) = self.toast.as_ref() {
-            let color = ctx.ctx().global_style().visuals.error_fg_color;
-            ctx.label(
-                egui::RichText::new(toast.as_str())
-                    .color(color)
-                    .monospace()
-                    .small(),
-            );
+            let ui = ctx.ui_mut();
+            let warn_fg = egui::Color32::from_rgb(0xf7, 0xba, 0x0b); // RAL 1003
+            let warn_bg = egui::Color32::from_rgb(0x33, 0x2d, 0x12);
+            egui::Frame::NONE
+                .fill(warn_bg)
+                .stroke(egui::Stroke::new(1.0, warn_fg))
+                .corner_radius(egui::CornerRadius::same(3))
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            egui::RichText::new("\u{26a0}")
+                                .small()
+                                .color(warn_fg),
+                        );
+                        ui.label(
+                            egui::RichText::new(toast.as_str())
+                                .monospace()
+                                .small()
+                                .color(warn_fg),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("\u{00d7}").clicked() {
+                                    dismiss_toast = true;
+                                }
+                            },
+                        );
+                    });
+                });
+        }
+        if dismiss_toast {
+            self.toast = None;
         }
     }
 
@@ -267,6 +295,31 @@ impl Drop for StorageState {
         // call `close()` explicitly before dropping.
         let _ = self.close();
     }
+}
+
+/// Render a single-line colored banner (icon + message) used for the
+/// pile-open error path. Toast rendering is inline because it also
+/// needs a dismiss button.
+fn render_banner(ctx: &mut CardCtx<'_>, icon: &str, msg: &str, color: egui::Color32) {
+    let ui = ctx.ui_mut();
+    let bg = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40);
+    egui::Frame::NONE
+        .fill(bg)
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(egui::CornerRadius::same(3))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(egui::RichText::new(icon).small().color(color));
+                ui.label(
+                    egui::RichText::new(msg)
+                        .monospace()
+                        .small()
+                        .color(color),
+                );
+            });
+        });
 }
 
 /// Walk a repository's branches and return the id of the branch named
