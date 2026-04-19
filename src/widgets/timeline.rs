@@ -811,11 +811,11 @@ impl BranchTimeline {
 
         let painter = ui.painter_at(viewport_rect);
 
-        // No viewport background — the timeline blends into the
-        // notebook panel so the ruler and event chips read directly
-        // against the section fill. `frame_color` is still used by
-        // the event chips themselves below.
+        // Neutral dark-grey viewport background — makes the ruler
+        // ticks and event chips pop against a consistent panel
+        // regardless of the notebook theme fill.
         let frame_color = egui::Color32::from_rgb(0x29, 0x2c, 0x2f);
+        painter.rect_filled(viewport_rect, 0.0, frame_color);
 
         // Four-sine ruler: one cosine per natural time period.
         let muted = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
