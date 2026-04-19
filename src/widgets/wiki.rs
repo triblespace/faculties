@@ -878,24 +878,14 @@ impl WikiGraph {
         // click-sensing rect that covers every widget rendered below
         // the wiki section (compass, messages, etc.) and eats all
         // their clicks.
-        // Graph viewport height: bounded so the click-sense rect can't
-        // be infinite (would cover everything rendered below us in the
-        // notebook and eat their clicks), but still honors the host's
-        // available vertical space if it's finite.
-        const GRAPH_MIN_HEIGHT: f32 = 400.0;
-        const GRAPH_MAX_HEIGHT: f32 = 800.0;
-        let available = ui.available_size();
-        let height = if available.y.is_finite() {
-            available.y.clamp(GRAPH_MIN_HEIGHT, GRAPH_MAX_HEIGHT)
-        } else {
-            GRAPH_MAX_HEIGHT
-        };
+        const GRAPH_HEIGHT_PX: f32 = 600.0;
+        let available_x = ui.available_width();
         // Click-only sense — drag is implemented manually below. Avoids
         // egui's hit_test unwrap panic that fires when a drag-sensing
         // widget coexists with a nearby click-sensing one (the section
         // header above us).
         let (response, painter) = ui.allocate_painter(
-            egui::vec2(available.x, height),
+            egui::vec2(available_x, GRAPH_HEIGHT_PX),
             egui::Sense::click(),
         );
         let rect = response.rect;
