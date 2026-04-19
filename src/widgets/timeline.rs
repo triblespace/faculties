@@ -2,32 +2,29 @@
 //!
 //! A pan/zoom time axis that overlays events from one or more pile
 //! branches on a single vertical timeline (newest at top, oldest at
-//! bottom). v1 painted opaque "commit happened" bars for a single
-//! branch; v2 adds per-event-type decoration for the most visible
-//! daily activity branches:
+//! bottom). The widget holds UI + cached-event state only; the host
+//! configures it with a list of [`SourceKind`]s (what kind of decoration
+//! to use per branch) and passes in the matching workspaces at render
+//! time.
 //!
+//! Per-kind decoration:
 //! * Compass — goal status changes (pill + goal title)
 //! * Local messages — body preview with sender/recipient pills
 //! * Wiki — fragment-version commits with title
 //! * Commits — generic commit-bar rendering for arbitrary branches
 //!
-//! The widget is `Send + Sync` (GORBIE's state storage requires it
-//! across threads), so the live connection lives behind a
-//! `parking_lot::Mutex`.
-//!
 //! ```ignore
-//! // Single-branch: generic commit bars (v1 behavior).
-//! let mut timeline = BranchTimeline::new("./self.pile", "wiki");
-//! // Inside a GORBIE card:
-//! timeline.render(ctx);
-//!
-//! // Multi-branch: decorated overlay.
-//! let mut timeline = BranchTimeline::multi("./self.pile", vec![
-//!     TimelineSource::Compass { branch: "compass".into() },
-//!     TimelineSource::LocalMessages { branch: "local-messages".into() },
-//!     TimelineSource::Wiki { branch: "wiki".into() },
+//! let mut timeline = BranchTimeline::multi(vec![
+//!     TimelineSource::Compass { label: "goals".into() },
+//!     TimelineSource::LocalMessages { label: "local".into() },
+//!     TimelineSource::Wiki { label: "wiki".into() },
 //! ]);
-//! timeline.render(ctx);
+//! // Inside a GORBIE card:
+//! timeline.render(ctx, &mut [
+//!     ("compass", &mut compass_ws),
+//!     ("local-messages", &mut messages_ws),
+//!     ("wiki", &mut wiki_ws),
+//! ]);
 //! ```
 //!
 //! Input handling:
@@ -42,17 +39,15 @@
 //! that gives ~6-10 labels per viewport.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use hifitime::{Duration as HifiDuration, Epoch};
-use parking_lot::Mutex;
 use GORBIE::card_ctx::GRID_ROW_MODULE;
 use GORBIE::prelude::CardCtx;
 use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{
-    ancestors, CommitSelector, CommitSet, Workspace,
+    ancestors, CommitHandle, CommitSelector, CommitSet, Workspace,
 };
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
@@ -66,7 +61,6 @@ use crate::schemas::compass::{
 };
 use crate::schemas::local_messages::{local as local_attrs, KIND_MESSAGE_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
-use crate::widgets::live::SharedPile;
 
 /// Handle to a long-string blob (branch names, titles, bodies, notes).
 type TextHandle = Value<Handle<Blake3, LongString>>;
@@ -161,23 +155,22 @@ fn text_on(fill: egui::Color32) -> egui::Color32 {
 
 // ── Source descriptions & styling ────────────────────────────────────
 
-/// Branch + decoration description for the multi-branch constructor.
+/// Decoration description for a timeline source. Branch names are
+/// supplied separately at render time.
 #[derive(Clone, Debug)]
 pub enum TimelineSource {
-    /// Just paint commits as plain bars (useful for arbitrary branches).
+    /// Plain commit bars (useful for arbitrary branches).
     Commits {
-        branch: String,
         label: String,
         color: egui::Color32,
     },
-    /// Compass branch — render goal status changes with the goal title
-    /// and status-color pill.
-    Compass { branch: String },
-    /// Local-messages branch — render each message with sender/body
-    /// preview.
-    LocalMessages { branch: String },
-    /// Wiki branch — render fragment-version commits with title.
-    Wiki { branch: String },
+    /// Compass — render goal status changes with the goal title and
+    /// status-color pill.
+    Compass { label: String },
+    /// Local-messages — render each message with sender/body preview.
+    LocalMessages { label: String },
+    /// Wiki — render fragment-version commits with title.
+    Wiki { label: String },
 }
 
 /// Coarse kind used on the widget's `selected_event` and as a color key.
@@ -190,22 +183,13 @@ pub enum SourceKind {
 }
 
 impl TimelineSource {
-    fn branch(&self) -> &str {
-        match self {
-            TimelineSource::Commits { branch, .. } => branch,
-            TimelineSource::Compass { branch } => branch,
-            TimelineSource::LocalMessages { branch } => branch,
-            TimelineSource::Wiki { branch } => branch,
-        }
-    }
-
     /// A short (≤6 char) source label used in the pill.
     fn label(&self) -> String {
         match self {
-            TimelineSource::Commits { label, .. } => label.clone(),
-            TimelineSource::Compass { .. } => "goals".to_string(),
-            TimelineSource::LocalMessages { .. } => "local".to_string(),
-            TimelineSource::Wiki { .. } => "wiki".to_string(),
+            TimelineSource::Commits { label, .. }
+            | TimelineSource::Compass { label }
+            | TimelineSource::LocalMessages { label }
+            | TimelineSource::Wiki { label } => label.clone(),
         }
     }
 
@@ -261,88 +245,66 @@ struct Event {
 
 // ── Live connection ──────────────────────────────────────────────────
 
-/// Opened pile + per-source workspaces and cached fact spaces.
-///
-/// All sources share a single `Repository`/`Pile` handle for efficiency.
-/// Each requested branch is pulled once; its checked-out `TribleSet`
-/// feeds the event query, and the `Workspace` stays live so blob reads
-/// (bodies, titles, notes) resolve against the correct branch.
+/// Cached events + per-source head markers. Rebuilt when any source's
+/// workspace head advances.
 struct MultiLive {
-    sources: Vec<SourceLive>,
+    cached_heads: Vec<Option<CommitHandle>>,
     events: Vec<Event>,
 }
 
-struct SourceLive {
-    source: TimelineSource,
-    ws: Workspace<Pile<Blake3>>,
-    space: TribleSet,
-}
-
 impl MultiLive {
-    fn open(pile: SharedPile, sources: &[TimelineSource]) -> Result<Self, String> {
-        let mut live = MultiLive {
-            sources: Vec::with_capacity(sources.len()),
-            events: Vec::new(),
-        };
-        for src in sources {
-            let mut ws = pile.pull_branch(src.branch())?;
-            // For commit-only rendering we do NOT need a checked-out
-            // fact space; skip the work for that case.
-            let space = match src {
-                TimelineSource::Commits { .. } => TribleSet::new(),
-                _ => ws
-                    .checkout(..)
-                    .map_err(|e| format!("checkout: {e:?}"))?
-                    .into_facts(),
-            };
-            live.sources.push(SourceLive {
-                source: src.clone(),
-                ws,
-                space,
-            });
-        }
-        live.refresh_events();
-        Ok(live)
-    }
-
-    /// Re-enumerate events from every source. Eager — good enough for
-    /// v1; progressive loading is future work.
-    fn refresh_events(&mut self) {
+    /// Rebuild events from the provided workspaces.
+    fn refresh(
+        sources: &[TimelineSource],
+        workspaces: &mut [(&str, &mut Workspace<Pile<Blake3>>)],
+    ) -> Self {
         let mut out: Vec<Event> = Vec::new();
-        for (idx, s) in self.sources.iter_mut().enumerate() {
-            match s.source.clone() {
-                TimelineSource::Commits { .. } => {
-                    collect_commit_events(idx, s, &mut out);
+        let mut heads: Vec<Option<CommitHandle>> = Vec::with_capacity(sources.len());
+
+        for (idx, src) in sources.iter().enumerate() {
+            let entry = workspaces.get_mut(idx);
+            let ws = match entry {
+                Some((_, ws)) => ws,
+                None => {
+                    heads.push(None);
+                    continue;
                 }
-                TimelineSource::Compass { .. } => {
-                    collect_compass_events(idx, s, &mut out);
-                }
+            };
+            heads.push(ws.head());
+            match src {
+                TimelineSource::Commits { .. } => collect_commit_events(idx, ws, &mut out),
+                TimelineSource::Compass { .. } => collect_compass_events(idx, ws, &mut out),
                 TimelineSource::LocalMessages { .. } => {
-                    collect_local_events(idx, s, &mut out);
+                    collect_local_events(idx, ws, &mut out)
                 }
-                TimelineSource::Wiki { .. } => {
-                    collect_wiki_events(idx, s, &mut out);
-                }
+                TimelineSource::Wiki { .. } => collect_wiki_events(idx, ws, &mut out),
             }
         }
         out.sort_by_key(|e| e.ts_ns);
-        self.events = out;
+        MultiLive {
+            cached_heads: heads,
+            events: out,
+        }
     }
 }
 
 /// Walk every commit reachable from HEAD and emit one Event per commit.
 /// Commits without `created_at` are skipped — they're merge commits by
 /// design and carry no author-time bits.
-fn collect_commit_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
-    let Some(head) = s.ws.head() else {
+fn collect_commit_events(
+    idx: usize,
+    ws: &mut Workspace<Pile<Blake3>>,
+    out: &mut Vec<Event>,
+) {
+    let Some(head) = ws.head() else {
         return;
     };
-    let Ok(set): Result<CommitSet, _> = ancestors(head).select(&mut s.ws) else {
+    let Ok(set): Result<CommitSet, _> = ancestors(head).select(ws) else {
         return;
     };
     for raw in set.iter() {
         let handle: CommitHandleValue = Value::new(*raw);
-        let Ok(meta) = s.ws.get::<TribleSet, SimpleArchive>(handle) else {
+        let Ok(meta) = ws.get::<TribleSet, SimpleArchive>(handle) else {
             continue;
         };
         if let Some((cid, ts)) = find!(
@@ -364,19 +326,35 @@ fn collect_commit_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
     }
 }
 
-/// Emit a Compass event per status-change entity. Status events carry
-/// `compass::task` → goal, `compass::status` → text, plus `created_at`.
-/// We also record a plain "goal created" event for each goal so an
-/// otherwise-quiet board still paints something.
-fn collect_compass_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
-    // Cache titles per goal id so repeated status changes don't re-read
-    // the same blob N times.
+fn read_text(ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+    ws.get::<View<str>, LongString>(h)
+        .map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// Emit a Compass event per status-change entity. Also records "goal
+/// created" and "note" events so quiet boards still show up.
+fn collect_compass_events(
+    idx: usize,
+    ws: &mut Workspace<Pile<Blake3>>,
+    out: &mut Vec<Event>,
+) {
+    let space = match ws.checkout(..) {
+        Ok(co) => co.into_facts(),
+        Err(e) => {
+            eprintln!("[timeline] compass checkout: {e:?}");
+            return;
+        }
+    };
+
     let mut title_by_goal: HashMap<Id, String> = HashMap::new();
 
-    // Goal creations — useful even when no status transition exists yet.
     let goal_rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
         (gid: Id, title: TextHandle, ts: (i128, i128)),
-        pattern!(&s.space, [{
+        pattern!(&space, [{
             ?gid @
             metadata::tag: &KIND_GOAL_ID,
             compass_attrs::title: ?title,
@@ -386,14 +364,7 @@ fn collect_compass_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) 
     .collect();
 
     for (gid, title_h, ts) in goal_rows {
-        let title = s
-            .ws
-            .get::<View<str>, LongString>(title_h)
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_default();
+        let title = read_text(ws, title_h);
         title_by_goal.insert(gid, title.clone());
         out.push(Event {
             source_idx: idx,
@@ -406,10 +377,9 @@ fn collect_compass_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) 
         });
     }
 
-    // Status transitions.
     let status_rows: Vec<(Id, Id, String, (i128, i128))> = find!(
         (event_id: Id, gid: Id, status: String, ts: (i128, i128)),
-        pattern!(&s.space, [{
+        pattern!(&space, [{
             ?event_id @
             metadata::tag: &KIND_STATUS_ID,
             compass_attrs::task: ?gid,
@@ -435,11 +405,9 @@ fn collect_compass_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) 
         });
     }
 
-    // Notes — painted as a small "note" pill so activity on goals is
-    // visible on the timeline even when the status hasn't moved.
     let note_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
         (event_id: Id, gid: Id, note: TextHandle, ts: (i128, i128)),
-        pattern!(&s.space, [{
+        pattern!(&space, [{
             ?event_id @
             metadata::tag: &KIND_NOTE_ID,
             compass_attrs::task: ?gid,
@@ -450,14 +418,7 @@ fn collect_compass_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) 
     .collect();
 
     for (event_id, gid, note_h, ts) in note_rows {
-        let body = s
-            .ws
-            .get::<View<str>, LongString>(note_h)
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_default();
+        let body = read_text(ws, note_h);
         let title = title_by_goal
             .get(&gid)
             .cloned()
@@ -479,12 +440,23 @@ fn collect_compass_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) 
     }
 }
 
-/// Emit a LocalMessages event per message. The "sender → recipient"
-/// prefix is shown as a pill; the body preview is the summary.
-fn collect_local_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
+/// Emit a LocalMessages event per message.
+fn collect_local_events(
+    idx: usize,
+    ws: &mut Workspace<Pile<Blake3>>,
+    out: &mut Vec<Event>,
+) {
+    let space = match ws.checkout(..) {
+        Ok(co) => co.into_facts(),
+        Err(e) => {
+            eprintln!("[timeline] local-messages checkout: {e:?}");
+            return;
+        }
+    };
+
     let rows: Vec<(Id, Id, Id, TextHandle, (i128, i128))> = find!(
         (mid: Id, from: Id, to: Id, body: TextHandle, ts: (i128, i128)),
-        pattern!(&s.space, [{
+        pattern!(&space, [{
             ?mid @
             metadata::tag: &KIND_MESSAGE_ID,
             local_attrs::from: ?from,
@@ -496,14 +468,7 @@ fn collect_local_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
     .collect();
 
     for (mid, from, to, body_h, ts) in rows {
-        let body = s
-            .ws
-            .get::<View<str>, LongString>(body_h)
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_default();
+        let body = read_text(ws, body_h);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::LocalMessages,
@@ -516,12 +481,23 @@ fn collect_local_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
     }
 }
 
-/// Emit a Wiki event per fragment-version. The title blob is pulled
-/// eagerly so we don't need per-frame blob I/O during paint.
-fn collect_wiki_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
+/// Emit a Wiki event per fragment-version.
+fn collect_wiki_events(
+    idx: usize,
+    ws: &mut Workspace<Pile<Blake3>>,
+    out: &mut Vec<Event>,
+) {
+    let space = match ws.checkout(..) {
+        Ok(co) => co.into_facts(),
+        Err(e) => {
+            eprintln!("[timeline] wiki checkout: {e:?}");
+            return;
+        }
+    };
+
     let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
         (vid: Id, title: TextHandle, ts: (i128, i128)),
-        pattern!(&s.space, [{
+        pattern!(&space, [{
             ?vid @
             metadata::tag: &KIND_VERSION_ID,
             wiki_attrs::title: ?title,
@@ -531,14 +507,7 @@ fn collect_wiki_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
     .collect();
 
     for (vid, title_h, ts) in rows {
-        let title = s
-            .ws
-            .get::<View<str>, LongString>(title_h)
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-            .unwrap_or_default();
+        let title = read_text(ws, title_h);
         out.push(Event {
             source_idx: idx,
             kind: SourceKind::Wiki,
@@ -566,19 +535,14 @@ fn collect_wiki_events(idx: usize, s: &mut SourceLive, out: &mut Vec<Event>) {
 /// The pile + all requested source branches are opened lazily on the
 /// first render, in the same pattern as [`WikiViewer`](crate::widgets::WikiViewer).
 pub struct BranchTimeline {
-    pile_path: PathBuf,
-    /// One entry per requested source. Single-branch constructor builds
-    /// a single `TimelineSource::Commits` entry with a default label.
+    /// One entry per source — matches the workspaces passed in at
+    /// render time (by index). Single-branch constructor builds a single
+    /// `TimelineSource::Commits` entry.
     sources: Vec<TimelineSource>,
     viewport_height: f32,
-    /// Optional shared pile supplied by a parent widget. `None` = we
-    /// open our own pile from `pile_path` on first render.
-    shared_pile: Option<SharedPile>,
-    // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's state
-    // storage requires that across threads, and `Workspace<Pile<Blake3>>`
-    // uses interior-mutability types (Cell/RefCell) that aren't Sync.
-    live: Option<Mutex<MultiLive>>,
-    error: Option<String>,
+    /// Cached events + head markers; rebuilt when any source's head
+    /// advances.
+    live: Option<MultiLive>,
     /// Top edge of viewport, in TAI ns. Newest visible time.
     timeline_start: i128,
     /// Pixels per minute of wall time.
@@ -597,59 +561,23 @@ pub struct BranchTimeline {
 }
 
 impl BranchTimeline {
-    /// Single-branch timeline — renders commits on `branch_name` as
-    /// generic commit bars. Matches v1 behavior.
-    pub fn new(pile_path: impl Into<PathBuf>, branch_name: impl Into<String>) -> Self {
-        let branch = branch_name.into();
+    /// Single-source commit-bars timeline (matches v1 behavior).
+    pub fn new(label: impl Into<String>) -> Self {
         // Default commit-bar color: muted amber (matches v1 "commit_color").
         let color = egui::Color32::from_rgb(0xff, 0xc8, 0x3a);
-        Self {
-            pile_path: pile_path.into(),
-            sources: vec![TimelineSource::Commits {
-                label: branch.clone(),
-                branch,
-                color,
-            }],
-            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
-            shared_pile: None,
-            live: None,
-            error: None,
-            timeline_start: 0,
-            timeline_scale: TIMELINE_DEFAULT_SCALE,
-            first_render: true,
-            drag_last_y: None,
-            selected_event: None,
-        }
+        Self::multi(vec![TimelineSource::Commits {
+            label: label.into(),
+            color,
+        }])
     }
 
-    /// Multi-branch overlay — each source paints its own events on the
+    /// Multi-source overlay — each source paints its own events on the
     /// shared axis.
-    pub fn multi(pile_path: impl Into<PathBuf>, sources: Vec<TimelineSource>) -> Self {
+    pub fn multi(sources: Vec<TimelineSource>) -> Self {
         Self {
-            pile_path: pile_path.into(),
             sources,
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
-            shared_pile: None,
             live: None,
-            error: None,
-            timeline_start: 0,
-            timeline_scale: TIMELINE_DEFAULT_SCALE,
-            first_render: true,
-            drag_last_y: None,
-            selected_event: None,
-        }
-    }
-
-    /// Multi-branch timeline that shares a pile with sibling widgets
-    /// (e.g. inside a [`PileInspector`](crate::widgets::PileInspector)).
-    pub fn multi_with_shared(pile: SharedPile, sources: Vec<TimelineSource>) -> Self {
-        Self {
-            pile_path: pile.path(),
-            sources,
-            viewport_height: DEFAULT_VIEWPORT_HEIGHT,
-            shared_pile: Some(pile),
-            live: None,
-            error: None,
             timeline_start: 0,
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             first_render: true,
@@ -664,77 +592,41 @@ impl BranchTimeline {
         self
     }
 
-    /// Retarget at a different pile. No-op if the path is unchanged.
-    pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
-        let path = path.into();
-        if path == self.pile_path {
-            return;
-        }
-        self.pile_path = path;
-        self.shared_pile = None;
-        self.live = None;
-        self.error = None;
-        self.first_render = true;
-        self.drag_last_y = None;
-        self.selected_event = None;
-    }
-
-    /// Replace the shared pile handle (e.g. when the parent
-    /// [`PileInspector`](crate::widgets::PileInspector) reopens).
-    pub fn set_shared_pile(&mut self, pile: SharedPile) {
-        self.pile_path = pile.path();
-        self.shared_pile = Some(pile);
-        self.live = None;
-        self.error = None;
-        self.first_render = true;
-        self.drag_last_y = None;
-        self.selected_event = None;
-    }
-
-    /// Render the timeline into a GORBIE card context.
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
-        // Lazy pile open on first render.
-        if self.live.is_none() && self.error.is_none() {
-            if self.shared_pile.is_none() {
-                match SharedPile::open(&self.pile_path) {
-                    Ok(p) => self.shared_pile = Some(p),
-                    Err(e) => self.error = Some(e),
-                }
-            }
-            if let Some(pile) = self.shared_pile.clone() {
-                match MultiLive::open(pile, &self.sources) {
-                    Ok(live) => self.live = Some(Mutex::new(live)),
-                    Err(e) => self.error = Some(e),
-                }
-            }
-        }
-
-        if let Some(err) = &self.error {
-            ctx.label(format!("branch timeline error: {err}"));
-            return;
-        }
-
-        let Some(live_lock) = self.live.as_ref() else {
-            ctx.label("branch timeline not initialized");
-            return;
-        };
-
+    /// Render the timeline. `workspaces` must have the same length and
+    /// ordering as the `sources` list configured at construction. Each
+    /// entry is `(branch_name, &mut Workspace)` — the branch name is
+    /// only used in error messages; indices are what's authoritative.
+    pub fn render(
+        &mut self,
+        ctx: &mut CardCtx<'_>,
+        workspaces: &mut [(&str, &mut Workspace<Pile<Blake3>>)],
+    ) {
         let now = now_key();
         if self.first_render {
             self.timeline_start = now;
             self.first_render = false;
-            // Opportunistically refresh on first render in case events
-            // were added between construction and first paint.
-            live_lock.lock().refresh_events();
         }
 
-        // Snapshot events + source descriptors so we don't hold the
-        // mutex across egui calls.
-        let (events, sources): (Vec<Event>, Vec<TimelineSource>) = {
-            let guard = live_lock.lock();
-            (guard.events.clone(), guard.sources.iter().map(|s| s.source.clone()).collect())
+        // Refresh if any head advanced (or first pass).
+        let need_refresh = match self.live.as_ref() {
+            None => true,
+            Some(l) => {
+                if l.cached_heads.len() != self.sources.len() {
+                    true
+                } else {
+                    (0..self.sources.len()).any(|i| {
+                        let head = workspaces.get(i).map(|(_, ws)| ws.head()).unwrap_or(None);
+                        l.cached_heads.get(i).copied().flatten() != head
+                    })
+                }
+            }
         };
+        if need_refresh {
+            self.live = Some(MultiLive::refresh(&self.sources, workspaces));
+        }
 
+        let events = self.live.as_ref().map(|l| l.events.clone()).unwrap_or_default();
+        let sources = self.sources.clone();
         let viewport_height = self.viewport_height;
 
         ctx.section("Activity", |ctx| {

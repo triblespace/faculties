@@ -1,40 +1,38 @@
 //! Full-featured GORBIE-embeddable wiki viewer.
 //!
-//! Renders wiki fragments from a triblespace pile. The viewer opens the
-//! pile lazily on first render, then provides:
+//! Renders wiki fragments from a triblespace pile. The widget holds only
+//! UI state plus cached query results; the host is responsible for
+//! pulling the wiki branch (and optionally a files branch) and passing
+//! the workspaces in at render time:
 //!
-//! - A pile-path/search bar at the top
+//! ```ignore
+//! let mut viewer = WikiViewer::default();
+//! // Inside a GORBIE card, with `wiki_ws` and optional `files_ws`:
+//! viewer.render(ctx, wiki_ws, files_ws);
+//! ```
+//!
+//! Features:
+//! - Search bar at the top
 //! - A force-directed graph of fragments + their `links_to` edges (GPU,
 //!   with optional FDEB edge bundling)
 //! - Floating wiki-page cards that open when the user clicks a node, a
 //!   `wiki:<hex>` link in typst content, or a file entry
 //! - Version navigation (prev/next/latest) on fragments with history
 //! - `files:` link handling — resolves a 32-char entity id or 64-char
-//!   content hash to a file blob, writes it to `$TMPDIR/liora-files/`,
-//!   and opens it via the platform `open` command
-//!
-//! The widget is `Send + Sync` (needed for `GORBIE::NotebookCtx::state`).
-//! The live connection wraps `Workspace<Pile<Blake3>>`, which is not
-//! `Sync` on its own, so it lives behind a `parking_lot::Mutex`.
-//!
-//! ```ignore
-//! let mut viewer = WikiViewer::new("./self.pile");
-//! // Inside a GORBIE card:
-//! viewer.render(ctx);
-//! ```
+//!   content hash to a file blob (against the optional files workspace),
+//!   writes it to `$TMPDIR/liora-files/`, and opens it via the platform
+//!   `open` command.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
 
 use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-use parking_lot::Mutex;
 use GORBIE::prelude::CardCtx;
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
+use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{TryToValue, Value};
@@ -42,9 +40,8 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobschemas::{FileBytes, LongString};
 use triblespace::prelude::View;
 
-use crate::schemas::files::{file, FILES_BRANCH_NAME, KIND_FILE};
-use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID, WIKI_BRANCH_NAME};
-use crate::widgets::live::SharedPile;
+use crate::schemas::files::{file, KIND_FILE};
+use crate::schemas::wiki::{attrs as wiki, KIND_VERSION_ID, TAG_ARCHIVED_ID};
 
 /// Handle to a long-string blob living in a pile.
 type TextHandle = Value<Handle<Blake3, LongString>>;
@@ -57,56 +54,59 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-// ── live wiki connection ─────────────────────────────────────────────
+// ── cached wiki query state ──────────────────────────────────────────
 
-/// Opened pile + cached wiki/files fact spaces + workspaces for blob reads.
+/// Cached fact spaces + head marker. Rebuilt when the wiki workspace's
+/// head advances past `cached_head` (i.e. we pushed something, or the
+/// host re-pulled after an external write).
 struct WikiLive {
     wiki_space: TribleSet,
     files_space: TribleSet,
-    wiki_ws: Workspace<Pile<Blake3>>,
-    files_ws: Option<Workspace<Pile<Blake3>>>,
+    cached_head: Option<CommitHandle>,
+    files_cached_head: Option<CommitHandle>,
 }
 
 impl WikiLive {
-    fn open(pile: SharedPile) -> Result<Self, String> {
-        let mut wiki_ws = pile.pull_branch(WIKI_BRANCH_NAME)?;
+    /// Refresh cached fact spaces from the provided workspaces. Pulls
+    /// fresh `TribleSet`s via `checkout(..)`.
+    fn refresh(
+        wiki_ws: &mut Workspace<Pile<Blake3>>,
+        files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+    ) -> Self {
         let wiki_space = wiki_ws
             .checkout(..)
-            .map_err(|e| format!("checkout wiki: {e:?}"))?
-            .into_facts();
+            .map(|co| co.into_facts())
+            .unwrap_or_else(|e| {
+                eprintln!("[wiki] checkout: {e:?}");
+                TribleSet::new()
+            });
+        let cached_head = wiki_ws.head();
 
-        let (files_space, files_ws) = match pile.pull_branch(FILES_BRANCH_NAME) {
-            Ok(mut files_ws) => match files_ws.checkout(..) {
-                Ok(co) => (co.into_facts(), Some(files_ws)),
-                Err(e) => {
-                    eprintln!("[files] checkout {FILES_BRANCH_NAME}: {e:?}");
-                    (TribleSet::new(), None)
-                }
-            },
-            Err(e) => {
-                // Only print if it's not just a missing branch.
-                if !e.contains(&format!("no '{FILES_BRANCH_NAME}' branch")) {
-                    eprintln!("[files] pull {FILES_BRANCH_NAME}: {e}");
-                } else {
-                    eprintln!(
-                        "[files] no '{FILES_BRANCH_NAME}' branch found — file links will not resolve"
-                    );
-                }
-                (TribleSet::new(), None)
+        let (files_space, files_cached_head) = match files_ws {
+            Some(ws) => {
+                let head = ws.head();
+                let space = ws
+                    .checkout(..)
+                    .map(|co| co.into_facts())
+                    .unwrap_or_else(|e| {
+                        eprintln!("[files] checkout: {e:?}");
+                        TribleSet::new()
+                    });
+                (space, head)
             }
+            None => (TribleSet::new(), None),
         };
 
-        Ok(WikiLive {
+        WikiLive {
             wiki_space,
             files_space,
-            wiki_ws,
-            files_ws,
-        })
+            cached_head,
+            files_cached_head,
+        }
     }
 
-    fn text(&mut self, h: TextHandle) -> String {
-        self.wiki_ws
-            .get::<View<str>, LongString>(h)
+    fn text(&self, ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+        ws.get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -114,9 +114,12 @@ impl WikiLive {
             .unwrap_or_default()
     }
 
-    fn file_text(&mut self, h: TextHandle) -> String {
-        self.files_ws
-            .as_mut()
+    fn file_text(
+        &self,
+        files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        h: TextHandle,
+    ) -> String {
+        files_ws
             .and_then(|ws| ws.get::<View<str>, LongString>(h).ok())
             .map(|v| {
                 let s: &str = v.as_ref();
@@ -195,17 +198,17 @@ impl WikiLive {
         .map(|(vid, _)| vid)
     }
 
-    fn title(&mut self, vid: Id) -> String {
+    fn title(&self, wiki_ws: &mut Workspace<Pile<Blake3>>, vid: Id) -> String {
         find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::title: ?h }]))
             .next()
-            .map(|h| self.text(h))
+            .map(|h| self.text(wiki_ws, h))
             .unwrap_or_default()
     }
 
-    fn content(&mut self, vid: Id) -> String {
+    fn content(&self, wiki_ws: &mut Workspace<Pile<Blake3>>, vid: Id) -> String {
         find!(h: TextHandle, pattern!(&self.wiki_space, [{ vid @ wiki::content: ?h }]))
             .next()
-            .map(|h| self.text(h))
+            .map(|h| self.text(wiki_ws, h))
             .unwrap_or_default()
     }
 
@@ -228,7 +231,7 @@ impl WikiLive {
     }
 
     /// Latest non-archived (fragment_id, version_id) pairs sorted by title.
-    fn fragments_sorted(&mut self) -> Vec<(Id, Id)> {
+    fn fragments_sorted(&self, wiki_ws: &mut Workspace<Pile<Blake3>>) -> Vec<(Id, Id)> {
         let mut latest: BTreeMap<Id, (Id, i128)> = BTreeMap::new();
         for (vid, frag, ts) in find!(
             (vid: Id, frag: Id, ts: (i128, i128)),
@@ -253,9 +256,9 @@ impl WikiLive {
             .filter(|(_, vid)| !self.is_archived(*vid))
             .collect();
         entries.sort_by(|a, b| {
-            self.title(a.1)
+            self.title(wiki_ws, a.1)
                 .to_lowercase()
-                .cmp(&self.title(b.1).to_lowercase())
+                .cmp(&self.title(wiki_ws, b.1).to_lowercase())
         });
         entries
     }
@@ -265,7 +268,11 @@ impl WikiLive {
     /// Resolve a `files:<hex>` URL fragment. `hex` must be either a
     /// 32-char file-entity id or a 64-char blake3 content hash. Returns
     /// the blob handle and a file name (or "file" if none is known).
-    fn resolve_file(&mut self, hex: &str) -> Option<(FileHandle, String)> {
+    fn resolve_file(
+        &self,
+        files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+        hex: &str,
+    ) -> Option<(FileHandle, String)> {
         let (entity_id, handle) = if hex.len() == 32 {
             let eid = Id::from_hex(hex)?;
             let h = find!(
@@ -298,7 +305,7 @@ impl WikiLive {
             pattern!(&self.files_space, [{ entity_id @ file::name: ?h }])
         )
         .next()
-        .map(|h| self.file_text(h))
+        .map(|h| self.file_text(files_ws, h))
         .unwrap_or_else(|| "file".to_string());
 
         Some((handle, name))
@@ -307,21 +314,19 @@ impl WikiLive {
     /// Resolve `files:<hex>`, write the blob to `$TMPDIR/liora-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
-    fn open_file(&mut self, hex: &str) {
-        let Some((handle, name)) = self.resolve_file(hex) else {
+    fn open_file(&self, files_ws: Option<&mut Workspace<Pile<Blake3>>>, hex: &str) {
+        let Some(ws) = files_ws else {
+            eprintln!("[files] no files workspace available");
+            return;
+        };
+        // Resolve using a re-borrow so we can still use the workspace for
+        // the blob read below.
+        let Some((handle, name)) = self.resolve_file(Some(&mut *ws), hex) else {
             eprintln!("[files] could not resolve files:{hex}");
             return;
         };
 
-        let ws = match self.files_ws.as_mut() {
-            Some(ws) => ws,
-            None => {
-                eprintln!("[files] no files workspace available");
-                return;
-            }
-        };
-
-        let result = (|| -> Result<PathBuf, String> {
+        let result = (|| -> Result<std::path::PathBuf, String> {
             let blob: Blob<FileBytes> = ws.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
             let tmp_dir = std::env::temp_dir().join("liora-files");
             std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
@@ -572,8 +577,8 @@ struct GraphNode {
 }
 
 impl WikiGraph {
-    fn from_wiki(live: &mut WikiLive) -> Self {
-        let fragments = live.fragments_sorted();
+    fn from_wiki(live: &WikiLive, wiki_ws: &mut Workspace<Pile<Blake3>>) -> Self {
+        let fragments = live.fragments_sorted(wiki_ws);
         let mut frag_to_idx = BTreeMap::new();
         let mut nodes = Vec::new();
 
@@ -581,7 +586,7 @@ impl WikiGraph {
         for (i, &(frag_id, vid)) in fragments.iter().enumerate() {
             let angle = (i as f32 / n) * std::f32::consts::TAU;
             let radius = 200.0 + n * 5.0;
-            let title = live.title(vid);
+            let title = live.title(wiki_ws, vid);
             frag_to_idx.insert(frag_id, i);
             nodes.push(GraphNode {
                 frag_id,
@@ -1038,150 +1043,65 @@ struct OpenPage {
 
 /// GORBIE-embeddable wiki viewer.
 ///
-/// Opens a triblespace pile lazily on first render. Provides a search
-/// bar, a force-directed graph of fragments (with optional FDEB edge
-/// bundling), and floating wiki-page cards with version navigation and
-/// link interception for both `wiki:` and `files:` URLs.
+/// Holds pure UI state plus a cached query snapshot. The wiki workspace
+/// (and optionally a files workspace, for `files:` link resolution) are
+/// passed in at render time; the viewer refreshes its cached fact space
+/// whenever the wiki workspace's head advances.
 ///
 /// ```ignore
-/// let mut viewer = WikiViewer::new("./self.pile");
-/// // Inside a GORBIE card:
-/// viewer.render(ctx);
+/// let mut viewer = WikiViewer::default();
+/// // Inside a GORBIE card, with `wiki_ws` and optional `files_ws`:
+/// viewer.render(ctx, wiki_ws, files_ws);
 /// ```
+#[derive(Default)]
 pub struct WikiViewer {
-    pile_path: PathBuf,
     search_query: String,
-    /// Optional shared pile supplied by a parent widget. `None` = we
-    /// open our own pile from `pile_path` on first render.
-    shared_pile: Option<SharedPile>,
-    // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's
-    // `NotebookCtx::state` requires that for cross-thread state storage.
-    // `WikiLive` holds a `Workspace<Pile<Blake3>>` which uses `Cell`
-    // internally and is not `Sync`.
-    live: Option<Mutex<WikiLive>>,
-    /// Lazily-initialized once `live` is open (needs queries to build).
+    /// Rebuilt when the wiki workspace's head advances.
+    live: Option<WikiLive>,
+    /// Lazily-initialized once `live` is populated (needs queries to
+    /// build). Dropped whenever `live` is rebuilt.
     graph: Option<WikiGraph>,
     open_pages: Vec<OpenPage>,
-    error: Option<String>,
-    /// Whether we attempted the auto-open on first render.
-    auto_loaded: bool,
 }
 
 impl WikiViewer {
-    /// Build a viewer pointing at a pile on disk. The pile is not opened
-    /// until the first [`render`](Self::render) call.
-    pub fn new(pile_path: impl Into<PathBuf>) -> Self {
-        Self {
-            pile_path: pile_path.into(),
-            search_query: String::new(),
-            shared_pile: None,
-            live: None,
-            graph: None,
-            open_pages: Vec::new(),
-            error: None,
-            auto_loaded: false,
-        }
+    /// Build a viewer with no cached state. State will be populated on
+    /// the first `render` call.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Build a viewer that shares a pile with sibling widgets (e.g.
-    /// inside a [`PileInspector`](crate::widgets::PileInspector)).
-    pub fn with_shared(pile: SharedPile) -> Self {
-        Self {
-            pile_path: pile.path(),
-            search_query: String::new(),
-            shared_pile: Some(pile),
-            live: None,
-            graph: None,
-            open_pages: Vec::new(),
-            error: None,
-            auto_loaded: false,
-        }
-    }
-
-    /// Retarget the viewer at a different pile. If the path has changed,
-    /// the current live state is dropped and the new pile is opened on
-    /// the next render.
-    pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
-        let path = path.into();
-        if path == self.pile_path {
-            return;
-        }
-        self.pile_path = path;
-        self.shared_pile = None;
-        self.live = None;
-        self.graph = None;
-        self.open_pages.clear();
-        self.error = None;
-        self.auto_loaded = false;
-    }
-
-    /// Replace the shared pile handle (e.g. when the parent
-    /// [`PileInspector`](crate::widgets::PileInspector) reopens).
-    pub fn set_shared_pile(&mut self, pile: SharedPile) {
-        self.pile_path = pile.path();
-        self.shared_pile = Some(pile);
-        self.live = None;
-        self.graph = None;
-        self.open_pages.clear();
-        self.error = None;
-        self.auto_loaded = false;
-    }
-
-    /// Attempt to open (or re-open) the pile. Updates `live` and `error`.
-    fn load(&mut self) {
-        // Any previously-built graph refers to the old WikiLive's fact
-        // space / ids — drop it on reload.
-        self.graph = None;
-        self.open_pages.clear();
-        self.error = None;
-        if self.shared_pile.is_none() {
-            match SharedPile::open(&self.pile_path) {
-                Ok(p) => self.shared_pile = Some(p),
-                Err(e) => {
-                    self.live = None;
-                    self.error = Some(e);
-                    return;
-                }
-            }
-        }
-        let Some(pile) = self.shared_pile.clone() else {
-            return;
-        };
-        match WikiLive::open(pile) {
-            Ok(live) => self.live = Some(Mutex::new(live)),
-            Err(e) => {
-                self.live = None;
-                self.error = Some(e);
-            }
-        }
-    }
-
-    /// Render the viewer into a GORBIE card context.
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
+    /// Render the viewer into a GORBIE card context. `wiki_ws` must point
+    /// at the wiki branch; `files_ws` is optional — when provided, the
+    /// viewer will resolve `files:<hex>` links and open the resulting
+    /// blobs via the platform `open` command.
+    pub fn render(
+        &mut self,
+        ctx: &mut CardCtx<'_>,
+        wiki_ws: &mut Workspace<Pile<Blake3>>,
+        mut files_ws: Option<&mut Workspace<Pile<Blake3>>>,
+    ) {
         ctx.section("Wiki", |ctx| {
-        // Lazy pile open on first render.
-        if !self.auto_loaded {
-            self.auto_loaded = true;
-            self.load();
-        }
-
-        // Error banner — pile path is now managed by the parent
-        // (PileInspector / host notebook).
-        if let Some(err) = &self.error {
-            ctx.grid(|g| {
-                g.full(|ctx| {
-                    let color = ctx.visuals().error_fg_color;
-                    ctx.label(egui::RichText::new(err.as_str()).color(color).monospace());
-                });
-            });
-        }
-
-        let Some(live_lock) = self.live.as_ref() else {
-            return;
+        // Refresh cached spaces if the wiki head has advanced since the
+        // last frame (push happened, external write, or first render).
+        let wiki_head = wiki_ws.head();
+        let files_head = files_ws.as_ref().and_then(|ws| ws.head());
+        let need_refresh = match self.live.as_ref() {
+            None => true,
+            Some(l) => l.cached_head != wiki_head || l.files_cached_head != files_head,
         };
-        // Mutex is never contended (widget is only touched on the UI
-        // thread), but it's what lets WikiViewer be Sync.
-        let mut live = live_lock.lock();
+        if need_refresh {
+            self.live = Some(WikiLive::refresh(
+                wiki_ws,
+                files_ws.as_mut().map(|w| &mut **w),
+            ));
+            self.graph = None;
+        }
+
+        let live = match self.live.as_ref() {
+            Some(l) => l,
+            None => return,
+        };
 
         // ── search bar ───────────────────────────────────────────────
         let mut submit_query: Option<String> = None;
@@ -1202,10 +1122,10 @@ impl WikiViewer {
                 live.resolve_prefix(&q)
             } else {
                 let q_lower = q.to_lowercase();
-                let frags = live.fragments_sorted();
+                let frags = live.fragments_sorted(wiki_ws);
                 frags
                     .iter()
-                    .find(|(_, vid)| live.title(*vid).to_lowercase().contains(&q_lower))
+                    .find(|(_, vid)| live.title(wiki_ws, *vid).to_lowercase().contains(&q_lower))
                     .map(|(frag_id, _)| *frag_id)
             };
             if let Some(frag_id) = found {
@@ -1221,7 +1141,7 @@ impl WikiViewer {
 
         // ── force-directed graph ─────────────────────────────────────
         if self.graph.is_none() {
-            self.graph = Some(WikiGraph::from_wiki(&mut live));
+            self.graph = Some(WikiGraph::from_wiki(live, wiki_ws));
         }
         if let Some(graph) = self.graph.as_mut() {
             ctx.grid(|g| {
@@ -1279,8 +1199,8 @@ impl WikiViewer {
 
             let history = live.version_history(frag_id);
             let vid = pinned.or_else(|| live.latest_version(frag_id));
-            let title = vid.map(|v| live.title(v)).unwrap_or_default();
-            let content = vid.map(|v| live.content(v)).unwrap_or_default();
+            let title = vid.map(|v| live.title(wiki_ws, v)).unwrap_or_default();
+            let content = vid.map(|v| live.content(wiki_ws, v)).unwrap_or_default();
             let current_idx = vid.and_then(|v| history.iter().position(|&h| h == v));
             let n_versions = history.len();
 
@@ -1389,7 +1309,7 @@ impl WikiViewer {
             });
         }
         for hex in to_open_file {
-            live.open_file(&hex);
+            live.open_file(files_ws.as_mut().map(|w| &mut **w), &hex);
         }
         });
     }

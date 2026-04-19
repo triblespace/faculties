@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::CompassBoard;
+use faculties::widgets::{CompassBoard, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -28,6 +28,10 @@ fn main(nb: &mut NotebookCtx) {
         .or_else(|| std::env::var("BRANCH").ok())
         .unwrap_or_else(|| "compass".to_owned());
 
+    let storage = nb.state("storage", StorageState::new(pile_path), |ctx, st| {
+        st.top_bar(ctx);
+    });
+
     nb.view(|ctx| {
         ctx.grid(|g| {
             g.full(|ctx| {
@@ -38,11 +42,10 @@ fn main(nb: &mut NotebookCtx) {
         });
     });
 
-    nb.state(
-        "compass",
-        CompassBoard::new(pile_path, branch),
-        |ctx, board| {
-            board.render(ctx);
-        },
-    );
+    nb.state("compass", CompassBoard::default(), move |ctx, board| {
+        let mut st = storage.read_mut(ctx);
+        let Some(ws) = st.ensure_workspace(&branch) else { return };
+        board.render(ctx, ws);
+        st.push_if_dirty(&branch);
+    });
 }

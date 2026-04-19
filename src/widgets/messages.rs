@@ -2,41 +2,41 @@
 //!
 //! Renders the append-only direct messages kept on a pile's
 //! `local-messages` branch as a chronological chat log: oldest at the
-//! top, newest at the bottom. When constructed via
+//! top, newest at the bottom. When constructed with a current user via
 //! [`MessagesPanel::with_user`], the panel also supports composing new
-//! messages and automatically committing read-receipts for the current
-//! user's inbound messages.
+//! messages and automatically committing read-receipts for inbound
+//! messages addressed to that user.
 //!
-//! Identity display is resolved against the pile's `relations` branch.
-//! A person's display name falls back through `alias → first_name
-//! last_name → display_name → 8-char hex prefix`. If the relations
-//! branch is absent the widget quietly degrades to the hex-prefix view.
+//! The widget holds UI + cached-query state only; the host supplies the
+//! local-messages workspace (required) and an optional `relations`
+//! workspace at render time.
 //!
-//! Sender and recipient color chips use
+//! Identity display is resolved against the relations branch (if
+//! supplied): `alias → first_name last_name → display_name → 8-char hex
+//! prefix`. If relations is absent the widget quietly degrades to the
+//! hex-prefix view. Per-person color chips use
 //! `GORBIE::themes::colorhash::ral_categorical` keyed on the user id
-//! bytes, so the same person always gets the same hue.
+//! bytes.
 //!
 //! ```ignore
 //! // Read-only (anonymous):
-//! let mut panel = MessagesPanel::new("./self.pile", "local-messages");
+//! let mut panel = MessagesPanel::default();
+//! panel.render(ctx, messages_ws, Some(relations_ws));
 //!
 //! // Interactive (composes + marks read as `me`):
-//! let mut panel = MessagesPanel::with_user("./self.pile", "local-messages", me)
+//! let mut panel = MessagesPanel::with_user(me)
 //!     .with_default_recipient(peer);
-//! // Inside a GORBIE card:
-//! panel.render(ctx);
+//! panel.render(ctx, messages_ws, Some(relations_ws));
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
-use parking_lot::Mutex;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 use triblespace::core::id::{ufoid, ExclusiveId, Id};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
+use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{TryToValue, Value};
@@ -47,12 +47,6 @@ use triblespace::prelude::View;
 
 use crate::schemas::local_messages::{local, KIND_MESSAGE_ID, KIND_READ_ID};
 use crate::schemas::relations::{relations as rel, KIND_PERSON_ID};
-use crate::widgets::live::SharedPile;
-
-/// Default branch name the local-messages faculty writes to.
-pub const LOCAL_MESSAGES_BRANCH_NAME: &str = "local-messages";
-/// Default branch name the relations faculty writes to.
-pub const RELATIONS_BRANCH_NAME: &str = "relations";
 
 /// Handle to a long-string blob (message bodies).
 type TextHandle = Value<Handle<Blake3, LongString>>;
@@ -198,210 +192,65 @@ impl Person {
     }
 }
 
-// ── Live messages connection (read + write) ──────────────────────────
+// ── Cached message query state ───────────────────────────────────────
 
-/// Holds the shared pile handle and active workspaces for the
-/// local-messages + (optional) relations branches. Queries run against
-/// the cached `space`s; writes build a change tribleset, call
-/// `ws.commit(..)`, push via `try_push`, then `refresh`.
+/// Cached fact spaces + head markers + resolved people map. Rebuilt
+/// whenever the local-messages head advances or the relations head
+/// changes.
 struct MessagesLive {
-    branch_name: String,
     space: TribleSet,
-    ws: Workspace<Pile<Blake3>>,
-    pile: SharedPile,
-
-    /// `true` if the relations branch exists on this pile.
-    has_relations: bool,
-    relations_space: TribleSet,
-    relations_ws: Option<Workspace<Pile<Blake3>>>,
+    cached_head: Option<CommitHandle>,
+    relations_cached_head: Option<CommitHandle>,
     people: HashMap<Id, Person>,
 }
 
 impl MessagesLive {
-    fn open(pile: SharedPile, branch_name: &str) -> Result<Self, String> {
-        let mut ws = pile.pull_branch(branch_name)?;
+    /// Refresh cached fact spaces + people map from the provided
+    /// workspaces.
+    fn refresh(
+        ws: &mut Workspace<Pile<Blake3>>,
+        relations_ws: Option<&mut Workspace<Pile<Blake3>>>,
+    ) -> Self {
         let space = ws
             .checkout(..)
-            .map_err(|e| format!("checkout {branch_name}: {e:?}"))?
-            .into_facts();
+            .map(|co| co.into_facts())
+            .unwrap_or_else(|e| {
+                eprintln!("[messages] checkout: {e:?}");
+                TribleSet::new()
+            });
+        let cached_head = ws.head();
 
-        // Relations branch is best-effort: absence just means we show
-        // hex prefixes instead of friendly names.
-        let (has_relations, relations_space, relations_ws) =
-            match pile.pull_branch(RELATIONS_BRANCH_NAME) {
-                Ok(mut rws) => match rws.checkout(..) {
-                    Ok(co) => (true, co.into_facts(), Some(rws)),
-                    Err(e) => {
+        let (relations_cached_head, people) = match relations_ws {
+            Some(rws) => {
+                let head = rws.head();
+                let rspace = rws
+                    .checkout(..)
+                    .map(|co| co.into_facts())
+                    .unwrap_or_else(|e| {
                         eprintln!("[messages] relations checkout: {e:?}");
-                        (false, TribleSet::new(), None)
-                    }
-                },
-                Err(e) => {
-                    // No relations branch is the common case; only log
-                    // if it's not a plain missing-branch error.
-                    if !e.contains("no 'relations' branch") {
-                        eprintln!("[messages] relations pull: {e}");
-                    }
-                    (false, TribleSet::new(), None)
-                }
-            };
-
-        let mut live = MessagesLive {
-            branch_name: branch_name.to_string(),
-            space,
-            ws,
-            pile,
-            has_relations,
-            relations_space,
-            relations_ws,
-            people: HashMap::new(),
+                        TribleSet::new()
+                    });
+                let people = build_people(&rspace, rws);
+                (head, people)
+            }
+            None => (None, HashMap::new()),
         };
-        live.rebuild_people();
-        Ok(live)
-    }
 
-    /// Re-pull both the local-messages and relations branches and
-    /// rebuild the people map. Called after each successful commit.
-    fn refresh(&mut self) -> Result<(), String> {
-        let mut ws = self.pile.pull_branch(&self.branch_name)?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| format!("checkout {}: {e:?}", self.branch_name))?
-            .into_facts();
-        self.ws = ws;
-        self.space = space;
-
-        if self.has_relations {
-            match self.pile.pull_branch(RELATIONS_BRANCH_NAME) {
-                Ok(mut rws) => match rws.checkout(..) {
-                    Ok(co) => {
-                        self.relations_space = co.into_facts();
-                        self.relations_ws = Some(rws);
-                    }
-                    Err(e) => eprintln!("[messages] relations checkout on refresh: {e:?}"),
-                },
-                Err(e) => eprintln!("[messages] relations pull on refresh: {e}"),
-            }
-        }
-        self.rebuild_people();
-        Ok(())
-    }
-
-    /// Commit a change and push. On CAS conflict: refresh and return an
-    /// error string so the caller can surface it as a toast.
-    fn commit_and_push(&mut self, change: TribleSet, message: &str) -> Result<(), String> {
-        self.ws.commit(change, message);
-        match self.pile.try_push(&mut self.ws) {
-            Ok(None) => self.refresh(),
-            Ok(Some(_conflict_ws)) => {
-                let _ = self.refresh();
-                Err("branch advanced concurrently — please retry".to_string())
-            }
-            Err(e) => {
-                let _ = self.refresh();
-                Err(format!("push: {e:?}"))
-            }
+        MessagesLive {
+            space,
+            cached_head,
+            relations_cached_head,
+            people,
         }
     }
 
-    fn text(&mut self, h: TextHandle) -> String {
-        self.ws
-            .get::<View<str>, LongString>(h)
+    fn text(&self, ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+        ws.get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
             })
             .unwrap_or_default()
-    }
-
-    fn relations_text(&mut self, h: TextHandle) -> Option<String> {
-        self.relations_ws
-            .as_mut()
-            .and_then(|ws| ws.get::<View<str>, LongString>(h).ok())
-            .map(|v| {
-                let s: &str = v.as_ref();
-                s.to_string()
-            })
-    }
-
-    /// Rebuild `people` from the cached `relations_space`. Done once on
-    /// open and again after every successful commit.
-    fn rebuild_people(&mut self) {
-        self.people.clear();
-        if self.relations_ws.is_none() {
-            return;
-        }
-
-        let person_ids: Vec<Id> = find!(
-            pid: Id,
-            pattern!(&self.relations_space, [{ ?pid @ metadata::tag: &KIND_PERSON_ID }])
-        )
-        .collect();
-
-        for pid in &person_ids {
-            self.people.insert(*pid, Person::default());
-        }
-
-        let alias_rows: Vec<(Id, String)> = find!(
-            (pid: Id, alias: String),
-            pattern!(&self.relations_space, [{ ?pid @ rel::alias: ?alias }])
-        )
-        .collect();
-        for (pid, alias) in alias_rows {
-            if let Some(p) = self.people.get_mut(&pid) {
-                // Keep the lexicographically-first alias so the rendered
-                // name is stable across runs.
-                match p.alias.as_ref() {
-                    Some(existing) if existing.as_str() <= alias.as_str() => {}
-                    _ => p.alias = Some(alias),
-                }
-            }
-        }
-
-        let first_rows: Vec<(Id, TextHandle)> = find!(
-            (pid: Id, h: TextHandle),
-            pattern!(&self.relations_space, [{ ?pid @ rel::first_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in first_rows {
-            if self.people.contains_key(&pid) {
-                if let Some(v) = self.relations_text(h) {
-                    if let Some(p) = self.people.get_mut(&pid) {
-                        p.first_name.get_or_insert(v);
-                    }
-                }
-            }
-        }
-
-        let last_rows: Vec<(Id, TextHandle)> = find!(
-            (pid: Id, h: TextHandle),
-            pattern!(&self.relations_space, [{ ?pid @ rel::last_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in last_rows {
-            if self.people.contains_key(&pid) {
-                if let Some(v) = self.relations_text(h) {
-                    if let Some(p) = self.people.get_mut(&pid) {
-                        p.last_name.get_or_insert(v);
-                    }
-                }
-            }
-        }
-
-        let display_rows: Vec<(Id, TextHandle)> = find!(
-            (pid: Id, h: TextHandle),
-            pattern!(&self.relations_space, [{ ?pid @ rel::display_name: ?h }])
-        )
-        .collect();
-        for (pid, h) in display_rows {
-            if self.people.contains_key(&pid) {
-                if let Some(v) = self.relations_text(h) {
-                    if let Some(p) = self.people.get_mut(&pid) {
-                        p.display_name.get_or_insert(v);
-                    }
-                }
-            }
-        }
     }
 
     /// Friendly display name for an Id, falling back to hex prefix.
@@ -425,7 +274,7 @@ impl MessagesLive {
 
     /// Collect every message with its from/to/body/created_at and fold
     /// in the read-receipt events that target it.
-    fn messages(&mut self) -> Vec<MessageRow> {
+    fn messages(&self, ws: &mut Workspace<Pile<Blake3>>) -> Vec<MessageRow> {
         let mut by_id: HashMap<Id, MessageRow> = HashMap::new();
 
         let rows: Vec<(Id, Id, Id, TextHandle, (i128, i128))> = find!(
@@ -451,7 +300,7 @@ impl MessagesLive {
             if by_id.contains_key(&mid) {
                 continue;
             }
-            let body = self.text(body_handle);
+            let body = self.text(ws, body_handle);
             by_id.insert(
                 mid,
                 MessageRow {
@@ -497,12 +346,13 @@ impl MessagesLive {
     }
 
     // ── Write operations (mirror faculty CLI fact shapes) ─────────────
+    // The host pushes the workspace after render; see StorageState.
 
-    fn send_message(&mut self, from: Id, to: Id, body: String) -> Result<Id, String> {
+    fn send_message(ws: &mut Workspace<Pile<Blake3>>, from: Id, to: Id, body: String) -> Id {
         let msg_id: ExclusiveId = ufoid();
         let msg_ref: Id = msg_id.id;
         let now = epoch_interval(now_epoch());
-        let body_handle = self.ws.put::<LongString, _>(body);
+        let body_handle = ws.put::<LongString, _>(body);
 
         let mut change = TribleSet::new();
         change += entity! { &msg_id @
@@ -513,11 +363,11 @@ impl MessagesLive {
             metadata::created_at: now,
         };
 
-        self.commit_and_push(change, "local message")?;
-        Ok(msg_ref)
+        ws.commit(change, "local message");
+        msg_ref
     }
 
-    fn mark_read(&mut self, message_id: Id, reader: Id) -> Result<(), String> {
+    fn mark_read(ws: &mut Workspace<Pile<Blake3>>, message_id: Id, reader: Id) {
         let now = epoch_interval(now_epoch());
         let read_id: ExclusiveId = ufoid();
         let mut change = TribleSet::new();
@@ -527,8 +377,93 @@ impl MessagesLive {
             local::reader: &reader,
             local::read_at: now,
         };
-        self.commit_and_push(change, "local message read")
+        ws.commit(change, "local message read");
     }
+}
+
+/// Build the people map by scanning the relations fact space.
+fn build_people(
+    relations_space: &TribleSet,
+    relations_ws: &mut Workspace<Pile<Blake3>>,
+) -> HashMap<Id, Person> {
+    let mut people: HashMap<Id, Person> = HashMap::new();
+
+    let person_ids: Vec<Id> = find!(
+        pid: Id,
+        pattern!(relations_space, [{ ?pid @ metadata::tag: &KIND_PERSON_ID }])
+    )
+    .collect();
+    for pid in &person_ids {
+        people.insert(*pid, Person::default());
+    }
+
+    let alias_rows: Vec<(Id, String)> = find!(
+        (pid: Id, alias: String),
+        pattern!(relations_space, [{ ?pid @ rel::alias: ?alias }])
+    )
+    .collect();
+    for (pid, alias) in alias_rows {
+        if let Some(p) = people.get_mut(&pid) {
+            match p.alias.as_ref() {
+                Some(existing) if existing.as_str() <= alias.as_str() => {}
+                _ => p.alias = Some(alias),
+            }
+        }
+    }
+
+    let relations_text = |ws: &mut Workspace<Pile<Blake3>>, h: TextHandle| -> Option<String> {
+        ws.get::<View<str>, LongString>(h).ok().map(|v| {
+            let s: &str = v.as_ref();
+            s.to_string()
+        })
+    };
+
+    let first_rows: Vec<(Id, TextHandle)> = find!(
+        (pid: Id, h: TextHandle),
+        pattern!(relations_space, [{ ?pid @ rel::first_name: ?h }])
+    )
+    .collect();
+    for (pid, h) in first_rows {
+        if people.contains_key(&pid) {
+            if let Some(v) = relations_text(relations_ws, h) {
+                if let Some(p) = people.get_mut(&pid) {
+                    p.first_name.get_or_insert(v);
+                }
+            }
+        }
+    }
+
+    let last_rows: Vec<(Id, TextHandle)> = find!(
+        (pid: Id, h: TextHandle),
+        pattern!(relations_space, [{ ?pid @ rel::last_name: ?h }])
+    )
+    .collect();
+    for (pid, h) in last_rows {
+        if people.contains_key(&pid) {
+            if let Some(v) = relations_text(relations_ws, h) {
+                if let Some(p) = people.get_mut(&pid) {
+                    p.last_name.get_or_insert(v);
+                }
+            }
+        }
+    }
+
+    let display_rows: Vec<(Id, TextHandle)> = find!(
+        (pid: Id, h: TextHandle),
+        pattern!(relations_space, [{ ?pid @ rel::display_name: ?h }])
+    )
+    .collect();
+    for (pid, h) in display_rows {
+        if people.contains_key(&pid) {
+            if let Some(v) = relations_text(relations_ws, h) {
+                if let Some(p) = people.get_mut(&pid) {
+                    p.display_name.get_or_insert(v);
+                }
+            }
+        }
+    }
+
+    people
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -539,24 +474,14 @@ impl MessagesLive {
 ///
 /// See the module docs for construction examples.
 pub struct MessagesPanel {
-    pile_path: PathBuf,
-    branch_name: String,
     /// Current user (sender of composed messages, reader for receipts).
     /// `None` = read-only panel; compose UI hidden, no receipts.
     me: Option<Id>,
     /// Preset recipient for composed messages. If `None`, the compose
     /// UI shows a picker populated from the relations branch.
     default_recipient: Option<Id>,
-    /// Optional shared pile supplied by a parent widget. `None` = we
-    /// open our own pile from `pile_path` on first render.
-    shared_pile: Option<SharedPile>,
-    // Wrapped in a Mutex so the widget is `Send + Sync`. GORBIE's state
-    // storage requires that across threads, and `Workspace<Pile<Blake3>>`
-    // uses interior-mutability types (Cell/RefCell) that aren't Sync.
-    live: Option<Mutex<MessagesLive>>,
-    error: Option<String>,
-    /// Transient error toast from the last write (clears on next success).
-    toast: Option<String>,
+    /// Rebuilt when the messages / relations head changes.
+    live: Option<MessagesLive>,
 
     viewport_height: f32,
     /// Composer text buffer.
@@ -582,47 +507,12 @@ pub struct MessagesPanel {
     first_render: bool,
 }
 
-impl MessagesPanel {
-    /// Read-only panel (anonymous — shows names but no compose UI,
-    /// no read-receipts).
-    pub fn new(pile_path: impl Into<PathBuf>, branch_name: impl Into<String>) -> Self {
-        let mut s = Self::with_shared_deferred(branch_name);
-        s.pile_path = pile_path.into();
-        s
-    }
-
-    /// Interactive panel — composer is active, and inbound messages
-    /// addressed to `me` get auto-acknowledged with a read-receipt
-    /// (once per message per session).
-    pub fn with_user(
-        pile_path: impl Into<PathBuf>,
-        branch_name: impl Into<String>,
-        me: Id,
-    ) -> Self {
-        let mut s = Self::new(pile_path, branch_name);
-        s.me = Some(me);
-        s
-    }
-
-    /// Build a read-only panel that shares a pile with sibling widgets
-    /// (e.g. inside a [`PileInspector`](crate::widgets::PileInspector)).
-    pub fn with_shared(pile: SharedPile, branch_name: impl Into<String>) -> Self {
-        let mut s = Self::with_shared_deferred(branch_name);
-        s.pile_path = pile.path();
-        s.shared_pile = Some(pile);
-        s
-    }
-
-    fn with_shared_deferred(branch_name: impl Into<String>) -> Self {
+impl Default for MessagesPanel {
+    fn default() -> Self {
         Self {
-            pile_path: PathBuf::new(),
-            branch_name: branch_name.into(),
             me: None,
             default_recipient: None,
-            shared_pile: None,
             live: None,
-            error: None,
-            toast: None,
             viewport_height: 500.0,
             compose_draft: String::new(),
             compose_recipient: None,
@@ -633,6 +523,23 @@ impl MessagesPanel {
             read_sent: HashSet::new(),
             first_render: true,
         }
+    }
+}
+
+impl MessagesPanel {
+    /// Read-only panel (anonymous — shows names but no compose UI,
+    /// no read-receipts).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Interactive panel — composer is active, and inbound messages
+    /// addressed to `me` get auto-acknowledged with a read-receipt
+    /// (once per message per session).
+    pub fn with_user(me: Id) -> Self {
+        let mut s = Self::default();
+        s.me = Some(me);
+        s
     }
 
     /// Address the next composed message to a specific recipient. If
@@ -648,86 +555,41 @@ impl MessagesPanel {
         self
     }
 
-    /// Retarget at a different pile. No-op if the path is unchanged.
-    pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
-        let path = path.into();
-        if path == self.pile_path {
-            return;
-        }
-        self.pile_path = path;
-        self.shared_pile = None;
-        self.live = None;
-        self.error = None;
-        self.toast = None;
-        self.compose_draft.clear();
-        self.compose_recipient = None;
-        self.last_message_count = 0;
-        self.scroll_to_bottom = false;
-        self.user_scrolled_up = false;
-        self.pending_new = 0;
-        self.read_sent.clear();
-        self.first_render = true;
-    }
-
-    /// Replace the shared pile handle (e.g. when the parent
-    /// [`PileInspector`](crate::widgets::PileInspector) reopens).
-    pub fn set_shared_pile(&mut self, pile: SharedPile) {
-        self.pile_path = pile.path();
-        self.shared_pile = Some(pile);
-        self.live = None;
-        self.error = None;
-        self.toast = None;
-        self.compose_draft.clear();
-        self.compose_recipient = None;
-        self.last_message_count = 0;
-        self.scroll_to_bottom = false;
-        self.user_scrolled_up = false;
-        self.pending_new = 0;
-        self.read_sent.clear();
-        self.first_render = true;
-    }
-
-    /// Render the panel into a GORBIE card context.
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
-        // Lazy pile open on first render.
-        if self.live.is_none() && self.error.is_none() {
-            if self.shared_pile.is_none() {
-                match SharedPile::open(&self.pile_path) {
-                    Ok(p) => self.shared_pile = Some(p),
-                    Err(e) => self.error = Some(e),
-                }
-            }
-            if let Some(pile) = self.shared_pile.clone() {
-                match MessagesLive::open(pile, &self.branch_name) {
-                    Ok(live) => self.live = Some(Mutex::new(live)),
-                    Err(e) => self.error = Some(e),
-                }
-            }
+    /// Render the panel. `ws` must point at the local-messages branch;
+    /// `relations_ws` is optional and, when provided, is used for
+    /// friendly-name resolution.
+    pub fn render(
+        &mut self,
+        ctx: &mut CardCtx<'_>,
+        ws: &mut Workspace<Pile<Blake3>>,
+        mut relations_ws: Option<&mut Workspace<Pile<Blake3>>>,
+    ) {
+        // Refresh cached state if any head advanced.
+        let head = ws.head();
+        let rhead = relations_ws.as_ref().and_then(|w| w.head());
+        let need_refresh = match self.live.as_ref() {
+            None => true,
+            Some(l) => l.cached_head != head || l.relations_cached_head != rhead,
+        };
+        if need_refresh {
+            self.live = Some(MessagesLive::refresh(
+                ws,
+                relations_ws.as_mut().map(|w| &mut **w),
+            ));
         }
 
         ctx.section("Messages", |ctx| {
-            if let Some(err) = &self.error {
-                ctx.label(format!("messages panel error: {err}"));
-                return;
-            }
-
-            let Some(live_lock) = self.live.as_ref() else {
-                ctx.label("messages panel not initialized");
-                return;
-            };
-            let mut live = live_lock.lock();
+            let Some(live) = self.live.as_ref() else { return };
 
             // Pre-materialize everything the UI closure needs.
-            let mut messages = live.messages();
+            let mut messages = live.messages(ws);
             messages.sort_by(|a, b| {
                 a.sort_key()
                     .cmp(&b.sort_key())
                     .then_with(|| a.id.cmp(&b.id))
             });
 
-            // Build a name lookup for every id we'll paint (senders,
-            // recipients, readers) so we never hold the mutex across
-            // the UI closure.
+            // Build a name lookup for every id we'll paint.
             let mut names: HashMap<Id, String> = HashMap::new();
             for m in &messages {
                 names
@@ -758,8 +620,6 @@ impl MessagesPanel {
                 } else {
                     Vec::new()
                 };
-
-            drop(live);
 
             // Detect arrivals (fires on first paint too, but we'll
             // overwrite user_scrolled_up below).
@@ -805,16 +665,6 @@ impl MessagesPanel {
             let count_label = format!("{} messages", messages.len());
             ctx.label(count_label);
 
-            if let Some(msg) = self.toast.as_ref() {
-                let color = ctx.ctx().global_style().visuals.error_fg_color;
-                ctx.label(
-                    egui::RichText::new(msg.as_str())
-                        .color(color)
-                        .monospace()
-                        .small(),
-                );
-            }
-
             let mut send_intent: Option<(Id, String)> = None;
             ctx.grid(|g| g.full(|ctx| {
             let ui = ctx.ui_mut();
@@ -829,7 +679,7 @@ impl MessagesPanel {
             let pending_new_slot = &mut self.pending_new;
 
             let mut scroll = egui::ScrollArea::vertical()
-                .id_salt(("messages_panel", self.branch_name.as_str()))
+                .id_salt(("messages_panel", "root"))
                 .max_height(viewport_height)
                 .auto_shrink([false, false])
                 // Disable drag-to-scroll — see note on compass.rs; prevents
@@ -909,52 +759,37 @@ impl MessagesPanel {
             }
             }));
 
-            // Apply writes after UI closure.
-            if !to_mark_read.is_empty() || send_intent.is_some() {
-                let Some(live_lock) = self.live.as_ref() else {
-                    return;
-                };
-                let mut live = live_lock.lock();
-                let mut err: Option<String> = None;
+            // Apply writes after UI closure. Each helper does a
+            // `ws.commit(..)`; the host pushes between frames via
+            // `StorageState::push_if_dirty`.
+            let mut did_write = false;
+            for mid in to_mark_read {
+                if let Some(me) = self.me {
+                    MessagesLive::mark_read(ws, mid, me);
+                    self.read_sent.insert(mid);
+                    did_write = true;
+                }
+            }
 
-                for mid in to_mark_read {
+            if let Some((to, body)) = send_intent {
+                let trimmed = body.trim();
+                if !trimmed.is_empty() {
                     if let Some(me) = self.me {
-                        match live.mark_read(mid, me) {
-                            Ok(()) => {
-                                self.read_sent.insert(mid);
-                            }
-                            Err(e) => {
-                                err = Some(format!("mark-read failed: {e}"));
-                                break;
-                            }
-                        }
+                        MessagesLive::send_message(ws, me, to, trimmed.to_string());
+                        self.compose_draft.clear();
+                        // Auto-scroll on our own send regardless of
+                        // whether we were scrolled up.
+                        self.scroll_to_bottom = true;
+                        self.user_scrolled_up = false;
+                        self.pending_new = 0;
+                        did_write = true;
                     }
                 }
+            }
 
-                if let Some((to, body)) = send_intent {
-                    let trimmed = body.trim();
-                    if trimmed.is_empty() {
-                        err = Some("message is empty".to_string());
-                    } else if let Some(me) = self.me {
-                        match live.send_message(me, to, trimmed.to_string()) {
-                            Ok(_new_id) => {
-                                self.compose_draft.clear();
-                                // Auto-scroll on our own send regardless
-                                // of whether we were scrolled up.
-                                self.scroll_to_bottom = true;
-                                self.user_scrolled_up = false;
-                                self.pending_new = 0;
-                            }
-                            Err(e) => err = Some(format!("send failed: {e}")),
-                        }
-                    }
-                }
-
-                if let Some(msg) = err {
-                    self.toast = Some(msg);
-                } else {
-                    self.toast = None;
-                }
+            if did_write {
+                // Drop cached state so the next frame re-queries off the new head.
+                self.live = None;
             }
         });
     }

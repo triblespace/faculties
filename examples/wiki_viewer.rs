@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::WikiViewer;
+use faculties::widgets::{StorageState, WikiViewer};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -22,6 +22,10 @@ fn main(nb: &mut NotebookCtx) {
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into();
 
+    let storage = nb.state("storage", StorageState::new(pile_path), |ctx, st| {
+        st.top_bar(ctx);
+    });
+
     nb.view(|ctx| {
         ctx.grid(|g| {
             g.full(|ctx| {
@@ -32,7 +36,19 @@ fn main(nb: &mut NotebookCtx) {
         });
     });
 
-    nb.state("wiki", WikiViewer::new(pile_path), |ctx, viewer| {
-        viewer.render(ctx);
+    nb.state("wiki", WikiViewer::default(), move |ctx, viewer| {
+        let mut st = storage.read_mut(ctx);
+        let _ = st.ensure_workspace("wiki");
+        let _ = st.ensure_workspace("files");
+        let mut pair = st.workspace_many(&["wiki", "files"]);
+        let (files_slot, wiki_slot) = {
+            let mut it = pair.drain(..);
+            let wiki_slot = it.next().flatten();
+            let files_slot = it.next().flatten();
+            (files_slot, wiki_slot)
+        };
+        let Some(wiki_ws) = wiki_slot else { return };
+        viewer.render(ctx, wiki_ws, files_slot);
+        st.push_if_dirty("wiki");
     });
 }

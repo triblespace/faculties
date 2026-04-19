@@ -2,7 +2,13 @@
 //!
 //! Renders goals from a triblespace pile's `compass` branch grouped into
 //! kanban columns by their latest status (default: todo / doing / blocked
-//! / done). Beyond read-only display, the widget supports:
+//! / done). The widget holds only UI + cached-query state; the host is
+//! responsible for pulling the compass branch and passing the workspace
+//! in at render time. Writes go through `Workspace::commit(..)`; pushing
+//! is the host's responsibility (e.g. via
+//! [`StorageState::push_if_dirty`](crate::widgets::StorageState::push_if_dirty)).
+//!
+//! Features beyond read-only display:
 //!
 //! - Composing new goals (title, tags, optional parent, initial status)
 //! - Moving a goal to a new status (click a goal card → pick a status)
@@ -10,31 +16,22 @@
 //! - Parent/child indentation with a collapse toggle per subtree
 //! - Priority arrows: `board::higher` / `board::lower` edges rendered as
 //!   `> over <id_prefix>` badges on the card
-//! - Tag chips colored via `GORBIE::themes::colorhash::ral_categorical`,
-//!   so the same tag string always gets the same hue.
-//!
-//! Writes produce the same fact shapes as the `compass.rs` faculty CLI —
-//! new goal/status/note/prioritize entities tagged with the appropriate
-//! `KIND_*_ID`. Commits go through `Repository::pull → Workspace::commit
-//! → Repository::try_push`; on CAS conflict a side toast is shown and
-//! the user can retry (the next render will have re-pulled).
+//! - Tag chips colored via `GORBIE::themes::colorhash::ral_categorical`.
 //!
 //! ```ignore
-//! let mut board = CompassBoard::new("./self.pile", "compass");
-//! // Inside a GORBIE card:
-//! board.render(ctx);
+//! let mut board = CompassBoard::default();
+//! // Inside a GORBIE card, with `compass_ws`:
+//! board.render(ctx, compass_ws);
 //! ```
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
 
-use parking_lot::Mutex;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 use triblespace::core::id::{ufoid, ExclusiveId, Id};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::Workspace;
+use triblespace::core::repo::{CommitHandle, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::core::value::schemas::hash::{Blake3, Handle};
 use triblespace::core::value::{TryToValue, Value};
@@ -47,10 +44,6 @@ use crate::schemas::compass::{
     board as compass, DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
     KIND_STATUS_ID,
 };
-use crate::widgets::live::SharedPile;
-
-/// Default branch name the compass faculty writes to.
-pub const COMPASS_BRANCH_NAME: &str = "compass";
 
 /// Handle to a long-string blob (titles, notes).
 type TextHandle = Value<Handle<Blake3, LongString>>;
@@ -173,70 +166,33 @@ struct NoteRow {
     body: String,
 }
 
-// ── Live compass connection (read + write) ───────────────────────────
+// ── Cached compass query state ───────────────────────────────────────
 
-/// Holds a shared pile handle plus the active workspace for the compass
-/// branch. Queries run against the cached `space`; writes build a change
-/// tribleset, call `ws.commit(..)`, and push via the shared pile.
+/// Holds a cached fact space for the compass branch plus a head marker.
+/// Queries run against `space`; writes take a `&mut Workspace<Pile>` from
+/// the host and call `ws.commit(..)`. Push is the host's concern.
 struct CompassLive {
-    branch_name: String,
     space: TribleSet,
-    pile: SharedPile,
-    ws: Workspace<Pile<Blake3>>,
+    cached_head: Option<CommitHandle>,
 }
 
 impl CompassLive {
-    fn open(pile: SharedPile, branch_name: &str) -> Result<Self, String> {
-        let mut ws = pile.pull_branch(branch_name)?;
+    fn refresh(ws: &mut Workspace<Pile<Blake3>>) -> Self {
         let space = ws
             .checkout(..)
-            .map_err(|e| format!("checkout {branch_name}: {e:?}"))?
-            .into_facts();
-
-        Ok(CompassLive {
-            branch_name: branch_name.to_string(),
+            .map(|co| co.into_facts())
+            .unwrap_or_else(|e| {
+                eprintln!("[compass] checkout: {e:?}");
+                TribleSet::new()
+            });
+        Self {
             space,
-            pile,
-            ws,
-        })
-    }
-
-    /// Refresh the cached fact space after a successful commit+push. We
-    /// re-pull the branch (cheap: just re-fetches head metadata and
-    /// rebuilds the workspace) and re-checkout to pick up the new commit.
-    fn refresh(&mut self) -> Result<(), String> {
-        let mut ws = self.pile.pull_branch(&self.branch_name)?;
-        let space = ws
-            .checkout(..)
-            .map_err(|e| format!("checkout {}: {e:?}", self.branch_name))?
-            .into_facts();
-        self.ws = ws;
-        self.space = space;
-        Ok(())
-    }
-
-    /// Commit a change and push. On push CAS conflict this returns an
-    /// error string — the caller is expected to surface it as a toast.
-    fn commit_and_push(&mut self, change: TribleSet, message: &str) -> Result<(), String> {
-        self.ws.commit(change, message);
-        match self.pile.try_push(&mut self.ws) {
-            Ok(None) => self.refresh(),
-            Ok(Some(_conflict_ws)) => {
-                // CAS conflict. Drop our local workspace state by re-pulling,
-                // and surface the conflict so the user knows to retry.
-                let _ = self.refresh();
-                Err("branch advanced concurrently — please retry".to_string())
-            }
-            Err(e) => {
-                let _ = self.refresh();
-                Err(format!("push: {e:?}"))
-            }
+            cached_head: ws.head(),
         }
     }
 
-    fn text(&mut self, h: TextHandle) -> String {
-        self.ws
-            .get::<View<str>, LongString>(h)
+    fn text(&self, ws: &mut Workspace<Pile<Blake3>>, h: TextHandle) -> String {
+        ws.get::<View<str>, LongString>(h)
             .map(|v| {
                 let s: &str = v.as_ref();
                 s.to_string()
@@ -246,7 +202,7 @@ impl CompassLive {
 
     /// Collect every goal with derived current status, tags, note count,
     /// parent, and outgoing priority edges (higher_over).
-    fn goals(&mut self) -> Vec<GoalRow> {
+    fn goals(&self, ws: &mut Workspace<Pile<Blake3>>) -> Vec<GoalRow> {
         let mut by_id: HashMap<Id, GoalRow> = HashMap::new();
 
         // Title + created_at.
@@ -265,7 +221,7 @@ impl CompassLive {
             if by_id.contains_key(&gid) {
                 continue;
             }
-            let title = self.text(title_handle);
+            let title = self.text(ws, title_handle);
             by_id.insert(
                 gid,
                 GoalRow {
@@ -376,7 +332,7 @@ impl CompassLive {
     }
 
     /// Notes on a specific goal, sorted newest-first.
-    fn notes_for(&mut self, goal_id: Id) -> Vec<NoteRow> {
+    fn notes_for(&self, ws: &mut Workspace<Pile<Blake3>>, goal_id: Id) -> Vec<NoteRow> {
         let raw: Vec<(TextHandle, (i128, i128))> = find!(
             (note_handle: TextHandle, ts: (i128, i128)),
             pattern!(&self.space, [{
@@ -393,7 +349,7 @@ impl CompassLive {
             .into_iter()
             .map(|(h, ts)| NoteRow {
                 at: Some(ts.0),
-                body: self.text(h),
+                body: self.text(ws, h),
             })
             .collect();
         notes.sort_by(|a, b| b.at.cmp(&a.at));
@@ -401,18 +357,19 @@ impl CompassLive {
     }
 
     // ── Write operations (mirror faculty CLI fact shapes) ─────────────
+    // The host pushes the workspace after render; see StorageState.
 
     fn add_goal(
-        &mut self,
+        ws: &mut Workspace<Pile<Blake3>>,
         title: String,
         status: String,
         parent: Option<Id>,
         tags: Vec<String>,
-    ) -> Result<Id, String> {
+    ) -> Id {
         let task_id: ExclusiveId = ufoid();
         let task_ref: Id = task_id.id;
         let now = epoch_interval(now_epoch());
-        let title_handle = self.ws.put::<LongString, _>(title);
+        let title_handle = ws.put::<LongString, _>(title);
 
         let mut change = TribleSet::new();
         change += entity! { &task_id @
@@ -430,11 +387,11 @@ impl CompassLive {
             metadata::created_at: now,
         };
 
-        self.commit_and_push(change, "add goal")?;
-        Ok(task_ref)
+        ws.commit(change, "add goal");
+        task_ref
     }
 
-    fn move_status(&mut self, task_id: Id, status: String) -> Result<(), String> {
+    fn move_status(ws: &mut Workspace<Pile<Blake3>>, task_id: Id, status: String) {
         let now = epoch_interval(now_epoch());
         let status_id: ExclusiveId = ufoid();
         let mut change = TribleSet::new();
@@ -444,13 +401,13 @@ impl CompassLive {
             compass::status: status.as_str(),
             metadata::created_at: now,
         };
-        self.commit_and_push(change, "move goal")
+        ws.commit(change, "move goal");
     }
 
-    fn add_note(&mut self, task_id: Id, body: String) -> Result<(), String> {
+    fn add_note(ws: &mut Workspace<Pile<Blake3>>, task_id: Id, body: String) {
         let now = epoch_interval(now_epoch());
         let note_id: ExclusiveId = ufoid();
-        let body_handle = self.ws.put::<LongString, _>(body);
+        let body_handle = ws.put::<LongString, _>(body);
         let mut change = TribleSet::new();
         change += entity! { &note_id @
             metadata::tag: &KIND_NOTE_ID,
@@ -458,7 +415,7 @@ impl CompassLive {
             compass::note: body_handle,
             metadata::created_at: now,
         };
-        self.commit_and_push(change, "add goal note")
+        ws.commit(change, "add goal note");
     }
 }
 
@@ -565,25 +522,13 @@ struct ComposeForm {
 /// and colorhashed tag chips. See the module docs for details.
 ///
 /// ```ignore
-/// let mut board = CompassBoard::new("./self.pile", "compass");
-/// // Inside a GORBIE card:
-/// board.render(ctx);
+/// let mut board = CompassBoard::default();
+/// // Inside a GORBIE card, with `compass_ws`:
+/// board.render(ctx, compass_ws);
 /// ```
 pub struct CompassBoard {
-    pile_path: PathBuf,
-    branch_name: String,
-    /// Optional shared pile supplied by a parent widget (e.g. the
-    /// [`PileInspector`](crate::widgets::PileInspector)). When `None`,
-    /// the widget opens its own `SharedPile` from `pile_path` on first
-    /// render.
-    shared_pile: Option<SharedPile>,
-    // Wrapped in a Mutex so the widget is `Send + Sync` — GORBIE's state
-    // storage requires that across threads, and `Workspace<Pile<Blake3>>`
-    // uses interior-mutability types (Cell/RefCell) that aren't Sync.
-    live: Option<Mutex<CompassLive>>,
-    error: Option<String>,
-    /// Transient error toast from the last write (clears on next success).
-    toast: Option<String>,
+    /// Rebuilt when the workspace's head advances.
+    live: Option<CompassLive>,
     expanded_goal: Option<Id>,
     /// Goals whose children should be hidden (parent-node collapsed).
     collapsed: HashSet<Id>,
@@ -595,38 +540,10 @@ pub struct CompassBoard {
     column_height: f32,
 }
 
-impl CompassBoard {
-    /// Build a board pointing at a pile on disk and a named branch. The
-    /// pile is not opened until the first [`render`](Self::render) call.
-    pub fn new(pile_path: impl Into<PathBuf>, branch_name: impl Into<String>) -> Self {
-        let mut s = Self::with_shared_deferred(branch_name);
-        s.pile_path = pile_path.into();
-        s
-    }
-
-    /// Build a board pointing at the conventional `compass` branch.
-    pub fn new_default(pile_path: impl Into<PathBuf>) -> Self {
-        Self::new(pile_path, COMPASS_BRANCH_NAME)
-    }
-
-    /// Build a board that shares a pile with sibling widgets (e.g. inside
-    /// a [`PileInspector`](crate::widgets::PileInspector)). No pile is
-    /// opened here — the widget pulls its branch on first render.
-    pub fn with_shared(pile: SharedPile, branch_name: impl Into<String>) -> Self {
-        let mut s = Self::with_shared_deferred(branch_name);
-        s.pile_path = pile.path();
-        s.shared_pile = Some(pile);
-        s
-    }
-
-    fn with_shared_deferred(branch_name: impl Into<String>) -> Self {
+impl Default for CompassBoard {
+    fn default() -> Self {
         Self {
-            pile_path: PathBuf::new(),
-            branch_name: branch_name.into(),
-            shared_pile: None,
             live: None,
-            error: None,
-            toast: None,
             expanded_goal: None,
             collapsed: HashSet::new(),
             compose: HashMap::new(),
@@ -635,6 +552,13 @@ impl CompassBoard {
             column_height: 500.0,
         }
     }
+}
+
+impl CompassBoard {
+    /// Build a board with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Override the per-column scroll-area height (pixels). Default 500.
     pub fn with_column_height(mut self, height: f32) -> Self {
@@ -642,71 +566,21 @@ impl CompassBoard {
         self
     }
 
-    /// Retarget at a different pile. No-op if the path is unchanged.
-    pub fn set_pile_path(&mut self, path: impl Into<PathBuf>) {
-        let path = path.into();
-        if path == self.pile_path {
-            return;
-        }
-        self.pile_path = path;
-        self.shared_pile = None;
-        self.live = None;
-        self.error = None;
-        self.expanded_goal = None;
-        self.collapsed.clear();
-        self.note_inputs.clear();
-        self.status_menu = None;
-        self.compose.clear();
-        self.toast = None;
-    }
-
-    /// Replace the shared pile handle (e.g. when the parent
-    /// [`PileInspector`](crate::widgets::PileInspector) reopens). Drops
-    /// any cached `CompassLive`; the next render will re-pull against
-    /// the new pile.
-    pub fn set_shared_pile(&mut self, pile: SharedPile) {
-        self.pile_path = pile.path();
-        self.shared_pile = Some(pile);
-        self.live = None;
-        self.error = None;
-        self.expanded_goal = None;
-        self.collapsed.clear();
-        self.note_inputs.clear();
-        self.status_menu = None;
-        self.compose.clear();
-        self.toast = None;
-    }
-
-    /// Render the board into a GORBIE card context.
-    pub fn render(&mut self, ctx: &mut CardCtx<'_>) {
-        // Lazy pile open on first render.
-        if self.live.is_none() && self.error.is_none() {
-            if self.shared_pile.is_none() {
-                match SharedPile::open(&self.pile_path) {
-                    Ok(p) => self.shared_pile = Some(p),
-                    Err(e) => self.error = Some(e),
-                }
-            }
-            if let Some(pile) = self.shared_pile.clone() {
-                match CompassLive::open(pile, &self.branch_name) {
-                    Ok(live) => self.live = Some(Mutex::new(live)),
-                    Err(e) => self.error = Some(e),
-                }
-            }
-        }
-
-        if let Some(err) = &self.error {
-            ctx.label(format!("compass board error: {err}"));
-            return;
-        }
-
-        let Some(live_lock) = self.live.as_ref() else {
-            ctx.label("compass board not initialized");
-            return;
+    /// Render the board into a GORBIE card context. `ws` must point at
+    /// the compass branch.
+    pub fn render(&mut self, ctx: &mut CardCtx<'_>, ws: &mut Workspace<Pile<Blake3>>) {
+        // Refresh cached state if the workspace head has advanced.
+        let head = ws.head();
+        let need_refresh = match self.live.as_ref() {
+            None => true,
+            Some(l) => l.cached_head != head,
         };
-        let mut live = live_lock.lock();
+        if need_refresh {
+            self.live = Some(CompassLive::refresh(ws));
+        }
+        let live = self.live.as_ref().expect("refreshed above");
 
-        let mut goals = live.goals();
+        let mut goals = live.goals(ws);
         // Global sort used when a goal has no parent context.
         goals.sort_by(|a, b| {
             b.sort_key()
@@ -747,14 +621,12 @@ impl CompassBoard {
             })
             .collect();
 
-        // Resolve expanded goal's notes (if any) while we still hold `live`.
+        // Resolve expanded goal's notes (if any).
         let expanded = self.expanded_goal;
         let expanded_notes: Option<(Id, Vec<NoteRow>)> = expanded.map(|gid| {
-            let notes = live.notes_for(gid);
+            let notes = live.notes_for(ws, gid);
             (gid, notes)
         });
-
-        drop(live);
 
         // Pull scalars out of `self` before the closure so we don't end up
         // with conflicting borrows.
@@ -762,7 +634,7 @@ impl CompassBoard {
         let total_goals: usize = column_data.iter().map(|(_, r)| r.len()).sum();
 
         // Write intents collected during render (applied after the UI closure
-        // so we don't re-enter `live` while holding egui state).
+        // so we don't re-enter `self` while holding egui state).
         let mut add_intent: Option<AddIntent> = None;
         let mut move_intent: Option<(Id, String)> = None;
         let mut note_intent: Option<(Id, String)> = None;
@@ -773,7 +645,6 @@ impl CompassBoard {
         let compose = &mut self.compose;
         let note_inputs = &mut self.note_inputs;
         let status_menu = &mut self.status_menu;
-        let toast = &mut self.toast;
 
         ctx.section("Compass", |ctx| {
             ctx.label(
@@ -782,16 +653,6 @@ impl CompassBoard {
                     .small()
                     .color(color_muted()),
             );
-
-            if let Some(msg) = toast.as_ref() {
-                let color = ctx.ctx().global_style().visuals.error_fg_color;
-                ctx.label(
-                    egui::RichText::new(msg.as_str())
-                        .color(color)
-                        .monospace()
-                        .small(),
-                );
-            }
 
             if total_goals == 0 && column_data.iter().all(|(s, _)| !compose.contains_key(s)) {
                 ctx.label("No goals yet. Click + Add in a column below to start.");
@@ -846,58 +707,34 @@ impl CompassBoard {
             });
         });
 
-        // Apply writes after the UI closure.
-        if add_intent.is_some() || move_intent.is_some() || note_intent.is_some() {
-            let Some(live_lock) = self.live.as_ref() else {
-                return;
-            };
-            let mut live = live_lock.lock();
-            let mut err_msg: Option<String> = None;
-
-            if let Some(intent) = add_intent {
-                match live.add_goal(intent.title, intent.status.clone(), intent.parent, intent.tags)
-                {
-                    Ok(_new_id) => {
-                        // Close the compose form on success.
-                        if let Some(form) = self.compose.get_mut(&intent.status) {
-                            form.open = false;
-                            form.title.clear();
-                            form.tags.clear();
-                            form.parent_prefix.clear();
-                        }
-                        self.toast = None;
-                    }
-                    Err(e) => err_msg = Some(format!("add failed: {e}")),
-                }
+        // Apply writes after the UI closure. Each helper does a
+        // `ws.commit(..)`; the host pushes between frames via
+        // `StorageState::push_if_dirty`.
+        if let Some(intent) = add_intent {
+            let status = intent.status.clone();
+            let _ = CompassLive::add_goal(ws, intent.title, status.clone(), intent.parent, intent.tags);
+            if let Some(form) = self.compose.get_mut(&status) {
+                form.open = false;
+                form.title.clear();
+                form.tags.clear();
+                form.parent_prefix.clear();
             }
-            if let Some((id, status)) = move_intent {
-                match live.move_status(id, status) {
-                    Ok(()) => {
-                        self.status_menu = None;
-                        self.toast = None;
-                    }
-                    Err(e) => err_msg = Some(format!("move failed: {e}")),
+            // Drop cached state so the next frame re-queries off the new head.
+            self.live = None;
+        }
+        if let Some((id, status)) = move_intent {
+            CompassLive::move_status(ws, id, status);
+            self.status_menu = None;
+            self.live = None;
+        }
+        if let Some((id, body)) = note_intent {
+            let body_trimmed = body.trim();
+            if !body_trimmed.is_empty() {
+                CompassLive::add_note(ws, id, body_trimmed.to_string());
+                if let Some(buf) = self.note_inputs.get_mut(&id) {
+                    buf.clear();
                 }
-            }
-            if let Some((id, body)) = note_intent {
-                let body_trimmed = body.trim();
-                if body_trimmed.is_empty() {
-                    err_msg = Some("note body is empty".to_string());
-                } else {
-                    match live.add_note(id, body_trimmed.to_string()) {
-                        Ok(()) => {
-                            if let Some(buf) = self.note_inputs.get_mut(&id) {
-                                buf.clear();
-                            }
-                            self.toast = None;
-                        }
-                        Err(e) => err_msg = Some(format!("note failed: {e}")),
-                    }
-                }
-            }
-
-            if let Some(msg) = err_msg {
-                self.toast = Some(msg);
+                self.live = None;
             }
         }
     }

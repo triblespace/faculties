@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::BranchTimeline;
+use faculties::widgets::{BranchTimeline, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -27,6 +27,10 @@ fn main(nb: &mut NotebookCtx) {
         .or_else(|| std::env::var("BRANCH").ok())
         .unwrap_or_else(|| "wiki".to_owned());
 
+    let storage = nb.state("storage", StorageState::new(pile_path), |ctx, st| {
+        st.top_bar(ctx);
+    });
+
     nb.view(|ctx| {
         ctx.grid(|g| {
             g.full(|ctx| {
@@ -37,7 +41,12 @@ fn main(nb: &mut NotebookCtx) {
         });
     });
 
-    nb.state("timeline", BranchTimeline::new(pile_path, branch), |ctx, t| {
-        t.render(ctx);
+    let branch_for_render = branch.clone();
+    nb.state("timeline", BranchTimeline::new(branch), move |ctx, tl| {
+        let mut st = storage.read_mut(ctx);
+        let Some(ws) = st.ensure_workspace(&branch_for_render) else {
+            return;
+        };
+        tl.render(ctx, &mut [(branch_for_render.as_str(), ws)]);
     });
 }
