@@ -229,8 +229,10 @@ impl StorageState {
                     );
                     // Subtle divider glyph between label and field.
                     ui.label(egui::RichText::new("│").small().color(muted));
-                    // Path field expands to fill remaining width; the
-                    // OPEN button is placed after via right-to-left.
+                    // Path field uses GORBIE's wide LCD-style
+                    // TextField (auto-sizes to available_width), with
+                    // OPEN placed on the right via right_to_left so
+                    // the field flows up against the button.
                     ui.with_layout(
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
@@ -246,18 +248,13 @@ impl StorageState {
                             if open_btn.clicked() {
                                 reopen = true;
                             }
-                            // The field fills whatever is left to the
-                            // left of the OPEN button.
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    let avail = ui.available_width();
-                                    let resp = ui.add_sized(
-                                        egui::vec2(avail, 22.0),
-                                        egui::TextEdit::singleline(&mut self.pile_path_text)
-                                            .font(egui::TextStyle::Monospace)
-                                            .hint_text("./self.pile")
-                                            .desired_width(avail),
+                                    let resp = ui.add(
+                                        GORBIE::widgets::TextField::singleline(
+                                            &mut self.pile_path_text,
+                                        ),
                                     );
                                     if resp.lost_focus()
                                         && ui.input(|i| i.key_pressed(egui::Key::Enter))
