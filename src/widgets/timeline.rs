@@ -29,7 +29,7 @@
 //!
 //! Input handling:
 //! * scroll = pan (vertical)
-//! * ctrl+scroll or horizontal scroll = zoom
+//! * cmd/ctrl + scroll = zoom (horizontal trackpad drift no longer zooms)
 //! * drag = pan
 //! * double-click = jump to "now"
 //!
@@ -697,10 +697,9 @@ impl BranchTimeline {
                 .map(|p| viewport_rect.contains(p))
                 .unwrap_or(false);
             if pointer_in_viewport {
-                let (scroll_y, scroll_x, ctrl, pointer_pos) = ui.input(|i| {
+                let (scroll_y, ctrl, pointer_pos) = ui.input(|i| {
                     (
                         i.smooth_scroll_delta.y,
-                        i.smooth_scroll_delta.x,
                         i.modifiers.command || i.modifiers.ctrl,
                         i.pointer.hover_pos(),
                     )
@@ -713,9 +712,15 @@ impl BranchTimeline {
                 let cursor_time =
                     self.timeline_start - (cursor_rel_y as f64 * ns_per_px) as i128;
 
-                if !ctrl && scroll_y != 0.0 {
+                // Scroll without a modifier → pan the timeline.
+                // Cmd/Ctrl + scroll → zoom around the cursor row.
+                // Horizontal scroll no longer zooms — trackpad sideways
+                // drift was triggering unintended zoom on every swipe.
+                let mut consumed_scroll = false;
+                if scroll_y != 0.0 && !ctrl {
                     let pan_ns = (scroll_y as f64 * scroll_speed * ns_per_px) as i128;
                     self.timeline_start += pan_ns;
+                    consumed_scroll = true;
                 }
 
                 let zoom_factor = if ctrl && scroll_y != 0.0 {
@@ -723,12 +728,6 @@ impl BranchTimeline {
                         1.15
                     } else {
                         1.0 / 1.15
-                    }
-                } else if scroll_x != 0.0 {
-                    if scroll_x > 0.0 {
-                        1.08
-                    } else {
-                        1.0 / 1.08
                     }
                 } else {
                     1.0
@@ -740,11 +739,17 @@ impl BranchTimeline {
                     self.timeline_start =
                         cursor_time + (cursor_rel_y as f64 * new_ns_per_px) as i128;
                     self.timeline_scale = new_scale;
+                    consumed_scroll = true;
                 }
 
-                ui.ctx().input_mut(|i| {
-                    i.smooth_scroll_delta = egui::Vec2::ZERO;
-                });
+                // Only swallow the scroll delta when we actually used
+                // it for pan/zoom — otherwise let the outer notebook
+                // ScrollArea consume the gesture normally.
+                if consumed_scroll {
+                    ui.ctx().input_mut(|i| {
+                        i.smooth_scroll_delta = egui::Vec2::ZERO;
+                    });
+                }
             }
 
             // Manual drag-to-pan (see comment on the allocate_exact_size
