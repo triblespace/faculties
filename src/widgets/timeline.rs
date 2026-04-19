@@ -641,17 +641,52 @@ impl BranchTimeline {
         let sources = self.sources.clone();
         let viewport_height = self.viewport_height;
 
+        // Visible time span in the viewport — used for the right-
+        // aligned scale chip in the legend row so the viewer always
+        // knows what range they're looking at without manually
+        // reading the tick marks.
+        let visible_secs = viewport_height as f64 * 60.0 / self.timeline_scale as f64;
+        let span_label = format_span(visible_secs);
         ctx.section("Activity", |ctx| {
             ctx.grid(|g| {
-                // Source legend — one dot-swatch per source with label + count.
+                // Source legend (left) + span/hint chip (right).
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
-                        for (i, s) in sources.iter().enumerate() {
-                            let count = events.iter().filter(|e| e.source_idx == i).count();
-                            render_legend_swatch(ui, &s.label(), count, s.color());
-                        }
+                    ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            for (i, s) in sources.iter().enumerate() {
+                                let count = events.iter().filter(|e| e.source_idx == i).count();
+                                render_legend_swatch(ui, &s.label(), count, s.color());
+                            }
+                        });
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(
+                                    egui::RichText::new("\u{2318}+SCROLL TO ZOOM")
+                                        .small()
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(
+                                            0x6a, 0x6a, 0x6a,
+                                        )),
+                                );
+                                ui.label(
+                                    egui::RichText::new("\u{00b7}")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(
+                                            0x6a, 0x6a, 0x6a,
+                                        )),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("SPAN {span_label}"))
+                                        .small()
+                                        .monospace()
+                                        .strong(),
+                                );
+                            },
+                        );
                     });
                 });
                 // Viewport spans the whole grid row.
@@ -1116,6 +1151,24 @@ impl BranchTimeline {
         if let Some(sel) = clicked_event {
             self.selected_event = Some(sel);
         }
+    }
+}
+
+/// Format a visible-window duration as a short human-readable span
+/// label ("2h", "30m", "3d") for the right-aligned scale chip. Only
+/// two significant units — enough precision for a header chip.
+fn format_span(secs: f64) -> String {
+    let s = secs.max(1.0);
+    if s >= 86_400.0 {
+        let d = s / 86_400.0;
+        if d >= 10.0 { format!("{d:.0}D") } else { format!("{d:.1}D") }
+    } else if s >= 3_600.0 {
+        let h = s / 3_600.0;
+        if h >= 10.0 { format!("{h:.0}H") } else { format!("{h:.1}H") }
+    } else if s >= 60.0 {
+        format!("{:.0}M", s / 60.0)
+    } else {
+        format!("{s:.0}S")
     }
 }
 
