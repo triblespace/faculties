@@ -116,4 +116,5 @@ and have it just work.
 
 ## License
 
-Apache-2.0.
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE),
+at your option.

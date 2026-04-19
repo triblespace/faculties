@@ -3,8 +3,13 @@ name = "faculties"
 version = "0.11.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Shared schemas, helpers, and widgets for triblespace-backed faculties."
+description = "An office suite for AI agents: kanban, wiki, files, messaging, and a GORBIE-backed viewer — all persisted in a TribleSpace pile."
+authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
+homepage = "https://github.com/triblespace/faculties"
 repository = "https://github.com/triblespace/faculties"
+readme = "README.md"
+keywords = ["triblespace", "ai-agent", "kanban", "wiki", "notebook"]
+categories = ["command-line-utilities", "data-structures"]
 
 [lib]
 path = "src/lib.rs"
