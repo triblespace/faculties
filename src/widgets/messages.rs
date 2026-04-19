@@ -916,13 +916,24 @@ fn render_message(
         color_bubble()
     };
 
+    // Cap bubble width so the alignment is visible and bubbles don't
+    // stretch full-pane. Outbound messages float right; inbound float
+    // left — classic chat layout.
+    let avail = ui.available_width();
+    let bubble_max = (avail * 0.78).max(200.0);
+    let alignment = if from_is_me {
+        egui::Layout::right_to_left(egui::Align::Min)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Min)
+    };
+    ui.with_layout(alignment, |ui| {
     egui::Frame::NONE
         .fill(bubble_fill)
         .stroke(egui::Stroke::new(1.0, color_frame()))
-        .corner_radius(egui::CornerRadius::same(4))
-        .inner_margin(egui::Margin::symmetric(8, 6))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 6))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_max_width(bubble_max);
 
             // Header row: from → to, plus age.
             ui.horizontal(|ui| {
@@ -989,6 +1000,7 @@ fn render_message(
                 );
             });
         });
+    });
 }
 
 fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
