@@ -847,10 +847,14 @@ fn render_column(
             bottom: 8,
         })
         .show(ui, |ui| {
-            // Fixed column width; force vertical layout (Frame inherits
-            // its parent's direction by default, and the parent here is
-            // `horizontal_top` so nested rows would otherwise stack L→R).
-            ui.set_width(width);
+            // Claim the full available inside-Frame width. Using the
+            // outer `width` here would exceed `available_width()` by
+            // the Frame's inner_margin (left+right = 20 px) — which
+            // pushed the lane that much past the notebook column and
+            // caused the "stuff overflows" impression on every
+            // relayout. `available_width()` respects the margin.
+            let _ = width; // kept in the signature for the caller's math
+            ui.set_width(ui.available_width());
             ui.set_min_height(height);
             ui.vertical(|ui| {
 
