@@ -1230,51 +1230,48 @@ impl WikiViewer {
                         ctx.add(
                             egui::Label::new(egui::RichText::new(&title).heading()).wrap(),
                         );
-                        let vid_hex = vid.map(|v| format!("{v:x}")).unwrap_or_default();
-                        ctx.label(
-                            egui::RichText::new(format!("wiki:{frag_id:x}\nwiki:{vid_hex}"))
-                                .monospace()
-                                .weak()
-                                .small(),
-                        );
 
-                        // Version navigation bar.
-                        if n_versions > 1 {
-                            let vi = current_idx.unwrap_or(0);
-                            let ver_label = if pinned.is_some() {
-                                format!("v{}/{}", n_versions - vi, n_versions)
-                            } else {
-                                format!("latest (v{})", n_versions)
-                            };
-                            ctx.grid(|g| {
-                                g.place(8, |ctx| {
-                                    ctx.label(
-                                        egui::RichText::new(ver_label).weak().monospace(),
-                                    );
-                                });
-                                g.place(1, |ctx| {
-                                    if ctx.button("◀").clicked() && vi + 1 < n_versions {
-                                        version_nav = Some((frag_id, Some(history[vi + 1])));
-                                    }
-                                });
-                                g.place(1, |ctx| {
-                                    if ctx.button("▶").clicked() {
-                                        if vi > 0 {
-                                            version_nav = Some((frag_id, Some(history[vi - 1])));
-                                        } else {
-                                            version_nav = Some((frag_id, None));
-                                        }
-                                    }
-                                });
-                                if pinned.is_some() {
-                                    g.place(2, |ctx| {
-                                        if ctx.button("↻ latest").clicked() {
-                                            version_nav = Some((frag_id, None));
-                                        }
-                                    });
+                        // Compact meta row: wiki:<frag_id> · version badge
+                        // · inline prev/next/latest controls when history
+                        // > 1. Replaces the three-line header + separate
+                        // version grid with a single tight row.
+                        ctx.ui_mut().horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                egui::RichText::new(format!("wiki:{frag_id:x}"))
+                                    .monospace()
+                                    .weak()
+                                    .small(),
+                            );
+                            if n_versions > 1 {
+                                let vi = current_idx.unwrap_or(0);
+                                let ver_label = if pinned.is_some() {
+                                    format!("v{}/{}", n_versions - vi, n_versions)
+                                } else {
+                                    format!("v{} · latest", n_versions)
+                                };
+                                ui.label(
+                                    egui::RichText::new(ver_label)
+                                        .monospace()
+                                        .small()
+                                        .strong(),
+                                );
+                                if ui.small_button("◀").clicked() && vi + 1 < n_versions {
+                                    version_nav = Some((frag_id, Some(history[vi + 1])));
                                 }
-                            });
-                        }
+                                if ui.small_button("▶").clicked() {
+                                    if vi > 0 {
+                                        version_nav =
+                                            Some((frag_id, Some(history[vi - 1])));
+                                    } else {
+                                        version_nav = Some((frag_id, None));
+                                    }
+                                }
+                                if pinned.is_some() && ui.small_button("↻").clicked() {
+                                    version_nav = Some((frag_id, None));
+                                }
+                            }
+                        });
 
                         ctx.separator();
 
