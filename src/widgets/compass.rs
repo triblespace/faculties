@@ -1373,43 +1373,52 @@ fn render_goal_card(
     }
 }
 
-/// Paint a priority edge between two goal cards: cubic-bezier-ish
-/// curve from the higher card's right edge to the lower card's left
-/// edge, with a small filled arrowhead at the target.
+/// Paint a priority edge between two goal cards: a smooth horizontal
+/// cubic Bézier from the higher card's side to the lower card's side
+/// with a small filled arrowhead at the target. The horizontally-
+/// tangent control points make the curve bow outward from the
+/// straight line, which naturally keeps it clear of intervening
+/// cards most of the time (much better than the old 3-segment path
+/// that cut straight through).
 fn draw_priority_edge(
     painter: &egui::Painter,
     from: egui::Rect,
     to: egui::Rect,
     color: egui::Color32,
 ) {
-    // Start / end anchors on the nearest card edges — left-to-right
-    // if the target is right of the source, right-to-left otherwise.
-    let (start, end) = if from.center().x < to.center().x {
+    let (start, end, dir) = if from.center().x < to.center().x {
         (
             egui::pos2(from.right(), from.center().y),
             egui::pos2(to.left() - 6.0, to.center().y),
+            1.0_f32,
         )
     } else {
         (
             egui::pos2(from.left(), from.center().y),
             egui::pos2(to.right() + 6.0, to.center().y),
+            -1.0_f32,
         )
     };
+    // Control-point offset: ~half the horizontal gap, clamped so short
+    // edges still bow visibly and long edges don't over-curve.
+    let dx = (end.x - start.x).abs().max(40.0).min(240.0) * 0.5;
+    let c1 = egui::pos2(start.x + dir * dx, start.y);
+    let c2 = egui::pos2(end.x - dir * dx, end.y);
     let stroke = egui::Stroke::new(1.5, color);
-    // Simple 3-segment curve: horizontal exit, diagonal bridge, horizontal entry.
-    let bridge_x = (start.x + end.x) * 0.5;
-    let mid1 = egui::pos2(bridge_x, start.y);
-    let mid2 = egui::pos2(bridge_x, end.y);
-    painter.line_segment([start, mid1], stroke);
-    painter.line_segment([mid1, mid2], stroke);
-    painter.line_segment([mid2, end], stroke);
-    // Arrowhead — small filled triangle pointing at `end`.
-    let dir = if end.x > start.x { -1.0 } else { 1.0 };
+    painter.add(egui::Shape::CubicBezier(egui::epaint::CubicBezierShape {
+        points: [start, c1, c2, end],
+        closed: false,
+        fill: egui::Color32::TRANSPARENT,
+        stroke: egui::epaint::PathStroke::new(stroke.width, stroke.color),
+    }));
+    // Arrowhead — small filled triangle at the target, pointing along
+    // the curve's terminal tangent (which is horizontal here).
     let head_len = 6.0;
+    let back_x = end.x - dir * head_len;
     let tip = end;
-    let back = egui::pos2(end.x + dir * head_len, end.y);
-    let wing_up = egui::pos2(end.x + dir * head_len, end.y - 3.5);
-    let wing_dn = egui::pos2(end.x + dir * head_len, end.y + 3.5);
+    let back = egui::pos2(back_x, end.y);
+    let wing_up = egui::pos2(back_x, end.y - 3.5);
+    let wing_dn = egui::pos2(back_x, end.y + 3.5);
     painter.add(egui::Shape::convex_polygon(
         vec![tip, wing_up, back, wing_dn],
         color,
