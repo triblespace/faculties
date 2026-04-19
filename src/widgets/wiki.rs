@@ -1129,10 +1129,31 @@ impl WikiViewer {
         };
 
         // ── search bar ───────────────────────────────────────────────
+        // Search bar with a small label prefix and a hint inside the
+        // text field. Also submits on Enter for keyboard-driven use.
         let mut submit_query: Option<String> = None;
         ctx.grid(|g| {
-            g.place(10, |ctx| {
-                ctx.text_field(&mut self.search_query);
+            g.place(1, |ctx| {
+                ctx.label(
+                    egui::RichText::new("FIND")
+                        .monospace()
+                        .strong()
+                        .small(),
+                );
+            });
+            g.place(9, |ctx| {
+                let ui = ctx.ui_mut();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .hint_text("hex prefix or title substring…")
+                        .desired_width(f32::INFINITY),
+                );
+                if resp.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && !self.search_query.trim().is_empty()
+                {
+                    submit_query = Some(self.search_query.trim().to_string());
+                }
             });
             g.place(2, |ctx| {
                 if ctx.button("Go").clicked() && !self.search_query.trim().is_empty() {
