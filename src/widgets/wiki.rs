@@ -751,6 +751,14 @@ impl WikiGraph {
         self.polylines.is_some()
     }
 
+    fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
     fn clear_bundling(&mut self) {
         self.polylines = None;
     }
@@ -1161,20 +1169,47 @@ impl WikiViewer {
             self.graph = Some(WikiGraph::from_wiki(live, wiki_ws));
         }
         if let Some(graph) = self.graph.as_mut() {
+            // Compact header: GRAPH · N fragments · M links · [Bundle|Straight]
+            let bundled = graph.is_bundled();
+            let n_nodes = graph.node_count();
+            let n_edges = graph.edge_count();
             ctx.grid(|g| {
-                let bundled = graph.is_bundled();
-                g.place(2, |ctx| {
-                    if ctx
-                        .button(if bundled { "Re-bundle" } else { "Bundle" })
-                        .clicked()
-                    {
-                        graph.bundle_edges();
-                    }
-                });
-                g.place(2, |ctx| {
-                    if ctx.button("Straight").clicked() {
-                        graph.clear_bundling();
-                    }
+                g.full(|ctx| {
+                    let ui = ctx.ui_mut();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(
+                            egui::RichText::new("GRAPH")
+                                .monospace()
+                                .strong()
+                                .small(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "\u{00b7} {n_nodes} FRAGMENTS \u{00b7} {n_edges} LINKS"
+                            ))
+                            .monospace()
+                            .small()
+                            .color(egui::Color32::from_rgb(0x8a, 0x8a, 0x8a)),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui
+                                    .small_button(
+                                        if bundled { "STRAIGHT" } else { "BUNDLE" },
+                                    )
+                                    .clicked()
+                                {
+                                    if bundled {
+                                        graph.clear_bundling();
+                                    } else {
+                                        graph.bundle_edges();
+                                    }
+                                }
+                            },
+                        );
+                    });
                 });
             });
             if !graph.is_bundled() {
