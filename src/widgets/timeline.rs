@@ -1029,40 +1029,69 @@ impl BranchTimeline {
                         let src_label = src_label.clone();
                         let status_label = ev.status.clone();
                         let fromto_label = ev.from_to.clone();
+                        let src_color_tip = src_color;
                         egui::show_tooltip_at_pointer(
                             ui.ctx(),
                             ui.layer_id(),
                             egui::Id::new(("timeline_event_tip", ev.entity_id)),
                             |tip| {
-                                tip.label(
-                                    egui::RichText::new(src_label.to_uppercase())
-                                        .small()
-                                        .monospace()
-                                        .strong(),
-                                );
-                                tip.label(
-                                    egui::RichText::new(time_str)
-                                        .small()
-                                        .monospace()
-                                        .weak(),
-                                );
-                                if let Some(st) = status_label {
-                                    tip.label(
-                                        egui::RichText::new(st.to_uppercase())
-                                            .small()
-                                            .monospace(),
+                                tip.set_max_width(360.0);
+                                // Header: colored source dot + source
+                                // label + timestamp on a single line.
+                                tip.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    let (dot_rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(8.0, 8.0),
+                                        egui::Sense::hover(),
                                     );
-                                }
-                                if let Some(ft) = fromto_label {
-                                    tip.label(
-                                        egui::RichText::new(ft)
+                                    ui.painter().circle_filled(
+                                        dot_rect.center(),
+                                        4.0,
+                                        src_color_tip,
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(src_label.to_uppercase())
+                                            .small()
+                                            .monospace()
+                                            .strong()
+                                            .color(src_color_tip),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("·")
+                                            .small()
+                                            .weak(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(time_str)
                                             .small()
                                             .monospace()
                                             .weak(),
                                     );
+                                });
+                                // Optional status + from→to meta line.
+                                if status_label.is_some() || fromto_label.is_some() {
+                                    tip.horizontal_wrapped(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        if let Some(st) = status_label {
+                                            ui.label(
+                                                egui::RichText::new(st.to_uppercase())
+                                                    .small()
+                                                    .monospace()
+                                                    .strong(),
+                                            );
+                                        }
+                                        if let Some(ft) = fromto_label {
+                                            ui.label(
+                                                egui::RichText::new(ft)
+                                                    .small()
+                                                    .monospace()
+                                                    .weak(),
+                                            );
+                                        }
+                                    });
                                 }
                                 tip.separator();
-                                tip.label(summary);
+                                tip.add(egui::Label::new(summary).wrap());
                             },
                         );
                     }
