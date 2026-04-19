@@ -655,50 +655,19 @@ impl BranchTimeline {
         // aligned scale chip in the legend row so the viewer always
         // knows what range they're looking at without manually
         // reading the tick marks.
-        let visible_secs = viewport_height as f64 * 60.0 / self.timeline_scale as f64;
-        let span_label = format_span(visible_secs);
         ctx.section("Activity", |ctx| {
             ctx.grid(|g| {
-                // Source legend (left) + span/hint chip (right).
+                // Source legend — SPAN + zoom hint are now painted as
+                // an overlay inside the viewport itself (see
+                // paint_viewport) so the legend row stays clean.
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    ui.horizontal(|ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            for (i, s) in sources.iter().enumerate() {
-                                let count = events.iter().filter(|e| e.source_idx == i).count();
-                                render_legend_swatch(ui, &s.label(), count, s.color());
-                            }
-                        });
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.label(
-                                    egui::RichText::new(
-                                        "PINCH/\u{2318}+SCROLL ZOOM · DBL-CLICK \u{2192} NOW",
-                                    )
-                                    .small()
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(
-                                        0x6a, 0x6a, 0x6a,
-                                    )),
-                                );
-                                ui.label(
-                                    egui::RichText::new("\u{00b7}")
-                                        .small()
-                                        .color(egui::Color32::from_rgb(
-                                            0x6a, 0x6a, 0x6a,
-                                        )),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!("SPAN {span_label}"))
-                                        .small()
-                                        .monospace()
-                                        .strong(),
-                                );
-                            },
-                        );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 12.0;
+                        for (i, s) in sources.iter().enumerate() {
+                            let count = events.iter().filter(|e| e.source_idx == i).count();
+                            render_legend_swatch(ui, &s.label(), count, s.color());
+                        }
                     });
                 });
                 // Viewport spans the whole grid row.
@@ -959,6 +928,51 @@ impl BranchTimeline {
                 egui::FontId::monospace(9.0),
                 now_color,
             );
+        }
+
+        // Top-right overlay: visible-window span + interaction hint.
+        // Painted as semi-transparent pills over the ruler so the
+        // viewer always sees current zoom and how to control it
+        // without crowding the legend row above.
+        {
+            let visible_secs =
+                viewport_height as f64 * 60.0 / self.timeline_scale as f64;
+            let span_label = format!("SPAN {}", format_span(visible_secs));
+            let hint_label = "PINCH/\u{2318}+SCROLL \u{2192} ZOOM · DBL-CLICK \u{2192} NOW";
+            let span_font = egui::FontId::monospace(10.0);
+            let hint_font = egui::FontId::monospace(9.0);
+            let span_color = egui::Color32::from_rgb(0xe6, 0xe6, 0xe6);
+            let hint_color = egui::Color32::from_rgb(0x8a, 0x8a, 0x8a);
+            let pill_bg = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160);
+            let pad_x = 6.0;
+            let pad_y = 2.0;
+            let gap = 4.0;
+            let top = viewport_rect.top() + 6.0;
+            let right = viewport_rect.right() - 8.0;
+            // Lay out right-to-left: hint first, then span to its left.
+            let span_galley =
+                painter.layout_no_wrap(span_label, span_font, span_color);
+            let hint_galley =
+                painter.layout_no_wrap(hint_label.to_string(), hint_font, hint_color);
+            let hint_pos = egui::pos2(right - hint_galley.size().x, top);
+            painter.rect_filled(
+                egui::Rect::from_min_size(hint_pos, hint_galley.size())
+                    .expand2(egui::vec2(pad_x, pad_y)),
+                2.0,
+                pill_bg,
+            );
+            painter.galley(hint_pos, hint_galley, hint_color);
+            let span_pos = egui::pos2(
+                hint_pos.x - gap * 2.0 - pad_x * 2.0 - span_galley.size().x,
+                top,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(span_pos, span_galley.size())
+                    .expand2(egui::vec2(pad_x, pad_y)),
+                2.0,
+                pill_bg,
+            );
+            painter.galley(span_pos, span_galley, span_color);
         }
 
         // Per-source event rendering.
