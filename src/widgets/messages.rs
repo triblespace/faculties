@@ -942,19 +942,24 @@ fn render_composer(
         });
 
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
         let can_send = recipient.is_some() && !draft.trim().is_empty();
         let send_label = match recipient {
             Some(to) => {
                 let name = names.get(&to).cloned().unwrap_or_else(|| id_prefix(to));
-                format!("Send → {name}")
+                format!("SEND \u{2192} {}", name.to_uppercase())
             }
-            None => "Send".to_string(),
+            None => "SEND".to_string(),
         };
         if ui
             .add_enabled(
                 can_send,
                 egui::Button::new(
-                    egui::RichText::new(send_label).color(colorhash::text_color_on(accent)),
+                    egui::RichText::new(send_label)
+                        .small()
+                        .monospace()
+                        .strong()
+                        .color(colorhash::text_color_on(accent)),
                 )
                 .fill(accent),
             )
@@ -964,7 +969,15 @@ fn render_composer(
                 *send_intent = Some((to, draft.clone()));
             }
         }
-        if ui.small_button("Clear").clicked() {
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new("CLEAR")
+                    .small()
+                    .monospace()
+                    .color(color_muted()),
+            ))
+            .clicked()
+        {
             draft.clear();
         }
     });
