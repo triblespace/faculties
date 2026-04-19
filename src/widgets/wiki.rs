@@ -1300,16 +1300,19 @@ impl WikiViewer {
             }
             ctx.ctx().request_repaint();
 
-            // ── Search-bar overlay inside the top-left of the graph.
-            // Uses a scope_builder with an explicit max_rect so the
-            // interactive widgets land on top of the painted graph
-            // (later-added widgets win egui's hit-test). Field takes
-            // whatever width is left after the FIND label and GO
-            // button; fixed height matches the button.
+            // ── Search-bar overlay in the top-left of the graph.
+            // No FIND label — the empty field's hint_text and the
+            // sibling GO button make intent clear enough. Uses
+            // scope_builder with an explicit max_rect so interactive
+            // widgets land on top of the painted graph (later-added
+            // widgets win egui's hit-test). Top offset uses GORBIE's
+            // GRID_ROW_MODULE so the bar aligns with the rest of the
+            // notebook's vertical rhythm.
             {
-                let bar_top = graph_rect.top() + 6.0;
-                let bar_left = graph_rect.left() + 8.0;
-                let bar_width = (graph_rect.width() * 0.5).clamp(260.0, 480.0);
+                let module = GORBIE::card_ctx::GRID_ROW_MODULE;
+                let bar_top = graph_rect.top() + module;
+                let bar_left = graph_rect.left() + module;
+                let bar_width = (graph_rect.width() * 0.5).clamp(240.0, 420.0);
                 let bar_height = 26.0;
                 let bar_rect = egui::Rect::from_min_size(
                     egui::pos2(bar_left, bar_top),
@@ -1321,16 +1324,10 @@ impl WikiViewer {
                     |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(
-                                egui::RichText::new("FIND")
-                                    .monospace()
-                                    .strong()
-                                    .small(),
-                            );
                             let go_enabled =
                                 !self.search_query.trim().is_empty();
-                            // Place GO on the right; field fills what's
-                            // left.
+                            // Place GO on the right; field fills
+                            // whatever's left.
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -1359,10 +1356,15 @@ impl WikiViewer {
                                             egui::Align::Center,
                                         ),
                                         |ui| {
-                                            let resp = ui.add(
-                                                GORBIE::widgets::TextField::singleline(
+                                            let avail = ui.available_width();
+                                            let resp = ui.add_sized(
+                                                egui::vec2(avail, 22.0),
+                                                egui::TextEdit::singleline(
                                                     &mut self.search_query,
-                                                ),
+                                                )
+                                                .font(egui::TextStyle::Monospace)
+                                                .hint_text("find fragment…")
+                                                .desired_width(avail),
                                             );
                                             if resp.changed() {
                                                 self.search_miss = None;
