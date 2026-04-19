@@ -1002,16 +1002,32 @@ impl WikiGraph {
             let r = node_radius * deg_scale;
             painter.circle(pos, r, node_fill, node_stroke);
             if show_labels {
-                let label_anchor = pos + egui::vec2(r + 4.0, 0.0);
-                // Measure the label, paint a pill behind it, then the text.
+                // Measure the label first so we know whether it fits
+                // on the right. If painting to the right of the node
+                // would clip past the viewport, flip to the left side
+                // instead — keeps labels on-screen and reduces the
+                // "labels all pile up at the right edge" look on
+                // dense graphs.
                 let galley = painter.layout_no_wrap(
                     node.label.clone(),
                     font_id.clone(),
                     label_color,
                 );
-                let label_rect = egui::Align2::LEFT_CENTER.anchor_rect(
-                    egui::Rect::from_min_size(label_anchor, galley.size()),
+                let right_anchor = pos + egui::vec2(r + 4.0, 0.0);
+                let right_rect = egui::Align2::LEFT_CENTER.anchor_rect(
+                    egui::Rect::from_min_size(right_anchor, galley.size()),
                 );
+                let label_rect = if right_rect.right() <= rect.right() - 2.0 {
+                    right_rect
+                } else {
+                    let left_anchor = pos - egui::vec2(r + 4.0, 0.0);
+                    egui::Align2::RIGHT_CENTER.anchor_rect(
+                        egui::Rect::from_min_size(
+                            left_anchor - egui::vec2(galley.size().x, 0.0),
+                            galley.size(),
+                        ),
+                    )
+                };
                 painter.rect_filled(
                     label_rect.expand2(egui::vec2(3.0, 1.0)),
                     2.0,
