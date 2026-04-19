@@ -9,6 +9,15 @@ repository = "https://github.com/triblespace/faculties"
 [lib]
 path = "src/lib.rs"
 
+# GORBIE-backed viewer binary. Ships inside the crate so
+# `cargo install faculties --features widgets` installs the viewer
+# globally. Requires the `widgets` feature because the binary
+# depends on the `widgets` module.
+[[bin]]
+name = "faculties-viewer"
+path = "src/bin/faculties-viewer.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.

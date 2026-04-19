@@ -96,13 +96,21 @@ window.
 [GORBIE]: https://github.com/triblespace/GORBIE
 
 ```sh
-# From the faculties/ checkout:
-cargo run --release --example pile_inspector --features widgets -- ./self.pile
+cargo install faculties --features widgets
+faculties-viewer ./self.pile
+# or: PILE=./self.pile faculties-viewer
 ```
 
-Standalone per-widget demos are also in `examples/`:
+From a checkout:
+
+```sh
+cargo run --release --features widgets --bin faculties-viewer -- ./self.pile
+```
+
+Standalone per-widget demos (showing how to embed a single widget
+in your own GORBIE notebook) are in `examples/`:
 `compass_board.rs`, `wiki_viewer.rs`, `messages_panel.rs`,
-`branch_timeline.rs`.
+`branch_timeline.rs`, `pile_inspector.rs`.
 
 ### Creating a demo pile
 
