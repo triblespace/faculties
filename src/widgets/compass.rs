@@ -704,7 +704,12 @@ impl CompassBoard {
             });
 
             if total_goals == 0 && column_data.iter().all(|(s, _)| !compose.contains_key(s)) {
-                ctx.label("No goals yet. Click + Add in a column below to start.");
+                render_empty_state(
+                    ctx.ui_mut(),
+                    "\u{1f9ed}",
+                    "No goals yet",
+                    Some("Click + ADD in a column below to start tracking work."),
+                );
             }
 
             // Fixed-width kanban columns in a horizontal scroll area.
@@ -1500,6 +1505,37 @@ fn draw_priority_edge(
         color,
         egui::Stroke::NONE,
     ));
+}
+
+/// Centered empty-state block: a muted glyph, a monospace headline,
+/// and an optional muted sub-hint. Used when the board is empty and
+/// the user needs a nudge toward the right action.
+fn render_empty_state(ui: &mut egui::Ui, glyph: &str, headline: &str, hint: Option<&str>) {
+    ui.add_space(16.0);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            egui::RichText::new(glyph)
+                .size(28.0)
+                .color(color_muted()),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(headline)
+                .monospace()
+                .small()
+                .strong()
+                .color(color_muted()),
+        );
+        if let Some(h) = hint {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(h)
+                    .small()
+                    .color(color_muted()),
+            );
+        }
+    });
+    ui.add_space(16.0);
 }
 
 fn render_chip(ui: &mut egui::Ui, label: &str, fill: egui::Color32) {
