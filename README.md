@@ -123,14 +123,6 @@ Then point the viewer at the new pile:
 cargo run --release --example pile_inspector --features widgets -- ./demo.pile
 ```
 
-### Building from a checkout
-
-The viewer depends on [GORBIE]. If you're iterating on both, clone
-GORBIE as a sibling directory — the repo's `Cargo.toml` has
-`[patch.crates-io] GORBIE = { path = "../GORBIE" }` for local
-development. Users who just want to build against the published
-crate can remove that patch line after cloning.
-
 ### Known limitations
 
 - Requires a working `egui 0.34.1`. There is an open upstream panic
