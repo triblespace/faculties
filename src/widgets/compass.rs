@@ -1270,22 +1270,43 @@ fn render_goal_card(
             .fixed_pos(card_response.rect.right_top())
             .show(ui.ctx(), |ui| {
                 ui.label(
-                    egui::RichText::new("Move to…")
+                    egui::RichText::new("MOVE TO")
                         .small()
+                        .monospace()
+                        .strong()
                         .color(color_muted()),
                 );
                 for status in DEFAULT_STATUSES {
+                    if status == row.status {
+                        continue;
+                    }
                     let fill = status_color(status);
+                    let text = colorhash::text_color_on(fill);
                     if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new(status).color(fill).monospace(),
-                        ))
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(status.to_uppercase())
+                                    .small()
+                                    .monospace()
+                                    .strong()
+                                    .color(text),
+                            )
+                            .fill(fill),
+                        )
                         .clicked()
                     {
                         *move_intent = Some((row.id, status.to_string()));
                     }
                 }
-                if ui.small_button("Cancel").clicked() {
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new("CANCEL")
+                            .small()
+                            .monospace()
+                            .color(color_muted()),
+                    ))
+                    .clicked()
+                {
                     *status_menu = None;
                 }
             });
