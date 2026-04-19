@@ -961,7 +961,24 @@ fn render_column(
                 })
                 .show(ui, |ui| {
                     if rows.is_empty() && !form.open {
-                        ui.small("(empty)");
+                        // Subtle centered placeholder for an empty
+                        // column. Matches the muted monospace style
+                        // used elsewhere (keeps the column compact —
+                        // a full empty-state with icon would be
+                        // heavy at 240px wide).
+                        ui.add_space(8.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "NO {} GOALS",
+                                    status.to_uppercase()
+                                ))
+                                .monospace()
+                                .small()
+                                .color(color_muted()),
+                            );
+                        });
+                        ui.add_space(8.0);
                         return;
                     }
                     for (row, depth) in rows {
