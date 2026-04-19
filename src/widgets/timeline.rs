@@ -647,16 +647,6 @@ impl BranchTimeline {
         // reading the tick marks.
         let visible_secs = viewport_height as f64 * 60.0 / self.timeline_scale as f64;
         let span_label = format_span(visible_secs);
-        // True when the current window lies outside the present — we
-        // only surface the "JUMP TO NOW" button when it'd actually do
-        // something (and when now > timeline_start, meaning we've
-        // panned into the past).
-        let viewport_ns = (viewport_height as f64 * 60_000_000_000.0
-            / self.timeline_scale as f64) as i128;
-        let view_start = self.timeline_start;
-        let view_end = view_start - viewport_ns;
-        let now_in_view = now >= view_end && now <= view_start;
-        let mut jump_to_now = false;
         ctx.section("Activity", |ctx| {
             ctx.grid(|g| {
                 // Source legend (left) + span/hint chip (right).
@@ -676,7 +666,7 @@ impl BranchTimeline {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 ui.label(
                                     egui::RichText::new(
-                                        "PINCH OR \u{2318}+SCROLL TO ZOOM",
+                                        "PINCH/\u{2318}+SCROLL ZOOM · DBL-CLICK \u{2192} NOW",
                                     )
                                     .small()
                                     .monospace()
@@ -697,29 +687,6 @@ impl BranchTimeline {
                                         .monospace()
                                         .strong(),
                                 );
-                                if !now_in_view {
-                                    ui.label(
-                                        egui::RichText::new("\u{00b7}")
-                                            .small()
-                                            .color(egui::Color32::from_rgb(
-                                                0x6a, 0x6a, 0x6a,
-                                            )),
-                                    );
-                                    if ui
-                                        .add(egui::Button::new(
-                                            egui::RichText::new("\u{21ba} NOW")
-                                                .small()
-                                                .monospace()
-                                                .strong(),
-                                        ))
-                                        .on_hover_text(
-                                            "Recenter the viewport on the present",
-                                        )
-                                        .clicked()
-                                    {
-                                        jump_to_now = true;
-                                    }
-                                }
                             },
                         );
                     });
@@ -730,9 +697,6 @@ impl BranchTimeline {
                 });
             });
         });
-        if jump_to_now {
-            self.timeline_start = now;
-        }
     }
 
     /// Paint the timeline viewport. All pan/zoom/scroll logic lives here.
