@@ -905,13 +905,24 @@ impl WikiGraph {
             .map(|p| rect.contains(p))
             .unwrap_or(false);
         if pointer_in_graph {
-            // Pinch-to-zoom (trackpad) and scroll-to-zoom (mouse wheel).
-            let pinch = ui.input(|i| i.zoom_delta());
-            let scroll = ui.input(|i| i.smooth_scroll_delta.x);
+            // Pinch-to-zoom (trackpad native) or cmd/ctrl + scroll
+            // (mouse wheel). Plain vertical/horizontal scroll is NOT
+            // consumed — it falls through to the outer notebook
+            // ScrollArea. Previously we zoomed on `smooth_scroll_delta.x`
+            // alone, which caught trackpad sideways drift on every
+            // scroll and made the graph zoom when the user just wanted
+            // to scroll the page.
+            let (pinch, scroll_y, ctrl) = ui.input(|i| {
+                (
+                    i.zoom_delta(),
+                    i.smooth_scroll_delta.y,
+                    i.modifiers.command || i.modifiers.ctrl,
+                )
+            });
             let zoom_factor = if pinch != 1.0 {
                 pinch
-            } else if scroll != 0.0 {
-                (1.0 + scroll * 0.002).clamp(0.9, 1.1)
+            } else if ctrl && scroll_y != 0.0 {
+                (1.0 + scroll_y * 0.004).clamp(0.85, 1.15)
             } else {
                 1.0
             };
@@ -926,8 +937,10 @@ impl WikiGraph {
                     m.data.insert_temp(zoom_id, zoom);
                     m.data.insert_temp(pan_id, pan);
                 });
-                // Consume only horizontal scroll so vertical passes through to notebook.
-                ui.ctx().input_mut(|i| i.smooth_scroll_delta.x = 0.0);
+                // Only consume the scroll delta we actually used.
+                if ctrl && scroll_y != 0.0 {
+                    ui.ctx().input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+                }
             }
         }
 
