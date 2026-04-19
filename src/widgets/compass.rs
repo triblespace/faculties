@@ -657,12 +657,51 @@ impl CompassBoard {
         let status_menu = &mut self.status_menu;
 
         ctx.section("Compass", |ctx| {
-            ctx.label(
-                egui::RichText::new(format!("{total_goals} GOALS"))
-                    .monospace()
-                    .small()
-                    .color(color_muted()),
-            );
+            // Header: total + per-status breakdown as small colored
+            // chips. Same statuses appear as column headers below, so
+            // the summary is a mini-legend too.
+            let ui = ctx.ui_mut();
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(
+                    egui::RichText::new(format!("{total_goals} GOALS"))
+                        .monospace()
+                        .strong()
+                        .small()
+                        .color(color_muted()),
+                );
+                ui.label(
+                    egui::RichText::new("\u{00b7}")
+                        .small()
+                        .color(color_muted()),
+                );
+                for (status, rows) in &column_data {
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let (dot, _) = ui.allocate_exact_size(
+                        egui::vec2(8.0, 8.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().circle_filled(
+                        dot.center(),
+                        3.5,
+                        status_color(status),
+                    );
+                    ui.label(
+                        egui::RichText::new(status.to_uppercase())
+                            .monospace()
+                            .strong()
+                            .small(),
+                    );
+                    ui.label(
+                        egui::RichText::new(rows.len().to_string())
+                            .monospace()
+                            .small()
+                            .color(color_muted()),
+                    );
+                }
+            });
 
             if total_goals == 0 && column_data.iter().all(|(s, _)| !compose.contains_key(s)) {
                 ctx.label("No goals yet. Click + Add in a column below to start.");
