@@ -54,21 +54,35 @@ pub struct StorageState {
 }
 
 impl StorageState {
-    /// Attempt to open the pile at `pile_path`. Failures are stashed on
-    /// `error` so the top-bar banner can surface them; rendering still
-    /// works (workspace lookups return `None`).
+    /// Stash the pile path for lazy open. No I/O happens here — the
+    /// pile is opened on the first call that needs it (`workspace`,
+    /// `top_bar`, `push`).
+    ///
+    /// This matters because `GORBIE::NotebookCtx::state` takes its
+    /// initial value eagerly: it's constructed every frame and
+    /// discarded when state already exists. A heavy constructor
+    /// (opening a pile) every frame would spam pile-not-closed warnings
+    /// and churn mmap handles.
     pub fn new(pile_path: impl Into<PathBuf>) -> Self {
         let pile_path = pile_path.into();
         let pile_path_text = pile_path.to_string_lossy().into_owned();
-        let mut s = Self {
+        Self {
             repo: None,
             pile_path,
             pile_path_text,
             error: None,
             toast: None,
-        };
-        s.open_current_path();
-        s
+        }
+    }
+
+    /// Open the pile at `self.pile_path` if it isn't already open.
+    /// No-op if the repo is already open or the last open attempt
+    /// failed (see `error`).
+    fn ensure_open(&mut self) {
+        if self.repo.is_some() || self.error.is_some() {
+            return;
+        }
+        self.open_current_path();
     }
 
     /// Reopen against a new path.
@@ -122,6 +136,7 @@ impl StorageState {
     /// the branch is missing. Each call is a fresh pull — workspaces are
     /// NOT cached across frames.
     pub fn workspace(&mut self, branch: &str) -> Option<Workspace<Pile<Blake3>>> {
+        self.ensure_open();
         let repo = self.repo.as_mut()?;
         let bid = find_branch(repo, branch)?;
         match repo.pull(bid) {
@@ -139,6 +154,7 @@ impl StorageState {
     /// unconditionally. On CAS failure / storage error, stores a toast.
     /// Uses `Repository::push` which handles merge-retry internally.
     pub fn push(&mut self, ws: &mut Workspace<Pile<Blake3>>) {
+        self.ensure_open();
         let Some(repo) = self.repo.as_mut() else {
             return;
         };
@@ -167,6 +183,7 @@ impl StorageState {
     /// error/toast banner. Call once per frame at the start of a
     /// notebook.
     pub fn top_bar(&mut self, ctx: &mut CardCtx<'_>) {
+        self.ensure_open();
         let mut reopen = false;
         ctx.grid(|g| {
             g.place(10, |ctx| {
