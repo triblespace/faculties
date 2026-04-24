@@ -22,6 +22,11 @@ pub mod archive {
 
         "0D9195A7B1B20DE312A08ECE39168079" as pub reply_to: GenId;
         "838CC157FFDD37C6AC7CC5A472E43ADB" as pub author: GenId;
+        /// Wall-clock interval at which the message was last
+        /// edited. Absent on unedited messages. Protocol-agnostic
+        /// — every messaging faculty (teams, discord, any future
+        /// Slack / Matrix / etc.) writes the same attribute.
+        "76ED22B5BBB68EC6418DE2B6234EA5FB" as pub edited_at: NsTAIInterval;
         "E63EE961ABDB1D1BEC0789FDAFFB9501" as pub author_name: Handle<Blake3, LongString>;
         "2D15150501ACCD9DFD96CB4BF19D1883" as pub author_role: Handle<Blake3, LongString>;
         "4FE6A8A43658BC2F61FEDF5CFB29EEFC" as pub author_model: Handle<Blake3, LongString>;

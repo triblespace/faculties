@@ -389,6 +389,9 @@ struct IncomingMessage {
     author_display_name: String,
     content: String,
     created_at: Value<NsTAIInterval>,
+    /// Present only on edited messages. Re-ingesting an edited
+    /// message updates this attribute on the existing entity.
+    edited_at: Option<Value<NsTAIInterval>>,
     reply_to_external_id: Option<String>,
     attachments: Vec<AttachmentSource>,
 }
@@ -547,9 +550,12 @@ fn print_history(
             .root()
             .ok_or_else(|| anyhow!("channel id rooted"))?;
 
-        // Gather messages for this channel.
+        // First pass: required attributes, filtered to this
+        // channel. `edited_at` is optional in the schema —
+        // `pattern!` has no optional-binding syntax, so the
+        // second pass fills it in from a sparse HashMap.
         let mut messages: Vec<HistoryRow> = Vec::new();
-        for (_, content, author_id, created_at, ch) in find!(
+        for (msg, content, author_id, created_at, ch) in find!(
             (
                 message: Id,
                 content: Value<Handle<Blake3, LongString>>,
@@ -570,11 +576,27 @@ fn print_history(
                 continue;
             }
             messages.push(HistoryRow {
+                message_id: msg,
                 content,
                 author_id,
                 created_at,
                 created_at_key: interval_key(created_at),
+                edited_at: None,
             });
+        }
+
+        let edited: std::collections::HashMap<Id, Value<NsTAIInterval>> = find!(
+            (message: Id, edited: Value<NsTAIInterval>),
+            pattern!(&catalog, [{
+                ?message @
+                metadata::tag: archive::kind_message,
+                archive::edited_at: ?edited,
+            }])
+        )
+        .into_iter()
+        .collect();
+        for row in messages.iter_mut() {
+            row.edited_at = edited.get(&row.message_id).copied();
         }
 
         // Resolve author display names in one pass.
@@ -616,17 +638,23 @@ fn print_history(
                 .cloned()
                 .unwrap_or_else(|| format!("{}", message.author_id));
             let timestamp = format_interval(message.created_at);
-            println!("[{timestamp}] {author}: {content}");
+            let edited_marker = match message.edited_at {
+                Some(edit_interval) => format!(" (edited {})", format_interval(edit_interval)),
+                None => String::new(),
+            };
+            println!("[{timestamp}]{edited_marker} {author}: {content}");
         }
         Ok(())
     })
 }
 
 struct HistoryRow {
+    message_id: Id,
     content: Value<Handle<Blake3, LongString>>,
     author_id: Id,
     created_at: Value<NsTAIInterval>,
     created_at_key: i128,
+    edited_at: Option<Value<NsTAIInterval>>,
 }
 
 fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result<Vec<IncomingMessage>> {
@@ -664,6 +692,13 @@ fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result
             .ok_or_else(|| anyhow!("message {external_id} missing timestamp"))?;
         let created_at = parse_iso8601(timestamp_str)
             .with_context(|| format!("parse timestamp {timestamp_str}"))?;
+        // `edited_timestamp` is null on unedited messages and an
+        // ISO-8601 string otherwise. Skip silently on parse
+        // failure — a malformed edit stamp shouldn't block ingest.
+        let edited_at = message
+            .get("edited_timestamp")
+            .and_then(|v| v.as_str())
+            .and_then(|s| parse_iso8601(s).ok());
         let reply_to_external_id = message
             .get("referenced_message")
             .and_then(|v| v.get("id"))
@@ -709,6 +744,7 @@ fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result
             author_display_name,
             content,
             created_at,
+            edited_at,
             reply_to_external_id,
             attachments,
         });
@@ -806,6 +842,7 @@ fn build_ingest_change(
             discord::channel: channel_id,
             discord::message_raw: raw_handle,
             archive::reply_to?: reply_to,
+            archive::edited_at?: message.edited_at,
         };
 
         // ── attachments ──
