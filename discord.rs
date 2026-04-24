@@ -57,7 +57,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use hifitime::Epoch;
+use hifitime::{Epoch, TimeScale};
 use rand_core::OsRng;
 use reqwest::blocking::Client;
 use serde_json::{Value as JsonValue, json};
@@ -109,15 +109,40 @@ enum CommandMode {
         /// Message body. Use `@path` / `@-` for file / stdin.
         text: String,
     },
-    /// Pull recent messages from a channel into the pile.
-    /// Successive runs are incremental — a per-channel cursor
-    /// records the newest message already ingested.
+    /// Pull recent messages from a channel into the pile, then
+    /// print the newest ones from the pile. Successive runs are
+    /// incremental — a per-channel cursor records the newest
+    /// message already ingested.
     Read {
         /// Channel id (external Discord snowflake).
         channel_id: String,
         /// Max messages to fetch per call (1–100, Discord's cap).
         #[arg(long, default_value_t = 50)]
         limit: u32,
+        /// Max messages to print from the pile after ingest.
+        #[arg(long, default_value_t = 20)]
+        show: usize,
+        /// Print newest first (default: oldest first).
+        #[arg(long)]
+        descending: bool,
+    },
+    /// List guilds (servers) + their text channels visible to the
+    /// bot. Answers the "what can the bot see?" diagnostic — if a
+    /// channel you expect isn't listed, the bot needs to be
+    /// invited / granted access on Discord's side first.
+    Channels {
+        #[command(subcommand)]
+        command: ChannelsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelsCommand {
+    /// Print guilds + channels.
+    List {
+        /// Only show channels in this guild (snowflake id).
+        #[arg(long)]
+        guild: Option<String>,
     },
 }
 
@@ -143,7 +168,15 @@ fn main() -> Result<()> {
     match mode {
         CommandMode::Login { token } => login(config, token),
         CommandMode::Send { channel_id, text } => send(config, channel_id, text),
-        CommandMode::Read { channel_id, limit } => read(config, channel_id, limit),
+        CommandMode::Read {
+            channel_id,
+            limit,
+            show,
+            descending,
+        } => read(config, channel_id, limit, show, descending),
+        CommandMode::Channels { command } => match command {
+            ChannelsCommand::List { guild } => list_channels(config, guild),
+        },
     }
 }
 
@@ -350,7 +383,13 @@ struct IncomingMessage {
     reply_to_external_id: Option<String>,
 }
 
-fn read(config: DiscordConfig, channel_id: String, limit: u32) -> Result<()> {
+fn read(
+    config: DiscordConfig,
+    channel_id: String,
+    limit: u32,
+    show: usize,
+    descending: bool,
+) -> Result<()> {
     let token = load_bot_token(&config)?;
     let limit = limit.clamp(1, 100);
 
@@ -428,7 +467,119 @@ fn read(config: DiscordConfig, channel_id: String, limit: u32) -> Result<()> {
         &format!("ingested {ingested} messages from channel {channel_id}"),
     )?;
     println!("Ingested {ingested} messages from channel {channel_id}.");
+
+    if show > 0 {
+        print_history(&config, &channel_id, show, descending)?;
+    }
     Ok(())
+}
+
+/// Query the pile for messages in a given channel and print them.
+/// Channel identity is derived from `channel_external_id` via the
+/// same identity-only-fragment idiom `build_ingest_change` uses,
+/// so the lookup is by intrinsic id, not name.
+fn print_history(
+    config: &DiscordConfig,
+    channel_external_id: &str,
+    limit: usize,
+    descending: bool,
+) -> Result<()> {
+    with_repo(&config.pile_path, |repo| {
+        let mut ws = repo
+            .pull(config.branch_id)
+            .map_err(|e| anyhow!("pull discord: {e:?}"))?;
+        let catalog = ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout discord: {e:?}"))?
+            .into_facts();
+
+        // Re-derive the channel id from the external snowflake.
+        let external_handle = ws.put(channel_external_id.to_string());
+        let id_frag = entity! { _ @ discord::channel_id: external_handle };
+        let channel_id = id_frag
+            .root()
+            .ok_or_else(|| anyhow!("channel id rooted"))?;
+
+        // Gather messages for this channel.
+        let mut messages: Vec<HistoryRow> = Vec::new();
+        for (_, content, author_id, created_at, ch) in find!(
+            (
+                message: Id,
+                content: Value<Handle<Blake3, LongString>>,
+                author: Id,
+                created_at: Value<NsTAIInterval>,
+                channel: Id,
+            ),
+            pattern!(&catalog, [{
+                ?message @
+                metadata::tag: archive::kind_message,
+                archive::content: ?content,
+                archive::author: ?author,
+                metadata::created_at: ?created_at,
+                discord::channel: ?channel,
+            }])
+        ) {
+            if ch != channel_id {
+                continue;
+            }
+            messages.push(HistoryRow {
+                content,
+                author_id,
+                created_at,
+                created_at_key: interval_key(created_at),
+            });
+        }
+
+        // Resolve author display names in one pass.
+        let mut author_names: HashMap<Id, String> = HashMap::new();
+        for (author, name_handle) in find!(
+            (author: Id, name: Value<Handle<Blake3, LongString>>),
+            pattern!(&catalog, [{
+                ?author @
+                metadata::tag: archive::kind_author,
+                archive::author_name: ?name,
+            }])
+        ) {
+            let view: View<str> = ws
+                .get(name_handle)
+                .map_err(|e| anyhow!("load author name: {e:?}"))?;
+            author_names.insert(author, view.to_string());
+        }
+
+        messages.sort_by_key(|m| m.created_at_key);
+        if limit > 0 && messages.len() > limit {
+            let start = messages.len() - limit;
+            messages = messages.split_off(start);
+        }
+        if descending {
+            messages.reverse();
+        }
+
+        if messages.is_empty() {
+            println!("(no messages in pile for channel {channel_external_id})");
+            return Ok(());
+        }
+        for message in messages {
+            let view: View<str> = ws
+                .get(message.content)
+                .map_err(|e| anyhow!("load content: {e:?}"))?;
+            let content = view.to_string();
+            let author = author_names
+                .get(&message.author_id)
+                .cloned()
+                .unwrap_or_else(|| format!("{}", message.author_id));
+            let timestamp = format_interval(message.created_at);
+            println!("[{timestamp}] {author}: {content}");
+        }
+        Ok(())
+    })
+}
+
+struct HistoryRow {
+    content: Value<Handle<Blake3, LongString>>,
+    author_id: Id,
+    created_at: Value<NsTAIInterval>,
+    created_at_key: i128,
 }
 
 fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result<Vec<IncomingMessage>> {
@@ -662,6 +813,108 @@ fn store_channel_cursor(
     })
 }
 
+// ── channels list ────────────────────────────────────────────────
+
+fn list_channels(config: DiscordConfig, guild_filter: Option<String>) -> Result<()> {
+    let token = load_bot_token(&config)?;
+    let client = build_client()?;
+
+    // 1. guilds the bot is in.
+    let guilds: Vec<JsonValue> = client
+        .get(format!("{DISCORD_API_BASE}/users/@me/guilds"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .context("GET /users/@me/guilds")?
+        .error_for_status()
+        .context("guilds request failed")?
+        .json()
+        .context("parse guilds response")?;
+
+    if guilds.is_empty() {
+        println!("Bot is not a member of any guilds. Invite it to a server first.");
+        return Ok(());
+    }
+
+    let filter = guild_filter.as_deref().map(str::trim);
+
+    for guild in guilds {
+        let guild_id = guild
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<missing>");
+        let guild_name = guild
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>");
+        if filter.map_or(false, |f| !f.is_empty() && f != guild_id) {
+            continue;
+        }
+
+        println!("{guild_name}  ({guild_id})");
+
+        // 2. channels in this guild.
+        let channels: Vec<JsonValue> = client
+            .get(format!("{DISCORD_API_BASE}/guilds/{guild_id}/channels"))
+            .header("Authorization", format!("Bot {token}"))
+            .send()
+            .with_context(|| format!("GET /guilds/{guild_id}/channels"))?
+            .error_for_status()
+            .with_context(|| format!("channels request for guild {guild_id} failed"))?
+            .json()
+            .with_context(|| format!("parse channels for guild {guild_id}"))?;
+
+        // Discord channel types: 0 = GUILD_TEXT, 2 = GUILD_VOICE,
+        // 4 = GUILD_CATEGORY, 5 = GUILD_ANNOUNCEMENT, 15 = GUILD_FORUM.
+        // Group by category; show text-ish ones first.
+        let mut rows: Vec<(i64, &str, &str, &str)> = Vec::new();
+        for channel in &channels {
+            let id = channel
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<missing>");
+            let name = channel
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<unnamed>");
+            let kind = channel.get("type").and_then(|v| v.as_i64()).unwrap_or(-1);
+            let kind_label = channel_type_label(kind);
+            rows.push((kind, id, name, kind_label));
+        }
+        // Stable order: categories first, then text/announce/forum, then voice.
+        rows.sort_by_key(|(kind, _, _, _)| match kind {
+            4 => 0,   // category
+            0 | 5 => 1, // text / announcement
+            15 => 2,  // forum
+            _ => 3,   // voice, stage, thread, ...
+        });
+
+        for (_, id, name, kind_label) in rows {
+            println!("  {kind_label:<12} #{name:<30} {id}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn channel_type_label(kind: i64) -> &'static str {
+    match kind {
+        0 => "text",
+        1 => "dm",
+        2 => "voice",
+        3 => "group-dm",
+        4 => "category",
+        5 => "announcement",
+        10 => "announce-thread",
+        11 => "public-thread",
+        12 => "private-thread",
+        13 => "stage",
+        14 => "directory",
+        15 => "forum",
+        16 => "media",
+        _ => "other",
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────────────
 
 fn build_client() -> Result<Client> {
@@ -694,6 +947,16 @@ fn now_epoch() -> Epoch {
 
 fn epoch_interval(epoch: Epoch) -> Value<NsTAIInterval> {
     (epoch, epoch).try_to_value().unwrap()
+}
+
+fn interval_key(interval: Value<NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+    lower.to_tai_duration().total_nanoseconds()
+}
+
+fn format_interval(interval: Value<NsTAIInterval>) -> String {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_value().unwrap();
+    lower.to_gregorian_str(TimeScale::UTC)
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
