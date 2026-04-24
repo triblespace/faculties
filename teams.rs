@@ -38,9 +38,23 @@ use triblespace::core::metadata;
 use triblespace::core::blob::Bytes;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
+use triblespace::macros::id_hex;
 use triblespace::prelude::blobschemas::LongString;
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
+
+/// Author entity used by the teams faculty when writing its own log entries.
+/// Singleton — same id across every faculty run.
+const TEAMS_LOG_AUTHOR_ID: Id = id_hex!("5E9B01A9D7C9BB6D765F8C96A83D2E60");
+/// Author entity used for attachment backfill rows (there is no real author
+/// for these; the attachments-only backfill is a faculty action, not a user
+/// message). Singleton.
+const TEAMS_BACKFILL_AUTHOR_ID: Id = id_hex!("64A9492F3B2368A0DAB5FAF3277132C2");
+/// Fallback author id used when Teams delivers a message with no `from.user.id`.
+/// Mapping every anonymous message to the same id keeps the graph small and
+/// lets us eventually merge/correct them later if the upstream data improves.
+#[allow(dead_code)]
+const TEAMS_UNKNOWN_AUTHOR_ID: Id = id_hex!("04217F0E5F75F57B8A7CBFD824D5FF31");
 
 use faculties::schemas::archive::{FileBytes, archive};
 use faculties::schemas::teams::{
@@ -514,10 +528,9 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
         let catalog = map_err_debug(ws.checkout(..), "checkout workspace")?.into_facts();
 
         let mut change = TribleSet::new();
-        let author_id = stable_id("teams-log-author", &[]);
         let author_name = ws.put("teams".to_string());
         let author_role = ws.put("faculty".to_string());
-        change += entity! { ExclusiveId::force_ref(&author_id) @
+        change += entity! { ExclusiveId::force_ref(&TEAMS_LOG_AUTHOR_ID) @
             metadata::tag: archive::kind_author,
             archive::author_name: author_name,
             archive::author_role: author_role,
@@ -529,7 +542,7 @@ fn log_event(config: &TeamsBridgeConfig, level: &str, message: &str) -> Result<(
         let created_at = epoch_interval(now_epoch());
         change += entity! { &log_id @
             metadata::tag: teams::kind_log,
-            archive::author: author_id,
+            archive::author: TEAMS_LOG_AUTHOR_ID,
             metadata::created_at: created_at,
             archive::content: content_handle,
         };
@@ -1910,9 +1923,6 @@ struct IncomingMessage {
     chat_external_id: String,
     message_external_id: String,
     raw_json: String,
-    chat_id: Id,
-    message_id: Id,
-    author_id: Id,
     author_external_id: Option<String>,
     author_display_name: Option<String>,
     content: String,
@@ -2254,31 +2264,23 @@ fn backfill_attachments(config: TeamsBridgeConfig, options: AttachmentBackfillOp
                 continue;
             }
 
+            // `created_at`, `content`, `chat_external_id`, `message_external_id`,
+            // and `raw_json` are not used by the new `ensure_attachments` —
+            // they were kept in the stub only to satisfy the old IncomingMessage
+            // shape. The backfill only needs `message_id` + the attachments list.
+            let _ = (created_at, &content, &chat_external_id, &message_external_id, &raw_json);
             let before = change.len();
-            let message_stub = IncomingMessage {
-                chat_external_id,
-                message_external_id,
-                raw_json: raw_json.unwrap_or_default(),
-                chat_id,
-                message_id,
-                author_id: stable_id("teams:author", &["backfill"]),
-                author_external_id: None,
-                author_display_name: None,
-                content,
-                created_at,
-                created_at_key: interval_key(created_at),
-                attachments,
-            };
             ensure_attachments(
                 &mut ws,
                 &mut change,
                 &mut files_change,
                 &index,
-                &message_stub,
+                message_id,
+                &attachments,
                 &token,
                 &config,
                 &mut added_attachments,
-            );
+            )?;
             if change.len() > before {
                 created += 1;
             }
@@ -2600,20 +2602,10 @@ fn parse_messages(messages: Vec<JsonValue>) -> Result<Vec<IncomingMessage>> {
             &mut seen_sources,
         ));
 
-        let chat_id = stable_id("teams:chat", &[chat_external_id]);
-        let message_id = stable_id("teams:message", &[chat_external_id, message_external_id]);
-        let author_id = stable_id(
-            "teams:user",
-            &[author_external_id.as_deref().unwrap_or("unknown")],
-        );
-
         parsed.push(IncomingMessage {
             chat_external_id: chat_external_id.to_owned(),
             message_external_id: message_external_id.to_owned(),
             raw_json,
-            chat_id,
-            message_id,
-            author_id,
             author_external_id,
             author_display_name,
             content: content.to_owned(),
@@ -2740,9 +2732,6 @@ struct CatalogIndex {
     message_attachment_set: HashSet<(Id, Id)>,
     last_message_by_chat: HashMap<Id, (i128, Id)>,
     author_name_set: HashSet<Id>,
-    author_user_id_set: HashSet<Id>,
-    chat_id_set: HashSet<Id>,
-    message_external_id_set: HashSet<Id>,
     message_raw_set: HashSet<Id>,
     message_chat_set: HashSet<Id>,
     message_content_set: HashSet<Id>,
@@ -2815,30 +2804,6 @@ impl CatalogIndex {
         .map(|(author, _)| author)
         .collect::<HashSet<_>>();
 
-        let author_user_id_set = find!(
-            (author: Id, user_id: Value<Handle<Blake3, LongString>>),
-            pattern!(catalog, [{ ?author @ teams::user_id: ?user_id }])
-        )
-        .into_iter()
-        .map(|(author, _)| author)
-        .collect::<HashSet<_>>();
-
-        let chat_id_set = find!(
-            (chat: Id, chat_id: Value<Handle<Blake3, LongString>>),
-            pattern!(catalog, [{ ?chat @ teams::chat_id: ?chat_id }])
-        )
-        .into_iter()
-        .map(|(chat, _)| chat)
-        .collect::<HashSet<_>>();
-
-        let message_external_id_set = find!(
-            (message: Id, message_id: Value<Handle<Blake3, LongString>>),
-            pattern!(catalog, [{ ?message @ teams::message_id: ?message_id }])
-        )
-        .into_iter()
-        .map(|(message, _)| message)
-        .collect::<HashSet<_>>();
-
         let message_raw_set = find!(
             (message: Id, raw: Value<Handle<Blake3, LongString>>),
             pattern!(catalog, [{ ?message @ teams::message_raw: ?raw }])
@@ -2904,9 +2869,6 @@ impl CatalogIndex {
             message_attachment_set,
             last_message_by_chat,
             author_name_set,
-            author_user_id_set,
-            chat_id_set,
-            message_external_id_set,
             message_raw_set,
             message_chat_set,
             message_content_set,
@@ -2923,37 +2885,42 @@ fn build_ingest_change(
     token: &str,
     config: &TeamsBridgeConfig,
 ) -> Result<(TribleSet, TribleSet)> {
-    let mut by_chat: HashMap<Id, Vec<IncomingMessage>> = HashMap::new();
+    let mut by_chat: HashMap<String, Vec<IncomingMessage>> = HashMap::new();
     for message in incoming {
-        by_chat.entry(message.chat_id).or_default().push(message);
+        by_chat
+            .entry(message.chat_external_id.clone())
+            .or_default()
+            .push(message);
     }
 
     let mut change = TribleSet::new();
     let mut files_change = TribleSet::new();
     let mut added_attachments = HashSet::new();
-    for (chat_id, mut messages) in by_chat {
+    for (chat_external_id, mut messages) in by_chat {
+        // Derive chat_id intrinsically from the external id.
+        let chat_external_handle = ws.put(chat_external_id.clone());
+        let chat_id_frag = entity! { _ @
+            teams::chat_id: chat_external_handle,
+        };
+        let chat_id = chat_id_frag
+            .root()
+            .ok_or_else(|| anyhow::anyhow!("chat id rooted"))?;
+        change += chat_id_frag;
+
+        let missing_chat_kind = !index.chats.contains(&chat_id);
+        if missing_chat_kind {
+            change += entity! { ExclusiveId::force_ref(&chat_id) @
+                metadata::tag: teams::kind_chat,
+            };
+        }
+
+        // Sort by created_at (stable across runs; no derived-id tiebreak yet
+        // because message_ids are per-message below).
         messages.sort_by(|left, right| {
             left.created_at_key
                 .cmp(&right.created_at_key)
-                .then_with(|| left.message_id.cmp(&right.message_id))
+                .then_with(|| left.message_external_id.cmp(&right.message_external_id))
         });
-
-        let missing_chat_kind = !index.chats.contains(&chat_id);
-        let chat_id_handle = if !index.chat_id_set.contains(&chat_id) {
-            let chat_external = messages
-                .first()
-                .map(|msg| msg.chat_external_id.clone())
-                .unwrap_or_default();
-            (!chat_external.is_empty()).then(|| ws.put(chat_external))
-        } else {
-            None
-        };
-        if missing_chat_kind || chat_id_handle.is_some() {
-            change += entity! { ExclusiveId::force_ref(&chat_id) @
-                metadata::tag?: missing_chat_kind.then_some(teams::kind_chat),
-                teams::chat_id?: chat_id_handle,
-            };
-        }
 
         let mut predecessor = index
             .last_message_by_chat
@@ -2961,67 +2928,79 @@ fn build_ingest_change(
             .map(|(_, message_id)| *message_id);
 
         for message in messages {
-            ensure_author(
-                ws,
-                &mut change,
-                index,
-                message.author_id,
-                message.author_external_id.as_deref(),
-                message.author_display_name.as_deref(),
-            );
+            // Derive author_id intrinsically from the author's external id,
+            // or fall back to the unknown-author singleton if Teams did not
+            // provide one.
+            let author_id = match message.author_external_id.as_deref() {
+                Some(ext) if !ext.trim().is_empty() => {
+                    ensure_author(
+                        ws,
+                        &mut change,
+                        index,
+                        ext,
+                        message.author_display_name.as_deref(),
+                    )?
+                }
+                _ => TEAMS_UNKNOWN_AUTHOR_ID,
+            };
+
+            // Derive message_id intrinsically from the message's external id.
+            let message_external_handle = ws.put(message.message_external_id.clone());
+            let message_id_frag = entity! { _ @
+                teams::message_id: message_external_handle,
+            };
+            let message_id = message_id_frag
+                .root()
+                .ok_or_else(|| anyhow::anyhow!("message id rooted"))?;
+            change += message_id_frag;
 
             ensure_attachments(
                 ws,
                 &mut change,
                 &mut files_change,
                 index,
-                &message,
+                message_id,
+                &message.attachments,
                 token,
                 config,
                 &mut added_attachments,
-            );
+            )?;
 
-            if !index.messages.contains(&message.message_id) {
+            if !index.messages.contains(&message_id) {
                 // New message entity.
                 let content_handle = ws.put(message.content);
                 let raw_handle = ws.put(message.raw_json);
-                let external_handle = ws.put(message.message_external_id);
-                change += entity! { ExclusiveId::force_ref(&message.message_id) @
+                change += entity! { ExclusiveId::force_ref(&message_id) @
                     metadata::tag: archive::kind_message,
-                    archive::author: message.author_id,
+                    archive::author: author_id,
                     metadata::created_at: message.created_at,
                     archive::content: content_handle,
                     teams::chat: chat_id,
                     teams::message_raw: raw_handle,
-                    teams::message_id: external_handle,
                     archive::reply_to?: predecessor,
                 };
             } else {
                 // Fill in missing metadata for existing messages when possible.
-                let message_chat = (!index.message_chat_set.contains(&message.message_id))
+                let message_chat = (!index.message_chat_set.contains(&message_id))
                     .then_some(chat_id);
-                let message_external = (!index.message_external_id_set.contains(&message.message_id))
-                    .then(|| ws.put(message.message_external_id.clone()));
-                let message_raw = (!index.message_raw_set.contains(&message.message_id))
+                let message_raw = (!index.message_raw_set.contains(&message_id))
                     .then(|| ws.put(message.raw_json.clone()));
-                let message_created_at = (!index.message_created_at_set.contains(&message.message_id))
+                let message_created_at = (!index.message_created_at_set.contains(&message_id))
                     .then_some(message.created_at);
-                let message_content = (!index.message_content_set.contains(&message.message_id))
+                let message_content = (!index.message_content_set.contains(&message_id))
                     .then(|| ws.put(message.content.clone()));
                 let message_reply_to = (predecessor.is_some()
-                    && !index.reply_to_set.contains(&message.message_id))
+                    && !index.reply_to_set.contains(&message_id))
                     .then_some(predecessor.unwrap());
 
                 if message_chat.is_some()
-                    || message_external.is_some()
                     || message_raw.is_some()
                     || message_created_at.is_some()
                     || message_content.is_some()
                     || message_reply_to.is_some()
                 {
-                    change += entity! { ExclusiveId::force_ref(&message.message_id) @
+                    change += entity! { ExclusiveId::force_ref(&message_id) @
                         teams::chat?: message_chat,
-                        teams::message_id?: message_external,
                         teams::message_raw?: message_raw,
                         metadata::created_at?: message_created_at,
                         archive::content?: message_content,
@@ -3030,7 +3009,7 @@ fn build_ingest_change(
                 }
             }
 
-            predecessor = Some(message.message_id);
+            predecessor = Some(message_id);
         }
     }
 
@@ -3041,35 +3020,37 @@ fn ensure_author(
     ws: &mut Workspace<Pile<Blake3>>,
     change: &mut TribleSet,
     index: &CatalogIndex,
-    author_id: Id,
-    author_external_id: Option<&str>,
+    author_external_id: &str,
     author_display_name: Option<&str>,
-) {
+) -> Result<Id> {
+    // Derive author_id intrinsically from the external id via the
+    // identity-only-fragment idiom.
+    let external_handle = ws.put(author_external_id.to_owned());
+    let id_frag = entity! { _ @
+        teams::user_id: external_handle,
+    };
+    let author_id = id_frag
+        .root()
+        .ok_or_else(|| anyhow::anyhow!("author id rooted"))?;
+    *change += id_frag;
+
     let missing_author_kind = !index.authors.contains(&author_id);
     let author_name = (!index.author_name_set.contains(&author_id)).then(|| {
         let name = author_display_name
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .or(author_external_id)
-            .unwrap_or("unknown");
+            .unwrap_or(author_external_id);
         ws.put(name.to_string())
     });
-    let author_user_id = if !index.author_user_id_set.contains(&author_id) {
-        author_external_id
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|user_id| ws.put(user_id.to_string()))
-    } else {
-        None
-    };
 
-    if missing_author_kind || author_name.is_some() || author_user_id.is_some() {
+    if missing_author_kind || author_name.is_some() {
         *change += entity! { ExclusiveId::force_ref(&author_id) @
             metadata::tag?: missing_author_kind.then_some(archive::kind_author),
             archive::author_name?: author_name,
-            teams::user_id?: author_user_id,
         };
     }
+
+    Ok(author_id)
 }
 
 fn ensure_attachments(
@@ -3077,29 +3058,36 @@ fn ensure_attachments(
     change: &mut TribleSet,
     files_change: &mut TribleSet,
     index: &CatalogIndex,
-    message: &IncomingMessage,
+    message_id: Id,
+    attachments: &[AttachmentSource],
     token: &str,
     config: &TeamsBridgeConfig,
     added: &mut HashSet<Id>,
-) {
-    for source in &message.attachments {
+) -> Result<()> {
+    for source in attachments {
         let source_id = source.source_id.trim();
         if source_id.is_empty() {
             continue;
         }
-        let attachment_id = stable_id(
-            "teams:attachment",
-            &[&message.chat_external_id, &message.message_external_id, source_id],
-        );
+        // Derive attachment_id intrinsically from the source id via the
+        // shared archive::attachment_source_id attribute.
+        let source_handle = ws.put(source_id.to_owned());
+        let att_id_frag = entity! { _ @
+            archive::attachment_source_id: source_handle,
+        };
+        let attachment_id = att_id_frag
+            .root()
+            .ok_or_else(|| anyhow::anyhow!("attachment id rooted"))?;
 
         if !index
             .message_attachment_set
-            .contains(&(message.message_id, attachment_id))
+            .contains(&(message_id, attachment_id))
         {
-            *change += entity! { ExclusiveId::force_ref(&message.message_id) @
+            *change += entity! { ExclusiveId::force_ref(&message_id) @
                 archive::attachment: attachment_id,
             };
         }
+        *change += att_id_frag;
 
         if index.attachments.contains(&attachment_id) || !added.insert(attachment_id) {
             continue;
@@ -3151,6 +3139,7 @@ fn ensure_attachments(
             file::mime: mime
         };
     }
+    Ok(())
 }
 
 fn fetch_attachment_bytes(token: &str, url: &str) -> Result<(Vec<u8>, Option<String>)> {
@@ -3260,25 +3249,6 @@ fn infer_extension(mime: Option<&Value<ShortString>>) -> Option<&'static str> {
         "video/quicktime" => Some("mov"),
         _ => None,
     }
-}
-
-fn stable_id(namespace: &str, parts: &[&str]) -> Id {
-    use triblespace::prelude::valueschemas::Blake3 as Blake3Hasher;
-    let mut hasher = Blake3Hasher::new();
-    hasher.update(namespace.as_bytes());
-    hasher.update(&[0u8]);
-    for part in parts {
-        hasher.update(part.as_bytes());
-        hasher.update(&[0u8]);
-    }
-    let digest = hasher.finalize();
-    let bytes = digest.as_bytes();
-    let mut raw = [0u8; 16];
-    raw.copy_from_slice(&bytes[..16]);
-    if raw == [0; 16] {
-        raw[15] = 1;
-    }
-    Id::new(raw).expect("non-nil stable id")
 }
 
 fn now_epoch() -> Epoch {
