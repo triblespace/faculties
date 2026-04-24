@@ -65,12 +65,15 @@ use serde_json::{Value as JsonValue, json};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
-use triblespace::prelude::blobschemas::LongString;
+use triblespace::prelude::blobschemas::{self, LongString};
 use triblespace::prelude::valueschemas::{Blake3, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use faculties::schemas::archive::archive;
 use faculties::schemas::discord::{DEFAULT_BRANCH, DEFAULT_LOG_BRANCH, discord};
+use faculties::schemas::teams::{FILES_BRANCH_NAME, file_schema};
+use file_schema::KIND_FILE;
+use file_schema::file;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
@@ -153,6 +156,7 @@ struct DiscordConfig {
     branch: String,
     branch_id: Id,
     log_branch_id: Id,
+    files_branch_id: Id,
 }
 
 fn main() -> Result<()> {
@@ -198,11 +202,16 @@ fn build_config(cli: &Cli) -> Result<DiscordConfig> {
         repo.ensure_branch(&log_branch, None)
             .map_err(|e| anyhow!("ensure logs branch: {e:?}"))
     })?;
+    let files_branch_id = with_repo(&pile_path, |repo| {
+        repo.ensure_branch(FILES_BRANCH_NAME, None)
+            .map_err(|e| anyhow!("ensure files branch: {e:?}"))
+    })?;
     Ok(DiscordConfig {
         pile_path,
         branch,
         branch_id,
         log_branch_id,
+        files_branch_id,
     })
 }
 
@@ -381,6 +390,23 @@ struct IncomingMessage {
     content: String,
     created_at: Value<NsTAIInterval>,
     reply_to_external_id: Option<String>,
+    attachments: Vec<AttachmentSource>,
+}
+
+#[derive(Debug, Clone)]
+struct AttachmentSource {
+    /// Discord attachment snowflake — the external identity used
+    /// to derive the attachment entity's intrinsic id via
+    /// `archive::attachment_source_id`.
+    source_id: String,
+    /// CDN URL Discord serves the file from. Open (no auth) for
+    /// discord.com attachments; we still user-agent the request.
+    url: String,
+    /// Original filename as uploaded.
+    filename: String,
+    /// MIME type Discord reports. May be missing for legacy
+    /// attachments; caller falls back to "application/octet-stream".
+    content_type: Option<String>,
 }
 
 fn read(
@@ -439,12 +465,21 @@ fn read(
         let mut ws = repo
             .pull(config.branch_id)
             .map_err(|e| anyhow!("pull discord: {e:?}"))?;
+        let mut files_ws = repo
+            .pull(config.files_branch_id)
+            .map_err(|e| anyhow!("pull files: {e:?}"))?;
         let catalog = ws
             .checkout(..)
             .map_err(|e| anyhow!("checkout discord: {e:?}"))?
             .into_facts();
+        let files_catalog = files_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout files: {e:?}"))?
+            .into_facts();
 
-        let change = build_ingest_change(&mut ws, &catalog, incoming)?;
+        let (change, files_change) =
+            build_ingest_change(&mut ws, &mut files_ws, &catalog, incoming, &config)?;
+
         let delta = change.difference(&catalog);
         if !delta.is_empty() {
             ws.commit(
@@ -453,6 +488,18 @@ fn read(
             );
             repo.push(&mut ws)
                 .map_err(|e| anyhow!("push discord: {e:?}"))?;
+        }
+
+        let files_delta = files_change.difference(&files_catalog);
+        if !files_delta.is_empty() {
+            files_ws.commit(
+                files_delta,
+                &format!(
+                    "discord: attachments from channel {channel_id}"
+                ),
+            );
+            repo.push(&mut files_ws)
+                .map_err(|e| anyhow!("push files: {e:?}"))?;
         }
         Ok(())
     })?;
@@ -623,6 +670,37 @@ fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
+        // Discord attachments live in `attachments[]` on the
+        // message body; shape documented at
+        // https://discord.com/developers/docs/resources/channel#attachment-object
+        let attachments = message
+            .get("attachments")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| {
+                        let source_id = a.get("id").and_then(|v| v.as_str())?.to_string();
+                        let url = a.get("url").and_then(|v| v.as_str())?.to_string();
+                        let filename = a
+                            .get("filename")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("attachment")
+                            .to_string();
+                        let content_type = a
+                            .get("content_type")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        Some(AttachmentSource {
+                            source_id,
+                            url,
+                            filename,
+                            content_type,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         out.push(IncomingMessage {
             external_id,
             raw_json,
@@ -632,6 +710,7 @@ fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result
             content,
             created_at,
             reply_to_external_id,
+            attachments,
         });
     }
     // Normalise to oldest-first for stable `reply_to` resolution.
@@ -641,10 +720,15 @@ fn parse_messages(messages: Vec<JsonValue>, channel_external_id: &str) -> Result
 
 fn build_ingest_change(
     ws: &mut Workspace<Pile<Blake3>>,
+    files_ws: &mut Workspace<Pile<Blake3>>,
     _catalog: &TribleSet,
     messages: Vec<IncomingMessage>,
-) -> Result<TribleSet> {
+    config: &DiscordConfig,
+) -> Result<(TribleSet, TribleSet)> {
     let mut change = TribleSet::new();
+    let mut files_change = TribleSet::new();
+    let mut added_attachment_files: std::collections::HashSet<Id> =
+        std::collections::HashSet::new();
 
     // Resolve each external id (channel, author, message) to an
     // intrinsic Id via the identity-only-fragment idiom. Cached
@@ -723,9 +807,72 @@ fn build_ingest_change(
             discord::message_raw: raw_handle,
             archive::reply_to?: reply_to,
         };
+
+        // ── attachments ──
+        // For each attachment on this message, derive an intrinsic
+        // id from `archive::attachment_source_id`, link the
+        // message → attachment, and put the file on the shared
+        // files branch tagged KIND_FILE. Deduped across this
+        // batch so the same attachment seen twice only fetches
+        // once.
+        for source in &message.attachments {
+            let source_handle = ws.put(source.source_id.clone());
+            let att_id_frag = entity! { _ @
+                archive::attachment_source_id: source_handle,
+            };
+            let attachment_id = att_id_frag
+                .root()
+                .ok_or_else(|| anyhow!("attachment id rooted"))?;
+
+            // Link message → attachment. Safe to re-emit; trible
+            // de-duplicates against the catalog at commit time.
+            change += entity! { ExclusiveId::force_ref(&message_id) @
+                archive::attachment: attachment_id,
+            };
+            change += att_id_frag;
+
+            if !added_attachment_files.insert(attachment_id) {
+                continue;
+            }
+
+            // Download the bytes from Discord's CDN. No bot auth
+            // required — CDN URLs are open. If the fetch fails,
+            // log and skip the file entity; the message and the
+            // `archive::attachment_source_id` entity still land,
+            // so a later backfill can pick it up.
+            let (bytes, fetched_type) = match fetch_attachment_bytes(&source.url) {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let _ = log_event(
+                        config,
+                        "error",
+                        &format!(
+                            "attachment fetch failed ({}): {err:?}",
+                            source.url
+                        ),
+                    );
+                    continue;
+                }
+            };
+
+            let mime = source
+                .content_type
+                .clone()
+                .or(fetched_type)
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let content_handle = files_ws.put::<blobschemas::FileBytes, _>(bytes);
+            let name_handle = files_ws.put(source.filename.clone());
+
+            files_change += entity! { ExclusiveId::force_ref(&attachment_id) @
+                metadata::tag: &KIND_FILE,
+                file::content: content_handle,
+                file::name: name_handle,
+                file::mime: mime.as_str(),
+            };
+        }
     }
 
-    Ok(change)
+    Ok((change, files_change))
 }
 
 // ── per-channel cursor ───────────────────────────────────────────
@@ -913,6 +1060,33 @@ fn channel_type_label(kind: i64) -> &'static str {
         16 => "media",
         _ => "other",
     }
+}
+
+// ── attachment bytes ─────────────────────────────────────────────
+
+/// Fetch attachment bytes from Discord's CDN. Unlike teams'
+/// `fetch_attachment_bytes`, no bearer token is needed — Discord
+/// CDN URLs are open. Returns `(bytes, response_content_type)`
+/// so a missing `content_type` on the JSON attachment object can
+/// fall back to whatever the CDN reports.
+fn fetch_attachment_bytes(url: &str) -> Result<(Vec<u8>, Option<String>)> {
+    let client = build_client()?;
+    let resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        bail!("GET {url} failed: status={status} body={body}");
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let bytes = resp.bytes().context("read attachment body")?;
+    Ok((bytes.to_vec(), content_type))
 }
 
 // ── helpers ──────────────────────────────────────────────────────
