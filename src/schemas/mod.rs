@@ -2,6 +2,7 @@
 
 pub mod archive;
 pub mod compass;
+pub mod discord;
 pub mod files;
 pub mod gauge;
 pub mod headspace;
