@@ -112,22 +112,32 @@ enum CommandMode {
         /// Message body. Use `@path` / `@-` for file / stdin.
         text: String,
     },
-    /// Pull recent messages from a channel into the pile, then
-    /// print the newest ones from the pile. Successive runs are
-    /// incremental — a per-channel cursor records the newest
-    /// message already ingested.
+    /// Pull recent messages into the pile, then print the newest
+    /// ones. If no channel is specified, polls every channel the
+    /// bot can see (iterating via `/users/@me/guilds` +
+    /// `/guilds/{id}/channels`) — Discord has no cross-channel
+    /// delta stream the way Graph does, so the faculty does the
+    /// fan-out itself. Successive runs are incremental: each
+    /// channel has its own cursor.
     Read {
-        /// Channel id (external Discord snowflake).
-        channel_id: String,
-        /// Max messages to fetch per call (1–100, Discord's cap).
-        #[arg(long, default_value_t = 50)]
-        limit: u32,
-        /// Max messages to print from the pile after ingest.
+        /// Channel id (external Discord snowflake). If omitted,
+        /// polls every text-capable channel the bot can see.
+        channel_id: Option<String>,
+        /// Only show messages at or after this timestamp
+        /// (RFC3339: e.g. `2026-04-24T12:00:00Z`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Max messages to print from the pile after ingest
+        /// (0 = no limit).
         #[arg(long, default_value_t = 20)]
-        show: usize,
+        limit: usize,
         /// Print newest first (default: oldest first).
         #[arg(long)]
         descending: bool,
+        /// Max messages to fetch *per channel call* (1–100,
+        /// Discord's API cap).
+        #[arg(long, default_value_t = 50)]
+        fetch_limit: u32,
     },
     /// List guilds (servers) + their text channels visible to the
     /// bot. Answers the "what can the bot see?" diagnostic — if a
@@ -174,10 +184,20 @@ fn main() -> Result<()> {
         CommandMode::Send { channel_id, text } => send(config, channel_id, text),
         CommandMode::Read {
             channel_id,
+            since,
             limit,
-            show,
             descending,
-        } => read(config, channel_id, limit, show, descending),
+            fetch_limit,
+        } => read(
+            config,
+            ReadOptions {
+                channel_id,
+                since,
+                limit,
+                descending,
+                fetch_limit,
+            },
+        ),
         CommandMode::Channels { command } => match command {
             ChannelsCommand::List { guild } => list_channels(config, guild),
         },
@@ -412,28 +432,72 @@ struct AttachmentSource {
     content_type: Option<String>,
 }
 
-fn read(
-    config: DiscordConfig,
-    channel_id: String,
-    limit: u32,
-    show: usize,
+#[derive(Debug, Clone)]
+struct ReadOptions {
+    channel_id: Option<String>,
+    since: Option<String>,
+    limit: usize,
     descending: bool,
-) -> Result<()> {
+    fetch_limit: u32,
+}
+
+fn read(config: DiscordConfig, options: ReadOptions) -> Result<()> {
     let token = load_bot_token(&config)?;
-    let limit = limit.clamp(1, 100);
+    let fetch_limit = options.fetch_limit.clamp(1, 100);
 
-    // Fetch cursor (last ingested snowflake) for this channel.
-    let cursor = load_channel_cursor(&config, &channel_id)?;
+    match options.channel_id.as_deref() {
+        Some(id) => {
+            pull_channel(&config, &token, id, fetch_limit)?;
+        }
+        None => {
+            let channels = list_visible_text_channels(&token)?;
+            if channels.is_empty() {
+                println!("Bot is not in any guilds (or has no text-capable channels).");
+                return Ok(());
+            }
+            println!(
+                "Polling {} channels across {} guilds…",
+                channels.len(),
+                channels
+                    .iter()
+                    .map(|c| c.guild_id.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            );
+            for ch in &channels {
+                if let Err(err) = pull_channel(&config, &token, &ch.id, fetch_limit) {
+                    let _ = log_event(
+                        &config,
+                        "warn",
+                        &format!("poll failed for channel {} ({}): {err:?}", ch.id, ch.name),
+                    );
+                    eprintln!("  ! {}: {err}", ch.id);
+                }
+            }
+        }
+    }
 
-    // Call Discord REST. `after=<id>` returns messages newer than
-    // `id` in *oldest-first* order (despite what the docs initially
-    // suggest; verify with the response). If no cursor yet, omit —
-    // you'll get the most-recent `limit` messages in reverse order,
-    // which we'll normalise below.
+    print_history(&config, &options)?;
+    Ok(())
+}
+
+/// Sync one channel from Discord into the pile: fetch via REST
+/// using the stored cursor (if any), ingest messages +
+/// attachments, advance the cursor to the newest snowflake seen.
+fn pull_channel(
+    config: &DiscordConfig,
+    token: &str,
+    channel_id: &str,
+    fetch_limit: u32,
+) -> Result<()> {
+    let cursor = load_channel_cursor(config, channel_id)?;
+
+    // `after=<id>` returns messages newer than `id`. Without a
+    // cursor we get the most-recent `fetch_limit` messages (in
+    // reverse order), which we normalise below.
     let client = build_client()?;
-    let mut url = format!(
-        "{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={limit}"
-    );
+    let mut url =
+        format!("{DISCORD_API_BASE}/channels/{channel_id}/messages?limit={fetch_limit}");
     if let Some(c) = cursor.as_deref() {
         url.push_str(&format!("&after={c}"));
     }
@@ -442,22 +506,17 @@ fn read(
         .header("Authorization", format!("Bot {token}"))
         .send()
         .with_context(|| format!("GET {url}"))?;
-
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
         bail!("discord read failed ({status}): {body}");
     }
     let messages: Vec<JsonValue> = resp.json().context("parse read response")?;
-
     if messages.is_empty() {
-        println!("No new messages in channel {channel_id}.");
         return Ok(());
     }
 
-    let incoming = parse_messages(messages, &channel_id)?;
-
-    // ── commit ──
+    let incoming = parse_messages(messages, channel_id)?;
     let ingested = incoming.len();
     let newest_snowflake = incoming
         .iter()
@@ -481,7 +540,7 @@ fn read(
             .into_facts();
 
         let (change, files_change) =
-            build_ingest_change(&mut ws, &mut files_ws, &catalog, incoming, &config)?;
+            build_ingest_change(&mut ws, &mut files_ws, &catalog, incoming, config)?;
 
         let delta = change.difference(&catalog);
         if !delta.is_empty() {
@@ -497,9 +556,7 @@ fn read(
         if !files_delta.is_empty() {
             files_ws.commit(
                 files_delta,
-                &format!(
-                    "discord: attachments from channel {channel_id}"
-                ),
+                &format!("discord: attachments from channel {channel_id}"),
             );
             repo.push(&mut files_ws)
                 .map_err(|e| anyhow!("push files: {e:?}"))?;
@@ -508,32 +565,91 @@ fn read(
     })?;
 
     if let Some(snowflake) = newest_snowflake {
-        store_channel_cursor(&config, &channel_id, &snowflake)?;
+        store_channel_cursor(config, channel_id, &snowflake)?;
     }
 
     log_event(
-        &config,
+        config,
         "info",
         &format!("ingested {ingested} messages from channel {channel_id}"),
     )?;
-    println!("Ingested {ingested} messages from channel {channel_id}.");
-
-    if show > 0 {
-        print_history(&config, &channel_id, show, descending)?;
-    }
+    println!("  {channel_id}: +{ingested}");
     Ok(())
 }
 
-/// Query the pile for messages in a given channel and print them.
-/// Channel identity is derived from `channel_external_id` via the
+/// Describe one visible channel for the all-channels poll loop.
+struct VisibleChannel {
+    id: String,
+    name: String,
+    guild_id: String,
+}
+
+/// Enumerate every text-capable channel the bot can see. Text
+/// channels are types 0 (GUILD_TEXT), 5 (GUILD_ANNOUNCEMENT), and
+/// 15 (GUILD_FORUM); voice / stage / category / thread types are
+/// skipped. Mirrors the shape `channels list` uses for display.
+fn list_visible_text_channels(token: &str) -> Result<Vec<VisibleChannel>> {
+    let client = build_client()?;
+    let guilds: Vec<JsonValue> = client
+        .get(format!("{DISCORD_API_BASE}/users/@me/guilds"))
+        .header("Authorization", format!("Bot {token}"))
+        .send()
+        .context("GET /users/@me/guilds")?
+        .error_for_status()
+        .context("guilds request failed")?
+        .json()
+        .context("parse guilds response")?;
+
+    let mut out = Vec::new();
+    for guild in guilds {
+        let guild_id = guild
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if guild_id.is_empty() {
+            continue;
+        }
+        let channels: Vec<JsonValue> = client
+            .get(format!("{DISCORD_API_BASE}/guilds/{guild_id}/channels"))
+            .header("Authorization", format!("Bot {token}"))
+            .send()
+            .with_context(|| format!("GET /guilds/{guild_id}/channels"))?
+            .error_for_status()
+            .with_context(|| format!("channels request for guild {guild_id} failed"))?
+            .json()
+            .with_context(|| format!("parse channels for guild {guild_id}"))?;
+        for ch in channels {
+            let kind = ch.get("type").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if !matches!(kind, 0 | 5 | 15) {
+                continue;
+            }
+            let id = ch.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let name = ch.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            out.push(VisibleChannel {
+                id: id.to_string(),
+                name: name.to_string(),
+                guild_id: guild_id.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Query the pile for messages — filtered by channel if
+/// `options.channel_id` is set, otherwise pooled across every
+/// channel — and print them. Channel identity comes from the
 /// same identity-only-fragment idiom `build_ingest_change` uses,
-/// so the lookup is by intrinsic id, not name.
-fn print_history(
-    config: &DiscordConfig,
-    channel_external_id: &str,
-    limit: usize,
-    descending: bool,
-) -> Result<()> {
+/// so the filter is by intrinsic id.
+fn print_history(config: &DiscordConfig, options: &ReadOptions) -> Result<()> {
+    let since_key = match options.since.as_deref() {
+        Some(s) => Some(interval_key(parse_iso8601(s.trim())?)),
+        None => None,
+    };
+
     with_repo(&config.pile_path, |repo| {
         let mut ws = repo
             .pull(config.branch_id)
@@ -543,17 +659,39 @@ fn print_history(
             .map_err(|e| anyhow!("checkout discord: {e:?}"))?
             .into_facts();
 
-        // Re-derive the channel id from the external snowflake.
-        let external_handle = ws.put(channel_external_id.to_string());
-        let id_frag = entity! { _ @ discord::channel_id: external_handle };
-        let channel_id = id_frag
-            .root()
-            .ok_or_else(|| anyhow!("channel id rooted"))?;
+        // Re-derive the channel id from the external snowflake,
+        // if filtering.
+        let channel_filter: Option<Id> = match options.channel_id.as_deref() {
+            Some(id_str) => {
+                let external_handle = ws.put(id_str.to_string());
+                let id_frag = entity! { _ @ discord::channel_id: external_handle };
+                Some(
+                    id_frag
+                        .root()
+                        .ok_or_else(|| anyhow!("channel id rooted"))?,
+                )
+            }
+            None => None,
+        };
 
-        // First pass: required attributes, filtered to this
-        // channel. `edited_at` is optional in the schema —
-        // `pattern!` has no optional-binding syntax, so the
-        // second pass fills it in from a sparse HashMap.
+        // Channel id → external snowflake, for display when the
+        // filter is off.
+        let mut channel_externals: HashMap<Id, String> = HashMap::new();
+        for (ch_id, ext_handle) in find!(
+            (channel: Id, ext: Value<Handle<Blake3, LongString>>),
+            pattern!(&catalog, [{
+                ?channel @
+                metadata::tag: discord::kind_channel,
+                discord::channel_id: ?ext,
+            }])
+        ) {
+            let view: View<str> = ws
+                .get(ext_handle)
+                .map_err(|e| anyhow!("load channel external: {e:?}"))?;
+            channel_externals.insert(ch_id, view.to_string());
+        }
+
+        // First pass: required attributes.
         let mut messages: Vec<HistoryRow> = Vec::new();
         for (msg, content, author_id, created_at, ch) in find!(
             (
@@ -572,15 +710,24 @@ fn print_history(
                 discord::channel: ?channel,
             }])
         ) {
-            if ch != channel_id {
-                continue;
+            if let Some(filter) = channel_filter {
+                if ch != filter {
+                    continue;
+                }
+            }
+            let key = interval_key(created_at);
+            if let Some(s) = since_key {
+                if key < s {
+                    continue;
+                }
             }
             messages.push(HistoryRow {
                 message_id: msg,
+                channel_id: ch,
                 content,
                 author_id,
                 created_at,
-                created_at_key: interval_key(created_at),
+                created_at_key: key,
                 edited_at: None,
             });
         }
@@ -616,16 +763,19 @@ fn print_history(
         }
 
         messages.sort_by_key(|m| m.created_at_key);
-        if limit > 0 && messages.len() > limit {
-            let start = messages.len() - limit;
+        if options.limit > 0 && messages.len() > options.limit {
+            let start = messages.len() - options.limit;
             messages = messages.split_off(start);
         }
-        if descending {
+        if options.descending {
             messages.reverse();
         }
 
         if messages.is_empty() {
-            println!("(no messages in pile for channel {channel_external_id})");
+            match options.channel_id.as_deref() {
+                Some(id) => println!("(no messages in pile for channel {id})"),
+                None => println!("(no messages in pile)"),
+            }
             return Ok(());
         }
         for message in messages {
@@ -642,7 +792,17 @@ fn print_history(
                 Some(edit_interval) => format!(" (edited {})", format_interval(edit_interval)),
                 None => String::new(),
             };
-            println!("[{timestamp}]{edited_marker} {author}: {content}");
+            // Prefix with the channel snowflake when showing
+            // pooled history across channels.
+            let channel_prefix = if channel_filter.is_some() {
+                String::new()
+            } else {
+                match channel_externals.get(&message.channel_id) {
+                    Some(ext) => format!(" #{ext}"),
+                    None => String::new(),
+                }
+            };
+            println!("[{timestamp}]{channel_prefix}{edited_marker} {author}: {content}");
         }
         Ok(())
     })
@@ -650,6 +810,7 @@ fn print_history(
 
 struct HistoryRow {
     message_id: Id,
+    channel_id: Id,
     content: Value<Handle<Blake3, LongString>>,
     author_id: Id,
     created_at: Value<NsTAIInterval>,
