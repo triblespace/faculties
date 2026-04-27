@@ -12,6 +12,7 @@
 //! typst = "0.14"
 //! typst-syntax = "0.14"
 //! comemo = "0.5.1"
+//! dirs = "5"
 //! ```
 
 use anyhow::{Context, Result, bail};
@@ -817,16 +818,56 @@ mod typst_validate {
         fn main(&self) -> FileId { self.main_id }
         fn source(&self, id: FileId) -> FileResult<Source> {
             if id == self.main_id {
-                Ok(self.source.clone())
-            } else {
-                Err(typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))
+                return Ok(self.source.clone());
             }
+            // Resolve @preview/... package files from the local typst cache.
+            if let Some(path) = package_file_path(&id) {
+                let bytes = std::fs::read(&path)
+                    .map_err(|_| typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))?;
+                return Ok(Source::new(id, text));
+            }
+            Err(typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))
         }
         fn file(&self, id: FileId) -> FileResult<Bytes> {
+            if let Some(path) = package_file_path(&id) {
+                let bytes = std::fs::read(&path)
+                    .map_err(|_| typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))?;
+                return Ok(Bytes::new(bytes));
+            }
             Err(typst::diag::FileError::NotFound(id.vpath().as_rootless_path().into()))
         }
         fn font(&self, _index: usize) -> Option<Font> { None }
         fn today(&self, _offset: Option<i64>) -> Option<Datetime> { None }
+    }
+
+    /// Resolve a typst FileId pointing into a package (e.g.
+    /// `@preview/cetz:0.3.2`) to a path on the local typst package cache.
+    /// Returns None if the FileId has no package spec, or the cache
+    /// directory cannot be located on this platform.
+    ///
+    /// Cache layout follows the typst CLI's convention:
+    ///   <cache-root>/typst/packages/<namespace>/<name>/<version>/<vpath>
+    ///
+    /// Where <cache-root> is `dirs::cache_dir()`. On macOS that's
+    /// `~/Library/Caches`; on Linux `$XDG_CACHE_HOME` or `~/.cache`.
+    /// We fall back to `~/.cache/typst/packages` if `dirs::cache_dir`
+    /// cannot be determined.
+    fn package_file_path(id: &FileId) -> Option<std::path::PathBuf> {
+        let pkg = id.package()?;
+        let cache_root = dirs::cache_dir()
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })?;
+        let mut p = cache_root;
+        p.push("typst");
+        p.push("packages");
+        p.push(pkg.namespace.as_str());
+        p.push(pkg.name.as_str());
+        p.push(pkg.version.to_string());
+        p.push(id.vpath().as_rootless_path());
+        Some(p)
     }
 }
 
