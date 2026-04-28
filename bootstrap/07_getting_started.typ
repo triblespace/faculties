@@ -78,6 +78,7 @@ fragments by id and title. The set covers two shapes:
   - "Local Messages: Agent-to-Agent Direct Messaging"
   - "Orient: The Situation-Snapshot Faculty"
   - "Relations: People and Handle Mappings"
+  - "Web: Search and Fetch Through Provider APIs"
 
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.

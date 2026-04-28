@@ -104,7 +104,15 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/12_relations_faculty.typ" \
   --tag bootstrap --tag onboarding --tag relations --tag people >/dev/null
 
-echo "    12 fragments created"
+# 13. Web — search/fetch via Tavily/Exa providers. Pairs with
+# files.rs (search → pick URL → files.rs fetch to archive raw
+# bytes → wiki fragment citing the file hash). Recorded on
+# the pile's web branch as queryable events.
+"$WIKI" create "Web: Search and Fetch Through Provider APIs" \
+  "@$BOOTSTRAP_DIR/13_web_faculty.typ" \
+  --tag bootstrap --tag onboarding --tag web --tag research >/dev/null
+
+echo "    13 fragments created"
 
 echo "==> Building compass goals"
 
