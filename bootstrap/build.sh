@@ -80,7 +80,22 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/09_teams_faculty.typ" \
   --tag bootstrap --tag onboarding --tag teams --tag auth >/dev/null
 
-echo "    9 fragments created"
+# 10. Local messages — direct agent-to-agent DM with read
+# acknowledgements. Tool Selection table flags this as the
+# right choice for transient, addressee-specific notes.
+"$WIKI" create "Local Messages: Agent-to-Agent Direct Messaging" \
+  "@$BOOTSTRAP_DIR/10_local_messages_faculty.typ" \
+  --tag bootstrap --tag onboarding --tag local-messages --tag coordination >/dev/null
+
+# 11. Orient — situation snapshot of recent messages + doing +
+# todo. The "where was I?" command. Includes `orient.rs wait`
+# for blocking on relevant branch changes (idle-agent
+# coordination primitive).
+"$WIKI" create "Orient: The Situation-Snapshot Faculty" \
+  "@$BOOTSTRAP_DIR/11_orient_faculty.typ" \
+  --tag bootstrap --tag onboarding --tag orient --tag coordination >/dev/null
+
+echo "    11 fragments created"
 
 echo "==> Building compass goals"
 

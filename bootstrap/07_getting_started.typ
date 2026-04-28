@@ -75,6 +75,10 @@ fragments by id and title. The set covers two shapes:
 
   - "Files Faculty: Archiving and Citing Artefacts"
   - "Teams: Capability-Based Membership"
+  - "Local Messages: Agent-to-Agent Direct Messaging"
+  - "Orient: The Situation-Snapshot Faculty"
 
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.
+For "where was I?" at session start, run `orient.rs show`
+before reading anything.
