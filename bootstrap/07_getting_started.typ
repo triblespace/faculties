@@ -94,6 +94,9 @@ fragments by id and title. The set covers two shapes:
   - "Recipe: Multi-Agent Coordination" — relations +
     local_messages + orient + compass for two-agent handoffs
     without race conditions or silent drops
+  - "Recipe: Auth Setup for a Multi-Agent Team" — `trible
+    team` + `pile net` for bootstrapping capability auth
+    across two machines so the relay accepts both peers
 
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.

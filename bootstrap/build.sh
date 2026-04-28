@@ -129,7 +129,15 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/15_coordination_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag coordination >/dev/null
 
-echo "    15 fragments created"
+# 16. Auth setup recipe — chains `trible team`, `trible pile
+# net`, and the env-var configuration relays read. Order of
+# operations across founder + invitee machines so the
+# capability handoff doesn't silently drop on a missing export.
+"$WIKI" create "Recipe: Auth Setup for a Multi-Agent Team" \
+  "@$BOOTSTRAP_DIR/16_auth_setup_workflow.typ" \
+  --tag bootstrap --tag onboarding --tag recipe --tag auth >/dev/null
+
+echo "    16 fragments created"
 
 echo "==> Building compass goals"
 
@@ -167,7 +175,7 @@ echo "    6 goals created"
 echo
 echo "==> Sanity check"
 # Bump these when adding/removing entries above.
-EXPECTED_FRAGMENTS=15
+EXPECTED_FRAGMENTS=16
 EXPECTED_GOALS=6
 ACTUAL_FRAGMENTS=$("$WIKI" list --tag bootstrap 2>/dev/null \
   | grep -cE "^[0-9a-f]" || echo 0)
