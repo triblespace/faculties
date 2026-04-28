@@ -30,7 +30,7 @@ web.rs search "<query>"
 #    addressing dedupes if you accidentally fetch the same URL
 #    twice.
 files.rs fetch https://arxiv.org/pdf/<id>.pdf
-# → files:8f9a3b...   (use this hash below)
+# → files:<hash>   (use this hash below)
 
 # 4. Take notes as fragments while you read.
 #    Cite the archived file by hash.
@@ -38,7 +38,7 @@ wiki.rs create "<finding title>" "@-" \
   --tag research --tag <topic> <<EOF
 = <finding title>
 
-Per files:8f9a3b... (Smith 2024 §3.2), <claim>. The proof
+Per files:<hash> (Smith 2024 §3.2), <claim>. The proof
 relies on <observation>; key assumption is <X>.
 
 Open: does the bound tighten when <Y>?

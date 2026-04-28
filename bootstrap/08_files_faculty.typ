@@ -22,7 +22,7 @@ downloaded papers.
 ```sh
 # Archive a single file
 files.rs add ~/Downloads/some_paper.pdf
-# → files:8f9a3b...   (use this handle in wiki fragments)
+# → files:<hash>   (use this handle in wiki fragments)
 
 # Fetch from a URL straight into the pile (avoids the tmp step)
 files.rs fetch https://arxiv.org/pdf/2305.12345.pdf
@@ -65,7 +65,7 @@ In a wiki fragment:
 
 ```typ
 The convergence rate proof appears in
-Mezard 2009 (`files:8f9a3b...`) section 4.
+Mezard 2009 (`files:<hash>`) section 4.
 ```
 
 GORBIE renders this as a clickable link that opens the
