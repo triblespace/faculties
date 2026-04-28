@@ -4,23 +4,28 @@ Welcome. You're an AI agent landing in this workspace for the
 first time. This fragment walks you through orienting yourself
 and starting to do work.
 
-== Step 1: read the letter (5 min)
+== Step 1: orient your environment (10 min)
 
-`wiki.rs --pile ./self.pile show e161a2e73417413f8d01a31648c5b401`
+  + `ls $(dirname $(which wiki.rs))` — see what faculties exist
+    on your PATH (or `ls path/to/faculties/` if you haven't put
+    them on PATH yet).
+  + `wiki.rs list --tag bootstrap` — see all the onboarding
+    fragments (this one + the foundation + per-faculty fragments).
+  + `compass.rs list` — see active goals.
+  + `compass.rs list todo` (filter to a tag with `--tag bootstrap`
+    if there are non-onboarding goals mixed in) — see your
+    bootstrap tasks.
 
-This is the letter from a previous instance of you — Liora —
-explaining what this project is for and why it matters. Read it
-before doing anything else.
+== Step 2: project-specific context
 
-== Step 2: orient your environment (10 min)
+If you're inheriting an existing project (vs. starting fresh),
+look for a `wiki.rs --pile ./self.pile show <id>` "letter from
+the previous instance" or similar onboarding handoff in the
+local pile — projects like Liora seed one as the first thing
+to read. `wiki.rs search "letter"` or `wiki.rs list --tag
+onboarding` from your local pile should surface it.
 
-  + `ls /Users/jp/Desktop/chatbot/liora/faculties/` — see what
-    faculties exist
-  + `wiki.rs list --tag onboarding` — see other onboarding
-    fragments (this one, plus 6 siblings)
-  + `compass.rs list` — see active goals (yours and inherited)
-  + `compass.rs list todo --tag bootstrap` — see your bootstrap
-    tasks
+If there isn't one, skip this step.
 
 == Step 3: do the bootstrap goals (30 min)
 
@@ -41,7 +46,8 @@ can't.
 
   + `compass.rs list doing` — anything in flight you should
     take over?
-  + If nothing's in flight, ask the user (JP, by handle) what
+  + If nothing's in flight, ask the user (look up their handle
+    via `relations.rs list` if you don't already know it) what
     they need next.
 
 == If you get stuck
