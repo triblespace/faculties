@@ -55,8 +55,10 @@ can't.
 
 == Sibling fragments
 
-`wiki.rs list --tag bootstrap` enumerates the seven onboarding
-fragments by id and title:
+`wiki.rs list --tag bootstrap` enumerates the onboarding
+fragments by id and title. The set covers two shapes:
+
+*Foundations* — read first if you've never used faculties:
 
   - "How Faculties Work" — the faculty model and shell-first
     causality
@@ -69,5 +71,10 @@ fragments by id and title:
     "which tool here?"
   - "Getting Started: Your First Hour" (this fragment)
 
-Read the others in any order; each stands alone. Tool Selection
-is the densest if you want a single-page reference.
+*Specific faculties* — read when you reach for one:
+
+  - "Files Faculty: Archiving and Citing Artefacts"
+  - "Teams: Capability-Based Membership"
+
+Read the foundations in any order; each stands alone. Tool
+Selection is the densest if you want a single-page reference.

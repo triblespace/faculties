@@ -65,7 +65,22 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/07_getting_started.typ" \
   --tag bootstrap --tag onboarding --tag start-here >/dev/null
 
-echo "    7 fragments created"
+# 8. Files faculty — usage patterns for `files.rs add/fetch/list`,
+# why content-addressing matters, citation conventions for wiki
+# fragments.
+"$WIKI" create "Files Faculty: Archiving and Citing Artefacts" \
+  "@$BOOTSTRAP_DIR/08_files_faculty.typ" \
+  --tag bootstrap --tag onboarding --tag files >/dev/null
+
+# 9. Teams — `trible team` lifecycle, env-var-driven config,
+# `pile net status` diagnostic, when to revoke. The auth-arc
+# tool surface, which is its own user-facing chapter in the
+# triblespace-rs book.
+"$WIKI" create "Teams: Capability-Based Membership" \
+  "@$BOOTSTRAP_DIR/09_teams_faculty.typ" \
+  --tag bootstrap --tag onboarding --tag teams --tag auth >/dev/null
+
+echo "    9 fragments created"
 
 echo "==> Building compass goals"
 

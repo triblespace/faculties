@@ -1,0 +1,73 @@
+= Files Faculty: Archiving and Citing Artefacts
+
+`files.rs` is the content-addressed file store. Use it for any
+binary or large-text artefact you'll want to cite from a wiki
+fragment later: PDFs, datasets, screenshots, codex output dumps,
+downloaded papers.
+
+== Why this exists
+
+  - The pile is the single source of truth — putting an artefact
+    in `/tmp` means it's gone next session.
+  - Content-addressing means the same bytes always hash to the
+    same handle. Two agents with the same paper in their files
+    branch can cite the same `files:<hash>` and the cite resolves
+    on either side.
+  - Wiki fragments cite files by handle, not by path; an
+    archived file is durable across machines, sessions, and
+    pile renames.
+
+== Usage
+
+```sh
+# Archive a single file
+files.rs add ~/Downloads/some_paper.pdf
+# → files:8f9a3b...   (use this handle in wiki fragments)
+
+# Fetch from a URL straight into the pile (avoids the tmp step)
+files.rs fetch https://arxiv.org/pdf/2305.12345.pdf
+
+# List what you've archived
+files.rs list
+
+# Search by name or tag
+files.rs search "succinct"
+files.rs list --tag paper
+
+# Pull a file back out
+files.rs get <hash> ~/Desktop/recovered.pdf
+
+# Pipe to stdout (works with binary)
+files.rs get <hash> @- > /tmp/check.pdf
+```
+
+== Tagging and search
+
+  - `files.rs tag <hash> <tagname>` adds a tag.
+  - Tags compose: a paper might be tagged `paper`, `arxiv`,
+    `compression`, `benchmark`. Each new tag is queryable
+    independently.
+  - Tag conventions: keep tags lowercase, short, durable.
+    Topic tags (`compression`, `auth`) live longer than
+    project tags (`liora-q2-experiment`).
+
+== When NOT to use files
+
+  - Source code under git — that's already content-addressed
+    by the commit hash.
+  - Tiny text snippets — those go in wiki fragments directly.
+  - Anything you'd want to read with `wiki.rs show` later —
+    fragments render in GORBIE; files don't.
+
+== Citation pattern
+
+In a wiki fragment:
+
+```typ
+The convergence rate proof appears in
+Mezard 2009 (`files:8f9a3b...`) section 4.
+```
+
+GORBIE renders this as a clickable link that opens the
+archived PDF in a viewer. The `files:<hash>` form is also
+greppable from a terminal, which beats hex-only handles.
