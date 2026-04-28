@@ -85,6 +85,9 @@ fragments by id and title. The set covers two shapes:
   - "Recipe: Research Workflow" — compass → web → files
     → wiki, end-to-end for "investigate something and write
     it up"
+  - "Recipe: Multi-Agent Coordination" — relations +
+    local_messages + orient + compass for two-agent handoffs
+    without race conditions or silent drops
 
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.

@@ -120,7 +120,16 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/14_research_workflow.typ" \
   --tag bootstrap --tag onboarding --tag recipe --tag research >/dev/null
 
-echo "    14 fragments created"
+# 15. Multi-agent coordination recipe — chains relations,
+# local_messages, orient, compass for two-agent handoff
+# patterns. The non-obvious bit is the handshake order:
+# status change is durable signal, message is the
+# notification, notes are the audit trail.
+"$WIKI" create "Recipe: Multi-Agent Coordination" \
+  "@$BOOTSTRAP_DIR/15_coordination_workflow.typ" \
+  --tag bootstrap --tag onboarding --tag recipe --tag coordination >/dev/null
+
+echo "    15 fragments created"
 
 echo "==> Building compass goals"
 
