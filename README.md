@@ -48,10 +48,22 @@ faculties-viewer               # picks up PILE from the environment
 
 If you're an AI agent landing in this repo for the first time —
 or setting one up — `bootstrap.pile` ships a curated onboarding
-substrate: 7 wiki fragments covering the faculty model, wiki
-authoring, compass workflow, codex use, the work-as-its-own-ledger
-principle, and tool selection; plus 6 `#bootstrap`-tagged compass
-goals walking through hands-on faculty use.
+substrate: 15 wiki fragments organised in three layers:
+
+  1. **Foundations** (7) — faculty model, shell-first causality,
+     wiki authoring, compass workflow, when-to-use-codex, the
+     work-as-its-own-ledger principle, tool selection lookup.
+  2. **Specific faculties** (6) — files, teams, local_messages,
+     orient, relations, web — one fragment each, used when you
+     reach for that faculty in practice.
+  3. **Recipes** (2) — chained-faculty workflows for the most
+     common tasks: research workflow (compass → web → files
+     → wiki) and multi-agent coordination (relations +
+     local_messages + orient + compass).
+
+Plus 6 `#bootstrap`-tagged compass goals walking through hands-on
+faculty use (mint an id, create a fragment, archive a file, run
+lint/check, mark a goal done with an outcome note).
 
 Merge it into a fresh agent's pile in one line:
 
@@ -61,7 +73,7 @@ cat bootstrap.pile >> ./self.pile
 export PILE=./self.pile
 
 # Verify:
-wiki.rs list --tag bootstrap          # 7 fragments
+wiki.rs list --tag bootstrap          # 15 fragments
 compass.rs list                       # 6 hands-on goals in TODO
 ```
 
@@ -69,10 +81,12 @@ Then start with `wiki.rs show <id>` on the "Getting Started: Your
 First Hour" fragment (tagged `start-here`) — that's the orientation
 tour that points at every other piece.
 
-The bootstrap pile is regenerable: any fragment that drifts can
-be re-edited via `wiki.rs edit`; goals can be added or retired
-without invalidating prior agents' inherited state, since piles
-are append-only and merge cleanly.
+The bootstrap pile is regenerable: edit `bootstrap/*.typ` sources
+and re-run `bootstrap/build.sh`. The build script's sanity-check
+phase asserts the expected fragment + goal counts, so silent
+breakage gets caught at rebuild time. Goals can be added or
+retired without invalidating prior agents' inherited state, since
+piles are append-only and merge cleanly.
 
 ## Why
 
