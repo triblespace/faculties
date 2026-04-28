@@ -95,7 +95,16 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/11_orient_faculty.typ" \
   --tag bootstrap --tag onboarding --tag orient --tag coordination >/dev/null
 
-echo "    11 fragments created"
+# 12. Relations — contacts/handle registry. The label-to-person
+# mapping that local_messages and compass workflows resolve
+# recipient/assignee references through. Conventions for
+# labels, aliases, when not to use it (network identities
+# belong to team CLI state, not relations).
+"$WIKI" create "Relations: People and Handle Mappings" \
+  "@$BOOTSTRAP_DIR/12_relations_faculty.typ" \
+  --tag bootstrap --tag onboarding --tag relations --tag people >/dev/null
+
+echo "    12 fragments created"
 
 echo "==> Building compass goals"
 
