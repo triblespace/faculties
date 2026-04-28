@@ -159,6 +159,30 @@ echo "==> Building compass goals"
 
 echo "    6 goals created"
 
+# ── Sanity check ──────────────────────────────────────────────────
+# Verify the build actually produced the expected content. This
+# catches silent breakage where a fragment fails to compile (typst
+# error) or the wiki/compass faculty changes shape — the script
+# would otherwise exit 0 with a partial pile.
+echo
+echo "==> Sanity check"
+# Bump these when adding/removing entries above.
+EXPECTED_FRAGMENTS=15
+EXPECTED_GOALS=6
+ACTUAL_FRAGMENTS=$("$WIKI" list --tag bootstrap 2>/dev/null \
+  | grep -cE "^[0-9a-f]" || echo 0)
+ACTUAL_GOALS=$("$COMPASS" list 2>/dev/null \
+  | grep -cE "^- \[" || echo 0)
+if [ "$ACTUAL_FRAGMENTS" -ne "$EXPECTED_FRAGMENTS" ]; then
+  echo "    FAIL: expected $EXPECTED_FRAGMENTS bootstrap fragments, got $ACTUAL_FRAGMENTS" >&2
+  exit 1
+fi
+if [ "$ACTUAL_GOALS" -ne "$EXPECTED_GOALS" ]; then
+  echo "    FAIL: expected $EXPECTED_GOALS bootstrap goals, got $ACTUAL_GOALS" >&2
+  exit 1
+fi
+echo "    OK: $ACTUAL_FRAGMENTS fragments, $ACTUAL_GOALS goals"
+
 echo
 echo "==> Done. bootstrap.pile is at $PILE_PATH"
 echo "    $(ls -lh "$PILE_PATH" | awk '{print $5}') / $(wc -c < "$PILE_PATH") bytes"
