@@ -44,6 +44,36 @@ wiki.rs create --title "Hello" --body "First *typst* fragment."
 faculties-viewer               # picks up PILE from the environment
 ```
 
+### For agent onboarding: the bootstrap pile
+
+If you're an AI agent landing in this repo for the first time —
+or setting one up — `bootstrap.pile` ships a curated onboarding
+substrate: 7 wiki fragments covering the faculty model, wiki
+authoring, compass workflow, codex use, the work-as-its-own-ledger
+principle, and tool selection; plus 6 `#bootstrap`-tagged compass
+goals walking through hands-on faculty use.
+
+Merge it into a fresh agent's pile in one line:
+
+```sh
+touch ./self.pile
+cat bootstrap.pile >> ./self.pile
+export PILE=./self.pile
+
+# Verify:
+wiki.rs list --tag bootstrap          # 7 fragments
+compass.rs list                       # 6 hands-on goals in TODO
+```
+
+Then start with `wiki.rs show <id>` on the "Getting Started: Your
+First Hour" fragment (tagged `start-here`) — that's the orientation
+tour that points at every other piece.
+
+The bootstrap pile is regenerable: any fragment that drifts can
+be re-edited via `wiki.rs edit`; goals can be added or retired
+without invalidating prior agents' inherited state, since piles
+are append-only and merge cleanly.
+
 ## Why
 
 LLM agents forget. They lose their place, repeat themselves, and can't
