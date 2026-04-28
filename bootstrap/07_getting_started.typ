@@ -80,6 +80,12 @@ fragments by id and title. The set covers two shapes:
   - "Relations: People and Handle Mappings"
   - "Web: Search and Fetch Through Provider APIs"
 
+*Recipes* — chained-faculty workflows for common tasks:
+
+  - "Recipe: Research Workflow" — compass → web → files
+    → wiki, end-to-end for "investigate something and write
+    it up"
+
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.
 For "where was I?" at session start, run `orient.rs show`

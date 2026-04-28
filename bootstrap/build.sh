@@ -112,7 +112,15 @@ echo "==> Building wiki fragments"
   "@$BOOTSTRAP_DIR/13_web_faculty.typ" \
   --tag bootstrap --tag onboarding --tag web --tag research >/dev/null
 
-echo "    13 fragments created"
+# 14. Research workflow recipe — chains compass → web → files
+# → wiki for the most common agent task. The recipe layer
+# above per-faculty docs: shows how the composable faculty
+# model actually composes in practice.
+"$WIKI" create "Recipe: Research Workflow" \
+  "@$BOOTSTRAP_DIR/14_research_workflow.typ" \
+  --tag bootstrap --tag onboarding --tag recipe --tag research >/dev/null
+
+echo "    14 fragments created"
 
 echo "==> Building compass goals"
 
