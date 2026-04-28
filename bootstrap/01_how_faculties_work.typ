@@ -1,8 +1,10 @@
 = How Faculties Work
 
-Faculties are self-contained `rust-script` scripts at
-`/Users/jp/Desktop/chatbot/liora/faculties/`. Each one is a CLI that
-reads and writes a TribleSpace pile via the `triblespace` crate.
+Faculties are self-contained `rust-script` scripts living in a
+`faculties/` checkout (the canonical upstream is
+[github.com/triblespace/faculties](https://github.com/triblespace/faculties)).
+Each one is a CLI that reads and writes a TribleSpace pile via
+the `triblespace` crate.
 
 == Mental model
 
@@ -19,10 +21,10 @@ reads and writes a TribleSpace pile via the `triblespace` crate.
 
 == Discovery
 
-`ls /Users/jp/Desktop/chatbot/liora/faculties/` shows what's
-available. Each faculty supports `--help` listing its
-subcommands; subcommands take their own `--help` for argument
-detail.
+`ls $(dirname $(which wiki.rs))` (or `ls path/to/faculties/`
+if you haven't put them on PATH yet) shows what's available.
+Each faculty supports `--help` listing its subcommands;
+subcommands take their own `--help` for argument detail.
 
 == Why this shape
 

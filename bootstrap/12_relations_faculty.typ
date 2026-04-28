@@ -36,7 +36,7 @@ relations.rs list
 relations.rs show jp
 
 # Update
-relations.rs set jp --note "Bremen-based, founded the team-of-one"
+relations.rs set jp --note "Project lead. Prefers async over sync."
 ```
 
 The label is the short form you'll type at faculty-call sites:

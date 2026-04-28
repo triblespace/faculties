@@ -34,8 +34,9 @@ itself is the right level for "and now do X".
 == Tags
 
 Compass tags work like wiki tags. Common ones:
-`#liora`, `#meta`, `#bootstrap`, `#parking` (see Scope Control
-below).
+`#meta`, `#bootstrap`, `#parking` (see Scope Control below),
+plus project-specific tags (`#liora` in the Liora project,
+`#deploy` for ops work, etc.).
 
 == Scope control: parking lot
 
