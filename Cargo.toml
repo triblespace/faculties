@@ -1,6 +1,6 @@
 [package]
 name = "faculties"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "An office suite for AI agents: kanban, wiki, files, messaging, and a GORBIE-backed viewer — all persisted in a TribleSpace pile."
@@ -70,6 +70,3 @@ typst-syntax = "0.14"       # wiki
 GORBIE = { version = "0.12", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
-
-[patch.crates-io]
-GORBIE = { path = "../GORBIE" }

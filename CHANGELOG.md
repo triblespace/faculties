@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.12.1 — 2026-05-05
+
+- **Drop stray `[patch.crates-io]` GORBIE local override.** v0.12.0
+  shipped with `GORBIE = { path = "../GORBIE" }` in the manifest,
+  which broke the release workflow (the GH runner has no sibling
+  GORBIE checkout). Local dev overrides belong in
+  `~/.cargo/config.toml` or a gitignored override file, not the
+  published manifest. v0.12.0 source is identical otherwise; this
+  is a CI-only fix.
+
 ## 0.12.0 — 2026-05-05
 
 - **Faculties are real Cargo binaries now.** Every faculty moved
