@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.12.0 — 2026-05-05
+
 - **Faculties are real Cargo binaries now.** Every faculty moved
   from a `rust-script` shebang at the repo root into `src/bin/`,
   with the unioned dep set hoisted into `Cargo.toml`. Install
