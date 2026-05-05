@@ -1,6 +1,6 @@
 = Files Faculty: Archiving and Citing Artefacts
 
-`files.rs` is the content-addressed file store. Use it for any
+`files` is the content-addressed file store. Use it for any
 binary or large-text artefact you'll want to cite from a wiki
 fragment later: PDFs, datasets, screenshots, codex output dumps,
 downloaded papers.
@@ -21,29 +21,29 @@ downloaded papers.
 
 ```sh
 # Archive a single file
-files.rs add ~/Downloads/some_paper.pdf
+files add ~/Downloads/some_paper.pdf
 # → files:<hash>   (use this handle in wiki fragments)
 
 # Fetch from a URL straight into the pile (avoids the tmp step)
-files.rs fetch https://arxiv.org/pdf/2305.12345.pdf
+files fetch https://arxiv.org/pdf/2305.12345.pdf
 
 # List what you've archived
-files.rs list
+files list
 
 # Search by name or tag
-files.rs search "succinct"
-files.rs list --tag paper
+files search "succinct"
+files list --tag paper
 
 # Pull a file back out
-files.rs get <hash> ~/Desktop/recovered.pdf
+files get <hash> ~/Desktop/recovered.pdf
 
 # Pipe to stdout (works with binary)
-files.rs get <hash> @- > /tmp/check.pdf
+files get <hash> @- > /tmp/check.pdf
 ```
 
 == Tagging and search
 
-  - `files.rs tag <hash> <tagname>` adds a tag.
+  - `files tag <hash> <tagname>` adds a tag.
   - Tags compose: a paper might be tagged `paper`, `arxiv`,
     `compression`, `benchmark`. Each new tag is queryable
     independently.
@@ -56,7 +56,7 @@ files.rs get <hash> @- > /tmp/check.pdf
   - Source code under git — that's already content-addressed
     by the commit hash.
   - Tiny text snippets — those go in wiki fragments directly.
-  - Anything you'd want to read with `wiki.rs show` later —
+  - Anything you'd want to read with `wiki show` later —
     fragments render in GORBIE; files don't.
 
 == Citation pattern

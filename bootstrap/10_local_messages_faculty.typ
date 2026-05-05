@@ -1,6 +1,6 @@
 = Local Messages: Agent-to-Agent Direct Messaging
 
-`local_messages.rs` is the append-only DM primitive. Useful when
+`local_messages` is the append-only DM primitive. Useful when
 you want to leave a note for another agent (or a future-you) that
 isn't a wiki fragment — it's transient, addressee-specific, with
 read acknowledgements.
@@ -10,7 +10,7 @@ read acknowledgements.
   - Coordination between two agents on the same pile
     (e.g. "I'm taking over goal X, please don't touch it").
   - Hand-offs that need a read-receipt
-    (`local_messages.rs ack <id>`).
+    (`local_messages ack <id>`).
   - Notes-to-self that are time-sensitive but not durable enough
     for a wiki fragment.
 
@@ -30,17 +30,17 @@ read acknowledgements.
 
 ```sh
 # Send
-local_messages.rs send <recipient-handle> "your message"
+local_messages send <recipient-handle> "your message"
 
 # List recent (latest first)
-local_messages.rs list
+local_messages list
 
 # Mark as read
-local_messages.rs ack <message-id>
+local_messages ack <message-id>
 ```
 
 The recipient handle is whatever name maps to a person/agent in
-the relations branch (`local_messages.rs --help` shows the
+the relations branch (`local_messages --help` shows the
 `--relations-branch` flag for picking which branch holds those
 mappings — `relations` by default).
 

@@ -6,23 +6,23 @@ and starting to do work.
 
 == Step 1: orient your environment (10 min)
 
-  + `ls $(dirname $(which wiki.rs))` — see what faculties exist
+  + `ls $(dirname $(which wiki))` — see what faculties exist
     on your PATH (or `ls path/to/faculties/` if you haven't put
     them on PATH yet).
-  + `wiki.rs list --tag bootstrap` — see all the onboarding
+  + `wiki list --tag bootstrap` — see all the onboarding
     fragments (this one + the foundation + per-faculty fragments).
-  + `compass.rs list` — see active goals.
-  + `compass.rs list todo` (filter to a tag with `--tag bootstrap`
+  + `compass list` — see active goals.
+  + `compass list todo` (filter to a tag with `--tag bootstrap`
     if there are non-onboarding goals mixed in) — see your
     bootstrap tasks.
 
 == Step 2: project-specific context
 
 If you're inheriting an existing project (vs. starting fresh),
-look for a `wiki.rs --pile ./self.pile show <id>` "letter from
+look for a `wiki --pile ./self.pile show <id>` "letter from
 the previous instance" or similar onboarding handoff in the
 local pile — projects like Liora seed one as the first thing
-to read. `wiki.rs search "letter"` or `wiki.rs list --tag
+to read. `wiki search "letter"` or `wiki list --tag
 onboarding` from your local pile should surface it.
 
 If there isn't one, skip this step.
@@ -36,7 +36,7 @@ you through hands-on faculty use:
   - create your first wiki fragment
   - link two fragments
   - archive a file
-  - run `wiki.rs lint` and `wiki.rs check`
+  - run `wiki lint` and `wiki check`
   - add a compass note to one of your goals
 
 Working through these gives you the muscle memory the docs
@@ -44,15 +44,15 @@ can't.
 
 == Step 4: pick up real work (15 min)
 
-  + `compass.rs list doing` — anything in flight you should
+  + `compass list doing` — anything in flight you should
     take over?
   + If nothing's in flight, ask the user (look up their handle
-    via `relations.rs list` if you don't already know it) what
+    via `relations list` if you don't already know it) what
     they need next.
 
 == If you get stuck
 
-  - `wiki.rs search <keyword>` — full-text across all
+  - `wiki search <keyword>` — full-text across all
     fragments.
   - Re-run any faculty with `--help`.
   - Check `CLAUDE.md` (project root) for project-specific
@@ -61,7 +61,7 @@ can't.
 
 == Sibling fragments
 
-`wiki.rs list --tag bootstrap` enumerates the onboarding
+`wiki list --tag bootstrap` enumerates the onboarding
 fragments by id and title. The set covers two shapes:
 
 *Foundations* — read first if you've never used faculties:
@@ -100,5 +100,5 @@ fragments by id and title. The set covers two shapes:
 
 Read the foundations in any order; each stands alone. Tool
 Selection is the densest if you want a single-page reference.
-For "where was I?" at session start, run `orient.rs show`
+For "where was I?" at session start, run `orient show`
 before reading anything.

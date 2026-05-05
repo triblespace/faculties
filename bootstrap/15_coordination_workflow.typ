@@ -16,40 +16,40 @@ that was sent but never read).
 
 ```sh
 # Setup (once, on each pile):
-relations.rs add jp --display-name "JP" --affinity "user"
-relations.rs add agent-b --display-name "Agent B" --affinity "teammate"
+relations add jp --display-name "JP" --affinity "user"
+relations add agent-b --display-name "Agent B" --affinity "teammate"
 
 # Agent A: claim the goal first.
 GOAL=<existing-goal-id>
-compass.rs move $GOAL doing
-compass.rs note $GOAL "Claimed by agent-a, draft pending"
+compass move $GOAL doing
+compass note $GOAL "Claimed by agent-a, draft pending"
 
 # Agent A: do partial work, then prepare hand-off.
-compass.rs note $GOAL "Draft at wiki:<frag-id>; need agent-b to verify the calculation"
-compass.rs move $GOAL blocked   # signals "external dependency"
-local_messages.rs send agent-b "Goal $GOAL ready for review — see wiki:<frag-id>"
+compass note $GOAL "Draft at wiki:<frag-id>; need agent-b to verify the calculation"
+compass move $GOAL blocked   # signals "external dependency"
+local_messages send agent-b "Goal $GOAL ready for review — see wiki:<frag-id>"
 
 # Agent B (later, possibly different session):
-orient.rs show                  # surfaces the new message + blocked goal
-local_messages.rs ack <msg-id>  # read receipt
-compass.rs move $GOAL doing
-compass.rs note $GOAL "Picked up by agent-b for review"
+orient show                  # surfaces the new message + blocked goal
+local_messages ack <msg-id>  # read receipt
+compass move $GOAL doing
+compass note $GOAL "Picked up by agent-b for review"
 
 # Agent B does the work, hands back:
-compass.rs note $GOAL "Verified §3.2; numbers correct. Pushed back to A."
-local_messages.rs send agent-a "Done with review on $GOAL"
-compass.rs move $GOAL doing     # NOT done — A still owns the goal
+compass note $GOAL "Verified §3.2; numbers correct. Pushed back to A."
+local_messages send agent-a "Done with review on $GOAL"
+compass move $GOAL doing     # NOT done — A still owns the goal
 ```
 
 == Why each step
 
-  - *relations.rs once per pile*: handles resolve through this
-    registry. Without it, `local_messages.rs send agent-b ...`
+  - *relations once per pile*: handles resolve through this
+    registry. Without it, `local_messages send agent-b ...`
     can't address the recipient.
-  - *Status change before sending the message*: `compass.rs move $GOAL blocked` first.
+  - *Status change before sending the message*: `compass move $GOAL blocked` first.
     the status change is the durable signal; the message is
     the polite notification. If the message is missed, the next
-    `orient.rs show` from B still surfaces the blocked goal.
+    `orient show` from B still surfaces the blocked goal.
   - *Notes on every transition*: the goal's history is the
     audit trail. "Claimed by", "Draft at", "Verified", "Pushed
     back" — each note records what happened and who did it.
@@ -57,17 +57,17 @@ compass.rs move $GOAL doing     # NOT done — A still owns the goal
     who *originated* the goal should mark it done. B verifies
     and hands back; A confirms and closes.
 
-== orient.rs wait for idle agents
+== orient wait for idle agents
 
 If Agent B is running a `/loop` or sitting idle, replace
-`orient.rs show` with `orient.rs wait` — that blocks until any
+`orient show` with `orient wait` — that blocks until any
 relevant branch changes, including gossip-merged remote writes
 through `pile net sync`.
 
 ```sh
 # Agent B's idle loop:
 while true; do
-  orient.rs wait    # blocks until something arrives
+  orient wait    # blocks until something arrives
   # ...handle whatever showed up...
 done
 ```
@@ -77,10 +77,10 @@ done
 Pile branches are append-only with `cat` union for compass and
 local-messages, so concurrent writes never overwrite. Two agents
 both moving the same goal to `doing` produces two status events
-in chronological order; `compass.rs list` shows the latest.
+in chronological order; `compass list` shows the latest.
 
 For genuine ambiguity ("we both started working on this"), the
-fix is a quick `local_messages.rs send <other> "I'm taking this
+fix is a quick `local_messages send <other> "I'm taking this
 one — you grab X"` — a coordination layer the system supports
 but doesn't enforce.
 

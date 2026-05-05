@@ -1,9 +1,9 @@
 = Relations: People and Handle Mappings
 
-`relations.rs` is the contact registry. Each entry maps a short
+`relations` is the contact registry. Each entry maps a short
 canonical label (the "handle") to a person record with names,
 aliases, and free-form notes. Other faculties — most notably
-`local_messages.rs` — resolve recipient handles through this
+`local_messages` — resolve recipient handles through this
 registry.
 
 == Why a separate faculty
@@ -23,24 +23,24 @@ addressee data.
 
 ```sh
 # Add a person
-relations.rs add jp --first-name "Jan-Paul" --last-name "Bultmann" \
+relations add jp --first-name "Jan-Paul" --last-name "Bultmann" \
   --display-name "JP" --affinity "user / project lead"
 
 # Add an alias
-relations.rs add codex --display-name "Codex subagent" --alias "data-plane"
+relations add codex --display-name "Codex subagent" --alias "data-plane"
 
 # List
-relations.rs list
+relations list
 
 # Show one (label, alias, or hex id all work)
-relations.rs show jp
+relations show jp
 
 # Update
-relations.rs set jp --note "Project lead. Prefers async over sync."
+relations set jp --note "Project lead. Prefers async over sync."
 ```
 
 The label is the short form you'll type at faculty-call sites:
-`local_messages.rs send jp "..."` resolves "jp" via the
+`local_messages send jp "..."` resolves "jp" via the
 relations registry.
 
 == Conventions

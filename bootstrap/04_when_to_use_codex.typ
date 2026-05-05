@@ -45,5 +45,5 @@ instantly.
     and demand a heredoc.
   - Set a budget ("~15 min, stub if you run out").
   - Wrap the resulting `.typ` file as a wiki fragment yourself —
-    don't have codex invoke `wiki.rs create` directly. Sanity-check
+    don't have codex invoke `wiki create` directly. Sanity-check
     is easier from your side first.

@@ -16,11 +16,11 @@ step? If separate, redesign until it's not.
 
 == How faculties embody this
 
-  - `wiki.rs create` *is* the writing. The fragment is durable
+  - `wiki create` *is* the writing. The fragment is durable
     the moment it's saved.
-  - `compass.rs status <id> doing` *is* the claim. No separate
+  - `compass status <id> doing` *is* the claim. No separate
     "log that I started this".
-  - `files.rs add <path>` *is* the archive step. The handle is
+  - `files add <path>` *is* the archive step. The handle is
     the citation.
   - Pile commits *are* the version history. No separate
     snapshotting.
@@ -30,7 +30,7 @@ step? If separate, redesign until it's not.
 Free-floating `.md` plan files in repos are a red flag. They:
 
   - Don't merge between agents.
-  - Don't show up in `wiki.rs list`.
+  - Don't show up in `wiki list`.
   - Aren't content-addressed.
   - Drift the moment you stop editing them.
 

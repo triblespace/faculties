@@ -2,16 +2,30 @@
 
 An office suite for AI agents.
 
-Faculties are small, self-contained `rust-script` tools that give an agent
-a stable workspace: a kanban board, a personal wiki, a file organizer, a
-situation-awareness dashboard, direct messaging, and more. They persist
-their state in a [TribleSpace](https://github.com/triblespace/triblespace-rs)
-pile — typically `./self.pile` — so the agent owns its own history across
-sessions.
+Faculties are small, self-contained CLI tools that give an agent a
+stable workspace: a kanban board, a personal wiki, a file organizer,
+a situation-awareness dashboard, direct messaging, and more. They
+persist their state in a [TribleSpace](https://github.com/triblespace/triblespace-rs)
+pile — typically `./self.pile` — so the agent owns its own history
+across sessions.
 
 ![faculties-viewer composing activity, wiki, compass, and messages widgets](preview.png)
 
 ## Getting started
+
+### Precompiled binaries (sandboxes, restricted envs)
+
+Each tagged release attaches per-target tarballs containing every
+faculty CLI (and the GUI viewer where it cross-compiles cleanly):
+
+```sh
+# pick the asset matching your platform — see github.com/triblespace/faculties/releases
+curl -L https://github.com/triblespace/faculties/releases/latest/download/faculties-<TAG>-aarch64-apple-darwin.tar.gz \
+  | tar -xz
+export PATH="$PWD/faculties-<TAG>-aarch64-apple-darwin:$PATH"
+```
+
+### From source (dev environments)
 
 Install a Rust toolchain (if you don't have one):
 
@@ -19,28 +33,32 @@ Install a Rust toolchain (if you don't have one):
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Install the GUI viewer and `rust-script` (for the CLI tools):
+Install all faculty CLIs (and the GUI viewer) onto `$PATH`:
 
 ```sh
-cargo install faculties --features widgets     # gives you `faculties-viewer`
-cargo install rust-script                      # needed to run *.rs faculties
+cargo install --git https://github.com/triblespace/faculties --bins
+cargo install --git https://github.com/triblespace/faculties --features widgets --bin faculties-viewer
 ```
 
-Clone the repo, put it on PATH, and create an empty pile:
+Or from a local checkout:
 
 ```sh
 git clone https://github.com/triblespace/faculties
 cd faculties
-export PATH="$(pwd):$PATH"
-touch ./self.pile
-export PILE=./self.pile
+cargo install --path . --bins
+cargo install --path . --features widgets --bin faculties-viewer
 ```
 
-Add a few things through the CLI faculties, then open the viewer:
+### Use it
+
+Create an empty pile and add a few things:
 
 ```sh
-compass.rs add "ship the demo" --status doing
-wiki.rs create --title "Hello" --body "First *typst* fragment."
+touch ./self.pile
+export PILE=./self.pile
+
+compass add "ship the demo" --status doing
+wiki create --title "Hello" --body "First *typst* fragment."
 faculties-viewer               # picks up PILE from the environment
 ```
 
@@ -73,11 +91,11 @@ cat bootstrap.pile >> ./self.pile
 export PILE=./self.pile
 
 # Verify:
-wiki.rs list --tag bootstrap          # 15 fragments
-compass.rs list                       # 6 hands-on goals in TODO
+wiki list --tag bootstrap          # 15 fragments
+compass list                       # 6 hands-on goals in TODO
 ```
 
-Then start with `wiki.rs show <id>` on the "Getting Started: Your
+Then start with `wiki show <id>` on the "Getting Started: Your
 First Hour" fragment (tagged `start-here`) — that's the orientation
 tour that points at every other piece.
 
@@ -104,22 +122,25 @@ telling the tool what to show you next, and the history falls out naturally.
 
 | Faculty | Purpose |
 |---|---|
-| `compass.rs` | Kanban goal/task board with status, tags, notes, priorities |
-| `wiki.rs` | Personal wiki with typst fragments, links, and full-text search |
-| `files.rs` | File organizer backed by blob storage and tags |
-| `orient.rs` | Situation awareness dashboard — what's happening right now |
-| `atlas.rs` | Cross-branch map of the pile's contents |
-| `gauge.rs` | Metrics and counters |
-| `memory.rs` | Long-term memory: compact history and salient fragments |
-| `headspace.rs` | Model/prompt configuration |
-| `reason.rs` | Record reasoning steps alongside actions |
-| `patience.rs` | Soft timers and pacing |
-| `local_messages.rs` | Direct messaging between personas and humans |
-| `relations.rs` | People, affinity, contact info |
-| `teams.rs` | Microsoft Teams archive and bridge |
-| `triage.rs` | Workflow staging for inbound items |
-| `archive.rs` | Import external archives (chats, exports) into the pile |
-| `web.rs` | Web search and fetch with results recorded |
+| `compass` | Kanban goal/task board with status, tags, notes, priorities |
+| `wiki` | Personal wiki with typst fragments, links, and full-text search |
+| `files` | File organizer backed by blob storage and tags |
+| `orient` | Situation awareness dashboard — what's happening right now |
+| `atlas` | Cross-branch map of the pile's contents |
+| `gauge` | Metrics and counters |
+| `memory` | Long-term memory: compact history and salient fragments |
+| `headspace` | Model/prompt configuration |
+| `reason` | Record reasoning steps alongside actions |
+| `patience` | Soft timers and pacing |
+| `local_messages` | Direct messaging between personas and humans |
+| `relations` | People, affinity, contact info |
+| `teams` | Microsoft Teams archive and bridge |
+| `triage` | Workflow staging for inbound items |
+| `archive` | Import external archives (chats, exports) into the pile |
+| `web` | Web search and fetch with results recorded |
+
+Each faculty's source is a single file under [`src/bin/`](src/bin/) —
+copy one out and tweak it as a starting point for your own.
 
 ## Notes on pile & branches
 
@@ -154,9 +175,9 @@ in your own [GORBIE] notebook) are in `examples/`: `compass_board.rs`,
 
 Faculties are deliberately simple. If you find yourself adding abstraction
 layers, stop and ask whether the feature belongs in the faculty at all or
-whether it would be better as a separate tool. Each file should stand
-alone — you should be able to copy `wiki.rs` into an unrelated project
-and have it just work.
+whether it would be better as a separate tool. Each `src/bin/<name>.rs`
+should stand alone — you should be able to copy a faculty out into an
+unrelated crate and have it work with the same union of root deps.
 
 ## License
 

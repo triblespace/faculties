@@ -4,7 +4,7 @@ A quick lookup for "which tool do I reach for here?"
 
 == Goals and tasks
 
-  - *Use* `compass.rs goal-create` / `status` / `note`.
+  - *Use* `compass goal-create` / `status` / `note`.
   - *Don't use* the harness's TaskCreate / TaskUpdate for
     persistent goals — those vanish at end of session.
   - *Do use* TaskCreate inline within a single conversation when
@@ -13,7 +13,7 @@ A quick lookup for "which tool do I reach for here?"
 
 == Knowledge fragments
 
-  - *Use* `wiki.rs create / edit / lint`.
+  - *Use* `wiki create / edit / lint`.
   - *Don't use* free-floating `.md` files in repos.
   - *Exception*: when a downstream consumer needs the file at a
     specific path (a crate's `CHANGELOG.md`, a `book/src/`
@@ -21,14 +21,14 @@ A quick lookup for "which tool do I reach for here?"
 
 == Files (PDFs, datasets, binaries)
 
-  - *Use* `files.rs add <path>`. Returns a `files:<hash>` handle
+  - *Use* `files add <path>`. Returns a `files:<hash>` handle
     you cite from wiki fragments.
   - *Don't use* `/tmp` for anything you'll want past this turn.
   - *Don't commit* binaries to repos — they bloat the history.
 
 == Direct messages between agents
 
-  - *Use* `local_messages.rs` for in-place agent-to-agent
+  - *Use* `local_messages` for in-place agent-to-agent
     messaging (append-only, with read acknowledgements).
   - For shared knowledge between two agents: a wiki fragment
     they both query is usually better than a message.

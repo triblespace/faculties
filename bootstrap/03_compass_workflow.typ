@@ -1,6 +1,6 @@
 = Compass Goals Workflow
 
-`compass.rs` is the goal/task tracker. Use it instead of
+`compass` is the goal/task tracker. Use it instead of
 Claude Code's TaskCreate/TaskUpdate — compass goals persist
 across sessions and merge between agents; the harness's task
 list does neither.
@@ -17,16 +17,16 @@ another.
 
 == Daily flow
 
-  + `compass.rs list` — see your active goals
-  + Pick one, `compass.rs status <id> doing` — claim it
-  + Add notes as you decide things: `compass.rs note <id> "..."`
-  + When finished: `compass.rs status <id> done` then a final
+  + `compass list` — see your active goals
+  + Pick one, `compass status <id> doing` — claim it
+  + Add notes as you decide things: `compass note <id> "..."`
+  + When finished: `compass status <id> done` then a final
     note recording the outcome
   + Repeat
 
 == Hierarchy
 
-`compass.rs goal-create --parent <id>` creates a sub-goal. Use
+`compass goal-create --parent <id>` creates a sub-goal. Use
 this when a goal naturally breaks into 3+ steps you'll want to
 track separately. Don't sub-goal trivial steps — the conversation
 itself is the right level for "and now do X".

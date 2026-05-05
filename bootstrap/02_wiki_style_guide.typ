@@ -5,15 +5,15 @@ Atomic, cross-linked, written in typst, rendered by GORBIE.
 
 == Authoring
 
-  - `wiki.rs create "Title" "@/tmp/body.typ" --tag <tag>...` —
+  - `wiki create "Title" "@/tmp/body.typ" --tag <tag>...` —
     create a new fragment from a file.
-  - `wiki.rs create "Title" "@-" --tag <tag>` — read body from
+  - `wiki create "Title" "@-" --tag <tag>` — read body from
     stdin (useful in pipes).
-  - `wiki.rs edit <ID> @/tmp/body.typ` — bump a new version of an
+  - `wiki edit <ID> @/tmp/body.typ` — bump a new version of an
     existing fragment.
-  - `wiki.rs lint` — lint markdown→typst, expand short ids,
+  - `wiki lint` — lint markdown→typst, expand short ids,
     rebuild the `links_to` index.
-  - `wiki.rs check` — diagnose orphan fragments, broken links,
+  - `wiki check` — diagnose orphan fragments, broken links,
     truncated ids, missing format tags.
 
 == One claim per fragment
@@ -41,5 +41,5 @@ it everywhere.
   - Per-task working notes that the conversation already covers
     — the moment-history captures those.
   - Status of in-flight work — that goes in compass goals.
-  - Binary artefacts — `files.rs add` puts them content-addressed
+  - Binary artefacts — `files add` puts them content-addressed
     in the pile and gives you a `files:<hash>` reference.

@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Faculties are real Cargo binaries now.** Every faculty moved
+  from a `rust-script` shebang at the repo root into `src/bin/`,
+  with the unioned dep set hoisted into `Cargo.toml`. Install
+  with `cargo install --git ... --bins` (or grab a precompiled
+  tarball from a tagged release). Invocation drops the `.rs`
+  suffix: `wiki list`, `compass add ...`, etc. The `faculties`
+  lib (schemas + widgets) is unchanged; binaries `use faculties::...`
+  the same way external crates would.
+- **GitHub Actions release workflow.** `v*` tags trigger per-target
+  builds (`x86_64-linux-gnu`, `aarch64-linux-gnu` via cross,
+  `x86_64-apple-darwin`, `aarch64-apple-darwin`) and attach
+  tarballs + sha256s to the GH release. Restricted sandboxes can
+  fetch binaries without a Rust toolchain.
+
 ## 0.11.2 — 2026-04-19
 
 - **Theme-adaptive compass + messages.** `color_frame`, `card_bg`,

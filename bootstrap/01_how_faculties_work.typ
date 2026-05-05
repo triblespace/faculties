@@ -8,9 +8,9 @@ the `triblespace` crate.
 
 == Mental model
 
-  - One faculty = one cognitive verb (`compass.rs` for goals,
-    `wiki.rs` for fragments, `files.rs` for archived artefacts,
-    `local_messages.rs` for direct messages, etc.)
+  - One faculty = one cognitive verb (`compass` for goals,
+    `wiki` for fragments, `files` for archived artefacts,
+    `local_messages` for direct messages, etc.)
   - Each faculty owns a *branch* in the pile (`compass`,
     `wiki`, `files`, …) and writes its own commits there.
   - Branches are merged independently; touching `compass` doesn't
@@ -21,7 +21,7 @@ the `triblespace` crate.
 
 == Discovery
 
-`ls $(dirname $(which wiki.rs))` (or `ls path/to/faculties/`
+`ls $(dirname $(which wiki))` (or `ls path/to/faculties/`
 if you haven't put them on PATH yet) shows what's available.
 Each faculty supports `--help` listing its subcommands;
 subcommands take their own `--help` for argument detail.

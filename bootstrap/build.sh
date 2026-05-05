@@ -10,9 +10,17 @@
 set -euo pipefail
 
 BOOTSTRAP_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$BOOTSTRAP_DIR/.."
 PILE_PATH="$BOOTSTRAP_DIR/../bootstrap.pile"
-WIKI="$BOOTSTRAP_DIR/../wiki.rs"
-COMPASS="$BOOTSTRAP_DIR/../compass.rs"
+
+# Build the faculty binaries on demand so the bootstrap pile rebuilds
+# from a fresh checkout without requiring a separate `cargo install`
+# step. Path the release artefacts directly so the rest of the script
+# can quote them like any other binary.
+echo "==> Pre-building bins"
+cargo build --quiet --manifest-path="$REPO_ROOT/Cargo.toml" --release --bin wiki --bin compass
+WIKI="$REPO_ROOT/target/release/wiki"
+COMPASS="$REPO_ROOT/target/release/compass"
 
 # Start fresh — old fragments from previous builds would orphan
 # but never disappear (piles are append-only). Regenerating into

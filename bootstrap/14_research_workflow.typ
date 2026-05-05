@@ -16,25 +16,25 @@ from the individual `--help` outputs.
 ```sh
 # 1. Frame the question as a compass goal.
 #    The goal is your container — every artefact below cites it.
-GOAL=$(compass.rs add "Investigate <topic>" \
+GOAL=$(compass add "Investigate <topic>" \
   --tag research \
   --note "Hypothesis: ..." \
   | grep -oE '[0-9a-f]{32}')
-compass.rs move "$GOAL" doing
+compass move "$GOAL" doing
 
 # 2. Search.
-web.rs search "<query>"
+web search "<query>"
 
 # 3. For each promising result, archive the raw bytes.
-#    Multiple `files.rs fetch` calls are fine — content-
+#    Multiple `files fetch` calls are fine — content-
 #    addressing dedupes if you accidentally fetch the same URL
 #    twice.
-files.rs fetch https://arxiv.org/pdf/<id>.pdf
+files fetch https://arxiv.org/pdf/<id>.pdf
 # → files:<hash>   (use this hash below)
 
 # 4. Take notes as fragments while you read.
 #    Cite the archived file by hash.
-wiki.rs create "<finding title>" "@-" \
+wiki create "<finding title>" "@-" \
   --tag research --tag <topic> <<EOF
 = <finding title>
 
@@ -45,11 +45,11 @@ Open: does the bound tighten when <Y>?
 EOF
 
 # 5. Cross-link new fragments back to the goal.
-compass.rs note "$GOAL" "Wrote up finding: see wiki:<frag-id>"
+compass note "$GOAL" "Wrote up finding: see wiki:<frag-id>"
 
 # 6. When done: outcome note + status done.
-compass.rs note "$GOAL" "Conclusion: ..."
-compass.rs move "$GOAL" done
+compass note "$GOAL" "Conclusion: ..."
+compass move "$GOAL" done
 ```
 
 == Why each step
@@ -57,25 +57,25 @@ compass.rs move "$GOAL" done
   - *Compass goal first*: the goal id is a stable handle for
     every cross-reference. If you skip this and just open a
     fragment, you have to retroactively link findings back later.
-  - *web.rs search before files.rs fetch*: web.rs gives
+  - *web search before files fetch*: web gives
     cleaned text + provider-quality results;
-    files.rs grabs raw bytes for durable citation.
+    files grabs raw bytes for durable citation.
   - *Fragment per finding, not per session*: atomic fragments
     cross-link cleanly and survive session boundaries. A
     "session log" fragment that tries to capture everything is
     a leaky abstraction.
   - *Outcome note before status done*: the outcome line is
     what future-you (or another agent) will see when scanning
-    `compass.rs list done`. Make it useful — what did you
+    `compass list done`. Make it useful — what did you
     learn, what's still open.
 
 == Skipping steps
 
   - For fast lookup ("just need the dates", "what's the URL of
     the paper I read last week"), skip compass. Run
-    `wiki.rs search` or `files.rs search` directly.
+    `wiki search` or `files search` directly.
   - For one-off facts you'll never cite again, skip
-    files.rs and just paste the relevant text into a wiki
+    files and just paste the relevant text into a wiki
     fragment with the URL inline. Use judgement: if you'll cite
     the source from another fragment, archive it.
 

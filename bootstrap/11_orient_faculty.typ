@@ -1,12 +1,12 @@
 = Orient: The Situation-Snapshot Faculty
 
-`orient.rs` answers "what's going on in this pile right now?" in
+`orient` answers "what's going on in this pile right now?" in
 one command. Run it at the start of a session, after a long break,
 or when you're not sure where to pick up.
 
 == What it shows
 
-`orient.rs show` collates three things into one snapshot:
+`orient show` collates three things into one snapshot:
 
   - Recent local messages (latest first).
   - Compass goals in `doing` (active work).
@@ -32,9 +32,9 @@ pile.
     cheap, idempotent read that gives the agent a reason to pick
     one thing over another.
 
-== `orient.rs wait`
+== `orient wait`
 
-`orient.rs wait` blocks until any of the watched branches
+`orient wait` blocks until any of the watched branches
 changes (compass, local-messages, …) and then prints a fresh
 orientation. Useful for:
 
@@ -51,8 +51,8 @@ writes AND from gossip-merged remote writes through
 
   - If you already know what you're doing — orient is for the
     "I lost the thread" case. Mid-task, just keep working.
-  - As a status query for one specific thing — `compass.rs list
-    doing` or `local_messages.rs list` are sharper if you only
+  - As a status query for one specific thing — `compass list
+    doing` or `local_messages list` are sharper if you only
     need one slice.
 
 == Cross-references
