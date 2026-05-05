@@ -117,7 +117,7 @@ impl StorageState {
             self.error = Some(format!("restore: {err:?}"));
             return;
         }
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core06::OsRng);
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let mut repo = match Repository::new(pile, signing_key, TribleSet::new()) {
             Ok(r) => r,
             Err(e) => {

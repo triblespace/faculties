@@ -21,10 +21,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [lib]
 path = "src/lib.rs"
 
-# GORBIE-backed viewer binary. Ships inside the crate so
-# `cargo install faculties --features widgets` installs the viewer
-# globally. Requires the `widgets` feature because the binary
-# depends on the `widgets` module.
+# GORBIE-backed viewer binary. Requires the `widgets` feature.
 [[bin]]
 name = "faculties-viewer"
 path = "src/bin/faculties-viewer.rs"
@@ -37,16 +34,42 @@ widgets = [
     "dep:GORBIE",
     "dep:egui",
     "dep:cubecl",
-    "dep:ed25519-dalek",
-    "dep:rand_core06",
-    "dep:hifitime",
 ]
 
 [dependencies]
+# Core: every CLI faculty depends on these.
+anyhow = "1.0"
+clap = { version = "4.5.4", features = ["derive", "env"] }
+ed25519-dalek = "2.1.1"
+hifitime = "4.2.3"
+rand_core = "0.6.4"
 triblespace = "0.36"
+
+# Per-faculty deps (kept here so faculties stay single-file in src/bin/).
+anybytes = "0.20"           # files
+base64 = "0.22"             # teams
+chrono = { version = "0.4.39", features = ["clock"] }  # orient
+comemo = "0.5.1"            # wiki
+dirs = "5"                  # wiki
+hex = "0.4"                 # gauge
+humantime = "2.3.0"         # orient, patience
+itertools = "0.14"          # wiki
+libc = "0.2"                # teams
+rayon = "1.10"              # archive
+regex = "1"                 # wiki
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }  # discord, files, teams, web
+scraper = "0.23"            # archive
+serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
+serde_json = "1"            # archive, discord, teams, triage, web
+tracing = "0.1"             # archive
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # archive
+typst = "0.14"              # wiki
+typst-syntax = "0.14"       # wiki
+
+# Widgets-only (optional): GORBIE viewer stack.
 GORBIE = { version = "0.12", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
-ed25519-dalek = { version = "2.1.1", optional = true }
-rand_core06 = { package = "rand_core", version = "0.6.4", optional = true }
-hifitime = { version = "4.1.2", optional = true }
+
+[patch.crates-io]
+GORBIE = { path = "../GORBIE" }
