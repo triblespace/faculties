@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.12.2 — 2026-05-07
+
+- **Bump optional `GORBIE` dep 0.12 → 0.13.** Picks up the
+  GORBIE 0.13.x line: stacked floats no longer drag in
+  lockstep, tall floats render at natural content height
+  without a viewport-multiple cap, and the infinite-scroll
+  feedback loop when a wiki/compass float was open is fixed.
+  See GORBIE's CHANGELOG for the full notes.
+- **Drop manual drag detection in `wiki` and `timeline`
+  widgets.** Switch to egui's `Sense::click_and_drag` +
+  z-aware `dragged()` / `drag_delta()`. Floats dragged
+  across the wiki graph or the activity timeline no longer
+  pan them in lockstep; the manual `primary_pressed && in_rect`
+  + memory-id bookkeeping is gone.
+- **Fix wiki graph label flip-overshoot.** When a node's
+  label would overflow the right edge, the mirror-to-left
+  path used `Align2::RIGHT_CENTER.anchor_rect` against an
+  already-shifted origin — the label landed one whole
+  galley-width further left than intended, sometimes
+  clipping or appearing to wrap around to the viewport's
+  left side. Pass the unshifted `left_anchor` so the
+  label's right edge sits cleanly just left of the node.
+
 ## 0.12.1 — 2026-05-05
 
 - **Drop stray `[patch.crates-io]` GORBIE local override.** v0.12.0
