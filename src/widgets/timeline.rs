@@ -562,19 +562,6 @@ pub struct BranchTimeline {
     /// Tracks the first render so we can initialize `timeline_start` to
     /// "now" before painting.
     first_render: bool,
-    /// Manual drag tracking — avoids registering `Sense::drag` on the
-    /// viewport, which would trigger an egui 0.33/0.34 hit_test panic
-    /// when the section header above us has `Sense::click`. Holds the
-    /// pointer y from the previous frame while a drag is in progress.
-    drag_last_y: Option<f32>,
-    /// Pointer y at press-down. Used with a 4px dead-zone so a short
-    /// press+release (a click) doesn't pan the viewport at all —
-    /// sub-pixel per-frame motion during a click otherwise shifts the
-    /// event chips between press and release and eats the click.
-    drag_start_y: Option<f32>,
-    /// True once the gesture has exceeded the drag threshold and is
-    /// committed to panning (i.e. it's no longer a pending click).
-    dragging: bool,
     /// The most-recently-clicked event, if any. Hosts can read this to
     /// drive floating detail cards.
     pub selected_event: Option<(SourceKind, Id)>,
@@ -601,9 +588,6 @@ impl BranchTimeline {
             timeline_start: 0,
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             first_render: true,
-            drag_last_y: None,
-            drag_start_y: None,
-            dragging: false,
             selected_event: None,
         }
     }
@@ -677,14 +661,13 @@ impl BranchTimeline {
         let ui = ctx.ui_mut();
         let scroll_speed = 3.0;
         let viewport_width = ui.available_width();
-        // Click-only sense. We implement drag-to-pan manually below via
-        // raw pointer state to sidestep egui's hit_test unwrap panic that
-        // fires when a click-sensing widget (like the section header) and
-        // a drag-sensing widget (what this viewport would be) both land
-        // close to the cursor.
+        // egui's drag sense is z-aware (only the topmost widget claims
+        // the drag), so floats dragged across the viewport don't pan
+        // the timeline. The hit_test.rs panic that prompted manual
+        // detection in earlier 0.34 versions has been fixed upstream.
         let (viewport_rect, viewport_response) = ui.allocate_exact_size(
             egui::vec2(viewport_width, viewport_height),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
         );
 
         // Input handling — compute ns_per_px from CURRENT scale.
@@ -759,47 +742,14 @@ impl BranchTimeline {
                 }
             }
 
-            // Manual drag-to-pan with a 4-px dead-zone so a short
-            // press+release (a click) doesn't pan at all. We only
-            // latch onto a drag whose press *started* inside the
-            // viewport — otherwise something else (e.g. a floating
-            // wiki-page card being dragged across the screen) would
-            // also pan the timeline when its pointer crossed us.
-            let (primary_down, primary_pressed, pointer_pos) = ui.input(|i| {
-                (
-                    i.pointer.primary_down(),
-                    i.pointer.primary_pressed(),
-                    i.pointer.hover_pos(),
-                )
-            });
-            let in_viewport =
-                pointer_pos.map(|p| viewport_rect.contains(p)).unwrap_or(false);
-            const DRAG_THRESHOLD_PX: f32 = 4.0;
-            if primary_pressed && in_viewport {
-                if let Some(p) = pointer_pos {
-                    self.drag_start_y = Some(p.y);
-                }
-            }
-            if !primary_down {
-                self.drag_last_y = None;
-                self.drag_start_y = None;
-                self.dragging = false;
-            } else if let Some(p) = pointer_pos {
-                // `drag_start_y.is_some()` means the press happened
-                // inside us; ignore drags that started elsewhere.
-                if !self.dragging {
-                    if let Some(start) = self.drag_start_y {
-                        if (p.y - start).abs() > DRAG_THRESHOLD_PX {
-                            self.dragging = true;
-                            self.drag_last_y = Some(p.y);
-                        }
-                    }
-                } else if let Some(last_y) = self.drag_last_y {
-                    let drag_delta = p.y - last_y;
-                    let pan_ns = (drag_delta as f64 * ns_per_px) as i128;
-                    self.timeline_start += pan_ns;
-                    self.drag_last_y = Some(p.y);
-                }
+            // Drag-to-pan via egui's z-aware drag sense. egui handles
+            // the click/drag deadzone internally — short press+release
+            // returns clicked() without ever flipping dragged() — so
+            // we don't need a manual threshold.
+            let drag_dy = viewport_response.drag_delta().y;
+            if drag_dy != 0.0 {
+                let pan_ns = (drag_dy as f64 * ns_per_px) as i128;
+                self.timeline_start += pan_ns;
             }
 
             if viewport_response.double_clicked() {

@@ -888,13 +888,15 @@ impl WikiGraph {
         const GRAPH_MAX_HEIGHT: f32 = 900.0;
         let available = ui.available_size();
         let h = available.y.max(400.0).min(GRAPH_MAX_HEIGHT);
-        // Click-only sense — drag is implemented manually below. Avoids
-        // egui's hit_test unwrap panic that fires when a drag-sensing
-        // widget coexists with a nearby click-sensing one (the section
-        // header above us).
+        // egui's drag sense is z-aware (only the topmost widget under
+        // the pointer claims the drag), so a float being dragged over
+        // the graph viewport doesn't trigger a pan. Earlier 0.34
+        // versions hit a `hit_test.rs:365` panic with click_and_drag
+        // adjacent to clickers; the upstream fix in 0.34.x lets us
+        // use the proper sense again.
         let (response, painter) = ui.allocate_painter(
             egui::vec2(available.x, h),
-            egui::Sense::click(),
+            egui::Sense::click_and_drag(),
         );
         let rect = response.rect;
         let center = rect.center();
@@ -902,7 +904,6 @@ impl WikiGraph {
         let view_id = ui.id().with("wiki_graph_view");
         let pan_id = view_id.with("pan");
         let zoom_id = view_id.with("zoom");
-        let drag_id = view_id.with("drag_last");
 
         let mut pan: egui::Vec2 = ui.ctx().memory_mut(|m| {
             *m.data
@@ -960,40 +961,14 @@ impl WikiGraph {
             }
         }
 
-        // Manual drag-to-pan — tracks last pointer pos in egui memory
-        // so it persists across frames without needing `Sense::drag`.
-        // The drag is gated on the press *starting* inside this rect:
-        // `drag_id` in memory is only set on `primary_pressed` while
-        // the cursor was in-rect, and cleared on release. This stops
-        // the graph from stealing a drag when something else (e.g. a
-        // floating wiki-page card) is being dragged across the
-        // viewport.
-        let (primary_down, primary_pressed, pointer_pos) = ui.input(|i| {
-            (
-                i.pointer.primary_down(),
-                i.pointer.primary_pressed(),
-                i.pointer.hover_pos(),
-            )
-        });
-        let in_rect = pointer_pos.map(|p| rect.contains(p)).unwrap_or(false);
-        if primary_pressed && in_rect {
-            if let Some(p) = pointer_pos {
-                ui.ctx().memory_mut(|m| m.data.insert_temp(drag_id, p));
-            }
-        } else if !primary_down {
-            ui.ctx().memory_mut(|m| m.data.remove_temp::<egui::Pos2>(drag_id));
-        }
-        if primary_down {
-            if let (Some(last_p), Some(p)) = (
-                ui.ctx().memory(|m| m.data.get_temp::<egui::Pos2>(drag_id)),
-                pointer_pos,
-            ) {
-                pan += p - last_p;
-                ui.ctx().memory_mut(|m| {
-                    m.data.insert_temp(pan_id, pan);
-                    m.data.insert_temp(drag_id, p);
-                });
-            }
+        // Drag-to-pan via egui's z-aware drag sense — `drag_delta()`
+        // only fires when the press started on this widget AND no
+        // higher-z widget is on top, so floats dragged across the
+        // viewport don't steal pans (or pan-and-drag in lockstep).
+        let drag_delta = response.drag_delta();
+        if drag_delta != egui::Vec2::ZERO {
+            pan += drag_delta;
+            ui.ctx().memory_mut(|m| m.data.insert_temp(pan_id, pan));
         }
 
         let to_screen =
@@ -1066,12 +1041,13 @@ impl WikiGraph {
                 let label_rect = if right_rect.right() <= rect.right() - 2.0 {
                     right_rect
                 } else {
+                    // `Align2::RIGHT_CENTER.anchor_rect(rect)` already
+                    // positions the result so its right-center sits at
+                    // `rect.min`; passing `left_anchor` directly puts
+                    // the label's right edge just left of the node.
                     let left_anchor = pos - egui::vec2(r + 4.0, 0.0);
                     egui::Align2::RIGHT_CENTER.anchor_rect(
-                        egui::Rect::from_min_size(
-                            left_anchor - egui::vec2(galley.size().x, 0.0),
-                            galley.size(),
-                        ),
+                        egui::Rect::from_min_size(left_anchor, galley.size()),
                     )
                 };
                 painter.rect_filled(
