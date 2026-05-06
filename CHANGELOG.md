@@ -4,7 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-## 0.12.2 — 2026-05-07
+## 0.13.0 — 2026-05-07
+
+- **Bump `triblespace` 0.36 → 0.37.** Aligns the CLI faculties
+  + shared lib with the same triblespace release that GORBIE
+  0.13 ships against — no more split between binaries on 0.36
+  and the optional widgets stack pulling 0.37 transitively.
+  Pre-1.0 minor bump, breaking for downstreams that pin
+  `faculties = "0.12"`. (Bundles the v0.12.2 changes, which
+  are not separately published.)
+
+## 0.12.2 — 2026-05-07 (unpublished)
 
 - **Bump optional `GORBIE` dep 0.12 → 0.13.** Picks up the
   GORBIE 0.13.x line: stacked floats no longer drag in
