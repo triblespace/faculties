@@ -63,10 +63,12 @@ trible team show --pile shared.pile --cap "$TRIBLE_TEAM_CAP" \
   --verify "$TRIBLE_TEAM_ROOT"
 # → ✓ VERIFIED  ←  matches what the relay would report at OP_AUTH
 
-# 7. Connect to the relay (founder) and sync.
+# 7. Connect to the relay (founder) and sync. The gossip mesh
+#    is identified by the team root pubkey (no separate topic
+#    flag) — once `TRIBLE_TEAM_ROOT` is set, both peers join
+#    the same mesh automatically.
 trible pile net sync ./local.pile \
   --peers <founder-iroh-node-id> \
-  --topic our-team-graph \
   --key node.key
 ```
 
@@ -86,10 +88,11 @@ trible pile net sync ./local.pile \
     at `OP_AUTH` time. `team show --verify` runs the same
     `verify_chain` locally so you see the result without
     needing to debug a network round-trip.
-  - *--topic on sync*: the gossip mesh is per-topic. The
-    invitee and founder must use the SAME topic name or they're
-    on different meshes and won't see each other's HEAD
-    announcements.
+  - *gossip mesh = team root*: the gossip mesh is identified by
+    the team root pubkey directly. One identifier per team
+    handles both auth (cap chain verification) and rendezvous
+    (gossip topic) — there's no way to "join the right team but
+    the wrong gossip channel" because they're the same channel.
 
 == Revoking a teammate
 
