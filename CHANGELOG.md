@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.13.1 — 2026-05-07
+
+- **CI-only fix.** v0.13.0's release workflow died on every job
+  with `wasm32-unknown-unknown target may not be installed`:
+  triblespace 0.37 pulls `wasmi 0.31`, whose build script
+  invokes rustc against `wasm32-unknown-unknown`. The workflow's
+  rust-toolchain step only installed the per-target host
+  triple. Fix:
+  - add `wasm32-unknown-unknown` to the toolchain install,
+  - swap `cross` for native arm64 Linux (GitHub now provides
+    `ubuntu-24.04-arm` runners for free public repos), so the
+    aarch64-linux job can install the wasm32 target via
+    rustup like every other job.
+  Lib source identical to v0.13.0; not republished to
+  crates.io.
+
 ## 0.13.0 — 2026-05-07
 
 - **Bump `triblespace` 0.36 → 0.37.** Aligns the CLI faculties
