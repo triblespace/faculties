@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.13.2 — 2026-05-07
+
+- **CI-only fix.** v0.13.1's release workflow built past the
+  wasm32 issue but tripped on `RUSTFLAGS: -D warnings` —
+  pre-existing unused-import noise in the rust-script-ported
+  bins (e.g. `src/bin/triage.rs::use std::fs;`) escalated to
+  errors. Drop the deny; the release workflow's job is to ship
+  working binaries, not enforce lint. A separate lint workflow
+  can come back if/when we want to gate that on PRs.
+  Lib source identical to v0.13.0.
+
 ## 0.13.1 — 2026-05-07
 
 - **CI-only fix.** v0.13.0's release workflow died on every job
