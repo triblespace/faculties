@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.14.0 — 2026-05-07
+
+- **Bump `triblespace` 0.37 → 0.38, `GORBIE` 0.13 → 0.13.2.**
+  Picks up the team-rooted-gossip release: the gossip mesh id
+  is now derived directly from the team root pubkey, so users
+  no longer pick + coordinate a separate `--topic` string with
+  invitees. Bootstrap fragment 16 (auth setup recipe) updated
+  in lock-step in a previous commit.
+  Minor bump (pre-1.0 but breaking for downstreams pinning
+  `faculties = "0.13"`) because the upstream change in
+  `triblespace::net::peer::PeerConfig` re-exports through
+  `faculties::widgets::storage` and the `--topic` flag removal
+  is a user-facing change in the bundled `trible` CLI.
+
 ## 0.13.3 — 2026-05-07
 
 - **README: fix stale `wiki create` example.** The CLI moved
