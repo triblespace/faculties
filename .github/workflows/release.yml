@@ -48,6 +48,17 @@ jobs:
         # workflow if/when we want to enforce.
         run: cargo build --release --bins --target ${{ matrix.target }}
 
+      - name: Build bundled trible CLI
+        # Ship the `trible` CLI alongside the faculty bins so users
+        # who grab a tarball get the whole pile-management toolkit
+        # in one drop. Pulled from crates.io (latest) and built for
+        # the matrix target via `cargo install`.
+        run: |
+          cargo install trible \
+            --target ${{ matrix.target }} \
+            --root "$RUNNER_TEMP/trible-staged" \
+            --locked
+
       - name: Stage binaries
         run: |
           set -eu
@@ -65,6 +76,8 @@ jobs:
             esac
             cp "$bin" "$stage/"
           done
+          # Bundled trible CLI from the previous step.
+          cp "$RUNNER_TEMP/trible-staged/bin/trible" "$stage/"
           tar -czf "$stage.tar.gz" "$stage"
           shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
           echo "STAGE_TARBALL=$stage.tar.gz" >> "$GITHUB_ENV"

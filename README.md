@@ -58,7 +58,7 @@ touch ./self.pile
 export PILE=./self.pile
 
 compass add "ship the demo" --status doing
-wiki create --title "Hello" --body "First *typst* fragment."
+wiki create "Hello" "First *typst* fragment."
 faculties-viewer               # picks up PILE from the environment
 ```
 

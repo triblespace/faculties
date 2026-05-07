@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.13.3 — 2026-05-07
+
+- **README: fix stale `wiki create` example.** The CLI moved
+  to positional `<TITLE> <CONTENT>` arguments; the README still
+  showed the old `--title`/`--body` flag form. Other examples
+  already match the current syntax.
+- **Bundle the `trible` CLI in release tarballs.** Each
+  per-target tarball now ships `trible` alongside the faculty
+  bins (`compass`, `wiki`, `files`, …), so a single download
+  delivers the whole pile-management toolkit. The release
+  workflow `cargo install trible`s the latest crates.io
+  version for the matrix target and copies the binary into
+  the staging dir.
+
 ## 0.13.2 — 2026-05-07
 
 - **CI-only fix.** v0.13.1's release workflow built past the
