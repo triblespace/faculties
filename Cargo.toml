@@ -53,11 +53,13 @@ comemo = "0.5.1"            # wiki
 dirs = "5"                  # wiki
 hex = "0.4"                 # gauge
 humantime = "2.3.0"         # orient, patience
+ical = "0.11"               # planner
 itertools = "0.14"          # wiki
 libc = "0.2"                # teams
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }  # discord, files, teams, web
+rrule = "0.14"              # planner
 scraper = "0.23"            # archive
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
 serde_json = "1"            # archive, discord, teams, triage, web

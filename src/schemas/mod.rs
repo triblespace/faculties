@@ -10,6 +10,7 @@ pub mod local_messages;
 pub mod memory;
 pub mod orient;
 pub mod patience;
+pub mod planner;
 pub mod reason;
 pub mod relations;
 pub mod teams;
