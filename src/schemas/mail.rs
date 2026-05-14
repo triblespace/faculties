@@ -41,6 +41,18 @@ pub const KIND_MESSAGE: Id = id_hex!("4426CEA53841F34E8D3C0913818F340F");
 /// `--spam` or `--all` to surface them.
 pub const KIND_SPAM: Id = id_hex!("809C2F66A336C6D61140ABEFFA49513C");
 
+/// Tag marker for outbound messages that haven't been transmitted
+/// yet. `mail draft` mints a KIND_DRAFT entity with all the
+/// normal `mail::*` attributes (subject, body, to, cc, bcc); a
+/// successful `mail send` adds the KIND_MESSAGE tag and the
+/// send-time facts (`sent_at`, `raw`) without dropping
+/// KIND_DRAFT — so the history "this used to be a draft, then
+/// sent at X" is preserved.
+///
+/// Send is gated on a linked `decide::KIND_DECISION` (via
+/// `decide::about: <draft-id>`) being resolved.
+pub const KIND_DRAFT: Id = id_hex!("C6A2C78ADD94CBEC207072FD3931017D");
+
 /// Message attributes — one per RFC 5322 header field we care
 /// about, plus the original raw bytes for round-trip fidelity.
 pub mod mail {

@@ -21,9 +21,12 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
+use faculties::schemas::decide::{
+    KIND_DECISION, decide as decide_attrs,
+};
 use faculties::schemas::files::{file, KIND_FILE};
 use faculties::schemas::local_messages::{local as read_attrs, KIND_READ_ID};
-use faculties::schemas::mail::{mail, KIND_MESSAGE, KIND_SPAM};
+use faculties::schemas::mail::{mail, KIND_DRAFT, KIND_MESSAGE, KIND_SPAM};
 use faculties::schemas::relations::{relations as rel_attrs, KIND_PERSON_ID};
 use hifitime::Epoch;
 use lettre::message::{Mailbox, header};
@@ -62,6 +65,9 @@ struct Cli {
     /// Branch name for relations (auto-registered senders)
     #[arg(long, default_value = "relations")]
     relations_branch: String,
+    /// Branch name for decide (deliberation gate for outbound mail)
+    #[arg(long, default_value = "decide")]
+    decide_branch: String,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -73,8 +79,11 @@ enum Command {
     /// branch, then the server-side message is deleted (atomically
     /// on QUIT — if anything fails before then, nothing is deleted).
     Fetch,
-    /// Send a new email. Body may be `@path` or `@-` for stdin.
-    Send {
+    /// Compose a new email as a draft. Does NOT transmit; mints a
+    /// linked `decide` decision that must be resolved before
+    /// `mail send` will transmit. Prints both the draft id and the
+    /// decision id (use the latter with `decide pro/con/resolve`).
+    Draft {
         /// Comma-separated TO recipients.
         to: String,
         /// Subject line.
@@ -86,8 +95,9 @@ enum Command {
         #[arg(long)]
         bcc: Vec<String>,
     },
-    /// Reply to a message. Auto-fills In-Reply-To and References from
-    /// the parent's headers.
+    /// Compose a reply as a draft. Pre-fills In-Reply-To and
+    /// References from the parent's headers; rest of the flow
+    /// (decide pros/cons/resolve, then mail send) is the same.
     Reply {
         /// Full 32-char hex entity id of the message to reply to
         /// (use `mail show` to find one).
@@ -95,6 +105,25 @@ enum Command {
         /// Reply body. `@path` for file, `@-` for stdin.
         body: String,
     },
+    /// Transmit a drafted message. Refuses unless the draft's
+    /// linked decision is resolved (and the resolution is newer
+    /// than the most recent draft body change).
+    Send {
+        /// Full 32-char hex draft id.
+        draft: String,
+    },
+    /// Discard a draft — resolves the linked decision with
+    /// outcome="discard". Subject to the same deliberation gate as
+    /// any other resolve; pass `--force` to skip pros/cons.
+    Discard {
+        /// Full 32-char hex draft id.
+        draft: String,
+        /// Bypass the ≥1 pro AND ≥1 con check on the linked decision.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List pending drafts (KIND_DRAFT entities not yet sent).
+    Outbox,
     /// List messages overlapping the given window.
     List {
         /// Window start (ISO 8601 date or datetime).
@@ -775,6 +804,12 @@ fn cmd_fetch(
 
 /// Decompose one parsed message + its attachments into tribles and
 /// commit them across the three branches (relations, files, mail).
+/// Persist a parsed message into the pile. With `as_draft = false`,
+/// the entity is tagged `KIND_MESSAGE` (used by `mail fetch` for
+/// inbound, and by `mark_sent` after SMTP for outbound). With
+/// `as_draft = true`, it's tagged `KIND_DRAFT` only — the
+/// `mail::raw` / `mail::sent_at` attrs are skipped (those become
+/// known at send time).
 fn ingest_message(
     repo: &mut Repository<Pile<valueschemas::Blake3>>,
     mail_branch_id: Id,
@@ -782,6 +817,18 @@ fn ingest_message(
     relations_branch_id: Id,
     parsed: ParsedMail,
 ) -> Result<()> {
+    persist_message(repo, mail_branch_id, files_branch_id, relations_branch_id, parsed, false)
+        .map(|_| ())
+}
+
+fn persist_message(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    mail_branch_id: Id,
+    files_branch_id: Id,
+    relations_branch_id: Id,
+    parsed: ParsedMail,
+    as_draft: bool,
+) -> Result<Id> {
     // 1. relations branch: auto-register any new addresses.
     let mut from_id: Option<Id> = None;
     let mut to_ids: Vec<Id> = Vec::new();
@@ -867,12 +914,9 @@ fn ingest_message(
 
         let entity_id = entity_id_for_message(&parsed.message_id);
         let now = instant_interval(now_epoch());
-        let sent_at_iv = instant_interval(parsed.sent_at);
         let subject_handle: TextHandle = ws.put(parsed.subject.clone());
         let body_handle: TextHandle = ws.put(parsed.body.clone());
         let message_id_handle: TextHandle = ws.put(parsed.message_id.clone());
-        let raw_blob: Blob<blobschemas::FileBytes> = parsed.raw.clone().to_blob();
-        let raw_handle: FileHandle = ws.put(raw_blob);
 
         let in_reply_ids: Vec<Id> = parsed
             .in_reply_to
@@ -885,14 +929,13 @@ fn ingest_message(
             .map(|m| entity_id_for_message(m))
             .collect();
 
+        let kind = if as_draft { KIND_DRAFT } else { KIND_MESSAGE };
         change += entity! { ExclusiveId::force_ref(&entity_id) @
-            metadata::tag: &KIND_MESSAGE,
+            metadata::tag: &kind,
             metadata::created_at: now,
             mail::subject: subject_handle,
             mail::body: body_handle,
             mail::message_id: message_id_handle,
-            mail::sent_at: sent_at_iv,
-            mail::raw: raw_handle,
             mail::from?: from_id.as_ref(),
             mail::to*: to_ids.iter(),
             mail::cc*: cc_ids.iter(),
@@ -901,18 +944,87 @@ fn ingest_message(
             mail::references*: reference_ids.iter(),
             mail::attachment*: attachment_ids.iter(),
         };
+        // sent_at + raw only apply once the message is actually
+        // transmitted (or received from elsewhere). Drafts skip
+        // both — they get added by `mark_sent` after SMTP.
+        if !as_draft {
+            let sent_at_iv = instant_interval(parsed.sent_at);
+            let raw_blob: Blob<blobschemas::FileBytes> = parsed.raw.clone().to_blob();
+            let raw_handle: FileHandle = ws.put(raw_blob);
+            change += entity! { ExclusiveId::force_ref(&entity_id) @
+                mail::sent_at: sent_at_iv,
+                mail::raw: raw_handle,
+            };
+        }
         if parsed.is_spam {
             change += entity! { ExclusiveId::force_ref(&entity_id) @
                 metadata::tag: &KIND_SPAM,
             };
         }
 
-        ws.commit(change, "mail: ingest message");
+        ws.commit(
+            change,
+            if as_draft { "mail: draft" } else { "mail: ingest message" },
+        );
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push mail: {e:?}"))?;
-    }
 
+        return Ok(entity_id);
+    }
+}
+
+/// Append the send-time facts (KIND_MESSAGE tag + sent_at + raw)
+/// to an existing draft entity. The draft entity id stays the
+/// same; this is just additional facts about it.
+fn mark_sent(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    mail_branch_id: Id,
+    draft_id: Id,
+    raw_bytes: Vec<u8>,
+    sent_at: Epoch,
+) -> Result<()> {
+    let mut ws = repo
+        .pull(mail_branch_id)
+        .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+    let raw_blob: Blob<blobschemas::FileBytes> = raw_bytes.to_blob();
+    let raw_handle: FileHandle = ws.put(raw_blob);
+    let sent_iv = instant_interval(sent_at);
+    let change = entity! { ExclusiveId::force_ref(&draft_id) @
+        metadata::tag: &KIND_MESSAGE,
+        mail::sent_at: sent_iv,
+        mail::raw: raw_handle,
+    };
+    ws.commit(change, "mail: mark sent");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push mark-sent: {e:?}"))?;
     Ok(())
+}
+
+/// Mint a decision in the decide branch linked to the given draft
+/// via `decide::about`. Returns the decision's entity id.
+fn mint_linked_decision(
+    repo: &mut Repository<Pile<valueschemas::Blake3>>,
+    decide_branch_id: Id,
+    draft_id: Id,
+    title: String,
+) -> Result<Id> {
+    let mut ws = repo
+        .pull(decide_branch_id)
+        .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
+    let decision_id = ufoid();
+    let decision_ref = decision_id.id;
+    let now = instant_interval(now_epoch());
+    let title_handle: TextHandle = ws.put(title);
+    let change = entity! { &decision_id @
+        metadata::tag: &KIND_DECISION,
+        metadata::created_at: now,
+        metadata::name: title_handle,
+        decide_attrs::about: &draft_id,
+    };
+    ws.commit(change, "mail: mint linked decision");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow::anyhow!("push decide: {e:?}"))?;
+    Ok(decision_ref)
 }
 
 // ── send / reply ──────────────────────────────────────────────────────────
@@ -922,11 +1034,15 @@ fn synthesize_message_id(local_part_seed: &str) -> String {
     format!("<{}-toby@trible.space>", hex::encode(&hash.as_bytes()[..12]))
 }
 
-fn cmd_send(
+/// Compose a draft: persists the draft entity in the pile (no
+/// SMTP), mints a linked decision in the decide branch, prints
+/// both ids. Sending requires resolving the decision first.
+fn cmd_draft(
     pile: &Path,
     mail_branch_id: Id,
     files_branch_id: Id,
     relations_branch_id: Id,
+    decide_branch_id: Id,
     to: String,
     subject: String,
     body: String,
@@ -956,40 +1072,10 @@ fn cmd_send(
     let now = now_epoch();
     let seed = format!("{}:{}:{}", config.user, subject, now.to_tai_seconds());
     let message_id = synthesize_message_id(&seed);
+    let bare_id = message_id.trim_matches(|c| c == '<' || c == '>').to_string();
 
-    let from_mb: Mailbox = format!("{} <{}>", config.from_name, config.user)
-        .parse()
-        .context("parse from address")?;
-    let mut builder = Message::builder()
-        .from(from_mb.clone())
-        .message_id(Some(message_id.clone()))
-        .subject(subject.clone())
-        .date(std::time::SystemTime::now());
-
-    for addr in &to_addrs {
-        let mb: Mailbox = format_address_for_lettre(addr)?.parse().context("to mailbox")?;
-        builder = builder.to(mb);
-    }
-    for addr in &cc_addrs {
-        let mb: Mailbox = format_address_for_lettre(addr)?.parse().context("cc mailbox")?;
-        builder = builder.cc(mb);
-    }
-    for addr in &bcc_addrs {
-        let mb: Mailbox = format_address_for_lettre(addr)?.parse().context("bcc mailbox")?;
-        builder = builder.bcc(mb);
-    }
-
-    let message = builder
-        .header(header::ContentType::TEXT_PLAIN)
-        .body(body_text.clone())
-        .context("build message")?;
-
-    send_via_smtp(&config, &message)?;
-    let raw_bytes = message.formatted();
-
-    // Persist the sent message to the pile.
     let parsed = ParsedMail {
-        message_id: message_id.trim_matches(|c| c == '<' || c == '>').to_string(),
+        message_id: bare_id.clone(),
         from: Some(Address {
             name: Some(config.from_name.clone()),
             email: config.user.clone(),
@@ -997,20 +1083,34 @@ fn cmd_send(
         to: to_addrs,
         cc: cc_addrs,
         bcc: bcc_addrs,
-        subject,
+        subject: subject.clone(),
         body: body_text,
-        sent_at: now,
+        sent_at: now, // ignored by persist_message when as_draft=true
         in_reply_to: Vec::new(),
         references: Vec::new(),
         is_spam: false,
-        raw: raw_bytes,
+        raw: Vec::new(), // ignored by persist_message when as_draft=true
         attachments: Vec::new(),
     };
-    with_repo(pile, |repo| {
-        ingest_message(repo, mail_branch_id, files_branch_id, relations_branch_id, parsed)
+    let (draft_id, decision_id) = with_repo(pile, |repo| {
+        let draft_id = persist_message(
+            repo,
+            mail_branch_id,
+            files_branch_id,
+            relations_branch_id,
+            parsed,
+            true,
+        )?;
+        let decision_id = mint_linked_decision(
+            repo,
+            decide_branch_id,
+            draft_id,
+            format!("Send: {}", subject),
+        )?;
+        Ok((draft_id, decision_id))
     })?;
-
-    println!("Sent {}", message_id);
+    println!("Drafted {}", fmt_id(draft_id));
+    println!("Decision {} (deliberate with `decide pro/con/resolve`)", fmt_id(decision_id));
     Ok(())
 }
 
@@ -1039,6 +1139,7 @@ fn cmd_reply(
     mail_branch_id: Id,
     files_branch_id: Id,
     relations_branch_id: Id,
+    decide_branch_id: Id,
     parent_hex: String,
     body: String,
 ) -> Result<()> {
@@ -1130,36 +1231,11 @@ fn cmd_reply(
         now_epoch().to_tai_seconds()
     );
     let new_message_id = synthesize_message_id(&seed);
-    let new_references = {
-        let mut v = parent_references.clone();
-        v.push(parent_msg_id.clone());
-        v.iter().map(|s| format!("<{}>", s)).collect::<Vec<_>>().join(" ")
-    };
-    let in_reply_to = format!("<{}>", parent_msg_id);
-
-    let from_mb: Mailbox = format!("{} <{}>", config.from_name, config.user)
-        .parse()
-        .context("parse from address")?;
-    let to_mb: Mailbox = reply_to.parse().context("parse reply-to mailbox")?;
-
-    let message = Message::builder()
-        .from(from_mb)
-        .to(to_mb)
-        .message_id(Some(new_message_id.clone()))
-        .subject(reply_subject.clone())
-        .in_reply_to(in_reply_to.clone())
-        .references(new_references.clone())
-        .date(std::time::SystemTime::now())
-        .header(header::ContentType::TEXT_PLAIN)
-        .body(body_text.clone())
-        .context("build reply")?;
-
-    send_via_smtp(&config, &message)?;
-    let raw_bytes = message.formatted();
+    let bare_new_id = new_message_id.trim_matches(|c| c == '<' || c == '>').to_string();
 
     let now = now_epoch();
     let parsed = ParsedMail {
-        message_id: new_message_id.trim_matches(|c| c == '<' || c == '>').to_string(),
+        message_id: bare_new_id.clone(),
         from: Some(Address {
             name: Some(config.from_name.clone()),
             email: config.user.clone(),
@@ -1170,21 +1246,438 @@ fn cmd_reply(
         }],
         cc: Vec::new(),
         bcc: Vec::new(),
-        subject: reply_subject,
+        subject: reply_subject.clone(),
         body: body_text,
-        sent_at: now,
+        sent_at: now, // ignored when as_draft=true
         in_reply_to: vec![parent_msg_id.clone()],
         references: parent_references,
         is_spam: false,
-        raw: raw_bytes,
+        raw: Vec::new(),
         attachments: Vec::new(),
     };
-    with_repo(pile, |repo| {
-        ingest_message(repo, mail_branch_id, files_branch_id, relations_branch_id, parsed)
+    let (draft_id, decision_id) = with_repo(pile, |repo| {
+        let draft_id = persist_message(
+            repo,
+            mail_branch_id,
+            files_branch_id,
+            relations_branch_id,
+            parsed,
+            true,
+        )?;
+        let decision_id = mint_linked_decision(
+            repo,
+            decide_branch_id,
+            draft_id,
+            format!("Reply: {}", reply_subject),
+        )?;
+        Ok((draft_id, decision_id))
+    })?;
+    println!("Drafted reply {} (parent {})", fmt_id(draft_id), parent_msg_id);
+    println!("Decision {} (deliberate with `decide pro/con/resolve`)", fmt_id(decision_id));
+    Ok(())
+}
+
+// ── send draft / discard / outbox ─────────────────────────────────────────
+
+/// Look up the decide-branch decision linked to a given draft via
+/// `decide::about: <draft-id>`.
+fn find_linked_decision(decide_space: &TribleSet, draft_id: Id) -> Option<Id> {
+    find!(
+        d: Id,
+        pattern!(decide_space, [{
+            ?d @
+                metadata::tag: (KIND_DECISION),
+                decide_attrs::about: (draft_id),
+        }])
+    )
+    .next()
+}
+
+/// True iff the decision has both finished_at AND a non-empty outcome.
+fn decision_is_resolved(
+    ws: &mut Workspace<Pile<valueschemas::Blake3>>,
+    space: &TribleSet,
+    decision_id: Id,
+) -> bool {
+    let has_finished_at = find!(
+        f: IntervalValue,
+        pattern!(space, [{ decision_id @ metadata::finished_at: ?f }])
+    )
+    .next()
+    .is_some();
+    let has_outcome = find!(
+        o: TextHandle,
+        pattern!(space, [{ decision_id @ decide_attrs::outcome: ?o }])
+    )
+    .next()
+    .and_then(|h| read_text(ws, h))
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false);
+    has_finished_at && has_outcome
+}
+
+fn cmd_send(
+    pile: &Path,
+    mail_branch_id: Id,
+    relations_branch_id: Id,
+    decide_branch_id: Id,
+    draft_hex: String,
+) -> Result<()> {
+    let draft_id = parse_full_id(&draft_hex)?;
+    let config = load_config()?;
+
+    // 1. Resolve the linked decision and check it's resolved.
+    let decision_outcome = with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(decide_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
+        let decision_id = find_linked_decision(&space, draft_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no decision linked to draft {} — has it already been sent, or was \
+                 the decide branch tampered with?",
+                fmt_id(draft_id)
+            )
+        })?;
+        if !decision_is_resolved(&mut ws, &space, decision_id) {
+            bail!(
+                "draft {}'s linked decision {} is not resolved yet. \
+                 Add pros and cons via `decide pro/con {}` and then \
+                 `decide resolve {} <outcome>` before sending.",
+                fmt_id(draft_id),
+                fmt_id(decision_id),
+                fmt_id(decision_id),
+                fmt_id(decision_id),
+            );
+        }
+        let outcome_h: Option<TextHandle> = find!(
+            o: TextHandle,
+            pattern!(&space, [{ decision_id @ decide_attrs::outcome: ?o }])
+        )
+        .next();
+        let outcome = outcome_h.and_then(|h| read_text(&mut ws, h)).unwrap_or_default();
+        Ok(outcome)
     })?;
 
-    println!("Replied to {} (new id {})", parent_msg_id, new_message_id);
+    // 2. Pull draft attrs from the mail branch.
+    struct DraftAttrs {
+        message_id: String,
+        subject: String,
+        body: String,
+        to_emails: Vec<String>,
+        cc_emails: Vec<String>,
+        bcc_emails: Vec<String>,
+        in_reply_to_strings: Vec<String>,
+        references_strings: Vec<String>,
+    }
+
+    let attrs: DraftAttrs = with_repo(pile, |repo| {
+        let mut mws = repo
+            .pull(mail_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout mail: {e:?}"))?;
+        let mut rws = repo
+            .pull(relations_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+
+        let already_sent = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
+            .any(|t| t == KIND_MESSAGE);
+        if already_sent {
+            bail!("draft {} has already been sent", fmt_id(draft_id));
+        }
+
+        let is_draft = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
+            .any(|t| t == KIND_DRAFT);
+        if !is_draft {
+            bail!("no draft entity with id {}", fmt_id(draft_id));
+        }
+
+        let message_id = find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::message_id: ?h }]))
+            .next()
+            .and_then(|h| read_text(&mut mws, h))
+            .ok_or_else(|| anyhow::anyhow!("draft missing message_id"))?;
+        let subject = find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::subject: ?h }]))
+            .next()
+            .and_then(|h| read_text(&mut mws, h))
+            .unwrap_or_default();
+        let body = find!(h: TextHandle, pattern!(&mail_space, [{ draft_id @ mail::body: ?h }]))
+            .next()
+            .and_then(|h| read_text(&mut mws, h))
+            .unwrap_or_default();
+
+        let resolve_emails = |ids: Vec<Id>| -> Vec<String> {
+            ids.into_iter()
+                .filter_map(|rid| {
+                    find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
+                })
+                .collect()
+        };
+        let to_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::to: ?r }])).collect();
+        let cc_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::cc: ?r }])).collect();
+        let bcc_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::bcc: ?r }])).collect();
+
+        let to_emails = resolve_emails(to_ids);
+        let cc_emails = resolve_emails(cc_ids);
+        let bcc_emails = resolve_emails(bcc_ids);
+        if to_emails.is_empty() {
+            bail!("draft has no resolvable TO recipients");
+        }
+
+        // Look up message_id strings for in_reply_to / references entities.
+        let irt_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::in_reply_to: ?r }])).collect();
+        let ref_ids: Vec<Id> = find!(r: Id, pattern!(&mail_space, [{ draft_id @ mail::references: ?r }])).collect();
+        let mut resolve_msg_ids = |ids: Vec<Id>| -> Vec<String> {
+            ids.into_iter()
+                .filter_map(|mid| {
+                    find!(h: TextHandle, pattern!(&mail_space, [{ mid @ mail::message_id: ?h }]))
+                        .next()
+                        .and_then(|h| read_text(&mut mws, h))
+                })
+                .collect()
+        };
+        let in_reply_to_strings = resolve_msg_ids(irt_ids);
+        let references_strings = resolve_msg_ids(ref_ids);
+
+        Ok(DraftAttrs {
+            message_id,
+            subject,
+            body,
+            to_emails,
+            cc_emails,
+            bcc_emails,
+            in_reply_to_strings,
+            references_strings,
+        })
+    })?;
+
+    // 3. Build RFC 5322 message and transmit.
+    let from_mb: Mailbox = format!("{} <{}>", config.from_name, config.user)
+        .parse()
+        .context("parse from address")?;
+    let mut builder = Message::builder()
+        .from(from_mb)
+        .message_id(Some(format!("<{}>", attrs.message_id)))
+        .subject(attrs.subject.clone())
+        .date(std::time::SystemTime::now());
+    for em in &attrs.to_emails {
+        let mb: Mailbox = em.parse().with_context(|| format!("parse to {em}"))?;
+        builder = builder.to(mb);
+    }
+    for em in &attrs.cc_emails {
+        let mb: Mailbox = em.parse().with_context(|| format!("parse cc {em}"))?;
+        builder = builder.cc(mb);
+    }
+    for em in &attrs.bcc_emails {
+        let mb: Mailbox = em.parse().with_context(|| format!("parse bcc {em}"))?;
+        builder = builder.bcc(mb);
+    }
+    if !attrs.in_reply_to_strings.is_empty() {
+        builder = builder.in_reply_to(
+            attrs
+                .in_reply_to_strings
+                .iter()
+                .map(|s| format!("<{}>", s))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    if !attrs.references_strings.is_empty() {
+        builder = builder.references(
+            attrs
+                .references_strings
+                .iter()
+                .map(|s| format!("<{}>", s))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    let message = builder
+        .header(header::ContentType::TEXT_PLAIN)
+        .body(attrs.body.clone())
+        .context("build message")?;
+
+    send_via_smtp(&config, &message)?;
+    let raw_bytes = message.formatted();
+
+    // 4. Append send-time facts to the draft entity.
+    let now = now_epoch();
+    with_repo(pile, |repo| {
+        mark_sent(repo, mail_branch_id, draft_id, raw_bytes, now)
+    })?;
+
+    println!(
+        "Sent draft {} (outcome was: {})",
+        fmt_id(draft_id),
+        decision_outcome.lines().next().unwrap_or("").trim()
+    );
     Ok(())
+}
+
+fn cmd_discard(
+    pile: &Path,
+    mail_branch_id: Id,
+    decide_branch_id: Id,
+    draft_hex: String,
+    force: bool,
+) -> Result<()> {
+    let draft_id = parse_full_id(&draft_hex)?;
+    with_repo(pile, |repo| {
+        // Verify the draft exists and is still a draft (not already sent).
+        let mut mws = repo
+            .pull(mail_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let is_draft = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
+            .any(|t| t == KIND_DRAFT);
+        if !is_draft {
+            bail!("no draft with id {}", fmt_id(draft_id));
+        }
+        let already_sent = find!(t: Id, pattern!(&mail_space, [{ draft_id @ metadata::tag: ?t }]))
+            .any(|t| t == KIND_MESSAGE);
+        if already_sent {
+            bail!("draft {} has already been sent — can't discard a sent message", fmt_id(draft_id));
+        }
+        drop(mws);
+
+        // Resolve the linked decision with outcome="discard".
+        let mut dws = repo
+            .pull(decide_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
+        let space = dws.checkout(..).map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
+        let decision_id = find_linked_decision(&space, draft_id).ok_or_else(|| {
+            anyhow::anyhow!("no linked decision for draft {}", fmt_id(draft_id))
+        })?;
+        if decision_is_resolved(&mut dws, &space, decision_id) {
+            bail!("linked decision {} already resolved", fmt_id(decision_id));
+        }
+
+        if !force {
+            let pros = find!(
+                p: Id,
+                pattern!(&space, [{
+                    ?p @ metadata::tag: (faculties::schemas::decide::KIND_PRO),
+                    faculties::schemas::decide::factor::about_decision: (decision_id),
+                }])
+            )
+            .count();
+            let cons = find!(
+                c: Id,
+                pattern!(&space, [{
+                    ?c @ metadata::tag: (faculties::schemas::decide::KIND_CON),
+                    faculties::schemas::decide::factor::about_decision: (decision_id),
+                }])
+            )
+            .count();
+            if pros == 0 || cons == 0 {
+                bail!(
+                    "cannot discard without deliberation: need ≥1 pro AND ≥1 con on \
+                     decision {} (have {pros} pro, {cons} con). Add factors with \
+                     `decide pro/con {}`, or pass --force if this genuinely doesn't \
+                     merit deliberation.",
+                    fmt_id(decision_id),
+                    fmt_id(decision_id),
+                );
+            }
+        }
+
+        let outcome_text = "discard".to_string();
+        let outcome_handle: TextHandle = dws.put(outcome_text);
+        let now = instant_interval(now_epoch());
+        let change = entity! { ExclusiveId::force_ref(&decision_id) @
+            metadata::finished_at: now,
+            decide_attrs::outcome: outcome_handle,
+        };
+        dws.commit(change, "mail: discard draft");
+        repo.push(&mut dws)
+            .map_err(|e| anyhow::anyhow!("push decide: {e:?}"))?;
+        Ok(())
+    })?;
+    println!("Discarded draft {}", fmt_id(draft_id));
+    Ok(())
+}
+
+fn cmd_outbox(
+    pile: &Path,
+    mail_branch_id: Id,
+    relations_branch_id: Id,
+    decide_branch_id: Id,
+) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut mws = repo
+            .pull(mail_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut rws = repo
+            .pull(relations_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+        let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let mut dws = repo
+            .pull(decide_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull decide: {e:?}"))?;
+        let decide_space = dws.checkout(..).map_err(|e| anyhow::anyhow!("checkout decide: {e:?}"))?;
+
+        // Drafts not yet sent: KIND_DRAFT tag, NOT KIND_MESSAGE.
+        let drafts: Vec<Id> = find!(
+            d: Id,
+            pattern!(&mail_space, [{ ?d @ metadata::tag: (KIND_DRAFT) }])
+        )
+        .filter(|d| {
+            !find!(t: Id, pattern!(&mail_space, [{ d @ metadata::tag: ?t }]))
+                .any(|t| t == KIND_MESSAGE)
+        })
+        .collect();
+
+        if drafts.is_empty() {
+            println!("(no pending drafts)");
+            return Ok(());
+        }
+
+        for did in drafts {
+            let subject = find!(h: TextHandle, pattern!(&mail_space, [{ did @ mail::subject: ?h }]))
+                .next()
+                .and_then(|h| read_text(&mut mws, h))
+                .unwrap_or_default();
+            let to_id: Option<Id> = find!(r: Id, pattern!(&mail_space, [{ did @ mail::to: ?r }])).next();
+            let to_email = to_id
+                .and_then(|rid| {
+                    find!(e: String, pattern!(&rel_space, [{ rid @ rel_attrs::email: ?e }])).next()
+                })
+                .unwrap_or_else(|| "?".into());
+            let created = find!(c: IntervalValue, pattern!(&mail_space, [{ did @ metadata::created_at: ?c }]))
+                .next()
+                .map(|iv| unpack_interval(iv).0);
+            let created_str = created
+                .map(|e| epoch_to_chrono_utc(e).format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "?".into());
+
+            let decision_id = find_linked_decision(&decide_space, did);
+            let decision_status = match decision_id {
+                None => "no decision".to_string(),
+                Some(decid) if decision_is_resolved(&mut dws, &decide_space, decid) => {
+                    let outcome = find!(
+                        h: TextHandle,
+                        pattern!(&decide_space, [{ decid @ decide_attrs::outcome: ?h }])
+                    )
+                    .next()
+                    .and_then(|h| read_text(&mut dws, h))
+                    .unwrap_or_default();
+                    let first = outcome.lines().next().unwrap_or("").trim();
+                    format!("resolved → {}", truncate_for_display(first, 60))
+                }
+                Some(decid) => format!("undecided ({})", fmt_id(decid)),
+            };
+            println!(
+                "  {} {} {:30} {}\n    decision: {}",
+                &fmt_id(did)[..8],
+                created_str,
+                truncate_for_display(&to_email, 30),
+                subject,
+                decision_status,
+            );
+        }
+        Ok(())
+    })
 }
 
 // ── queries ───────────────────────────────────────────────────────────────
@@ -1708,13 +2201,20 @@ fn cmd_resolve(pile: &Path, mail_branch_id: Id, prefix: String) -> Result<()> {
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
         let space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let mut matches = Vec::new();
+        let mut matches: HashSet<Id> = HashSet::new();
+        // Resolve over both messages and drafts — they share the
+        // entity-id namespace and the user often wants either.
         for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: (KIND_MESSAGE) }])) {
-            let hex = fmt_id(id);
-            if hex.starts_with(&needle) {
-                matches.push(id);
+            if fmt_id(id).starts_with(&needle) {
+                matches.insert(id);
             }
         }
+        for id in find!(e: Id, pattern!(&space, [{ ?e @ metadata::tag: (KIND_DRAFT) }])) {
+            if fmt_id(id).starts_with(&needle) {
+                matches.insert(id);
+            }
+        }
+        let matches: Vec<Id> = matches.into_iter().collect();
         match matches.len() {
             0 => bail!("no message id starts with '{}'", needle),
             1 => {
@@ -1746,40 +2246,52 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cmd = cli.command.unwrap_or(Command::Today);
 
-    let (mail_branch, files_branch, relations_branch) = with_repo(&cli.pile, |repo| {
+    let (mail_branch, files_branch, relations_branch, decide_branch) = with_repo(&cli.pile, |repo| {
         let m = resolve_branch(repo, &cli.branch)?;
         let f = resolve_branch(repo, &cli.files_branch)?;
         let r = resolve_branch(repo, &cli.relations_branch)?;
-        Ok((m, f, r))
+        let d = resolve_branch(repo, &cli.decide_branch)?;
+        Ok((m, f, r, d))
     })?;
 
     match cmd {
         Command::Fetch => cmd_fetch(&cli.pile, mail_branch, files_branch, relations_branch),
-        Command::Send {
-            to,
-            subject,
-            body,
-            cc,
-            bcc,
-        } => cmd_send(
+        Command::Draft { to, subject, body, cc, bcc } => cmd_draft(
             &cli.pile,
             mail_branch,
             files_branch,
             relations_branch,
+            decide_branch,
             to,
             subject,
             body,
             cc,
             bcc,
+        ),
+        Command::Send { draft } => cmd_send(
+            &cli.pile,
+            mail_branch,
+            relations_branch,
+            decide_branch,
+            draft,
         ),
         Command::Reply { message, body } => cmd_reply(
             &cli.pile,
             mail_branch,
             files_branch,
             relations_branch,
+            decide_branch,
             message,
             body,
         ),
+        Command::Discard { draft, force } => cmd_discard(
+            &cli.pile,
+            mail_branch,
+            decide_branch,
+            draft,
+            force,
+        ),
+        Command::Outbox => cmd_outbox(&cli.pile, mail_branch, relations_branch, decide_branch),
         Command::List { from, to, spam, all, unread } => cmd_list(
             &cli.pile,
             mail_branch,
