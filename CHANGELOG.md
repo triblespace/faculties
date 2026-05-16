@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.14.4 — 2026-05-16
+
+- **Bump `triblespace` 0.40 → 0.41, `GORBIE` 0.14.2 → 0.14.3.**
+  Tracks the iroh-0.98 family upgrade in `triblespace-net
+  0.41.0`, which is the proper upstream resolution for the
+  ed25519-dalek 3.0.0-pre.1 / ed25519 3.0.0 compile failure
+  that 0.14.3 worked around with a Cargo.lock pin in
+  `trible 0.40.3`. Same end-user effect (sandbox-friendly
+  precompiled binaries via the OS trust store), cleaner
+  resolution path — fresh `cargo install trible` now picks a
+  set that compiles end-to-end.
+
+  Source identical to 0.14.3.
+
 ## 0.14.3 — 2026-05-16
 
 - **Pick up `triblespace 0.40.2` + `GORBIE 0.14.2`.** Both
