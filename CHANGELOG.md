@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.14.7 — 2026-05-17
+
+- **Bump `triblespace` 0.41.2 → 0.41.3.** Picks up the
+  trailing-FQDN-dot fix in `triblespace-net`. iroh's default
+  relay hostnames (`*.iroh-canary.iroh.link.` — note the
+  dot) were tripping strict WAFs that treat trailing-dot
+  Host headers as bypass-attempt signatures (Anthropic web
+  sandbox egress being the concrete case). `triblespace-net`
+  now strips the dot before iroh constructs `RelayUrl`s,
+  producing an HTTP-canonical Host header on the wire. Same
+  relays, friendlier request shape.
+
+  Practical effect: the bundled `trible` CLI in this release's
+  precompiled tarballs should now successfully establish iroh
+  relay sessions from inside Anthropic's web sandbox, which
+  unblocks the gossip-mesh + DHT bootstrap path for live sync.
+  Faculties source unchanged.
+
 ## 0.14.6 — 2026-05-17
 
 - **Bump `triblespace` 0.41.1 → 0.41.2.** Picks up the
