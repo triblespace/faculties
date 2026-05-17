@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.14.6 — 2026-05-17
+
+- **Bump `triblespace` 0.41.1 → 0.41.2.** Picks up the
+  StaticAddressLookup work in `triblespace-net`:
+  `pile net sync --peers <EndpointTicket>` now bypasses
+  iroh's discovery on the gossip/DHT bootstrap path, not
+  just on `pile net pull`. Closes the
+  "tickets-work-for-pull-but-not-sync" asymmetry from
+  0.14.5. Faculties source unchanged.
+
+  Practical effect for sandboxed users: the bundled `trible`
+  CLI in this release's precompiled tarballs can now run a
+  full bidirectional gossip sync against a ticketed peer
+  without iroh discovery being reachable — relevant when
+  iroh-canary 503s the discovery probes (claude.ai web
+  sandbox shared-egress IP rate limiting) or DNS is
+  filtered (corporate proxies).
+
 ## 0.14.5 — 2026-05-17
 
 - **Bump `triblespace` 0.41.0 → 0.41.1.** Picks up the
