@@ -213,15 +213,10 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn parse_full_id(input: &str) -> Result<Id> {
+fn parse_full_id_strict(input: &str) -> Result<Id> {
     let trimmed = input.trim();
-    Id::from_hex(trimmed).ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid event id '{}': expected a full 32-char hex id\n\
-             Hint: use `planner resolve <prefix>` to look up the full id",
-            trimmed
-        )
-    })
+    Id::from_hex(trimmed)
+        .ok_or_else(|| anyhow::anyhow!("invalid id '{}': expected 32-char hex", trimmed))
 }
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
@@ -284,7 +279,7 @@ fn resolve_branch(
     branch_id_hex: Option<&str>,
 ) -> Result<Id> {
     if let Some(hex) = branch_id_hex {
-        return parse_full_id(hex);
+        return parse_full_id_strict(hex);
     }
     repo.ensure_branch(branch_name, None)
         .map_err(|e| anyhow::anyhow!("ensure branch '{branch_name}': {e:?}"))
@@ -346,28 +341,7 @@ fn read_text(ws: &mut Workspace<Pile>, h: TextHandle) -> Option<String> {
 }
 
 fn resolve_event_id(input: &str, space: &TribleSet) -> Result<Id> {
-    let needle = input.trim().to_lowercase();
-    if needle.is_empty() {
-        bail!("event id is empty");
-    }
-    if let Some(id) = Id::from_hex(&needle) {
-        return Ok(id);
-    }
-    let mut matches = Vec::new();
-    for id in all_event_ids(space) {
-        let hex = format!("{id:x}");
-        if hex.starts_with(&needle) {
-            matches.push(id);
-        }
-    }
-    match matches.len() {
-        0 => bail!("no event id starts with '{}'", needle),
-        1 => Ok(matches[0]),
-        n => bail!(
-            "{n} event ids start with '{}'; provide a longer prefix",
-            needle
-        ),
-    }
+    faculties::resolve_id_prefix(input, all_event_ids(space))
 }
 
 // ── recurrence expansion ──────────────────────────────────────────────────
@@ -733,13 +707,13 @@ fn cmd_note(
     id: String,
     text: String,
 ) -> Result<()> {
-    let event_ref = parse_full_id(&id)?;
     let body = load_value_or_file(&text, "note")?;
-    with_repo(pile, |repo| {
-        
+    let event_ref = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let event_ref = resolve_event_id(&id, &space)?;
 
         let note_id = ufoid();
         let text_handle = ws.put(body);
@@ -756,7 +730,7 @@ fn cmd_note(
         ws.commit(change, "add note");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push note: {e:?}"))?;
-        Ok(())
+        Ok(event_ref)
     })?;
     println!("Added note to event {}", fmt_id(event_ref));
     Ok(())
@@ -768,13 +742,12 @@ fn cmd_show(
     branch_id: Id,
     id: String,
 ) -> Result<()> {
-    let event_ref = parse_full_id(&id)?;
     with_repo(pile, |repo| {
-        
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let event_ref = resolve_event_id(&id, &space)?;
 
         let summary = event_summary(&mut ws, &space, event_ref);
         println!("event {}  {}", fmt_id(event_ref), summary);
@@ -843,12 +816,12 @@ fn cmd_cancel(
     branch_id: Id,
     id: String,
 ) -> Result<()> {
-    let event_ref = parse_full_id(&id)?;
-    with_repo(pile, |repo| {
-        
+    let event_ref = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let event_ref = resolve_event_id(&id, &space)?;
         let mut change = TribleSet::new();
         change += entity! { ExclusiveId::force_ref(&event_ref) @
             event::status: STATUS_CANCELLED,
@@ -856,7 +829,7 @@ fn cmd_cancel(
         ws.commit(change, "cancel event");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push cancel: {e:?}"))?;
-        Ok(())
+        Ok(event_ref)
     })?;
     println!("Cancelled event {}", fmt_id(event_ref));
     Ok(())

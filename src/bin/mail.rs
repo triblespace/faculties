@@ -252,9 +252,14 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn parse_full_id(input: &str) -> Result<Id> {
-    Id::from_hex(input.trim())
-        .ok_or_else(|| anyhow::anyhow!("invalid id '{}': expected 32-char hex", input.trim()))
+/// Resolve a message/draft id, accepting either a full 32-char hex
+/// or a shorter prefix. Faculty-specific candidate set: `KIND_MESSAGE`
+/// and `KIND_DRAFT` entities, since they share the entity-id namespace
+/// and the user often wants either.
+fn resolve_message_id(space: &TribleSet, input: &str) -> Result<Id> {
+    let messages = find!(e: Id, pattern!(space, [{ ?e @ metadata::tag: KIND_MESSAGE }]));
+    let drafts = find!(e: Id, pattern!(space, [{ ?e @ metadata::tag: KIND_DRAFT }]));
+    faculties::resolve_id_prefix(input, messages.chain(drafts))
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
@@ -1144,15 +1149,15 @@ fn cmd_reply(
     body: String,
 ) -> Result<()> {
     let body_text = load_value_or_file(&body, "reply body")?;
-    let parent_id = parse_full_id(&parent_hex)?;
 
     // Pull parent's properties for thread headers.
-    let (parent_msg_id, parent_subject, parent_from, parent_references) =
+    let (parent_id, parent_msg_id, parent_subject, parent_from, parent_references) =
         with_repo(pile, |repo| {
             let mut ws = repo
                 .pull(mail_branch_id)
                 .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
             let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+            let parent_id = resolve_message_id(&space, &parent_hex)?;
             let msg_id_h: Option<TextHandle> = find!(
                 h: TextHandle,
                 pattern!(&space, [{ parent_id @ mail::message_id: ?h }])
@@ -1217,7 +1222,7 @@ fn cmd_reply(
                     }
                 }
             }
-            Ok((msg_id, subject, from_email, ref_strings))
+            Ok((parent_id, msg_id, subject, from_email, ref_strings))
         })?;
 
     let reply_to = parent_from.ok_or_else(|| {
@@ -1329,7 +1334,15 @@ fn cmd_send(
     decide_branch_id: Id,
     draft_hex: String,
 ) -> Result<()> {
-    let draft_id = parse_full_id(&draft_hex)?;
+    // Resolve the prefix once against the mail space; the rest of the
+    // function uses the full Id internally.
+    let draft_id = with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(mail_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        resolve_message_id(&space, &draft_hex)
+    })?;
     let config = load_config()?;
 
     // 1. Resolve the linked decision and check it's resolved.
@@ -1527,7 +1540,13 @@ fn cmd_discard(
     draft_hex: String,
     force: bool,
 ) -> Result<()> {
-    let draft_id = parse_full_id(&draft_hex)?;
+    let draft_id = with_repo(pile, |repo| {
+        let mut ws = repo
+            .pull(mail_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        resolve_message_id(&space, &draft_hex)
+    })?;
     with_repo(pile, |repo| {
         // Verify the draft exists and is still a draft (not already sent).
         let mut mws = repo
@@ -1924,12 +1943,12 @@ fn cmd_show(
     relations_branch_id: Id,
     message: String,
 ) -> Result<()> {
-    let id = parse_full_id(&message)?;
-    with_repo(pile, |repo| {
+    let resolved_id = with_repo(pile, |repo| {
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
         let space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let id = resolve_message_id(&space, &message)?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
@@ -1996,7 +2015,7 @@ fn cmd_show(
         for line in body.lines() {
             println!("  {line}");
         }
-        Ok(())
+        Ok(id)
     })?;
     // Auto-mark on show (opening = reading, mirrors what mail clients do).
     // Idempotent: if a read receipt already exists for this message + the
@@ -2011,7 +2030,7 @@ fn cmd_show(
                 .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
             let rel_space = rws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
             if let Some(self_id) = find_self_persona(&rel_space, &config.user) {
-                mark_read_if_unread(repo, mail_branch_id, id, self_id)?;
+                mark_read_if_unread(repo, mail_branch_id, resolved_id, self_id)?;
             }
             Ok(())
         });
@@ -2025,9 +2044,14 @@ fn cmd_read(
     relations_branch_id: Id,
     message: String,
 ) -> Result<()> {
-    let id = parse_full_id(&message)?;
     let config = load_config()?;
     with_repo(pile, |repo| {
+        let mut mws = repo
+            .pull(mail_branch_id)
+            .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
+        let mail_space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let id = resolve_message_id(&mail_space, &message)?;
+        drop(mws);
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
@@ -2055,12 +2079,12 @@ fn cmd_thread(
     relations_branch_id: Id,
     message: String,
 ) -> Result<()> {
-    let start = parse_full_id(&message)?;
     with_repo(pile, |repo| {
         let mut mws = repo
             .pull(mail_branch_id)
             .map_err(|e| anyhow::anyhow!("pull mail: {e:?}"))?;
         let space = mws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let start = resolve_message_id(&space, &message)?;
         let mut rws = repo
             .pull(relations_branch_id)
             .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;

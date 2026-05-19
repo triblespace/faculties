@@ -124,9 +124,11 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn parse_full_id(input: &str) -> Result<Id> {
-    Id::from_hex(input.trim())
-        .ok_or_else(|| anyhow::anyhow!("invalid id '{}': expected 32-char hex", input.trim()))
+/// Resolve a decision id, accepting either a full 32-char hex or a
+/// shorter prefix. Scans `KIND_DECISION` entities for matches.
+fn resolve_decision_id(space: &TribleSet, input: &str) -> Result<Id> {
+    let candidates = find!(d: Id, pattern!(space, [{ ?d @ metadata::tag: KIND_DECISION }]));
+    faculties::resolve_id_prefix(input, candidates)
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
@@ -284,7 +286,22 @@ fn cmd_propose(
     if title.trim().is_empty() {
         bail!("title must not be empty");
     }
-    let about_id = about.as_deref().map(parse_full_id).transpose()?;
+    // `about` can reference any entity across faculties (a compass goal,
+    // a mail draft, a wiki fragment, etc.); we don't have a single
+    // KIND to scope a prefix search against, so it stays strict — pass
+    // a full 32-char id.
+    let about_id = about
+        .as_deref()
+        .map(|raw| {
+            Id::from_hex(raw.trim()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid --about id '{}': expected a full 32-char hex id \
+                     (cross-faculty linker, no prefix expansion)",
+                    raw.trim()
+                )
+            })
+        })
+        .transpose()?;
     let context_text = context.as_deref().map(|s| load_value_or_file(s, "context")).transpose()?;
 
     let decision_ref = with_repo(pile, |repo| {
@@ -322,17 +339,17 @@ fn cmd_factor(
     text: String,
     kind: Id,
 ) -> Result<()> {
-    let decision_id = parse_full_id(&decision_hex)?;
     let body = load_value_or_file(&text, "factor text")?;
     if body.trim().is_empty() {
         bail!("factor text must not be empty");
     }
-    with_repo(pile, |repo| {
+    let decision_id = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         // Sanity-check the decision exists and isn't already resolved.
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let decision_id = resolve_decision_id(&space, &decision_hex)?;
         let exists = find!(
             d: Id,
             pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
@@ -365,7 +382,7 @@ fn cmd_factor(
         );
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        Ok(())
+        Ok(decision_id)
     })?;
     let side = if kind == KIND_PRO { "pro" } else { "con" };
     println!("Added {side} to decision {}", fmt_id(decision_id));
@@ -379,16 +396,16 @@ fn cmd_resolve(
     outcome: String,
     force: bool,
 ) -> Result<()> {
-    let decision_id = parse_full_id(&decision_hex)?;
     let outcome_text = load_value_or_file(&outcome, "outcome")?;
     if outcome_text.trim().is_empty() {
         bail!("outcome must not be empty (use @- to pipe in stdin)");
     }
-    with_repo(pile, |repo| {
+    let decision_id = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let decision_id = resolve_decision_id(&space, &decision_hex)?;
         let exists = find!(
             d: Id,
             pattern!(&space, [{ ?d @ metadata::tag: KIND_DECISION }])
@@ -425,7 +442,7 @@ fn cmd_resolve(
         ws.commit(change, "decide: resolve");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        Ok(())
+        Ok(decision_id)
     })?;
     println!("Resolved decision {}", fmt_id(decision_id));
     Ok(())
@@ -543,12 +560,12 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn cmd_show(pile: &Path, branch_id: Id, decision_hex: String) -> Result<()> {
-    let decision_id = parse_full_id(&decision_hex)?;
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let decision_id = resolve_decision_id(&space, &decision_hex)?;
 
         let title = decision_title(&mut ws, &space, decision_id);
         println!("decision {}", fmt_id(decision_id));
@@ -667,7 +684,11 @@ fn main() -> Result<()> {
     let branch_id_hex = cli.branch_id.as_deref();
     let branch_id = with_repo(&cli.pile, |repo| {
         if let Some(hex) = branch_id_hex {
-            parse_full_id(hex)
+            // Branch ids aren't enumerable by content kind, so no prefix
+            // expansion — pass a full 32-char hex.
+            Id::from_hex(hex.trim()).ok_or_else(|| {
+                anyhow::anyhow!("invalid --branch-id '{}': expected 32-char hex", hex.trim())
+            })
         } else {
             repo.ensure_branch(&cli.branch, None)
                 .map_err(|e| anyhow::anyhow!("ensure branch '{}': {e:?}", cli.branch))

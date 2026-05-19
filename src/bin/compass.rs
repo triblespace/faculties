@@ -280,38 +280,8 @@ fn read_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
 }
 
 /// Parse a full 64-char hex ID. Returns a helpful error pointing to `compass resolve` on failure.
-fn parse_full_id(input: &str) -> Result<Id> {
-    let trimmed = input.trim();
-    Id::from_hex(trimmed).ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid goal id '{}': expected a full 32-char hex id\n\
-             Hint: use `compass resolve <prefix>` to look up the full id from a short prefix",
-            trimmed
-        )
-    })
-}
-
 fn resolve_task_id(input: &str, space: &TribleSet) -> Result<Id> {
-    let needle = input.trim().to_lowercase();
-    if needle.is_empty() {
-        bail!("goal id is empty");
-    }
-    let mut matches = Vec::new();
-    for id in all_goal_ids(space) {
-        let hex = format!("{id:x}");
-        if hex.starts_with(&needle) {
-            matches.push(id);
-        }
-    }
-    match matches.len() {
-        0 => bail!("no goal id matches '{input}'"),
-        1 => Ok(matches[0]),
-        _ => {
-            let mut rendered: Vec<String> = matches.into_iter().map(|id| format!("{id:x}")).collect();
-            rendered.sort();
-            bail!("ambiguous goal id '{input}': {}", rendered.join(", "));
-        }
-    }
+    faculties::resolve_id_prefix(input, all_goal_ids(space))
 }
 
 /// Compute active priority edges from the space.
@@ -675,12 +645,17 @@ fn cmd_add(
         validate_short("tag", tag)?;
     }
 
-    let parent_id = parent.as_deref().map(parse_full_id).transpose()?;
-
     let task_ref = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let parent_id = match parent.as_deref() {
+            Some(p) => {
+                let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+                Some(resolve_task_id(p, &space)?)
+            }
+            None => None,
+        };
         let task_id = ufoid();
         let task_ref = task_id.id;
         let now = epoch_interval(now_epoch());
@@ -755,12 +730,13 @@ fn cmd_move(
 ) -> Result<()> {
     let status = normalize_status(status);
     validate_short("status", &status)?;
-    let task_id = parse_full_id(&id)?;
 
-    with_repo(pile, |repo| {
+    let resolved = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let task_id = resolve_task_id(&id, &space)?;
         let now = epoch_interval(now_epoch());
 
         let status_id = ufoid();
@@ -776,19 +752,19 @@ fn cmd_move(
         ws.commit(change, "move goal");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push status: {e:?}"))?;
-        Ok(())
+        Ok(task_id)
     })?;
-    println!("Moved goal {:x} to {}", task_id, status);
+    println!("Moved goal {:x} to {}", resolved, status);
     Ok(())
 }
 
 fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: String) -> Result<()> {
-    let task_id = parse_full_id(&id)?;
-
-    with_repo(pile, |repo| {
+    let task_id = with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let task_id = resolve_task_id(&id, &space)?;
         let now = epoch_interval(now_epoch());
 
         let note_id = ufoid();
@@ -804,20 +780,19 @@ fn cmd_note(pile: &Path, _branch_name: &str, branch_id: Id, id: String, note: St
         ws.commit(change, "add goal note");
         repo.push(&mut ws)
             .map_err(|e| anyhow::anyhow!("push note: {e:?}"))?;
-        Ok(())
+        Ok(task_id)
     })?;
     println!("Noted goal {:x}", task_id);
     Ok(())
 }
 
 fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Result<()> {
-    let task_id = parse_full_id(&id)?;
-
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let task_id = resolve_task_id(&id, &space)?;
 
         let title = task_title(&mut ws, &space, task_id);
         if title.is_empty() {
@@ -915,14 +890,13 @@ fn cmd_prioritize(
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
-    let higher_id = parse_full_id(&higher_input)?;
-    let lower_id = parse_full_id(&lower_input)?;
-
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let higher_id = resolve_task_id(&higher_input, &space)?;
+        let lower_id = resolve_task_id(&lower_input, &space)?;
 
         if higher_id == lower_id {
             bail!("cannot prioritize a goal over itself");
@@ -974,14 +948,13 @@ fn cmd_deprioritize(
     higher_input: String,
     lower_input: String,
 ) -> Result<()> {
-    let higher_id = parse_full_id(&higher_input)?;
-    let lower_id = parse_full_id(&lower_input)?;
-
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let higher_id = resolve_task_id(&higher_input, &space)?;
+        let lower_id = resolve_task_id(&lower_input, &space)?;
 
         let edges = active_priority_edges(&space);
         if !edges.contains(&(higher_id, lower_id)) {

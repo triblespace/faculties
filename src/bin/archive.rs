@@ -800,40 +800,13 @@ fn message_attachments(
 }
 
 fn resolve_message_id(catalog: &TribleSet, prefix: &str) -> Result<Id> {
-    let trimmed = prefix.trim();
-    if trimmed.len() == 32 {
-        if let Some(id) = Id::from_hex(trimmed) {
-            return Ok(id);
-        }
-    }
-
-    let mut matches = Vec::new();
-    for (message_id,) in find!(
-        (message: Id),
+    let candidates = find!(
+        message: Id,
         pattern!(catalog, [{
             ?message @ common::metadata::tag: common::archive::kind_message,
         }])
-    ) {
-        if format!("{message_id:x}").starts_with(trimmed) {
-            matches.push(message_id);
-            if matches.len() > 10 {
-                break;
-            }
-        }
-    }
-
-    match matches.len() {
-        0 => bail!("no message matches id prefix {trimmed}"),
-        1 => Ok(matches[0]),
-        _ => bail!(
-            "id prefix {trimmed} is ambiguous; matches: {}",
-            matches
-                .into_iter()
-                .map(|id| format!("{id:x}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
+    );
+    faculties::resolve_id_prefix(prefix, candidates)
 }
 
 fn message_record(

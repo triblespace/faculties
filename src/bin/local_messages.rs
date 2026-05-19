@@ -304,32 +304,11 @@ fn ensure_metadata(ws: &mut Workspace<Pile>) -> Result<TribleSet> {
 }
 
 fn resolve_message_id(space: &TribleSet, prefix: &str) -> Result<Id> {
-    let prefix = prefix.trim().to_lowercase();
-    if prefix.is_empty() {
-        bail!("message id prefix is empty");
-    }
-    if prefix.len() == 32 {
-        if let Some(id) = Id::from_hex(&prefix) {
-            return Ok(id);
-        }
-    }
-
-    let mut matches = Vec::new();
-    for (message_id,) in find!(
-        (message_id: Id),
-        pattern!(&space, [{ ?message_id @ metadata::tag: &KIND_MESSAGE_ID }])
-    ) {
-        let hex = format!("{message_id:x}");
-        if hex.starts_with(&prefix) {
-            matches.push(message_id);
-        }
-    }
-
-    match matches.len() {
-        0 => bail!("no message id matches prefix '{prefix}'"),
-        1 => Ok(matches[0]),
-        _ => bail!("multiple messages match prefix '{prefix}'"),
-    }
+    let candidates = find!(
+        message_id: Id,
+        pattern!(space, [{ ?message_id @ metadata::tag: &KIND_MESSAGE_ID }])
+    );
+    faculties::resolve_id_prefix(prefix, candidates)
 }
 
 fn load_text(ws: &mut Workspace<Pile>, handle: TextHandle) -> Result<String> {
