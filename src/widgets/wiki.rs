@@ -754,15 +754,59 @@ impl WikiGraph {
         }
         let omega = if inertia > 1.0 { angular / inertia } else { 0.0 };
 
-        for (i, node) in self.nodes.iter_mut().enumerate() {
-            let px = positions[i * 2] - cx;
-            let py = positions[i * 2 + 1] - cy;
-            // Subtract rigid rotation: v_rot = omega × r = (-omega*y, omega*x)
-            node.pos = egui::vec2(
-                positions[i * 2] + omega * py,
-                positions[i * 2 + 1] - omega * px,
-            );
+        // Read back velocities up-front so we can compute the mean
+        // (= the system's linear momentum / mass) alongside the
+        // angular correction.
+        let vel_bytes = gpu.client.read_one(gpu.vel_handle.clone());
+        let velocities: &[f32] = f32::from_bytes(&vel_bytes);
+        let mut mean_vx = 0.0f32;
+        let mut mean_vy = 0.0f32;
+        for i in 0..n {
+            mean_vx += velocities[i * 2];
+            mean_vy += velocities[i * 2 + 1];
         }
+        mean_vx /= n as f32;
+        mean_vy /= n as f32;
+
+        // Two galilean corrections fed back to the GPU each frame:
+        //
+        // - Translation: pin the centroid at the world origin
+        //   (positions ← positions − centroid) and zero net linear
+        //   momentum (velocities ← velocities − mean velocity). Net
+        //   forces from the kernel should sum to zero pair-wise
+        //   (repulsion + edge attraction obey Newton's 3rd), but any
+        //   numerical residue used to accumulate as drift until
+        //   damping ate it.
+        // - Rotation: subtract `omega × r` from positions and
+        //   velocities so net angular momentum is zero (same form
+        //   as before).
+        //
+        // Both states are written back to the GPU; integrating from a
+        // de-driffed, de-rotated frame keeps the graph anchored
+        // visually instead of relying on the small-angle linear
+        // approximation to absorb drift cosmetically.
+        let mut corrected_pos: Vec<f32> = Vec::with_capacity(n * 2);
+        let mut corrected_vel: Vec<f32> = Vec::with_capacity(n * 2);
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            let dx = positions[i * 2] - cx;
+            let dy = positions[i * 2 + 1] - cy;
+            // Position: centroid-relative + de-rotation.
+            let new_x = dx + omega * dy;
+            let new_y = dy - omega * dx;
+            node.pos = egui::vec2(new_x, new_y);
+            corrected_pos.push(new_x);
+            corrected_pos.push(new_y);
+            // Velocity: subtract mean linear velocity + tangential
+            // rotation.
+            corrected_vel.push(velocities[i * 2] - mean_vx + omega * dy);
+            corrected_vel.push(velocities[i * 2 + 1] - mean_vy - omega * dx);
+        }
+
+        // Replace GPU buffers — `create_from_slice` is the only public
+        // update path in cubecl 0.9; the old handles drop and the
+        // runtime's allocator reclaims their slots.
+        gpu.pos_handle = gpu.client.create_from_slice(f32::as_bytes(&corrected_pos));
+        gpu.vel_handle = gpu.client.create_from_slice(f32::as_bytes(&corrected_vel));
     }
 
     #[allow(dead_code)]
