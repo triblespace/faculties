@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.17.0 — 2026-05-31
+
+- **Bump `triblespace` 0.43 → 0.44 and `GORBIE` 0.15 → 0.16.**
+  Picks up the descriptive-capabilities substrate in
+  `triblespace-net` (cap blobs + chain proofs in sig blobs +
+  `/triblespace/auth-handshake/1` ALPN + renewal daemon),
+  the `BranchStore → PinStore` rename (Branch is now a
+  specialization of Pin), `Repository::new` taking
+  `F: Into<Fragment>`, and the engine improvements
+  (NotAttr, full same-Variable handling, RegularPathConstraint
+  symmetric end-bound proposal, path! infix `?`/`!`/`^`).
+- **`triage`**: switch from `pile.branches()` to `pile.pins()`
+  for the listing iterator; no behavioural change since the
+  named-branch filtering happens downstream.
+
 ## 0.14.8 — 2026-05-17
 
 - **Bump `triblespace` 0.41.3 → 0.41.4.** Two follow-on fixes

@@ -430,8 +430,8 @@ fn find_branch_ids_by_name(
         .get_handle();
     let reader = pile.reader().map_err(|e| anyhow!("pile reader: {e:?}"))?;
     let iter = pile
-        .branches()
-        .map_err(|e| anyhow!("list branches: {e:?}"))?;
+        .pins()
+        .map_err(|e| anyhow!("list pins: {e:?}"))?;
     let mut matches = Vec::new();
     for branch_entry in iter {
         let branch_id = branch_entry.map_err(|e| anyhow!("branch id: {e:?}"))?;
