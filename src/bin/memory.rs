@@ -25,7 +25,8 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory create [<range>] <summary> — create a memory chunk\n\n\
+             memory create [<range>] <summary> — create a memory chunk\n  \
+             memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
              Time format: YYYY-MM-DDTHH:MM:SS..YYYY-MM-DDTHH:MM:SS (TAI)\n\
              Hex id prefixes also accepted as fallback."
 )]
@@ -93,6 +94,11 @@ fn format_time_range(start: Epoch, end: Epoch) -> String {
     format!(
         "{y1:04}-{m1:02}-{d1:02}T{h1:02}:{mi1:02}:{s1:02}..{y2:04}-{m2:02}-{d2:02}T{h2:02}:{mi2:02}:{s2:02}"
     )
+}
+
+fn fmt_epoch(e: Epoch) -> String {
+    let (y, m, d, h, mi, s, _) = e.to_gregorian_tai();
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}")
 }
 
 fn parse_tai_timestamp(s: &str) -> Result<Epoch> {
@@ -196,6 +202,9 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "meta") {
         return cmd_meta(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
     }
+    if cli.ids.first().is_some_and(|value| value == "provenance") {
+        return cmd_provenance(&cli.pile, &cli.ids[1..]);
+    }
 
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref())?;
     with_repo(&cli.pile, |repo| {
@@ -290,8 +299,6 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         let mut child_ids: Vec<Id> = Vec::new();
         let mut children_start: Option<Inline<NsTAIInterval>> = None;
         let mut children_end: Option<Inline<NsTAIInterval>> = None;
-        let mut about_exec: Option<(Id, Inline<NsTAIInterval>)> = None;
-        let mut about_archive: Option<(Id, Inline<NsTAIInterval>)> = None;
 
         if !memory_refs.is_empty() {
             let ctx_catalog = {
@@ -328,44 +335,18 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             }
         }
 
-        // For memories without children and with a range, resolve provenance.
-        if child_ids.is_empty() {
-            if let Some((range_start, range_end)) = explicit_range {
-                // Try exec branch (cognition).
-                if let Ok(exec_bid) = repo.ensure_branch(DEFAULT_COGNITION_BRANCH, None) {
-                    if let Some(exec_catalog) = repo.pull(exec_bid)
-                        .ok()
-                        .and_then(|mut ws| ws.checkout(..).ok())
-                    {
-                        about_exec = find_exec_by_time_range(&exec_catalog, range_start, range_end);
-                    }
-                }
-                if about_exec.is_none() {
-                    // Try archive branch.
-                    if let Ok(archive_bid) = repo.ensure_branch(DEFAULT_ARCHIVE_BRANCH, None) {
-                        if let Some(archive_catalog) = repo.pull(archive_bid)
-                            .ok()
-                            .and_then(|mut ws| ws.checkout(..).ok())
-                        {
-                            about_archive =
-                                find_archive_by_time_range(&archive_catalog, range_start, range_end);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Infer time span.
+        // Infer time span. Loose coupling: chunks no longer attach about_exec_result /
+        // about_archive_message references at write-time. Provenance is recovered by
+        // time-range query against the cognition / archive branches at read-time (see
+        // the `provenance` subcommand). Re-importing archive data after a chunk was
+        // written automatically associates it with the chunk by overlapping range —
+        // no rewrite pass needed.
         let (start_at, end_at) = if let (Some(s), Some(e)) = (children_start, children_end) {
             (s, e)
         } else if let Some((range_start, range_end)) = explicit_range {
             let start_val: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
             let end_val: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
             (start_val, end_val)
-        } else if let Some((_, time)) = about_exec {
-            (time, time)
-        } else if let Some((_, time)) = about_archive {
-            (time, time)
         } else {
             let now = Epoch::now()
                 .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
@@ -393,12 +374,6 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
             ctx::end_at: end_at,
         };
 
-        if let Some((exec_id, _)) = about_exec {
-            change += entity! { &chunk_id @ ctx::about_exec_result: exec_id };
-        }
-        if let Some((archive_id, _)) = about_archive {
-            change += entity! { &chunk_id @ ctx::about_archive_message: archive_id };
-        }
         for child_id in &child_ids {
             change += entity! { &chunk_id @ ctx::child: *child_id };
         }
@@ -630,65 +605,132 @@ fn extract_references(text: &str) -> Vec<(String, String)> {
     refs
 }
 
-/// Find the exec result whose finished_at falls within the given time range.
-fn find_exec_by_time_range(
+/// Find all exec results whose finished_at falls within the given time range,
+/// sorted chronologically.
+fn find_execs_in_range(
     catalog: &TribleSet,
     query_start: Epoch,
     query_end: Epoch,
-) -> Option<(Id, Inline<NsTAIInterval>)> {
+) -> Vec<(Id, Inline<NsTAIInterval>)> {
     let qs = query_start.to_tai_duration().total_nanoseconds();
     let qe = query_end.to_tai_duration().total_nanoseconds();
-    let mut best: Option<(Id, Inline<NsTAIInterval>, i128)> = None;
-
-    for (result_id, finished_at) in find!(
+    let mut out: Vec<(Id, Inline<NsTAIInterval>, i128)> = find!(
         (result_id: Id, finished_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?result_id @
             metadata::tag: &KIND_EXEC_RESULT,
             metadata::finished_at: ?finished_at,
         }])
-    ) {
-        let t = interval_key(finished_at);
-        if t >= qs && t <= qe {
-            // Prefer the closest to query_start.
-            let dist = (t - qs).abs();
-            match best {
-                Some((_, _, prev_dist)) if prev_dist <= dist => {}
-                _ => best = Some((result_id, finished_at, dist)),
-            }
-        }
-    }
-    best.map(|(id, t, _)| (id, t))
+    )
+    .filter_map(|(id, t)| {
+        let k = interval_key(t);
+        (k >= qs && k <= qe).then_some((id, t, k))
+    })
+    .collect();
+    out.sort_by_key(|(_, _, k)| *k);
+    out.into_iter().map(|(id, t, _)| (id, t)).collect()
 }
 
-/// Find the archive message whose created_at falls within the given time range.
-fn find_archive_by_time_range(
+/// Find all archive messages whose created_at falls within the given time range,
+/// sorted chronologically.
+fn find_archive_in_range(
     catalog: &TribleSet,
     query_start: Epoch,
     query_end: Epoch,
-) -> Option<(Id, Inline<NsTAIInterval>)> {
+) -> Vec<(Id, Inline<NsTAIInterval>)> {
     let qs = query_start.to_tai_duration().total_nanoseconds();
     let qe = query_end.to_tai_duration().total_nanoseconds();
-    let mut best: Option<(Id, Inline<NsTAIInterval>, i128)> = None;
-
-    for (msg_id, created_at) in find!(
+    let mut out: Vec<(Id, Inline<NsTAIInterval>, i128)> = find!(
         (msg_id: Id, created_at: Inline<NsTAIInterval>),
         pattern!(catalog, [{
             ?msg_id @
             metadata::tag: &KIND_ARCHIVE_MESSAGE,
             metadata::created_at: ?created_at,
         }])
-    ) {
-        let t = interval_key(created_at);
-        if t >= qs && t <= qe {
-            let dist = (t - qs).abs();
-            match best {
-                Some((_, _, prev_dist)) if prev_dist <= dist => {}
-                _ => best = Some((msg_id, created_at, dist)),
+    )
+    .filter_map(|(id, t)| {
+        let k = interval_key(t);
+        (k >= qs && k <= qe).then_some((id, t, k))
+    })
+    .collect();
+    out.sort_by_key(|(_, _, k)| *k);
+    out.into_iter().map(|(id, t, _)| (id, t)).collect()
+}
+
+/// Resolve provenance for a memory chunk by time-range query — find all
+/// exec results (cognition branch) and archive messages (archive branch)
+/// whose timestamps fall within the chunk's `[start_at, end_at]` interval.
+/// This is the loose-coupling alternative to chunk-side `about_exec_result`
+/// / `about_archive_message` attributes: associations emerge from temporal
+/// overlap at read-time, so importing archive data after a chunk was written
+/// automatically associates it with that chunk.
+fn cmd_provenance(pile_path: &Path, args: &[String]) -> Result<()> {
+    let Some(chunk_arg) = args.first() else {
+        bail!("usage: memory provenance <chunk-id>");
+    };
+
+    with_repo(pile_path, |repo| {
+        let memory_branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let memory_catalog = {
+            let mut ws = repo
+                .pull(memory_branch_id)
+                .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+            ws.checkout(..).context("checkout memory branch")?
+        };
+
+        let chunk_id = resolve_chunk_id(&memory_catalog, chunk_arg)
+            .map_err(|e| anyhow!("resolve chunk id `{chunk_arg}`: {e}"))?;
+
+        let start_at = chunk_start_at(&memory_catalog, chunk_id)
+            .ok_or_else(|| anyhow!("chunk {chunk_id:x} has no start_at"))?;
+        let end_at = chunk_end_at(&memory_catalog, chunk_id)
+            .ok_or_else(|| anyhow!("chunk {chunk_id:x} has no end_at"))?;
+        let (start_epoch, _): (Epoch, Epoch) = start_at.try_from_inline().unwrap();
+        let (_, end_epoch): (Epoch, Epoch) = end_at.try_from_inline().unwrap();
+
+        println!("chunk: {chunk_id:x}");
+        println!(
+            "range: {}..{}",
+            fmt_epoch(start_epoch),
+            fmt_epoch(end_epoch),
+        );
+
+        // Cognition branch.
+        if let Ok(exec_bid) = repo.ensure_branch(DEFAULT_COGNITION_BRANCH, None) {
+            if let Some(catalog) = repo
+                .pull(exec_bid)
+                .ok()
+                .and_then(|mut ws| ws.checkout(..).ok())
+            {
+                let execs = find_execs_in_range(&catalog, start_epoch, end_epoch);
+                println!("\ncognition exec results in range: {}", execs.len());
+                for (id, t) in execs {
+                    let (epoch, _): (Epoch, Epoch) = t.try_from_inline().unwrap();
+                    println!("  {id:x}  {}", fmt_epoch(epoch));
+                }
             }
         }
-    }
-    best.map(|(id, t, _)| (id, t))
+
+        // Archive branch.
+        if let Ok(archive_bid) = repo.ensure_branch(DEFAULT_ARCHIVE_BRANCH, None) {
+            if let Some(catalog) = repo
+                .pull(archive_bid)
+                .ok()
+                .and_then(|mut ws| ws.checkout(..).ok())
+            {
+                let msgs = find_archive_in_range(&catalog, start_epoch, end_epoch);
+                println!("\narchive messages in range: {}", msgs.len());
+                for (id, t) in msgs {
+                    let (epoch, _): (Epoch, Epoch) = t.try_from_inline().unwrap();
+                    println!("  {id:x}  {}", fmt_epoch(epoch));
+                }
+            }
+        }
+
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------

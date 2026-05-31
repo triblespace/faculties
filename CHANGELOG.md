@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.18.0 — 2026-06-01
+
+- **Loose-couple memory chunk provenance.** `memory create` no longer
+  scans the cognition / archive branches and writes `about_exec_result`
+  / `about_archive_message` references at chunk-write time. Provenance
+  is now recovered by *temporal overlap* at read-time via the new
+  `memory provenance <chunk-id>` subcommand, which lists every cognition
+  exec result and archive message whose timestamps fall within the
+  chunk's `[start_at, end_at]` interval. This means a chunk written
+  before its source data is imported (e.g. a reflective summary written
+  in one environment, with the matching .claude/chatgpt-data-dump
+  imported later) automatically picks up its provenance when the data
+  lands — no rewrite pass needed. The `ctx::about_exec_result` and
+  `ctx::about_archive_message` attribute IDs remain declared in the
+  schema so older chunks stay queryable and downstream consumers
+  (`triage` etc.) keep working on legacy data.
+
 ## 0.17.0 — 2026-05-31
 
 - **Bump `triblespace` 0.43 → 0.44 and `GORBIE` 0.15 → 0.16.**
