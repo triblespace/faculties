@@ -56,6 +56,12 @@ name = "gauge-capture"
 path = "src/bin/gauge-capture.rs"
 required-features = ["widgets"]
 
+# Messages-only viewer.
+[[bin]]
+name = "messages-capture"
+path = "src/bin/messages-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
