@@ -94,6 +94,22 @@ fn person_color(id: Id) -> egui::Color32 {
     colorhash::ral_categorical(id.as_ref())
 }
 
+/// Blend `a` toward `b` by `t` (0 = pure `a`, 1 = pure `b`). Used for
+/// the body's muted-text colour: `mix(text, bg, 0.45)` lands roughly
+/// halfway, giving a softer reading hierarchy without going invisible
+/// against either dark or light backgrounds.
+fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| {
+        ((x as f32) * (1.0 - t) + (y as f32) * t).round().clamp(0.0, 255.0) as u8
+    };
+    egui::Color32::from_rgb(
+        lerp(a.r(), b.r()),
+        lerp(a.g(), b.g()),
+        lerp(a.b(), b.b()),
+    )
+}
+
 // ── Time helpers ─────────────────────────────────────────────────────
 
 fn epoch_to_chrono(e: Epoch) -> DateTime<Utc> {
@@ -556,17 +572,15 @@ impl PlannerViewer {
                             .push(event);
                     }
                     for (date, events) in by_date.iter() {
-                        let header = format_day_section(*date);
+                        let n = events.len();
+                        let header = format!(
+                            "{} · {n} EVENT{}",
+                            format_day_section(*date),
+                            if n == 1 { "" } else { "S" },
+                        );
+                        let is_today = *date == today;
                         g.full(|ctx| {
-                            let ui = ctx.ui_mut();
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(header)
-                                    .monospace()
-                                    .strong()
-                                    .small()
-                                    .color(color_muted(ui)),
-                            );
+                            render_day_section_header(ctx.ui_mut(), &header, is_today);
                         });
                         for event in events {
                             g.full(|ctx| {
@@ -621,7 +635,10 @@ fn render_week_grid(
     let hour_grid_top = all_day_top + ALL_DAY_HEIGHT;
     let hour_grid_bottom = hour_grid_top + hours_visible * PX_PER_HOUR;
 
-    // Day headers.
+    // Day headers — all columns share a uniform frame fill; today
+    // gets a thin RAL 1003 accent strip along the bottom edge of its
+    // header instead of a full yellow cell (less visually loud, but
+    // still locates "now" at a glance).
     for day in 0..7u32 {
         let date = monday + ChronoDuration::days(day as i64);
         let col_left = day_grid_left + (day as f32) * day_col_width;
@@ -630,13 +647,12 @@ fn render_week_grid(
             egui::vec2(day_col_width, DAY_HEADER_HEIGHT),
         );
         let is_today = date == today;
-        let header_fill = if is_today { color_today() } else { color_frame(ui) };
+        painter.rect_filled(header_rect, egui::CornerRadius::ZERO, color_frame(ui));
         let text_color = if is_today {
-            colorhash::text_color_on(header_fill)
+            ui.visuals().text_color()
         } else {
             muted
         };
-        painter.rect_filled(header_rect, egui::CornerRadius::ZERO, header_fill);
         painter.text(
             header_rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -644,6 +660,16 @@ fn render_week_grid(
             egui::FontId::monospace(11.0),
             text_color,
         );
+        if is_today {
+            // 3-px accent strip across the TOP of today's header cell
+            // — visually leads the eye down the column, and reads as
+            // "now starts here" instead of a footer on the header.
+            let accent_rect = egui::Rect::from_min_size(
+                egui::pos2(col_left, header_rect.top()),
+                egui::vec2(day_col_width, 3.0),
+            );
+            painter.rect_filled(accent_rect, egui::CornerRadius::ZERO, color_today());
+        }
     }
 
     // All-day band background — same colour as day headers but muted.
@@ -653,19 +679,44 @@ fn render_week_grid(
     );
     painter.rect_filled(all_day_rect, egui::CornerRadius::ZERO, color_faint(ui));
 
-    // Hour labels & horizontal gridlines.
+    // Today's column gets a faint background tint behind the hour
+    // grid too, so the "now" bookkeeping carries down past the header.
+    if today >= monday && today < monday + ChronoDuration::days(7) {
+        let day_index = (today - monday).num_days() as u32;
+        let col_left = day_grid_left + (day_index as f32) * day_col_width;
+        let tint = egui::Color32::from_rgba_unmultiplied(
+            color_today().r(),
+            color_today().g(),
+            color_today().b(),
+            22, // gentle but noticeable wash
+        );
+        let tint_rect = egui::Rect::from_min_size(
+            egui::pos2(col_left, all_day_top),
+            egui::vec2(day_col_width, hour_grid_bottom - all_day_top),
+        );
+        painter.rect_filled(tint_rect, egui::CornerRadius::ZERO, tint);
+    }
+
+    // Hour labels & horizontal gridlines. Major gridlines every 6h
+    // are drawn slightly heavier so the grid has visual rhythm
+    // without becoming busy.
     for h in HOUR_START..=HOUR_END {
         let y = hour_grid_top + ((h - HOUR_START) as f32) * PX_PER_HOUR;
         painter.text(
-            egui::pos2(rect.left() + HOUR_LABEL_WIDTH - 4.0, y),
+            egui::pos2(rect.left() + HOUR_LABEL_WIDTH - 6.0, y),
             egui::Align2::RIGHT_CENTER,
             format!("{h:02}"),
             egui::FontId::monospace(9.0),
             muted,
         );
+        let stroke = if h % 6 == 0 {
+            egui::Stroke::new(0.8, color_frame(ui))
+        } else {
+            faint_stroke
+        };
         painter.line_segment(
             [egui::pos2(day_grid_left, y), egui::pos2(rect.right(), y)],
-            faint_stroke,
+            stroke,
         );
     }
 
@@ -727,19 +778,61 @@ fn paint_event_block(
         Some(org) => person_color(org),
         None => color_default_event(),
     };
-    let (fill, text_color) = match event.status {
-        EventStatus::Confirmed => (accent, colorhash::text_color_on(accent)),
+    // Status-modulated fill + stroke:
+    // - Confirmed: solid accent.
+    // - Tentative: hatched (diagonal stripes) at the accent colour so
+    //   the event is still clearly that organiser's, but the dashes
+    //   read as "not committed yet". Earlier solid-gamma-multiply at
+    //   0.45 was too washed-out to register in the grid.
+    // - Cancelled: muted grey + the summary gets struck through on
+    //   the agenda card; here the block fades back and uses a darker
+    //   stroke so it can be told apart from an empty slot.
+    let (fill, stroke_color, text_color) = match event.status {
+        EventStatus::Confirmed => (
+            accent,
+            accent.gamma_multiply(0.7),
+            colorhash::text_color_on(accent),
+        ),
         EventStatus::Tentative => (
-            accent.gamma_multiply(0.45),
+            // 50% alpha lets the column tint show through but keeps
+            // enough of the accent that small tentative blocks (e.g.
+            // a 30-min slot) still register as "this person's event"
+            // — the hatch overlay below adds the "tentative" reading.
+            accent.gamma_multiply(0.50),
+            accent,
             colorhash::text_color_on(accent),
         ),
         EventStatus::Cancelled => (
-            egui::Color32::from_gray(170),
+            egui::Color32::from_gray(120),
             egui::Color32::from_gray(80),
+            egui::Color32::from_gray(40),
         ),
     };
 
     painter.rect_filled(rect, egui::CornerRadius::ZERO, fill);
+    if matches!(event.status, EventStatus::Tentative) {
+        // Diagonal hatch overlay — 5-px spaced stripes at 45°. The
+        // pattern reads as "tentative" even when the fill is faded.
+        paint_diagonal_hatch(painter, rect, accent.gamma_multiply(0.6));
+    }
+    if matches!(event.status, EventStatus::Cancelled) {
+        // Single diagonal slash through the block so cancelled events
+        // are unmistakable in the grid — the agenda card has the
+        // strikethrough on the summary, the grid needs an analogue.
+        painter.line_segment(
+            [
+                egui::pos2(rect.left() + 1.0, rect.bottom() - 1.0),
+                egui::pos2(rect.right() - 1.0, rect.top() + 1.0),
+            ],
+            egui::Stroke::new(1.5, egui::Color32::from_gray(40)),
+        );
+    }
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(1.0, stroke_color),
+        egui::StrokeKind::Inside,
+    );
 
     let pad = 3.0;
     let text_rect = rect.shrink(pad);
@@ -774,6 +867,36 @@ fn paint_event_block(
     }
 }
 
+/// Paint a 45° diagonal hatch over `rect` in `stripe_color`. Stripes
+/// are 4 px apart so the pattern reads at the small block sizes the
+/// week grid uses. Clipped to the rect so the painter doesn't bleed
+/// over the gridlines.
+fn paint_diagonal_hatch(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    stripe_color: egui::Color32,
+) {
+    let stripe = egui::Stroke::new(1.0, stripe_color);
+    let step = 5.0;
+    // Sweep diagonals from x = rect.left - rect.height (so they
+    // enter the rect from below-left) to x = rect.right (so they
+    // exit upper-right). Painter::with_clip_rect keeps the strokes
+    // bounded to the block.
+    let painter = painter.with_clip_rect(rect);
+    let start_x = rect.left() - rect.height();
+    let mut x = start_x;
+    while x < rect.right() {
+        painter.line_segment(
+            [
+                egui::pos2(x, rect.bottom()),
+                egui::pos2(x + rect.height(), rect.top()),
+            ],
+            stripe,
+        );
+        x += step;
+    }
+}
+
 /// Lay out `text` as a single line and truncate with `…` if it doesn't
 /// fit `max_width`. Cheap visual truncation — not Unicode-bidi-aware,
 /// fine for event titles.
@@ -805,7 +928,6 @@ fn render_event_card(ui: &mut egui::Ui, event: &EventRow, live: &PlannerLive) {
         None => color_default_event(),
     };
     let text_on_accent = colorhash::text_color_on(accent);
-    let muted = color_muted(ui);
 
     egui::Frame::NONE
         .fill(bubble_fill)
@@ -871,72 +993,132 @@ fn render_event_card(ui: &mut egui::Ui, event: &EventRow, live: &PlannerLive) {
                 });
 
             // ── Body: location / recurrence / attendees / notes ──
-            egui::Frame::NONE
-                .fill(bubble_fill)
-                .corner_radius(egui::CornerRadius::ZERO)
-                .inner_margin(egui::Margin {
-                    left: 10,
-                    right: 10,
-                    top: 6,
-                    bottom: 8,
-                })
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+            //
+            // Only render the body section when at least one row will
+            // appear. Earlier every card got a body Frame regardless of
+            // content, producing an empty paper strip beneath the
+            // header that was visually indistinguishable from the
+            // inter-card gap — making the card feel "missing".
+            let has_body = event.location.is_some()
+                || event.rrule.is_some()
+                || event.organizer.is_some()
+                || !event.attendees.is_empty()
+                || !event.notes.is_empty();
 
-                    if let Some(loc) = event.location.as_ref() {
-                        ui.label(
-                            egui::RichText::new(format!("\u{1F4CD} {loc}")) // 📍
-                                .monospace()
-                                .small()
-                                .color(muted),
-                        );
-                    }
+            if has_body {
+                // Body text colors derive from the fill so meta/note
+                // text reads against the paper bg regardless of theme.
+                // Earlier the bubble_fill in GORBIE's dark mode was
+                // lighter than the surrounding section, while
+                // `color_muted` returned a light-gray suited to dark
+                // backgrounds — so meta rows rendered light-on-light
+                // and were invisible.
+                let body_text = colorhash::text_color_on(bubble_fill);
+                // Subtle hierarchy: ~25% bg mixed into text keeps
+                // meta rows quieter than the primary text without
+                // collapsing contrast against the body fill.
+                let body_muted = mix(body_text, bubble_fill, 0.22);
+                egui::Frame::NONE
+                    .fill(bubble_fill)
+                    .corner_radius(egui::CornerRadius::ZERO)
+                    .inner_margin(egui::Margin {
+                        left: 10,
+                        right: 10,
+                        top: 6,
+                        bottom: 8,
+                    })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
 
-                    if let Some(rrule) = event.rrule.as_ref() {
-                        ui.label(
-                            egui::RichText::new(format!("\u{21BB} {rrule}")) // ↻
-                                .monospace()
-                                .small()
-                                .color(muted),
-                        );
-                    }
+                        if let Some(loc) = event.location.as_ref() {
+                            ui.label(
+                                egui::RichText::new(format!("\u{1F4CD} {loc}")) // 📍
+                                    .monospace()
+                                    .small()
+                                    .color(body_muted),
+                            );
+                        }
 
-                    if event.organizer.is_some() || !event.attendees.is_empty() {
-                        ui.add_space(2.0);
-                        ui.horizontal_wrapped(|ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                            if let Some(org) = event.organizer {
-                                render_attendee_chip(
-                                    ui,
-                                    &live.display(org),
-                                    person_color(org),
-                                    true,
-                                );
-                            }
-                            for &att in &event.attendees {
-                                if Some(att) == event.organizer {
-                                    continue;
+                        if let Some(rrule) = event.rrule.as_ref() {
+                            ui.label(
+                                egui::RichText::new(format!("\u{21BB} {rrule}")) // ↻
+                                    .monospace()
+                                    .small()
+                                    .color(body_muted),
+                            );
+                        }
+
+                        if event.organizer.is_some() || !event.attendees.is_empty() {
+                            ui.add_space(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing =
+                                    egui::vec2(4.0, 4.0);
+                                if let Some(org) = event.organizer {
+                                    render_attendee_chip(
+                                        ui,
+                                        &live.display(org),
+                                        person_color(org),
+                                        true,
+                                    );
                                 }
-                                render_attendee_chip(
-                                    ui,
-                                    &live.display(att),
-                                    person_color(att),
-                                    false,
-                                );
-                            }
-                        });
-                    }
+                                for &att in &event.attendees {
+                                    if Some(att) == event.organizer {
+                                        continue;
+                                    }
+                                    render_attendee_chip(
+                                        ui,
+                                        &live.display(att),
+                                        person_color(att),
+                                        false,
+                                    );
+                                }
+                            });
+                        }
 
-                    for note_text in &event.notes {
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(format!("» {note_text}"))
-                                .size(13.0)
-                                .color(ui.visuals().text_color()),
-                        );
-                    }
-                });
+                        for note_text in &event.notes {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(format!("» {note_text}"))
+                                    .size(13.0)
+                                    .color(body_text),
+                            );
+                        }
+                    });
+            }
         });
+}
+
+/// Render a day-section header above the agenda cards for that day.
+/// Uses a narrow colored strip + larger-than-small text so the day
+/// breaks read as structure instead of incidental labels. The strip
+/// turns RAL 1003 yellow on today, otherwise picks up the muted frame
+/// colour.
+fn render_day_section_header(ui: &mut egui::Ui, label: &str, is_today: bool) {
+    let muted = color_muted(ui);
+    let strip_color = if is_today { color_today() } else { muted };
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(3.0, 14.0),
+            egui::Sense::hover(),
+        );
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::ZERO, strip_color);
+        let text_color = if is_today {
+            ui.visuals().text_color()
+        } else {
+            muted
+        };
+        ui.label(
+            egui::RichText::new(label)
+                .monospace()
+                .strong()
+                .size(12.0)
+                .color(text_color),
+        );
+    });
+    ui.add_space(2.0);
 }
 
 fn render_attendee_chip(

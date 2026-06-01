@@ -28,7 +28,7 @@ use GORBIE::prelude::CardCtx;
 use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStore, BlobStoreGet, BranchStore, Repository, Workspace};
+use triblespace::core::repo::{BlobStore, BlobStoreGet, PinStore, Repository, Workspace};
 use triblespace::core::trible::TribleSet;
 use triblespace::core::inline::encodings::hash::{Blake3, Handle};
 use triblespace::core::inline::Inline;
@@ -369,7 +369,7 @@ fn render_banner(ctx: &mut CardCtx<'_>, icon: &str, msg: &str, color: egui::Colo
 /// `name`, or `None` if no such branch exists.
 pub(crate) fn find_branch(repo: &mut Repository<Pile>, name: &str) -> Option<Id> {
     let reader = repo.storage_mut().reader().ok()?;
-    for item in repo.storage_mut().branches().ok()? {
+    for item in repo.storage_mut().pins().ok()? {
         let bid = item.ok()?;
         let head = repo.storage_mut().head(bid).ok()??;
         let meta: TribleSet = reader.get(head).ok()?;

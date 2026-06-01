@@ -27,6 +27,15 @@ name = "faculties-viewer"
 path = "src/bin/faculties-viewer.rs"
 required-features = ["widgets"]
 
+# Minimal headless capture target for iterating on planner-widget
+# visuals in isolation — avoids spinning up the wiki widget (cubecl
+# GPU context) which collides with the headless wgpu renderer on
+# some platforms.
+[[bin]]
+name = "planner-capture"
+path = "src/bin/planner-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
