@@ -18,8 +18,8 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, DecidePanel, HeadspaceViewer, MailViewer, MessagesPanel,
-    PlannerViewer, RelationsViewer, StorageState, TimelineSource, WikiViewer,
+    BranchTimeline, CompassBoard, DecidePanel, HeadspaceViewer, MailViewer, MemoryViewer,
+    MessagesPanel, PlannerViewer, RelationsViewer, StorageState, TimelineSource, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -137,6 +137,16 @@ fn main(nb: &mut NotebookCtx) {
     nb.state("relations", RelationsViewer::default(), move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
         let Some(mut ws) = st.workspace("relations") else { return };
+        panel.render(ctx, &mut ws);
+        st.push(&mut ws);
+    });
+
+    nb.state("memory", MemoryViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        // Try the canonical `memory` branch first; fall back to
+        // `cognition` for piles seeded before memory split out.
+        let ws = st.workspace("memory").or_else(|| st.workspace("cognition"));
+        let Some(mut ws) = ws else { return };
         panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
