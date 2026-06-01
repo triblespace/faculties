@@ -68,6 +68,12 @@ name = "files-capture"
 path = "src/bin/files-capture.rs"
 required-features = ["widgets"]
 
+# Triage diagnostic viewer.
+[[bin]]
+name = "triage-capture"
+path = "src/bin/triage-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.

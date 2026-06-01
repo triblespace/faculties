@@ -14,6 +14,7 @@ pub mod planner;
 pub mod relations;
 pub mod storage;
 pub mod timeline;
+pub mod triage;
 pub mod wiki;
 
 pub use compass::CompassBoard;
@@ -28,4 +29,5 @@ pub use planner::PlannerViewer;
 pub use relations::RelationsViewer;
 pub use storage::StorageState;
 pub use timeline::{BranchTimeline, SourceKind, TimelineSource};
+pub use triage::TriageViewer;
 pub use wiki::WikiViewer;
