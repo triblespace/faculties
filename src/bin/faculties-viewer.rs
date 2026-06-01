@@ -18,9 +18,9 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, FilesViewer, GaugeViewer,
-    HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer, RelationsViewer,
-    StorageState, TimelineSource, TriageViewer, WikiViewer,
+    AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
+    GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
+    RelationsViewer, StorageState, TeamsViewer, TimelineSource, TriageViewer, WikiViewer,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
@@ -72,10 +72,23 @@ fn main(nb: &mut NotebookCtx) {
             TimelineSource::Wiki {
                 label: "wiki".to_owned(),
             },
+            TimelineSource::Reason {
+                label: "reason".to_owned(),
+            },
+            TimelineSource::Archive {
+                label: "archive".to_owned(),
+            },
         ]),
         move |ctx, tl| {
             let mut st = storage.read_mut(ctx);
-            let branch_names: &[&str] = &["compass", "local-messages", "wiki"];
+            // Branches are positional w.r.t. the TimelineSource vec
+            // above. Missing branches at the tail are handled cleanly
+            // by MultiLive (workspaces.get_mut(idx) returning None
+            // → the corresponding source is skipped for the frame),
+            // so e.g. an empty archive branch produces no archive
+            // events without breaking the others.
+            let branch_names: &[&str] =
+                &["compass", "local-messages", "wiki", "cognition", "archive"];
             let mut pulled: Vec<(&str, Workspace<Pile>)> =
                 Vec::with_capacity(branch_names.len());
             for name in branch_names {
@@ -139,6 +152,20 @@ fn main(nb: &mut NotebookCtx) {
         let Some(mut ws) = st.workspace("local-messages") else { return };
         let mut relations = st.workspace("relations");
         panel.render(ctx, &mut ws, relations.as_mut());
+        st.push(&mut ws);
+    });
+
+    nb.state("discord", DiscordViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("discord") else { return };
+        panel.render(ctx, &mut ws);
+        st.push(&mut ws);
+    });
+
+    nb.state("teams", TeamsViewer::default(), move |ctx, panel| {
+        let mut st = storage.read_mut(ctx);
+        let Some(mut ws) = st.workspace("teams") else { return };
+        panel.render(ctx, &mut ws);
         st.push(&mut ws);
     });
 

@@ -59,7 +59,9 @@ use triblespace::prelude::View;
 use crate::schemas::compass::{
     board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
+use crate::schemas::archive::archive as archive_attrs;
 use crate::schemas::local_messages::{local as local_attrs, KIND_MESSAGE_ID};
+use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
 use crate::schemas::wiki::{attrs as wiki_attrs, KIND_VERSION_ID};
 
 /// Handle to a long-string blob (branch names, titles, bodies, notes).
@@ -182,6 +184,14 @@ pub enum TimelineSource {
     LocalMessages { label: String },
     /// Wiki — render fragment-version commits with title.
     Wiki { label: String },
+    /// Reason events — explicit reasoning notes the agent records
+    /// alongside the command it ran (cognition branch). Useful as
+    /// "thought before action" markers along the activity axis.
+    Reason { label: String },
+    /// Archive — externally imported conversation messages (archive
+    /// branch), so e.g. ChatGPT / Codex / Copilot history appears
+    /// inline with the rest of the timeline.
+    Archive { label: String },
 }
 
 /// Coarse kind used on the widget's `selected_event` and as a color key.
@@ -191,6 +201,8 @@ pub enum SourceKind {
     Compass,
     LocalMessages,
     Wiki,
+    Reason,
+    Archive,
 }
 
 impl TimelineSource {
@@ -200,7 +212,9 @@ impl TimelineSource {
             TimelineSource::Commits { label, .. }
             | TimelineSource::Compass { label }
             | TimelineSource::LocalMessages { label }
-            | TimelineSource::Wiki { label } => label.clone(),
+            | TimelineSource::Wiki { label }
+            | TimelineSource::Reason { label }
+            | TimelineSource::Archive { label } => label.clone(),
         }
     }
 
@@ -213,6 +227,10 @@ impl TimelineSource {
             TimelineSource::LocalMessages { .. } => egui::Color32::from_rgb(0x23, 0x7f, 0x52),
             // RAL 3012 beige red — matches playground color_wiki.
             TimelineSource::Wiki { .. } => egui::Color32::from_rgb(0xc1, 0x87, 0x6b),
+            // RAL 1003 signal yellow — reason events read as "agent thought".
+            TimelineSource::Reason { .. } => egui::Color32::from_rgb(0xf7, 0xba, 0x0b),
+            // RAL 5012 light blue — archived conversation messages.
+            TimelineSource::Archive { .. } => egui::Color32::from_rgb(0x3b, 0x83, 0xbd),
         }
     }
 }
@@ -289,6 +307,8 @@ impl MultiLive {
                     collect_local_events(idx, ws, &mut out)
                 }
                 TimelineSource::Wiki { .. } => collect_wiki_events(idx, ws, &mut out),
+                TimelineSource::Reason { .. } => collect_reason_events(idx, ws, &mut out),
+                TimelineSource::Archive { .. } => collect_archive_events(idx, ws, &mut out),
             }
         }
         out.sort_by_key(|e| e.ts_ns);
@@ -525,6 +545,88 @@ fn collect_wiki_events(
             entity_id: vid,
             ts_ns: ts.0,
             summary: preview(&title, 80),
+            status: None,
+            from_to: None,
+        });
+    }
+}
+
+/// Emit a Reason event per cognition-branch reason entity. Each
+/// entity has a long-string `text` payload (the agent's thought)
+/// and a created-at timestamp; the timeline chip shows the first
+/// line of the thought as its summary.
+fn collect_reason_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
+    let space = match ws.checkout(..) {
+        Ok(co) => co.into_facts(),
+        Err(e) => {
+            eprintln!("[timeline] reason checkout: {e:?}");
+            return;
+        }
+    };
+
+    let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
+        (rid: Id, text: TextHandle, ts: (i128, i128)),
+        pattern!(&space, [{
+            ?rid @
+            metadata::tag: &KIND_REASON_ID,
+            reason_attrs::text: ?text,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .collect();
+
+    for (rid, text_h, ts) in rows {
+        let text = read_text(ws, text_h);
+        out.push(Event {
+            source_idx: idx,
+            kind: SourceKind::Reason,
+            entity_id: rid,
+            ts_ns: ts.0,
+            summary: preview(&text, 80),
+            status: None,
+            from_to: None,
+        });
+    }
+}
+
+/// Emit an Archive event per externally imported conversation
+/// message (archive branch). Each archived message carries the
+/// same `kind_message` tag we use for local messages — we
+/// disambiguate by branch (the archive workspace is what's
+/// passed in here). The chip's summary line is the message
+/// `content`'s first line.
+fn collect_archive_events(idx: usize, ws: &mut Workspace<Pile>, out: &mut Vec<Event>) {
+    let space = match ws.checkout(..) {
+        Ok(co) => co.into_facts(),
+        Err(e) => {
+            eprintln!("[timeline] archive checkout: {e:?}");
+            return;
+        }
+    };
+
+    // archive::archive::kind_message is the canonical tag id for an
+    // archived message payload — same value the local-messages
+    // schema uses for KIND_MESSAGE_ID, since both faculties share
+    // the protocol-agnostic "this is a message" marker.
+    let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
+        (mid: Id, content: TextHandle, ts: (i128, i128)),
+        pattern!(&space, [{
+            ?mid @
+            metadata::tag: &archive_attrs::kind_message,
+            archive_attrs::content: ?content,
+            metadata::created_at: ?ts,
+        }])
+    )
+    .collect();
+
+    for (mid, content_h, ts) in rows {
+        let content = read_text(ws, content_h);
+        out.push(Event {
+            source_idx: idx,
+            kind: SourceKind::Archive,
+            entity_id: mid,
+            ts_ns: ts.0,
+            summary: preview(&content, 80),
             status: None,
             from_to: None,
         });

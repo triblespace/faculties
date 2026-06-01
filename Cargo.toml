@@ -80,6 +80,18 @@ name = "atlas-capture"
 path = "src/bin/atlas-capture.rs"
 required-features = ["widgets"]
 
+# Discord recent-messages viewer.
+[[bin]]
+name = "discord-capture"
+path = "src/bin/discord-capture.rs"
+required-features = ["widgets"]
+
+# Teams recent-messages viewer.
+[[bin]]
+name = "teams-capture"
+path = "src/bin/teams-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
