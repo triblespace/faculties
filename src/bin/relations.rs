@@ -62,6 +62,13 @@ enum Command {
         /// Email address
         #[arg(long)]
         email: Option<String>,
+        /// Create even if a relation with this label, alias, or email
+        /// already exists. Without this flag, `relations add` refuses
+        /// to mint a duplicate person entity — protects the knowledge
+        /// base from accidental forks when the same person gets touched
+        /// by multiple faculties (mail autoregister, manual add, etc.).
+        #[arg(long)]
+        force: bool,
     },
     /// Update a person
     Set {
@@ -307,6 +314,24 @@ fn find_people_by_lookup_key(space: &TribleSet, key: &str) -> HashSet<Id> {
     .collect()
 }
 
+/// Find people whose `email` attribute matches `email_norm` (case-folded
+/// comparison). Used by `relations add` to refuse minting a duplicate
+/// person entity when the same email already lives on another relation —
+/// otherwise mail autoregister + manual add ends up forking the same
+/// person across two ids.
+fn find_people_by_email_norm(space: &TribleSet, email_norm: &str) -> HashSet<Id> {
+    find!(
+        (person_id: Id, email: String),
+        pattern!(space, [{ ?person_id @
+            metadata::tag: &KIND_PERSON_ID,
+            relations::email: ?email,
+        }])
+    )
+    .filter(|(_, email)| email.to_ascii_lowercase() == email_norm)
+    .map(|(id, _)| id)
+    .collect()
+}
+
 fn cmd_add(
     pile: &Path,
     _branch_name: &str,
@@ -321,6 +346,7 @@ fn cmd_add(
     aliases: Vec<String>,
     teams_user_id: Option<String>,
     email: Option<String>,
+    force: bool,
 ) -> Result<()> {
     let label = normalize_label(&label)?;
     let label_lookup = normalize_lookup_key(&label)?;
@@ -328,6 +354,10 @@ fn cmd_add(
         Some(raw) => parse_hex_id(&raw, "person id")?,
         None => ufoid().id,
     };
+    let email_norm = email
+        .as_deref()
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty());
 
     with_repo(pile, |repo| {
         let mut ws = repo
@@ -339,21 +369,43 @@ fn cmd_add(
         let aliases = normalize_aliases(aliases);
         let alias_lookup = normalize_alias_lookup_keys(&aliases);
 
-        for existing in find_people_by_lookup_key(&space, &label_lookup) {
-            if existing != person_id {
-                bail!(
-                    "lookup key '{label_lookup}' already belongs to person {}",
-                    fmt_id(existing)
-                );
-            }
-        }
-        for key in &alias_lookup {
-            for existing in find_people_by_lookup_key(&space, key) {
+        if !force {
+            for existing in find_people_by_lookup_key(&space, &label_lookup) {
                 if existing != person_id {
                     bail!(
-                        "lookup key '{key}' already belongs to person {}",
-                        fmt_id(existing)
+                        "label/alias '{label_lookup}' already belongs to relation {} \
+                         — use `relations set {} --label '{label}' …` to update it, \
+                         or pass --force to mint a duplicate",
+                        fmt_id(existing),
+                        fmt_id(existing),
                     );
+                }
+            }
+            for key in &alias_lookup {
+                for existing in find_people_by_lookup_key(&space, key) {
+                    if existing != person_id {
+                        bail!(
+                            "label/alias '{key}' already belongs to relation {} \
+                             — use `relations set {} --alias '{key}' …` to update it, \
+                             or pass --force to mint a duplicate",
+                            fmt_id(existing),
+                            fmt_id(existing),
+                        );
+                    }
+                }
+            }
+            if let Some(email_norm) = &email_norm {
+                for existing in find_people_by_email_norm(&space, email_norm) {
+                    if existing != person_id {
+                        bail!(
+                            "email '{email_norm}' already belongs to relation {} \
+                             — use `relations set {} --label '{label}' …` \
+                             to attach this label to the existing entry, \
+                             or pass --force to mint a duplicate",
+                            fmt_id(existing),
+                            fmt_id(existing),
+                        );
+                    }
                 }
             }
         }
@@ -597,6 +649,7 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            force,
         } => cmd_add(
             &cli.pile,
             &cli.branch,
@@ -611,6 +664,7 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            force,
         ),
         Command::Set {
             id,

@@ -83,15 +83,24 @@ enum Command {
     /// linked `decide` decision that must be resolved before
     /// `mail send` will transmit. Prints both the draft id and the
     /// decision id (use the latter with `decide pro/con/resolve`).
+    ///
+    /// Recipients are relation references — comma-separated hex
+    /// prefixes that resolve against the relations branch. The
+    /// faculty refuses raw email strings: if you want to send mail
+    /// to someone, they should exist as a relation first. Run
+    /// `relations list` to find an existing person or
+    /// `relations add 'Name' --email <addr>` to record a new one.
     Draft {
-        /// Comma-separated TO recipients.
+        /// Comma-separated relation hex prefixes (TO).
         to: String,
         /// Subject line.
         subject: String,
         /// Body text. `@path` for file, `@-` for stdin.
         body: String,
+        /// Relation hex prefix for CC (repeatable).
         #[arg(long)]
         cc: Vec<String>,
+        /// Relation hex prefix for BCC (repeatable).
         #[arg(long)]
         bcc: Vec<String>,
     },
@@ -442,6 +451,75 @@ fn parse_address_list(input: &str) -> Result<Vec<Address>> {
         }
     }
     Ok(out)
+}
+
+/// Resolve a relation hex prefix to a single relation id by scanning
+/// `KIND_PERSON_ID` entries and matching the leading hex of each id.
+/// Used by `mail draft` to refuse free-floating email strings: the
+/// operator names a relation, we resolve to its entity id, and the
+/// recipient becomes a first-class part of the knowledge base. Errors
+/// distinguish "no match" (user needs to `relations add` first) from
+/// "ambiguous" (user needs more characters of the prefix).
+fn resolve_relation_prefix(space: &TribleSet, prefix: &str) -> Result<Id> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        bail!("relation prefix is empty");
+    }
+    let needle = trimmed.to_ascii_lowercase();
+    if !needle.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!(
+            "'{trimmed}' is not a hex prefix. \
+             `mail draft` takes relation references, not email \
+             addresses — see `relations list` for existing relations \
+             or `relations add 'Name' --email <addr>` to record a \
+             new one"
+        );
+    }
+    let matches: Vec<Id> = find!(
+        id: Id,
+        pattern!(space, [{ ?id @ metadata::tag: KIND_PERSON_ID }])
+    )
+    .filter(|id| format!("{id:x}").starts_with(&needle))
+    .collect();
+    match matches.len() {
+        0 => bail!(
+            "no relation matches prefix '{trimmed}'. Run \
+             `relations add 'Name' --email <addr>` to record them \
+             first, then redraft"
+        ),
+        1 => Ok(matches[0]),
+        n => bail!(
+            "prefix '{trimmed}' is ambiguous ({n} relations match) — \
+             use more characters or `relations list` to disambiguate"
+        ),
+    }
+}
+
+/// Look up the email attribute on a relation. Returns an error if
+/// missing because `mail draft` can't construct an RFC 5322 envelope
+/// without an address — operator should set the email via
+/// `relations set <id> --email <addr>` first.
+fn relation_email_required(space: &TribleSet, id: Id) -> Result<String> {
+    find!(e: String, pattern!(space, [{ id @ rel_attrs::email: ?e }]))
+        .next()
+        .ok_or_else(|| anyhow::anyhow!(
+            "relation {id:x} has no email attribute set — \
+             `relations set {id:x} --email <addr>` to add one"
+        ))
+}
+
+/// Look up an optional display label for the relation (metadata::name).
+/// Returns `None` if the relation has no human-readable label set yet
+/// — autoregistered relations from incoming mail commonly do.
+fn relation_label(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
+    let handle = find!(
+        h: Inline<inlineencodings::Handle<blobencodings::LongString>>,
+        pattern!(space, [{ id @ metadata::name: ?h }])
+    )
+    .next()?;
+    ws.get::<View<str>, blobencodings::LongString>(handle)
+        .ok()
+        .map(|v| v.to_string())
 }
 
 /// Look up an existing relations entry by email (case-folded). Returns
@@ -1048,20 +1126,12 @@ fn cmd_draft(
     let body_text = load_value_or_file(&body, "body")?;
     let config = load_config()?;
 
-    let to_addrs: Vec<Address> = to
+    let to_raw: Vec<String> = to
         .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(parse_address)
-        .collect::<Result<_>>()?;
-    let cc_addrs: Vec<Address> = cc
-        .into_iter()
-        .map(|s| parse_address(&s))
-        .collect::<Result<_>>()?;
-    let bcc_addrs: Vec<Address> = bcc
-        .into_iter()
-        .map(|s| parse_address(&s))
-        .collect::<Result<_>>()?;
-    if to_addrs.is_empty() {
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if to_raw.is_empty() {
         bail!("no TO recipients");
     }
 
@@ -1070,25 +1140,51 @@ fn cmd_draft(
     let message_id = synthesize_message_id(&seed);
     let bare_id = message_id.trim_matches(|c| c == '<' || c == '>').to_string();
 
-    let parsed = ParsedMail {
-        message_id: bare_id.clone(),
-        from: Some(Address {
-            name: Some(config.from_name.clone()),
-            email: config.user.clone(),
-        }),
-        to: to_addrs,
-        cc: cc_addrs,
-        bcc: bcc_addrs,
-        subject: subject.clone(),
-        body: body_text,
-        sent_at: now, // ignored by persist_message when as_draft=true
-        in_reply_to: Vec::new(),
-        references: Vec::new(),
-        is_spam: false,
-        raw: Vec::new(), // ignored by persist_message when as_draft=true
-        attachments: Vec::new(),
-    };
     let (draft_id, decision_id) = with_repo(pile, |repo| {
+        // Resolve TO/CC/BCC from relation prefixes against the relations
+        // branch. `mail draft` no longer accepts raw email strings —
+        // every recipient must be a first-class relation entity. The
+        // Address structs we synthesize below carry the relation's
+        // canonical email + label, which `resolve_or_register` (called
+        // from persist_message) then short-circuits on for the email
+        // match, so no new relation entities get minted.
+        let (to_addrs, cc_addrs, bcc_addrs) = {
+            let mut ws = repo
+                .pull(relations_branch_id)
+                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+            let space = ws.checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+            let mut resolve = |raw: &str| -> Result<Address> {
+                let id = resolve_relation_prefix(&space, raw)?;
+                let email = relation_email_required(&space, id)?;
+                let name = relation_label(&mut ws, &space, id);
+                Ok(Address { name, email })
+            };
+            let to_addrs: Vec<Address> = to_raw.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
+            let cc_addrs: Vec<Address> = cc.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
+            let bcc_addrs: Vec<Address> = bcc.iter().map(|s| resolve(s)).collect::<Result<_>>()?;
+            (to_addrs, cc_addrs, bcc_addrs)
+        };
+
+        let parsed = ParsedMail {
+            message_id: bare_id.clone(),
+            from: Some(Address {
+                name: Some(config.from_name.clone()),
+                email: config.user.clone(),
+            }),
+            to: to_addrs,
+            cc: cc_addrs,
+            bcc: bcc_addrs,
+            subject: subject.clone(),
+            body: body_text,
+            sent_at: now, // ignored by persist_message when as_draft=true
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
+            is_spam: false,
+            raw: Vec::new(), // ignored by persist_message when as_draft=true
+            attachments: Vec::new(),
+        };
+
         let draft_id = persist_message(
             repo,
             mail_branch_id,
