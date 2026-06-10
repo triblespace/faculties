@@ -666,16 +666,47 @@ fn load_watched_view(
     })
 }
 
-/// Is there news in `new` relative to `old`? Unread and roster are
-/// growth-only: a message leaving the unread set (the persona acked
-/// it) is not news, an arriving message is; a NEW person is news,
-/// enrichment of an existing entry is not (so another zooid's
-/// multi-commit contact-editing burst wakes at most once). Goals
-/// wake on any id:status change.
-fn view_has_news(old: &WatchedView, new: &WatchedView) -> bool {
-    new.unread.difference(&old.unread).next().is_some()
-        || old.goals_view != new.goals_view
-        || new.roster.difference(&old.roster).next().is_some()
+/// What news is in `new` relative to `old`? Returns one line per
+/// item, empty = no news. Unread and roster are growth-only: a
+/// message leaving the unread set (the persona acked it) is not
+/// news, an arriving message is; a NEW person is news, enrichment
+/// of an existing entry is not (so another zooid's multi-commit
+/// contact-editing burst wakes at most once). Goals wake on any
+/// id:status change — and the reason line names the goal, so the
+/// woken agent doesn't have to diff 1700 goals by hand.
+fn view_news(old: &WatchedView, new: &WatchedView) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for msg in new.unread.difference(&old.unread) {
+        reasons.push(format!("new message [{}]", fmt_id(*msg)));
+    }
+    let parse = |view: &str| -> HashMap<String, String> {
+        view.lines()
+            .filter_map(|line| {
+                line.split_once(':')
+                    .map(|(id, status)| (id.to_owned(), status.to_owned()))
+            })
+            .collect()
+    };
+    let old_goals = parse(&old.goals_view);
+    let new_goals = parse(&new.goals_view);
+    for (id, status) in &new_goals {
+        match old_goals.get(id) {
+            None => reasons.push(format!("new goal [{id}] ({status})")),
+            Some(prev) if prev != status => {
+                reasons.push(format!("goal [{id}]: {prev} → {status}"))
+            }
+            _ => {}
+        }
+    }
+    for id in old_goals.keys() {
+        if !new_goals.contains_key(id) {
+            reasons.push(format!("goal [{id}] gone"));
+        }
+    }
+    for person in new.roster.difference(&old.roster) {
+        reasons.push(format!("new person [{}]", fmt_id(*person)));
+    }
+    reasons
 }
 
 fn load_checkpoint_heads(
@@ -1008,7 +1039,11 @@ fn cmd_wait(
                     relations_branch_id,
                 )?;
                 if let Some(seen) = load_checkpoint_view(repo, orient_state_branch_id, pid)? {
-                    if view_has_news(&seen, &view) {
+                    let reasons = view_news(&seen, &view);
+                    if !reasons.is_empty() {
+                        for reason in &reasons {
+                            println!("News: {reason}");
+                        }
                         return Ok((true, true));
                     }
                 }
@@ -1052,7 +1087,11 @@ fn cmd_wait(
                         compass_branch_id,
                         relations_branch_id,
                     )?;
-                    if view_has_news(view, &current_view) {
+                    let reasons = view_news(view, &current_view);
+                    if !reasons.is_empty() {
+                        for reason in &reasons {
+                            println!("News: {reason}");
+                        }
                         return Ok((false, true));
                     }
                     // Movement without news (own ack/send, another
