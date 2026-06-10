@@ -223,6 +223,14 @@ echo "    6 goals created"
 # error) or the wiki/compass faculty changes shape — the script
 # would otherwise exit 0 with a partial pile.
 echo
+# Forward references (the tour graph is cyclic) get no links_to edge at
+# create time — the target doesn't exist yet to classify. One lint --fix
+# pass rebuilds the link index now that every fragment exists.
+echo "==> Rebuilding link index"
+"$WIKI" lint --fix >/dev/null 2>&1 || true
+"$WIKI" lint --check >/dev/null 2>&1 || { echo "    FAIL: lint not clean after relink" >&2; exit 1; }
+echo "    OK: lint clean"
+
 echo "==> Sanity check"
 # Bump these when adding/removing entries above.
 EXPECTED_FRAGMENTS=19
