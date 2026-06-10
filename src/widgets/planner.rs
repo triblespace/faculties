@@ -734,6 +734,14 @@ fn render_week_grid(
     // isn't in the visible week or when the current time is
     // outside the rendered hour rail.
     if today >= monday && today < monday + ChronoDuration::days(7) {
+        // Keep the line moving without input events: egui repaints
+        // only on interaction by default, so the wall-clock marker
+        // froze until the mouse moved. At PX_PER_HOUR=18 the line
+        // moves ~1px every 3 minutes — a 60s heartbeat is already
+        // generous and costs nothing.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(60));
+
         let now = Utc::now();
         let now_hour_f = now.hour() as f32 + now.minute() as f32 / 60.0;
         if now_hour_f >= HOUR_START as f32 && now_hour_f <= HOUR_END as f32 {

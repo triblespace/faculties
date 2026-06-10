@@ -952,6 +952,16 @@ impl BranchTimeline {
         // so the viewer can orient immediately. Only painted when
         // `now` falls inside the visible window.
         if now >= view_end && now <= view_start {
+            // egui only repaints on input events, which froze the
+            // marker until the mouse moved. Schedule a repaint for
+            // when the marker will have travelled ~1px at the current
+            // zoom, clamped to [1s, 60s] so a zoomed-out idle viewer
+            // doesn't busy-spin and a zoomed-in one still glides.
+            let secs_per_px = (ns_per_px / 1e9).clamp(1.0, 60.0);
+            painter
+                .ctx()
+                .request_repaint_after(std::time::Duration::from_secs_f64(secs_per_px));
+
             let y = viewport_rect.top()
                 + ((view_start - now) as f64 / ns_per_px) as f32;
             let now_color = egui::Color32::from_rgb(0xf7, 0xba, 0x0b); // RAL 1003
