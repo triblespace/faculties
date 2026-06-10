@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.20.1 — 2026-06-10
+
+- **Re-bundle `trible` CLI at 0.46.3** (release tarballs pull latest
+  from crates.io at build time). The v0.20.0 tarballs shipped trible
+  0.46.0, which predates two join-handshake fixes:
+  - CapDeliveryConfirmed lookup matches by sig handle, not cap
+    handle (0.46.1) — `team request-join` confirmation no longer
+    misses.
+  - `team approve` + remaining team subcommands route through
+    `with_pile` so `close()` runs on every exit path (0.46.3).
+  No faculty-side code changes.
+- **wiki: unknown tag in `list --tag` matches zero fragments**
+  instead of silently degrading to an unfiltered listing. Same for
+  `--with-backlink-tag`; unknown tags in `--without-backlink-tag`
+  still correctly exclude nothing.
+- **bootstrap: substrate-concepts trio** — three new onboarding
+  fragments (Substrate 1/3 tribles, 2/3 pile, 3/3 monotonic merge)
+  covering the "why does this work" layer behind the workflow
+  fragments. Indexed from Getting Started; fragment count 16 → 19.
+
 ## 0.20.0 — 2026-06-05
 
 - **Bump `triblespace` 0.45 → 0.46 and `GORBIE` 0.17 → 0.18.**
