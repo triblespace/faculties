@@ -308,12 +308,15 @@ fn resolve_tag(
             }
         }
     }
-    // Not found — mint a new tag.
-    let tag_id = genid();
-    let tag_ref = tag_id.id;
+    // Not found — mint deterministically: the tag entity's id is
+    // content-derived from its (lowercased) name, so the same tag
+    // name mints the same id in every pile, and vocabularies
+    // converge on merge instead of forking.
     let name_handle = ws.put(name.to_lowercase());
-    *change += entity! { &tag_id @ metadata::name: name_handle };
-    tag_ref
+    let tag = entity! { _ @ metadata::name: name_handle };
+    let tag_id = tag.root().expect("tag should be rooted");
+    *change += tag;
+    tag_id
 }
 
 /// Resolve a list of tag names to IDs, minting unknown ones.
@@ -1212,17 +1215,24 @@ fn commit_version(
 
     let title_handle = ws.put(title.to_owned());
 
-    // Create the version entity. Edges (links_to + derived typed attrs) are
-    // added separately after we know the version's ID.
+    // Create the version entity. Only the stable identity — fragment,
+    // title, content — feeds the intrinsic id, so the same source always
+    // mints the same version id (reproducible pile builds; re-creating
+    // identical content dedups instead of duplicating). The volatile
+    // metadata (timestamp, tags — tags are mutable via `wiki tag` and
+    // tag ids are minted per pile) merges onto the id afterwards.
+    // Edges (links_to + derived typed attrs) likewise follow below.
     let version = entity! { _ @
         wiki::fragment: &fragment_id,
         wiki::title: title_handle,
         wiki::content: content,
-        metadata::created_at: now_tai(),
-        metadata::tag*: tag_ids.iter(),
     };
     let version_id = version.root().expect("version should be rooted");
     change += version;
+    change += entity! { ExclusiveId::force_ref(&version_id) @
+        metadata::created_at: now_tai(),
+        metadata::tag*: tag_ids.iter(),
+    };
 
     let edges = extract_references(content_text.as_ref(), space, version_id);
 
