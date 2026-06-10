@@ -121,7 +121,25 @@ fn normalize_label(label: &str) -> Result<String> {
     if trimmed.is_empty() {
         bail!("label is empty");
     }
+    validate_short(trimmed, "label")?;
     Ok(trimmed.to_string())
+}
+
+/// ShortString fields live inline in the 32-byte value slot; anything
+/// longer must go in `--note` (LongString). Bail with the limit named
+/// instead of panicking in the encoder.
+fn validate_short(value: &str, field: &str) -> Result<()> {
+    let len = value.len();
+    if len > 32 {
+        bail!(
+            "{field} is {len} bytes but ShortString fields hold at most 32 — \
+             shorten it or move the detail into --note"
+        );
+    }
+    if value.bytes().any(|b| b == 0) {
+        bail!("{field} contains a NUL byte");
+    }
+    Ok(())
 }
 
 fn normalize_lookup_key(value: &str) -> Result<String> {
@@ -350,6 +368,18 @@ fn cmd_add(
 ) -> Result<()> {
     let label = normalize_label(&label)?;
     let label_lookup = normalize_lookup_key(&label)?;
+    for (value, field) in [
+        (affinity.as_deref(), "affinity"),
+        (teams_user_id.as_deref(), "teams-user-id"),
+        (email.as_deref(), "email"),
+    ] {
+        if let Some(v) = value {
+            validate_short(v, field)?;
+        }
+    }
+    for alias in &aliases {
+        validate_short(alias, "alias")?;
+    }
     let person_id = match id {
         Some(raw) => parse_hex_id(&raw, "person id")?,
         None => ufoid().id,
@@ -456,6 +486,18 @@ fn cmd_set(
 ) -> Result<()> {
     let label = label.map(|l| normalize_label(&l)).transpose()?;
     let label_lookup = label.as_deref().map(normalize_lookup_key).transpose()?;
+    for (value, field) in [
+        (affinity.as_deref(), "affinity"),
+        (teams_user_id.as_deref(), "teams-user-id"),
+        (email.as_deref(), "email"),
+    ] {
+        if let Some(v) = value {
+            validate_short(v, field)?;
+        }
+    }
+    for alias in &aliases {
+        validate_short(alias, "alias")?;
+    }
 
     let person_id = with_repo(pile, |repo| {
         let mut ws = repo
