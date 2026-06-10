@@ -2196,18 +2196,28 @@ fn cmd_list(
 ) -> Result<()> {
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let filter_ids: Vec<Id> = filter_tags
-        .iter()
-        .filter_map(|name| {
-            let name = name.trim().to_lowercase();
-            find_tag_by_name(&space, &mut ws, &name)
-        })
-        .collect();
+    // A tag name that doesn't resolve to a tag entity matches zero fragments.
+    // Silently dropping it (filter_map) would degrade the filter to "no
+    // filter" and list everything — so unknown positive filters short-circuit
+    // to an empty listing instead.
+    let mut filter_ids: Vec<Id> = Vec::new();
+    for name in &filter_tags {
+        let name = name.trim().to_lowercase();
+        match find_tag_by_name(&space, &mut ws, &name) {
+            Some(id) => filter_ids.push(id),
+            None => return Ok(()),
+        }
+    }
 
-    let with_bl_ids: Vec<Id> = with_backlink_tag
-        .iter()
-        .filter_map(|name| find_tag_by_name(&space, &mut ws, &name.trim().to_lowercase()))
-        .collect();
+    let mut with_bl_ids: Vec<Id> = Vec::new();
+    for name in &with_backlink_tag {
+        match find_tag_by_name(&space, &mut ws, &name.trim().to_lowercase()) {
+            Some(id) => with_bl_ids.push(id),
+            None => return Ok(()),
+        }
+    }
+    // Unknown tags in the *negative* filter exclude nothing, so dropping
+    // them is the correct semantics here.
     let without_bl_ids: Vec<Id> = without_backlink_tag
         .iter()
         .filter_map(|name| find_tag_by_name(&space, &mut ws, &name.trim().to_lowercase()))
