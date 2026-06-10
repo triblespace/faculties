@@ -8,8 +8,8 @@
 //! ```sh
 //! cargo install faculties --features widgets
 //! faculties-viewer ./self.pile
-//! # or set PILE=./self.pile in the environment;
-//! # --pile <path> overrides both, like every other faculty
+//! # or set PILE=./self.pile in the environment; anything passed
+//! # on the command line (--pile <path> or positional) beats it
 //! ```
 //!
 //! This mirrors `examples/pile_inspector.rs`; the example is kept as
@@ -30,26 +30,41 @@ use GORBIE::notebook;
 use GORBIE::prelude::*;
 
 fn resolve_pile_path() -> PathBuf {
-    // Precedence: --pile > PILE env > positional > ./self.pile.
-    // Explicit --pile matches the clap faculties (flag beats env).
-    // The positional slot stays weakest because #[notebook] flags
-    // (`--out-dir <path>`, etc.) put path-shaped values in argv
-    // that the bare token scan below would misread.
-    let mut argv = std::env::args().skip(1);
+    // Precedence: --pile > positional > PILE env > ./self.pile —
+    // anything explicit on the command line beats the ambient env.
+    // The scan skips the values of value-taking flags (#[notebook]'s
+    // `--out-dir <path>`, etc.) so they can't be misread as the
+    // positional pile path.
+    const VALUE_FLAGS: &[&str] = &[
+        "--pile",
+        "--out-dir",
+        "--export-dir",
+        "--scale",
+        "--headless-wait-ms",
+    ];
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut flagged = None;
-    while let Some(a) = argv.next() {
+    let mut positional = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
         if a == "--pile" {
-            flagged = argv.next();
-            break;
+            flagged = args.get(i + 1).cloned();
+            i += 2;
+            continue;
         }
+        if VALUE_FLAGS.contains(&a) {
+            i += 2; // skip the flag's value token
+            continue;
+        }
+        if !a.starts_with("--") && positional.is_none() {
+            positional = Some(args[i].clone());
+        }
+        i += 1;
     }
     flagged
+        .or(positional)
         .or_else(|| std::env::var("PILE").ok())
-        .or_else(|| {
-            std::env::args()
-                .skip(1)
-                .find(|a| !a.starts_with("--"))
-        })
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into()
 }
