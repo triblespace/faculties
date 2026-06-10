@@ -38,6 +38,11 @@ struct Cli {
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]
     pile: PathBuf,
+    /// Persona identity for the local-messages inbox (relations label or
+    /// 32-char hex id). Per-process so multiple agents can share one pile
+    /// under distinct identities; falls back to the pile-config persona_id.
+    #[arg(long, env = "PERSONA")]
+    persona: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -413,8 +418,34 @@ fn load_config_identity(
     Ok(ConfigIdentity { persona_id })
 }
 
+/// Resolve a persona given as 32-char hex id or a relations label/alias
+/// (matched against the pre-normalized `label_norm` / `alias_norm` fields,
+/// same semantics as `local_messages`).
+fn resolve_persona(relations_space: &TribleSet, input: &str) -> Result<Id> {
+    let trimmed = input.trim();
+    if let Some(id) = Id::from_hex(trimmed) {
+        return Ok(id);
+    }
+    let key = trimmed.to_ascii_lowercase();
+    let matches: Vec<Id> = find!(
+        person_id: Id,
+        pattern!(relations_space, [{ ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID }])
+    )
+    .filter(|&person_id| {
+        exists!(pattern!(relations_space, [{ person_id @ rel_attrs::label_norm: key.as_str() }]))
+            || exists!(pattern!(relations_space, [{ person_id @ rel_attrs::alias_norm: key.as_str() }]))
+    })
+    .collect();
+    match matches.len() {
+        0 => bail!("unknown persona label '{trimmed}' (no relations entry; try the hex id)"),
+        1 => Ok(matches[0]),
+        _ => bail!("multiple relations entries match persona label '{trimmed}'"),
+    }
+}
+
 fn cmd_show(
     pile: &Path,
+    persona: Option<&str>,
     message_limit: usize,
     doing_limit: usize,
     todo_limit: usize,
@@ -451,8 +482,23 @@ fn cmd_show(
 
         let now_key = interval_key(epoch_interval(now_epoch()));
 
+        // Per-process persona (flag / $PERSONA) wins over pile config:
+        // multiple agents share one pile but must not share one identity.
+        let effective_persona = match persona {
+            Some(input) => {
+                let mut relations_ws = repo
+                    .pull(relations_branch_id)
+                    .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
+                let relations_space = relations_ws
+                    .checkout(..)
+                    .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+                Some(resolve_persona(&relations_space, input)?)
+            }
+            None => config_identity.persona_id,
+        };
+
         println!("Orient");
-        match config_identity.persona_id {
+        match effective_persona {
             Some(reader_id) => {
                 let mut relations_ws = repo
                     .pull(relations_branch_id)
@@ -500,7 +546,7 @@ fn cmd_show(
             None => {
                 println!("Local messages:");
                 println!(
-                    "- Unavailable: missing persona_id in config (set via `playground config set persona-id <hex-id>`)"
+                    "- Unavailable: no persona (pass --persona <label-or-hex>, set $PERSONA, or `playground config set persona-id <hex-id>`)"
                 );
             }
         }
@@ -784,6 +830,7 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
 
 fn cmd_wait(
     pile: &Path,
+    persona: Option<&str>,
     target: Option<WaitTarget>,
     message_limit: usize,
     doing_limit: usize,
@@ -846,7 +893,7 @@ fn cmd_wait(
     if !changed {
         println!("No change detected since wait started; showing current snapshot.");
     }
-    cmd_show(pile, message_limit, doing_limit, todo_limit)
+    cmd_show(pile, persona, message_limit, doing_limit, todo_limit)
 }
 
 fn render_tags(tags: &[String]) -> String {
@@ -914,7 +961,13 @@ fn main() -> Result<()> {
             message_limit,
             doing_limit,
             todo_limit,
-        } => cmd_show(&cli.pile, message_limit, doing_limit, todo_limit),
+        } => cmd_show(
+            &cli.pile,
+            cli.persona.as_deref(),
+            message_limit,
+            doing_limit,
+            todo_limit,
+        ),
         Command::Wait {
             target,
             message_limit,
@@ -923,6 +976,7 @@ fn main() -> Result<()> {
             poll_ms,
         } => cmd_wait(
             &cli.pile,
+            cli.persona.as_deref(),
             target,
             message_limit,
             doing_limit,
