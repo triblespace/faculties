@@ -40,7 +40,7 @@ struct Cli {
     pile: PathBuf,
     /// Persona identity for the local-messages inbox (relations label or
     /// 32-char hex id). Per-process so multiple agents can share one pile
-    /// under distinct identities; falls back to the pile-config persona_id.
+    /// under distinct identities.
     #[arg(long, env = "PERSONA")]
     persona: Option<String>,
     #[command(subcommand)]
