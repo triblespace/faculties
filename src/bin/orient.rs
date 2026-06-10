@@ -604,7 +604,7 @@ fn load_watched_heads(
 struct WatchedView {
     unread: std::collections::BTreeSet<Id>,
     goals_view: String,
-    relations: Option<CommitHandle>,
+    roster: std::collections::BTreeSet<Id>,
 }
 
 fn load_watched_view(
@@ -645,23 +645,37 @@ fn load_watched_view(
     goal_lines.sort();
     let goals_view = goal_lines.join("\n");
 
-    let relations = branch_head_by_id(repo, relations_branch_id)?;
+    let mut relations_ws = repo
+        .pull(relations_branch_id)
+        .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
+    let relations_space = relations_ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+    let roster: std::collections::BTreeSet<Id> = find!(
+        person_id: Id,
+        pattern!(&relations_space, [{
+            ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID
+        }])
+    )
+    .collect();
 
     Ok(WatchedView {
         unread,
         goals_view,
-        relations,
+        roster,
     })
 }
 
-/// Is there news in `new` relative to `old`? Unread is growth-only:
-/// a message leaving the unread set (the persona acked it) is not
-/// news, a message arriving is. Goals and relations wake on any
-/// change.
+/// Is there news in `new` relative to `old`? Unread and roster are
+/// growth-only: a message leaving the unread set (the persona acked
+/// it) is not news, an arriving message is; a NEW person is news,
+/// enrichment of an existing entry is not (so another zooid's
+/// multi-commit contact-editing burst wakes at most once). Goals
+/// wake on any id:status change.
 fn view_has_news(old: &WatchedView, new: &WatchedView) -> bool {
     new.unread.difference(&old.unread).next().is_some()
         || old.goals_view != new.goals_view
-        || old.relations != new.relations
+        || new.roster.difference(&old.roster).next().is_some()
 }
 
 fn load_checkpoint_heads(
@@ -774,13 +788,16 @@ fn load_checkpoint_view(
     .map(|h| read_text(&mut ws, h))
     .transpose()?
     .unwrap_or_default();
-    let relations =
-        load_optional_commit_head(&space, checkpoint_id, &orient_state::relations_head);
+    let roster: std::collections::BTreeSet<Id> = find!(
+        person: Id,
+        pattern!(&space, [{ checkpoint_id @ orient_state::roster_member: ?person }])
+    )
+    .collect();
 
     Ok(Some(WatchedView {
         unread,
         goals_view,
-        relations,
+        roster,
     }))
 }
 
@@ -810,6 +827,7 @@ fn save_checkpoint_heads(
             orient_state::persona: &persona_id,
             orient_state::goals_view: goals_handle,
             orient_state::unread_msg*: view.unread.iter(),
+            orient_state::roster_member*: view.roster.iter(),
         };
     }
 

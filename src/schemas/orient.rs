@@ -67,5 +67,6 @@ pub mod orient_state {
         "AE16414EE1D15DBAC9DF44F77A742E0A" as persona: inlineencodings::GenId;
         "174944957EC01DF2C10D470DBCE4263F" as unread_msg: inlineencodings::GenId;
         "7D7D457CA0184919497E2585CF779125" as goals_view: inlineencodings::Handle<blobencodings::LongString>;
+        "5D3327421EB2F0D92FD50CF32D5A513C" as roster_member: inlineencodings::GenId;
     }
 }
