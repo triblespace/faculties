@@ -78,9 +78,9 @@ fn main(nb: &mut NotebookCtx) {
         // collapsed so the initial view is a scannable list of
         // section headers instead of kilometres of open cards. A
         // user's toggle is persisted per section and wins over this
-        // default on subsequent runs. (The *-capture bins don't set
-        // this, so headless screenshots still render open.)
-        GORBIE::card_ctx::set_default_section_open(ctx.ctx(), false);
+        // default on later runs; headless captures ignore it and
+        // always render sections open.
+        ctx.set_default_section_open(false);
         st.top_bar(ctx);
     });
 
