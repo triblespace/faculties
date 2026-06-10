@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.20.2 — 2026-06-10
+
+- **Re-bundle `trible` CLI at 0.46.4** — publisher-first sync fix
+  (closure walks no longer stall on unreachable DHT; the announcing
+  peer is used directly), validated by the new deterministic sim
+  suite upstream. This is the release that makes multi-peer sync
+  work out of the tarball.
+- **wiki: deterministic version + tag ids** — version ids minted from
+  (fragment, title, content); tag ids content-derived from the
+  lowercased name. Identical content converges across piles on merge
+  instead of forking. `create --id <hex>` for pre-minted stable
+  fragment ids; `--force` tolerates dangling links at write time.
+- **bootstrap pile: fully-linked tour** — stable fragment ids, hub +
+  next-stop navigation spine (0 orphans), new "Substrate 4/4: The
+  Architecture — Zero Sync Code" fragment, substrate trio numbering
+  1/4..4/4, codex fragment dropped (provider-specific advice removed
+  from a provider-agnostic pile).
+- **orient: per-process persona** — `--persona <label-or-hex>` /
+  `$PERSONA` env; the pile-config persona path is removed (multiple
+  agents share one pile but must not share one identity).
+- **faculties-viewer**: widgets for every data-bearing faculty,
+  reason+archive in the activity timeline, live NOW markers,
+  sections start collapsed (headless captures force-open),
+  `--pile` flag precedence: --pile > positional > PILE env > default.
+- **mail/decide: i128::MIN negation overflow fixed** in sort keys.
+- **GORBIE dependency: 0.18.1 from crates.io** — the temporary
+  [patch.crates-io] path override is removed; `cargo install --git`
+  works from any clone again.
+
 ## 0.20.1 — 2026-06-10
 
 - **Re-bundle `trible` CLI at 0.46.3** (release tarballs pull latest
