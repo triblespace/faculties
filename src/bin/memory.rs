@@ -6,7 +6,7 @@ use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::memory::{
     DEFAULT_ARCHIVE_BRANCH, DEFAULT_COGNITION_BRANCH, DEFAULT_MEMORY_BRANCH, KIND_ARCHIVE_MESSAGE,
-    KIND_CHUNK_ID, KIND_EXEC_RESULT, archive_import_schema, archive_schema, ctx,
+    KIND_CHUNK_ID, KIND_EXEC_RESULT, archive_import_schema, archive_schema, comb, ctx,
 };
 use hifitime::Epoch;
 use rand_core::OsRng;
@@ -28,6 +28,8 @@ use triblespace::prelude::*;
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory respan <id> <from>..<to>  — correct a chunk's span (new chunk supersedes old; views exclude old)\n  \
              memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
+             memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
+             memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
              Time format: YYYY-MM-DDTHH:MM:SS..YYYY-MM-DDTHH:MM:SS (TAI)\n\
              Hex id prefixes also accepted as fallback."
@@ -230,6 +232,12 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "provenance") {
         return cmd_provenance(&cli.pile, &cli.ids[1..]);
     }
+    if cli.ids.first().is_some_and(|value| value == "consolidate") {
+        return cmd_consolidate(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "replay") {
+        return cmd_replay(&cli.pile, &cli.ids[1..]);
+    }
 
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref())?;
     with_repo(&cli.pile, |repo| {
@@ -317,78 +325,363 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
 
-    // Hard references: [context](memory:<hex>) → ctx::reference facts.
-    // Resolved against the catalog so a dangling hard ref fails at write
-    // time (that is the point of the hard form). No span or tree effect.
-    let hard_refs = scan_hard_references(&summary_text);
-
     with_repo(pile_path, |repo| {
-        let branch_id = repo
-            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
-            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let range = match explicit_range {
+            Some(range) => range,
+            None => {
+                let now = Epoch::now()
+                    .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+                (now, now)
+            }
+        };
+        let chunk_id = create_chunk(repo, &summary_text, range)?;
+        println!(
+            "range: {}",
+            format_time_range(range.0, range.1)
+        );
+        println!("id: {chunk_id:x}");
+        Ok(())
+    })
+}
 
-        let mut reference_ids: Vec<Id> = Vec::new();
-        if !hard_refs.is_empty() {
-            let catalog = {
-                let mut ws = repo
-                    .pull(branch_id)
-                    .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
-                ws.checkout(..).context("checkout memory branch")?
-            };
-            for hex in &hard_refs {
-                let target = resolve_chunk_id(&catalog, hex)
-                    .map_err(|e| anyhow!("hard reference (memory:{hex}): {e}"))?;
-                reference_ids.push(target);
+/// The chunk-creation core, shared by `create` and `consolidate`.
+///
+/// Hard references `[context](memory:<hex>)` in the summary become
+/// ctx::reference facts (resolved against the catalog so a dangling hard ref
+/// fails at write time). Soft references `(memory:<from>..<to>)` stay prose.
+/// Neither affects the span: temporal containment is the only hierarchy, and
+/// the given range is stored as typed. Chunks carry no persona or author —
+/// the memory belongs to the one being; only cursors are session-scoped.
+fn create_chunk(
+    repo: &mut Repository<Pile>,
+    summary_text: &str,
+    range: (Epoch, Epoch),
+) -> Result<Id> {
+    let branch_id = repo
+        .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+        .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+
+    let hard_refs = scan_hard_references(summary_text);
+    let mut reference_ids: Vec<Id> = Vec::new();
+    if !hard_refs.is_empty() {
+        let catalog = {
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+            ws.checkout(..).context("checkout memory branch")?
+        };
+        for hex in &hard_refs {
+            let target = resolve_chunk_id(&catalog, hex)
+                .map_err(|e| anyhow!("hard reference (memory:{hex}): {e}"))?;
+            reference_ids.push(target);
+        }
+    }
+
+    let start_at: Inline<NsTAIInterval> = (range.0, range.0).try_to_inline().unwrap();
+    let end_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
+
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
+    let summary_handle = ws.put(summary_text.to_owned());
+    let chunk_id = ufoid();
+    let now = Epoch::now()
+        .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
+
+    let mut change = TribleSet::new();
+    change += entity! { &chunk_id @
+        metadata::tag: KIND_CHUNK_ID,
+        ctx::summary: summary_handle,
+        metadata::created_at: created_at,
+        ctx::start_at: start_at,
+        ctx::end_at: end_at,
+        ctx::reference*: reference_ids.iter(),
+    };
+
+    ws.commit(change, "memory create");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow!("push failed: {e:?}"))?;
+    Ok(*chunk_id)
+}
+
+// ---------------------------------------------------------------------------
+// consolidate + replay — the comb verbs
+// ---------------------------------------------------------------------------
+
+const COMB_STATE_BRANCH: &str = "comb-state";
+const CONSOLIDATE_STREAM: &str = "consolidate-edge";
+const MEMORY_REPLAY_STREAM: &str = "memory-replay";
+
+fn comb_persona() -> Result<String> {
+    std::env::var("PERSONA").map_err(|_| {
+        anyhow!(
+            "no persona: set $PERSONA.\n\
+             Cursors are session bookkeeping — no zooid is defaulted as \
+             \"the\" rememberer; the memories themselves belong to the one \
+             being and are never persona-scoped."
+        )
+    })
+}
+
+fn comb_catalog(repo: &mut Repository<Pile>) -> Result<(Id, TribleSet)> {
+    let branch_id = repo
+        .ensure_branch(COMB_STATE_BRANCH, None)
+        .map_err(|e| anyhow!("ensure comb-state branch: {e:?}"))?;
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull comb-state branch: {e:?}"))?;
+    let catalog = ws.checkout(..).context("checkout comb-state branch")?.into_facts();
+    Ok((branch_id, catalog))
+}
+
+fn comb_advance(
+    repo: &mut Repository<Pile>,
+    branch_id: Id,
+    stream: &str,
+    persona: &str,
+    position: Option<Epoch>,
+    grain: Option<&str>,
+) -> Result<()> {
+    let now = Epoch::now()
+        .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    let change = comb::advance_change(stream, persona, position, grain, now);
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull comb-state for write: {e:?}"))?;
+    ws.commit(change, "comb cursor");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow!("push failed: {e:?}"))?;
+    Ok(())
+}
+
+fn key_to_epoch(key: i128) -> Epoch {
+    Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(key))
+}
+
+/// `memory consolidate start <ts> | stop | <ts> <summary...>`
+///
+/// The consolidation edge is where the next chunk opens. `<ts> <summary>`
+/// writes a chunk spanning [edge, ts] and advances the edge to ts — the
+/// boundary is chosen in hindsight (you pass the timestamp where the shift
+/// happened, typically copied from replay output; the shift-signaling
+/// message becomes the next chunk's opening).
+fn cmd_consolidate(pile_path: &Path, args: &[String]) -> Result<()> {
+    let persona = comb_persona()?;
+    if args.is_empty() {
+        bail!(
+            "usage: memory consolidate start <YYYY-MM-DDTHH:MM:SS>\n\
+             \x20      memory consolidate stop\n\
+             \x20      memory consolidate <YYYY-MM-DDTHH:MM:SS> <summary...>"
+        );
+    }
+    with_repo(pile_path, |repo| {
+        let (comb_branch, catalog) = comb_catalog(repo)?;
+        match args[0].as_str() {
+            "start" => {
+                let Some(raw) = args.get(1) else {
+                    bail!("usage: memory consolidate start <YYYY-MM-DDTHH:MM:SS>");
+                };
+                let edge = parse_tai_timestamp(raw)?;
+                comb_advance(repo, comb_branch, CONSOLIDATE_STREAM, &persona, Some(edge), None)?;
+                println!("consolidation edge set to {raw} (persona {persona})");
+                Ok(())
+            }
+            "stop" => {
+                comb_advance(repo, comb_branch, CONSOLIDATE_STREAM, &persona, None, None)?;
+                println!("consolidation stopped (persona {persona})");
+                Ok(())
+            }
+            _ => {
+                let until = parse_tai_timestamp(&args[0])?;
+                let summary = args[1..].join(" ");
+                if summary.is_empty() {
+                    bail!("summary required: memory consolidate <ts> <summary...>");
+                }
+                let Some((Some(edge_key), _)) =
+                    comb::latest(&catalog, CONSOLIDATE_STREAM, &persona)
+                else {
+                    bail!(
+                        "no open consolidation edge for persona {persona}: \
+                         use `memory consolidate start <ts>`"
+                    );
+                };
+                let edge = key_to_epoch(edge_key);
+                if until.to_tai_duration().total_nanoseconds() <= edge_key {
+                    bail!(
+                        "consolidate target {} is not after the open edge {}",
+                        args[0],
+                        fmt_epoch(edge)
+                    );
+                }
+                let chunk_id = create_chunk(repo, &summary, (edge, until))?;
+                comb_advance(
+                    repo,
+                    comb_branch,
+                    CONSOLIDATE_STREAM,
+                    &persona,
+                    Some(until),
+                    None,
+                )?;
+                println!("range: {}", format_time_range(edge, until));
+                println!("id: {chunk_id:x}");
+                println!("edge → {}", args[0]);
+                Ok(())
             }
         }
+    })
+}
 
-        // Time span: explicit range or now. Loose coupling throughout —
-        // provenance is recovered by time-range query at read-time (see the
-        // `provenance` subcommand), and chunk-to-chunk relation is temporal
-        // containment (a finer chunk inside a coarser span is its refinement).
-        let (start_at, end_at) = if let Some((range_start, range_end)) = explicit_range {
-            let start_val: Inline<NsTAIInterval> = (range_start, range_start).try_to_inline().unwrap();
-            let end_val: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
-            (start_val, end_val)
-        } else {
-            let now = Epoch::now()
-                .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-            let t: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
-            (t, t)
-        };
+/// Parse a grain like "90m", "2h", "1d", "4w" into nanoseconds.
+fn parse_grain(s: &str) -> Result<i128> {
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i128 = num.parse().with_context(|| format!("invalid grain: {s}"))?;
+    let ns_per = match unit {
+        "m" => 60_i128 * 1_000_000_000,
+        "h" => 3_600_i128 * 1_000_000_000,
+        "d" => 86_400_i128 * 1_000_000_000,
+        "w" => 7 * 86_400_i128 * 1_000_000_000,
+        _ => bail!("grain unit must be m/h/d/w: {s}"),
+    };
+    Ok(n * ns_per)
+}
 
-        // Write chunk entity.
-        let mut ws = repo
-            .pull(branch_id)
-            .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
+/// `memory replay start <grain> [<from>] | stop | [<count>]`
+///
+/// Streams the memory itself, chronologically, at a zoom level: maximal
+/// non-superseded chunks whose span-width fits the grain. This is how upper
+/// layers get written — replay the layer below, consolidate up. Reads ALL
+/// chunks regardless of which session wrote them: one being, one memory.
+fn cmd_replay(pile_path: &Path, args: &[String]) -> Result<()> {
+    let persona = comb_persona()?;
+    with_repo(pile_path, |repo| {
+        let (comb_branch, comb_cat) = comb_catalog(repo)?;
+        match args.first().map(String::as_str) {
+            Some("start") => {
+                let Some(grain_raw) = args.get(1) else {
+                    bail!("usage: memory replay start <grain e.g. 2h/1d/4w> [<from-ts>]");
+                };
+                parse_grain(grain_raw)?;
+                let from = match args.get(2) {
+                    Some(raw) => parse_tai_timestamp(raw)?,
+                    None => Epoch::from_gregorian_tai(1970, 1, 1, 0, 0, 0, 0),
+                };
+                let position = from - hifitime::Duration::from_total_nanoseconds(1);
+                comb_advance(
+                    repo,
+                    comb_branch,
+                    MEMORY_REPLAY_STREAM,
+                    &persona,
+                    Some(position),
+                    Some(grain_raw),
+                )?;
+                println!("memory replay started at grain {grain_raw} (persona {persona})");
+                Ok(())
+            }
+            Some("stop") => {
+                comb_advance(repo, comb_branch, MEMORY_REPLAY_STREAM, &persona, None, None)?;
+                println!("memory replay stopped (persona {persona})");
+                Ok(())
+            }
+            other => {
+                let count: usize = match other {
+                    None => 5,
+                    Some(raw) => raw
+                        .parse()
+                        .with_context(|| format!("expected a batch count, got `{raw}`"))?,
+                };
+                let Some((Some(position_key), Some(grain_raw))) =
+                    comb::latest(&comb_cat, MEMORY_REPLAY_STREAM, &persona)
+                else {
+                    bail!(
+                        "no active memory replay for persona {persona}: \
+                         use `memory replay start <grain> [<from>]`"
+                    );
+                };
+                let grain_ns = parse_grain(&grain_raw)?;
 
-        let summary_handle = ws.put(summary_text.clone());
-        let chunk_id = ufoid();
-        let now = Epoch::now()
-            .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-        let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
+                let memory_branch = repo
+                    .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                    .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+                let mut ws = repo
+                    .pull(memory_branch)
+                    .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+                let space = ws.checkout(..).context("checkout memory branch")?;
 
-        let mut change = TribleSet::new();
-        change += entity! { &chunk_id @
-            metadata::tag: KIND_CHUNK_ID,
-            ctx::summary: summary_handle,
-            metadata::created_at: created_at,
-            ctx::start_at: start_at,
-            ctx::end_at: end_at,
-            ctx::reference*: reference_ids.iter(),
-        };
+                // Chunks at this zoom: width fits the grain, not superseded,
+                // and maximal among grain-fitting chunks (not contained in a
+                // wider one that also fits — that one IS this zoom's voice).
+                let superseded = superseded_ids(&space);
+                let mut fitting: Vec<(i128, i128, Id)> = Vec::new();
+                for chunk_id in all_chunk_ids(&space) {
+                    if superseded.contains(&chunk_id) {
+                        continue;
+                    }
+                    let (Some(s), Some(e)) =
+                        (chunk_start_at(&space, chunk_id), chunk_end_at(&space, chunk_id))
+                    else {
+                        continue;
+                    };
+                    let (sk, ek) = (interval_key(s), interval_key(e));
+                    if ek - sk <= grain_ns {
+                        fitting.push((sk, ek, chunk_id));
+                    }
+                }
+                let maximal: Vec<(i128, i128, Id)> = fitting
+                    .iter()
+                    .filter(|(sk, ek, id)| {
+                        !fitting.iter().any(|(osk, oek, oid)| {
+                            oid != id && osk <= sk && oek >= ek && (oek - osk) > (ek - sk)
+                        })
+                    })
+                    .copied()
+                    .collect();
 
-        ws.commit(change, "memory create");
-        repo.push(&mut ws)
-            .map_err(|e| anyhow!("push failed: {e:?}"))?;
-
-        let range_str = format_time_range(
-            epoch_from_interval(start_at),
-            epoch_end_from_interval(end_at),
-        );
-        println!("range: {range_str}");
-        println!("id: {:x}", chunk_id.id);
-        Ok(())
+                let mut batch: Vec<(i128, i128, Id)> = maximal
+                    .into_iter()
+                    .filter(|(sk, _, _)| *sk > position_key)
+                    .collect();
+                batch.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+                let total = batch.len();
+                if total == 0 {
+                    println!("memory replay complete at grain {grain_raw}: nothing after the cursor.");
+                    return Ok(());
+                }
+                let take = count.min(total);
+                let mut last_start = position_key;
+                for (sk, ek, chunk_id) in batch.iter().take(take) {
+                    let summary = match chunk_summary_handle(&space, *chunk_id) {
+                        Some(handle) => {
+                            let view: View<str> =
+                                ws.get(handle).context("read chunk summary")?;
+                            view.trim_end().to_string()
+                        }
+                        None => String::new(),
+                    };
+                    println!(
+                        "── {} ({:x})",
+                        format_time_range(key_to_epoch(*sk), key_to_epoch(*ek)),
+                        chunk_id
+                    );
+                    println!("{summary}");
+                    println!();
+                    last_start = *sk;
+                }
+                comb_advance(
+                    repo,
+                    comb_branch,
+                    MEMORY_REPLAY_STREAM,
+                    &persona,
+                    Some(key_to_epoch(last_start)),
+                    Some(&grain_raw),
+                )?;
+                println!(
+                    "— batch: {take} chunk(s) at grain {grain_raw}; {} remaining",
+                    total - take
+                );
+                Ok(())
+            }
+        }
     })
 }
 

@@ -1,6 +1,6 @@
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::Instant;
@@ -49,6 +49,7 @@ mod common {
     use triblespace::prelude::*;
 
     pub use faculties::schemas::archive::{self as archive_schema, archive, import_schema};
+    pub use faculties::schemas::memory::comb;
 
     pub type Repo = Repository<Pile>;
     pub type Ws = Workspace<Pile>;
@@ -390,6 +391,34 @@ enum Command {
         format: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+    },
+    /// Replay the archive as ONE interleaved temporal stream — the comb's
+    /// reading instrument. All conversations from all sources merge into a
+    /// single chronological view (one being, one timeline). Dialogue only by
+    /// default: tool/system exhaust is skipped, since its effect already
+    /// lives inside the dialogue's own words.
+    ///
+    /// `archive replay start <from>` begins (or restarts) at a timestamp;
+    /// bare `archive replay` emits the next batch and advances the cursor;
+    /// `archive replay stop` clears the cursor. Cursors are persona-scoped
+    /// session bookkeeping (append-only, latest-wins) — the archive itself
+    /// is never scoped.
+    Replay {
+        /// `start <from-ts>`, `stop`, or nothing for the next batch.
+        #[arg(value_name = "ACTION")]
+        action: Vec<String>,
+        /// Messages per batch (a batch extends past the limit to finish
+        /// equal-timestamp runs, so the cursor can be strictly-greater).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Include tool/system exhaust (deliberate evidence consultation,
+        /// not part of the memory act).
+        #[arg(long)]
+        with_tools: bool,
+        /// Cursor owner. No default label on purpose: cursors are session
+        /// bookkeeping, and no zooid is baked in as "the" rememberer.
+        #[arg(long, env = "PERSONA")]
+        persona: Option<String>,
     },
 }
 
@@ -882,6 +911,376 @@ fn message_record(
     Ok((message_id, name, role, created_at, content_handle, reply_to))
 }
 
+// ---------------------------------------------------------------------------
+// replay — the comb's reading instrument
+// ---------------------------------------------------------------------------
+
+/// Parse "YYYY-MM-DDTHH:MM:SS" as TAI.
+fn parse_tai_timestamp(s: &str) -> Result<Epoch> {
+    let parts: Vec<&str> = s.split('T').collect();
+    if parts.len() != 2 {
+        bail!("invalid timestamp (expected YYYY-MM-DDTHH:MM:SS): {s}");
+    }
+    let date: Vec<&str> = parts[0].split('-').collect();
+    let time: Vec<&str> = parts[1].split(':').collect();
+    if date.len() != 3 || time.len() != 3 {
+        bail!("invalid timestamp (expected YYYY-MM-DDTHH:MM:SS): {s}");
+    }
+    Ok(Epoch::from_gregorian_tai(
+        date[0].parse().context("year")?,
+        date[1].parse().context("month")?,
+        date[2].parse().context("day")?,
+        time[0].parse().context("hour")?,
+        time[1].parse().context("minute")?,
+        time[2].parse().context("second")?,
+        0,
+    ))
+}
+
+/// Append a cursor advance (or a stop marker when `position` is None) via
+/// the shared comb helpers (faculties::schemas::memory::comb).
+fn write_cursor(
+    repo: &mut common::Repo,
+    branch_id: Id,
+    stream: &str,
+    persona: &str,
+    position: Option<Epoch>,
+) -> Result<()> {
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull for cursor write: {e:?}"))?;
+    let change =
+        common::comb::advance_change(stream, persona, position, None, common::now_epoch());
+    ws.commit(change, "archive replay cursor");
+    common::push_workspace(repo, &mut ws)
+}
+
+/// Conversation label for a message: "source · title-or-id-prefix".
+fn conversation_label(
+    ws: &mut common::Ws,
+    catalog: &TribleSet,
+    message_id: Id,
+    cache: &mut HashMap<Id, String>,
+) -> Result<String> {
+    // Forward edge (most importers) then reverse edge (claude-code).
+    let convo = find!(
+        c: Id,
+        pattern!(catalog, [{ message_id @ common::import_schema::conversation: ?c }])
+    )
+    .next()
+    .or_else(|| {
+        find!(
+            c: Id,
+            pattern!(catalog, [{ ?c @ common::import_schema::message: message_id }])
+        )
+        .next()
+    });
+    let Some(convo) = convo else {
+        return Ok("?".to_string());
+    };
+    if let Some(label) = cache.get(&convo) {
+        return Ok(label.clone());
+    }
+    let format = find!(
+        f: String,
+        pattern!(catalog, [{ convo @ common::import_schema::source_format: ?f }])
+    )
+    .next()
+    .unwrap_or_else(|| "?".to_string());
+    let title = find!(
+        t: Inline<Handle<LongString>>,
+        pattern!(catalog, [{ convo @ common::import_schema::source_conversation_title: ?t }])
+    )
+    .next()
+    .map(|h| load_longstring(ws, h))
+    .transpose()?;
+    let label = match title {
+        Some(title) if !title.is_empty() => format!("{format} · {title}"),
+        _ => {
+            let source_id = find!(
+                s: Inline<Handle<LongString>>,
+                pattern!(catalog, [{ convo @ common::import_schema::source_conversation_id: ?s }])
+            )
+            .next()
+            .map(|h| load_longstring(ws, h))
+            .transpose()?
+            .unwrap_or_default();
+            let prefix: String = source_id.chars().take(8).collect();
+            format!("{format} · {prefix}")
+        }
+    };
+    cache.insert(convo, label.clone());
+    Ok(label)
+}
+
+const REPLAY_STREAM: &str = "archive-replay";
+
+/// Cursors live on their own tiny branch: per-batch reads stay instant, and
+/// the archive branch remains pure evidence — no practice state mixed in.
+const COMB_STATE_BRANCH: &str = "comb-state";
+
+/// One replay record in the disk index. The index is a disposable cache of
+/// the dialogue timeline (the pile remains the truth): rebuilt only when the
+/// archive branch head changes, i.e. after imports.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ReplayRecord {
+    /// interval_key of created_at — the timeline coordinate.
+    k: i128,
+    /// Display timestamp.
+    w: String,
+    /// Conversation label ("source · title-or-id").
+    l: String,
+    /// Author display name.
+    n: String,
+    /// Author role ("" when unknown) — tool/system filtering happens at
+    /// read time so one index serves both modes.
+    r: String,
+    /// Message content text.
+    c: String,
+}
+
+fn replay_index_path(pile_path: &Path) -> PathBuf {
+    let mut name = pile_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "pile".to_string());
+    name.push_str(".replay-index.jsonl");
+    pile_path.with_file_name(name)
+}
+
+/// Build the timeline index from the archive branch (the expensive pass:
+/// full checkout of the evidence). Returns the number of records written.
+fn build_replay_index(
+    repo: &mut common::Repo,
+    archive_branch_id: Id,
+    head_key: &str,
+    path: &Path,
+) -> Result<usize> {
+    eprintln!("replay index stale — rebuilding (full evidence checkout; this is the slow pass)...");
+    let mut ws = repo
+        .pull(archive_branch_id)
+        .map_err(|e| anyhow!("pull archive branch: {e:?}"))?;
+    let catalog = ws.checkout(..).context("checkout archive branch")?;
+
+    let mut author_names: HashMap<Id, String> = HashMap::new();
+    let mut author_roles: HashMap<Id, String> = HashMap::new();
+    for (author_id, name_handle) in find!(
+        (a: Id, n: Inline<Handle<LongString>>),
+        pattern!(&catalog, [{
+            ?a @
+                common::metadata::tag: common::archive::kind_author,
+                common::archive::author_name: ?n,
+        }])
+    ) {
+        author_names.insert(author_id, load_longstring(&mut ws, name_handle)?);
+    }
+    for (author_id, role_handle) in find!(
+        (a: Id, r: Inline<Handle<LongString>>),
+        pattern!(&catalog, [{
+            ?a @
+                common::metadata::tag: common::archive::kind_author,
+                common::archive::author_role: ?r,
+        }])
+    ) {
+        author_roles.insert(author_id, load_longstring(&mut ws, role_handle)?);
+    }
+
+    let mut records: Vec<(i128, Id, Id, Inline<Handle<LongString>>)> = Vec::new();
+    for (message_id, author_id, content_handle, created_at) in find!(
+        (
+            message: Id,
+            author: Id,
+            content: Inline<Handle<LongString>>,
+            created_at: Inline<NsTAIInterval>
+        ),
+        pattern!(&catalog, [{
+            ?message @
+                common::metadata::tag: common::archive::kind_message,
+                common::archive::author: ?author,
+                common::archive::content: ?content,
+                common::metadata::created_at: ?created_at,
+        }])
+    ) {
+        records.push((
+            interval_key(created_at),
+            message_id,
+            author_id,
+            content_handle,
+        ));
+    }
+    records.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut convo_cache: HashMap<Id, String> = HashMap::new();
+    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut out = std::io::BufWriter::new(file);
+    use std::io::Write as _;
+    writeln!(out, "{head_key}")?;
+    let total = records.len();
+    for (i, (key, message_id, author_id, content_handle)) in records.into_iter().enumerate() {
+        let content = load_longstring(&mut ws, content_handle)?;
+        let label = conversation_label(&mut ws, &catalog, message_id, &mut convo_cache)?;
+        let when = {
+            let e = Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(key));
+            let (y, m, d, hh, mm, ss, _) = e.to_gregorian_tai();
+            format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+        };
+        let record = ReplayRecord {
+            k: key,
+            w: when,
+            l: label,
+            n: author_names.get(&author_id).cloned().unwrap_or_default(),
+            r: author_roles.get(&author_id).cloned().unwrap_or_default(),
+            c: content,
+        };
+        writeln!(out, "{}", serde_json::to_string(&record)?)?;
+        if (i + 1) % 100_000 == 0 {
+            eprintln!("  indexed {}/{}", i + 1, total);
+        }
+    }
+    out.into_inner().context("flush index")?;
+    Ok(total)
+}
+
+/// Replay is self-contained: it manages the comb-state branch (cursors) and
+/// the disk index (timeline cache), touching the heavy archive branch only
+/// when the index is stale.
+fn run_replay_standalone(
+    pile_path: &Path,
+    archive_branch_id: Id,
+    archive_branch_name: &str,
+    action: &[String],
+    limit: usize,
+    with_tools: bool,
+    persona: Option<&str>,
+) -> Result<()> {
+    let Some(persona) = persona else {
+        bail!(
+            "no persona: set $PERSONA or pass --persona.\n\
+             Cursors are session bookkeeping — no zooid is defaulted as \
+             \"the\" rememberer; the archive and the memories belong to \
+             the one being."
+        );
+    };
+
+    let (mut repo, archive_branch_id) =
+        common::open_repo_for_write(pile_path, archive_branch_id, archive_branch_name)?;
+    let res = (|| -> Result<()> {
+        let comb_branch_id = repo
+            .ensure_branch(COMB_STATE_BRANCH, None)
+            .map_err(|e| anyhow!("ensure comb-state branch: {e:?}"))?;
+
+        match action.first().map(String::as_str) {
+            Some("start") => {
+                let Some(raw) = action.get(1) else {
+                    bail!("usage: archive replay start <YYYY-MM-DDTHH:MM:SS>");
+                };
+                let from = parse_tai_timestamp(raw)?;
+                // Exclusive position one ns before the requested start, so
+                // the first batch includes messages at exactly <from>.
+                let position = from - hifitime::Duration::from_total_nanoseconds(1);
+                write_cursor(&mut repo, comb_branch_id, REPLAY_STREAM, persona, Some(position))?;
+                println!("replay started at {raw} (persona {persona})");
+                return Ok(());
+            }
+            Some("stop") => {
+                write_cursor(&mut repo, comb_branch_id, REPLAY_STREAM, persona, None)?;
+                println!("replay stopped (persona {persona})");
+                return Ok(());
+            }
+            Some(other) => bail!("unknown replay action `{other}` (start/stop or nothing)"),
+            None => {}
+        }
+
+        // Cursor read: tiny branch, instant checkout.
+        let comb_catalog = {
+            let mut ws = repo
+                .pull(comb_branch_id)
+                .map_err(|e| anyhow!("pull comb-state branch: {e:?}"))?;
+            ws.checkout(..).context("checkout comb-state branch")?
+        };
+        let Some((Some(position_key), _)) = common::comb::latest(&comb_catalog, REPLAY_STREAM, persona)
+        else {
+            bail!("no active replay for persona {persona}: use `archive replay start <from>`");
+        };
+
+        // Index freshness: keyed by the archive branch head.
+        let head_key = {
+            let head = repo
+                .storage_mut()
+                .head(archive_branch_id)
+                .map_err(|e| anyhow!("archive branch head: {e:?}"))?;
+            format!("{head:?}")
+        };
+        let index_path = replay_index_path(pile_path);
+        let stale = match std::fs::File::open(&index_path) {
+            Ok(file) => {
+                let mut first = String::new();
+                std::io::BufReader::new(file).read_line(&mut first)?;
+                first.trim_end() != head_key
+            }
+            Err(_) => true,
+        };
+        if stale {
+            let total = build_replay_index(&mut repo, archive_branch_id, &head_key, &index_path)?;
+            eprintln!("replay index built: {total} message(s) at {}", index_path.display());
+        }
+
+        // Stream the index: filter, position, batch (extending through any
+        // equal-timestamp run so the cursor stays strictly-greater), count.
+        let file = std::fs::File::open(&index_path)
+            .with_context(|| format!("open {}", index_path.display()))?;
+        let reader = std::io::BufReader::new(file);
+        let mut emitted = 0usize;
+        let mut remaining = 0usize;
+        let mut last_key = position_key;
+        for (line_no, line) in reader.lines().enumerate() {
+            let line = line?;
+            if line_no == 0 || line.is_empty() {
+                continue;
+            }
+            let record: ReplayRecord = serde_json::from_str(&line)
+                .with_context(|| format!("parse index line {}", line_no + 1))?;
+            if !with_tools && (record.r == "tool" || record.r == "system") {
+                continue;
+            }
+            if record.k <= position_key {
+                continue;
+            }
+            if emitted < limit || record.k == last_key {
+                println!("── [{}] {} — {}:", record.w, record.l, record.n);
+                println!("{}", record.c);
+                println!();
+                last_key = record.k;
+                emitted += 1;
+            } else {
+                remaining += 1;
+            }
+        }
+
+        if emitted == 0 {
+            println!("replay complete: nothing after the cursor. The past is read.");
+            return Ok(());
+        }
+
+        let last_epoch =
+            Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(last_key));
+        write_cursor(&mut repo, comb_branch_id, REPLAY_STREAM, persona, Some(last_epoch))?;
+        println!(
+            "— batch: {emitted} message(s); cursor → {last_epoch}; {remaining} remaining"
+        );
+        Ok(())
+    })();
+
+    let close_result = repo
+        .close()
+        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    match (res, close_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn snippet(text: &str, max: usize) -> String {
     let mut out = String::new();
     for ch in text.chars() {
@@ -933,6 +1332,23 @@ fn main() -> Result<()> {
     })?;
     if let Command::Import { source, path } = cmd {
         return run_import_jobs(source, path.as_deref(), &pile_path, &cli.branch, branch_id);
+    }
+    if let Command::Replay {
+        action,
+        limit,
+        with_tools,
+        persona,
+    } = cmd
+    {
+        return run_replay_standalone(
+            &pile_path,
+            branch_id,
+            &cli.branch,
+            &action,
+            limit,
+            with_tools,
+            persona.as_deref(),
+        );
     }
 
     let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
@@ -1198,6 +1614,9 @@ fn main() -> Result<()> {
                         source_conversation_id
                     );
                 }
+            }
+            Command::Replay { .. } => {
+                unreachable!("replay is handled before opening the archive branch")
             }
         }
 
