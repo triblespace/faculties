@@ -26,6 +26,7 @@ use triblespace::prelude::*;
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
+             memory link <parent> <child>...  — add child edges to an existing chunk (retroactive deepening)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
              Time format: YYYY-MM-DDTHH:MM:SS..YYYY-MM-DDTHH:MM:SS (TAI)\n\
              Hex id prefixes also accepted as fallback."
@@ -201,6 +202,9 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "meta") {
         return cmd_meta(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "link") {
+        return cmd_link(&cli.pile, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "provenance") {
         return cmd_provenance(&cli.pile, &cli.ids[1..]);
@@ -388,6 +392,70 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         );
         println!("range: {range_str}");
         println!("id: {:x}", chunk_id.id);
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// link subcommand
+// ---------------------------------------------------------------------------
+
+/// Add child edges to an existing chunk. Supports retroactive deepening:
+/// finer episodic leaves written later nest under an already-existing parent,
+/// so the cover algorithm can split the parent into them. The parent's stored
+/// start_at/end_at are NOT widened — retroactive children are expected to lie
+/// inside the parent's span (deepening, not extension).
+fn cmd_link(pile_path: &Path, args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        bail!(
+            "usage: memory link <parent-id> <child-id>...\n\
+             \n\
+             Adds ctx::child edges from parent to each child (hex id prefixes).\n\
+             Use for retroactive deepening: nest finer episodic leaves under an\n\
+             existing parent chunk after the fact."
+        );
+    }
+
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let parent = resolve_chunk_id(&space, &args[0])
+            .map_err(|e| anyhow!("parent {}: {e}", args[0]))?;
+        let parent_entity = parent
+            .acquire()
+            .unwrap_or_else(|| triblespace::core::id::ExclusiveId::force(parent));
+
+        let existing = chunk_children(&space, parent);
+        let mut change = TribleSet::new();
+        let mut linked = 0usize;
+        for raw in &args[1..] {
+            let child = resolve_chunk_id(&space, raw)
+                .map_err(|e| anyhow!("child {raw}: {e}"))?;
+            if child == parent {
+                bail!("refusing to link {raw} to itself");
+            }
+            if existing.contains(&child) {
+                println!("already linked: {child:x}");
+                continue;
+            }
+            change += entity! { &parent_entity @ ctx::child: child };
+            linked += 1;
+        }
+
+        if change.is_empty() {
+            println!("nothing to do");
+            return Ok(());
+        }
+        ws.commit(change, "memory link");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push failed: {e:?}"))?;
+        println!("linked {linked} child(ren) under {parent:x}");
         Ok(())
     })
 }
