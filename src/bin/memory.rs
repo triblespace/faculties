@@ -27,6 +27,8 @@ use triblespace::prelude::*;
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory link <parent> <child>...  — add child edges to an existing chunk (retroactive deepening)\n  \
+             memory respan <id> <from>..<to>  — correct a chunk's span (new chunk supersedes old; views exclude old)\n  \
+             memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
              Time format: YYYY-MM-DDTHH:MM:SS..YYYY-MM-DDTHH:MM:SS (TAI)\n\
              Hex id prefixes also accepted as fallback."
@@ -64,6 +66,8 @@ fn chunk_children(space: &TribleSet, id: Id) -> Vec<Id> {
     children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::left: ?c }])));
     children.extend(find!(c: Id, pattern!(space, [{ id @ ctx::right: ?c }])));
     // Sort children by their start_at time.
+    let superseded = superseded_ids(space);
+    children.retain(|child_id| !superseded.contains(child_id));
     children.sort_by_key(|child_id| {
         chunk_start_at(space, *child_id)
             .map(interval_key)
@@ -83,6 +87,14 @@ fn chunk_about_archive_message(space: &TribleSet, id: Id) -> Option<Id> {
 
 fn all_chunk_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_CHUNK_ID }])).collect()
+}
+
+/// Ids of chunks that have been superseded by a corrected chunk.
+/// Monotonic correction: the `supersedes` fact is appended, never removed;
+/// covers and trees exclude superseded chunks (read-side policy), while
+/// direct id lookup still resolves them for history inspection.
+fn superseded_ids(space: &TribleSet) -> std::collections::HashSet<Id> {
+    find!(old: Id, pattern!(space, [{ _ @ ctx::supersedes: ?old }])).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +167,11 @@ fn find_chunk_by_time_range(
     let mut best_cover: Option<(Id, i128)> = None;
     let mut best_overlap: Option<(Id, i128)> = None;
 
+    let superseded = superseded_ids(space);
     for chunk_id in all_chunk_ids(space) {
+        if superseded.contains(&chunk_id) {
+            continue;
+        }
         let start_val = chunk_start_at(space, chunk_id);
         let end_val = chunk_end_at(space, chunk_id);
         let (Some(start_v), Some(end_v)) = (start_val, end_val) else { continue };
@@ -205,6 +221,12 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "link") {
         return cmd_link(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "respan") {
+        return cmd_respan(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "supersede") {
+        return cmd_supersede(&cli.pile, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "provenance") {
         return cmd_provenance(&cli.pile, &cli.ids[1..]);
@@ -456,6 +478,112 @@ fn cmd_link(pile_path: &Path, args: &[String]) -> Result<()> {
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push failed: {e:?}"))?;
         println!("linked {linked} child(ren) under {parent:x}");
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// supersede subcommand
+// ---------------------------------------------------------------------------
+
+/// Assert that an existing chunk replaces another. The superseded chunk
+/// leaves all views (covers, trees) but stays resolvable by id.
+fn cmd_supersede(pile_path: &Path, args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        bail!("usage: memory supersede <new-id> <old-id>");
+    }
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let new = resolve_chunk_id(&space, &args[0])
+            .map_err(|e| anyhow!("new chunk {}: {e}", args[0]))?;
+        let old = resolve_chunk_id(&space, &args[1])
+            .map_err(|e| anyhow!("old chunk {}: {e}", args[1]))?;
+        if new == old {
+            bail!("a chunk cannot supersede itself");
+        }
+        let new_entity = new
+            .acquire()
+            .unwrap_or_else(|| triblespace::core::id::ExclusiveId::force(new));
+        let mut change = TribleSet::new();
+        change += entity! { &new_entity @ ctx::supersedes: old };
+        ws.commit(change, "memory supersede");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push failed: {e:?}"))?;
+        println!("{new:x} supersedes {old:x}");
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// respan subcommand
+// ---------------------------------------------------------------------------
+
+/// Correct a chunk's time span. Appends a new chunk with the same summary
+/// (content-addressed handle reused) and the corrected explicit range, plus a
+/// `supersedes` fact pointing at the old chunk. Covers and trees exclude
+/// superseded chunks; direct id lookup still shows them (history inspection).
+/// Child edges are NOT copied: a span correction usually exists precisely
+/// because link-inferred children dragged the span wrong — re-link explicitly
+/// if the new chunk should keep them.
+fn cmd_respan(pile_path: &Path, args: &[String]) -> Result<()> {
+    if args.len() != 2 || !args[1].contains("..") {
+        bail!(
+            "usage: memory respan <id> <from>..<to>\n\
+             \n\
+             Creates a corrected chunk (same summary, new span) that\n\
+             supersedes the old one. Views exclude superseded chunks."
+        );
+    }
+    let (range_start, range_end) = parse_time_range(&args[1])?;
+
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let old = resolve_chunk_id(&space, &args[0])
+            .map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
+        let summary_handle = chunk_summary_handle(&space, old)
+            .ok_or_else(|| anyhow!("chunk {old:x} has no summary"))?;
+
+        let start_at: Inline<NsTAIInterval> =
+            (range_start, range_start).try_to_inline().unwrap();
+        let end_at: Inline<NsTAIInterval> = (range_end, range_end).try_to_inline().unwrap();
+        let now = Epoch::now()
+            .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+        let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
+
+        let new_chunk = ufoid();
+        let mut change = TribleSet::new();
+        change += entity! { &new_chunk @
+            metadata::tag: KIND_CHUNK_ID,
+            ctx::summary: summary_handle,
+            metadata::created_at: created_at,
+            ctx::start_at: start_at,
+            ctx::end_at: end_at,
+            ctx::supersedes: old,
+        };
+
+        ws.commit(change, "memory respan");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push failed: {e:?}"))?;
+
+        println!(
+            "range: {}",
+            format_time_range(range_start, range_end)
+        );
+        println!("id: {:x} (supersedes {old:x})", new_chunk.id);
         Ok(())
     })
 }

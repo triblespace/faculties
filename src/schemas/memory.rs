@@ -46,5 +46,11 @@ pub mod ctx {
         "087D07E3D9D94F0C4E96813C7BC5E74C" as right: GenId;
         "316834CC6B0EA6F073BF5362D67AC530" as about_exec_result: GenId;
         "A4E2B712CA28AB1EED76C34DE72AFA39" as about_archive_message: GenId;
+        /// This chunk replaces another (wrong span, superseded retelling).
+        /// Monotonic correction: the fact is appended, never removed; readers
+        /// exclude any chunk that something else supersedes (read-side policy,
+        /// periphery principle). Mis-created chunks stay in history but leave
+        /// every view.
+        "0381735B64BFE71EA0341B95EA42C984" as supersedes: GenId;
     }
 }
