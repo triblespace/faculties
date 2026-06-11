@@ -627,15 +627,43 @@ fn load_watched_view(
         .map(|msg| msg.id)
         .collect();
 
+    let mut relations_ws = repo
+        .pull(relations_branch_id)
+        .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
+    let relations_space = relations_ws
+        .checkout(..)
+        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+    let roster: std::collections::BTreeSet<Id> = find!(
+        person_id: Id,
+        pattern!(&relations_space, [{
+            ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID
+        }])
+    )
+    .collect();
+    // The persona's normalized labels/aliases — goals tagged with one of
+    // these are "addressed to" the persona for wake purposes.
+    let persona_keys: std::collections::HashSet<String> = find!(
+        key: String,
+        pattern!(&relations_space, [{ persona_id @ rel_attrs::label_norm: ?key }])
+    )
+    .chain(find!(
+        key: String,
+        pattern!(&relations_space, [{ persona_id @ rel_attrs::alias_norm: ?key }])
+    ))
+    .collect();
+
     let mut compass_ws = repo
         .pull(compass_branch_id)
         .map_err(|e| anyhow!("pull compass workspace: {e:?}"))?;
     let compass_space = compass_ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout compass: {e:?}"))?;
-    // One line per goal: "id:status:author" (author = persona hex on
-    // the latest status event, empty when unattributed). The author
-    // lets view_news absorb the persona's own goal edits.
+    // One line per goal: "id:status:author:flags". Author = persona hex
+    // on the latest status event (empty when unattributed), so own
+    // edits can be absorbed. Flags carry the relevance bits view_news
+    // scopes wakes by: i = persona is involved (authored any status
+    // event on the goal), p = goal carries one of the persona's
+    // labels as a tag, c = goal tagged "colony" (wakes everyone).
     let mut goal_lines: Vec<String> =
         find!(id: Id, pattern!(&compass_space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
             .map(|id| {
@@ -650,6 +678,31 @@ fn load_watched_view(
                     }])
                 )
                 .max_by(|a, b| interval_key(a.2).cmp(&interval_key(b.2)));
+
+                let involved = exists!(pattern!(&compass_space, [{
+                    _?evt @
+                    metadata::tag: &KIND_STATUS_ID,
+                    board::task: &id,
+                    board::by: &persona_id,
+                }]));
+                let tags = task_tags(&compass_space, id);
+                let persona_tagged = tags
+                    .iter()
+                    .any(|tag| persona_keys.contains(&tag.to_ascii_lowercase()));
+                let colony_tagged = tags
+                    .iter()
+                    .any(|tag| tag.eq_ignore_ascii_case("colony"));
+                let mut flags = String::new();
+                if involved {
+                    flags.push('i');
+                }
+                if persona_tagged {
+                    flags.push('p');
+                }
+                if colony_tagged {
+                    flags.push('c');
+                }
+
                 match latest {
                     Some((evt, status, _)) => {
                         let by = find!(
@@ -659,28 +712,14 @@ fn load_watched_view(
                         .next()
                         .map(fmt_id)
                         .unwrap_or_default();
-                        format!("{:x}:{status}:{by}", id)
+                        format!("{:x}:{status}:{by}:{flags}", id)
                     }
-                    None => format!("{:x}::", id),
+                    None => format!("{:x}:::{flags}", id),
                 }
             })
             .collect();
     goal_lines.sort();
     let goals_view = goal_lines.join("\n");
-
-    let mut relations_ws = repo
-        .pull(relations_branch_id)
-        .map_err(|e| anyhow!("pull relations workspace: {e:?}"))?;
-    let relations_space = relations_ws
-        .checkout(..)
-        .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
-    let roster: std::collections::BTreeSet<Id> = find!(
-        person_id: Id,
-        pattern!(&relations_space, [{
-            ?person_id @ metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID
-        }])
-    )
-    .collect();
 
     Ok(WatchedView {
         unread,
@@ -702,36 +741,42 @@ fn view_news(old: &WatchedView, new: &WatchedView, persona_id: Id) -> Vec<String
     for msg in new.unread.difference(&old.unread) {
         reasons.push(format!("new message [{}]", fmt_id(*msg)));
     }
-    // Goal lines are "id:status:author" (older checkpoints lack the
-    // author field — parsed as unattributed). A change whose latest
-    // status event the persona itself authored is not news.
+    // Goal lines are "id:status:author:flags" (older checkpoints may
+    // lack trailing fields — parsed as unattributed/unflagged). Scope:
+    // a change the persona itself authored is never news; a change by
+    // someone else is news only when the goal is RELEVANT to the
+    // persona — involved (i: persona authored a status event on it),
+    // persona-tagged (p), or colony-tagged (c). A brand-new goal is
+    // news only when tagged for the persona or the colony — tagging a
+    // goal with a persona's label is the "summon that zooid" primitive;
+    // unclaimed work is discovered at snapshots, not via wakes.
     let me = fmt_id(persona_id);
-    let parse = |view: &str| -> HashMap<String, (String, String)> {
+    let parse = |view: &str| -> HashMap<String, (String, String, String)> {
         view.lines()
             .filter_map(|line| {
-                let mut parts = line.splitn(3, ':');
+                let mut parts = line.splitn(4, ':');
                 let id = parts.next()?.to_owned();
                 let status = parts.next().unwrap_or("").to_owned();
                 let by = parts.next().unwrap_or("").to_owned();
-                Some((id, (status, by)))
+                let flags = parts.next().unwrap_or("").to_owned();
+                Some((id, (status, by, flags)))
             })
             .collect()
     };
     let old_goals = parse(&old.goals_view);
     let new_goals = parse(&new.goals_view);
-    for (id, (status, by)) in &new_goals {
+    for (id, (status, by, flags)) in &new_goals {
         let own_edit = *by == me;
+        let addressed = flags.contains('p') || flags.contains('c');
+        let relevant = flags.contains('i') || addressed;
         match old_goals.get(id) {
-            None if !own_edit => reasons.push(format!("new goal [{id}] ({status})")),
-            Some((prev, _)) if prev != status && !own_edit => {
+            None if !own_edit && addressed => {
+                reasons.push(format!("new goal [{id}] ({status})"))
+            }
+            Some((prev, _, _)) if prev != status && !own_edit && relevant => {
                 reasons.push(format!("goal [{id}]: {prev} → {status}"))
             }
             _ => {}
-        }
-    }
-    for id in old_goals.keys() {
-        if !new_goals.contains_key(id) {
-            reasons.push(format!("goal [{id}] gone"));
         }
     }
     for person in new.roster.difference(&old.roster) {
