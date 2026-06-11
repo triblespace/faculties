@@ -25,6 +25,8 @@ mod archive_import_copilot;
 mod archive_import_gemini;
 #[path = "importers/archive_import_claude_code.rs"]
 mod archive_import_claude_code;
+#[path = "importers/archive_import_claude_web.rs"]
+mod archive_import_claude_web;
 mod common {
     #![allow(dead_code)]
 
@@ -398,6 +400,7 @@ enum ImportSource {
     Copilot,
     Gemini,
     ClaudeCode,
+    ClaudeWeb,
     All,
 }
 
@@ -409,6 +412,7 @@ impl ImportSource {
             ImportSource::Copilot => "copilot",
             ImportSource::Gemini => "gemini",
             ImportSource::ClaudeCode => "claude-code",
+            ImportSource::ClaudeWeb => "claude-web",
             ImportSource::All => "all",
         }
     }
@@ -429,6 +433,7 @@ fn default_source_path(source: ImportSource, base: &Path) -> PathBuf {
             base.join("gemini/Takeout/My Activity/Gemini Apps/My Activity.html")
         }
         ImportSource::ClaudeCode => base.join("claude-code"),
+        ImportSource::ClaudeWeb => base.join("claude-web"),
         ImportSource::All => base.to_path_buf(),
     }
 }
@@ -459,6 +464,10 @@ fn resolve_import_jobs(source: ImportSource, path: Option<&Path>) -> Result<Vec<
                 ImportJob {
                     source: ImportSource::ClaudeCode,
                     path: default_source_path(ImportSource::ClaudeCode, &root),
+                },
+                ImportJob {
+                    source: ImportSource::ClaudeWeb,
+                    path: default_source_path(ImportSource::ClaudeWeb, &root),
                 },
             ])
         }
@@ -556,6 +565,12 @@ fn run_import_jobs(
                 branch_id,
             ),
             ImportSource::ClaudeCode => archive_import_claude_code::import_into_archive(
+                &job.path,
+                pile_path,
+                branch_name,
+                branch_id,
+            ),
+            ImportSource::ClaudeWeb => archive_import_claude_web::import_into_archive(
                 &job.path,
                 pile_path,
                 branch_name,

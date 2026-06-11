@@ -71,6 +71,10 @@ pub mod import_schema {
         "D59247F3AADD3DE8E23B01E8B7406020" as pub source_created_at: NsTAIInterval;
         /// Conversation → message edge (repeated).
         "06DB96427C8EA6FC982D44E018AB0831" as pub message: GenId;
+        /// Source-assigned conversation title (e.g. claude.ai `name`).
+        "BCFFFF156EB6D8694D263DCFDAA39CF6" as pub source_conversation_title: Handle<LongString>;
+        /// Source-assigned conversation summary (e.g. claude.ai `summary`).
+        "F23BD37982802B051A261561A694DA0C" as pub source_conversation_summary: Handle<LongString>;
     }
 
     /// Root id for describing the import metadata protocol.
