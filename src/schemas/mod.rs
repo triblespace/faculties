@@ -1,6 +1,7 @@
 //! Faculty schemas: attribute IDs and kind markers per faculty.
 
 pub mod archive;
+pub mod body;
 pub mod compass;
 pub mod decide;
 pub mod discord;
@@ -15,7 +16,6 @@ pub mod patience;
 pub mod planner;
 pub mod reason;
 pub mod relations;
-pub mod senses;
 pub mod teams;
 pub mod triage;
 pub mod web;
