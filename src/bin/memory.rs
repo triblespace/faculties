@@ -29,6 +29,8 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
+             memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
+             memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
              memory respan <id> <from>..<to>  — correct a chunk's span (new chunk supersedes old; views exclude old)\n  \
              memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
@@ -382,6 +384,12 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "search") {
         return cmd_search(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "list") {
+        return cmd_list(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "check") {
+        return cmd_check(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
     }
 
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref())?;
@@ -939,6 +947,203 @@ fn cmd_respan(pile_path: &Path, args: &[String]) -> Result<()> {
 // ---------------------------------------------------------------------------
 // meta subcommand
 // ---------------------------------------------------------------------------
+
+/// Humanize a nanosecond duration into a coarse `d/h/m/s` string.
+fn humanize_ns(ns: i128) -> String {
+    let secs = ns / 1_000_000_000;
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3600;
+    let mins = (secs % 3600) / 60;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Load the non-superseded chunks of the memory branch as `(start_key, end_key, id)`.
+/// Chunks missing a start/end interval are skipped. Shared by `list` and `check`.
+fn collect_chunk_spans(space: &TribleSet) -> Vec<(i128, i128, Id)> {
+    let superseded = superseded_ids(space);
+    let mut spans = Vec::new();
+    for id in all_chunk_ids(space) {
+        if superseded.contains(&id) {
+            continue;
+        }
+        let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
+            continue;
+        };
+        spans.push((interval_key(s), interval_key(e), id));
+    }
+    spans
+}
+
+/// `memory list [<grain>]` — show the SHAPE of the memory as time-ranges only,
+/// never content (coverage is by time range, not by reference). With a grain,
+/// lists the maximal non-superseded chunks whose width fits that zoom — the
+/// same layer `replay <grain>` would stream. Without a grain, prints every
+/// non-superseded chunk as a containment outline: indentation expresses how
+/// wider ranges cover narrower ones.
+fn cmd_list(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+    let grain: Option<(String, i128)> = match args.first() {
+        Some(raw) => Some((raw.clone(), parse_grain(raw)?)),
+        None => None,
+    };
+    with_repo(pile_path, |repo| {
+        let branch_id = match explicit_branch_id {
+            Some(id) => id,
+            None => repo
+                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout branch")?;
+
+        let mut chunks = collect_chunk_spans(&space);
+        if chunks.is_empty() {
+            println!("no memory chunks on branch {branch_id:x}");
+            return Ok(());
+        }
+
+        match grain {
+            Some((raw, grain_ns)) => {
+                // The layer at this zoom: width <= grain, maximal among fitting
+                // (not contained in a wider chunk that also fits) — matches `replay`.
+                let fitting: Vec<(i128, i128, Id)> =
+                    chunks.iter().copied().filter(|(s, e, _)| e - s <= grain_ns).collect();
+                let mut layer: Vec<(i128, i128, Id)> = fitting
+                    .iter()
+                    .copied()
+                    .filter(|(s, e, id)| {
+                        !fitting.iter().any(|(os, oe, oid)| {
+                            oid != id && os <= s && oe >= e && (oe - os) > (e - s)
+                        })
+                    })
+                    .collect();
+                layer.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+                println!(
+                    "layer at grain {raw}: {} chunk(s) of {} total",
+                    layer.len(),
+                    chunks.len()
+                );
+                for (s, e, id) in &layer {
+                    println!(
+                        "  {}  [{}]  ({:x})",
+                        format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
+                        humanize_ns(e - s),
+                        id
+                    );
+                }
+            }
+            None => {
+                // Containment outline: containers before contained; indent by
+                // how many strictly-wider chunks contain this one.
+                chunks.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+                println!(
+                    "{} chunk(s) on branch {branch_id:x} (indent = containment by time range)",
+                    chunks.len()
+                );
+                for (s, e, id) in &chunks {
+                    let depth = chunks
+                        .iter()
+                        .filter(|(os, oe, oid)| {
+                            oid != id && os <= s && oe >= e && (oe - os) > (e - s)
+                        })
+                        .count();
+                    let indent = "  ".repeat(depth + 1);
+                    println!(
+                        "{indent}{}  ({:x})",
+                        format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
+                        id
+                    );
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `memory check <grain>` — coverage audit at a coarseness level. Coverage is
+/// by TIME RANGE, not by reference: a span is covered at grain G if some
+/// non-superseded chunk of width <= G overlaps it. Reports the spans of the
+/// overall extent left uncovered at that zoom (e.g. `check 1d` finds holes in
+/// the fine edge; `check 13w` finds regions with no coarse cover).
+fn cmd_check(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+    let Some(grain_raw) = args.first() else {
+        bail!("usage: memory check <grain e.g. 1d/4w/13w>");
+    };
+    let grain_ns = parse_grain(grain_raw)?;
+    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+    with_repo(pile_path, |repo| {
+        let branch_id = match explicit_branch_id {
+            Some(id) => id,
+            None => repo
+                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout branch")?;
+
+        let all = collect_chunk_spans(&space);
+        if all.is_empty() {
+            println!("no memory chunks on branch {branch_id:x}");
+            return Ok(());
+        }
+        let global_start = all.iter().map(|(s, _, _)| *s).min().unwrap();
+        let global_end = all.iter().map(|(_, e, _)| *e).max().unwrap();
+
+        // Coverage at this zoom: intervals of chunks with width <= grain.
+        let mut covering: Vec<(i128, i128)> =
+            all.iter().filter(|(s, e, _)| e - s <= grain_ns).map(|(s, e, _)| (*s, *e)).collect();
+        covering.sort_by_key(|(s, _)| *s);
+
+        // Sweep for holes in [global_start, global_end].
+        let mut gaps: Vec<(i128, i128)> = Vec::new();
+        let mut cursor = global_start;
+        for (s, e) in &covering {
+            if *s > cursor {
+                gaps.push((cursor, *s));
+            }
+            if *e > cursor {
+                cursor = *e;
+            }
+        }
+        if cursor < global_end {
+            gaps.push((cursor, global_end));
+        }
+        // A gap only matters at coarseness G if it is at least G wide; smaller
+        // holes are below this zoom's resolution (you'd see them at a finer grain).
+        gaps.retain(|(s, e)| e - s >= grain_ns);
+
+        println!(
+            "extent {}  ({} chunk(s) of width <= {grain_raw})",
+            format_time_range(key_to_epoch(global_start), key_to_epoch(global_end)),
+            covering.len()
+        );
+        if gaps.is_empty() {
+            println!("OK no gaps >= {grain_raw} — coverage is contiguous at this zoom");
+        } else {
+            println!("{} gap(s) at grain {grain_raw}:", gaps.len());
+            for (s, e) in &gaps {
+                println!(
+                    "  GAP {}  ({})",
+                    format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
+                    humanize_ns(e - s)
+                );
+            }
+        }
+        Ok(())
+    })
+}
 
 fn cmd_meta(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
     if args.len() != 1 {
