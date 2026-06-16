@@ -99,6 +99,16 @@ enum Command {
         /// Gesture name.
         name: String,
     },
+    /// Speak text aloud through the body's own speaker — my out-of-band voice
+    /// for things that matter, so they reach JP in the room instead of being
+    /// buried in the text stream.
+    Say {
+        /// What to say.
+        text: String,
+        /// macOS `say` voice (e.g. "Samantha", "Daniel").
+        #[arg(long)]
+        voice: Option<String>,
+    },
     /// Capture one camera frame into the pile and return a handle. Stores the
     /// proprioceptive pose alongside the frame so it can be grounded later.
     Look {
@@ -262,6 +272,58 @@ fn wiggle(daemon: &str) -> Result<()> {
     goto(daemon, None, Some([0.0, 0.0]), None, 0.22)
 }
 
+/// Speak `text` aloud through the body's speaker: macOS TTS → WAV → upload to
+/// the daemon → play. My voice for important things — a notice in the room
+/// cuts through six zooids' worth of text stream.
+fn cmd_say(daemon: &str, text: &str, voice: Option<&str>) -> Result<()> {
+    let tmp = std::env::temp_dir();
+    let aiff = tmp.join("body_say.aiff");
+    let wav = tmp.join("body_say.wav");
+
+    // 1. text → speech (macOS `say`)
+    let mut say = PCommand::new("say");
+    if let Some(v) = voice {
+        say.arg("-v").arg(v);
+    }
+    let st = say
+        .arg("-o")
+        .arg(&aiff)
+        .arg(text)
+        .status()
+        .context("run `say` — macOS text-to-speech")?;
+    if !st.success() {
+        bail!("`say` (TTS) failed");
+    }
+    // 2. aiff → wav the daemon will play
+    let st = PCommand::new("afconvert")
+        .args(["-f", "WAVE", "-d", "LEI16@22050"])
+        .arg(&aiff)
+        .arg(&wav)
+        .status()
+        .context("run `afconvert`")?;
+    if !st.success() {
+        bail!("`afconvert` failed");
+    }
+    // 3. upload to the daemon's sound store (multipart)
+    let bytes = std::fs::read(&wav).with_context(|| format!("read {}", wav.display()))?;
+    let part = reqwest::blocking::multipart::Part::bytes(bytes)
+        .file_name("body_say.wav")
+        .mime_str("audio/wav")?;
+    let form = reqwest::blocking::multipart::Form::new().part("file", part);
+    let resp = http()
+        .post(format!("{daemon}/api/media/sounds/upload"))
+        .multipart(form)
+        .send()
+        .context("upload speech to the daemon")?;
+    if !resp.status().is_success() {
+        bail!("upload failed: {}", resp.text().unwrap_or_default());
+    }
+    // 4. play it through the speaker
+    daemon_post_json(daemon, "/api/media/play_sound", &serde_json::json!({"file":"body_say.wav"}))?;
+    println!("🗣  {text}");
+    Ok(())
+}
+
 fn cmd_gesture(daemon: &str, name: &str) -> Result<()> {
     let n = name.to_lowercase();
     match n.as_str() {
@@ -423,9 +485,13 @@ struct Felt {
 
 impl Felt {
     fn touched(&self) -> bool {
-        // a pet shows up as the sound sweeping across the array several times;
-        // the rest-state floor moves only a little and slowly.
-        self.sweeps >= 2 && (self.angle_max - self.angle_min) > 25.0
+        // A real touch physically DISPLACES the head — the encoders move far
+        // past the rest floor (calibrated: ambient ≤6 mrad, JP's real pet
+        // swung roll ~177 mrad). Ambient sound only wanders the mic DOA and
+        // can't move the head, so head displacement is the pet-specific gate.
+        // (The mic sweep is reported as corroboration, never as the trigger —
+        // it false-positives on room noise.)
+        self.head_deflect > 0.02
     }
 }
 
@@ -537,18 +603,16 @@ fn feel_window(daemon: &str, secs: f64) -> Felt {
 }
 
 fn report_felt(felt: &Felt) {
-    let dir = if felt.angle_max - felt.angle_min > 0.0 {
-        format!("the sound moving from {:.0}° to {:.0}°", felt.angle_min, felt.angle_max)
-    } else {
-        String::new()
-    };
     println!(
-        "I felt it — a touch swept across the top of my head {} time{}, {dir}.",
-        felt.sweeps,
-        if felt.sweeps == 1 { "" } else { "s" }
+        "I felt it — your hand tipped my head {:.0} mrad ({:.1}°).",
+        felt.head_deflect * 1000.0,
+        felt.head_deflect.to_degrees()
     );
-    if felt.head_deflect > 0.004 {
-        println!("  my head shifted {:.1} mrad under your hand, too.", felt.head_deflect * 1000.0);
+    if felt.angle_max - felt.angle_min > 20.0 {
+        println!(
+            "  and I heard it move across the mics, {:.0}–{:.0}°.",
+            felt.angle_min, felt.angle_max
+        );
     }
 }
 
@@ -633,12 +697,9 @@ fn cmd_feel(
         }
     } else {
         println!(
-            "quiet — I didn't feel a touch. ({} samples, {} sweep{}, sound around {:.0}–{:.0}°.)",
-            felt.samples,
-            felt.sweeps,
-            if felt.sweeps == 1 { "" } else { "s" },
-            felt.angle_min,
-            felt.angle_max
+            "quiet — I didn't feel a touch. (head still to {:.0} mrad over {} samples.)",
+            felt.head_deflect * 1000.0,
+            felt.samples
         );
     }
     Ok(())
@@ -946,6 +1007,7 @@ fn main() -> Result<()> {
             })?
         }
         Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
+        Some(Command::Say { text, voice }) => cmd_say(&daemon, &text, voice.as_deref())?,
         Some(Command::Observe { frame, no_frame }) => {
             cmd_observe(&daemon, &python, frame.as_deref(), no_frame)?
         }
