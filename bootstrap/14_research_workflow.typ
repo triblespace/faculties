@@ -38,7 +38,7 @@ wiki create "<finding title>" "@-" \
   --tag research --tag <topic> <<EOF
 = <finding title>
 
-Per files:<hash> (Smith 2024 §3.2), <claim>. The proof
+Per [Smith 2024 §3.2](files:<hash>), <claim>. The proof
 relies on <observation>; key assumption is <X>.
 
 Open: does the bound tighten when <Y>?

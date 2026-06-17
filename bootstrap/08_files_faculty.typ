@@ -65,11 +65,14 @@ In a wiki fragment:
 
 ```typ
 The convergence rate proof appears in
-Mezard 2009 (`files:<hash>`) section 4.
+[Mezard 2009, section 4](files:<hash>).
 ```
 
-GORBIE renders this as a clickable link that opens the
-archived PDF in a viewer. The `files:<hash>` form is also
-greppable from a terminal, which beats hex-only handles.
+GORBIE renders this as a clickable link (labelled
+"Mezard 2009, section 4") that opens the archived PDF in a
+viewer. Always cite with the `[label](files:<hash>)` form: a
+*bare* `files:<hash>` in prose does NOT become a link (the
+wiki warns you if you write one), and the label reads far
+better than a raw hash.
 
 Next stop: wiki:ff27b500d93e1d545b7465438a0146e1 — Orient: The Situation-Snapshot Faculty.

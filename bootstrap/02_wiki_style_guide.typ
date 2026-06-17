@@ -20,7 +20,12 @@ Atomic, cross-linked, written in typst, rendered by GORBIE.
 
 If you find yourself writing "and another thing", split. The
 fragment's title should fit on one line and accurately describe
-its single claim. Cross-link by reference (`wiki:<full-id>`).
+its single claim. Cross-link with the labelled form
+`[label](wiki:<full-id>)` (and `[label](files:<hash>)` for
+files) — a graph edge comes only from that explicit link. A
+*bare* `wiki:<id>` or `files:<hash>` in prose does NOT link;
+the wiki warns you if you write one. The label also reads far
+better than a raw id.
 
 == Tagging
 

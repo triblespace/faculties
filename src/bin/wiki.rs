@@ -891,6 +891,58 @@ fn lint_fix(content: &str, space: &TribleSet) -> String {
     out
 }
 
+/// Find well-formed *bare* references — `(wiki|files):[type:]<32|64-hex>` sitting
+/// in prose, NOT inside a `#link(...)`, markdown `[..](..)`, or `[..]` bracket,
+/// and not in a fenced or inline code span. These read like citations but create
+/// no traversable link (only the `[label](scheme:hex)` form does). Returns
+/// `(line_number, matched_text)` per occurrence. We never auto-link these — bare
+/// prose that merely looks like a ref must not forge graph edges — so the caller
+/// surfaces them as a warning instead.
+fn bare_ref_warnings(content: &str) -> Vec<(usize, String)> {
+    use regex::Regex;
+    let re = Regex::new(r"(?:wiki|files):(?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]+").unwrap();
+    let mut out = Vec::new();
+    let mut in_code_block = false;
+    for (i, line) in content.lines().enumerate() {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+        for m in re.find_iter(line) {
+            // The hex is the final colon-separated segment; require exactly a
+            // 32-char id or 64-char hash (excludes `<hex>` placeholders, stray runs).
+            let hex = m.as_str().rsplit(':').next().unwrap_or("");
+            if hex.len() != 32 && hex.len() != 64 {
+                continue;
+            }
+            let before = &line[..m.start()];
+            // Skip if already linked/bracketed: `](files:hex)`, `#link("files:hex")`,
+            // or `[files:hex]` (the latter is auto-converted by lint_bare_brackets).
+            if matches!(before.chars().last(), Some('(') | Some('"') | Some('[')) {
+                continue;
+            }
+            // Skip inside an inline `code` span (odd number of backticks before it).
+            if before.matches('`').count() % 2 == 1 {
+                continue;
+            }
+            out.push((i + 1, m.as_str().to_string()));
+        }
+    }
+    out
+}
+
+/// Print a non-fatal warning for each bare reference (used by create/edit).
+fn warn_bare_refs(content: &str) {
+    for (line, r) in bare_ref_warnings(content) {
+        eprintln!(
+            "⚠ line {line}: bare reference `{r}` is not a traversable link — wrap it to cite: [{r}]({r})"
+        );
+    }
+}
+
 /// Transform a single line: headings, bold, links.
 /// Bare `[wiki:HEX]`, `[wiki:<type>:HEX]` or `[files:HEX]` (no parenthesized URL, not
 /// inside #link) → `#link("scheme:hex")[scheme:hex]`.
@@ -946,47 +998,6 @@ fn split_typed(rest: &str) -> (String, &str) {
     (String::new(), rest)
 }
 
-/// Convert bare `wiki:HEX` / `wiki:<type>:HEX` references in prose to proper typst
-/// `#link("wiki:HEX")[wiki:HEX]` form. Requires full-length (32+ char) hex to avoid
-/// false positives on tag values or ambiguous prefixes. Skips matches already inside
-/// `#link("…")` quotes or `[…]` brackets.
-///
-/// Must run AFTER lint_links / lint_bare_brackets so that any remaining bare reference
-/// is definitely not part of an existing link construct.
-fn lint_bare_refs(line: &str, space: &TribleSet) -> String {
-    use regex::Regex;
-    let re = Regex::new(
-        r"\bwiki:((?:[a-zA-Z_][a-zA-Z0-9_]*:)?[0-9a-fA-F]{32,})\b"
-    ).unwrap();
-    let mut result = String::new();
-    let mut last_end = 0;
-    for caps in re.captures_iter(line) {
-        let m = caps.get(0).unwrap();
-        let start = m.start();
-        // Skip if inside #link("…") quotes
-        if start > 0 && &line[start-1..start] == "\"" {
-            continue;
-        }
-        // Skip if inside [wiki:HEX] brackets (typically the [text] of an existing #link)
-        if start > 0 && &line[start-1..start] == "[" {
-            continue;
-        }
-        let rest = &caps[1];
-        let (type_prefix, hex) = split_typed(rest);
-        let full_hex = match try_expand_id(hex, space) {
-            Ok(id) => format!("{:x}", id),
-            Err(_) => hex.to_lowercase(),
-        };
-        result.push_str(&line[last_end..start]);
-        result.push_str(&format!(
-            "#link(\"wiki:{type_prefix}{full_hex}\")[wiki:{type_prefix}{hex}]"
-        ));
-        last_end = m.end();
-    }
-    result.push_str(&line[last_end..]);
-    if result.is_empty() { line.to_string() } else { result }
-}
-
 /// `[text](https://url)` → `#link("https://url")[text]` — markdown web links to typst
 fn lint_web_links(line: &str) -> String {
     use regex::Regex;
@@ -1004,10 +1015,9 @@ fn lint_line(line: &str, space: &TribleSet) -> String {
     s = lint_bare_brackets(&s, space);
     s = lint_links(&s, space);
     s = lint_web_links(&s);
-    // Run bare-ref repair LAST so that any remaining bare `wiki:HEX` in prose is
-    // definitely not inside a link construct that the earlier passes built or
-    // rewrote.
-    s = lint_bare_refs(&s, space);
+    // NB: bare `scheme:HEX` in prose is deliberately NOT auto-linked — a graph
+    // edge must come from an explicit `[label](scheme:hex)`. `bare_ref_warnings`
+    // surfaces bare refs as a warning instead (create/edit + check).
     s = lint_horizontal_rule(&s);
     s
 }
@@ -1503,6 +1513,13 @@ fn cmd_check(repo: &mut Repo, bid: Id, try_compile: bool) -> Result<()> {
             }
         }
 
+        // Check: bare references — well-formed scheme:hex in prose that isn't a
+        // link. Looks like a citation but creates no traversable edge.
+        for (lineno, refstr) in bare_ref_warnings(content_str) {
+            eprintln!("BARE_REF     {}  {} (line {})  in {}", frag_hex, refstr, lineno, title);
+            issues += 1;
+        }
+
         // Check: typst compilation (in-process)
         if try_compile {
             let world = typst_validate::ValidateWorld::new(content_str);
@@ -1896,6 +1913,7 @@ fn cmd_create(
     let content = lint_fix(&content, &space);
     validate_typst(&content)?;
     validate_wiki_links(&content, &space, force)?;
+    warn_bare_refs(&content);
 
     let fragment_id = match id {
         Some(hex) => {
@@ -1962,6 +1980,7 @@ fn cmd_edit(
             let fixed = lint_fix(text, &space);
             validate_typst(&fixed)?;
             validate_wiki_links(&fixed, &space, force)?;
+            warn_bare_refs(&fixed);
             ws.put(fixed)
         }
         None => content_handle_of(&space, prev_vid)
