@@ -30,5 +30,16 @@ pub mod relations {
         "5A71C103E026FC1AC01E35EDAC274A5C" as profile_url: inlineencodings::Handle<blobencodings::LongString>;
         // Provenance: where this person came from ("linkedin" | "mail" | "summit" | …).
         "686FD344CD64C3F9C981C4028B1B6B9E" as source: inlineencodings::ShortString;
+        // Identity resolution (non-destructive). Append-only stores can't
+        // merge entities irreversibly, so a person's true identity is the
+        // connected component under `same_as`. Imports auto-assert `same_as`
+        // only on deterministic keys (matching email / profile_url); a
+        // name-only collision is recorded as a `review_candidate` edge for an
+        // agent to adjudicate with common-sense reasoning, recording the
+        // verdict as `same_as` or `distinct_from` (both correctable via
+        // supersede). All three point person → person.
+        "0FCF3A17B2EBE7243BDDD791B901E2D6" as same_as: inlineencodings::GenId;
+        "A89DC2F250432322D429D0E51316B6F3" as distinct_from: inlineencodings::GenId;
+        "EB09A042DE6AA778D05C1EF795C434EE" as review_candidate: inlineencodings::GenId;
     }
 }

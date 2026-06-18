@@ -316,6 +316,29 @@ fn person_aliases(space: &TribleSet, id: Id) -> Vec<String> {
     find!(v: String, pattern!(space, [{ id @ relations::alias: ?v }])).collect()
 }
 
+fn person_company(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ relations::company: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
+
+fn person_position(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ relations::position: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
+
+fn person_profile_url(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Option<String> {
+    find!(h: TextHandle, pattern!(space, [{ id @ relations::profile_url: ?h }]))
+        .next().and_then(|h| read_text(ws, h).ok())
+}
+
+fn person_sources(space: &TribleSet, id: Id) -> Vec<String> {
+    find!(v: String, pattern!(space, [{ id @ relations::source: ?v }])).collect()
+}
+
+fn person_same_as(space: &TribleSet, id: Id) -> Vec<Id> {
+    find!(o: Id, pattern!(space, [{ id @ relations::same_as: ?o }])).collect()
+}
+
 fn all_person_ids(space: &TribleSet) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])).collect()
 }
@@ -645,6 +668,26 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         }
         if let Some(value) = person_email(&space, person_id) {
             println!("email: {value}");
+        }
+        if let Some(value) = person_position(&mut ws, &space, person_id) {
+            println!("position: {value}");
+        }
+        if let Some(value) = person_company(&mut ws, &space, person_id) {
+            println!("company: {value}");
+        }
+        if let Some(value) = person_profile_url(&mut ws, &space, person_id) {
+            println!("profile_url: {value}");
+        }
+        let sources = person_sources(&space, person_id);
+        if !sources.is_empty() {
+            println!("source: {}", sources.join(", "));
+        }
+        let same_as = person_same_as(&space, person_id);
+        if !same_as.is_empty() {
+            println!("same_as:");
+            for other in same_as {
+                println!("- {}", fmt_id(other));
+            }
         }
         let aliases = person_aliases(&space, person_id);
         if !aliases.is_empty() {
