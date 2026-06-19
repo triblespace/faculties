@@ -17,10 +17,14 @@
 //! root (the `effective_admins` fixpoint). Strong/transitive removal therefore
 //! falls out for free — retracting an admin drops everything that depended on
 //! it. Transitive group membership is `path!`'s closure over *effective* grants.
-//! STILL PENDING (the genuinely concurrent part): epoch finality + the
-//! two-branch duelling-admin tests (wiki 65a1835b / D02D6767) — single- or
-//! coordinated-writer multi-admin is safe; independent concurrent writers need
-//! the finality layer. Secret rotation / `(scope,name)` addressing also pending.
+//! Secrets are `(scope, name)` addressed, latest-wins (`secret add` = rotate).
+//! The two-admin harness (`#[test] concurrent_*`) shows the effective-admin
+//! fixpoint over the merged union already defeats the cluster-G duelling-admin /
+//! backdating / headless-group attacks, because the verdict is order-independent
+//! (retraction presence is read, never its timestamp). The remaining concurrency
+//! concern is narrower — secret-rotation *timing* (a leaked DEK can't be
+//! retracted): gate re-seal on having-seen the removal. The finality mechanism
+//! for that is JP's open decision (wiki D02D6767).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1099,7 +1103,7 @@ mod tests {
     fn latest_secret_picks_newest_version() {
         let scope = ufoid().id;
         let mut space = TribleSet::new();
-        let mut add_version = |space: &mut TribleSet, year: i32| -> Id {
+        let add_version = |space: &mut TribleSet, year: i32| -> Id {
             let s = ufoid().id;
             let t = instant_interval(Epoch::from_gregorian_utc(year, 1, 1, 0, 0, 0, 0));
             *space += entity! { ExclusiveId::force_ref(&s) @
@@ -1119,6 +1123,99 @@ mod tests {
         let _ = v3_older;
     }
 
+    // ── concurrent two-admin harness ─────────────────────────────────────────
+    // triblespace merge is set-union, so a merged pile of two admins' diverged
+    // branches is exactly the union of their tribles. We model "concurrent
+    // branches, then merge" by building one TribleSet that contains BOTH
+    // admins' ops, and ask the CURRENT model for its verdict. These reproduce
+    // the cluster-G duelling-admin / backdating scenarios (wiki 65a1835b) to
+    // show what the effective-admin fixpoint already defends against.
+    fn mk_scope(space: &mut TribleSet, creator: &Id) -> Id {
+        let s = ufoid().id;
+        *space += entity! { ExclusiveId::force_ref(&s) @
+            metadata::tag: &KIND_SCOPE, scope_creator: creator };
+        s
+    }
+    fn mk_grant(space: &mut TribleSet, scope: &Id, iss: &Id, rel: &str, subj: &Id) -> Id {
+        let g = ufoid().id;
+        *space += entity! { ExclusiveId::force_ref(&g) @
+            metadata::tag: &KIND_GRANT,
+            grant_object: scope,
+            grant_relation: rel,
+            grant_issuer: iss,
+            grant_subject: subj,
+        };
+        g
+    }
+    fn retract(space: &mut TribleSet, g: &Id) {
+        *space += entity! { ExclusiveId::force_ref(g) @
+            grant_retracted_at: instant_interval(now_epoch()) };
+    }
+
+    #[test]
+    fn concurrent_confederate_add_is_defeated() {
+        // alice (root) -> admin -> bob. Then, concurrently: alice REMOVES bob,
+        // while bob (not yet seeing the removal) makes mallory an admin. After
+        // merge, both ops are present. The removal must win: mallory's grant was
+        // issued by bob, who is no longer an effective admin.
+        let (alice, bob, mallory) = (ufoid().id, ufoid().id, ufoid().id);
+        let mut space = TribleSet::new();
+        let s = mk_scope(&mut space, &alice);
+        let g_bob = mk_grant(&mut space, &s, &alice, "admin", &bob);
+        // branch A: alice removes bob.  branch B: bob adds mallory.  (union)
+        retract(&mut space, &g_bob);
+        mk_grant(&mut space, &s, &bob, "admin", &mallory);
+
+        let admins = effective_admins(&space, s);
+        assert_eq!(admins.len(), 1);
+        assert!(admins.contains(&alice));
+        assert!(!admins.contains(&bob), "bob was removed");
+        assert!(!admins.contains(&mallory), "confederate-add by a removed admin is inert");
+    }
+
+    #[test]
+    fn concurrent_removal_cascades_through_delegated_admin() {
+        // alice -> admin -> bob -> admin -> carol. Concurrently: alice removes
+        // bob, while carol (whose admin came via bob) makes dave an admin. The
+        // removal of bob must transitively void carol AND dave.
+        let (alice, bob, carol, dave) = (ufoid().id, ufoid().id, ufoid().id, ufoid().id);
+        let mut space = TribleSet::new();
+        let s = mk_scope(&mut space, &alice);
+        let g_bob = mk_grant(&mut space, &s, &alice, "admin", &bob);
+        mk_grant(&mut space, &s, &bob, "admin", &carol);
+        retract(&mut space, &g_bob); // alice removes bob
+        mk_grant(&mut space, &s, &carol, "admin", &dave); // concurrent, by carol
+
+        let admins = effective_admins(&space, s);
+        assert_eq!(admins, HashSet::from([alice]));
+    }
+
+    #[test]
+    fn root_is_unremovable_no_headless_group() {
+        // Even if every admin grant is retracted, the content-derived creator
+        // remains — there is no grant to retract for the root, so the group can
+        // never become headless.
+        let (alice, bob) = (ufoid().id, ufoid().id);
+        let mut space = TribleSet::new();
+        let s = mk_scope(&mut space, &alice);
+        let g = mk_grant(&mut space, &s, &alice, "admin", &bob);
+        retract(&mut space, &g);
+        assert_eq!(effective_admins(&space, s), HashSet::from([alice]));
+    }
+
+    #[test]
+    fn concurrent_independent_grants_both_apply() {
+        // Two non-conflicting concurrent ops by the same effective admin both
+        // survive the merge (convergence, no spurious loss).
+        let (alice, bob, carol, dave) = (ufoid().id, ufoid().id, ufoid().id, ufoid().id);
+        let mut space = TribleSet::new();
+        let s = mk_scope(&mut space, &alice);
+        mk_grant(&mut space, &s, &alice, "admin", &bob);
+        mk_grant(&mut space, &s, &bob, "admin", &carol); // branch A
+        mk_grant(&mut space, &s, &bob, "admin", &dave); // branch B
+        assert_eq!(effective_admins(&space, s), HashSet::from([alice, bob, carol, dave]));
+    }
+
     #[test]
     fn effective_admins_fixpoint_and_transitive_removal() {
         // Pure TribleSet (no pile/blobs): exercises the validity fixpoint.
@@ -1129,7 +1226,7 @@ mod tests {
         // scope rooted at alice
         space += entity! { ExclusiveId::force_ref(&sid) @
             metadata::tag: &KIND_SCOPE, scope_creator: &aid };
-        let mut grant = |space: &mut TribleSet, iss: &Id, rel: &str, subj: &Id| -> Id {
+        let grant = |space: &mut TribleSet, iss: &Id, rel: &str, subj: &Id| -> Id {
             let g = ufoid().id;
             *space += entity! { ExclusiveId::force_ref(&g) @
                 metadata::tag: &KIND_GRANT,
