@@ -62,6 +62,15 @@ enum Command {
         /// Email address
         #[arg(long)]
         email: Option<String>,
+        /// Company / organisation
+        #[arg(long)]
+        company: Option<String>,
+        /// Role / job title
+        #[arg(long)]
+        position: Option<String>,
+        /// Provenance ("summit" | "card" | "mail" | …)
+        #[arg(long)]
+        source: Option<String>,
         /// Create even if a relation with this label, alias, or email
         /// already exists. Without this flag, `relations add` refuses
         /// to mint a duplicate person entity — protects the knowledge
@@ -101,6 +110,15 @@ enum Command {
         /// Email address
         #[arg(long)]
         email: Option<String>,
+        /// Company / organisation
+        #[arg(long)]
+        company: Option<String>,
+        /// Role / job title
+        #[arg(long)]
+        position: Option<String>,
+        /// Provenance ("summit" | "card" | "mail" | …)
+        #[arg(long)]
+        source: Option<String>,
     },
     /// List people
     List {
@@ -387,6 +405,9 @@ fn cmd_add(
     aliases: Vec<String>,
     teams_user_id: Option<String>,
     email: Option<String>,
+    company: Option<String>,
+    position: Option<String>,
+    source: Option<String>,
     force: bool,
 ) -> Result<()> {
     let label = normalize_label(&label)?;
@@ -463,11 +484,16 @@ fn cmd_add(
             }
         }
 
+        if let Some(s) = source.as_deref() {
+            validate_short(s, "source")?;
+        }
         let label_handle = ws.put(label.clone());
         let display_name_handle = display_name.map(|value| ws.put(value));
         let first_name_handle = first_name.map(|value| ws.put(value));
         let last_name_handle = last_name.map(|value| ws.put(value));
         let note_handle = note.map(|value| ws.put(value));
+        let company_handle = company.map(|value| ws.put(value));
+        let position_handle = position.map(|value| ws.put(value));
         change += entity! { ExclusiveId::force_ref(&person_id) @
             metadata::tag: &KIND_PERSON_ID,
             metadata::name: label_handle,
@@ -479,6 +505,9 @@ fn cmd_add(
             metadata::description?: note_handle,
             relations::teams_user_id?: teams_user_id,
             relations::email?: email,
+            relations::company?: company_handle,
+            relations::position?: position_handle,
+            relations::source?: source,
             relations::alias*: aliases.iter().map(String::as_str),
             relations::alias_norm*: alias_lookup.iter().map(String::as_str),
         };
@@ -506,6 +535,9 @@ fn cmd_set(
     aliases: Vec<String>,
     teams_user_id: Option<String>,
     email: Option<String>,
+    company: Option<String>,
+    position: Option<String>,
+    source: Option<String>,
 ) -> Result<()> {
     let label = label.map(|l| normalize_label(&l)).transpose()?;
     let label_lookup = label.as_deref().map(normalize_lookup_key).transpose()?;
@@ -513,6 +545,7 @@ fn cmd_set(
         (affinity.as_deref(), "affinity"),
         (teams_user_id.as_deref(), "teams-user-id"),
         (email.as_deref(), "email"),
+        (source.as_deref(), "source"),
     ] {
         if let Some(v) = value {
             validate_short(v, field)?;
@@ -560,6 +593,8 @@ fn cmd_set(
         let first_name_handle = first_name.map(|value| ws.put(value));
         let last_name_handle = last_name.map(|value| ws.put(value));
         let note_handle = note.map(|value| ws.put(value));
+        let company_handle = company.map(|value| ws.put(value));
+        let position_handle = position.map(|value| ws.put(value));
         let has_updates = label_handle.is_some()
             || label_lookup.is_some()
             || display_name_handle.is_some()
@@ -569,6 +604,9 @@ fn cmd_set(
             || note_handle.is_some()
             || teams_user_id.is_some()
             || email.is_some()
+            || company_handle.is_some()
+            || position_handle.is_some()
+            || source.is_some()
             || !aliases.is_empty();
 
         if has_updates {
@@ -582,6 +620,9 @@ fn cmd_set(
                 metadata::description?: note_handle,
                 relations::teams_user_id?: teams_user_id,
                 relations::email?: email,
+                relations::company?: company_handle,
+                relations::position?: position_handle,
+                relations::source?: source,
                 relations::alias*: aliases.iter().map(String::as_str),
                 relations::alias_norm*: alias_lookup.iter().map(String::as_str),
             };
@@ -734,6 +775,9 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            company,
+            position,
+            source,
             force,
         } => cmd_add(
             &cli.pile,
@@ -749,6 +793,9 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            company,
+            position,
+            source,
             force,
         ),
         Command::Set {
@@ -762,6 +809,9 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            company,
+            position,
+            source,
         } => cmd_set(
             &cli.pile,
             &cli.branch,
@@ -776,6 +826,9 @@ fn main() -> Result<()> {
             alias,
             teams_user_id,
             email,
+            company,
+            position,
+            source,
         ),
         Command::List { limit } => cmd_list(&cli.pile, &cli.branch, branch_id, limit),
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
