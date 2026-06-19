@@ -10,10 +10,13 @@
 //! current recipient set is enumerated from the grant tuples with the query
 //! engine — never stored, "work as its own ledger".
 //!
-//! Status: MVP slice. `identity init/list`, `grant`, `secret add/get/list`,
-//! non-concurrent retraction. The concurrency-safe correctness layer
-//! (strong-removal + predecessor-validity + epoch finality, wiki 65a1835b) is
-//! NOT yet wired — do not run multi-admin removal flows against this until it is.
+//! Status: MVP slice. `identity init/list`, `grant`, `revoke`,
+//! `secret add/get/list`; non-concurrent retraction; transitive group
+//! membership (a group is any id used as both grant object and subject; the
+//! recipient set is `path!`'s closure over live grants). The concurrency-safe
+//! correctness layer (strong-removal + predecessor-validity + epoch finality,
+//! wiki 65a1835b) is NOT yet wired — do not run multi-admin removal flows
+//! against this until it is. Secret rotation is also still pending.
 
 use std::path::{Path, PathBuf};
 
@@ -69,6 +72,9 @@ mod schema {
         "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC" as pub wrap_secret: GenId;
         "CAD2A79E7F5B1A870F5814BDEE5C90F8" as pub wrap_recipient: GenId;
         "B30CE37D4DC3CAACC34D946B3D71E37C" as pub wrap_dek: Handle<RawBytes>;
+        // Ephemeral edge, only ever asserted into an in-memory TribleSet for
+        // `path!` transitive closure — never persisted. (minted 2026-06-19)
+        "ABAF427C4F1CB01AA7091A9C38F0DA3A" as pub reaches: GenId;
     }
 
     pub const KIND_IDENTITY: Id = id_hex!("0B870F06D1B502EBE1259C90234E8BA2");
@@ -79,8 +85,8 @@ mod schema {
 
 use schema::{
     KIND_GRANT, KIND_IDENTITY, KIND_SECRET, KIND_WRAP, grant_object, grant_relation,
-    grant_retracted_at, grant_subject, identity_lockbox, identity_sign_pk, secret_body, secret_name,
-    secret_scope, wrap_dek, wrap_recipient, wrap_secret,
+    grant_retracted_at, grant_subject, identity_lockbox, identity_sign_pk, reaches, secret_body,
+    secret_name, secret_scope, wrap_dek, wrap_recipient, wrap_secret,
 };
 
 const DEFAULT_BRANCH: &str = "secrets";
@@ -228,15 +234,32 @@ fn grant_is_live(space: &TribleSet, grant: Id) -> bool {
     !exists!(pattern!(space, [{ grant @ grant_retracted_at: _?r }]))
 }
 
-/// Recipients of a scope = subjects of its live grants. One hop for the MVP;
-/// transitive group nesting via `path!` is the next increment.
+/// Recipients of a scope = identities transitively reachable through its live
+/// grants. A "group" is just a scope that is itself a grant subject elsewhere;
+/// any id can be both object and subject, so membership nests with no extra
+/// entity kind. We project live grants into an ephemeral object->subject edge
+/// set and let the engine's `path!` take the transitive closure — the edge set
+/// is never persisted (work as its own ledger: recipients are a derived view).
 fn recipients_of(space: &TribleSet, scope: Id) -> Vec<Id> {
+    let mut edges = TribleSet::new();
+    for (g, obj, subj) in find!(
+        (g: Id, o: Id, s: Id),
+        pattern!(space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: ?o, grant_subject: ?s }])
+    ) {
+        if grant_is_live(space, g) {
+            edges += entity! { ExclusiveId::force_ref(&obj) @ reaches: &subj };
+        }
+    }
     let mut out: Vec<Id> = find!(
-        (g: Id, subj: Id),
-        pattern!(space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: scope, grant_subject: ?subj }])
+        (start: Id, leaf: Id),
+        and!(start.is(scope.to_inline()), path!(edges, start reaches+ leaf))
     )
-    .filter(|(g, _)| grant_is_live(space, *g))
-    .map(|(_, subj)| subj)
+    .map(|(_, leaf)| leaf)
+    // keep only identity leaves (intermediate groups carry no signing key)
+    .filter(|l| {
+        let lid = *l;
+        exists!(pattern!(space, [{ lid @ identity_sign_pk: _?p }]))
+    })
     .collect();
     out.sort();
     out.dedup();
