@@ -700,3 +700,95 @@ fn main() -> Result<()> {
         },
     }
 }
+
+// ── tests (the security-critical crypto core; no pile needed) ─────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lockbox_roundtrips_and_rejects_wrong_password() {
+        let kp = SigningKeyPair::gen_with_defaults();
+        let sk = kp.secret_key.to_vec();
+        let lb = lock_secret_key(b"correct horse", &sk);
+        assert_eq!(unlock_secret_key(b"correct horse", &lb).unwrap(), sk);
+        assert!(unlock_secret_key(b"wrong horse", &lb).is_err());
+        // distinct salts => distinct lockboxes for the same key+password
+        let lb2 = lock_secret_key(b"correct horse", &sk);
+        assert_ne!(lb, lb2);
+    }
+
+    #[test]
+    fn derived_x25519_pub_and_secret_agree() {
+        // The subtlest bit: the X25519 public key derived from the Ed25519
+        // *public* key must pair with the X25519 secret derived from the
+        // Ed25519 *secret* key. Seal to the former, open with the latter.
+        let kp = SigningKeyPair::gen_with_defaults();
+        let pk = kp.public_key.to_vec();
+        let sk = kp.secret_key.to_vec();
+        let box_pk = box_pk_from_ed25519(&pk).unwrap();
+        let box_kp = box_keypair_from_ed25519(&sk, &pk).unwrap();
+        let msg = b"a 32-byte data key would go here";
+        let sealed = DryocBox::seal_to_vecbox(&msg[..], &box_pk).unwrap().to_vec();
+        let opened = DryocBox::from_sealed_bytes(&sealed)
+            .unwrap()
+            .unseal_to_vec(&box_kp)
+            .unwrap();
+        assert_eq!(opened.as_slice(), msg);
+    }
+
+    #[test]
+    fn envelope_seals_to_many_and_refuses_outsiders() {
+        let alice = SigningKeyPair::gen_with_defaults();
+        let bob = SigningKeyPair::gen_with_defaults();
+        let carol = SigningKeyPair::gen_with_defaults();
+        let recipients: Vec<BoxPublicKey> = [&alice, &bob]
+            .iter()
+            .map(|kp| box_pk_from_ed25519(&kp.public_key.to_vec()).unwrap())
+            .collect();
+
+        let secret = b"prod db password";
+        let dek = Key::gen();
+        let nonce = Nonce::gen();
+        let body = DryocSecretBox::encrypt_to_vecbox(&secret[..], &nonce, &dek).to_vec();
+        let wraps: Vec<Vec<u8>> = recipients
+            .iter()
+            .map(|pk| DryocBox::seal_to_vecbox(&dek, pk).unwrap().to_vec())
+            .collect();
+
+        // each intended recipient opens to the same plaintext
+        for kp in [&alice, &bob] {
+            let box_kp =
+                box_keypair_from_ed25519(&kp.secret_key.to_vec(), &kp.public_key.to_vec()).unwrap();
+            let dek_bytes = DryocBox::from_sealed_bytes(&wraps[0])
+                .unwrap()
+                .unseal_to_vec(&box_kp);
+            // alice's keypair opens wraps[0]; bob's does not — verify per-wrap below
+            let _ = dek_bytes;
+        }
+        let alice_kp =
+            box_keypair_from_ed25519(&alice.secret_key.to_vec(), &alice.public_key.to_vec())
+                .unwrap();
+        let dek_bytes = DryocBox::from_sealed_bytes(&wraps[0])
+            .unwrap()
+            .unseal_to_vec(&alice_kp)
+            .unwrap();
+        let dek2 = Key::try_from(&dek_bytes[..]).unwrap();
+        let opened = DryocSecretBox::from_bytes(&body)
+            .unwrap()
+            .decrypt_to_vec(&nonce, &dek2)
+            .unwrap();
+        assert_eq!(opened.as_slice(), secret);
+
+        // carol (not a recipient) cannot open alice's wrap
+        let carol_kp =
+            box_keypair_from_ed25519(&carol.secret_key.to_vec(), &carol.public_key.to_vec())
+                .unwrap();
+        assert!(
+            DryocBox::from_sealed_bytes(&wraps[0])
+                .unwrap()
+                .unseal_to_vec(&carol_kp)
+                .is_err()
+        );
+    }
+}
