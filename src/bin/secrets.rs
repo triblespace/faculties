@@ -344,6 +344,13 @@ enum SecretCmd {
         #[arg(long)]
         r#as: String,
     },
+    /// Re-wrap a secret's DEK to recipients added after it was created.
+    /// Run as an existing recipient (needs LIORA_SECRETS_PW to unlock the DEK).
+    Share {
+        secret: String,
+        #[arg(long)]
+        r#as: String,
+    },
     /// List secrets.
     List,
 }
@@ -671,6 +678,92 @@ fn cmd_secret_get(pile: &Path, branch: &str, secret: String, as_id: String) -> R
     Ok(())
 }
 
+fn cmd_secret_share(pile: &Path, branch: &str, secret: String, as_id: String) -> Result<()> {
+    let pw = password()?;
+    with_repo(pile, |repo| {
+        let branch_id = repo
+            .ensure_branch(branch, None)
+            .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        let secret_id = resolve_kind_id(&space, KIND_SECRET, &secret)?;
+        let me = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
+
+        // Unlock my key and recover the DEK from my own wrap.
+        let (lock_h, my_pk_h): (BytesHandle, BytesHandle) = find!(
+            (l: BytesHandle, p: BytesHandle),
+            pattern!(&space, [{ me @ identity_lockbox: ?l, identity_sign_pk: ?p }])
+        )
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("identity {} not found", fmt_id(me)))?;
+        let lockbox = read_bytes(&mut ws, lock_h).context("read lockbox")?;
+        let my_pk = read_bytes(&mut ws, my_pk_h).context("read pk")?;
+        let my_sk = unlock_secret_key(&pw, &lockbox)?;
+        let box_kp = box_keypair_from_ed25519(&my_sk, &my_pk)?;
+
+        let my_wrap_h: BytesHandle = find!(
+            (w: Id, d: BytesHandle),
+            pattern!(&space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: me, wrap_dek: ?d }])
+        )
+        .next()
+        .map(|(_, d)| d)
+        .ok_or_else(|| anyhow::anyhow!("you ({}) are not a recipient of this secret", fmt_id(me)))?;
+        let sealed = read_bytes(&mut ws, my_wrap_h).context("read wrap")?;
+        let dek_bytes = DryocBox::from_sealed_bytes(&sealed)
+            .map_err(|e| anyhow::anyhow!("parse wrap: {e:?}"))?
+            .unseal_to_vec(&box_kp)
+            .map_err(|_| anyhow::anyhow!("unseal failed (wrong key?)"))?;
+        let dek = Key::try_from(&dek_bytes[..]).context("dek")?;
+
+        // Current recipients minus those who already hold a wrap.
+        let scope = find!(
+            sc: Id,
+            pattern!(&space, [{ secret_id @ secret_scope: ?sc }])
+        )
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("secret has no scope"))?;
+        let recipients = recipients_of(&space, scope);
+        let existing: std::collections::HashSet<Id> = find!(
+            (w: Id, r: Id),
+            pattern!(&space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: ?r }])
+        )
+        .map(|(_, r)| r)
+        .collect();
+        let missing: Vec<Id> = recipients.into_iter().filter(|r| !existing.contains(r)).collect();
+        if missing.is_empty() {
+            println!("already shared to all current recipients");
+            return Ok(());
+        }
+
+        let now = instant_interval(now_epoch());
+        let mut change = TribleSet::new();
+        for r in &missing {
+            let rid = *r;
+            let pk_h: BytesHandle = find!(h: BytesHandle, pattern!(&space, [{ rid @ identity_sign_pk: ?h }]))
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("recipient {} has no signing key", fmt_id(*r)))?;
+            let pk = read_bytes(&mut ws, pk_h).ok_or_else(|| anyhow::anyhow!("read pk"))?;
+            let rx_pk = box_pk_from_ed25519(&pk)?;
+            let sealed = DryocBox::seal_to_vecbox(&dek, &rx_pk)
+                .map_err(|e| anyhow::anyhow!("seal to {}: {e:?}", fmt_id(*r)))?
+                .to_vec();
+            let dek_h = put_bytes(&mut ws, sealed);
+            let w = ufoid();
+            change += entity! { &w @
+                metadata::tag: &KIND_WRAP,
+                metadata::created_at: now,
+                wrap_secret: &secret_id,
+                wrap_recipient: r,
+                wrap_dek: dek_h,
+            };
+        }
+        ws.commit(change, "secrets: secret share");
+        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        println!("shared to {} new recipient(s)", missing.len());
+        Ok(())
+    })
+}
+
 fn cmd_secret_list(pile: &Path, branch: &str) -> Result<()> {
     with_repo(pile, |repo| {
         let branch_id = repo
@@ -718,6 +811,9 @@ fn main() -> Result<()> {
             }
             SecretCmd::Get { secret, r#as } => {
                 cmd_secret_get(&cli.pile, &cli.branch, secret, r#as)
+            }
+            SecretCmd::Share { secret, r#as } => {
+                cmd_secret_share(&cli.pile, &cli.branch, secret, r#as)
             }
             SecretCmd::List => cmd_secret_list(&cli.pile, &cli.branch),
         },
