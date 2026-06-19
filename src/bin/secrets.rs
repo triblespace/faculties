@@ -246,6 +246,27 @@ fn resolve_kind_id(space: &TribleSet, kind: Id, input: &str) -> Result<Id> {
     faculties::resolve_id_prefix(input, candidates)
 }
 
+/// Resolve an entity of `kind` from an id (full hex or prefix) or, failing
+/// that, its name (`metadata::name` — a scope's name, an identity's nickname).
+/// Name resolution requires the name to be unambiguous.
+fn resolve_named(ws: &mut Workspace<Pile>, space: &TribleSet, kind: Id, input: &str) -> Result<Id> {
+    if let Ok(id) = resolve_kind_id(space, kind, input) {
+        return Ok(id);
+    }
+    let named: Vec<Id> = find!(
+        (e: Id, n: TextHandle),
+        pattern!(space, [{ ?e @ metadata::tag: kind, metadata::name: ?n }])
+    )
+    .filter(|(_, n)| read_text(ws, *n).as_deref() == Some(input))
+    .map(|(e, _)| e)
+    .collect();
+    match named.as_slice() {
+        [one] => Ok(*one),
+        [] => bail!("no match for '{input}' (by id or name)"),
+        many => bail!("name '{input}' is ambiguous ({} matches — use the id)", many.len()),
+    }
+}
+
 fn password() -> Result<Vec<u8>> {
     std::env::var("LIORA_SECRETS_PW")
         .map(|s| s.into_bytes())
@@ -606,7 +627,7 @@ fn cmd_scope_create(pile: &Path, branch: &str, name: String, as_id: String) -> R
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let creator = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
+        let creator = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
         let pk = read_sign_pk(&mut ws, &space, creator)?;
         let scope_id = derive_scope_id(&pk, &name);
 
@@ -668,10 +689,9 @@ fn cmd_grant(
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let object_id = Id::from_hex(object.trim().to_ascii_uppercase().as_str())
-            .ok_or_else(|| anyhow::anyhow!("--object must be a 32-char hex scope id"))?;
-        let subject_id = resolve_kind_id(&space, KIND_IDENTITY, &subject)?;
-        let issuer_id = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
+        let object_id = resolve_named(&mut ws, &space, KIND_SCOPE, &object)?;
+        let subject_id = resolve_named(&mut ws, &space, KIND_IDENTITY, &subject)?;
+        let issuer_id = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
 
         // The issuer must be an effective admin of the object — otherwise this
         // grant could never chain to the scope root and would be inert anyway.
@@ -722,9 +742,8 @@ fn cmd_revoke(pile: &Path, branch: &str, object: String, subject: String) -> Res
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let object_id = Id::from_hex(object.trim().to_ascii_uppercase().as_str())
-            .ok_or_else(|| anyhow::anyhow!("--object must be a 32-char hex scope id"))?;
-        let subject_id = resolve_kind_id(&space, KIND_IDENTITY, &subject)?;
+        let object_id = resolve_named(&mut ws, &space, KIND_SCOPE, &object)?;
+        let subject_id = resolve_named(&mut ws, &space, KIND_IDENTITY, &subject)?;
         let grants: Vec<Id> = find!(
             g: Id,
             pattern!(&space, [{ ?g @ metadata::tag: KIND_GRANT, grant_object: object_id, grant_subject: subject_id }])
@@ -765,7 +784,7 @@ fn cmd_secret_add(
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let scope_id = resolve_kind_id(&space, KIND_SCOPE, &scope)?;
+        let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
 
         let recipients = recipients_of(&space, scope_id);
         if recipients.is_empty() {
@@ -847,10 +866,10 @@ fn cmd_secret_get(
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let scope_id = resolve_kind_id(&space, KIND_SCOPE, &scope)?;
+        let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
         let secret_id = latest_secret(&space, scope_id, &name)
             .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
-        let me = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
+        let me = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
 
         // Unlock my private key, derive my X25519 keypair.
         let (lock_h, my_pk_h): (BytesHandle, BytesHandle) = find!(
@@ -916,10 +935,10 @@ fn cmd_secret_share(
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let scope_id = resolve_kind_id(&space, KIND_SCOPE, &scope)?;
+        let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
         let secret_id = latest_secret(&space, scope_id, &name)
             .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
-        let me = resolve_kind_id(&space, KIND_IDENTITY, &as_id)?;
+        let me = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
 
         // Unlock my key and recover the DEK from my own wrap.
         let (lock_h, my_pk_h): (BytesHandle, BytesHandle) = find!(
