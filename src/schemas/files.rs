@@ -7,6 +7,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
+use triblespace_search::schemas::Embedding;
 
 // ── branch name ──────────────────────────────────────────────────────────
 pub const FILES_BRANCH_NAME: &str = "files";
@@ -37,5 +38,10 @@ pub mod file {
         "7B36A7A304C26C5504EA54F5723FA135" as root: inlineencodings::GenId;
         // import: original filesystem path
         "E4B24BB9F469CEC6FD12926C56514E9F" as source_path: inlineencodings::Handle<blobencodings::LongString>;
+        // file leaf: CLIP embedding handle — semantic-search exhaust, set on
+        // `add` for image/* files. L2-normalized at put_embedding time;
+        // `files similar` builds an HNSW over these on demand. The embedder
+        // is a compute-boundary detail (ort/ONNX now, Burn-native later).
+        "433BE3AC7F95405872385898AD52FB73" as embedding: inlineencodings::Handle<Embedding>;
     }
 }

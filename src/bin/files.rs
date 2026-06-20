@@ -10,13 +10,17 @@ use rand_core::OsRng;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
+use triblespace_search::hnsw::HNSWBuilder;
+use triblespace_search::schemas::{put_embedding, Embedding};
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type EmbHandle = Inline<inlineencodings::Handle<Embedding>>;
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
@@ -98,6 +102,22 @@ enum Command {
     Search {
         /// Search query (substring, case-insensitive)
         query: String,
+    },
+    /// Find image files semantically similar to a query file (HNSW over CLIP
+    /// embeddings). `--tag` makes it a hybrid query: similar AND carrying the
+    /// tag — the join that tells "a form of me" from the project mascots.
+    Similar {
+        /// Entity id or content hash of the query file (must be an embedded image)
+        id: String,
+        /// Minimum cosine similarity, 0..1
+        #[arg(long, default_value_t = 0.5)]
+        floor: f32,
+        /// Maximum results
+        #[arg(long, short = 'n', default_value_t = 10)]
+        limit: usize,
+        /// Only results carrying ALL these tags (repeatable) — the hybrid filter
+        #[arg(long)]
+        tag: Vec<String>,
     },
     /// List imports (snapshots)
     Imports,
@@ -1346,6 +1366,133 @@ fn print_diff_removed(
 
 // ── main ─────────────────────────────────────────────────────────────────
 
+/// Read a stored embedding blob back into a plain `Vec<f32>`.
+fn read_embedding(ws: &mut Workspace<Pile>, h: EmbHandle) -> Result<Vec<f32>> {
+    let v: anybytes::View<[f32]> = ws
+        .get(h)
+        .map_err(|e| anyhow::anyhow!("read embedding blob: {e:?}"))?;
+    Ok(v.as_ref().to_vec())
+}
+
+/// Semantic nearest-neighbour search over image embeddings.
+///
+/// Embeddings are persisted as exhaust of `add` (one `Handle<Embedding>` per
+/// image file); the HNSW index itself is rebuilt on demand here — at this
+/// scale a build is sub-second, so there is no stale index to maintain. The
+/// query is pile-native: `candidates_above` walks the graph, and the optional
+/// `--tag` filter is the hybrid join that separates real forms from mascots.
+fn cmd_similar(
+    ws: &mut Workspace<Pile>,
+    id: &str,
+    floor: f32,
+    limit: usize,
+    filter_tags: &[String],
+) -> Result<()> {
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let query_eid = resolve_entity(&space, id)?;
+
+    // The query file's own embedding handle.
+    let query_handle: EmbHandle = find!(
+        (h: EmbHandle),
+        pattern!(&space, [{ query_eid @ file::embedding: ?h }])
+    )
+    .map(|(h,)| h)
+    .next()
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "file has no embedding — only image/* files are embedded, \
+             and only on `add` since embed-on-add landed (re-add it)"
+        )
+    })?;
+
+    // Every embedded file: (entity, handle). Read each vector back from the
+    // pile and stage it into a local store the HNSW can attach to.
+    let pairs: Vec<(Id, EmbHandle)> = find!(
+        (eid: Id, h: EmbHandle),
+        pattern!(&space, [{ ?eid @ file::embedding: ?h }])
+    )
+    .collect();
+    if pairs.len() < 2 {
+        bail!("need at least 2 embedded files to compare; add some images first");
+    }
+
+    let mut store = MemoryBlobStore::new();
+    let mut builder: Option<HNSWBuilder> = None;
+    let mut by_handle: std::collections::HashMap<EmbHandle, (Id, Vec<f32>)> =
+        std::collections::HashMap::new();
+    for (eid, h) in &pairs {
+        let v = read_embedding(ws, *h)?;
+        let dim = v.len();
+        let lh = put_embedding(&mut store, v.clone())
+            .map_err(|e| anyhow::anyhow!("stage embedding: {e:?}"))?;
+        builder
+            .get_or_insert_with(|| HNSWBuilder::new(dim).with_seed(42))
+            .insert(lh, v.clone())
+            .map_err(|e| anyhow::anyhow!("hnsw insert: {e:?}"))?;
+        by_handle.insert(lh, (*eid, v));
+    }
+    let builder = builder.expect("≥2 pairs guaranteed a builder");
+
+    // Stage the query vector too (content-addressed → same handle bits).
+    let query_vec = read_embedding(ws, query_handle)?;
+    let local_query = put_embedding(&mut store, query_vec.clone())
+        .map_err(|e| anyhow::anyhow!("stage query: {e:?}"))?;
+
+    let idx = builder.build();
+    let reader = store
+        .reader()
+        .map_err(|e| anyhow::anyhow!("blob reader: {e:?}"))?;
+    let view = idx.attach(&reader);
+
+    let candidates = view
+        .candidates_above(local_query, floor)
+        .map_err(|e| anyhow::anyhow!("similarity search: {e:?}"))?;
+
+    // Score (cosine = dot, since put_embedding L2-normalises), drop self,
+    // apply the hybrid tag filter, rank, truncate.
+    let mut rows: Vec<(f32, Id)> = Vec::new();
+    for h in candidates {
+        let Some((eid, v)) = by_handle.get(&h) else { continue };
+        if *eid == query_eid {
+            continue;
+        }
+        if !filter_tags.is_empty() {
+            let tags = tags_of(&space, *eid);
+            if !filter_tags.iter().all(|ft| tags.iter().any(|t| t == ft)) {
+                continue;
+            }
+        }
+        let cos: f32 = query_vec.iter().zip(v.iter()).map(|(a, b)| a * b).sum();
+        rows.push((cos, *eid));
+    }
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    rows.truncate(limit);
+
+    let qname = read_name(&space, ws, query_eid).unwrap_or_else(|| "?".into());
+    if rows.is_empty() {
+        println!("no files similar to {qname} above cos {floor}");
+        return Ok(());
+    }
+    println!("Similar to {qname} (cos ≥ {floor}):");
+    for (cos, eid) in &rows {
+        let name = read_name(&space, ws, *eid).unwrap_or_else(|| "?".into());
+        let mime = read_mime(&space, *eid).unwrap_or_else(|| "?".into());
+        let hash = content_handle_of(&space, *eid)
+            .map(handle_hex)
+            .unwrap_or_default();
+        let tags = tags_of(&space, *eid);
+        let tagstr = if tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", tags.join(", "))
+        };
+        println!("  {cos:.3}  {name}  ({mime})  {hash}{tagstr}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1386,6 +1533,11 @@ fn main() -> Result<()> {
         }
         Command::Search { query } => {
             with_files(pile, branch, |_repo, ws| cmd_search(ws, &query))
+        }
+        Command::Similar { id, floor, limit, tag } => {
+            with_files(pile, branch, |_repo, ws| {
+                cmd_similar(ws, &id, floor, limit, &tag)
+            })
         }
         Command::Imports => {
             with_files(pile, branch, |_repo, ws| cmd_imports(ws))
