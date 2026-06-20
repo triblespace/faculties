@@ -1178,6 +1178,16 @@ fn cmd_wait(
                             println!("News: {reason}");
                         }
                         print_news_detail(repo, &seen, &view, local_branch_id, relations_branch_id)?;
+                        // Advance the checkpoint — the terse path skips
+                        // cmd_show, which is what normally saves it. Without
+                        // this the checkpoint never moves and every re-arm
+                        // instantly re-fires on the same news.
+                        save_checkpoint_heads(
+                            repo,
+                            orient_state_branch_id,
+                            &baseline_heads,
+                            Some((pid, &view)),
+                        )?;
                         return Ok((true, true, true));
                     }
                 }
@@ -1227,6 +1237,13 @@ fn cmd_wait(
                             println!("News: {reason}");
                         }
                         print_news_detail(repo, &*view, &current_view, local_branch_id, relations_branch_id)?;
+                        // Advance the checkpoint (terse path skips cmd_show).
+                        save_checkpoint_heads(
+                            repo,
+                            orient_state_branch_id,
+                            &current_heads,
+                            Some((pid, &current_view)),
+                        )?;
                         return Ok((false, true, true));
                     }
                     // Movement without news (own ack/send, another
