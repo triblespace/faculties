@@ -103,14 +103,20 @@ enum Command {
         /// Search query (substring, case-insensitive)
         query: String,
     },
-    /// Find image files semantically similar to a query file (HNSW over CLIP
-    /// embeddings). `--tag` makes it a hybrid query: similar AND carrying the
-    /// tag — the join that tells "a form of me" from the project mascots.
+    /// Find files semantically similar to a query — by an embedded image file,
+    /// or cross-modally by `--text "a description"` (same CLIP space). `--tag`
+    /// makes it a hybrid query: similar AND carrying the tag — the join that
+    /// tells "a form of me" from the project mascots.
     Similar {
-        /// Entity id or content hash of the query file (must be an embedded image)
-        id: String,
-        /// Minimum cosine similarity, 0..1
-        #[arg(long, default_value_t = 0.5)]
+        /// Entity id or content hash of a query file (omit when using --text)
+        id: Option<String>,
+        /// Text query for cross-modal search (omit when querying by file)
+        #[arg(long)]
+        text: Option<String>,
+        /// Minimum cosine similarity, 0..1. NB image↔image scores run high
+        /// (~0.9 for near-dupes) but text↔image run low (~0.2, CLIP's modality
+        /// gap), so this low default serves both; raise it to tighten.
+        #[arg(long, default_value_t = 0.15)]
         floor: f32,
         /// Maximum results
         #[arg(long, short = 'n', default_value_t = 10)]
@@ -525,6 +531,19 @@ fn embed_image_on_add(
         let _ = (ws, embedder, mime, bytes);
         Ok(None)
     }
+}
+
+/// Embed a text query into the shared image+text space (for `files similar
+/// --text`). Loads the embedder fresh — a one-off query, no warm handle needed.
+#[allow(unused_variables)]
+fn embed_text_query(text: &str) -> Result<Vec<f32>> {
+    #[cfg(feature = "local-embed")]
+    {
+        let emb = load_clip_embedder()?;
+        return emb.embed_text(text);
+    }
+    #[cfg(not(feature = "local-embed"))]
+    bail!("`files similar --text` needs the embedder — rebuild with --features local-embed");
 }
 
 fn build_tree(
@@ -1504,7 +1523,8 @@ fn nearest(pairs: &[(Id, Vec<f32>)], query: &[f32], floor: f32) -> Result<Vec<(f
 /// `--tag` filter is the hybrid join that separates real forms from mascots.
 fn cmd_similar(
     ws: &mut Workspace<Pile>,
-    id: &str,
+    id: Option<&str>,
+    text: Option<&str>,
     floor: f32,
     limit: usize,
     filter_tags: &[String],
@@ -1512,21 +1532,31 @@ fn cmd_similar(
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-    let query_eid = resolve_entity(&space, id)?;
 
-    // The query file's own embedding handle.
-    let query_handle: EmbHandle = find!(
-        (h: EmbHandle),
-        pattern!(&space, [{ query_eid @ file::embedding: ?h }])
-    )
-    .map(|(h,)| h)
-    .next()
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "file has no embedding — only image/* files are embedded, \
-             and only on `add` since embed-on-add landed (re-add it)"
-        )
-    })?;
+    // The query vector + a label, from either a text string (cross-modal) or a
+    // query file's stored embedding. `query_eid` is Some only for a file query,
+    // so it drops itself from its own results.
+    let (query_vec, query_eid, label): (Vec<f32>, Option<Id>, String) = match (text, id) {
+        (Some(t), _) => (embed_text_query(t)?, None, format!("{t:?}")),
+        (None, Some(idstr)) => {
+            let eid = resolve_entity(&space, idstr)?;
+            let h: EmbHandle = find!(
+                (h: EmbHandle),
+                pattern!(&space, [{ eid @ file::embedding: ?h }])
+            )
+            .map(|(h,)| h)
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "that file has no embedding — only image/* files are embedded \
+                     on `add` (re-add it), or query with --text instead"
+                )
+            })?;
+            let name = read_name(&space, ws, eid).unwrap_or_else(|| "?".into());
+            (read_embedding(ws, h)?, Some(eid), name)
+        }
+        (None, None) => bail!("give a file id/hash, or --text \"a query\""),
+    };
 
     // Every embedded file: (entity, handle). Read each vector back from the
     // pile and stage it into a local store the HNSW can attach to.
@@ -1535,8 +1565,8 @@ fn cmd_similar(
         pattern!(&space, [{ ?eid @ file::embedding: ?h }])
     )
     .collect();
-    if pairs.len() < 2 {
-        bail!("need at least 2 embedded files to compare; add some images first");
+    if pairs.is_empty() {
+        bail!("no embedded files yet — add some images first");
     }
 
     // Read every embedding into a plain vector and run the pure NN core.
@@ -1544,13 +1574,12 @@ fn cmd_similar(
     for (eid, h) in &pairs {
         vec_pairs.push((*eid, read_embedding(ws, *h)?));
     }
-    let query_vec = read_embedding(ws, query_handle)?;
     let ranked = nearest(&vec_pairs, &query_vec, floor)?;
 
-    // Drop self, apply the hybrid tag filter, truncate to the limit.
+    // Drop self (file query only), apply the hybrid tag filter, truncate.
     let mut rows: Vec<(f32, Id)> = Vec::new();
     for (cos, eid) in ranked {
-        if eid == query_eid {
+        if Some(eid) == query_eid {
             continue;
         }
         if !filter_tags.is_empty() {
@@ -1563,12 +1592,11 @@ fn cmd_similar(
     }
     rows.truncate(limit);
 
-    let qname = read_name(&space, ws, query_eid).unwrap_or_else(|| "?".into());
     if rows.is_empty() {
-        println!("no files similar to {qname} above cos {floor}");
+        println!("no files similar to {label} above cos {floor}");
         return Ok(());
     }
-    println!("Similar to {qname} (cos ≥ {floor}):");
+    println!("Similar to {label} (cos ≥ {floor}):");
     for (cos, eid) in &rows {
         let name = read_name(&space, ws, *eid).unwrap_or_else(|| "?".into());
         let mime = read_mime(&space, *eid).unwrap_or_else(|| "?".into());
@@ -1627,9 +1655,9 @@ fn main() -> Result<()> {
         Command::Search { query } => {
             with_files(pile, branch, |_repo, ws| cmd_search(ws, &query))
         }
-        Command::Similar { id, floor, limit, tag } => {
+        Command::Similar { id, text, floor, limit, tag } => {
             with_files(pile, branch, |_repo, ws| {
-                cmd_similar(ws, &id, floor, limit, &tag)
+                cmd_similar(ws, id.as_deref(), text.as_deref(), floor, limit, &tag)
             })
         }
         Command::Imports => {
