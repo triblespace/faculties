@@ -100,6 +100,8 @@ widgets = [
     "dep:egui",
     "dep:cubecl",
 ]
+# Semantic similarity in `files` (image+text embeddings via mary's embedder).
+local-embed = ["dep:mary"]
 
 [dependencies]
 # Core: every CLI faculty depends on these.
@@ -144,3 +146,8 @@ typst-syntax = "0.14"       # wiki
 GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "markdown"], optional = true }
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
+
+# Local-embed-only (optional): mary's CLIP/SigLIP multi-modal embedder, for
+# `files` semantic similarity (image+text shared space). Heavy (pulls mary +
+# Burn), so gated behind `local-embed` — the default build stays light.
+mary = { path = "../mary", default-features = false, features = ["embed"], optional = true }

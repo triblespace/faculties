@@ -465,11 +465,74 @@ fn print_fs_tree(
     Ok(())
 }
 
+// ── embedder seam (mary, behind `local-embed`) ────────────────────────────
+// A faculties-local trait so the rest of `files` stays feature-independent;
+// the only impl is mary's `LocalEmbedder`, gated behind `local-embed`. Without
+// the feature there is no way to construct one, so embed-on-add is a no-op.
+#[allow(dead_code)] // embed_text is used by `files similar --text` (feature-gated)
+trait ImageEmbedder {
+    fn embed_image(&self, bytes: &[u8]) -> Result<Vec<f32>>;
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+}
+
+#[cfg(feature = "local-embed")]
+impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
+    fn embed_image(&self, bytes: &[u8]) -> Result<Vec<f32>> {
+        mary::embed::LocalEmbedder::embed_image(self, bytes)
+    }
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        mary::embed::LocalEmbedder::embed_text(self, text)
+    }
+}
+
+/// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB). Requires the model cached
+/// (`huggingface-cli download openai/clip-vit-base-patch32`). SigLIP so400m
+/// swaps in behind this same trait later.
+#[cfg(feature = "local-embed")]
+fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
+    let emb = mary::embed::load_clip_from_hf(
+        "openai/clip-vit-base-patch32",
+        mary::embed::default_device(),
+    )?;
+    Ok(Box::new(emb))
+}
+
+/// Embed an image on `add` and stage it as `file::embedding` exhaust (stored
+/// under the file's content-derived id, so identity is unaffected). Lazy-loads
+/// the embedder on the first image. No-op without `local-embed` or for
+/// non-raster mimes (SVG isn't a bitmap CLIP can decode).
+#[allow(unused_variables)]
+fn embed_image_on_add(
+    ws: &mut Workspace<Pile>,
+    embedder: &mut Option<Box<dyn ImageEmbedder>>,
+    mime: &str,
+    bytes: &[u8],
+) -> Result<Option<EmbHandle>> {
+    #[cfg(feature = "local-embed")]
+    {
+        if !mime.starts_with("image/") || mime == "image/svg+xml" {
+            return Ok(None);
+        }
+        if embedder.is_none() {
+            eprintln!("files: loading CLIP embedder (once)…");
+            *embedder = Some(load_clip_embedder()?);
+        }
+        let v = embedder.as_ref().unwrap().embed_image(bytes)?;
+        return Ok(Some(ws.put::<Embedding, _>(v)));
+    }
+    #[cfg(not(feature = "local-embed"))]
+    {
+        let _ = (ws, embedder, mime, bytes);
+        Ok(None)
+    }
+}
+
 fn build_tree(
     ws: &mut Workspace<Pile>,
     path: &Path,
     mime_override: Option<&str>,
     stats: &mut TreeStats,
+    embedder: &mut Option<Box<dyn ImageEmbedder>>,
 ) -> Result<Fragment> {
     let meta = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?;
@@ -478,18 +541,26 @@ fn build_tree(
         let bytes = fs::read(path)
             .with_context(|| format!("read {}", path.display()))?;
         stats.bytes += bytes.len() as u64;
+        let mime = mime_override.unwrap_or_else(|| infer_mime(path));
+        // Embed BEFORE the bytes are moved into the blob store.
+        let emb_handle = embed_image_on_add(ws, embedder, mime, &bytes)?;
         let content_h: FileHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
         let name_str = path.file_name().and_then(|n| n.to_str()).unwrap_or("unnamed");
         let name_h: TextHandle = ws.put(name_str.to_string());
-        let mime = mime_override.unwrap_or_else(|| infer_mime(path));
 
         stats.files += 1;
-        Ok(entity! {
+        let mut frag = entity! {
             metadata::tag: &KIND_FILE,
             file::content: content_h,
             file::name: name_h,
             file::mime: mime
-        })
+        };
+        if let Some(eh) = emb_handle {
+            // Exhaust: stored under the content-derived id, so identity holds.
+            let fid = frag.root().expect("file entity has a content-derived id");
+            frag += entity! { ExclusiveId::force_ref(&fid) @ file::embedding: eh };
+        }
+        Ok(frag)
     } else if meta.is_dir() {
         // Collect children sorted by name for deterministic ordering.
         let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -508,7 +579,7 @@ fn build_tree(
         let mut children = Fragment::default();
 
         for (_name, child_path) in &entries {
-            let child_frag = build_tree(ws, child_path, None, stats)?;
+            let child_frag = build_tree(ws, child_path, None, stats, embedder)?;
             children += child_frag;
         }
 
@@ -555,7 +626,8 @@ fn cmd_add(
     let source = abs_path.to_string_lossy().to_string();
 
     let mut stats = TreeStats { files: 0, dirs: 0, bytes: 0 };
-    let tree = build_tree(ws, &abs_path, mime_override, &mut stats)?;
+    let mut embedder: Option<Box<dyn ImageEmbedder>> = None;
+    let tree = build_tree(ws, &abs_path, mime_override, &mut stats, &mut embedder)?;
     let root_id = tree.root().expect("tree has a root");
 
     // Create import entity, spreading the tree into it.
