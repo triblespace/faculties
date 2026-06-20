@@ -160,17 +160,17 @@ fn unlock_secret_key(password: &[u8], lockbox: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| anyhow::anyhow!("wrong password"))
 }
 
-/// Content-derive a scope id from its creator's signing key and a name.
-/// `id = Blake3("liora-secrets-scope-v1" ‖ creator_pk ‖ name)[..16]`. Both
-/// admins compute the same id independently, and the id commits to its
-/// creator — so the scope's *root admin* is intrinsic, not a spoofable grant.
-fn derive_scope_id(creator_pk: &[u8], name: &str) -> Id {
-    let mut h = blake3::Hasher::new();
-    h.update(b"liora-secrets-scope-v1");
-    h.update(creator_pk);
-    h.update(name.as_bytes());
-    let bytes: [u8; 16] = h.finalize().as_bytes()[..16].try_into().unwrap();
-    Id::new(bytes).expect("blake3 output is non-zero")
+/// A scope's identity *is* its `(creator, name)`: build the intrinsic fragment
+/// whose entity id `entity!` derives from exactly those two facts. Creating
+/// "the same scope" twice converges to one entity (idempotent), and the id can
+/// never drift from what it commits to — the derivation is the macro's job, not
+/// a hand-rolled hash. Non-identifying facts (tag, created_at) are added by the
+/// caller under `fragment.root()`.
+fn scope_fragment(creator: Id, name_handle: TextHandle) -> Fragment {
+    entity! { _ @
+        scope_creator: &creator,
+        metadata::name: name_handle,
+    }
 }
 
 /// Derive the X25519 public key (for sealing) from an Ed25519 public key.
@@ -644,14 +644,6 @@ fn cmd_identity_list(pile: &Path, branch: &str) -> Result<()> {
     })
 }
 
-/// Read an identity's Ed25519 signing public key.
-fn read_sign_pk(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> Result<Vec<u8>> {
-    let h: BytesHandle = find!(h: BytesHandle, pattern!(space, [{ id @ identity_sign_pk: ?h }]))
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("identity {} has no signing key", fmt_id(id)))?;
-    read_bytes(ws, h).ok_or_else(|| anyhow::anyhow!("read pk for {}", fmt_id(id)))
-}
-
 fn cmd_scope_create(pile: &Path, branch: &str, name: String, as_id: String) -> Result<()> {
     with_repo(pile, |repo| {
         let branch_id = repo
@@ -660,17 +652,15 @@ fn cmd_scope_create(pile: &Path, branch: &str, name: String, as_id: String) -> R
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
         let creator = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
-        let pk = read_sign_pk(&mut ws, &space, creator)?;
-        let scope_id = derive_scope_id(&pk, &name);
-
         let now = instant_interval(now_epoch());
         let name_h = ws.put(name.clone());
-        let mut change = TribleSet::new();
+
+        // Intrinsic id from (creator, name); extra facts go under it.
+        let mut change = scope_fragment(creator, name_h);
+        let scope_id = change.root().expect("entity! derives a root id");
         change += entity! { ExclusiveId::force_ref(&scope_id) @
             metadata::tag: &KIND_SCOPE,
             metadata::created_at: now,
-            metadata::name: name_h,
-            scope_creator: &creator,
         };
         ws.commit(change, "secrets: scope create");
         repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
@@ -696,10 +686,10 @@ fn cmd_scope_list(pile: &Path, branch: &str) -> Result<()> {
         }
         for (s, c, n) in rows {
             let name = read_text(&mut ws, n).unwrap_or_default();
-            // Self-validation: recompute the id from the stored creator+name.
-            let rooted = read_sign_pk(&mut ws, &space, c)
-                .map(|pk| derive_scope_id(&pk, &name) == s)
-                .unwrap_or(false);
+            // Self-validation: the id must derive from the scope's own
+            // (creator, name) facts — the same intrinsic derivation used at
+            // create time, so a forged id-vs-facts pairing shows as a mismatch.
+            let rooted = scope_fragment(c, n).root() == Some(s);
             let mark = if rooted { "✓ rooted" } else { "✗ MISMATCH" };
             println!("{}  {}  root {}  [{}]", fmt_id(s), name, fmt_id(c), mark);
         }
@@ -1238,6 +1228,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace::core::blob::IntoBlob;
 
     #[test]
     fn lockbox_roundtrips_and_rejects_wrong_password() {
@@ -1468,17 +1459,17 @@ mod tests {
     }
 
     #[test]
-    fn scope_id_is_deterministic_and_creator_bound() {
-        let a = SigningKeyPair::gen_with_defaults();
-        let b = SigningKeyPair::gen_with_defaults();
-        let pk_a = a.public_key.to_vec();
-        let pk_b = b.public_key.to_vec();
-        // same creator+name => same id (both admins derive it independently)
-        assert_eq!(derive_scope_id(&pk_a, "prod"), derive_scope_id(&pk_a, "prod"));
-        // different creator => different scope id (root is intrinsic, unspoofable)
-        assert_ne!(derive_scope_id(&pk_a, "prod"), derive_scope_id(&pk_b, "prod"));
-        // different name => different id
-        assert_ne!(derive_scope_id(&pk_a, "prod"), derive_scope_id(&pk_a, "staging"));
+    fn scope_id_derives_from_creator_and_name() {
+        // The scope id is `entity!`'s intrinsic derivation over (creator, name):
+        // idempotent in those facts, and changes when either changes.
+        let a = ufoid().id;
+        let b = ufoid().id;
+        let id = |c: Id, name: &'static str| {
+            scope_fragment(c, name.to_blob().get_handle()).root().unwrap()
+        };
+        assert_eq!(id(a, "prod"), id(a, "prod")); // idempotent creation
+        assert_ne!(id(a, "prod"), id(b, "prod")); // creator-bound
+        assert_ne!(id(a, "prod"), id(a, "staging")); // name-bound
     }
 
     #[test]
