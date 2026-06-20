@@ -6,6 +6,7 @@ use faculties::schemas::message::{
     DEFAULT_BRANCH, DEFAULT_RELATIONS_BRANCH, KIND_MESSAGE_ID, KIND_PERSON_ID, KIND_READ_ID,
     KIND_SPECS, local, relations_schema,
 };
+use faculties::schemas::relations::KIND_GROUP;
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -186,15 +187,26 @@ fn load_relations(
 }
 
 fn resolve_normalized_person_matches(relations_space: &TribleSet, key: &str) -> Vec<Id> {
-    find!(
-        person_id: Id,
-        pattern!(relations_space, [{ ?person_id @ metadata::tag: &KIND_PERSON_ID }])
-    )
-    .filter(|&person_id| {
-        exists!(pattern!(relations_space, [{ person_id @ relations_schema::label_norm: key }]))
-            || exists!(pattern!(relations_space, [{ person_id @ relations_schema::alias_norm: key }]))
-    })
-    .collect()
+    // A recipient can be a person OR a group — both are addressable parties.
+    let persons = find!(
+        id: Id,
+        pattern!(relations_space, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])
+    );
+    let groups = find!(
+        id: Id,
+        pattern!(relations_space, [{ ?id @ metadata::tag: &KIND_GROUP }])
+    );
+    let mut matches: Vec<Id> = persons
+        .chain(groups)
+        .filter(|&id| {
+            exists!(pattern!(relations_space, [{ id @ relations_schema::label_norm: key }]))
+                || exists!(pattern!(relations_space, [{ id @ relations_schema::alias_norm: key }]))
+        })
+        .collect();
+    // An entity tagged both person and group (e.g. liora-cc) appears twice.
+    matches.sort();
+    matches.dedup();
+    matches
 }
 
 fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {

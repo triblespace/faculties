@@ -621,11 +621,7 @@ fn load_watched_view(
         .checkout(..)
         .map_err(|e| anyhow!("checkout local: {e:?}"))?;
     let reads = load_reads(&local_space);
-    let unread: std::collections::BTreeSet<Id> = load_message_ids(&local_space)
-        .into_iter()
-        .filter(|msg| msg.to == persona_id && !reads.contains_key(&(msg.id, persona_id)))
-        .map(|msg| msg.id)
-        .collect();
+    let message_rows = load_message_ids(&local_space);
 
     let mut relations_ws = repo
         .pull(relations_branch_id)
@@ -633,6 +629,25 @@ fn load_watched_view(
     let relations_space = relations_ws
         .checkout(..)
         .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+    // Groups this persona belongs to — a message addressed to one of them
+    // is news for the persona too (this is how broadcasts/colony work,
+    // replacing the old liora-cc magic id).
+    let my_groups: std::collections::HashSet<Id> = find!(
+        gid: Id,
+        pattern!(&relations_space, [{ ?gid @
+            metadata::tag: &faculties::schemas::relations::KIND_GROUP,
+            faculties::schemas::relations::group::member: persona_id,
+        }])
+    )
+    .collect();
+    let unread: std::collections::BTreeSet<Id> = message_rows
+        .into_iter()
+        .filter(|msg| {
+            (msg.to == persona_id || my_groups.contains(&msg.to))
+                && !reads.contains_key(&(msg.id, persona_id))
+        })
+        .map(|msg| msg.id)
+        .collect();
     // Only zooid personas count toward the watched roster. A new colony
     // member is news; bulk contact/lead imports (hundreds of KIND_PERSON
     // entries from e.g. a LinkedIn pull) must NOT wake every watcher.

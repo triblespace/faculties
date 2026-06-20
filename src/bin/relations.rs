@@ -2,7 +2,7 @@
 use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::relations::{DEFAULT_BRANCH, KIND_PERSON_ID, relations};
+use faculties::schemas::relations::{DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, group, relations};
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -133,6 +133,34 @@ enum Command {
     },
     /// Show a person
     Show { id: String },
+    /// Manage groups (addressable sets of people, e.g. the colony)
+    Group {
+        #[command(subcommand)]
+        command: GroupCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupCmd {
+    /// Create a group
+    Create {
+        /// Canonical short label (e.g. "colony", "embodiment")
+        name: String,
+    },
+    /// Add a person to a group
+    Add {
+        /// Group label or id
+        group: String,
+        /// Person label or id
+        person: String,
+    },
+    /// List groups and their members
+    List,
+    /// Show a group's members
+    Show {
+        /// Group label or id
+        group: String,
+    },
 }
 
 
@@ -768,6 +796,145 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
     })
 }
 
+// ── groups ──────────────────────────────────────────────────────────────────
+
+fn resolve_group_id(space: &TribleSet, raw: &str) -> Result<Id> {
+    let trimmed = raw.trim();
+    if trimmed.len() == 32 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Some(id) = Id::from_hex(&trimmed.to_lowercase()) {
+            if exists!(pattern!(space, [{ id @ metadata::tag: &KIND_GROUP }])) {
+                return Ok(id);
+            }
+        }
+    }
+    let key = normalize_lookup_key(trimmed)?;
+    let mut matches: Vec<Id> = find!(
+        gid: Id,
+        pattern!(space, [{ ?gid @ metadata::tag: &KIND_GROUP, relations::label_norm: key.as_str() }])
+    )
+    .collect();
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => bail!("no group matches '{raw}'"),
+        1 => Ok(matches[0]),
+        _ => bail!("multiple groups match '{raw}'"),
+    }
+}
+
+fn group_members(space: &TribleSet, group_id: Id) -> Vec<Id> {
+    find!(m: Id, pattern!(space, [{ group_id @ group::member: ?m }])).collect()
+}
+
+/// Resolve a person by hex id (or prefix) OR by label/alias — `group add`
+/// takes either, unlike `resolve_person_id` which is hex-only.
+fn resolve_member_id(space: &TribleSet, raw: &str) -> Result<Id> {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        return resolve_person_id(space, trimmed);
+    }
+    let key = normalize_lookup_key(trimmed)?;
+    let mut matches: Vec<Id> = find_people_by_lookup_key(space, &key).into_iter().collect();
+    matches.sort();
+    matches.dedup();
+    match matches.len() {
+        0 => bail!("no person matches '{raw}'"),
+        1 => Ok(matches[0]),
+        _ => bail!("multiple people match '{raw}'"),
+    }
+}
+
+fn cmd_group_create(pile: &Path, branch_id: Id, name: String) -> Result<()> {
+    let label = normalize_label(&name)?;
+    let key = normalize_lookup_key(&name)?;
+    let group_id = with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        for gid in find!(
+            gid: Id,
+            pattern!(&space, [{ ?gid @ metadata::tag: &KIND_GROUP, relations::label_norm: key.as_str() }])
+        ) {
+            bail!("group '{label}' already exists ({})", fmt_id(gid));
+        }
+        let gid = ufoid().id;
+        let label_handle = ws.put(label.clone());
+        let mut change = TribleSet::new();
+        change += entity! { ExclusiveId::force_ref(&gid) @
+            metadata::tag: &KIND_GROUP,
+            metadata::name: label_handle,
+            relations::label_norm: key.as_str(),
+        };
+        ws.commit(change, "relations group create");
+        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        Ok(gid)
+    })?;
+    println!("Created group {} ({label}).", fmt_id(group_id));
+    Ok(())
+}
+
+fn cmd_group_add(pile: &Path, branch_id: Id, group: String, person: String) -> Result<()> {
+    let (gid, pid, added) = with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let gid = resolve_group_id(&space, &group)?;
+        let pid = resolve_member_id(&space, &person)?;
+        if group_members(&space, gid).contains(&pid) {
+            return Ok((gid, pid, false));
+        }
+        let mut change = TribleSet::new();
+        change += entity! { ExclusiveId::force_ref(&gid) @ group::member: pid };
+        ws.commit(change, "relations group add");
+        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        Ok((gid, pid, true))
+    })?;
+    if added {
+        println!("Added {} to group {}.", fmt_id(pid), fmt_id(gid));
+    } else {
+        println!("{} already in group {}.", fmt_id(pid), fmt_id(gid));
+    }
+    Ok(())
+}
+
+fn cmd_group_list(pile: &Path, branch_id: Id) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let mut groups: Vec<Id> =
+            find!(gid: Id, pattern!(&space, [{ ?gid @ metadata::tag: &KIND_GROUP }])).collect();
+        groups.sort();
+        groups.dedup();
+        if groups.is_empty() {
+            println!("No groups.");
+            return Ok(());
+        }
+        for gid in groups {
+            let label = person_label(&mut ws, &space, gid).unwrap_or_else(|| fmt_id(gid));
+            let members = group_members(&space, gid);
+            println!("[{}] {label} — {} member(s)", fmt_id(gid), members.len());
+        }
+        Ok(())
+    })
+}
+
+fn cmd_group_show(pile: &Path, branch_id: Id, group: String) -> Result<()> {
+    with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let gid = resolve_group_id(&space, &group)?;
+        let label = person_label(&mut ws, &space, gid).unwrap_or_else(|| fmt_id(gid));
+        println!("group: {label} ({})", fmt_id(gid));
+        let members = group_members(&space, gid);
+        if members.is_empty() {
+            println!("- (no members)");
+        }
+        for m in members {
+            let mlabel = person_label(&mut ws, &space, m).unwrap_or_else(|| fmt_id(m));
+            println!("- {mlabel} ({})", fmt_id(m));
+        }
+        Ok(())
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(cmd) = cli.command else {
@@ -858,5 +1025,11 @@ fn main() -> Result<()> {
         ),
         Command::List { limit } => cmd_list(&cli.pile, &cli.branch, branch_id, limit),
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
+        Command::Group { command } => match command {
+            GroupCmd::Create { name } => cmd_group_create(&cli.pile, branch_id, name),
+            GroupCmd::Add { group, person } => cmd_group_add(&cli.pile, branch_id, group, person),
+            GroupCmd::List => cmd_group_list(&cli.pile, branch_id),
+            GroupCmd::Show { group } => cmd_group_show(&cli.pile, branch_id, group),
+        },
     }
 }

@@ -10,6 +10,21 @@ pub const DEFAULT_BRANCH: &str = "relations";
 
 pub const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 
+/// A group is an addressable party (like a person) whose membership is a
+/// set of `group::member` edges. Sending a message to a group id delivers
+/// to every member; a watcher wakes if a message is addressed to it OR to
+/// a group it belongs to. `liora-cc` (colony broadcast) is just the
+/// all-zooids group.
+pub const KIND_GROUP: Id = id_hex!("2CEE877C6C996CE66B4572CE8863DF04");
+
+pub mod group {
+    use super::*;
+    attributes! {
+        // Membership edge: group -> member (a person/window id). Repeated.
+        "EF5B6F8429FA30D503BA8B8F3ABD5FD9" as member: inlineencodings::GenId;
+    }
+}
+
 pub mod relations {
     use super::*;
     attributes! {
