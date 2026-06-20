@@ -17,14 +17,19 @@
 //! root (the `effective_admins` fixpoint). Strong/transitive removal therefore
 //! falls out for free — retracting an admin drops everything that depended on
 //! it. Transitive group membership is `path!`'s closure over *effective* grants.
-//! Secrets are `(scope, name)` addressed, latest-wins (`secret add` = rotate).
-//! The two-admin harness (`#[test] concurrent_*`) shows the effective-admin
-//! fixpoint over the merged union already defeats the cluster-G duelling-admin /
-//! backdating / headless-group attacks, because the verdict is order-independent
-//! (retraction presence is read, never its timestamp). The remaining concurrency
-//! concern is narrower — secret-rotation *timing* (a leaked DEK can't be
-//! retracted): gate re-seal on having-seen the removal. The finality mechanism
-//! for that is JP's open decision (wiki D02D6767).
+//! Secrets are `(scope, name)` addressed, latest-wins (`secret add` of an
+//! existing name is a new version, sealed to the *current* recipients).
+//!
+//! Removal is *operational, not cryptographic*: a removed user keeps the wrap
+//! (= the value) they already held — the append-only pile cannot delete it, and
+//! re-encrypting the same value protects nothing. So `secret rotate` is not a
+//! crypto op; it is an *advisory* that lists every credential still readable by
+//! a removed user, so you can change it at its source and `secret add` the new
+//! value (which seals only to current recipients). The two-admin harness
+//! (`#[test] concurrent_*`) shows the effective-admin fixpoint over the merged
+//! union already defeats the duelling-admin / backdating / headless-group
+//! attacks (the verdict is order-independent), so no epoch-finality layer is
+//! needed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -313,6 +318,19 @@ fn secret_versions(space: &TribleSet, scope: Id, name: &str) -> usize {
     .count()
 }
 
+/// The identities currently holding a wrap on a given secret version.
+fn wrap_holders(space: &TribleSet, secret_id: Id) -> Vec<Id> {
+    let mut v: Vec<Id> = find!(
+        (w: Id, r: Id),
+        pattern!(space, [{ ?w @ metadata::tag: KIND_WRAP, wrap_secret: secret_id, wrap_recipient: ?r }])
+    )
+    .map(|(_, r)| r)
+    .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// The creator (implicit root admin) of a rooted scope, if any.
 fn scope_creator_of(space: &TribleSet, scope: Id) -> Option<Id> {
     find!(
@@ -505,17 +523,14 @@ enum SecretCmd {
         #[arg(long)]
         r#as: String,
     },
-    /// Rotate a secret: re-encrypt the current value under a fresh DEK sealed
-    /// only to the current recipients. Run as a reader; anyone revoked since the
-    /// last version loses forward access. This is how a removal actually takes
-    /// effect on existing secrets.
+    /// Show which secrets are still readable by a removed user — the operational
+    /// rotate worklist. Re-encrypting a stored value protects nothing (the
+    /// removed user keeps their old wrap = the value), so the real fix is to
+    /// change the credential at its source and `secret add` the new value. Bare
+    /// `secret rotate` scans everything; `--scope` narrows it.
     Rotate {
         #[arg(long)]
-        scope: String,
-        #[arg(long)]
-        name: String,
-        #[arg(long)]
-        r#as: String,
+        scope: Option<String>,
     },
     /// Re-wrap a named secret's DEK to recipients added after it was created.
     /// Run as an existing recipient (needs LIORA_SECRETS_PW to unlock the DEK).
@@ -692,15 +707,13 @@ fn cmd_scope_list(pile: &Path, branch: &str) -> Result<()> {
     })
 }
 
-/// An identity's nickname, or its short id if unnamed.
-fn identity_nick(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
-    find!(
-        n: TextHandle,
-        pattern!(space, [{ id @ metadata::tag: KIND_IDENTITY, metadata::name: ?n }])
-    )
-    .next()
-    .and_then(|n| read_text(ws, n))
-    .unwrap_or_else(|| fmt_id(id))
+/// An entity's `metadata::name` (an identity's nickname, a scope's name), or
+/// its short id if unnamed.
+fn entity_name(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
+    find!(n: TextHandle, pattern!(space, [{ id @ metadata::name: ?n }]))
+        .next()
+        .and_then(|n| read_text(ws, n))
+        .unwrap_or_else(|| fmt_id(id))
 }
 
 fn cmd_scope_members(pile: &Path, branch: &str, scope: String) -> Result<()> {
@@ -718,7 +731,7 @@ fn cmd_scope_members(pile: &Path, branch: &str, scope: String) -> Result<()> {
             println!("(no members)");
         }
         for r in recipients {
-            let nick = identity_nick(&mut ws, &space, r);
+            let nick = entity_name(&mut ws, &space, r);
             let role = if creator == Some(r) {
                 "root admin"
             } else if admins.contains(&r) {
@@ -965,32 +978,70 @@ fn cmd_secret_add(
     })
 }
 
-fn cmd_secret_rotate(
-    pile: &Path,
-    branch: &str,
-    scope: String,
-    name: String,
-    as_id: String,
-) -> Result<()> {
-    let pw = password()?;
+fn cmd_secret_rotate(pile: &Path, branch: &str, scope: Option<String>) -> Result<()> {
     with_repo(pile, |repo| {
         let branch_id = repo
             .ensure_branch(branch, None)
             .map_err(|e| anyhow::anyhow!("ensure branch: {e:?}"))?;
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
-        let scope_id = resolve_named(&mut ws, &space, KIND_SCOPE, &scope)?;
-        let current = latest_secret(&space, scope_id, &name)
-            .ok_or_else(|| anyhow::anyhow!("no secret named '{name}' in that scope"))?;
-        let me = resolve_named(&mut ws, &space, KIND_IDENTITY, &as_id)?;
-        // Decrypt the current value as an authorized reader, then re-seal a new
-        // version to the *current* recipient set — anyone revoked since the last
-        // version simply gets no wrap, so they lose forward access.
-        let plaintext = open_secret_value(&pw, &mut ws, &space, current, me)?;
-        let (change, secret_id, n) = build_seal_change(&mut ws, &space, scope_id, &name, &plaintext)?;
-        ws.commit(change, "secrets: secret rotate");
-        repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-        println!("rotated {} -> new version {} sealed to {} recipient(s)", name, fmt_id(secret_id), n);
+        let filter = scope
+            .as_deref()
+            .map(|s| resolve_named(&mut ws, &space, KIND_SCOPE, s))
+            .transpose()?;
+
+        // Unique (scope, name) credentials.
+        let rows: Vec<(Id, TextHandle)> = find!(
+            (sc: Id, n: TextHandle),
+            pattern!(&space, [{ _?s @ metadata::tag: KIND_SECRET, secret_scope: ?sc, metadata::name: ?n }])
+        )
+        .collect();
+        let mut seen: HashSet<(Id, String)> = HashSet::new();
+        // (scope, name, exposed identities) for each credential whose *current*
+        // value is still wrapped to someone no longer a recipient.
+        let mut findings: Vec<(Id, String, Vec<Id>)> = Vec::new();
+        for (sc, nh) in rows {
+            if let Some(f) = filter {
+                if sc != f {
+                    continue;
+                }
+            }
+            let name = match read_text(&mut ws, nh) {
+                Some(n) => n,
+                None => continue,
+            };
+            if !seen.insert((sc, name.clone())) {
+                continue;
+            }
+            let latest = match latest_secret(&space, sc, &name) {
+                Some(l) => l,
+                None => continue,
+            };
+            let current: HashSet<Id> = recipients_of(&space, sc).into_iter().collect();
+            let exposed: Vec<Id> = wrap_holders(&space, latest)
+                .into_iter()
+                .filter(|h| !current.contains(h))
+                .collect();
+            if !exposed.is_empty() {
+                findings.push((sc, name, exposed));
+            }
+        }
+
+        if findings.is_empty() {
+            println!("✓ no secrets are exposed to removed users — nothing to rotate");
+            return Ok(());
+        }
+        println!(
+            "{} secret(s) still readable by a removed user. Re-encrypting them here\n\
+             would change nothing (they keep their old wrap = the value). Change each\n\
+             credential at its source, then `secret add` the new value:\n",
+            findings.len()
+        );
+        for (sc, name, exposed) in findings {
+            let scope_name = entity_name(&mut ws, &space, sc);
+            let who: Vec<String> = exposed.iter().map(|e| entity_name(&mut ws, &space, *e)).collect();
+            println!("  {scope_name}/{name}  →  exposed to: {}", who.join(", "));
+        }
         Ok(())
     })
 }
@@ -1174,9 +1225,7 @@ fn main() -> Result<()> {
             SecretCmd::Get { scope, name, r#as } => {
                 cmd_secret_get(&cli.pile, &cli.branch, scope, name, r#as)
             }
-            SecretCmd::Rotate { scope, name, r#as } => {
-                cmd_secret_rotate(&cli.pile, &cli.branch, scope, name, r#as)
-            }
+            SecretCmd::Rotate { scope } => cmd_secret_rotate(&cli.pile, &cli.branch, scope),
             SecretCmd::Share { scope, name, r#as } => {
                 cmd_secret_share(&cli.pile, &cli.branch, scope, name, r#as)
             }
@@ -1336,6 +1385,33 @@ mod tests {
         mk_grant(&mut space, &s, &bob, "admin", &carol); // branch A
         mk_grant(&mut space, &s, &bob, "admin", &dave); // branch B
         assert_eq!(effective_admins(&space, s), HashSet::from([alice, bob, carol, dave]));
+    }
+
+    #[test]
+    fn exposure_is_wrap_holders_minus_current_recipients() {
+        // A secret version wrapped to {alice, bob}; bob later revoked. The
+        // exposure set (what `secret rotate` reports) = wrap-holders not in the
+        // current recipient set = {bob}. Adding a newer version wrapped only to
+        // {alice} clears it (latest-version check).
+        let (alice, bob) = (ufoid().id, ufoid().id);
+        let secret_v1 = ufoid().id;
+        let mut space = TribleSet::new();
+        // wraps on v1 to both
+        for r in [alice, bob] {
+            let w = ufoid().id;
+            space += entity! { ExclusiveId::force_ref(&w) @
+                metadata::tag: &KIND_WRAP, wrap_secret: &secret_v1, wrap_recipient: &r };
+        }
+        let holders = wrap_holders(&space, secret_v1);
+        assert_eq!(holders, {
+            let mut v = vec![alice, bob];
+            v.sort();
+            v
+        });
+        // current recipients after bob's revocation = {alice}
+        let current: HashSet<Id> = HashSet::from([alice]);
+        let exposed: Vec<Id> = holders.into_iter().filter(|h| !current.contains(h)).collect();
+        assert_eq!(exposed, vec![bob]);
     }
 
     #[test]
