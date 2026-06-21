@@ -2,7 +2,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::files::{FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, file};
+use faculties::schemas::files::{
+    Embedding1152, FILES_BRANCH_NAME, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, file,
+};
 use hifitime::Epoch;
 use hifitime::efmt::Formatter;
 use hifitime::efmt::consts::ISO8601_DATE;
@@ -20,7 +22,8 @@ use triblespace_search::schemas::{put_embedding, Embedding};
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
-type EmbHandle = Inline<inlineencodings::Handle<Embedding>>;
+type EmbHandle = Inline<inlineencodings::Handle<Embedding>>; // crate Embedding: HNSW staging only
+type SiglipHandle = Inline<inlineencodings::Handle<Embedding1152>>; // dim-typed storage
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
@@ -125,6 +128,11 @@ enum Command {
         #[arg(long)]
         tag: Vec<String>,
     },
+    /// Backfill embeddings: embed every image file that lacks the current
+    /// (SigLIP) embedding. Idempotent — skips already-embedded files. Run it
+    /// to cover pre-existing images or after a model swap. Needs the
+    /// `local-embed` build.
+    Embed,
     /// List imports (snapshots)
     Imports,
     /// Show the tree structure of an import or directory
@@ -491,13 +499,13 @@ impl<T: mary::embed::LocalEmbedder> ImageEmbedder for T {
     }
 }
 
-/// Load mary's CLIP-ViT-B v0 (warm; ~1-2s, ~600MB). Requires the model cached
-/// (`huggingface-cli download openai/clip-vit-base-patch32`). SigLIP so400m
-/// swaps in behind this same trait later.
+/// Load mary's SigLIP2 so400m embedder (warm; the 1152-d quality model).
+/// Requires the checkpoint cached (`huggingface-cli download
+/// google/siglip2-so400m-patch14-384`). Both towers contrastive, L2-normed.
 #[cfg(feature = "local-embed")]
-fn load_clip_embedder() -> Result<Box<dyn ImageEmbedder>> {
-    let emb = mary::embed::load_clip_from_hf(
-        "openai/clip-vit-base-patch32",
+fn load_siglip_embedder() -> Result<Box<dyn ImageEmbedder>> {
+    let emb = mary::embed::load_siglip_from_hf(
+        "google/siglip2-so400m-patch14-384",
         mary::embed::default_device(),
     )?;
     Ok(Box::new(emb))
@@ -513,18 +521,18 @@ fn embed_image_on_add(
     embedder: &mut Option<Box<dyn ImageEmbedder>>,
     mime: &str,
     bytes: &[u8],
-) -> Result<Option<EmbHandle>> {
+) -> Result<Option<SiglipHandle>> {
     #[cfg(feature = "local-embed")]
     {
         if !mime.starts_with("image/") || mime == "image/svg+xml" {
             return Ok(None);
         }
         if embedder.is_none() {
-            eprintln!("files: loading CLIP embedder (once)…");
-            *embedder = Some(load_clip_embedder()?);
+            eprintln!("files: loading SigLIP embedder (once)…");
+            *embedder = Some(load_siglip_embedder()?);
         }
         let v = embedder.as_ref().unwrap().embed_image(bytes)?;
-        return Ok(Some(ws.put::<Embedding, _>(v)));
+        return Ok(Some(ws.put::<Embedding1152, _>(v)));
     }
     #[cfg(not(feature = "local-embed"))]
     {
@@ -539,7 +547,7 @@ fn embed_image_on_add(
 fn embed_text_query(text: &str) -> Result<Vec<f32>> {
     #[cfg(feature = "local-embed")]
     {
-        let emb = load_clip_embedder()?;
+        let emb = load_siglip_embedder()?;
         return emb.embed_text(text);
     }
     #[cfg(not(feature = "local-embed"))]
@@ -577,7 +585,7 @@ fn build_tree(
         if let Some(eh) = emb_handle {
             // Exhaust: stored under the content-derived id, so identity holds.
             let fid = frag.root().expect("file entity has a content-derived id");
-            frag += entity! { ExclusiveId::force_ref(&fid) @ file::embedding: eh };
+            frag += entity! { ExclusiveId::force_ref(&fid) @ file::siglip_embedding: eh };
         }
         Ok(frag)
     } else if meta.is_dir() {
@@ -1458,11 +1466,69 @@ fn print_diff_removed(
 // ── main ─────────────────────────────────────────────────────────────────
 
 /// Read a stored embedding blob back into a plain `Vec<f32>`.
-fn read_embedding(ws: &mut Workspace<Pile>, h: EmbHandle) -> Result<Vec<f32>> {
+fn read_embedding(ws: &mut Workspace<Pile>, h: SiglipHandle) -> Result<Vec<f32>> {
     let v: anybytes::View<[f32]> = ws
-        .get(h)
+        .get::<anybytes::View<[f32]>, Embedding1152>(h)
         .map_err(|e| anyhow::anyhow!("read embedding blob: {e:?}"))?;
     Ok(v.as_ref().to_vec())
+}
+
+/// Backfill: embed every image file that lacks the current (SigLIP) embedding.
+/// Idempotent — files already carrying a `siglip_embedding` are skipped — so it
+/// covers pre-existing images and re-runs cheaply after a model swap. The
+/// embeddings are stored as `file::siglip_embedding` exhaust under the existing
+/// file entities (no new file versions).
+fn cmd_embed(repo: &mut Repository<Pile>, ws: &mut Workspace<Pile>) -> Result<()> {
+    #[cfg(not(feature = "local-embed"))]
+    {
+        let _ = (repo, ws);
+        bail!("`files embed` needs the embedder — rebuild with --features local-embed");
+    }
+    #[cfg(feature = "local-embed")]
+    {
+        let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+        // Files that already have the current embedding (skip — idempotent).
+        let have: std::collections::HashSet<Id> = find!(
+            e: Id,
+            pattern!(&space, [{ ?e @ file::siglip_embedding: _?h }])
+        )
+        .collect();
+        let files: Vec<(Id, FileHandle)> = find!(
+            (e: Id, c: FileHandle),
+            pattern!(&space, [{ ?e @ metadata::tag: KIND_FILE, file::content: ?c }])
+        )
+        .collect();
+
+        let mut embedder: Option<Box<dyn ImageEmbedder>> = None;
+        let mut change = TribleSet::new();
+        let (mut embedded, mut skipped) = (0usize, 0usize);
+        for (eid, content_h) in files {
+            if have.contains(&eid) {
+                continue;
+            }
+            let mime = read_mime(&space, eid).unwrap_or_default();
+            if !mime.starts_with("image/") || mime == "image/svg+xml" {
+                skipped += 1;
+                continue;
+            }
+            let bytes: anybytes::Bytes = ws
+                .get::<anybytes::Bytes, _>(content_h)
+                .map_err(|e| anyhow::anyhow!("read content for {}: {e:?}", fmt_id(eid)))?;
+            if let Some(eh) = embed_image_on_add(ws, &mut embedder, &mime, bytes.as_ref())? {
+                change += entity! { ExclusiveId::force_ref(&eid) @ file::siglip_embedding: eh };
+                embedded += 1;
+            }
+        }
+        if embedded > 0 {
+            ws.commit(change, "files embed (backfill)");
+            repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+        }
+        println!(
+            "embedded {embedded} image(s){}",
+            if skipped > 0 { format!("; skipped {skipped} non-image") } else { String::new() }
+        );
+        Ok(())
+    }
 }
 
 /// Pure nearest-neighbour core: build a succinct HNSW over `pairs`
@@ -1540,16 +1606,16 @@ fn cmd_similar(
         (Some(t), _) => (embed_text_query(t)?, None, format!("{t:?}")),
         (None, Some(idstr)) => {
             let eid = resolve_entity(&space, idstr)?;
-            let h: EmbHandle = find!(
-                (h: EmbHandle),
-                pattern!(&space, [{ eid @ file::embedding: ?h }])
+            let h: SiglipHandle = find!(
+                (h: SiglipHandle),
+                pattern!(&space, [{ eid @ file::siglip_embedding: ?h }])
             )
             .map(|(h,)| h)
             .next()
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "that file has no embedding — only image/* files are embedded \
-                     on `add` (re-add it), or query with --text instead"
+                     on `add` (re-add it, or run `files embed`), or query with --text"
                 )
             })?;
             let name = read_name(&space, ws, eid).unwrap_or_else(|| "?".into());
@@ -1560,9 +1626,9 @@ fn cmd_similar(
 
     // Every embedded file: (entity, handle). Read each vector back from the
     // pile and stage it into a local store the HNSW can attach to.
-    let pairs: Vec<(Id, EmbHandle)> = find!(
-        (eid: Id, h: EmbHandle),
-        pattern!(&space, [{ ?eid @ file::embedding: ?h }])
+    let pairs: Vec<(Id, SiglipHandle)> = find!(
+        (eid: Id, h: SiglipHandle),
+        pattern!(&space, [{ ?eid @ file::siglip_embedding: ?h }])
     )
     .collect();
     if pairs.is_empty() {
@@ -1660,6 +1726,7 @@ fn main() -> Result<()> {
                 cmd_similar(ws, id.as_deref(), text.as_deref(), floor, limit, &tag)
             })
         }
+        Command::Embed => with_files(pile, branch, |repo, ws| cmd_embed(repo, ws)),
         Command::Imports => {
             with_files(pile, branch, |_repo, ws| cmd_imports(ws))
         }
