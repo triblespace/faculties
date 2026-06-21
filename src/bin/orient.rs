@@ -10,6 +10,7 @@ use faculties::schemas::orient::{
     KIND_READ_ID, KIND_STATUS_ID, board, local, orient_state,
 };
 use faculties::schemas::relations::relations as rel_attrs;
+use faculties::schemas::status::{KIND_STATUS_UPDATE, status as status_attrs};
 use hifitime::Epoch;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -560,6 +561,72 @@ fn cmd_show(
         }
 
         drop(compass_ws);
+
+        // Colony: each zooid's current status (latest-per-window).
+        let status_branch_id = repo
+            .ensure_branch("status", None)
+            .map_err(|e| anyhow!("ensure status branch: {e:?}"))?;
+        let mut status_ws = repo
+            .pull(status_branch_id)
+            .map_err(|e| anyhow!("pull status: {e:?}"))?;
+        let status_space = status_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout status: {e:?}"))?;
+        let mut latest_status: HashMap<Id, (TextHandle, i128)> = HashMap::new();
+        for (window, text, at) in find!(
+            (window: Id, text: TextHandle, at: IntervalValue),
+            pattern!(&status_space, [{ _?ev @
+                metadata::tag: &KIND_STATUS_UPDATE,
+                status_attrs::window: ?window,
+                status_attrs::text: ?text,
+                metadata::created_at: ?at,
+            }])
+        ) {
+            let k = interval_key(at);
+            latest_status
+                .entry(window)
+                .and_modify(|e| {
+                    if k > e.1 {
+                        *e = (text, k);
+                    }
+                })
+                .or_insert((text, k));
+        }
+        let mut rel_ws = repo
+            .pull(relations_branch_id)
+            .map_err(|e| anyhow!("pull relations: {e:?}"))?;
+        let rel_space = rel_ws
+            .checkout(..)
+            .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+        let zooids: Vec<Id> = find!(
+            id: Id,
+            pattern!(&rel_space, [{ ?id @
+                metadata::tag: &faculties::schemas::relations::KIND_PERSON_ID,
+                rel_attrs::affinity: "zooid",
+            }])
+        )
+        .collect();
+        let mut lines: Vec<(String, Option<String>)> = Vec::new();
+        for id in zooids {
+            let label = person_label(&mut rel_ws, &rel_space, id);
+            let text = latest_status
+                .get(&id)
+                .map(|(h, _)| *h)
+                .and_then(|h| read_text(&mut status_ws, h).ok());
+            lines.push((label, text));
+        }
+        lines.sort_by(|a, b| a.0.cmp(&b.0));
+        println!("Colony:");
+        if lines.is_empty() {
+            println!("- (no zooids)");
+        }
+        for (label, text) in lines {
+            match text {
+                Some(t) => println!("- {label}: {t}"),
+                None => println!("- {label}: —"),
+            }
+        }
+
         let persona_view = match effective_persona {
             Some(persona_id) => Some((
                 persona_id,
