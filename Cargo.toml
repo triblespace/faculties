@@ -92,6 +92,12 @@ name = "teams-capture"
 path = "src/bin/teams-capture.rs"
 required-features = ["widgets"]
 
+# Status colony-board viewer.
+[[bin]]
+name = "status-capture"
+path = "src/bin/status-capture.rs"
+required-features = ["widgets"]
+
 [features]
 default = []
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
