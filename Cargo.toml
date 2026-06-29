@@ -107,7 +107,9 @@ widgets = [
     "dep:cubecl",
 ]
 # Semantic similarity in `files` (image+text embeddings via mary's embedder).
-local-embed = ["dep:mary"]
+local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
+# Liora's imagination: text → image via mary's ported FLUX.2 pipeline (Burn/Metal).
+imagine = ["dep:mary", "mary/flux", "dep:image"]
 
 [dependencies]
 # Core: every CLI faculty depends on these.
@@ -153,12 +155,17 @@ GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "m
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
 
-# Local-embed-only (optional): mary's CLIP/SigLIP multi-modal embedder (CLIP
-# image+text shared space, behind `embed`) plus nomic-embed-multimodal-7b (the
-# 3584-d dense image/text space, behind `gemma` — pulls the Qwen2.5-VL port +
-# Metal/wgpu backend). Heavy, so gated behind `local-embed`; the default build
-# stays light.
-mary = { path = "../mary", default-features = false, features = ["embed", "gemma"], optional = true }
+# Optional, heavy: mary's Burn/Metal model ports. Activated as a bare optional
+# dep (no default features); the *consuming* faculties feature turns on exactly
+# the mary features it needs, so each build stays as lean as its job allows:
+#   local-embed → mary[embed,gemma]: CLIP/SigLIP multi-modal embedder (CLIP
+#                 image+text shared space) + nomic-embed-multimodal-7b (3584-d
+#                 dense image/text space; Qwen2.5-VL port + Metal/wgpu backend).
+#   imagine     → mary[flux]: the ported FLUX.2 text→image pipeline.
+mary = { path = "../mary", default-features = false, optional = true }
+# imagine-only: the `image` crate, matching mary's flux feature, so the
+# RgbImage the pipeline returns can be `.save()`d to a PNG here.
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 # ── patches ────────────────────────────────────────────────────────────────
 # `[patch]` only takes effect from the *root* crate of a build, so mary's own
