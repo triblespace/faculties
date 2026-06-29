@@ -16,11 +16,12 @@ use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
 use triblespace_search::tokens::hash_tokens;
 use hifitime::Epoch;
 use rand_core::OsRng;
+use triblespace::core::blob::Bytes;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::macros::{find, pattern};
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
@@ -38,6 +39,7 @@ use triblespace::prelude::*;
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
+             memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
              memory respan <id> <from>..<to>  — correct a chunk's span (new chunk supersedes old; views exclude old)\n  \
              memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
@@ -63,6 +65,41 @@ struct Cli {
 
 fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<LongString>>> {
     find!(h: Inline<Handle<LongString>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
+}
+
+/// The raw image bytes handle of a WORDLESS image memory chunk, if it is one.
+/// An image chunk has no `ctx::summary`; its content is the picture itself.
+fn chunk_image_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<RawBytes>>> {
+    find!(h: Inline<Handle<RawBytes>>, pattern!(space, [{ id @ ctx::image: ?h }])).next()
+}
+
+/// A chunk's `from..to` span as a string (or `?` if missing) — used to render
+/// a wordless image memory as `[image memory @ <span>]` everywhere a summary
+/// would otherwise print.
+fn chunk_span_str(space: &TribleSet, id: Id) -> String {
+    match (chunk_start_at(space, id), chunk_end_at(space, id)) {
+        (Some(s), Some(e)) => format_time_range(
+            epoch_from_interval(s),
+            epoch_end_from_interval(e),
+        ),
+        _ => "?".to_string(),
+    }
+}
+
+/// One-line render of a chunk for list/similar output: the summary's first
+/// line, or a wordless-image marker, or empty.
+fn chunk_oneline(ws: &mut Workspace<Pile>, space: &TribleSet, id: Id) -> String {
+    if let Some(h) = chunk_summary_handle(space, id) {
+        return ws
+            .get::<View<str>, LongString>(h)
+            .ok()
+            .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
+            .unwrap_or_default();
+    }
+    if chunk_image_handle(space, id).is_some() {
+        return format!("[image memory @ {}]", chunk_span_str(space, id));
+    }
+    String::new()
 }
 
 /// A chunk's lens-theme handle, if it is a thematic lens (not part of the
@@ -351,10 +388,7 @@ fn cmd_search(pile_path: &Path, args: &[String]) -> Result<()> {
             return Ok(());
         }
         for (chunk, score) in rows.into_iter().take(10) {
-            let summary = chunk_summary_handle(&space, chunk)
-                .and_then(|h| ws.get::<View<str>, LongString>(h).ok())
-                .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
-                .unwrap_or_default();
+            let summary = chunk_oneline(&mut ws, &space, chunk);
             println!("{score:6.2}  {chunk:x}  {summary}");
         }
         Ok(())
@@ -374,6 +408,12 @@ fn cmd_search(pile_path: &Path, args: &[String]) -> Result<()> {
 
 #[cfg(feature = "local-embed")]
 const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
+
+/// nomic-embed-vision-v1.5 — the image encoder co-embedded into the SAME 768-d
+/// space as nomic-text, so an image memory's vector is directly comparable to a
+/// text query's. Used by `memory embed` for wordless image chunks.
+#[cfg(feature = "local-embed")]
+const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
 
 /// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
 /// and `put_embedding` both assume unit vectors; nomic's raw output is not
@@ -407,9 +447,15 @@ fn chunk_embedding_handle(
 /// like the rebuild-and-replace BM25 index but per-chunk content-addressed.
 #[cfg(feature = "local-embed")]
 fn cmd_embed(pile_path: &Path) -> Result<()> {
-    eprintln!("memory: loading nomic-embed-text (once)…");
-    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
-        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+    use mary::embed::LocalEmbedder;
+
+    // What a chunk embeds FROM: its summary prose (nomic-text) or its raw image
+    // bytes (nomic-vision). Both land on the same `embeddings::attr::embedding`
+    // because nomic text+vision share one 768-d space.
+    enum Src {
+        Text(Inline<Handle<LongString>>),
+        Image(Inline<Handle<RawBytes>>),
+    }
 
     with_repo(pile_path, |repo| {
         let branch_id = repo
@@ -421,7 +467,7 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
         let space = ws.checkout(..).context("checkout memory branch")?;
 
         let superseded = superseded_ids(&space);
-        let mut todo: Vec<(Id, Inline<Handle<LongString>>)> = Vec::new();
+        let mut todo: Vec<(Id, Src)> = Vec::new();
         for chunk in all_chunk_ids(&space) {
             if superseded.contains(&chunk) {
                 continue;
@@ -429,8 +475,12 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
             if chunk_embedding_handle(&space, chunk).is_some() {
                 continue;
             }
-            if let Some(h) = chunk_summary_handle(&space, chunk) {
-                todo.push((chunk, h));
+            // An image chunk is wordless — route it to vision; otherwise embed
+            // its summary with text. (A chunk has one or the other.)
+            if let Some(h) = chunk_image_handle(&space, chunk) {
+                todo.push((chunk, Src::Image(h)));
+            } else if let Some(h) = chunk_summary_handle(&space, chunk) {
+                todo.push((chunk, Src::Text(h)));
             }
         }
         if todo.is_empty() {
@@ -438,13 +488,61 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
             return Ok(());
         }
         let total = todo.len();
+
+        // Load each model once, lazily — a pile with only text memories never
+        // pays for the vision weights, and vice versa.
+        let mut text_emb: Option<mary::embed::NomicTextEmbedder<_>> = None;
+        let mut vision_emb: Option<mary::embed::NomicVisionEmbedder<_>> = None;
+        let mut n_text = 0usize;
+        let mut n_image = 0usize;
         let mut change = TribleSet::new();
-        for (i, (chunk, sh)) in todo.into_iter().enumerate() {
-            let summary: View<str> = ws.get(sh).context("read chunk summary")?;
-            let v = l2_normalize(
-                emb.embed_document(summary.as_ref())
-                    .map_err(|e| anyhow!("embed chunk {chunk:x}: {e:?}"))?,
-            );
+        for (i, (chunk, src)) in todo.into_iter().enumerate() {
+            let v = match src {
+                Src::Text(sh) => {
+                    let summary: View<str> = ws.get(sh).context("read chunk summary")?;
+                    let emb = match &text_emb {
+                        Some(e) => e,
+                        None => {
+                            eprintln!("memory: loading nomic-embed-text (once)…");
+                            text_emb = Some(
+                                mary::embed::load_nomic_text_from_hf(
+                                    NOMIC_TEXT_MODEL,
+                                    mary::embed::default_device(),
+                                )
+                                .map_err(|e| anyhow!("load nomic text embedder: {e:?}"))?,
+                            );
+                            text_emb.as_ref().unwrap()
+                        }
+                    };
+                    n_text += 1;
+                    l2_normalize(
+                        emb.embed_document(summary.as_ref())
+                            .map_err(|e| anyhow!("embed chunk {chunk:x}: {e:?}"))?,
+                    )
+                }
+                Src::Image(ih) => {
+                    let bytes: Bytes = ws.get(ih).context("read image bytes")?;
+                    let emb = match &vision_emb {
+                        Some(e) => e,
+                        None => {
+                            eprintln!("memory: loading nomic-embed-vision (once)…");
+                            vision_emb = Some(
+                                mary::embed::load_nomic_vision_from_hf(
+                                    NOMIC_VISION_MODEL,
+                                    mary::embed::default_device(),
+                                )
+                                .map_err(|e| anyhow!("load nomic vision embedder: {e:?}"))?,
+                            );
+                            vision_emb.as_ref().unwrap()
+                        }
+                    };
+                    n_image += 1;
+                    l2_normalize(
+                        emb.embed_image(bytes.as_ref())
+                            .map_err(|e| anyhow!("embed image chunk {chunk:x}: {e:?}"))?,
+                    )
+                }
+            };
             let handle = ws.put::<Embedding768, _>(v);
             change += entity! { triblespace::core::id::ExclusiveId::force_ref(&chunk) @ embeddings::attr::embedding: handle };
             if (i + 1) % 25 == 0 || i + 1 == total {
@@ -453,7 +551,9 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
         }
         ws.commit(change, "memory embed");
         repo.push(&mut ws).map_err(|e| anyhow!("push failed: {e:?}"))?;
-        println!("embedded {total} chunk summaries into the shared nomic space.");
+        println!(
+            "embedded {n_text} text + {n_image} image chunk(s) into the shared nomic space."
+        );
         Ok(())
     })
 }
@@ -526,11 +626,17 @@ fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
                 }
                 _ => "?".to_string(),
             };
-            let summary = chunk_summary_handle(&space, chunk)
-                .and_then(|h| ws.get::<View<str>, LongString>(h).ok())
-                .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
-                .unwrap_or_default();
-            println!("{cos:6.3}  {chunk:x}  {span}\n        {summary}");
+            let summary = chunk_oneline(&mut ws, &space, chunk);
+            // Image memories: export the blob to a path the caller can Read,
+            // so a Claude-Code reader (no auto-injected blobs) can actually see it.
+            let img_line = match chunk_image_handle(&space, chunk) {
+                Some(h) => match materialize_image(&mut ws, chunk, h) {
+                    Ok(path) => format!("\n        → {} (Read this path to view)", path.display()),
+                    Err(e) => format!("\n        (image export failed: {e})"),
+                },
+                None => String::new(),
+            };
+            println!("{cos:6.3}  {chunk:x}  {span}\n        {summary}{img_line}");
         }
         Ok(())
     })
@@ -553,6 +659,9 @@ fn main() -> Result<()> {
     // Dispatch to subcommand handlers.
     if cli.ids.first().is_some_and(|value| value == "create") {
         return cmd_create(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "image") {
+        return cmd_image(&cli.pile, &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "meta") {
         return cmd_meta(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
@@ -784,6 +893,98 @@ fn create_chunk(
     }
 
     ws.commit(change, "memory create");
+    repo.push(&mut ws)
+        .map_err(|e| anyhow!("push failed: {e:?}"))?;
+    Ok(*chunk_id)
+}
+
+// ---------------------------------------------------------------------------
+// image subcommand — a WORDLESS memory at a time-coordinate
+// ---------------------------------------------------------------------------
+
+/// `memory image <when> <image-path>` — create an image memory chunk. It is
+/// JUST a chunk (tag KIND_CHUNK_ID) whose content is a picture instead of prose:
+/// no `ctx::summary`, the image bytes live on `ctx::image`. Same time-coordinate
+/// as any chunk — `<when>` is a single `YYYY-MM-DDTHH:MM:SS` point (start==end)
+/// or a `from..to` range. Embed it into the shared 768-d nomic space with
+/// `memory embed` (via nomic-VISION, co-embedded with nomic-text), and it ranks
+/// in `memory similar` by MEANING beside text memories. Reference it from prose
+/// like any chunk: `[caption](memory:<hex>)`.
+fn cmd_image(pile_path: &Path, args: &[String]) -> Result<()> {
+    if args.len() != 2 {
+        bail!(
+            "usage: memory image <when> <image-path>\n\
+             \n\
+             Create a WORDLESS image memory chunk and store it in the pile.\n\
+             <when> is a single TAI timestamp (YYYY-MM-DDTHH:MM:SS — a point\n\
+             where start==end) or a `from..to` range. The image bytes are stored\n\
+             as a blob; embed it into the shared nomic space with `memory embed`\n\
+             (nomic-VISION-768), and it ranks in `memory similar` by meaning\n\
+             beside text memories. Reference it from prose with [caption](memory:<hex>)."
+        );
+    }
+    let when = &args[0];
+    let image_path = Path::new(&args[1]);
+    let range = if when.contains("..") {
+        parse_time_range(when)?
+    } else {
+        let p = parse_tai_timestamp(when)?;
+        (p, p)
+    };
+    let bytes = std::fs::read(image_path)
+        .with_context(|| format!("read image {}", image_path.display()))?;
+    if bytes.is_empty() {
+        bail!("image file is empty: {}", image_path.display());
+    }
+
+    with_repo(pile_path, |repo| {
+        let chunk_id = create_image_chunk(repo, &bytes, range)?;
+        println!("range: {}", format_time_range(range.0, range.1));
+        println!("id: {chunk_id:x}");
+        println!(
+            "({} image bytes stored; run `memory embed` to place it in the shared nomic space)",
+            bytes.len()
+        );
+        Ok(())
+    })
+}
+
+/// Store image bytes as a blob and create a wordless image chunk at `range`.
+/// Mirrors `create_chunk`, but the content is the picture (`ctx::image`) rather
+/// than a summary — temporal containment (the only hierarchy) still relates it
+/// to text chunks by time, and `[caption](memory:<hex>)` references still point
+/// at it like any chunk.
+fn create_image_chunk(
+    repo: &mut Repository<Pile>,
+    bytes: &[u8],
+    range: (Epoch, Epoch),
+) -> Result<Id> {
+    let branch_id = repo
+        .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+        .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+
+    let start_at: Inline<NsTAIInterval> = (range.0, range.0).try_to_inline().unwrap();
+    let end_at: Inline<NsTAIInterval> = (range.1, range.1).try_to_inline().unwrap();
+
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
+    let image_handle = ws.put::<RawBytes, _>(bytes.to_vec());
+    let chunk_id = ufoid();
+    let now = Epoch::now()
+        .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
+    let created_at: Inline<NsTAIInterval> = (now, now).try_to_inline().unwrap();
+
+    let mut change = TribleSet::new();
+    change += entity! { &chunk_id @
+        metadata::tag: KIND_CHUNK_ID,
+        ctx::image: image_handle,
+        metadata::created_at: created_at,
+        ctx::start_at: start_at,
+        ctx::end_at: end_at,
+    };
+
+    ws.commit(change, "memory image");
     repo.push(&mut ws)
         .map_err(|e| anyhow!("push failed: {e:?}"))?;
     Ok(*chunk_id)
@@ -1395,6 +1596,11 @@ fn cmd_list(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 /// Token-cost of a chunk (its budget weight), loaded lazily and cached by span
 /// index. Cost is measured through the configured [`TokenEstimator`], so the
 /// budget and the per-chunk weights are in the same token units.
+/// Budget weight charged for a wordless image memory in the context cover —
+/// it renders as a one-line `[image memory @ <span>]` marker, so a small fixed
+/// token cost (vs a text summary's measured length).
+const IMAGE_CHUNK_TOKEN_COST: usize = 16;
+
 fn context_chunk_cost(
     ws: &mut Workspace<Pile>,
     space: &TribleSet,
@@ -1411,6 +1617,9 @@ fn context_chunk_cost(
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
             estimator.estimate(&summary)
         }
+        // A wordless image memory renders as a small `[image memory @ <span>]`
+        // marker in the cover — a fixed handful of tokens, not zero.
+        None if chunk_image_handle(space, spans[i].2).is_some() => IMAGE_CHUNK_TOKEN_COST,
         None => 0,
     };
     cache[i] = Some(c);
@@ -1717,6 +1926,8 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
             if let Some(handle) = chunk_summary_handle(&space, id) {
                 let summary: View<str> = ws.get(handle).context("read chunk summary")?;
                 println!("{}", summary.trim_end());
+            } else if chunk_image_handle(&space, id).is_some() {
+                println!("[image memory @ {}]", chunk_span_str(&space, id));
             }
         }
         Ok(())
@@ -2160,12 +2371,26 @@ fn cmd_provenance(pile_path: &Path, args: &[String]) -> Result<()> {
 
 
 fn print_chunk(ws: &mut Workspace<Pile>, space: &TribleSet, chunk_id: Id) -> Result<()> {
-    let handle = chunk_summary_handle(space, chunk_id)
-        .ok_or_else(|| anyhow!("chunk {:x} has no summary", chunk_id))?;
-    let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-    print!("{}", summary.trim_end());
-    println!();
-    Ok(())
+    if let Some(handle) = chunk_summary_handle(space, chunk_id) {
+        let summary: View<str> = ws.get(handle).context("read chunk summary")?;
+        print!("{}", summary.trim_end());
+        println!();
+        return Ok(());
+    }
+    // A wordless image memory has no summary — render a marker rather than
+    // crash, and export the blob so a Claude-Code reader can Read it to see it.
+    if let Some(h) = chunk_image_handle(space, chunk_id) {
+        let span = chunk_span_str(space, chunk_id);
+        match materialize_image(ws, chunk_id, h) {
+            Ok(path) => println!(
+                "[image memory @ {span}] → {} (Read this path to view)",
+                path.display()
+            ),
+            Err(e) => println!("[image memory @ {span}] (image export failed: {e})"),
+        }
+        return Ok(());
+    }
+    bail!("chunk {:x} has no summary", chunk_id)
 }
 
 fn fmt_id(id: Id) -> String {
@@ -2290,6 +2515,42 @@ fn parse_optional_hex_id(raw: Option<&str>) -> Result<Option<Id>> {
 fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
     let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
+}
+
+/// Export an image memory's blob to a temp file and return the path. The
+/// Claude-Code environment can't auto-inject pile blobs — a reader has to call
+/// the Read tool on a file path — so when a wordless image memory surfaces we
+/// drop its bytes at `/tmp/mem_img/<hex>.<ext>` and print the path. No embedder
+/// needed; this is pure blob → disk. Extension is sniffed from the magic bytes.
+fn materialize_image(
+    ws: &mut Workspace<Pile>,
+    chunk_id: Id,
+    handle: Inline<Handle<RawBytes>>,
+) -> Result<PathBuf> {
+    let bytes: Bytes = ws.get(handle).context("read image bytes")?;
+    let b = bytes.as_ref();
+    let dir = Path::new("/tmp/mem_img");
+    std::fs::create_dir_all(dir).context("create /tmp/mem_img")?;
+    let path = dir.join(format!("{chunk_id:x}.{}", sniff_image_ext(b)));
+    std::fs::write(&path, b).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Guess a file extension from an image's leading magic bytes; default `png`.
+fn sniff_image_ext(b: &[u8]) -> &'static str {
+    if b.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "png"
+    } else if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if b.starts_with(b"GIF8") {
+        "gif"
+    } else if b.len() >= 12 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        "webp"
+    } else if b.starts_with(b"BM") {
+        "bmp"
+    } else {
+        "png"
+    }
 }
 
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {

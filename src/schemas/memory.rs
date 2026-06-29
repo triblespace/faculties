@@ -5,7 +5,7 @@
 //! that wants to read memory chunks from a pile.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::LongString;
+use triblespace::prelude::blobencodings::{LongString, RawBytes};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 
@@ -196,5 +196,12 @@ pub mod ctx {
         /// `memory lens <theme>`. This is what lets memory be a many-threaded
         /// weave — overlapping views over the same time — instead of one tree.
         "B53D37A3BE552B0F47E279D69AB7ECD3" as lens: Handle<LongString>;
+        /// The raw image bytes of a WORDLESS image memory chunk. A chunk with
+        /// this attribute is a memory whose content is a picture, not prose —
+        /// no `ctx::summary` is required. It shares the same time-coordinate
+        /// (`start_at`/`end_at`) and the same shared-space `embeddings::embedding`
+        /// (via nomic-VISION-768, co-embedded with nomic-text) as text memories,
+        /// so `memory similar` ranks text and image memories together by meaning.
+        "1490E76164F3B523E32EDB15D949BD1C" as image: Handle<RawBytes>;
     }
 }
