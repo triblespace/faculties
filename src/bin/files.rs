@@ -20,6 +20,10 @@ use triblespace_search::schemas::Embedding;
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 type EmbHandle = Inline<inlineencodings::Handle<Embedding>>;
+/// Handle into the nomic-embed-multimodal-7b dense space (3584-d). A distinct
+/// type from `EmbHandle` (CLIP-512) so the two spaces index independently and
+/// can never collide in one HNSW.
+type Mm7bHandle = Inline<inlineencodings::Handle<embeddings::Embedding3584>>;
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 #[derive(Parser)]
@@ -123,6 +127,21 @@ enum Command {
         /// Only results carrying ALL these tags (repeatable) — the hybrid filter
         #[arg(long)]
         tag: Vec<String>,
+        /// Search the nomic-embed-multimodal-7b 3584-d space (run `files
+        /// embed-7b` first) instead of the CLIP-512 space. A *separate*,
+        /// stronger text→image space — not comparable to the CLIP one.
+        #[arg(long)]
+        mm7b: bool,
+    },
+    /// Embed every image file with nomic-embed-multimodal-7b (3584-d) and store
+    /// the vector on `attr_mm7b::embedding`. Idempotent: skips already-embedded
+    /// files unless `--force`. The 7b model loads once (~20s cold), then ~0.5-1s
+    /// per image. Needs `--features local-embed` and macOS (Metal). This is the
+    /// index that powers `files similar --mm7b --text "…"` (text→image recall).
+    Embed7b {
+        /// Re-embed even files that already carry a 7b embedding.
+        #[arg(long)]
+        force: bool,
     },
     /// List imports (snapshots)
     Imports,
@@ -543,6 +562,86 @@ fn embed_text_query(text: &str) -> Result<Vec<f32>> {
     }
     #[cfg(not(feature = "local-embed"))]
     bail!("`files similar --text` needs the embedder — rebuild with --features local-embed");
+}
+
+// ── nomic-embed-multimodal-7b seam (3584-d dense space) ───────────────────
+// A SEPARATE, additive path from the CLIP one above. The 7b model embeds both
+// images (`embed_image`, pure-Rust decode→preprocess→vision→backbone) and text
+// queries (`embed_query`) into one 3584-d space — strong text→image retrieval.
+// Loaded once per command (cold mmap ~20s, then ~0.5-1s/embed). macOS/Metal
+// only; gated behind `local-embed`.
+
+#[cfg(all(feature = "local-embed", target_os = "macos"))]
+type Mm7bEmbedder = mary::models::qwen2_5_vl::embedder::NomicMultimodalEmbedder<mary::nn::backend::B>;
+
+/// Default weights pile + tokenizer for the 7b, overridable via env so the
+/// faculty isn't pinned to one machine's paths.
+#[cfg(all(feature = "local-embed", target_os = "macos"))]
+fn load_mm7b() -> Result<Mm7bEmbedder> {
+    const DEFAULT_PILE: &str = "/Users/jp/Desktop/chatbot/liora/models/nomic_mm7b.pile";
+    const DEFAULT_TOKENIZER: &str = "/Users/jp/.cache/huggingface/hub/models--nomic-ai--nomic-embed-multimodal-7b/snapshots/1291f1b6ca07061b0329df9d5713c09b294be576/tokenizer.json";
+    let pile = std::env::var("NOMIC_MM7B_PILE").unwrap_or_else(|_| DEFAULT_PILE.to_string());
+    let tok = std::env::var("NOMIC_MM7B_TOKENIZER").unwrap_or_else(|_| DEFAULT_TOKENIZER.to_string());
+    eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
+    mary::persist::load_nomic_mm7b_aliased_from_pile(
+        Path::new(&pile),
+        Path::new(&tok),
+        mary::nn::backend::WgpuDevice::default(),
+    )
+}
+
+/// Embed image bytes into the 3584-d 7b space.
+#[allow(unused_variables)]
+fn mm7b_embed_image(emb: &Mm7bEmbedderOpt, bytes: &[u8]) -> Result<Vec<f32>> {
+    #[cfg(all(feature = "local-embed", target_os = "macos"))]
+    {
+        return emb.embed_image(bytes);
+    }
+    #[cfg(not(all(feature = "local-embed", target_os = "macos")))]
+    bail!("`files embed-7b` needs the 7b embedder — rebuild with --features local-embed on macOS");
+}
+
+/// Embed a text query into the 3584-d 7b space (query-side augmentation).
+#[allow(unused_variables)]
+fn mm7b_embed_query(emb: &Mm7bEmbedderOpt, text: &str) -> Result<Vec<f32>> {
+    #[cfg(all(feature = "local-embed", target_os = "macos"))]
+    {
+        return emb.embed_query(text);
+    }
+    #[cfg(not(all(feature = "local-embed", target_os = "macos")))]
+    bail!("`files similar --mm7b --text` needs the 7b embedder — rebuild with --features local-embed on macOS");
+}
+
+// A tiny alias so the helper signatures above are the same with/without the
+// feature: with it, the concrete embedder; without it, the unit type (the
+// helpers `bail!` before ever touching the value).
+#[cfg(all(feature = "local-embed", target_os = "macos"))]
+type Mm7bEmbedderOpt = Mm7bEmbedder;
+#[cfg(not(all(feature = "local-embed", target_os = "macos")))]
+type Mm7bEmbedderOpt = ();
+
+/// Construct the 7b embedder, or `bail!` cleanly when the feature/platform is
+/// absent. Returns the concrete embedder (feature) or `()` (no feature, after a
+/// bail — so the call site never proceeds without a real model).
+#[allow(unreachable_code)]
+fn load_mm7b_opt() -> Result<Mm7bEmbedderOpt> {
+    #[cfg(all(feature = "local-embed", target_os = "macos"))]
+    {
+        return load_mm7b();
+    }
+    #[cfg(not(all(feature = "local-embed", target_os = "macos")))]
+    bail!(
+        "the nomic-embed-multimodal-7b path needs `--features local-embed` on macOS (Metal); \
+         this build doesn't have it"
+    );
+}
+
+/// Read a stored 3584-d embedding blob back into a plain `Vec<f32>`.
+fn read_embedding_3584(ws: &mut Workspace<Pile>, h: Mm7bHandle) -> Result<Vec<f32>> {
+    let v: anybytes::View<[f32]> = ws
+        .get(h)
+        .map_err(|e| anyhow::anyhow!("read 7b embedding blob: {e:?}"))?;
+    Ok(v.as_ref().to_vec())
 }
 
 fn build_tree(
@@ -1464,6 +1563,112 @@ fn read_embedding(ws: &mut Workspace<Pile>, h: EmbHandle) -> Result<Vec<f32>> {
     Ok(v.as_ref().to_vec())
 }
 
+/// Embed every image file with nomic-embed-multimodal-7b and store the 3584-d
+/// vector on `attr_mm7b::embedding` (under the file's content-derived id, so
+/// identity is unaffected — pure exhaust). Additive to the CLIP `file::embedding`
+/// path: both coexist. Idempotent — already-embedded files are skipped unless
+/// `--force`. Identical bytes (duplicate imports) are embedded once and the
+/// vector fanned out to every entity that shares the content.
+fn cmd_embed7b(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    force: bool,
+) -> Result<()> {
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+
+    // Gather image file entities, grouped by content hash so identical bytes are
+    // embedded once. Skip SVG (not a raster the vision tower can decode).
+    let mut groups: BTreeMap<String, (FileHandle, Vec<(Id, bool)>)> = BTreeMap::new();
+    for (eid, h) in find!(
+        (eid: Id, h: FileHandle),
+        pattern!(&space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
+    ) {
+        let mime = read_mime(&space, eid).unwrap_or_default();
+        if !mime.starts_with("image/") || mime == "image/svg+xml" {
+            continue;
+        }
+        let has_emb = exists!(
+            (e: Mm7bHandle),
+            pattern!(&space, [{ eid @ embeddings::attr_mm7b::embedding: ?e }])
+        );
+        groups
+            .entry(handle_hex(h))
+            .or_insert_with(|| (h, Vec::new()))
+            .1
+            .push((eid, has_emb));
+    }
+
+    if groups.is_empty() {
+        println!("(no image files to embed)");
+        return Ok(());
+    }
+
+    // Which groups still need work?
+    let pending: Vec<_> = groups
+        .into_iter()
+        .filter(|(_, (_, eids))| force || eids.iter().any(|(_, has)| !*has))
+        .collect();
+
+    let total_imgs: usize = pending.iter().map(|(_, (_, e))| e.len()).sum();
+    if pending.is_empty() {
+        println!("All image files already have a 7b embedding (use --force to re-embed).");
+        return Ok(());
+    }
+
+    let embedder = load_mm7b_opt()?;
+
+    let mut change = TribleSet::new();
+    let mut embedded = 0usize;
+    let mut assigned = 0usize;
+    let mut failed = 0usize;
+    for (hash, (content, eids)) in &pending {
+        let bytes: anybytes::Bytes = match ws.get::<anybytes::Bytes, _>(*content) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("  skip {hash}: read content failed: {e:?}");
+                failed += 1;
+                continue;
+            }
+        };
+        let v = match mm7b_embed_image(&embedder, bytes.as_ref()) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("  skip {hash}: embed failed: {e:#}");
+                failed += 1;
+                continue;
+            }
+        };
+        embedded += 1;
+        for (eid, has) in eids {
+            if *has && !force {
+                continue;
+            }
+            let handle: Mm7bHandle = ws.put::<embeddings::Embedding3584, _>(v.clone());
+            change += entity! {
+                ExclusiveId::force_ref(eid) @ embeddings::attr_mm7b::embedding: handle
+            };
+            assigned += 1;
+        }
+        eprintln!("  embedded {hash}  ({} bytes → 3584-d)", bytes.len());
+    }
+
+    if change.is_empty() {
+        println!("Nothing to commit (embedded {embedded}, failed {failed}).");
+        return Ok(());
+    }
+
+    ws.commit(change, "files embed-7b");
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+
+    println!(
+        "7b-embedded {embedded} unique images → {assigned} file entities (of {total_imgs} pending){}",
+        if failed > 0 { format!(", {failed} failed") } else { String::new() },
+    );
+    Ok(())
+}
+
 /// Semantic nearest-neighbour search over image embeddings.
 ///
 /// Embeddings are persisted as exhaust of `add` (one `Handle<Embedding>` per
@@ -1471,6 +1676,8 @@ fn read_embedding(ws: &mut Workspace<Pile>, h: EmbHandle) -> Result<Vec<f32>> {
 /// scale a build is sub-second, so there is no stale index to maintain. The
 /// query is pile-native: `candidates_above` walks the graph, and the optional
 /// `--tag` filter is the hybrid join that separates real forms from mascots.
+/// With `mm7b`, the query and candidates live in the 3584-d nomic-7b space
+/// (`attr_mm7b::embedding`, populated by `files embed-7b`) instead of CLIP-512.
 fn cmd_similar(
     ws: &mut Workspace<Pile>,
     id: Option<&str>,
@@ -1478,7 +1685,11 @@ fn cmd_similar(
     floor: f32,
     limit: usize,
     filter_tags: &[String],
+    mm7b: bool,
 ) -> Result<()> {
+    if mm7b {
+        return cmd_similar_mm7b(ws, id, text, floor, limit, filter_tags);
+    }
     let space = ws
         .checkout(..)
         .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
@@ -1564,6 +1775,99 @@ fn cmd_similar(
     Ok(())
 }
 
+/// Nearest-neighbour search in the nomic-embed-multimodal-7b 3584-d space.
+/// Same shape as [`cmd_similar`] but over `attr_mm7b::embedding`: a text query
+/// is embedded with the 7b's query-side path (text→image recall), a file query
+/// reuses that file's stored 7b vector (image→image).
+fn cmd_similar_mm7b(
+    ws: &mut Workspace<Pile>,
+    id: Option<&str>,
+    text: Option<&str>,
+    floor: f32,
+    limit: usize,
+    filter_tags: &[String],
+) -> Result<()> {
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+
+    let (query_vec, query_eid, label): (Vec<f32>, Option<Id>, String) = match (text, id) {
+        (Some(t), _) => {
+            let embedder = load_mm7b_opt()?;
+            (mm7b_embed_query(&embedder, t)?, None, format!("{t:?}"))
+        }
+        (None, Some(idstr)) => {
+            let eid = resolve_entity(&space, idstr)?;
+            let h: Mm7bHandle = find!(
+                (h: Mm7bHandle),
+                pattern!(&space, [{ eid @ embeddings::attr_mm7b::embedding: ?h }])
+            )
+            .map(|(h,)| h)
+            .next()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "that file has no 7b embedding — run `files embed-7b` first, \
+                     or query with --text instead"
+                )
+            })?;
+            let name = read_name(&space, ws, eid).unwrap_or_else(|| "?".into());
+            (read_embedding_3584(ws, h)?, Some(eid), name)
+        }
+        (None, None) => bail!("give a file id/hash, or --text \"a query\""),
+    };
+
+    let pairs: Vec<(Id, Mm7bHandle)> = find!(
+        (eid: Id, h: Mm7bHandle),
+        pattern!(&space, [{ ?eid @ embeddings::attr_mm7b::embedding: ?h }])
+    )
+    .collect();
+    if pairs.is_empty() {
+        bail!("no 7b-embedded files yet — run `files embed-7b` first");
+    }
+
+    let mut vec_pairs: Vec<(Id, Vec<f32>)> = Vec::with_capacity(pairs.len());
+    for (eid, h) in &pairs {
+        vec_pairs.push((*eid, read_embedding_3584(ws, *h)?));
+    }
+    let ranked = embeddings::nearest(&vec_pairs, &query_vec, floor)?;
+
+    let mut rows: Vec<(f32, Id)> = Vec::new();
+    for (cos, eid) in ranked {
+        if Some(eid) == query_eid {
+            continue;
+        }
+        if !filter_tags.is_empty() {
+            let tags = tags_of(&space, eid);
+            if !filter_tags.iter().all(|ft| tags.iter().any(|t| t == ft)) {
+                continue;
+            }
+        }
+        rows.push((cos, eid));
+    }
+    rows.truncate(limit);
+
+    if rows.is_empty() {
+        println!("no files similar to {label} above cos {floor} (7b space)");
+        return Ok(());
+    }
+    println!("Similar to {label} (7b space, cos ≥ {floor}):");
+    for (cos, eid) in &rows {
+        let name = read_name(&space, ws, *eid).unwrap_or_else(|| "?".into());
+        let mime = read_mime(&space, *eid).unwrap_or_else(|| "?".into());
+        let hash = content_handle_of(&space, *eid)
+            .map(handle_hex)
+            .unwrap_or_default();
+        let tags = tags_of(&space, *eid);
+        let tagstr = if tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", tags.join(", "))
+        };
+        println!("  {cos:.3}  {name}  ({mime})  {hash}{tagstr}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1605,10 +1909,13 @@ fn main() -> Result<()> {
         Command::Search { query } => {
             with_files(pile, branch, |_repo, ws| cmd_search(ws, &query))
         }
-        Command::Similar { id, text, floor, limit, tag } => {
+        Command::Similar { id, text, floor, limit, tag, mm7b } => {
             with_files(pile, branch, |_repo, ws| {
-                cmd_similar(ws, id.as_deref(), text.as_deref(), floor, limit, &tag)
+                cmd_similar(ws, id.as_deref(), text.as_deref(), floor, limit, &tag, mm7b)
             })
+        }
+        Command::Embed7b { force } => {
+            with_files(pile, branch, |repo, ws| cmd_embed7b(repo, ws, force))
         }
         Command::Imports => {
             with_files(pile, branch, |_repo, ws| cmd_imports(ws))

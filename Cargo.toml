@@ -153,7 +153,24 @@ GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "m
 egui = { version = "0.34", optional = true }
 cubecl = { version = "0.9.0", default-features = false, features = ["wgpu", "std"], optional = true }
 
-# Local-embed-only (optional): mary's CLIP/SigLIP multi-modal embedder, for
-# `files` semantic similarity (image+text shared space). Heavy (pulls mary +
-# Burn), so gated behind `local-embed` — the default build stays light.
-mary = { path = "../mary", default-features = false, features = ["embed"], optional = true }
+# Local-embed-only (optional): mary's CLIP/SigLIP multi-modal embedder (CLIP
+# image+text shared space, behind `embed`) plus nomic-embed-multimodal-7b (the
+# 3584-d dense image/text space, behind `gemma` — pulls the Qwen2.5-VL port +
+# Metal/wgpu backend). Heavy, so gated behind `local-embed`; the default build
+# stays light.
+mary = { path = "../mary", default-features = false, features = ["embed", "gemma"], optional = true }
+
+# ── patches ────────────────────────────────────────────────────────────────
+# `[patch]` only takes effect from the *root* crate of a build, so mary's own
+# patch section is ignored when mary is consumed as a path dep here. We mirror
+# it: the nomic-mm7b zero-copy aliasing path (`local-embed`) needs the cubecl
+# fork (adds `register_external_aliased`) and the V3 256-byte-aligned local
+# triblespace-core. The cubecl patches are only exercised under `local-embed`
+# (mary's cubecl 0.10); the default and `local-embed` builds resolve cleanly.
+# NOTE: `--features widgets` (faculties' own cubecl 0.9 GPU graph layout) is
+# incompatible with these cubecl 0.10 patches — build widgets and local-embed
+# separately until the widgets GPU code is migrated to cubecl 0.10.
+[patch.crates-io]
+cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
+cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
+triblespace-core = { path = "../triblespace-rs/triblespace-core" }
