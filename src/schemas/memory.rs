@@ -188,5 +188,13 @@ pub mod ctx {
         /// periphery principle). Mis-created chunks stay in history but leave
         /// every view.
         "0381735B64BFE71EA0341B95EA42C984" as supersedes: GenId;
+        /// Marks this chunk as a thematic LENS rather than part of the
+        /// chronological spine; the value is the theme name. Lens chunks are
+        /// excluded from the temporal containment tree, so a wide lens (e.g. a
+        /// "story of us" over many months) can't hijack the spine by containing
+        /// the eras it overlaps. They are read on their own axis via
+        /// `memory lens <theme>`. This is what lets memory be a many-threaded
+        /// weave — overlapping views over the same time — instead of one tree.
+        "B53D37A3BE552B0F47E279D69AB7ECD3" as lens: Handle<LongString>;
     }
 }

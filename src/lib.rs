@@ -8,6 +8,7 @@
 //! that embeds a faculty widget — uses the same attribute IDs.
 
 pub mod schemas;
+pub mod tokens;
 
 #[cfg(feature = "widgets")]
 pub mod widgets;

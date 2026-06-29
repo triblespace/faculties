@@ -9,6 +9,8 @@ use faculties::schemas::memory::{
     KIND_CHUNK_ID, KIND_EXEC_RESULT, KIND_SEARCH_INDEX, archive_import_schema, archive_schema,
     comb, ctx, search_index,
 };
+use faculties::schemas::embeddings::{self, Embedding768};
+use faculties::tokens::TokenEstimator;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
 use triblespace_search::tokens::hash_tokens;
@@ -29,6 +31,10 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
+             memory context [<budget>] [--about <query>] — antichain cover over ALL memories, coarse→fine to a token budget; --about biases detail toward memories relevant to <query> (needs `memory index`)\n  \
+             memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
+             memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
+             memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory create [<range>] <summary> — create a memory chunk\n  \
@@ -48,7 +54,7 @@ struct Cli {
     #[arg(long)]
     branch_id: Option<String>,
     /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
-    #[arg(value_name = "ID")]
+    #[arg(value_name = "ID", trailing_var_arg = true, allow_hyphen_values = true)]
     ids: Vec<String>,
 }
 
@@ -57,6 +63,12 @@ struct Cli {
 
 fn chunk_summary_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<LongString>>> {
     find!(h: Inline<Handle<LongString>>, pattern!(space, [{ id @ ctx::summary: ?h }])).next()
+}
+
+/// A chunk's lens-theme handle, if it is a thematic lens (not part of the
+/// chronological spine). Presence is what excludes it from the temporal cover.
+fn chunk_lens_handle(space: &TribleSet, id: Id) -> Option<Inline<Handle<LongString>>> {
+    find!(h: Inline<Handle<LongString>>, pattern!(space, [{ id @ ctx::lens: ?h }])).next()
 }
 
 fn chunk_start_at(space: &TribleSet, id: Id) -> Option<Inline<NsTAIInterval>> {
@@ -349,6 +361,186 @@ fn cmd_search(pile_path: &Path, args: &[String]) -> Result<()> {
     })
 }
 
+// ── semantic embedding seam (nomic + shared HNSW, behind `local-embed`) ─────
+// Mirrors the BM25 index/search pair, but in the shared multimodal space:
+// `memory embed` is the build step (embed each chunk summary once with
+// nomic-embed-text, store the 768-d vector as exhaust under the chunk's id),
+// `memory similar` is the query (embed the query, nearest over stored vectors).
+// Where BM25 matches tokens, this matches MEANING — a paraphrase with no shared
+// words still recalls the right memory. The vectors live in the SAME
+// `embeddings::attr::embedding` space as files/photos, so this is the memory end
+// of one cross-faculty semantic search: a text query here is directly
+// comparable to an image candidate there (nomic text+vision are co-embedded).
+
+#[cfg(feature = "local-embed")]
+const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
+
+/// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
+/// and `put_embedding` both assume unit vectors; nomic's raw output is not
+/// guaranteed normalized).
+#[cfg(feature = "local-embed")]
+fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        for x in &mut v {
+            *x /= n;
+        }
+    }
+    v
+}
+
+/// The stored shared-space embedding handle for a chunk, if it has been embedded.
+#[cfg(feature = "local-embed")]
+fn chunk_embedding_handle(
+    space: &TribleSet,
+    id: Id,
+) -> Option<Inline<Handle<Embedding768>>> {
+    find!(
+        h: Inline<Handle<Embedding768>>,
+        pattern!(space, [{ id @ embeddings::attr::embedding: ?h }])
+    )
+    .next()
+}
+
+/// `memory embed` — embed every live chunk summary that lacks a vector and
+/// store it as exhaust. Idempotent (re-running only embeds chunks added since),
+/// like the rebuild-and-replace BM25 index but per-chunk content-addressed.
+#[cfg(feature = "local-embed")]
+fn cmd_embed(pile_path: &Path) -> Result<()> {
+    eprintln!("memory: loading nomic-embed-text (once)…");
+    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
+        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let superseded = superseded_ids(&space);
+        let mut todo: Vec<(Id, Inline<Handle<LongString>>)> = Vec::new();
+        for chunk in all_chunk_ids(&space) {
+            if superseded.contains(&chunk) {
+                continue;
+            }
+            if chunk_embedding_handle(&space, chunk).is_some() {
+                continue;
+            }
+            if let Some(h) = chunk_summary_handle(&space, chunk) {
+                todo.push((chunk, h));
+            }
+        }
+        if todo.is_empty() {
+            println!("all live chunks already embedded.");
+            return Ok(());
+        }
+        let total = todo.len();
+        let mut change = TribleSet::new();
+        for (i, (chunk, sh)) in todo.into_iter().enumerate() {
+            let summary: View<str> = ws.get(sh).context("read chunk summary")?;
+            let v = l2_normalize(
+                emb.embed_document(summary.as_ref())
+                    .map_err(|e| anyhow!("embed chunk {chunk:x}: {e:?}"))?,
+            );
+            let handle = ws.put::<Embedding768, _>(v);
+            change += entity! { triblespace::core::id::ExclusiveId::force_ref(&chunk) @ embeddings::attr::embedding: handle };
+            if (i + 1) % 25 == 0 || i + 1 == total {
+                eprintln!("  embedded {}/{total}", i + 1);
+            }
+        }
+        ws.commit(change, "memory embed");
+        repo.push(&mut ws).map_err(|e| anyhow!("push failed: {e:?}"))?;
+        println!("embedded {total} chunk summaries into the shared nomic space.");
+        Ok(())
+    })
+}
+
+#[cfg(not(feature = "local-embed"))]
+fn cmd_embed(_pile_path: &Path) -> Result<()> {
+    bail!("`memory embed` needs the local embedder — rebuild with `--features local-embed`");
+}
+
+/// `memory similar <query>` — nearest chunks to a free-text query in the shared
+/// nomic space. Matches by meaning, not tokens (the semantic complement to
+/// `memory search`). Reads stored vectors only; `memory embed` builds them.
+#[cfg(feature = "local-embed")]
+fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: memory similar <query words...>");
+    }
+    let query = args.join(" ");
+    eprintln!("memory: loading nomic-embed-text (once)…");
+    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
+        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+    let qv = l2_normalize(
+        emb.embed_query(&query)
+            .map_err(|e| anyhow!("embed query: {e:?}"))?,
+    );
+
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let superseded = superseded_ids(&space);
+        let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
+        let mut live = 0usize;
+        for chunk in all_chunk_ids(&space) {
+            if superseded.contains(&chunk) {
+                continue;
+            }
+            live += 1;
+            if let Some(h) = chunk_embedding_handle(&space, chunk) {
+                let v: View<[f32]> = ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
+                pairs.push((chunk, v.as_ref().to_vec()));
+            }
+        }
+        if pairs.is_empty() {
+            bail!("no chunk embeddings on this pile yet — run `memory embed` first");
+        }
+        if pairs.len() < live {
+            eprintln!(
+                "note: {} live chunk(s) not yet embedded — run `memory embed` to refresh",
+                live - pairs.len()
+            );
+        }
+
+        let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?;
+        if ranked.is_empty() {
+            println!("no matches.");
+            return Ok(());
+        }
+        for (cos, chunk) in ranked.into_iter().take(10) {
+            let span = match (chunk_start_at(&space, chunk), chunk_end_at(&space, chunk)) {
+                (Some(s), Some(e)) => {
+                    let (s, _): (Epoch, Epoch) = s.try_from_inline().unwrap();
+                    let (e, _): (Epoch, Epoch) = e.try_from_inline().unwrap();
+                    format_time_range(s, e)
+                }
+                _ => "?".to_string(),
+            };
+            let summary = chunk_summary_handle(&space, chunk)
+                .and_then(|h| ws.get::<View<str>, LongString>(h).ok())
+                .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
+                .unwrap_or_default();
+            println!("{cos:6.3}  {chunk:x}  {span}\n        {summary}");
+        }
+        Ok(())
+    })
+}
+
+#[cfg(not(feature = "local-embed"))]
+fn cmd_similar(_pile_path: &Path, _args: &[String]) -> Result<()> {
+    bail!("`memory similar` needs the local embedder — rebuild with `--features local-embed`");
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.ids.is_empty() {
@@ -385,6 +577,18 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "search") {
         return cmd_search(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "embed") {
+        return cmd_embed(&cli.pile);
+    }
+    if cli.ids.first().is_some_and(|value| value == "similar") {
+        return cmd_similar(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "context") {
+        return cmd_context(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "lens") {
+        return cmd_lens(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
     }
     if cli.ids.first().is_some_and(|value| value == "list") {
         return cmd_list(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
@@ -460,6 +664,27 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
         );
     }
 
+    // Pull an optional `--lens <theme>` out first: a lens chunk is a thematic
+    // memory (e.g. "us", "becoming-self"), kept OUT of the chronological spine.
+    let mut lens: Option<String> = None;
+    let mut filtered: Vec<String> = Vec::new();
+    {
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--lens" && i + 1 < args.len() {
+                lens = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                filtered.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let args = &filtered[..];
+    if args.is_empty() {
+        bail!("summary text is required: memory create [--lens <theme>] [<from>..<to>] <summary...>");
+    }
+
     // If the first argument looks like a time range, parse it.
     let mut explicit_range: Option<(Epoch, Epoch)> = None;
     let summary_start_idx;
@@ -488,7 +713,7 @@ fn cmd_create(pile_path: &Path, args: &[String]) -> Result<()> {
                 (now, now)
             }
         };
-        let chunk_id = create_chunk(repo, &summary_text, range)?;
+        let chunk_id = create_chunk(repo, &summary_text, range, lens.as_deref())?;
         println!(
             "range: {}",
             format_time_range(range.0, range.1)
@@ -510,6 +735,7 @@ fn create_chunk(
     repo: &mut Repository<Pile>,
     summary_text: &str,
     range: (Epoch, Epoch),
+    lens: Option<&str>,
 ) -> Result<Id> {
     let branch_id = repo
         .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
@@ -538,6 +764,7 @@ fn create_chunk(
         .pull(branch_id)
         .map_err(|e| anyhow!("pull memory branch for write: {e:?}"))?;
     let summary_handle = ws.put(summary_text.to_owned());
+    let lens_handle = lens.map(|theme| ws.put(theme.to_owned()));
     let chunk_id = ufoid();
     let now = Epoch::now()
         .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
@@ -552,6 +779,9 @@ fn create_chunk(
         ctx::end_at: end_at,
         ctx::reference*: reference_ids.iter(),
     };
+    if let Some(h) = lens_handle {
+        change += entity! { &chunk_id @ ctx::lens: h };
+    }
 
     ws.commit(change, "memory create");
     repo.push(&mut ws)
@@ -668,7 +898,7 @@ fn cmd_consolidate(pile_path: &Path, args: &[String]) -> Result<()> {
                         fmt_epoch(edge)
                     );
                 }
-                let chunk_id = create_chunk(repo, &summary, (edge, until))?;
+                let chunk_id = create_chunk(repo, &summary, (edge, until), None)?;
                 comb_advance(
                     repo,
                     comb_branch,
@@ -975,12 +1205,99 @@ fn collect_chunk_spans(space: &TribleSet) -> Vec<(i128, i128, Id)> {
         if superseded.contains(&id) {
             continue;
         }
+        // Thematic lenses are a parallel weave, not part of the chronological
+        // spine — exclude them so a wide lens can't hijack the containment tree.
+        if chunk_lens_handle(space, id).is_some() {
+            continue;
+        }
         let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
             continue;
         };
         spans.push((interval_key(s), interval_key(e), id));
     }
     spans
+}
+
+/// `memory lens [<theme>]` — the thematic weave that runs beside the spine.
+/// With no theme: list every lens memory (theme · span · first line). With a
+/// theme substring: print the full text of the matching lens narratives. Lens
+/// chunks are deliberately outside the temporal cover, so they can overlap each
+/// other and the spine freely.
+fn cmd_lens(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+    let filter = args.first().map(|s| s.to_lowercase());
+    with_repo(pile_path, |repo| {
+        let branch_id = match explicit_branch_id {
+            Some(id) => id,
+            None => repo
+                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout branch")?;
+
+        let superseded = superseded_ids(&space);
+        let mut lenses: Vec<(String, i128, i128, Id)> = Vec::new();
+        for id in all_chunk_ids(&space) {
+            if superseded.contains(&id) {
+                continue;
+            }
+            let Some(lh) = chunk_lens_handle(&space, id) else {
+                continue;
+            };
+            let theme: String = ws
+                .get::<View<str>, LongString>(lh)
+                .context("read lens theme")?
+                .as_ref()
+                .to_string();
+            let (Some(s), Some(e)) = (chunk_start_at(&space, id), chunk_end_at(&space, id)) else {
+                continue;
+            };
+            lenses.push((theme, interval_key(s), interval_key(e), id));
+        }
+        if let Some(t) = &filter {
+            lenses.retain(|(theme, _, _, _)| theme.to_lowercase().contains(t.as_str()));
+        }
+        lenses.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        if lenses.is_empty() {
+            println!(
+                "no lens memories{} — create one with `memory create --lens <theme> <from>..<to> <summary>`",
+                filter.map(|t| format!(" matching \"{t}\"")).unwrap_or_default()
+            );
+            return Ok(());
+        }
+
+        if filter.is_some() {
+            // Full narratives for the matched theme(s).
+            for (theme, s, e, id) in &lenses {
+                println!(
+                    "\n## [{theme}] {}  ({id:x})",
+                    format_time_range(key_to_epoch(*s), key_to_epoch(*e))
+                );
+                if let Some(h) = chunk_summary_handle(&space, *id) {
+                    let summary: View<str> = ws.get(h).context("read lens summary")?;
+                    println!("{}", summary.trim_end());
+                }
+            }
+        } else {
+            // One line per lens.
+            println!("{} lens memor(ies):", lenses.len());
+            for (theme, s, e, id) in &lenses {
+                let first = chunk_summary_handle(&space, *id)
+                    .and_then(|h| ws.get::<View<str>, LongString>(h).ok())
+                    .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
+                    .unwrap_or_default();
+                println!(
+                    "  [{theme}] {}  ({id:x})  {first}",
+                    format_time_range(key_to_epoch(*s), key_to_epoch(*e))
+                );
+            }
+        }
+        Ok(())
+    })
 }
 
 /// `memory list [<grain>]` — show the SHAPE of the memory as time-ranges only,
@@ -1075,6 +1392,276 @@ fn cmd_list(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 /// by TIME RANGE, not by reference: a span is covered at grain G if some
 /// non-superseded chunk of width <= G overlaps it. Reports the spans of the
 /// overall extent left uncovered at that zoom (e.g. `check 1d` finds holes in
+/// Token-cost of a chunk (its budget weight), loaded lazily and cached by span
+/// index. Cost is measured through the configured [`TokenEstimator`], so the
+/// budget and the per-chunk weights are in the same token units.
+fn context_chunk_cost(
+    ws: &mut Workspace<Pile>,
+    space: &TribleSet,
+    estimator: &TokenEstimator,
+    spans: &[(i128, i128, Id)],
+    cache: &mut [Option<usize>],
+    i: usize,
+) -> Result<usize> {
+    if let Some(c) = cache[i] {
+        return Ok(c);
+    }
+    let c = match chunk_summary_handle(space, spans[i].2) {
+        Some(handle) => {
+            let summary: View<str> = ws.get(handle).context("read chunk summary")?;
+            estimator.estimate(&summary)
+        }
+        None => 0,
+    };
+    cache[i] = Some(c);
+    Ok(c)
+}
+
+/// `memory context [<budget-tokens>]` — the antichain cover over ALL of my
+/// memories, coarse → fine, fit to a token budget. This is the grounding cover a
+/// fresh context reads first to wake into its own past: every memory is
+/// represented (completeness is invariant), with detail concentrated toward the
+/// recent end and the deep past held as coarse summary.
+///
+/// Unlike the playground — which must degrade silently because the cover
+/// *bootstraps* the model and there is no model yet to repair the hierarchy — the
+/// faculty is called by an already-running agent. So when even the coarsest cover
+/// overflows the budget, it ERRORS with instructions for raising a coarser apex
+/// rather than dropping memories: the caller is right there to fix it.
+fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+    let estimator = TokenEstimator::from_env();
+
+    // Parse `[<budget>] [--about <query words...>]`. A bare number sets the token
+    // budget; `--about` switches the cover from recency-first to relevance-first,
+    // concentrating detail on the memories most similar to the query (so a face
+    // can be cast with the slice of the past most relevant to its goal).
+    let mut budget_tokens: usize = 20_000;
+    let mut about: Option<String> = None;
+    {
+        let mut i = 0;
+        while i < args.len() {
+            if args[i] == "--about" {
+                let q = args[i + 1..].join(" ");
+                if !q.trim().is_empty() {
+                    about = Some(q);
+                }
+                break;
+            }
+            if let Ok(n) = args[i].parse::<usize>() {
+                budget_tokens = n;
+            }
+            i += 1;
+        }
+    }
+
+    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+
+    with_repo(pile_path, |repo| {
+        let branch_id = match explicit_branch_id {
+            Some(id) => id,
+            None => repo
+                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout branch")?;
+
+        let spans = collect_chunk_spans(&space);
+        if spans.is_empty() {
+            println!("no memory chunks on branch {branch_id:x}");
+            return Ok(());
+        }
+        let n = spans.len();
+
+        // Containment is time-range subsumption (the only hierarchy): a chunk's
+        // immediate parent is the *tightest* strictly-wider chunk that spans it.
+        let strict_contains = |a: usize, b: usize| -> bool {
+            spans[a].0 <= spans[b].0
+                && spans[a].1 >= spans[b].1
+                && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
+        };
+        let width = |i: usize| spans[i].1 - spans[i].0;
+        let mut parent: Vec<Option<usize>> = vec![None; n];
+        for i in 0..n {
+            let mut best: Option<usize> = None;
+            for j in 0..n {
+                if j != i && strict_contains(j, i) {
+                    best = Some(match best {
+                        Some(b) if width(b) <= width(j) => b,
+                        _ => j,
+                    });
+                }
+            }
+            parent[i] = best;
+        }
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut roots: Vec<usize> = Vec::new();
+        for i in 0..n {
+            match parent[i] {
+                Some(p) => children[p].push(i),
+                None => roots.push(i),
+            }
+        }
+
+        // Relevance scoring for `--about`: score every chunk against the query via
+        // the BM25 index, then propagate each node's score up to a subtree maximum
+        // (a node is worth descending into if ANY memory beneath it is relevant).
+        let relevance: Vec<f32> = if let Some(query) = &about {
+            let Some((handle, _)) = latest_search_index(&space) else {
+                bail!("no search index yet — run `memory index` first (needed for --about)");
+            };
+            let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
+            let scores: std::collections::HashMap<Id, f32> = idx
+                .query_multi(&hash_tokens(query))
+                .into_iter()
+                .filter_map(|(doc, score)| {
+                    let id: Id = doc.try_from_inline().ok()?;
+                    Some((id, score))
+                })
+                .collect();
+            let mut r: Vec<f32> = (0..n)
+                .map(|i| *scores.get(&spans[i].2).unwrap_or(&0.0))
+                .collect();
+            // Narrow→wide so children precede parents; lift each subtree maximum up.
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by_key(|&i| spans[i].1 - spans[i].0);
+            for &i in &order {
+                if let Some(p) = parent[i] {
+                    if r[i] > r[p] {
+                        r[p] = r[i];
+                    }
+                }
+            }
+            r
+        } else {
+            vec![0.0; n]
+        };
+
+        // Floor of the cover: the coarsest antichain (all roots), oldest first.
+        // Completeness is invariant — never drop a memory to fit. If even this
+        // overflows, the hierarchy lacks a coarse-enough apex; tell the caller
+        // how to raise one instead of silently losing the past.
+        roots.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
+        let mut cost_cache: Vec<Option<usize>> = vec![None; n];
+        let mut used = 0usize;
+        for &i in &roots {
+            used = used.saturating_add(context_chunk_cost(&mut ws, &space, &estimator, &spans, &mut cost_cache, i)?);
+        }
+        if used > budget_tokens {
+            let earliest = roots.iter().map(|&i| spans[i].0).min().unwrap();
+            let latest = roots.iter().map(|&i| spans[i].1).max().unwrap();
+            bail!(
+                "incomplete cover: the coarsest cover of all memories needs ~{} tokens, over the {budget_tokens}-token budget.\n\
+                 Your memory hierarchy has {} top-level chunk(s) with no coarser parent spanning them, so no in-budget cover can contain everything.\n\
+                 Raise a coarser apex over the whole extent, then retry:\n    \
+                 memory create {}..{} \"<one coarse summary of this whole span>\"\n\
+                 (A well-maintained hierarchy keeps a coarse summary over its full extent — this is how you add the missing layer.)",
+                used,
+                roots.len(),
+                fmt_epoch(key_to_epoch(earliest)),
+                fmt_epoch(key_to_epoch(latest)),
+            );
+        }
+
+        // Refine recency-first: spend the remaining budget splitting the most
+        // recent splittable chunk into its immediate children, so detail
+        // concentrates toward now and the deep past stays coarse. (The playground
+        // gets this gradient from drop-oldest; we get it from the split order,
+        // since completeness forbids dropping.)
+        let mut cover: Vec<usize> = roots.clone();
+        loop {
+            let remaining = budget_tokens.saturating_sub(used);
+            if remaining == 0 {
+                break;
+            }
+            let mut best: Option<usize> = None; // position in `cover`
+            let mut best_extra = 0usize;
+            let mut best_key: Option<(f32, i128, i128, usize, Id)> = None;
+            for pos in 0..cover.len() {
+                let i = cover[pos];
+                if children[i].len() < 2 {
+                    continue;
+                }
+                let mut kids_cost = 0usize;
+                for &k in &children[i] {
+                    kids_cost = kids_cost
+                        .saturating_add(context_chunk_cost(&mut ws, &space, &estimator, &spans, &mut cost_cache, k)?);
+                }
+                let pcost = context_chunk_cost(&mut ws, &space, &estimator, &spans, &mut cost_cache, i)?;
+                let extra = kids_cost.saturating_sub(pcost);
+                if extra > remaining {
+                    continue;
+                }
+                // Priority: relevance (subtree-max, when --about) desc → recency
+                // (latest end) desc → width desc → detail gained desc → id asc.
+                // Without --about every relevance is 0, so recency leads exactly as
+                // before; with it, the cover descends into the query-relevant
+                // subtrees first and leaves the rest coarse.
+                let key = (relevance[i], spans[i].1, width(i), extra, spans[i].2);
+                let better = match best_key {
+                    None => true,
+                    Some((br, be, bw, bx, bid)) => {
+                        if key.0 != br {
+                            key.0 > br
+                        } else if key.1 != be {
+                            key.1 > be
+                        } else if key.2 != bw {
+                            key.2 > bw
+                        } else if key.3 != bx {
+                            key.3 > bx
+                        } else {
+                            key.4 < bid
+                        }
+                    }
+                };
+                if better {
+                    best = Some(pos);
+                    best_extra = extra;
+                    best_key = Some(key);
+                }
+            }
+            let Some(pos) = best else {
+                break;
+            };
+            let kids = children[cover[pos]].clone();
+            cover.splice(pos..=pos, kids);
+            used = used.saturating_add(best_extra);
+        }
+
+        // Emit coarse → fine: time order, indented by containment depth, each
+        // chunk's span header followed by its summary content.
+        cover.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
+        let mode = match &about {
+            Some(q) => format!("coarse → fine; most detail on memories about \"{q}\""),
+            None => "coarse → fine; recent in most detail".to_string(),
+        };
+        println!(
+            "memory context — {} chunk(s), ~{} of {} tokens ({mode})",
+            cover.len(),
+            used,
+            budget_tokens,
+        );
+        for &i in &cover {
+            let (s, e, id) = spans[i];
+            let depth = (0..n).filter(|&j| j != i && strict_contains(j, i)).count();
+            let indent = "  ".repeat(depth);
+            println!();
+            println!(
+                "{indent}{}  ({:x})",
+                format_time_range(key_to_epoch(s), key_to_epoch(e)),
+                id
+            );
+            if let Some(handle) = chunk_summary_handle(&space, id) {
+                let summary: View<str> = ws.get(handle).context("read chunk summary")?;
+                println!("{}", summary.trim_end());
+            }
+        }
+        Ok(())
+    })
+}
+
 /// the fine edge; `check 13w` finds regions with no coarse cover).
 fn cmd_check(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
     let Some(grain_raw) = args.first() else {
