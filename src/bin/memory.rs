@@ -32,7 +32,8 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--about <query>] — antichain cover over ALL memories, coarse→fine to a token budget; --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`)\n  \
+             memory context [<budget>] [--chars N] [--about <query>] — antichain cover over ALL memories, coarse→fine to a budget (default tokens; --chars N budgets by CHARACTERS instead); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`)\n  \
+             memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
              memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
              memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
@@ -704,6 +705,9 @@ fn main() -> Result<()> {
     }
     if cli.ids.first().is_some_and(|value| value == "check") {
         return cmd_check(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "density") {
+        return cmd_density(&cli.pile, cli.branch_id.as_deref(), &cli.ids[1..]);
     }
 
     let explicit_branch_id = parse_optional_hex_id(cli.branch_id.as_deref())?;
@@ -1712,8 +1716,10 @@ fn semantic_about_scores(
 fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
     let estimator = TokenEstimator::from_env();
 
-    // Parse `[<budget>] [--about <query words...>]`. A bare number sets the token
-    // budget; `--about` switches the cover from recency-first to relevance-first,
+    // Parse `[<budget>] [--chars N] [--about <query words...>]`. A bare number
+    // sets the token budget; `--chars N` instead sets the budget as a CHARACTER
+    // count (converted to the internal token budget through the estimator);
+    // `--about` switches the cover from recency-first to relevance-first,
     // concentrating detail on the memories most similar to the query (so a face
     // can be cast with the slice of the past most relevant to its goal).
     let mut budget_tokens: usize = 20_000;
@@ -1727,6 +1733,29 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
                     about = Some(q);
                 }
                 break;
+            }
+            if args[i] == "--chars" {
+                let raw = args.get(i + 1).ok_or_else(|| {
+                    anyhow!("--chars needs a number, e.g. `memory context --chars 9500`")
+                })?;
+                let chars: usize = raw.parse().map_err(|_| {
+                    anyhow!("--chars expects a positive integer, got `{raw}`")
+                })?;
+                // Convert a CHARACTER budget to the internal token budget. The
+                // cover charges each chunk its summary's *token* estimate, but the
+                // rendered output also spends characters on span headers, ids,
+                // indentation and blank lines — empirically printed_chars ≈
+                // 4.15–4.32 × used_tokens while the estimator runs at ~4
+                // chars/token (so ~5% structural overhead). Convert through the
+                // estimator (probing its ratio on a fixed sample, never allocating
+                // the full N-char budget), then discount ~13% so the rendered
+                // cover lands at or just under N characters (slightly under is
+                // fine; over is not).
+                const PROBE: usize = 4096;
+                let toks_per_probe = estimator.estimate(&"x".repeat(PROBE)).max(1);
+                budget_tokens = chars.saturating_mul(toks_per_probe) / PROBE * 87 / 100;
+                i += 2;
+                continue;
             }
             if let Ok(n) = args[i].parse::<usize>() {
                 budget_tokens = n;
@@ -1999,6 +2028,167 @@ fn cmd_check(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> 
                     format_time_range(key_to_epoch(*s), key_to_epoch(*e)),
                     humanize_ns(e - s)
                 );
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `memory density [<grain>]` — inspection tooling that finds where the
+/// containment hierarchy is BUSHY: a span with many direct *leaf* children and
+/// no intermediate arc summary combing them into mid-level groups. Bushiness is
+/// exactly what makes a cover unable to drill granularly under budget — the only
+/// way to add detail beneath a bushy span is to dump ALL its leaves into the
+/// cover at once (the lumpy jump), because completeness forbids a partial split.
+/// The fix is never to drop memories; it is to ADD intermediate summaries
+/// (comb the leaves into arcs). This command only points at where to comb —
+/// it writes nothing. Optional `<grain>`: restrict the report to spans of width
+/// <= grain (zoom the analysis to e.g. day- vs week-level structure).
+fn cmd_density(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
+    // Threshold for the BUSHY flag: this many direct leaf-children with no
+    // intermediate arc make a span expensive to expand in the cover.
+    const BUSHY_LEAVES: usize = 5;
+    let grain_ns: Option<i128> = match args.first() {
+        Some(raw) => Some(parse_grain(raw)?),
+        None => None,
+    };
+    let explicit_branch_id = parse_optional_hex_id(branch_id_raw)?;
+    with_repo(pile_path, |repo| {
+        let branch_id = match explicit_branch_id {
+            Some(id) => id,
+            None => repo
+                .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+                .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?,
+        };
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull branch {branch_id:x}: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout branch")?;
+
+        let spans = collect_chunk_spans(&space);
+        if spans.is_empty() {
+            println!("no memory chunks on branch {branch_id:x}");
+            return Ok(());
+        }
+        let n = spans.len();
+
+        // Same containment hierarchy cmd_context builds: a chunk's parent is the
+        // tightest strictly-wider chunk that spans it (time-range subsumption).
+        let strict_contains = |a: usize, b: usize| -> bool {
+            spans[a].0 <= spans[b].0
+                && spans[a].1 >= spans[b].1
+                && (spans[a].1 - spans[a].0) > (spans[b].1 - spans[b].0)
+        };
+        let width = |i: usize| spans[i].1 - spans[i].0;
+        let mut parent: Vec<Option<usize>> = vec![None; n];
+        for i in 0..n {
+            let mut best: Option<usize> = None;
+            for j in 0..n {
+                if j != i && strict_contains(j, i) {
+                    best = Some(match best {
+                        Some(b) if width(b) <= width(j) => b,
+                        _ => j,
+                    });
+                }
+            }
+            parent[i] = best;
+        }
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            if let Some(p) = parent[i] {
+                children[p].push(i);
+            }
+        }
+
+        // Subtree depth (leaves = 0) and size, computed narrow→wide so children
+        // are finished before their parent.
+        let mut depth = vec![0usize; n];
+        let mut subtree = vec![1usize; n];
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| width(i));
+        for &i in &order {
+            if let Some(p) = parent[i] {
+                depth[p] = depth[p].max(depth[i] + 1);
+                subtree[p] += subtree[i];
+            }
+        }
+        let leaf_kids = |i: usize| children[i].iter().filter(|&&c| children[c].is_empty()).count();
+
+        // Non-leaf spans (forks worth inspecting: >= 2 children), optionally
+        // restricted to a coarseness zoom.
+        let mut forks: Vec<usize> = (0..n)
+            .filter(|&i| children[i].len() >= 2)
+            .filter(|&i| grain_ns.map_or(true, |g| width(i) <= g))
+            .collect();
+
+        // Classify each fork: BUSHY (many flat leaves, no comb) / coarse (few
+        // children) / balanced (the rest — already has intermediate arcs).
+        let classify = |i: usize| -> &'static str {
+            if leaf_kids(i) >= BUSHY_LEAVES {
+                "BUSHY"
+            } else if children[i].len() <= 3 {
+                "coarse"
+            } else {
+                "balanced"
+            }
+        };
+
+        let total_forks = forks.len();
+        let bushy_count = forks.iter().filter(|&&i| classify(i) == "BUSHY").count();
+        println!(
+            "memory density — {n} chunk(s), {total_forks} fork(s) (>=2 children) on branch {branch_id:x}{}",
+            grain_ns.map(|_| format!(" of width <= {}", args[0])).unwrap_or_default(),
+        );
+        println!(
+            "  BUSHY = >= {BUSHY_LEAVES} direct leaf-children with no intermediate arc (expensive to expand → comb leaves into arcs); {bushy_count} found"
+        );
+        if forks.is_empty() {
+            println!("  (no forks at this zoom)");
+            return Ok(());
+        }
+
+        // Bushiest first: by direct leaf-children desc, then recency (end) desc.
+        // Shallow subtrees with many leaves are the worst — splitting them dumps
+        // every leaf into the cover at once.
+        forks.sort_by(|&a, &b| {
+            leaf_kids(b)
+                .cmp(&leaf_kids(a))
+                .then(spans[b].1.cmp(&spans[a].1))
+        });
+        let render = |i: usize| -> String {
+            format!(
+                "{:8} {}  ({:x})  children={} leaf={} depth={} subtree={}",
+                classify(i),
+                format_time_range(key_to_epoch(spans[i].0), key_to_epoch(spans[i].1)),
+                spans[i].2,
+                children[i].len(),
+                leaf_kids(i),
+                depth[i],
+                subtree[i],
+            )
+        };
+
+        println!("\nBushiest forks (worst first):");
+        for &i in forks.iter().take(15) {
+            println!("  {}", render(i));
+        }
+
+        // The recent edge: forks STARTING in the last 14 days, newest first —
+        // local structure at the now-end (today's sessions), where chunks are
+        // most likely hanging flat and uncombed. (Start-based, so the 2024-rooted
+        // apex — whose own fan-out shows in the worst-first list above — doesn't
+        // crowd out the genuinely recent forks here.)
+        let newest_end = spans.iter().map(|(_, e, _)| *e).max().unwrap();
+        let recent_cutoff = newest_end - parse_grain("2w").unwrap_or(0);
+        let mut recent: Vec<usize> =
+            forks.iter().copied().filter(|&i| spans[i].0 >= recent_cutoff).collect();
+        recent.sort_by(|&a, &b| spans[b].1.cmp(&spans[a].1));
+        println!("\nRecent edge (forks starting within 2w, newest first):");
+        if recent.is_empty() {
+            println!("  (none)");
+        } else {
+            for &i in &recent {
+                println!("  {}", render(i));
             }
         }
         Ok(())
