@@ -27,20 +27,9 @@ pub const BODY_BRANCH_NAME: &str = "body";
 /// Tag for a deliberate capture (a frame, an audio clip, or a felt touch).
 pub const KIND_CAPTURE: Id = id_hex!("9C26C6EFD09EB2A401EF009FE9229E16");
 
-/// Tag for an utterance — the body *speaking* (efferent), the counterpart to
-/// KIND_CAPTURE's afferent perception. Carries the words, the channel, and the
-/// content-addressed audio (reusing `capture::frame`/`capture::mime`).
-pub const KIND_UTTERANCE: Id = id_hex!("B715BF1EEB1904393A7C31A0C1FFDF8C");
-
-pub mod utterance {
-    use super::*;
-    attributes! {
-        /// The words spoken.
-        "09792243FE6C424FD80D7EF7E48EBAEA" as pub text: Handle<LongString>;
-        /// Channel: "computer" (private) | "body" (aloud, through the speaker).
-        "33892D142FCB2ED2D40B9724847B3859" as pub channel: ShortString;
-    }
-}
+// Speech moved OUT of `body` into the dedicated `voice` faculty (2026-06-30):
+// speaking is its own organ. Utterances now live on the pile's `voice` branch
+// (see `schemas::voice`). The body is the physical Reachy loop only.
 
 /// Tag for an INTENT — the being's reasoned instruction to itself: gemma's
 /// perceive+reason output, the language the VLA is conditioned on. Unlike the

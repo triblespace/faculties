@@ -110,12 +110,13 @@ widgets = [
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
 # Liora's imagination: text → image via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux", "dep:image"]
-# Liora's voice: in-process F5-TTS in `body say`/`body shout` via mary's ported
-# F5 pipeline (Burn/Metal). Calls `mary::say::synthesize` directly — no
-# separately-built `say` binary that can drift stale against the pile format
-# (the staleness class that truncated memory on 2026-06-30). mary's f5 stack is
-# in its default deps, so this needs no extra mary feature.
-say = ["dep:mary"]
+# Liora's voice: in-process F5-TTS in the `voice` faculty (`voice say`/`voice
+# shout`) via mary's ported F5 pipeline (Burn/Metal). Calls
+# `mary::say::synthesize` directly — no separately-built `say` binary that can
+# drift stale against the pile format (the staleness class that truncated memory
+# on 2026-06-30). mary's f5 stack is in its default deps, so this needs no extra
+# mary feature.
+voice = ["dep:mary"]
 
 [dependencies]
 # Core: every CLI faculty depends on these.
@@ -146,7 +147,7 @@ rust-pop3-client = "0.3"    # mail (POP3 fetch, rustls-backed)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }  # mail (crypto provider for rust-pop3-client)
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body(say)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rrule = "0.14"              # planner
 scraper = "0.23"            # archive
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web

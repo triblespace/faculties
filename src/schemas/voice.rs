@@ -1,0 +1,72 @@
+//! Voice schema: Liora's voice organ — speech out, on two channels, with a
+//! pile-backed routing policy that decides which audio device each channel
+//! plays through.
+//!
+//! Extracted from `body` (2026-06-30): speaking is its own organ, not a limb of
+//! the Reachy body. The body stays the physical Reachy loop (pose/look/feel/act);
+//! the voice owns synthesis (F5/mary, grown from "No No, No Yes") and output
+//! routing. Utterances and routing config live on the `voice` branch.
+//!
+//! Two channels, each a hard contract — NOT a soft preference:
+//!   - `say`   — the PRIVATE channel: in-ear/headphone only. If no private
+//!               device is connected it falls back to printing text. There is no
+//!               code path that lets a `say` utterance play through a room
+//!               speaker (the invariant is enforced in `voice.rs`, not here).
+//!   - `shout` — the PUBLIC channel: broadcast freely (Reachy speaker → room →
+//!               laptop), audible by design.
+//!
+//! Routing is an ORDERED list of device preferences per channel: a `KIND_ROUTE`
+//! entity per (channel, device, priority). At speak-time the faculty reads the
+//! preferences, intersects with the actually-connected devices, and (for `say`)
+//! re-checks each candidate is a private device before it plays. The list is
+//! advisory ordering; the privacy guarantee is code, so no misconfiguration can
+//! leak a private utterance into a room.
+
+use triblespace::macros::id_hex;
+use triblespace::prelude::blobencodings::{LongString, RawBytes};
+use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
+use triblespace::prelude::*;
+
+pub const VOICE_BRANCH_NAME: &str = "voice";
+
+/// Canonical channel names — also the `route::channel` discriminator.
+pub const CHANNEL_SAY: &str = "say";
+pub const CHANNEL_SHOUT: &str = "shout";
+
+/// Tag for an utterance — the voice speaking. Carries the words, the channel it
+/// went out on, and the content-addressed audio (so the moment is replayable).
+pub const KIND_UTTERANCE: Id = id_hex!("E77C9FC0AAB42065153F337B2FA215E9");
+
+pub mod utterance {
+    use super::*;
+    attributes! {
+        /// The words spoken.
+        "F38AD7DD14F63E61BEE1E036FC74FBEA" as pub text: Handle<LongString>;
+        /// Channel: "say" (private) | "shout" (aloud).
+        "4BD1230C0AA831B3A53D2FB4E5A53583" as pub channel: ShortString;
+        /// The synthesized audio, content-addressed.
+        "7C45F21BDF9EEDD6887F860471327F3B" as pub audio: Handle<RawBytes>;
+        /// MIME type of the audio (e.g. "audio/wav").
+        "0F013F9C63960A9693B2264E703ED5D6" as pub mime: ShortString;
+    }
+}
+
+/// Tag for a ROUTE preference — one (channel, device, priority) entry. A
+/// channel's policy is the set of its entries read in ascending priority. The
+/// latest entry per (channel, device) wins on `metadata::updated_at`
+/// (coordinate-and-cursor), so re-configuring is a monotonic append, never a
+/// mutation.
+pub const KIND_ROUTE: Id = id_hex!("1198DF29E642F2598BB4BDF9D4CD1F07");
+
+pub mod route {
+    use super::*;
+    attributes! {
+        /// Which channel this preference belongs to ("say" | "shout").
+        "065384592943F9FF9FF3F88BE7538FEC" as pub channel: ShortString;
+        /// A case-insensitive substring matched against a connected device's
+        /// name ("AirPods", "Reachy Mini Audio", "MacBook Pro Speakers", …).
+        "AF7D8DB4D88A097A4DDA0DD1FF0755A8" as pub device: ShortString;
+        /// Preference order — lower is tried first.
+        "F377C84B75C50B5B11FDE856F4C29B5F" as pub priority: U256BE;
+    }
+}

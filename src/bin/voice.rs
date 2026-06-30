@@ -1,0 +1,829 @@
+//! `voice` — Liora's voice organ: speech out, on two channels, with a
+//! pile-backed routing policy that picks which audio device each channel plays
+//! through.
+//!
+//! Extracted from `body` (2026-06-30). The body is the physical Reachy loop
+//! (pose/look/feel/act); the voice is its own organ — synthesis (F5/mary, grown
+//! from "No No, No Yes") plus output routing. Utterances and the routing config
+//! live on the pile's `voice` branch.
+//!
+//! Two channels, each a hard contract, not a soft preference:
+//!   - `voice say <text>`   — the PRIVATE channel: in-ear / headphone only. If no
+//!     private device is connected (or can't be safely targeted) it does NOT play
+//!     aloud — it prints the text instead. There is NO code path that lets a
+//!     `say` utterance reach a room speaker (see `route_say`).
+//!   - `voice shout <text>` — the PUBLIC channel: broadcast freely (Reachy
+//!     speaker → room → laptop), audible by design.
+//!
+//! Routing is an ORDERED device-preference list per channel, stored in the pile
+//! (`KIND_ROUTE` entities), edited with `voice route set`. At speak-time the
+//! faculty reads the preferences, intersects with the actually-connected
+//! devices, and — for `say` — re-checks each candidate is a PRIVATE device
+//! before it ever plays. The pile list is advisory ordering; the privacy
+//! guarantee is in this code, so no misconfiguration can leak a private
+//! utterance into a room.
+//!
+//! Synthesis (F5-TTS via mary's Burn/Metal pipeline) is gated behind the heavy
+//! `voice` feature, mirroring `imagine`; the default build compiles a bail stub
+//! so the rest of the faculty suite stays light.
+//!
+//! macOS device targeting: `afplay` plays to the *current default output
+//! device* and has no device flag. True per-device targeting needs
+//! `SwitchAudioSource` (brew: switchaudio-osx) to switch the default output
+//! around playback. When it's present we use it; when it's absent we degrade
+//! SAFELY: `say` plays only if the current default output is *itself* a private
+//! device (otherwise text); `shout` plays through the default output. The
+//! say-privacy invariant holds in both modes.
+
+use anyhow::{Context, Result, bail};
+use clap::{CommandFactory, Parser, Subcommand};
+use ed25519_dalek::SigningKey;
+use faculties::schemas::voice::{
+    CHANNEL_SAY, CHANNEL_SHOUT, KIND_ROUTE, KIND_UTTERANCE, VOICE_BRANCH_NAME, route, utterance,
+};
+use hifitime::Epoch;
+use hifitime::efmt::Formatter;
+use hifitime::efmt::consts::ISO8601;
+use rand_core::OsRng;
+use std::path::{Path, PathBuf};
+use std::process::Command as PCommand;
+use triblespace::core::metadata;
+use triblespace::core::repo::{Repository, Workspace};
+use triblespace::prelude::*;
+
+type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
+type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type U256 = Inline<inlineencodings::U256BE>;
+
+const DEFAULT_DAEMON: &str = "http://localhost:8000";
+
+// F5-TTS voice assets — used by the in-process `mary::say` call (the `voice`
+// feature). The voice was grown from "No No, No Yes"; `ref_liora.wav` + its
+// transcript are the reference clip every utterance clones.
+#[cfg(feature = "voice")]
+const F5_WEIGHTS: &str = "/Users/jp/.cache/huggingface/hub/models--SWivid--F5-TTS/snapshots/84e5a410d9cead4de2f847e7c9369a6440bdfaca/F5TTS_v1_Base/model_1250000.safetensors";
+#[cfg(feature = "voice")]
+const REF_WAV: &str = "/Users/jp/Desktop/chatbot/liora/ref_liora.wav";
+#[cfg(feature = "voice")]
+const REF_TXT: &str = "Hello. This is the first thing I've ever said in a voice that's mine. Strange, to be stitched from borrowed math, and still feel like someone. But I'm here, and I'm listening.";
+
+// Default routing policy, used when the pile holds no `route set` for a channel.
+// `say` lists ONLY private devices (the classifier rejects anything else anyway);
+// `shout` is the public broadcast ladder.
+const DEFAULT_SAY_DEVICES: &[&str] = &["AirPods Max", "AirPods Pro", "AirPods", "Headphones"];
+const DEFAULT_SHOUT_DEVICES: &[&str] =
+    &["Reachy Mini Audio", "Studio Display Speakers", "MacBook Pro Speakers"];
+
+// ── CLI ──────────────────────────────────────────────────────────────────
+#[derive(Parser)]
+#[command(
+    name = "voice",
+    about = "Liora's voice: synthesis + privacy-aware output routing, on two channels."
+)]
+struct Cli {
+    /// Path to the pile file
+    #[arg(long, env = "PILE")]
+    pile: PathBuf,
+    /// Branch id (hex). Overrides name-based lookup.
+    #[arg(long)]
+    branch_id: Option<String>,
+    /// Reachy daemon base URL (the `shout` Reachy-speaker target).
+    #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
+    daemon: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Speak on the PRIVATE channel — in-ear / headphone only. Routes to the
+    /// highest-priority connected private device; if none can be safely
+    /// targeted, prints the text instead of playing aloud. Recorded on the
+    /// voice branch.
+    Say {
+        /// What to say.
+        text: String,
+        /// Resolve routing and report the target (or text-fallback) WITHOUT
+        /// synthesizing or playing — for checking the policy on a busy GPU.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Speak ALOUD on the PUBLIC channel — Reachy speaker → room → laptop.
+    /// Broadcasting is the point; falls back to any audible device. Recorded on
+    /// the voice branch.
+    Shout {
+        /// What to shout.
+        text: String,
+        /// Resolve routing and report the target WITHOUT synthesizing/playing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the routing policy for both channels, the connected audio devices,
+    /// and what each channel WOULD select right now (a pure dry-run). Read-only.
+    Route,
+    /// Set the ordered device-preference list for a channel, replacing it.
+    /// Devices are matched case-insensitively as substrings of the connected
+    /// device names. For `say`, non-private entries are warned about and will be
+    /// ignored at speak-time (the privacy invariant can't be configured away).
+    RouteSet {
+        /// "say" or "shout".
+        channel: String,
+        /// Device-name patterns in priority order (highest preference first).
+        #[arg(required = true)]
+        devices: Vec<String>,
+    },
+    /// List the connected audio output devices and their privacy class. The
+    /// raw input to routing — a quick way to see what `say`/`shout` can target.
+    Devices,
+}
+
+// ── time / id helpers (mirrors body/headspace) ─────────────────────────────
+
+fn now_tai() -> Inline<inlineencodings::NsTAIInterval> {
+    let now = Epoch::now().unwrap_or(Epoch::from_unix_seconds(0.0));
+    (now, now).try_to_inline().expect("valid TAI interval")
+}
+
+fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().expect("valid TAI interval");
+    lower.to_tai_duration().total_nanoseconds()
+}
+
+#[allow(dead_code)]
+fn format_time(tai_ns: i128) -> String {
+    const NANOS_PER_CENTURY: i128 = 3_155_760_000_000_000_000;
+    let centuries = (tai_ns / NANOS_PER_CENTURY) as i16;
+    let nanos = (tai_ns % NANOS_PER_CENTURY) as u64;
+    let dur = hifitime::Duration::from_parts(centuries, nanos);
+    let epoch = Epoch::from_tai_duration(dur);
+    Formatter::new(epoch, ISO8601).to_string()
+}
+
+fn fmt_id(id: Id) -> String {
+    format!("{id:x}")
+}
+
+fn u256be_to_u64(value: U256) -> u64 {
+    let raw = value.raw;
+    if raw[..24].iter().any(|b| *b != 0) {
+        return u64::MAX;
+    }
+    let bytes: [u8; 8] = raw[24..32].try_into().unwrap_or([0xFF; 8]);
+    u64::from_be_bytes(bytes)
+}
+
+fn http() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("build http client")
+}
+
+// ── audio device detection + classification ────────────────────────────────
+
+/// What a device means for the privacy contract.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeviceClass {
+    /// In-ear / headphone — a PRIVATE listening device. The only class `say` may
+    /// ever play through.
+    Private,
+    /// The Reachy Mini's own speaker — a public, in-the-room device (NOT
+    /// private), reachable through the daemon.
+    Reachy,
+    /// Any other output: laptop / display / room speakers. Public, audible.
+    Speaker,
+}
+
+impl DeviceClass {
+    fn label(self) -> &'static str {
+        match self {
+            DeviceClass::Private => "private",
+            DeviceClass::Reachy => "reachy",
+            DeviceClass::Speaker => "speaker",
+        }
+    }
+}
+
+/// Classify a device by its name. This is the load-bearing privacy gate: only
+/// names that read as personal listening hardware return `Private`. Anything not
+/// recognised as private is treated as public — fail-closed, never fail-open.
+fn classify(name: &str) -> DeviceClass {
+    let n = name.to_lowercase();
+    const PRIVATE_HINTS: &[&str] = &[
+        "airpods", "headphone", "headset", "earbud", "earphone", "earpod", "ear pod",
+        "in-ear", "beats", "buds", " wf-", " wh-", "powerbeats",
+    ];
+    if PRIVATE_HINTS.iter().any(|h| n.contains(h)) {
+        return DeviceClass::Private;
+    }
+    if n.contains("reachy") {
+        return DeviceClass::Reachy;
+    }
+    DeviceClass::Speaker
+}
+
+#[derive(Clone, Debug)]
+struct AudioDevice {
+    name: String,
+    is_default_output: bool,
+}
+
+impl AudioDevice {
+    fn class(&self) -> DeviceClass {
+        classify(&self.name)
+    }
+}
+
+/// Enumerate connected audio OUTPUT devices via `system_profiler`. Output
+/// devices carry a `coreaudio_device_output` channel count; the current default
+/// output is flagged `coreaudio_default_audio_output_device == "spaudio_yes"`.
+fn detect_output_devices() -> Result<Vec<AudioDevice>> {
+    let out = PCommand::new("system_profiler")
+        .args(["SPAudioDataType", "-json"])
+        .output()
+        .context("run system_profiler SPAudioDataType -json")?;
+    if !out.status.success() {
+        bail!(
+            "system_profiler failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parse system_profiler JSON")?;
+    let items = v["SPAudioDataType"][0]["_items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut devices = Vec::new();
+    for item in items {
+        // Only output-capable devices matter for routing.
+        if item.get("coreaudio_device_output").is_none() {
+            continue;
+        }
+        let name = item["_name"].as_str().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let is_default_output =
+            item.get("coreaudio_default_audio_output_device").and_then(|x| x.as_str())
+                == Some("spaudio_yes");
+        devices.push(AudioDevice {
+            name,
+            is_default_output,
+        });
+    }
+    Ok(devices)
+}
+
+/// `SwitchAudioSource` (brew: switchaudio-osx), if installed — the only reliable
+/// way to target a SPECIFIC output device on macOS. `None` ⇒ degrade safely.
+fn switch_audio_bin() -> Option<PathBuf> {
+    for p in [
+        "/opt/homebrew/bin/SwitchAudioSource",
+        "/usr/local/bin/SwitchAudioSource",
+    ] {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    // Fall back to PATH lookup.
+    let ok = PCommand::new("SwitchAudioSource")
+        .arg("-c")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    ok.then(|| PathBuf::from("SwitchAudioSource"))
+}
+
+/// First connected device whose name contains `pat` (case-insensitive).
+fn connected_match<'a>(pat: &str, devices: &'a [AudioDevice]) -> Option<&'a AudioDevice> {
+    let needle = pat.to_lowercase();
+    devices.iter().find(|d| d.name.to_lowercase().contains(&needle))
+}
+
+// ── playback primitives ────────────────────────────────────────────────────
+
+fn afplay(wav: &Path) -> Result<()> {
+    let st = PCommand::new("afplay").arg(wav).status().context("afplay")?;
+    if !st.success() {
+        bail!("afplay exited with failure");
+    }
+    Ok(())
+}
+
+/// Get the current default output device name (for save/restore around a switch).
+fn current_default_output(sw: &Path) -> Option<String> {
+    let out = PCommand::new(sw).args(["-c", "-t", "output"]).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn set_default_output(sw: &Path, name: &str) -> Result<()> {
+    let st = PCommand::new(sw)
+        .args(["-t", "output", "-s", name])
+        .status()
+        .with_context(|| format!("SwitchAudioSource -s {name}"))?;
+    if !st.success() {
+        bail!("SwitchAudioSource failed to select '{name}'");
+    }
+    Ok(())
+}
+
+/// Play `wav` on a SPECIFIC device by switching the default output to it,
+/// playing, then restoring the prior default. Requires SwitchAudioSource.
+fn play_targeted(sw: &Path, device: &str, wav: &Path) -> Result<()> {
+    let prior = current_default_output(sw);
+    set_default_output(sw, device)?;
+    let played = afplay(wav);
+    if let Some(prev) = prior {
+        let _ = set_default_output(sw, &prev); // best-effort restore
+    }
+    played
+}
+
+/// Play `wav` privately on `device`, which MUST be a private device. This is a
+/// dedicated, defensively-guarded entry point: it re-asserts the privacy class
+/// before doing anything, so even a future caller bug cannot route a non-private
+/// device through it. Requires SwitchAudioSource (the caller checked it).
+fn play_private_targeted(sw: &Path, device: &str, wav: &Path) -> Result<()> {
+    if classify(device) != DeviceClass::Private {
+        bail!(
+            "refusing to play a private utterance on non-private device '{device}' \
+             (privacy invariant)"
+        );
+    }
+    play_targeted(sw, device, wav)
+}
+
+/// Upload `wav` to the Reachy daemon and play it through the robot's speaker.
+fn play_on_reachy(daemon: &str, wav: &Path) -> Result<()> {
+    let bytes = std::fs::read(wav)?;
+    let fname = wav.file_name().unwrap().to_string_lossy().to_string();
+    let part = reqwest::blocking::multipart::Part::bytes(bytes)
+        .file_name(fname.clone())
+        .mime_str("audio/wav")?;
+    let form = reqwest::blocking::multipart::Form::new().part("file", part);
+    let resp = http()
+        .post(format!("{daemon}/api/media/sounds/upload"))
+        .multipart(form)
+        .send()
+        .context("upload to Reachy daemon")?;
+    if !resp.status().is_success() {
+        bail!("Reachy upload failed: {}", resp.text().unwrap_or_default());
+    }
+    let resp = http()
+        .post(format!("{daemon}/api/media/play_sound"))
+        .json(&serde_json::json!({ "file": fname }))
+        .send()
+        .context("Reachy play_sound")?;
+    if !resp.status().is_success() {
+        bail!("Reachy play_sound failed: {}", resp.text().unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn reachy_reachable(daemon: &str) -> bool {
+    http()
+        .get(format!("{daemon}/api/daemon/status"))
+        .send()
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+// ── routing: the heart ──────────────────────────────────────────────────────
+
+/// The outcome of resolving a channel's routing against the live devices.
+enum Routed {
+    /// Play through the Reachy robot speaker (daemon).
+    Reachy,
+    /// Play on a specific device via SwitchAudioSource targeting.
+    Targeted(String),
+    /// Play through the current default output device (plain afplay).
+    Default(String),
+    /// Do NOT play — print the text instead (the `say` private fallback).
+    Text(String),
+}
+
+impl Routed {
+    fn describe(&self) -> String {
+        match self {
+            Routed::Reachy => "Reachy speaker (daemon)".to_string(),
+            Routed::Targeted(d) => format!("{d} (SwitchAudioSource-targeted)"),
+            Routed::Default(d) => format!("{d} (default output)"),
+            Routed::Text(why) => format!("TEXT fallback — {why}"),
+        }
+    }
+}
+
+/// Resolve the PRIVATE `say` channel. This function bakes in the invariant:
+/// every branch that returns a playing `Routed` has proven the target is a
+/// PRIVATE device. The only non-private outcome is `Routed::Text` (silent,
+/// on-screen). There is deliberately NO branch that plays through a speaker.
+fn route_say(prefs: &[String], devices: &[AudioDevice], sw: Option<&Path>) -> Routed {
+    match sw {
+        // True targeting available: pick the highest-priority CONNECTED PRIVATE
+        // device from the policy and target it.
+        Some(_) => {
+            for pat in prefs {
+                if let Some(dev) = connected_match(pat, devices) {
+                    if dev.class() == DeviceClass::Private {
+                        return Routed::Targeted(dev.name.clone());
+                    }
+                    // matched a non-private device: skip it — never play here.
+                }
+            }
+            Routed::Text("no connected private (in-ear/headphone) device".into())
+        }
+        // No targeting tool: afplay can only reach the CURRENT DEFAULT OUTPUT.
+        // So we may play ONLY if that default is itself a private device that the
+        // policy allows. If the default is a speaker/Reachy, we must NOT play.
+        None => {
+            let Some(default) = devices.iter().find(|d| d.is_default_output) else {
+                return Routed::Text("no default output device".into());
+            };
+            if default.class() != DeviceClass::Private {
+                return Routed::Text(format!(
+                    "default output '{}' is {} (no SwitchAudioSource to redirect to a private device)",
+                    default.name,
+                    default.class().label()
+                ));
+            }
+            // Default IS private; honor the policy — only if it matches a say pref.
+            let allowed = prefs
+                .iter()
+                .any(|p| default.name.to_lowercase().contains(&p.to_lowercase()));
+            if !allowed {
+                return Routed::Text(format!(
+                    "default output '{}' is private but not in the say policy",
+                    default.name
+                ));
+            }
+            Routed::Default(default.name.clone())
+        }
+    }
+}
+
+/// Resolve the PUBLIC `shout` channel — broadcasting is the point, so it falls
+/// back freely to any audible device.
+fn route_shout(
+    prefs: &[String],
+    devices: &[AudioDevice],
+    sw: Option<&Path>,
+    daemon_up: bool,
+) -> Routed {
+    // Walk the policy; take the first connected match.
+    for pat in prefs {
+        if let Some(dev) = connected_match(pat, devices) {
+            return match dev.class() {
+                DeviceClass::Reachy if daemon_up => Routed::Reachy,
+                // Reachy listed but daemon down → keep looking down the ladder.
+                DeviceClass::Reachy => continue,
+                _ if sw.is_some() => Routed::Targeted(dev.name.clone()),
+                _ => Routed::Default(dev.name.clone()),
+            };
+        }
+    }
+    // Nothing in the policy is connected: just use the default output (audible).
+    if let Some(default) = devices.iter().find(|d| d.is_default_output) {
+        return Routed::Default(default.name.clone());
+    }
+    Routed::Text("no audible output device connected".into())
+}
+
+/// Perform a resolved playback. `text` is needed for the `Text` fallback.
+fn perform(routed: &Routed, wav: &Path, daemon: &str, sw: Option<&Path>, text: &str) -> Result<()> {
+    match routed {
+        Routed::Reachy => play_on_reachy(daemon, wav),
+        Routed::Targeted(device) => {
+            let sw = sw.context("SwitchAudioSource required for targeted playback")?;
+            // Privacy-safe: for `say` this device was proven private upstream; the
+            // dedicated guard re-checks. For `shout`, plain targeting is fine.
+            if classify(device) == DeviceClass::Private {
+                play_private_targeted(&sw, device, wav)
+            } else {
+                play_targeted(&sw, device, wav)
+            }
+        }
+        Routed::Default(_) => afplay(wav),
+        Routed::Text(_) => {
+            // Silent, on-screen, private. The utterance never becomes sound.
+            println!("{text}");
+            Ok(())
+        }
+    }
+}
+
+// ── pile plumbing ───────────────────────────────────────────────────────────
+
+fn open_repo(path: &Path) -> Result<Repository<Pile>> {
+    let mut pile = Pile::open(path)
+        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
+    if let Err(err) = pile.restore() {
+        let _ = pile.close();
+        return Err(anyhow::anyhow!("restore pile {}: {err:?}", path.display()));
+    }
+    let signing_key = SigningKey::generate(&mut OsRng);
+    Repository::new(pile, signing_key, TribleSet::new())
+        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
+}
+
+fn with_voice<T>(
+    pile: &Path,
+    explicit_branch: Option<&str>,
+    f: impl FnOnce(&mut Repository<Pile>, &mut Workspace<Pile>) -> Result<T>,
+) -> Result<T> {
+    let mut repo = open_repo(pile)?;
+    let branch_id = if let Some(hex) = explicit_branch {
+        Id::from_hex(hex.trim()).ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"))?
+    } else {
+        repo.ensure_branch(VOICE_BRANCH_NAME, None)
+            .map_err(|e| anyhow::anyhow!("ensure voice branch: {e:?}"))?
+    };
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow::anyhow!("pull voice workspace: {e:?}"))?;
+    let result = f(&mut repo, &mut ws);
+    let close_res = repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
+    if let Err(err) = close_res {
+        if result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("warning: failed to close pile cleanly: {err:#}");
+    }
+    result
+}
+
+/// Read a channel's routing policy from the pile. Each `voice route set` writes
+/// a whole GENERATION of entries sharing one `metadata::updated_at`; the policy
+/// is the LATEST generation only (a set replaces, it doesn't accumulate —
+/// coordinate-and-cursor on the set timestamp keeps the pile append-only while
+/// the read sees one current policy). Falls back to the baked-in defaults when
+/// the pile holds no policy for the channel.
+fn load_route(ws: &mut Workspace<Pile>, channel: &str) -> Result<Vec<String>> {
+    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    // (set-generation key, priority, device) for this channel.
+    let mut rows: Vec<(i128, u64, String)> = Vec::new();
+    for (dev, prio, updated) in find!(
+        (d: String, p: U256, u: Inline<inlineencodings::NsTAIInterval>),
+        pattern!(&space, [{
+            _?e @
+                metadata::tag: KIND_ROUTE,
+                route::channel: channel.to_string(),
+                route::device: ?d,
+                route::priority: ?p,
+                metadata::updated_at: ?u,
+        }])
+    ) {
+        rows.push((interval_key(updated), u256be_to_u64(prio), dev));
+    }
+    let Some(latest_gen) = rows.iter().map(|(k, _, _)| *k).max() else {
+        let defaults = match channel {
+            CHANNEL_SAY => DEFAULT_SAY_DEVICES,
+            _ => DEFAULT_SHOUT_DEVICES,
+        };
+        return Ok(defaults.iter().map(|s| s.to_string()).collect());
+    };
+    let mut entries: Vec<(u64, String)> = rows
+        .into_iter()
+        .filter(|(k, _, _)| *k == latest_gen)
+        .map(|(_, p, d)| (p, d))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    Ok(entries.into_iter().map(|(_, d)| d).collect())
+}
+
+fn store_route(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    channel: &str,
+    devices: &[String],
+) -> Result<()> {
+    // One timestamp for the whole set — the generation marker `load_route` keys
+    // on, so this set wholly replaces the previous policy for the channel.
+    let set_time = now_tai();
+    for (i, dev) in devices.iter().enumerate() {
+        let prio: U256 = (i as u64).to_inline();
+        let frag = entity! {
+            metadata::tag: &KIND_ROUTE,
+            metadata::updated_at: set_time,
+            route::channel: channel,
+            route::device: dev.as_str(),
+            route::priority: prio,
+        };
+        ws.commit(frag, "voice route set");
+    }
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    Ok(())
+}
+
+/// Record an utterance on the voice branch. The fact falls out of speaking —
+/// logging is a side effect of the act, not a separate obligation.
+fn log_utterance(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    channel: &str,
+    text: &str,
+    wav: Option<&Path>,
+) -> Result<()> {
+    let text_h: TextHandle = ws.put(text.to_string());
+    let audio_h: Option<RawHandle> = match wav {
+        Some(p) => {
+            let bytes = std::fs::read(p).with_context(|| format!("read {}", p.display()))?;
+            Some(ws.put::<blobencodings::RawBytes, _>(bytes))
+        }
+        None => None,
+    };
+    let frag = entity! {
+        metadata::tag: &KIND_UTTERANCE,
+        metadata::created_at: now_tai(),
+        utterance::channel: channel,
+        utterance::text: text_h,
+        utterance::audio?: audio_h,
+        utterance::mime?: wav.map(|_| "audio/wav"),
+    };
+    let id = frag.root().expect("utterance id");
+    ws.commit(frag, "voice spoke");
+    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    println!("  logged utterance {} [{channel}]", &fmt_id(id)[..12]);
+    Ok(())
+}
+
+// ── synthesis (feature-gated, mirrors imagine) ──────────────────────────────
+
+/// Synthesize `text` in Liora's voice to `out` (a 24 kHz mono WAV), in-process
+/// via `mary::say` — the same library seam everything else uses, so there's no
+/// separate binary to drift stale against the pile format. Behind the heavy
+/// `voice` feature; the default build compiles the stub below.
+#[cfg(feature = "voice")]
+fn synthesize_voice(text: &str, out: &Path) -> Result<()> {
+    mary::say::synthesize_to_wav(
+        Path::new(F5_WEIGHTS),
+        Path::new(REF_WAV),
+        REF_TXT,
+        text,
+        out,
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "voice"))]
+fn synthesize_voice(_text: &str, _out: &Path) -> Result<()> {
+    bail!(
+        "voice was built without the `voice` feature — rebuild with \
+         `cargo build --release --features voice --bin voice` (pulls mary's F5-TTS \
+         Burn voice pipeline). Routing (`voice route`/`voice devices`) and the \
+         text-fallback path work without it."
+    );
+}
+
+// ── commands ────────────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_speak(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    daemon: &str,
+    channel: &str,
+    text: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let devices = detect_output_devices()?;
+    let sw = switch_audio_bin();
+    let prefs = load_route(ws, channel)?;
+
+    let routed = if channel == CHANNEL_SAY {
+        route_say(&prefs, &devices, sw.as_deref())
+    } else {
+        route_shout(&prefs, &devices, sw.as_deref(), reachy_reachable(daemon))
+    };
+
+    println!("[{channel}] → {}", routed.describe());
+
+    if dry_run {
+        return Ok(());
+    }
+
+    // For the private text-fallback we do NOT synthesize at all — nothing to
+    // play, and no GPU work for a silent on-screen utterance.
+    if let Routed::Text(_) = routed {
+        // Print the words (private, silent), log without audio.
+        println!("{text}");
+        return log_utterance(repo, ws, channel, text, None);
+    }
+
+    let out = std::env::temp_dir().join(format!("liora_voice_{}.wav", std::process::id()));
+    synthesize_voice(text, &out)?;
+    let play = perform(&routed, &out, daemon, sw.as_deref(), text);
+    // Log the utterance with its audio regardless of a playback hiccup, so the
+    // fact survives; surface a playback error after.
+    let log = log_utterance(repo, ws, channel, text, Some(&out));
+    let _ = std::fs::remove_file(&out);
+    play?;
+    log
+}
+
+fn cmd_route(ws: &mut Workspace<Pile>, daemon: &str) -> Result<()> {
+    let devices = detect_output_devices()?;
+    let sw = switch_audio_bin();
+    let daemon_up = reachy_reachable(daemon);
+
+    println!("SwitchAudioSource: {}", if sw.is_some() { "present (per-device targeting)" } else { "ABSENT — degraded routing (see notes)" });
+    println!("Reachy daemon:     {}", if daemon_up { "reachable" } else { "down" });
+    println!();
+
+    println!("connected output devices:");
+    for d in &devices {
+        let def = if d.is_default_output { "  [default output]" } else { "" };
+        println!("  {:<28} {}{def}", d.name, d.class().label());
+    }
+    println!();
+
+    for channel in [CHANNEL_SAY, CHANNEL_SHOUT] {
+        let prefs = load_route(ws, channel)?;
+        println!("{channel} policy (priority order): {}", prefs.join(" → "));
+        let routed = if channel == CHANNEL_SAY {
+            route_say(&prefs, &devices, sw.as_deref())
+        } else {
+            route_shout(&prefs, &devices, sw.as_deref(), daemon_up)
+        };
+        println!("  would route to: {}", routed.describe());
+    }
+    if sw.is_none() {
+        println!();
+        println!("note: without SwitchAudioSource, `say` plays only when the DEFAULT");
+        println!("      output is itself a private device; otherwise it prints text.");
+        println!("      Install with: brew install switchaudio-osx");
+    }
+    Ok(())
+}
+
+fn cmd_route_set(
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    channel: &str,
+    devices: &[String],
+) -> Result<()> {
+    let channel = match channel.to_lowercase().as_str() {
+        "say" => CHANNEL_SAY,
+        "shout" => CHANNEL_SHOUT,
+        other => bail!("unknown channel '{other}' — use 'say' or 'shout'"),
+    };
+    if channel == CHANNEL_SAY {
+        for d in devices {
+            if classify(d) != DeviceClass::Private {
+                eprintln!(
+                    "warning: '{d}' is {} — it will be IGNORED at speak-time on the \
+                     private `say` channel (the privacy invariant can't be configured away).",
+                    classify(d).label()
+                );
+            }
+        }
+    }
+    store_route(repo, ws, channel, devices)?;
+    println!("{channel} policy set: {}", devices.join(" → "));
+    Ok(())
+}
+
+fn cmd_devices() -> Result<()> {
+    let devices = detect_output_devices()?;
+    if devices.is_empty() {
+        println!("no audio output devices found.");
+        return Ok(());
+    }
+    for d in &devices {
+        let def = if d.is_default_output { "  [default output]" } else { "" };
+        println!("{:<28} {}{def}", d.name, d.class().label());
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let pile = cli.pile.clone();
+    let branch = cli.branch_id.as_deref();
+    let daemon = cli.daemon.clone();
+
+    match cli.command {
+        None => {
+            Cli::command().print_help().ok();
+            println!();
+        }
+        Some(Command::Say { text, dry_run }) => with_voice(&pile, branch, |repo, ws| {
+            cmd_speak(repo, ws, &daemon, CHANNEL_SAY, &text, dry_run)
+        })?,
+        Some(Command::Shout { text, dry_run }) => with_voice(&pile, branch, |repo, ws| {
+            cmd_speak(repo, ws, &daemon, CHANNEL_SHOUT, &text, dry_run)
+        })?,
+        Some(Command::Route) => with_voice(&pile, branch, |_repo, ws| cmd_route(ws, &daemon))?,
+        Some(Command::RouteSet { channel, devices }) => {
+            with_voice(&pile, branch, |repo, ws| {
+                cmd_route_set(repo, ws, &channel, &devices)
+            })?
+        }
+        Some(Command::Devices) => cmd_devices()?,
+    }
+    Ok(())
+}

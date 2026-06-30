@@ -21,5 +21,6 @@ pub mod selfimage;
 pub mod status;
 pub mod teams;
 pub mod triage;
+pub mod voice;
 pub mod web;
 pub mod wiki;
