@@ -15,6 +15,14 @@ pub const DEFAULT_ARCHIVE_BRANCH: &str = "archive";
 
 pub const KIND_CHUNK_ID: Id = id_hex!("40E6004417F9B767AFF1F138DE3D3AAC");
 
+/// Marks a *retraction* tombstone: an entity that retracts a chunk (via
+/// `ctx::supersedes`) without being a chunk itself. Deliberately distinct from
+/// `KIND_CHUNK_ID` so retractions never enumerate in chunk views, yet remain
+/// queryable as their own class ("what have I walked back, and why"). The
+/// reason, when given, is stored as the tombstone's `ctx::summary`. Minted
+/// 2026-07-03.
+pub const KIND_RETRACTION: Id = id_hex!("89ACC4C9A8B961A529CC5DB19C2D393B");
+
 pub const KIND_EXEC_RESULT: Id = id_hex!("DF7165210F066E84D93E9A430BB0D4BD");
 
 pub const KIND_ARCHIVE_MESSAGE: Id = id_hex!("1A0841C92BBDA0A26EA9A8252D6ECD9B");

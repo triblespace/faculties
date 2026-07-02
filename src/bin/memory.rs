@@ -6,7 +6,8 @@ use clap::{CommandFactory, Parser};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::memory::{
     DEFAULT_ARCHIVE_BRANCH, DEFAULT_COGNITION_BRANCH, DEFAULT_MEMORY_BRANCH, KIND_ARCHIVE_MESSAGE,
-    KIND_CHUNK_ID, KIND_EXEC_RESULT, KIND_SEARCH_INDEX, archive_import_schema, archive_schema,
+    KIND_CHUNK_ID, KIND_EXEC_RESULT, KIND_RETRACTION, KIND_SEARCH_INDEX, archive_import_schema,
+    archive_schema,
     comb, ctx, search_index,
 };
 use faculties::schemas::embeddings::{self, Embedding768};
@@ -43,6 +44,8 @@ use triblespace::prelude::*;
              memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
              memory respan <id> <from>..<to>  — correct a chunk's span (new chunk supersedes old; views exclude old)\n  \
              memory supersede <new> <old>     — mark an existing chunk as replacing another (old leaves all views)\n  \
+             memory retract <id> [reason]      — retire a mistaken/duplicate chunk with NO replacement (invisible tombstone; target leaves all views, nothing new shows up as a memory)\n  \
+             memory retractions               — audit surface: list retractions (what was retracted, and why)\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
@@ -714,6 +717,12 @@ fn main() -> Result<()> {
     if cli.ids.first().is_some_and(|value| value == "supersede") {
         return cmd_supersede(&cli.pile, &cli.ids[1..]);
     }
+    if cli.ids.first().is_some_and(|value| value == "retract") {
+        return cmd_retract(&cli.pile, &cli.ids[1..]);
+    }
+    if cli.ids.first().is_some_and(|value| value == "retractions") {
+        return cmd_retractions(&cli.pile, &cli.ids[1..]);
+    }
     if cli.ids.first().is_some_and(|value| value == "provenance") {
         return cmd_provenance(&cli.pile, &cli.ids[1..]);
     }
@@ -1350,6 +1359,114 @@ fn cmd_supersede(pile_path: &Path, args: &[String]) -> Result<()> {
         repo.push(&mut ws)
             .map_err(|e| anyhow!("push failed: {e:?}"))?;
         println!("{new:x} supersedes {old:x}");
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// retract subcommand
+// ---------------------------------------------------------------------------
+
+/// Retire a chunk with NO replacement. Mints a *retraction* tombstone: a fresh
+/// entity tagged `KIND_RETRACTION` (never `KIND_CHUNK_ID`, so it never
+/// enumerates as a chunk) carrying the `supersedes` edge, plus the reason as
+/// its `ctx::summary` when one is given. The target leaves every view; the
+/// retraction stays invisible to covers/trees/recall yet queryable as a class
+/// ("what have I walked back, and why"). Use this for mistaken/duplicate
+/// ingests, where `supersede` would otherwise force a bogus replacement chunk
+/// that then shows up as a memory of its own. Nothing is destroyed: the retired
+/// chunk's own facts survive for direct-id / provenance lookup.
+fn cmd_retract(pile_path: &Path, args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("usage: memory retract <id> [reason...]");
+    }
+    let reason = args[1..].join(" ");
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let old = resolve_chunk_id(&space, &args[0])
+            .map_err(|e| anyhow!("chunk {}: {e}", args[0]))?;
+
+        let tombstone = ufoid();
+        let mut change = TribleSet::new();
+        // Tagged KIND_RETRACTION (not KIND_CHUNK_ID) so it never enumerates as a
+        // chunk, yet retractions stay queryable as a class. The reason, if given,
+        // rides along as the tombstone's summary — recoverable, never in a view.
+        if reason.is_empty() {
+            change += entity! { &tombstone @
+                metadata::tag: KIND_RETRACTION,
+                ctx::supersedes: old,
+            };
+        } else {
+            let reason_handle = ws.put(reason.clone());
+            change += entity! { &tombstone @
+                metadata::tag: KIND_RETRACTION,
+                ctx::supersedes: old,
+                ctx::summary: reason_handle,
+            };
+        }
+
+        ws.commit(change, "memory retract");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push failed: {e:?}"))?;
+
+        if reason.is_empty() {
+            println!("retracted {old:x} (retraction {:x})", tombstone.id);
+        } else {
+            println!(
+                "retracted {old:x} — {reason} (retraction {:x})",
+                tombstone.id
+            );
+        }
+        Ok(())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// retractions subcommand
+// ---------------------------------------------------------------------------
+
+/// Audit surface for `retract`: list every `KIND_RETRACTION` tombstone, the
+/// chunk(s) it retracts, and the recorded reason. Retracted chunks are gone from
+/// covers/trees/recall but never lost — what was walked back, and why, is always
+/// answerable here.
+fn cmd_retractions(pile_path: &Path, _args: &[String]) -> Result<()> {
+    with_repo(pile_path, |repo| {
+        let branch_id = repo
+            .ensure_branch(DEFAULT_MEMORY_BRANCH, None)
+            .map_err(|e| anyhow!("ensure memory branch: {e:?}"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout memory branch")?;
+
+        let retractions: Vec<Id> =
+            find!(r: Id, pattern!(&space, [{ ?r @ metadata::tag: &KIND_RETRACTION }])).collect();
+        if retractions.is_empty() {
+            println!("no retractions.");
+            return Ok(());
+        }
+        for r in retractions {
+            let targets: Vec<Id> =
+                find!(old: Id, pattern!(&space, [{ r @ ctx::supersedes: ?old }])).collect();
+            let reason = match chunk_summary_handle(&space, r) {
+                Some(handle) => {
+                    let s: View<str> = ws.get(handle).context("read retraction reason")?;
+                    s.as_ref().to_string()
+                }
+                None => "(no reason recorded)".to_string(),
+            };
+            println!("retraction {r:x} — {reason}");
+            for t in &targets {
+                println!("    -> retracted {t:x}");
+            }
+        }
         Ok(())
     })
 }
