@@ -32,7 +32,7 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--tokens N] [--chars N] [--about <query>] — antichain cover over ALL memories, coarse→fine to a budget (default tokens; bare <budget> or --tokens N budgets by TOKENS, --chars N budgets by CHARACTERS instead); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`)\n  \
+             memory context [<budget>] [--tokens N] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a budget (default tokens; bare <budget> or --tokens N budgets by TOKENS, --chars N budgets by CHARACTERS instead); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded+un-lexically-scorable chunks are kept (fail-open) with a stderr warning.\n  \
              memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
              memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
@@ -1713,6 +1713,130 @@ fn semantic_about_scores(
     Ok(Some(scores))
 }
 
+/// Default cosine cutoff for `--filter`/`--remove` eligibility. Chosen from the
+/// nomic score distribution observed on this pile: topically-matched chunks
+/// cluster ~0.62–0.73 for their query, while unrelated chunks fall to ~0.40–0.52
+/// (nomic cosines sit in a compressed high band). 0.55 lands in that natural gap
+/// — high enough to spare unrelated material, low enough to catch the whole
+/// matched cluster. Override per call with `--sim-threshold <f>`.
+const DEFAULT_SIM_THRESHOLD: f32 = 0.55;
+
+/// Per-chunk positive-similarity scores for `--filter`/`--remove` ELIGIBILITY,
+/// using the SAME scoring as `--about`: nomic cosine (clamped ≥0) when the chunk
+/// is embedded, else the lexical BM25 score (normalized to a fraction of the top
+/// score so the [0,1] threshold still means something). The second return value
+/// is the ids that could NOT be scored at all — no embedding AND no positive
+/// lexical score — which the caller treats fail-open (kept) and warns about, so
+/// the guardrail use of `--remove` never *silently* leaks an unassessable chunk.
+///
+/// Scores are POSITIVE similarity to the query (the reliable direction). `--remove`
+/// negates in the RETRIEVAL LOGIC (drop the high-match chunks), never by embedding
+/// a negated query — that is the whole point, and it sidesteps embedding-negation
+/// failure.
+/// `universe` is the exact set of chunks that can appear in the cover (non-
+/// superseded, non-lens — what `collect_chunk_spans` selects), so the unscorable
+/// warning never lists chunks that could never surface anyway.
+fn eligibility_scores(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    query: &str,
+    universe: &[Id],
+) -> Result<(std::collections::HashMap<Id, f32>, Vec<Id>)> {
+    #[cfg(feature = "local-embed")]
+    {
+        if let Some(res) = semantic_eligibility_scores(space, ws, query, universe)? {
+            return Ok(res);
+        }
+    }
+    // Pure lexical fallback (no embeddings on the pile yet, or built without
+    // `local-embed`): BM25 normalized to a fraction of the top score. Every chunk
+    // gets an explicit score — those absent from the postings scored a genuine 0
+    // ("no match"), so nothing here is *unscorable*.
+    let Some((handle, _)) = latest_search_index(space) else {
+        bail!(
+            "no relevance source for --filter/--remove: build one with `memory embed` \
+             (semantic, preferred) or `memory index` (lexical BM25)"
+        );
+    };
+    let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
+    let raw: std::collections::HashMap<Id, f32> = idx
+        .query_multi(&hash_tokens(query))
+        .into_iter()
+        .filter_map(|(doc, score)| Some((doc.try_from_inline().ok()?, score)))
+        .collect();
+    let max = raw.values().copied().fold(0.0_f32, f32::max).max(1e-6);
+    let scores = universe
+        .iter()
+        .map(|&id| (id, raw.get(&id).copied().map(|s| s / max).unwrap_or(0.0)))
+        .collect();
+    Ok((scores, Vec::new()))
+}
+
+/// Semantic half of [`eligibility_scores`]: nomic cosine over stored chunk
+/// embeddings. Unembedded chunks fall back to a positive lexical (BM25) score if
+/// the index has one; otherwise they are reported UNSCORABLE so the caller can
+/// keep them (fail-open) and warn — the honest, guardrail-safe behavior. Returns
+/// `None` when no chunk is embedded at all (caller drops to pure lexical).
+#[cfg(feature = "local-embed")]
+fn semantic_eligibility_scores(
+    space: &TribleSet,
+    ws: &mut Workspace<Pile>,
+    query: &str,
+    universe: &[Id],
+) -> Result<Option<(std::collections::HashMap<Id, f32>, Vec<Id>)>> {
+    let mut embedded: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
+    let mut unembedded: Vec<Id> = Vec::new();
+    for &chunk in universe {
+        match chunk_embedding_handle(space, chunk) {
+            Some(h) => embedded.push((chunk, h)),
+            None => unembedded.push(chunk),
+        }
+    }
+    if embedded.is_empty() {
+        return Ok(None);
+    }
+    eprintln!("memory: loading nomic-embed-text for --filter/--remove (once)…");
+    let emb = mary::embed::load_nomic_text_from_hf(NOMIC_TEXT_MODEL, mary::embed::default_device())
+        .map_err(|e| anyhow!("load nomic embedder: {e:?}"))?;
+    let qv = l2_normalize(
+        emb.embed_query(query)
+            .map_err(|e| anyhow!("embed query: {e:?}"))?,
+    );
+    let mut scores = std::collections::HashMap::new();
+    for (chunk, h) in embedded {
+        let v: View<[f32]> = ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
+        let cos: f32 = qv.iter().zip(v.as_ref().iter()).map(|(a, b)| a * b).sum();
+        scores.insert(chunk, cos.max(0.0));
+    }
+    // Unembedded chunks: try a positive lexical score; else mark unscorable.
+    let lexical: Option<(std::collections::HashMap<Id, f32>, f32)> =
+        if let Some((handle, _)) = latest_search_index(space) {
+            let idx: SuccinctBM25Index = ws.get(handle).context("load search index")?;
+            let raw: std::collections::HashMap<Id, f32> = idx
+                .query_multi(&hash_tokens(query))
+                .into_iter()
+                .filter_map(|(doc, score)| Some((doc.try_from_inline().ok()?, score)))
+                .collect();
+            let max = raw.values().copied().fold(0.0_f32, f32::max).max(1e-6);
+            Some((raw, max))
+        } else {
+            None
+        };
+    let mut unscorable = Vec::new();
+    for chunk in unembedded {
+        match lexical
+            .as_ref()
+            .and_then(|(raw, max)| raw.get(&chunk).map(|s| s / max))
+        {
+            Some(s) if s > 0.0 => {
+                scores.insert(chunk, s);
+            }
+            _ => unscorable.push(chunk),
+        }
+    }
+    Ok(Some((scores, unscorable)))
+}
+
 fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
     let estimator = TokenEstimator::from_env();
 
@@ -1724,19 +1848,52 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
     // can be cast with the slice of the past most relevant to its goal).
     let mut budget_tokens: usize = 20_000;
     let mut about: Option<String> = None;
+    // `--filter <query>` (include-only) and `--remove <query>` (anti-filter) gate
+    // ELIGIBILITY by positive similarity to their query; `--sim-threshold <f>` is
+    // the shared cosine cutoff (default `DEFAULT_SIM_THRESHOLD`).
+    let mut filter_q: Option<String> = None;
+    let mut remove_q: Option<String> = None;
+    let mut sim_threshold: f32 = DEFAULT_SIM_THRESHOLD;
     // `--tokens N` names the token budget explicitly; when present it wins over
     // the bare positional (which stays a backward-compatible fallback — it also
     // means tokens). `--chars N` budgets by characters instead (see below).
     let mut tokens_explicit = false;
     {
+        // A value flag consumes the following args up to the NEXT recognized flag
+        // (or end), so multi-word queries stay unquoted AND `--about`/`--filter`/
+        // `--remove` compose in any order.
+        let is_flag = |s: &str| {
+            matches!(
+                s,
+                "--about" | "--filter" | "--remove" | "--tokens" | "--chars" | "--sim-threshold"
+            )
+        };
         let mut i = 0;
         while i < args.len() {
-            if args[i] == "--about" {
-                let q = args[i + 1..].join(" ");
-                if !q.trim().is_empty() {
-                    about = Some(q);
+            if matches!(args[i].as_str(), "--about" | "--filter" | "--remove") {
+                let mut j = i + 1;
+                while j < args.len() && !is_flag(&args[j]) {
+                    j += 1;
                 }
-                break;
+                let q = args[i + 1..j].join(" ");
+                let q = (!q.trim().is_empty()).then_some(q);
+                match args[i].as_str() {
+                    "--about" => about = q,
+                    "--filter" => filter_q = q,
+                    _ => remove_q = q,
+                }
+                i = j;
+                continue;
+            }
+            if args[i] == "--sim-threshold" {
+                let raw = args.get(i + 1).ok_or_else(|| {
+                    anyhow!("--sim-threshold needs a number in [0,1], e.g. `--sim-threshold 0.55`")
+                })?;
+                sim_threshold = raw
+                    .parse()
+                    .map_err(|_| anyhow!("--sim-threshold expects a float, got `{raw}`"))?;
+                i += 2;
+                continue;
             }
             if args[i] == "--tokens" {
                 let raw = args.get(i + 1).ok_or_else(|| {
@@ -1832,11 +1989,73 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
             }
         }
 
-        // Relevance scoring for `--about`: score every chunk against the query via
-        // the BM25 index, then propagate each node's score up to a subtree maximum
-        // (a node is worth descending into if ANY memory beneath it is relevant).
-        let relevance: Vec<f32> = if let Some(query) = &about {
-            let scores = about_relevance_scores(&space, &mut ws, query)?;
+        // Eligibility gates. `--filter` keeps only chunks whose positive
+        // similarity to its query is ABOVE the threshold; `--remove` drops chunks
+        // whose similarity is above it (an anti-filter — the negation lives in the
+        // RETRIEVAL, not the query text, sidestepping embedding-negation failure).
+        // These decide WHICH chunks may appear; `--about` decides DETAIL WEIGHTING
+        // among the eligible; the budget decides how many / how coarse. A removed
+        // chunk must never be emitted at any granularity (enforced by gating the
+        // selected cover below). Both compose with each other and with `--about`.
+        let universe: Vec<Id> = spans.iter().map(|s| s.2).collect();
+        let filter_elig = match &filter_q {
+            Some(q) => Some(eligibility_scores(&space, &mut ws, q, &universe)?),
+            None => None,
+        };
+        let remove_elig = match &remove_q {
+            Some(q) => Some(eligibility_scores(&space, &mut ws, q, &universe)?),
+            None => None,
+        };
+        // Fail-open honesty: unembedded, un-lexically-scorable chunks can't be
+        // assessed, so they are KEPT — but say so loudly, because for the
+        // intimate-exclusion use of `--remove` a silent keep would LEAK.
+        for (label, elig) in [("--filter", &filter_elig), ("--remove", &remove_elig)] {
+            if let Some((_, unscorable)) = elig {
+                if !unscorable.is_empty() {
+                    let ids: Vec<String> = unscorable.iter().map(|id| format!("{id:x}")).collect();
+                    eprintln!(
+                        "memory: {} unembedded chunk(s) not scorable for {label} — kept (fail-open); \
+                         run `memory embed` to make them filterable: {}",
+                        unscorable.len(),
+                        ids.join(", ")
+                    );
+                }
+            }
+        }
+        let eligible = |id: Id| -> bool {
+            if let Some((scores, _)) = &filter_elig {
+                match scores.get(&id) {
+                    Some(v) => {
+                        if *v <= sim_threshold {
+                            return false;
+                        }
+                    }
+                    None => {} // unscorable → fail-open KEEP (warned above)
+                }
+            }
+            if let Some((scores, _)) = &remove_elig {
+                if let Some(v) = scores.get(&id) {
+                    if *v > sim_threshold {
+                        return false;
+                    }
+                }
+                // unscorable (absent from map) → fail-open KEEP
+            }
+            true
+        };
+
+        // Relevance scoring for detail weighting: score every chunk against a
+        // query, then propagate each node's score up to a subtree maximum (a node
+        // is worth descending into if ANY memory beneath it is relevant). `--about`
+        // drives this when present; with only `--filter`, reuse the filter scores
+        // so the cover descends TOWARD the eligible material instead of staying
+        // coarse (otherwise a filtered cover would surface little detail).
+        let relevance: Vec<f32> = if about.is_some() || filter_q.is_some() {
+            let scores: std::collections::HashMap<Id, f32> = if let Some(query) = &about {
+                about_relevance_scores(&space, &mut ws, query)?
+            } else {
+                filter_elig.as_ref().unwrap().0.clone()
+            };
             let mut r: Vec<f32> = (0..n)
                 .map(|i| *scores.get(&spans[i].2).unwrap_or(&0.0))
                 .collect();
@@ -1946,12 +2165,42 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
             used = used.saturating_add(best_extra);
         }
 
+        // Enforce eligibility at the chunk level the cover selected: a removed /
+        // filtered-out chunk is not emitted at ANY granularity. V1 LIMITATION: a
+        // surviving coarse ANCESTOR's summary is pre-written text and passes
+        // through unchanged, so it may still *mention* removed material in its
+        // prose — we drop selected nodes, we do not rewrite ancestor summaries.
+        if filter_elig.is_some() || remove_elig.is_some() {
+            cover.retain(|&i| eligible(spans[i].2));
+            // Recompute the token tally honestly over what actually survived.
+            used = 0;
+            for &i in &cover {
+                used = used.saturating_add(context_chunk_cost(
+                    &mut ws,
+                    &space,
+                    &estimator,
+                    &spans,
+                    &mut cost_cache,
+                    i,
+                )?);
+            }
+        }
+
         // Emit coarse → fine: time order, indented by containment depth, each
         // chunk's span header followed by its summary content.
         cover.sort_by(|&a, &b| spans[a].0.cmp(&spans[b].0).then(spans[b].1.cmp(&spans[a].1)));
-        let mode = match &about {
-            Some(q) => format!("coarse → fine; most detail on memories about \"{q}\""),
-            None => "coarse → fine; recent in most detail".to_string(),
+        let mode = {
+            let mut parts = vec![match &about {
+                Some(q) => format!("most detail on memories about \"{q}\""),
+                None => "recent in most detail".to_string(),
+            }];
+            if let Some(q) = &filter_q {
+                parts.push(format!("filtered to \"{q}\""));
+            }
+            if let Some(q) = &remove_q {
+                parts.push(format!("excluding \"{q}\""));
+            }
+            format!("coarse → fine; {}", parts.join("; "))
         };
         println!(
             "memory context — {} chunk(s), ~{} of {} tokens ({mode})",
