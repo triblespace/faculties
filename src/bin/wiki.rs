@@ -2738,8 +2738,14 @@ fn cmd_embed(repo: &mut Repo, bid: Id) -> Result<()> {
             eprintln!("  embedded {}/{total}", i + 1);
         }
     }
+    let delta = change.clone();
     ws.commit(change, "wiki embed");
     repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    // Refresh the persisted HNSW segment so `wiki similar` queries the graph
+    // instead of rebuilding it. Best-effort (soft state): warn on failure.
+    if let Err(e) = embeddings::update_index(repo.storage_mut(), bid, &delta) {
+        eprintln!("wiki: warning: HNSW index refresh failed (similar will fall back): {e:#}");
+    }
     println!("embedded {total} fragments into the shared nomic space.");
     Ok(())
 }
@@ -2764,8 +2770,10 @@ fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let latest = latest_versions(&space);
 
-    let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
+    // Map each current (non-archived) version to its fragment, and its
+    // embedding handle to its version id — tribles only, no blob reads.
     let mut vid_to_frag: HashMap<Id, Id> = HashMap::new();
+    let mut by_handle: HashMap<[u8; 32], Id> = HashMap::new();
     let mut current = 0usize;
     for (&frag, &(vid, _)) in &latest {
         if tags_of(&space, vid).contains(&TAG_ARCHIVED_ID) {
@@ -2773,22 +2781,47 @@ fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
         }
         current += 1;
         if let Some(h) = version_embedding_handle(&space, vid) {
-            let v: View<[f32]> = ws.get(h).map_err(|e| anyhow::anyhow!("read embedding: {e:?}"))?;
-            pairs.push((vid, v.as_ref().to_vec()));
             vid_to_frag.insert(vid, frag);
+            by_handle.insert(h.raw, vid);
         }
     }
-    if pairs.is_empty() {
-        bail!("no fragment embeddings on this pile yet — run `wiki embed` first");
-    }
-    if pairs.len() < current {
-        eprintln!(
-            "note: {} current fragment(s) not yet embedded — run `wiki embed` to refresh",
-            current - pairs.len()
-        );
-    }
 
-    let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow::anyhow!("nearest: {e:?}"))?;
+    // FAST PATH: attach the persisted HNSW segment(s) and query — no
+    // gather-all-pairs, no rebuild. Translate result handles → version ids.
+    let ranked: Vec<(f32, Id)> = match embeddings::nearest_via_index(
+        repo.storage_mut(),
+        bid,
+        &qv,
+        0.0,
+    )
+    .map_err(|e| anyhow::anyhow!("hnsw index query: {e:?}"))?
+    {
+        Some(rows) => rows
+            .into_iter()
+            .filter_map(|(cos, raw)| by_handle.get(&raw).map(|vid| (cos, *vid)))
+            .collect(),
+        // FALLBACK: no HNSW segment yet — gather all pairs and rebuild once.
+        None => {
+            let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
+            for (&vid, _) in &vid_to_frag {
+                if let Some(h) = version_embedding_handle(&space, vid) {
+                    let v: View<[f32]> =
+                        ws.get(h).map_err(|e| anyhow::anyhow!("read embedding: {e:?}"))?;
+                    pairs.push((vid, v.as_ref().to_vec()));
+                }
+            }
+            if pairs.is_empty() {
+                bail!("no fragment embeddings on this pile yet — run `wiki embed` first");
+            }
+            if pairs.len() < current {
+                eprintln!(
+                    "note: {} current fragment(s) not yet embedded — run `wiki embed` to refresh",
+                    current - pairs.len()
+                );
+            }
+            embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow::anyhow!("nearest: {e:?}"))?
+        }
+    };
     if ranked.is_empty() {
         println!("no matches.");
         return Ok(());

@@ -26,7 +26,11 @@ use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::trible::Fragment;
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
+use triblespace::core::repo::index_home::IndexHome;
+use triblespace::core::repo::{BlobStore, PinStore};
+use triblespace::core::trible::TribleSet;
 use triblespace_search::hnsw::HNSWBuilder;
+use triblespace_search::index_hnsw::{nearest_across, HnswRollup};
 use triblespace_search::schemas::{put_embedding, Embedding};
 
 /// Dimension of the shared space (nomic-embed-{text,vision}-v1.5).
@@ -227,6 +231,95 @@ pub fn nearest(pairs: &[(Id, Vec<f32>)], query: &[f32], floor: f32) -> anyhow::R
         .collect();
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     Ok(rows)
+}
+
+// ── persisted HNSW index-home (fast path for `similar`) ─────────────────────
+//
+// The `nearest` core above rebuilds the whole graph per query. These helpers
+// wrap the [`HnswRollup`] index-home so the graph is PERSISTED as a segment in
+// the branch head and refreshed incrementally, turning a query into
+// `attach + candidates_above` — no read-all-blobs, no rebuild.
+
+/// The [`HnswRollup`] for the shared 768-d space: indexes the
+/// `Handle<Embedding768>` values stored under [`attr::embedding`], resolving
+/// them to vectors through `reader`. The stored blobs are raw `[f32]` LE, so
+/// their content-addressed handles coincide with the search crate's
+/// `Handle<Embedding>` — the index resolves them transparently.
+pub fn embedding_rollup<R>(reader: R) -> HnswRollup<R> {
+    HnswRollup::new(reader, DIM, attr::embedding.id())
+}
+
+/// Append/refresh the persisted HNSW segment for `branch` from a delta of
+/// freshly-embedded `entity -> attr::embedding` tribles (typically the change
+/// a `memory embed` / `wiki embed` just committed). Size-tiered merge is
+/// handled inside the index-home machinery — this just calls `update_index`.
+///
+/// Best-effort: the segment is soft state (recomputable from the commit chain,
+/// GC-able), so callers may log-and-continue on error rather than fail the
+/// embed.
+pub fn update_index<S>(storage: &mut S, branch: Id, delta: &TribleSet) -> anyhow::Result<()>
+where
+    S: BlobStore + PinStore,
+{
+    let reader = storage
+        .reader()
+        .map_err(|e| anyhow::anyhow!("index-home reader: {e:?}"))?;
+    let rollup = embedding_rollup(reader);
+    let mut home = IndexHome::new(storage, branch, rollup);
+    home.update_index(delta)
+        .map_err(|e| anyhow::anyhow!("update hnsw index: {e}"))?;
+    Ok(())
+}
+
+/// Fast-path nearest neighbours via the persisted HNSW segment(s) on `branch`.
+///
+/// Returns `None` if no HNSW segment exists yet (the caller falls back to the
+/// rebuild path or builds one on the fly). Otherwise attaches every segment
+/// named by the manifest, stages the query vector, and unions the per-segment
+/// candidate lists — ranked by exact cosine. Each row is `(cosine,
+/// raw_handle_bytes)`; the caller maps the handle to its entity id via its own
+/// id↔handle tribles. Reads only the candidate vectors (bounded by the beam
+/// width), never the whole corpus.
+pub fn nearest_via_index<S>(
+    storage: &mut S,
+    branch: Id,
+    query: &[f32],
+    floor: f32,
+) -> anyhow::Result<Option<Vec<(f32, [u8; 32])>>>
+where
+    S: BlobStore + PinStore,
+{
+    let rollup = {
+        let reader = storage
+            .reader()
+            .map_err(|e| anyhow::anyhow!("index-home reader: {e:?}"))?;
+        embedding_rollup(reader)
+    };
+    let segments = {
+        let mut home = IndexHome::new(storage, branch, rollup);
+        if home
+            .read_manifest()
+            .map_err(|e| anyhow::anyhow!("read hnsw manifest: {e}"))?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        home.attach_all()
+            .map_err(|e| anyhow::anyhow!("attach hnsw segments: {e}"))?
+    };
+    // Stage the query vector so `candidates_above` can resolve it by handle.
+    // A loose blob (never committed) — soft state, GC-able, exactly like the
+    // segments themselves.
+    let qh = put_embedding(storage, query.to_vec())
+        .map_err(|e| anyhow::anyhow!("stage query embedding: {e:?}"))?;
+    let reader = storage
+        .reader()
+        .map_err(|e| anyhow::anyhow!("index reader: {e:?}"))?;
+    let rows = nearest_across(&segments, &reader, qh, query, floor)
+        .into_iter()
+        .map(|(cos, h)| (cos, h.raw))
+        .collect();
+    Ok(Some(rows))
 }
 
 #[cfg(test)]

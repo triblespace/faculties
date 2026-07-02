@@ -550,8 +550,16 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
                 eprintln!("  embedded {}/{total}", i + 1);
             }
         }
+        let delta = change.clone();
         ws.commit(change, "memory embed");
         repo.push(&mut ws).map_err(|e| anyhow!("push failed: {e:?}"))?;
+        // Refresh the persisted HNSW segment so `memory similar` queries the
+        // graph instead of rebuilding it. Best-effort: the segment is soft
+        // state (recomputable from the commit chain), so a failure here warns
+        // but doesn't fail the embed.
+        if let Err(e) = embeddings::update_index(repo.storage_mut(), branch_id, &delta) {
+            eprintln!("memory: warning: HNSW index refresh failed (similar will fall back): {e:#}");
+        }
         println!(
             "embedded {n_text} text + {n_image} image chunk(s) into the shared nomic space."
         );
@@ -591,29 +599,62 @@ fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
         let space = ws.checkout(..).context("checkout memory branch")?;
 
         let superseded = superseded_ids(&space);
-        let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
-        let mut live = 0usize;
-        for chunk in all_chunk_ids(&space) {
-            if superseded.contains(&chunk) {
-                continue;
-            }
-            live += 1;
-            if let Some(h) = chunk_embedding_handle(&space, chunk) {
-                let v: View<[f32]> = ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
-                pairs.push((chunk, v.as_ref().to_vec()));
-            }
-        }
-        if pairs.is_empty() {
-            bail!("no chunk embeddings on this pile yet — run `memory embed` first");
-        }
-        if pairs.len() < live {
-            eprintln!(
-                "note: {} live chunk(s) not yet embedded — run `memory embed` to refresh",
-                live - pairs.len()
-            );
-        }
 
-        let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?;
+        // FAST PATH: attach the persisted HNSW segment(s) from the branch head
+        // and query them — no read-all-blobs, no rebuild. The checkout above
+        // stays only to map result handles → chunk ids (tribles, no blob
+        // reads) and to render, not to gather every embedding.
+        let ranked: Vec<(f32, Id)> = match embeddings::nearest_via_index(
+            repo.storage_mut(),
+            branch_id,
+            &qv,
+            0.0,
+        )? {
+            Some(rows) => {
+                // Build handle→id over LIVE chunks (a trible query per chunk,
+                // no blob fetch), then translate the ranked candidate handles.
+                let mut by_handle: std::collections::HashMap<[u8; 32], Id> =
+                    std::collections::HashMap::new();
+                for chunk in all_chunk_ids(&space) {
+                    if superseded.contains(&chunk) {
+                        continue;
+                    }
+                    if let Some(h) = chunk_embedding_handle(&space, chunk) {
+                        by_handle.insert(h.raw, chunk);
+                    }
+                }
+                rows.into_iter()
+                    .filter_map(|(cos, raw)| by_handle.get(&raw).map(|id| (cos, *id)))
+                    .collect()
+            }
+            // FALLBACK: no HNSW segment yet (e.g. embedded before this landed).
+            // Gather all pairs and rebuild once, as before.
+            None => {
+                let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
+                let mut live = 0usize;
+                for chunk in all_chunk_ids(&space) {
+                    if superseded.contains(&chunk) {
+                        continue;
+                    }
+                    live += 1;
+                    if let Some(h) = chunk_embedding_handle(&space, chunk) {
+                        let v: View<[f32]> =
+                            ws.get(h).map_err(|e| anyhow!("read embedding: {e:?}"))?;
+                        pairs.push((chunk, v.as_ref().to_vec()));
+                    }
+                }
+                if pairs.is_empty() {
+                    bail!("no chunk embeddings on this pile yet — run `memory embed` first");
+                }
+                if pairs.len() < live {
+                    eprintln!(
+                        "note: {} live chunk(s) not yet embedded — run `memory embed` to refresh",
+                        live - pairs.len()
+                    );
+                }
+                embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?
+            }
+        };
         if ranked.is_empty() {
             println!("no matches.");
             return Ok(());
