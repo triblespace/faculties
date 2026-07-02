@@ -11,12 +11,12 @@ use hifitime::Epoch;
 use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, SuccinctArchive};
+use triblespace::core::repo::index_home::IndexHome;
 use triblespace::prelude::blobencodings::LongString;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
-use faculties::schemas::archive::{KIND_SEARCH_INDEX, search_index};
-use triblespace_search::bm25::BM25Builder;
-use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
+use triblespace_search::index_bm25::{query_across, Bm25Rollup};
 use triblespace_search::tokens::hash_tokens;
 
 #[path = "importers/archive_import_chatgpt.rs"]
@@ -1337,6 +1337,319 @@ fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
     Ok(raw.to_string())
 }
 
+/// Resolve one author's display name from a content rollup (no
+/// checkout — a pattern query over the attached `SuccinctArchive` plus
+/// one blob get for the name string).
+fn author_name_from_rollup(
+    ws: &mut common::Ws,
+    rollup: &SuccinctArchive<OrderedUniverse>,
+    author_id: Id,
+) -> Result<String> {
+    let Some((handle,)) = find!(
+        (handle: Inline<Handle<LongString>>),
+        pattern!(rollup, [{ author_id @ common::archive::author_name: ?handle }])
+    )
+    .next() else {
+        return Ok("<unknown>".to_string());
+    };
+    load_longstring(ws, handle)
+}
+
+/// Resolve one author's role from a content rollup, if present.
+fn author_role_from_rollup(
+    ws: &mut common::Ws,
+    rollup: &SuccinctArchive<OrderedUniverse>,
+    author_id: Id,
+) -> Result<Option<String>> {
+    let Some((handle,)) = find!(
+        (handle: Inline<Handle<LongString>>),
+        pattern!(rollup, [{ author_id @ common::archive::author_role: ?handle }])
+    )
+    .next() else {
+        return Ok(None);
+    };
+    Ok(Some(load_longstring(ws, handle)?))
+}
+
+/// Search is dispatched standalone so the fast BM25 path never pays the
+/// full-branch `ws.checkout(..)` the other read commands do.
+///
+/// Fast path (default / BM25): attach the branch-head BM25 index-home
+/// segments and rank via [`query_across`], then resolve each hit's
+/// author / content / timestamp by pattern-querying the branch's
+/// content rollup (a single `SuccinctArchive` blob, attached zero-copy)
+/// and one blob get per field — **no checkout materialises the branch**.
+/// Falls back to a clear error when the pile carries no segments yet.
+///
+/// `--exact` / `--case_sensitive` keep the substring scan, which is
+/// inherently a full-content pass and still checks out the branch.
+fn run_search_standalone(
+    pile_path: &Path,
+    branch_id: Id,
+    branch_name: &str,
+    text: String,
+    limit: usize,
+    case_sensitive: bool,
+    exact: bool,
+) -> Result<()> {
+    let text = load_value_or_file(&text, "search text")?;
+    let (mut repo, branch_id) = common::open_repo_for_read(pile_path, branch_id, branch_name)?;
+    let res = (|| -> Result<()> {
+        if exact || case_sensitive {
+            return exact_scan(&mut repo, branch_id, &text, limit, case_sensitive);
+        }
+
+        // 1. Attach the BM25 segments named by the branch-head manifest.
+        //    (No checkout — one manifest read + a bounded number of
+        //    segment blob fetches.)
+        let content_attr = common::archive::content.id();
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow!("open pile reader: {e:?}"))?;
+        let kind = Bm25Rollup::new(reader, content_attr);
+        let segments = {
+            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
+            home.attach_all()
+                .map_err(|e| anyhow!("attach BM25 segments: {e}"))?
+        };
+        if segments.is_empty() {
+            bail!(
+                "no BM25 search segments on this pile yet — run `archive index` \
+                 first, or use --exact for a substring scan"
+            );
+        }
+
+        // 2. Rank across the segment union (per-segment BM25; best score wins).
+        let ranked = query_across(&segments, &hash_tokens(&text));
+        let total_docs: usize = segments.iter().map(|s| s.doc_count()).sum();
+        drop(segments);
+
+        // 3. Resolve each hit's fields via the content rollup — the
+        //    checkout-free replacement for materialising the branch.
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let Some(rollup_handle) = ws.rollup().map_err(|e| anyhow!("read branch rollup: {e:?}"))?
+        else {
+            bail!(
+                "no content rollup on this pile — run `archive index` to build \
+                 the checkout-free content index"
+            );
+        };
+        let rollup: SuccinctArchive<OrderedUniverse> = ws
+            .get(rollup_handle)
+            .map_err(|e| anyhow!("load content rollup: {e:?}"))?;
+
+        // Note if the corpus has grown past what the index covers.
+        let live = find!(
+            (m: Id),
+            pattern!(&rollup, [{
+                ?m @ common::metadata::tag: common::archive::kind_message,
+            }])
+        )
+        .count();
+        if live > total_docs {
+            eprintln!(
+                "note: {} message(s) newer than the index — run `archive index` to refresh",
+                live - total_docs
+            );
+        }
+
+        for (doc, score) in ranked.into_iter().take(limit) {
+            let Ok(message_id): Result<Id, _> = doc.try_from_inline() else {
+                continue;
+            };
+            let Some((author_id, content_handle, created_at)) = find!(
+                (
+                    author: Id,
+                    content: Inline<Handle<LongString>>,
+                    created_at: Inline<NsTAIInterval>
+                ),
+                pattern!(&rollup, [{
+                    message_id @
+                        common::archive::author: ?author,
+                        common::archive::content: ?content,
+                        common::metadata::created_at: ?created_at,
+                }])
+            )
+            .next() else {
+                continue;
+            };
+            let content = load_longstring(&mut ws, content_handle)?;
+            let name = author_name_from_rollup(&mut ws, &rollup, author_id)?;
+            let role = author_role_from_rollup(&mut ws, &rollup, author_id)?;
+            let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
+            let role = role.as_deref().unwrap_or("");
+            println!(
+                "{score:7.2} {} {} {} {}",
+                &format!("{message_id:x}")[..8],
+                lower,
+                if role.is_empty() {
+                    name
+                } else {
+                    format!("{name} ({role})")
+                },
+                snippet(&content, 120)
+            );
+        }
+        Ok(())
+    })();
+
+    let close_result = repo
+        .close()
+        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    match (res, close_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Substring / case-sensitive scan fallback — inherently a full-content
+/// pass, so it still checks out the branch. Slow at archive scale but
+/// needs no index.
+fn exact_scan(
+    repo: &mut common::Repo,
+    branch_id: Id,
+    text: &str,
+    limit: usize,
+    case_sensitive: bool,
+) -> Result<()> {
+    let mut ws = repo
+        .pull(branch_id)
+        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+    let catalog = ws.checkout(..).context("checkout workspace")?;
+
+    let needle = if case_sensitive {
+        text.to_string()
+    } else {
+        text.to_lowercase()
+    };
+
+    let mut matches = Vec::new();
+    for (message_id, author_id, content_handle, created_at) in find!(
+        (
+            message: Id,
+            author: Id,
+            content: Inline<Handle<LongString>>,
+            created_at: Inline<NsTAIInterval>
+        ),
+        pattern!(&catalog, [{
+            ?message @
+                common::metadata::tag: common::archive::kind_message,
+                common::archive::author: ?author,
+                common::archive::content: ?content,
+                common::metadata::created_at: ?created_at,
+        }])
+    ) {
+        let content = load_longstring(&mut ws, content_handle)?;
+        let haystack = if case_sensitive {
+            content.clone()
+        } else {
+            content.to_lowercase()
+        };
+        if haystack.contains(&needle) {
+            matches.push((interval_key(created_at), message_id, author_id, created_at, content));
+        }
+    }
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (_key, message_id, author_id, created_at, content) in matches.into_iter().rev().take(limit) {
+        let name = author_name(&mut ws, &catalog, author_id)?;
+        let role = author_role(&mut ws, &catalog, author_id)?;
+        let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
+        let role = role.as_deref().unwrap_or("");
+        println!(
+            "{} {} {} {}",
+            &format!("{message_id:x}")[..8],
+            lower,
+            if role.is_empty() {
+                name
+            } else {
+                format!("{name} ({role})")
+            },
+            snippet(&content, 120)
+        );
+    }
+    Ok(())
+}
+
+/// `archive index`, dispatched standalone. Refreshes two derived
+/// indexes on the archive branch, both maintained off the branch head
+/// rather than committed into history:
+///
+/// 1. The **content rollup** ([`Repository::compute_rollup`]) — a
+///    monolithic `SuccinctArchive` the search fast path queries to
+///    resolve matched messages without a checkout. Rebuild-and-replace
+///    (it resets the branch-head derived state).
+/// 2. The **BM25 index** as index-home LSMT segments
+///    ([`Bm25Rollup`] via [`IndexHome::update_index`]) instead of the
+///    old rebuild-and-replace-whole-index committed entity. The rollup
+///    is refreshed first (it rewrites the branch metadata, dropping any
+///    prior manifest), then a fresh BM25 segment is appended over the
+///    current messages, so repeated runs don't accumulate orphans.
+fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> Result<()> {
+    let (mut repo, branch_id) = common::open_repo_for_write(pile_path, branch_id, branch_name)?;
+    let res = (|| -> Result<()> {
+        // 1. Content rollup for checkout-free query-time resolution.
+        eprintln!("building content rollup (SuccinctArchive over the branch)…");
+        repo.compute_rollup(branch_id)
+            .map_err(|e| anyhow!("compute content rollup: {e:?}"))?;
+
+        // 2. Collect the message-content tribles to index (the rollup
+        //    just reset the branch-head derived state, so this builds a
+        //    single fresh BM25 segment).
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
+        let catalog = ws.checkout(..).context("checkout workspace")?;
+        let mut delta = TribleSet::new();
+        let mut count = 0usize;
+        for (message_id, content_handle) in find!(
+            (message: Id, content: Inline<Handle<LongString>>),
+            pattern!(&catalog, [{
+                ?message @
+                    common::metadata::tag: common::archive::kind_message,
+                    common::archive::content: ?content,
+            }])
+        ) {
+            let entity = message_id.acquire().unwrap_or_else(|| {
+                triblespace::core::id::ExclusiveId::force(message_id)
+            });
+            delta += entity! { &entity @ common::archive::content: content_handle };
+            count += 1;
+            if count % 100_000 == 0 {
+                eprintln!("  …{count} messages collected");
+            }
+        }
+        drop(catalog);
+        drop(ws);
+
+        eprintln!("building BM25 segment over {count} message(s)…");
+        let reader = repo
+            .storage_mut()
+            .reader()
+            .map_err(|e| anyhow!("open pile reader: {e:?}"))?;
+        let kind = Bm25Rollup::new(reader, common::archive::content.id());
+        {
+            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
+            home.update_index(&delta)
+                .map_err(|e| anyhow!("append BM25 segment: {e}"))?;
+        }
+        println!("indexed {count} message(s); content rollup refreshed");
+        Ok(())
+    })();
+
+    let close_result = repo
+        .close()
+        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    match (res, close_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.trace, cli.trace_filter.as_deref());
@@ -1375,6 +1688,26 @@ fn main() -> Result<()> {
             with_tools,
             persona.as_deref(),
         );
+    }
+    if let Command::Search {
+        text,
+        limit,
+        case_sensitive,
+        exact,
+    } = cmd
+    {
+        return run_search_standalone(
+            &pile_path,
+            branch_id,
+            &cli.branch,
+            text,
+            limit,
+            case_sensitive,
+            exact,
+        );
+    }
+    if let Command::Index = cmd {
+        return run_index_standalone(&pile_path, branch_id, &cli.branch);
     }
 
     let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
@@ -1537,199 +1870,11 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            Command::Search {
-                text,
-                limit,
-                case_sensitive,
-                exact,
-            } => {
-                let text = load_value_or_file(&text, "search text")?;
-                if !(exact || case_sensitive) {
-                    // BM25 path: ranked match via the latest index entity.
-                    let latest = find!(
-                        (h: Inline<Handle<SuccinctBM25Blob>>, at: Inline<NsTAIInterval>),
-                        pattern!(&catalog, [{
-                            _?e @
-                                common::metadata::tag: KIND_SEARCH_INDEX,
-                                search_index::index: ?h,
-                                search_index::indexed_at: ?at,
-                        }])
-                    )
-                    .max_by_key(|(_, at)| {
-                        let (lower, _): (i128, i128) = at.try_from_inline().unwrap();
-                        lower
-                    });
-                    let Some((handle, _at)) = latest else {
-                        bail!(
-                            "no search index on this pile yet — run `archive index` \
-                             first, or use --exact for a substring scan"
-                        );
-                    };
-                    let idx: SuccinctBM25Index =
-                        ws.get(handle).context("load search index")?;
-
-                    // One scored postings walk over the whole index —
-                    // never score per-doc (that re-walks postings per
-                    // match and goes quadratic on common terms).
-                    let mut rows: Vec<(Id, f32)> = idx
-                        .query_multi(&hash_tokens(&text))
-                        .into_iter()
-                        .filter_map(|(doc, score)| {
-                            let id: Id = doc.try_from_inline().ok()?;
-                            Some((id, score))
-                        })
-                        .collect();
-                    rows.sort_unstable_by(|a, b| {
-                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-
-                    let live = find!(
-                        m: Id,
-                        pattern!(&catalog, [{
-                            ?m @ common::metadata::tag: common::archive::kind_message,
-                        }])
-                    )
-                    .count();
-                    if live > idx.doc_count() {
-                        eprintln!(
-                            "note: {} message(s) newer than the index — run `archive index` to refresh",
-                            live - idx.doc_count()
-                        );
-                    }
-
-                    for (message_id, score) in rows.into_iter().take(limit) {
-                        let Some((author_id, content_handle, created_at)) = find!(
-                            (
-                                author: Id,
-                                content: Inline<Handle<LongString>>,
-                                created_at: Inline<NsTAIInterval>
-                            ),
-                            pattern!(&catalog, [{
-                                message_id @
-                                    common::archive::author: ?author,
-                                    common::archive::content: ?content,
-                                    common::metadata::created_at: ?created_at,
-                            }])
-                        )
-                        .next() else {
-                            continue;
-                        };
-                        let content = load_longstring(&mut ws, content_handle)?;
-                        let name = author_name(&mut ws, &catalog, author_id)?;
-                        let role = author_role(&mut ws, &catalog, author_id)?;
-                        let (lower, _upper): (Epoch, Epoch) =
-                            created_at.try_from_inline().unwrap();
-                        let role = role.as_deref().unwrap_or("");
-                        println!(
-                            "{score:7.2} {} {} {} {}",
-                            &format!("{message_id:x}")[..8],
-                            lower,
-                            if role.is_empty() {
-                                name
-                            } else {
-                                format!("{name} ({role})")
-                            },
-                            snippet(&content, 120)
-                        );
-                    }
-                    return Ok(());
-                }
-
-                let needle = if case_sensitive {
-                    text
-                } else {
-                    text.to_lowercase()
-                };
-
-                let mut matches = Vec::new();
-                for (message_id, author_id, content_handle, created_at) in find!(
-                    (
-                        message: Id,
-                        author: Id,
-                        content: Inline<Handle<LongString>>,
-                        created_at: Inline<NsTAIInterval>
-                    ),
-                    pattern!(&catalog, [{
-                        ?message @
-                            common::metadata::tag: common::archive::kind_message,
-                            common::archive::author: ?author,
-                            common::archive::content: ?content,
-                            common::metadata::created_at: ?created_at,
-                    }])
-                ) {
-                    let content = load_longstring(&mut ws, content_handle)?;
-                    let haystack = if case_sensitive {
-                        content.clone()
-                    } else {
-                        content.to_lowercase()
-                    };
-                    if haystack.contains(&needle) {
-                        matches.push((
-                            interval_key(created_at),
-                            message_id,
-                            author_id,
-                            created_at,
-                            content,
-                        ));
-                    }
-                }
-                matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                for (_key, message_id, author_id, created_at, content) in
-                    matches.into_iter().rev().take(limit)
-                {
-                    let name = author_name(&mut ws, &catalog, author_id)?;
-                    let role = author_role(&mut ws, &catalog, author_id)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
-                    let role = role.as_deref().unwrap_or("");
-                    println!(
-                        "{} {} {} {}",
-                        &format!("{message_id:x}")[..8],
-                        lower,
-                        if role.is_empty() {
-                            name
-                        } else {
-                            format!("{name} ({role})")
-                        },
-                        snippet(&content, 120)
-                    );
-                }
+            Command::Search { .. } => {
+                unreachable!("search is handled before opening the branch")
             }
             Command::Index => {
-                let mut builder: BM25Builder = BM25Builder::new();
-                let mut count = 0usize;
-                for (message_id, content_handle) in find!(
-                    (message: Id, content: Inline<Handle<LongString>>),
-                    pattern!(&catalog, [{
-                        ?message @
-                            common::metadata::tag: common::archive::kind_message,
-                            common::archive::content: ?content,
-                    }])
-                ) {
-                    let content = load_longstring(&mut ws, content_handle)?;
-                    builder.insert(&message_id, hash_tokens(&content));
-                    count += 1;
-                    if count % 100_000 == 0 {
-                        eprintln!("  …{count} messages tokenized");
-                    }
-                }
-                eprintln!("building succinct index over {count} message(s)…");
-                let idx = builder.build();
-                let handle = ws.put(&idx);
-                let now = Epoch::now()
-                    .unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0));
-                let at: Inline<NsTAIInterval> = (now, now)
-                    .try_to_inline()
-                    .map_err(|e| anyhow!("encode timestamp: {e:?}"))?;
-                let mut change = TribleSet::new();
-                change += entity! { _ @
-                    common::metadata::tag: &KIND_SEARCH_INDEX,
-                    search_index::index: handle,
-                    search_index::indexed_at: at,
-                };
-                ws.commit(change, "archive index");
-                repo.push(&mut ws)
-                    .map_err(|e| anyhow!("push archive index: {e:?}"))?;
-                println!("indexed {count} message(s)");
+                unreachable!("index is handled before opening the branch")
             }
             Command::Imports { format, limit } => {
                 let format_filter = format.map(|s| s.to_lowercase());
