@@ -300,6 +300,7 @@ where
         if home
             .read_manifest()
             .map_err(|e| anyhow::anyhow!("read hnsw manifest: {e}"))?
+            .segments
             .is_empty()
         {
             return Ok(None);
