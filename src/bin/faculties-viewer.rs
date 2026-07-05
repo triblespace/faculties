@@ -31,6 +31,17 @@ use GORBIE::notebook;
 use GORBIE::prelude::*;
 
 fn resolve_pile_path() -> PathBuf {
+    // Handled before anything else so `--version` works without a pile,
+    // a display, or any other argument. Prints crate version + baked git
+    // hash — the stale-binary question, answerable in one flag.
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!(
+            "faculties-viewer {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            env!("FACULTIES_GIT_VERSION"),
+        );
+        std::process::exit(0);
+    }
     // Precedence: --pile > positional > PILE env > ./self.pile —
     // anything explicit on the command line beats the ambient env.
     // The scan skips the values of value-taking flags (#[notebook]'s
