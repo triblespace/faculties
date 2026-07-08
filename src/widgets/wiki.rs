@@ -396,8 +396,8 @@ fn force_step_kernel(
         let px = pos[ix];
         let py = pos[iy];
 
-        let mut fx = 0.0f32;
-        let mut fy = 0.0f32;
+        let mut fx = f32::new(0.0);
+        let mut fy = f32::new(0.0);
 
         for j in 0..node_count {
             if j != i {
@@ -517,8 +517,8 @@ fn fdeb_step_kernel(
             // Electrostatic: unit-vector pull toward corresponding
             // point on each compatible edge, averaged over compatible
             // count so total magnitude is bounded ≤ 1.
-            let mut fx_elec = 0.0f32;
-            let mut fy_elec = 0.0f32;
+            let mut fx_elec = f32::new(0.0);
+            let mut fy_elec = f32::new(0.0);
 
             for other in 0u32..edge_count {
                 if other != e {
@@ -743,27 +743,29 @@ impl WikiGraph {
         }
 
         unsafe {
-            let _ = force_step_kernel::launch::<WgpuRuntime>(
+            force_step_kernel::launch::<WgpuRuntime>(
                 &gpu.client,
                 CubeCount::new_1d(((n as u32) + 255) / 256),
                 CubeDim::new_1d(256),
-                ArrayArg::from_raw_parts::<f32>(&gpu.pos_handle, n * 2, 1),
-                ArrayArg::from_raw_parts::<f32>(&gpu.vel_handle, n * 2, 1),
-                ArrayArg::from_raw_parts::<u32>(
-                    &gpu.edges_handle,
+                ArrayArg::from_raw_parts(gpu.pos_handle.clone(), n * 2),
+                ArrayArg::from_raw_parts(gpu.vel_handle.clone(), n * 2),
+                ArrayArg::from_raw_parts(
+                    gpu.edges_handle.clone(),
                     gpu.edge_count.max(1) as usize * 2,
-                    1,
                 ),
-                ArrayArg::from_raw_parts::<f32>(&gpu.degrees_handle, n, 1),
-                ScalarArg::new(gpu.node_count),
-                ScalarArg::new(gpu.edge_count),
-                ArrayArg::from_raw_parts::<f32>(&gpu.pos_out_handle, n * 2, 1),
+                ArrayArg::from_raw_parts(gpu.degrees_handle.clone(), n),
+                gpu.node_count,
+                gpu.edge_count,
+                ArrayArg::from_raw_parts(gpu.pos_out_handle.clone(), n * 2),
             );
         }
 
         std::mem::swap(&mut gpu.pos_handle, &mut gpu.pos_out_handle);
 
-        let bytes = gpu.client.read_one(gpu.pos_handle.clone());
+        let bytes = gpu
+            .client
+            .read_one(gpu.pos_handle.clone())
+            .expect("gpu readback");
         let positions: &[f32] = f32::from_bytes(&bytes);
 
         // Compute center of mass and average angular velocity,
@@ -796,7 +798,10 @@ impl WikiGraph {
         // Read back velocities up-front so we can compute the mean
         // (= the system's linear momentum / mass) alongside the
         // angular correction.
-        let vel_bytes = gpu.client.read_one(gpu.vel_handle.clone());
+        let vel_bytes = gpu
+            .client
+            .read_one(gpu.vel_handle.clone())
+            .expect("gpu readback");
         let velocities: &[f32] = f32::from_bytes(&vel_bytes);
         let mut mean_vx = 0.0f32;
         let mut mean_vy = 0.0f32;
@@ -922,16 +927,16 @@ impl WikiGraph {
         for _cycle in 0..CYCLES {
             for _ in 0..iterations {
                 unsafe {
-                    let _ = fdeb_step_kernel::launch::<WgpuRuntime>(
+                    fdeb_step_kernel::launch::<WgpuRuntime>(
                         &client,
                         CubeCount::new_1d((total + 255) / 256),
                         CubeDim::new_1d(256),
-                        ArrayArg::from_raw_parts::<f32>(&pts_handle, total_floats, 1),
-                        ArrayArg::from_raw_parts::<f32>(&pts_out_handle, total_floats, 1),
-                        ScalarArg::new(e),
-                        ScalarArg::new(K),
-                        ScalarArg::new(step_size),
-                        ScalarArg::new(SPRING_K),
+                        ArrayArg::from_raw_parts(pts_handle.clone(), total_floats),
+                        ArrayArg::from_raw_parts(pts_out_handle.clone(), total_floats),
+                        e,
+                        K,
+                        step_size,
+                        SPRING_K,
                     );
                 }
                 std::mem::swap(&mut pts_handle, &mut pts_out_handle);
@@ -940,7 +945,7 @@ impl WikiGraph {
             iterations = (iterations * 2 / 3).max(10);
         }
 
-        let bytes = client.read_one(pts_handle);
+        let bytes = client.read_one(pts_handle).expect("gpu readback");
         let result: &[f32] = f32::from_bytes(&bytes);
 
         let mut polylines = Vec::with_capacity(self.edges.len());
