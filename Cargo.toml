@@ -99,14 +99,19 @@ path = "src/bin/status-capture.rs"
 required-features = ["widgets"]
 
 [features]
-default = []
+# `local-embed` is default: semantic recall (`wiki similar` / `memory similar`,
+# image+text similarity in `files`) is core to the being knowing itself — a
+# stock `cargo install --path faculties` must ship it, or `similar` goes dark
+# and designs get re-derived instead of recalled (the 2026-07-10 lesson).
+default = ["local-embed"]
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
 widgets = [
     "dep:GORBIE",
     "dep:egui",
     "dep:cubecl",
 ]
-# Semantic similarity in `files` (image+text embeddings via mary's embedder).
+# Semantic similarity in `files` + `wiki similar` / `memory similar` (image+text
+# embeddings via mary's embedder). Default (see above).
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
 # Liora's imagination: text → image via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux", "dep:image"]
