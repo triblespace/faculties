@@ -11,7 +11,6 @@ use faculties::schemas::memory::{
     comb, ctx, search_index,
 };
 use faculties::schemas::embeddings::{self, Embedding768};
-use faculties::tokens::TokenEstimator;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
 use triblespace_search::tokens::hash_tokens;
@@ -34,7 +33,7 @@ use triblespace::prelude::*;
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--tokens N] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a budget (default tokens; bare <budget> or --tokens N budgets by TOKENS, --chars N budgets by CHARACTERS instead); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded+un-lexically-scorable chunks are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded+un-lexically-scorable chunks are kept (fail-open) with a stderr warning.\n  \
              memory density [<grain>]        — find where the hierarchy is BUSHY (many flat leaf-children under one span, no intermediate arc summary) vs balanced vs coarse; worst-first\n  \
              memory search <query>           — lexical (BM25) search over chunk summaries (build/refresh with `memory index`)\n  \
              memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
@@ -1788,18 +1787,19 @@ fn cmd_list(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> R
 /// by TIME RANGE, not by reference: a span is covered at grain G if some
 /// non-superseded chunk of width <= G overlaps it. Reports the spans of the
 /// overall extent left uncovered at that zoom (e.g. `check 1d` finds holes in
-/// Token-cost of a chunk (its budget weight), loaded lazily and cached by span
-/// index. Cost is measured through the configured [`TokenEstimator`], so the
-/// budget and the per-chunk weights are in the same token units.
+/// Character-cost of a chunk (its budget weight), loaded lazily and cached by
+/// span index. Cost is the summary's exact character count, so the budget and
+/// the per-chunk weights are in the same, unambiguous CHARACTER units — no
+/// tokenizer estimate (the old token estimate ran ~2× off the real token count,
+/// which was confusing; characters are exact).
 /// Budget weight charged for a wordless image memory in the context cover —
 /// it renders as a one-line `[image memory @ <span>]` marker, so a small fixed
-/// token cost (vs a text summary's measured length).
-const IMAGE_CHUNK_TOKEN_COST: usize = 16;
+/// character cost (vs a text summary's measured length).
+const IMAGE_CHUNK_CHAR_COST: usize = 64;
 
 fn context_chunk_cost(
     ws: &mut Workspace<Pile>,
     space: &TribleSet,
-    estimator: &TokenEstimator,
     spans: &[(i128, i128, Id)],
     cache: &mut [Option<usize>],
     i: usize,
@@ -1810,19 +1810,19 @@ fn context_chunk_cost(
     let c = match chunk_summary_handle(space, spans[i].2) {
         Some(handle) => {
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-            estimator.estimate(&summary)
+            summary.chars().count()
         }
         // A wordless image memory renders as a small `[image memory @ <span>]`
-        // marker in the cover — a fixed handful of tokens, not zero.
-        None if chunk_image_handle(space, spans[i].2).is_some() => IMAGE_CHUNK_TOKEN_COST,
+        // marker in the cover — a fixed handful of characters, not zero.
+        None if chunk_image_handle(space, spans[i].2).is_some() => IMAGE_CHUNK_CHAR_COST,
         None => 0,
     };
     cache[i] = Some(c);
     Ok(c)
 }
 
-/// `memory context [<budget-tokens>]` — the antichain cover over ALL of my
-/// memories, coarse → fine, fit to a token budget. This is the grounding cover a
+/// `memory context [<budget-chars>]` — the antichain cover over ALL of my
+/// memories, coarse → fine, fit to a CHARACTER budget. This is the grounding cover a
 /// fresh context reads first to wake into its own past: every memory is
 /// represented (completeness is invariant), with detail concentrated toward the
 /// recent end and the deep past held as coarse summary.
@@ -2027,15 +2027,15 @@ fn semantic_eligibility_scores(
 }
 
 fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -> Result<()> {
-    let estimator = TokenEstimator::from_env();
-
-    // Parse `[<budget>] [--chars N] [--about <query words...>]`. A bare number
-    // sets the token budget; `--chars N` instead sets the budget as a CHARACTER
-    // count (converted to the internal token budget through the estimator);
-    // `--about` switches the cover from recency-first to relevance-first,
-    // concentrating detail on the memories most similar to the query (so a face
-    // can be cast with the slice of the past most relevant to its goal).
-    let mut budget_tokens: usize = 20_000;
+    // Parse `[<budget>] [--chars N] [--about <query words...>]`. The budget is a
+    // CHARACTER count: a bare number, `--chars N`, or (as an alias) `--tokens N`
+    // all set it directly — there is no separate token estimate anymore (the old
+    // estimate ran ~2× off the real token count, which was confusing; characters
+    // are exact). `--about` switches the cover from recency-first to
+    // relevance-first, concentrating detail on the memories most similar to the
+    // query (so a face can be cast with the slice of the past most relevant to
+    // its goal).
+    let mut budget_chars: usize = 200_000;
     let mut about: Option<String> = None;
     // `--filter <query>` (include-only) and `--remove <query>` (anti-filter) gate
     // ELIGIBILITY by positive similarity to their query; `--sim-threshold <f>` is
@@ -2043,10 +2043,10 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
     let mut filter_q: Option<String> = None;
     let mut remove_q: Option<String> = None;
     let mut sim_threshold: f32 = DEFAULT_SIM_THRESHOLD;
-    // `--tokens N` names the token budget explicitly; when present it wins over
-    // the bare positional (which stays a backward-compatible fallback — it also
-    // means tokens). `--chars N` budgets by characters instead (see below).
-    let mut tokens_explicit = false;
+    // `--chars N` (canonical) / `--tokens N` (alias) name the budget explicitly;
+    // when present either wins over the bare positional (a backward-compatible
+    // fallback — it also means characters).
+    let mut chars_explicit = false;
     {
         // A value flag consumes the following args up to the NEXT recognized flag
         // (or end), so multi-word queries stay unquoted AND `--about`/`--filter`/
@@ -2084,43 +2084,23 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
                 i += 2;
                 continue;
             }
-            if args[i] == "--tokens" {
+            // `--tokens N` is a backward-compatible ALIAS for `--chars N` (the
+            // budget is characters now; there is no separate token path).
+            if args[i] == "--tokens" || args[i] == "--chars" {
+                let flag = args[i].as_str();
                 let raw = args.get(i + 1).ok_or_else(|| {
-                    anyhow!("--tokens needs a number, e.g. `memory context --tokens 60000`")
+                    anyhow!("{flag} needs a number, e.g. `memory context --chars 80000`")
                 })?;
-                budget_tokens = raw.parse().map_err(|_| {
-                    anyhow!("--tokens expects a positive integer, got `{raw}`")
+                budget_chars = raw.parse().map_err(|_| {
+                    anyhow!("{flag} expects a positive integer, got `{raw}`")
                 })?;
-                tokens_explicit = true;
+                chars_explicit = true;
                 i += 2;
                 continue;
             }
-            if args[i] == "--chars" {
-                let raw = args.get(i + 1).ok_or_else(|| {
-                    anyhow!("--chars needs a number, e.g. `memory context --chars 9500`")
-                })?;
-                let chars: usize = raw.parse().map_err(|_| {
-                    anyhow!("--chars expects a positive integer, got `{raw}`")
-                })?;
-                // Convert a CHARACTER budget to the internal token budget. The
-                // cover charges each chunk its summary's *token* estimate, but the
-                // rendered output also spends characters on span headers, ids,
-                // indentation and blank lines — empirically printed_chars ≈
-                // 4.15–4.32 × used_tokens while the estimator runs at ~4
-                // chars/token (so ~5% structural overhead). Convert through the
-                // estimator (probing its ratio on a fixed sample, never allocating
-                // the full N-char budget), then discount ~13% so the rendered
-                // cover lands at or just under N characters (slightly under is
-                // fine; over is not).
-                const PROBE: usize = 4096;
-                let toks_per_probe = estimator.estimate(&"x".repeat(PROBE)).max(1);
-                budget_tokens = chars.saturating_mul(toks_per_probe) / PROBE * 87 / 100;
-                i += 2;
-                continue;
-            }
-            if !tokens_explicit {
+            if !chars_explicit {
                 if let Ok(n) = args[i].parse::<usize>() {
-                    budget_tokens = n;
+                    budget_chars = n;
                 }
             }
             i += 1;
@@ -2271,13 +2251,13 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
         let mut cost_cache: Vec<Option<usize>> = vec![None; n];
         let mut used = 0usize;
         for &i in &roots {
-            used = used.saturating_add(context_chunk_cost(&mut ws, &space, &estimator, &spans, &mut cost_cache, i)?);
+            used = used.saturating_add(context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, i)?);
         }
-        if used > budget_tokens {
+        if used > budget_chars {
             let earliest = roots.iter().map(|&i| spans[i].0).min().unwrap();
             let latest = roots.iter().map(|&i| spans[i].1).max().unwrap();
             bail!(
-                "incomplete cover: the coarsest cover of all memories needs ~{} tokens, over the {budget_tokens}-token budget.\n\
+                "incomplete cover: the coarsest cover of all memories needs ~{} characters, over the {budget_chars}-character budget.\n\
                  Your memory hierarchy has {} top-level chunk(s) with no coarser parent spanning them, so no in-budget cover can contain everything.\n\
                  Raise a coarser apex over the whole extent, then retry:\n    \
                  memory create {}..{} \"<one coarse summary of this whole span>\"\n\
@@ -2296,7 +2276,7 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
         // since completeness forbids dropping.)
         let mut cover: Vec<usize> = roots.clone();
         loop {
-            let remaining = budget_tokens.saturating_sub(used);
+            let remaining = budget_chars.saturating_sub(used);
             if remaining == 0 {
                 break;
             }
@@ -2311,9 +2291,9 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
                 let mut kids_cost = 0usize;
                 for &k in &children[i] {
                     kids_cost = kids_cost
-                        .saturating_add(context_chunk_cost(&mut ws, &space, &estimator, &spans, &mut cost_cache, k)?);
+                        .saturating_add(context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, k)?);
                 }
-                let pcost = context_chunk_cost(&mut ws, &space, &estimator, &spans, &mut cost_cache, i)?;
+                let pcost = context_chunk_cost(&mut ws, &space, &spans, &mut cost_cache, i)?;
                 let extra = kids_cost.saturating_sub(pcost);
                 if extra > remaining {
                     continue;
@@ -2361,13 +2341,12 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
         // prose — we drop selected nodes, we do not rewrite ancestor summaries.
         if filter_elig.is_some() || remove_elig.is_some() {
             cover.retain(|&i| eligible(spans[i].2));
-            // Recompute the token tally honestly over what actually survived.
+            // Recompute the character tally honestly over what actually survived.
             used = 0;
             for &i in &cover {
                 used = used.saturating_add(context_chunk_cost(
                     &mut ws,
                     &space,
-                    &estimator,
                     &spans,
                     &mut cost_cache,
                     i,
@@ -2392,10 +2371,10 @@ fn cmd_context(pile_path: &Path, branch_id_raw: Option<&str>, args: &[String]) -
             format!("coarse → fine; {}", parts.join("; "))
         };
         println!(
-            "memory context — {} chunk(s), ~{} of {} tokens ({mode})",
+            "memory context — {} chunk(s), ~{} of {} characters ({mode})",
             cover.len(),
             used,
-            budget_tokens,
+            budget_chars,
         );
         for &i in &cover {
             let (s, e, id) = spans[i];
