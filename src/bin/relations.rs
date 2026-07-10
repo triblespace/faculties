@@ -2,7 +2,10 @@
 use anyhow::{Result, anyhow, bail};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::relations::{DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, group, relations};
+use faculties::schemas::relations::{
+    DEFAULT_BRANCH, KIND_GROUP, KIND_PERSON_ID, KIND_RETIRE_ID, KIND_UNRETIRE_ID, group, relations,
+};
+use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,6 +15,7 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
+type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
 #[derive(Parser)]
 #[command(version = faculties::GIT_VERSION, name = "relations", about = "Relationship/contacts faculty")]
@@ -130,9 +134,28 @@ enum Command {
     List {
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Include soft-retired relations (default hides them)
+        #[arg(long)]
+        all: bool,
+        /// Show ONLY soft-retired relations
+        #[arg(long, conflicts_with = "all")]
+        retired: bool,
     },
     /// Show a person
     Show { id: String },
+    /// Soft-retire a relation (label or id). Append-only: the person
+    /// entity is never deleted — an "unretire"/"restore" reverses it and
+    /// the entry stays recoverable in the pile. Default `list` hides it.
+    Retire {
+        /// Person label, alias, or id (hex / prefix)
+        person: String,
+    },
+    /// Un-retire (restore) a soft-retired relation (label or id).
+    #[command(alias = "restore")]
+    Unretire {
+        /// Person label, alias, or id (hex / prefix)
+        person: String,
+    },
     /// Manage groups (addressable sets of people, e.g. the colony)
     Group {
         #[command(subcommand)]
@@ -166,6 +189,72 @@ enum GroupCmd {
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
+}
+
+fn now_epoch() -> Epoch {
+    Epoch::now().unwrap_or_else(|_| Epoch::from_gregorian_utc(1970, 1, 1, 0, 0, 0, 0))
+}
+
+fn epoch_interval(epoch: Epoch) -> IntervalValue {
+    (epoch, epoch).try_to_inline().unwrap()
+}
+
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
+    lower
+}
+
+/// People currently soft-retired: the latest retire/unretire event per
+/// person wins (retire => retired, unretire => active). Monotonic and
+/// invertible — mirrors compass prioritize/deprioritize. Default views
+/// exclude these; `--all`/`--retired` reveal them.
+fn retired_person_ids(space: &TribleSet) -> HashSet<Id> {
+    let mut latest: HashMap<Id, (i128, bool)> = HashMap::new();
+    for (person, at) in find!(
+        (person: Id, at: IntervalValue),
+        pattern!(space, [{
+            _?evt @
+            metadata::tag: &KIND_RETIRE_ID,
+            relations::subject: ?person,
+            metadata::created_at: ?at,
+        }])
+    ) {
+        let key = interval_key(at);
+        latest
+            .entry(person)
+            .and_modify(|(cur_key, cur_retired)| {
+                if key >= *cur_key {
+                    *cur_key = key;
+                    *cur_retired = true;
+                }
+            })
+            .or_insert((key, true));
+    }
+    for (person, at) in find!(
+        (person: Id, at: IntervalValue),
+        pattern!(space, [{
+            _?evt @
+            metadata::tag: &KIND_UNRETIRE_ID,
+            relations::subject: ?person,
+            metadata::created_at: ?at,
+        }])
+    ) {
+        let key = interval_key(at);
+        latest
+            .entry(person)
+            .and_modify(|(cur_key, cur_retired)| {
+                if key > *cur_key {
+                    *cur_key = key;
+                    *cur_retired = false;
+                }
+            })
+            .or_insert((key, false));
+    }
+    latest
+        .into_iter()
+        .filter(|(_, (_, retired))| *retired)
+        .map(|(id, _)| id)
+        .collect()
 }
 
 fn normalize_label(label: &str) -> Result<String> {
@@ -693,15 +782,30 @@ fn cmd_set(
     Ok(())
 }
 
-fn cmd_list(pile: &Path, _branch_name: &str, branch_id: Id, limit: usize) -> Result<()> {
+fn cmd_list(
+    pile: &Path,
+    _branch_name: &str,
+    branch_id: Id,
+    limit: usize,
+    all: bool,
+    retired_only: bool,
+) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
         let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
 
+        let retired = retired_person_ids(&space);
         let mut ids: Vec<(Option<String>, Id)> = all_person_ids(&space)
             .into_iter()
+            .filter(|id| {
+                if retired_only {
+                    retired.contains(id)
+                } else {
+                    all || !retired.contains(id)
+                }
+            })
             .map(|id| (person_label(&mut ws, &space, id), id))
             .collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -712,6 +816,9 @@ fn cmd_list(pile: &Path, _branch_name: &str, branch_id: Id, limit: usize) -> Res
             for (label, id) in ids.into_iter().take(limit) {
                 let label = label.as_deref().unwrap_or("<unnamed>");
                 let mut line = format!("[{}] {}", fmt_id(id), label);
+                if all && retired.contains(&id) {
+                    line.push_str(" (retired)");
+                }
                 let first = person_first_name(&mut ws, &space, id);
                 let last = person_last_name(&mut ws, &space, id);
                 let fallback_name = match (&first, &last) {
@@ -743,6 +850,9 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
         let person_id = resolve_person_id(&space, &id)?;
 
         println!("id: {:x}", person_id);
+        if retired_person_ids(&space).contains(&person_id) {
+            println!("retired: true");
+        }
         if let Some(label) = person_label(&mut ws, &space, person_id) {
             println!("label: {label}");
         }
@@ -801,6 +911,65 @@ fn cmd_show(pile: &Path, _branch_name: &str, branch_id: Id, id: String) -> Resul
 
         Ok(())
     })
+}
+
+/// Soft-retire (or restore) a relation by appending a retirement event.
+/// `retired = true` appends a `KIND_RETIRE_ID` event; `false` appends a
+/// `KIND_UNRETIRE_ID` event. Latest event by timestamp wins — see
+/// `retired_person_ids`. The person entity is never mutated or deleted.
+fn cmd_set_retired(
+    pile: &Path,
+    branch_id: Id,
+    person: String,
+    retired: bool,
+) -> Result<(Id, Option<String>, bool)> {
+    with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let person_id = resolve_member_id(&space, &person)?;
+        let label = person_label(&mut ws, &space, person_id);
+
+        // No-op if already in the requested state — keeps the ledger free
+        // of redundant events (and gives the caller a clear "already X").
+        if retired_person_ids(&space).contains(&person_id) == retired {
+            return Ok((person_id, label, false));
+        }
+
+        let now = epoch_interval(now_epoch());
+        let evt_id = ufoid();
+        let kind = if retired { &KIND_RETIRE_ID } else { &KIND_UNRETIRE_ID };
+        let mut change = TribleSet::new();
+        change += entity! { &evt_id @
+            metadata::tag: kind,
+            relations::subject: &person_id,
+            metadata::created_at: now,
+        };
+        ws.commit(change, if retired { "relations retire" } else { "relations unretire" });
+        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        Ok((person_id, label, true))
+    })
+}
+
+fn cmd_retire(pile: &Path, branch_id: Id, person: String) -> Result<()> {
+    let (id, label, changed) = cmd_set_retired(pile, branch_id, person, true)?;
+    let label = label.as_deref().unwrap_or("<unnamed>");
+    if changed {
+        println!("Retired {} ({label}).", fmt_id(id));
+    } else {
+        println!("{} ({label}) is already retired.", fmt_id(id));
+    }
+    Ok(())
+}
+
+fn cmd_unretire(pile: &Path, branch_id: Id, person: String) -> Result<()> {
+    let (id, label, changed) = cmd_set_retired(pile, branch_id, person, false)?;
+    let label = label.as_deref().unwrap_or("<unnamed>");
+    if changed {
+        println!("Restored {} ({label}).", fmt_id(id));
+    } else {
+        println!("{} ({label}) is not retired.", fmt_id(id));
+    }
+    Ok(())
 }
 
 // ── groups ──────────────────────────────────────────────────────────────────
@@ -1030,8 +1199,12 @@ fn main() -> Result<()> {
             position,
             source,
         ),
-        Command::List { limit } => cmd_list(&cli.pile, &cli.branch, branch_id, limit),
+        Command::List { limit, all, retired } => {
+            cmd_list(&cli.pile, &cli.branch, branch_id, limit, all, retired)
+        }
         Command::Show { id } => cmd_show(&cli.pile, &cli.branch, branch_id, id),
+        Command::Retire { person } => cmd_retire(&cli.pile, branch_id, person),
+        Command::Unretire { person } => cmd_unretire(&cli.pile, branch_id, person),
         Command::Group { command } => match command {
             GroupCmd::Create { name } => cmd_group_create(&cli.pile, branch_id, name),
             GroupCmd::Add { group, person } => cmd_group_add(&cli.pile, branch_id, group, person),

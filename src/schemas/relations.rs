@@ -17,6 +17,19 @@ pub const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 /// all-zooids group.
 pub const KIND_GROUP: Id = id_hex!("2CEE877C6C996CE66B4572CE8863DF04");
 
+/// Soft-retirement events. Retiring a relation is monotonic (append-only):
+/// we never delete the person entity — instead we append a small event
+/// entity tagged `KIND_RETIRE_ID` pointing at the person via
+/// `relations::subject`, carrying a `metadata::created_at` timestamp.
+/// `unretire`/`restore` appends a `KIND_UNRETIRE_ID` event the same way.
+/// A person's current state is the latest event by timestamp (retire vs
+/// unretire — exactly like compass prioritize/deprioritize). Default views
+/// exclude retired relations; `--all`/`--retired` reveal them. This keeps
+/// the active roster clean (real people + live zooids) without ever losing
+/// the imported cruft, which stays fully recoverable in the pile.
+pub const KIND_RETIRE_ID: Id = id_hex!("CB9251505F663A9232C632CC9E68863A");
+pub const KIND_UNRETIRE_ID: Id = id_hex!("D2D4AFCAD74CBD193B2EB7FE94AE27E9");
+
 pub mod group {
     use super::*;
     attributes! {
@@ -57,5 +70,8 @@ pub mod relations {
         "0FCF3A17B2EBE7243BDDD791B901E2D6" as same_as: inlineencodings::GenId;
         "A89DC2F250432322D429D0E51316B6F3" as distinct_from: inlineencodings::GenId;
         "EB09A042DE6AA778D05C1EF795C434EE" as review_candidate: inlineencodings::GenId;
+        // Subject of a retire/unretire event: retirement-event -> person.
+        // See KIND_RETIRE_ID / KIND_UNRETIRE_ID above.
+        "C9D3F48C660DADBDBFA32F30F595415A" as subject: inlineencodings::GenId;
     }
 }
