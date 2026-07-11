@@ -70,9 +70,9 @@ jobs:
           # Onboarding wiki fragments + starter goals; seed with
           # `cat bootstrap.pile >> ./self.pile` after unpacking.
           cp bootstrap.pile "$stage/"
-          # All faculty binaries (extension-less; .exe suffix on windows
-          # if we ever add it). The widgets-only viewer is gated by a
-          # feature so it's not built by default in this workflow.
+          # All faculty binaries, including the default-enabled viewer and
+          # capture tools (extension-less; .exe suffix on windows if we ever
+          # add it).
           for bin in target/${{ matrix.target }}/release/*; do
             [ -f "$bin" ] || continue
             [ -x "$bin" ] || continue

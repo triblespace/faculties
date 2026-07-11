@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Widgets are enabled by default.** A stock `cargo build`, `cargo test`, or
+  `cargo install --bins` now includes the GORBIE viewer/capture surface, so the
+  shipped widget examples compile in the default configuration. Use
+  `--no-default-features` for a CLI-only build.
+- **Archive search indexes are commit-native, resumable LSM forests.** Each
+  source commit becomes one logical Succinct + BM25 leaf (large commits may be
+  physically sharded), and both manifests carry an atomic coverage certificate.
+  Live writes maintain both indexes in the same branch repoint; an unhooked
+  writer makes search fail stale instead of silently omitting messages.
+  `archive index` now walks uncovered commit metadata parents-first, checkpoints
+  after each commit, resumes after interruption, and is a true no-op once both
+  indexes cover the archive HEAD. It discards uncertified legacy forests and
+  rebuilds certified manifests whose segment blobs are unreadable. Search
+  validates BM25 + Succinct coverage from one branch-head snapshot before any
+  attachment and reads the succinct segments only when lexical hits need
+  materialising; the legacy monolithic rollup is no longer rebuilt or consulted.
 - **Archive and memory BM25 search can retrieve standalone Unicode
   symbols.** The shared tokenizer now indexes non-ASCII symbol graphemes,
   so queries such as emoji take the normal indexed path instead of yielding

@@ -43,7 +43,6 @@ cargo run --bin compass --release -- list
 
 # install everything onto $PATH
 cargo install --path . --bins
-cargo install --path . --features widgets --bin viewer
 ```
 
 `PILE` is read from the environment by every faculty (clap's native
@@ -66,10 +65,9 @@ to match.
   every CLI faculty for x86_64-linux-gnu, aarch64-linux-gnu (via
   cross), x86_64-apple-darwin, and aarch64-apple-darwin, then
   attaches a tarball + sha256 per target to the GH release.
-* The viewer binary (`viewer`) is gated behind the
-  `widgets` feature and not included in release tarballs yet —
-  cubecl/wgpu cross-compile is its own thing, follow up when
-  someone needs it.
+* The `widgets` feature is enabled by default, so `viewer` and the
+  capture binaries are included in normal builds and release
+  tarballs. Use `--no-default-features` for a CLI-only build.
 * Bumping the version: edit `version` in `Cargo.toml`, move the
   unreleased CHANGELOG entries under a new `## X.Y.Z — YYYY-MM-DD`
   heading, `cargo check` to refresh the lockfile, commit, then

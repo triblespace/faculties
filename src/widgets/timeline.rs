@@ -50,7 +50,7 @@ use triblespace::core::repo::{
     ancestors, CommitHandle, CommitSelector, CommitSet, Workspace,
 };
 use triblespace::core::trible::TribleSet;
-use triblespace::core::inline::encodings::hash::{Blake3, Handle};
+use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{LongString, SimpleArchive};
@@ -1322,4 +1322,3 @@ fn format_span(secs: f64) -> String {
         format!("{s:.0}S")
     }
 }
-

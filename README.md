@@ -37,7 +37,6 @@ Install all faculty CLIs (and the GUI viewer) onto `$PATH`:
 
 ```sh
 cargo install --git https://github.com/triblespace/faculties --bins
-cargo install --git https://github.com/triblespace/faculties --features widgets --bin viewer
 ```
 
 Or from a local checkout:
@@ -46,7 +45,6 @@ Or from a local checkout:
 git clone https://github.com/triblespace/faculties
 cd faculties
 cargo install --path . --bins
-cargo install --path . --features widgets --bin viewer
 ```
 
 ### Use it
@@ -169,7 +167,7 @@ thread) against a single pile — see the screenshot above.
 From a checkout:
 
 ```sh
-cargo run --release --features widgets --bin viewer -- ./self.pile
+cargo run --release --bin viewer -- ./self.pile
 ```
 
 Standalone per-widget demos (showing how to embed a single widget

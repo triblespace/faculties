@@ -27,7 +27,6 @@
 //! panel.render(ctx, cognition_ws);
 //! ```
 
-use std::collections::HashMap;
 
 use chrono::{DateTime, TimeZone, Timelike, Utc};
 use hifitime::Epoch;

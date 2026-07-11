@@ -17,7 +17,6 @@ use faculties::widgets::{
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::Workspace;
-use triblespace::core::inline::encodings::hash::Blake3;
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
