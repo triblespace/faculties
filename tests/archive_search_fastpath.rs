@@ -11,6 +11,8 @@
 //!    snippet resolved — through the branch's `SuccinctArchive` rollup
 //!    and per-hit blob gets, with NO full `ws.checkout(..)` of the
 //!    branch on the query path.
+//! 4. Standalone and repeated Unicode symbols are regular indexed terms,
+//!    not an accidental request for the archive-scale exact scan.
 //!
 //! The exact ranking equivalence to the old monolithic index is proven
 //! at the crate level in
@@ -42,7 +44,11 @@ fn temp_pile_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    dir.join(format!("faculties-archive-test-{}-{}.pile", std::process::id(), nanos))
+    dir.join(format!(
+        "faculties-archive-test-{}-{}.pile",
+        std::process::id(),
+        nanos
+    ))
 }
 
 fn run_archive(pile: &PathBuf, args: &[&str]) -> std::process::Output {
@@ -60,12 +66,20 @@ fn run_archive(pile: &PathBuf, args: &[&str]) -> std::process::Output {
 fn bm25_fast_path_resolves_content_without_checkout() {
     let path = temp_pile_path();
 
-    // ── build a fresh archive pile with three synthetic messages ──────────
+    // ── build a fresh archive pile with synthetic messages ────────────────
     // Known vocabulary so we can assert which docs a query must return.
     let docs = [
         ("alpha beta gamma memory", "message A"),
         ("beta delta pile", "message B"),
         ("gamma delta epsilon trible", "message C"),
+        ("telemetry symbol alpha 🛰️, status nominal", "message D"),
+        (
+            "telemetry symbol alpha cluster 🛰️🛰️🛰️ status stable",
+            "message E",
+        ),
+        ("symbol beta 🧭", "message F"),
+        ("symbol gamma 🔭", "message G"),
+        ("symbol delta 🪐", "message H"),
     ];
     let msg_ids: Vec<Id> = (0..docs.len()).map(|_| *fucid()).collect();
     let branch_id;
@@ -126,7 +140,10 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("indexed 3 message"), "index summary: {stdout}");
+    assert!(
+        stdout.contains("indexed 8 message"),
+        "index summary: {stdout}"
+    );
 
     // ── 3. search "beta": must return A and B (contain 'beta'), not C ─────
     // Discriminate by the RESOLVED content snippet (the binary prints
@@ -142,14 +159,23 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("alpha"), "'beta' must return message A; got:\n{stdout}");
-    assert!(stdout.contains("pile"), "'beta' must return message B; got:\n{stdout}");
+    assert!(
+        stdout.contains("alpha"),
+        "'beta' must return message A; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("pile"),
+        "'beta' must return message B; got:\n{stdout}"
+    );
     assert!(
         !stdout.contains("epsilon"),
         "'beta' must NOT return message C; got:\n{stdout}"
     );
     // Author name resolved from the rollup too.
-    assert!(stdout.contains("Tester"), "author name resolved; got:\n{stdout}");
+    assert!(
+        stdout.contains("Tester"),
+        "author name resolved; got:\n{stdout}"
+    );
 
     // ── 4. a rare term hits exactly its one document ──────────────────────
     let out = run_archive(&path, &["search", "epsilon"]);
@@ -168,6 +194,48 @@ fn bm25_fast_path_resolves_content_without_checkout() {
             "absent term must return no messages; got:\n{stdout}"
         );
     }
+
+    // A standalone Unicode symbol uses the BM25 fast path. The synthetic
+    // fixtures cover punctuation adjacency and a repeated symbol cluster.
+    let out = run_archive(&path, &["search", "🛰️"]);
+    assert!(
+        out.status.success(),
+        "symbol search failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("status nominal"),
+        "punctuation-adjacent symbol must match; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("status stable"),
+        "a symbol inside a repeated cluster must match; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("symbol beta"),
+        "a different symbol must not match; got:\n{stdout}"
+    );
+
+    // Similar Unicode symbols receive distinct, context-free terms too.
+    let out = run_archive(&path, &["search", "🧭"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("symbol beta") && !stdout.contains("symbol gamma"),
+        "the first generic symbol must resolve independently; got:\n{stdout}"
+    );
+    let out = run_archive(&path, &["search", "🔭"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("symbol gamma") && !stdout.contains("symbol beta"),
+        "the second generic symbol must resolve independently; got:\n{stdout}"
+    );
+    let out = run_archive(&path, &["search", "🪐"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("symbol delta") && !stdout.contains("symbol beta"),
+        "a newer emoji scalar must be indexed too; got:\n{stdout}"
+    );
 
     let _ = std::fs::remove_file(&path);
     // Best-effort: the replay-index sibling file is not created here, but

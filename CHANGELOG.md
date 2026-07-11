@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Archive and memory BM25 search can retrieve standalone Unicode
+  symbols.** The shared tokenizer now indexes non-ASCII symbol graphemes,
+  so queries such as emoji take the normal indexed path instead of yielding
+  no terms (or forcing a full exact scan). Run `archive index` / `memory
+  index` once to add symbol postings to an existing pile.
 - **`faculties-viewer` renamed to `viewer`.** Binary, `[[bin]]`
   target, and docs all follow; `--version` now prints
   `viewer X.Y.Z (<git hash>)`. No compat alias.
