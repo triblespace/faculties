@@ -117,23 +117,7 @@ mod common {
         branch_id: Id,
         _branch_name: &str,
     ) -> Result<(Repo, Id)> {
-        let mut pile =
-            Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
-        if let Err(err) = pile.refresh() {
-            let _ = pile.close();
-            return Err(match err {
-                triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow!(
-                    "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                     could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                    pile_path.display()
-                ),
-                other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
-            });
-        }
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let repo = Repository::new(pile, signing_key, TribleSet::new())
-            .map_err(|err| anyhow!("create repository: {err:?}"))?;
-        Ok((repo, branch_id))
+        Ok((open_repo(pile_path)?, branch_id))
     }
 
     pub fn open_repo_for_read(
@@ -142,17 +126,7 @@ mod common {
         branch_name: &str,
     ) -> Result<(Repo, Id)> {
         let mut repo = open_repo(pile_path)?;
-        let res = (|| -> Result<(), anyhow::Error> {
-            if repo
-                .storage_mut()
-                .head(branch_id)
-                .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
-                .is_none()
-            {
-                return Err(anyhow!("unknown branch {branch_name} ({branch_id:x})"));
-            }
-            Ok(())
-        })();
+        let res = validate_branch_for_read(&mut repo, branch_id, branch_name);
         if let Err(err) = res {
             let _ = repo.close();
             return Err(err);
@@ -160,8 +134,14 @@ mod common {
         Ok((repo, branch_id))
     }
 
-    fn open_repo(pile_path: &Path) -> Result<Repo> {
+    pub fn open_repo(pile_path: &Path) -> Result<Repo> {
+        let open_start = std::time::Instant::now();
         let mut pile = Pile::open(pile_path).map_err(|e| anyhow!("open pile: {e:?}"))?;
+        tracing::info!(
+            elapsed_ms = open_start.elapsed().as_millis() as u64,
+            "pile mmap open complete"
+        );
+        let refresh_start = std::time::Instant::now();
         if let Err(err) = pile.refresh() {
             // Avoid Drop warnings on early errors.
             let _ = pile.close();
@@ -174,9 +154,35 @@ mod common {
                 other => anyhow!("refresh pile {}: {other:?}", pile_path.display()),
             });
         }
+        tracing::info!(
+            elapsed_ms = refresh_start.elapsed().as_millis() as u64,
+            "pile record refresh complete"
+        );
+        let repository_start = std::time::Instant::now();
         let signing_key = SigningKey::generate(&mut OsRng);
-        Repository::new(pile, signing_key, TribleSet::new())
-            .map_err(|err| anyhow!("create repository: {err:?}"))
+        let repo = Repository::new(pile, signing_key, TribleSet::new())
+            .map_err(|err| anyhow!("create repository: {err:?}"))?;
+        tracing::info!(
+            elapsed_ms = repository_start.elapsed().as_millis() as u64,
+            "repository construction complete"
+        );
+        Ok(repo)
+    }
+
+    pub fn validate_branch_for_read(
+        repo: &mut Repo,
+        branch_id: Id,
+        branch_name: &str,
+    ) -> Result<()> {
+        if repo
+            .storage_mut()
+            .head(branch_id)
+            .map_err(|e| anyhow!("branch head {branch_name}: {e:?}"))?
+            .is_none()
+        {
+            return Err(anyhow!("unknown branch {branch_name} ({branch_id:x})"));
+        }
+        Ok(())
     }
 
     pub fn with_repo<T>(pile: &Path, f: impl FnOnce(&mut Repo) -> Result<T>) -> Result<T> {
@@ -362,7 +368,7 @@ struct Cli {
     /// Branch id to query (hex). Overrides config/env branch id.
     #[arg(long)]
     branch_id: Option<String>,
-    /// Enable tracing spans for importer profiling.
+    /// Enable tracing spans for importer and search profiling.
     #[arg(long)]
     trace: bool,
     /// Optional tracing filter (defaults to `info`).
@@ -1384,16 +1390,15 @@ fn author_role_from_rollup(
 /// `--exact` / `--case_sensitive` keep the substring scan, which is
 /// inherently a full-content pass and still checks out the branch.
 fn run_search_standalone(
+    mut repo: common::Repo,
     pile_path: &Path,
     branch_id: Id,
-    branch_name: &str,
     text: String,
     limit: usize,
     case_sensitive: bool,
     exact: bool,
 ) -> Result<()> {
     let text = load_value_or_file(&text, "search text")?;
-    let (mut repo, branch_id) = common::open_repo_for_read(pile_path, branch_id, branch_name)?;
     let res = (|| -> Result<()> {
         if exact || case_sensitive {
             return exact_scan(&mut repo, branch_id, &text, limit, case_sensitive);
@@ -1403,6 +1408,7 @@ fn run_search_standalone(
         //    (No checkout — one manifest read + a bounded number of
         //    segment blob fetches.)
         let content_attr = common::archive::content.id();
+        let index_attach_start = Instant::now();
         let reader = repo
             .storage_mut()
             .reader()
@@ -1413,6 +1419,11 @@ fn run_search_standalone(
             home.attach_all()
                 .map_err(|e| anyhow!("attach BM25 segments: {e}"))?
         };
+        tracing::info!(
+            segments = segments.len(),
+            elapsed_ms = index_attach_start.elapsed().as_millis() as u64,
+            "BM25 manifest and segments attached"
+        );
         if segments.is_empty() {
             bail!(
                 "no BM25 search segments on this pile yet — run `archive index` \
@@ -1421,41 +1432,61 @@ fn run_search_standalone(
         }
 
         // 2. Rank across the segment union (per-segment BM25; best score wins).
+        let bm25_start = Instant::now();
         let ranked = query_across(&segments, &hash_tokens(&text));
         let total_docs: usize = segments.iter().map(|s| s.doc_count()).sum();
+        tracing::info!(
+            segment_documents = total_docs,
+            hits = ranked.len(),
+            elapsed_ms = bm25_start.elapsed().as_millis() as u64,
+            "BM25 query complete"
+        );
         drop(segments);
 
-        // 3. Resolve each hit's fields via the content rollup — the
-        //    checkout-free replacement for materialising the branch.
+        // 3. Resolve the current content-rollup handle before accepting an
+        //    empty result. A new archive commit invalidates this handle, so
+        //    its absence is the cheap stale-index guard. Loading/validating
+        //    the large blob itself is deferred until a hit needs display.
+        let rollup_start = Instant::now();
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-        let Some(rollup_handle) = ws.rollup().map_err(|e| anyhow!("read branch rollup: {e:?}"))?
+        let Some(rollup_handle) = ws
+            .rollup()
+            .map_err(|e| anyhow!("read branch rollup: {e:?}"))?
         else {
             bail!(
                 "no content rollup on this pile — run `archive index` to build \
                  the checkout-free content index"
             );
         };
+        tracing::info!(
+            elapsed_ms = rollup_start.elapsed().as_millis() as u64,
+            "content rollup handle resolved"
+        );
+
+        if limit == 0 || ranked.is_empty() {
+            tracing::info!(
+                materialized = 0,
+                elapsed_ms = 0,
+                "search results materialized"
+            );
+            return Ok(());
+        }
+
+        // Resolve each hit's fields via the content rollup — the
+        // checkout-free replacement for materialising the branch.
+        let rollup_load_start = Instant::now();
         let rollup: SuccinctArchive<OrderedUniverse> = ws
             .get(rollup_handle)
             .map_err(|e| anyhow!("load content rollup: {e:?}"))?;
+        tracing::info!(
+            elapsed_ms = rollup_load_start.elapsed().as_millis() as u64,
+            "content rollup attached"
+        );
 
-        // Note if the corpus has grown past what the index covers.
-        let live = find!(
-            (m: Id),
-            pattern!(&rollup, [{
-                ?m @ common::metadata::tag: common::archive::kind_message,
-            }])
-        )
-        .count();
-        if live > total_docs {
-            eprintln!(
-                "note: {} message(s) newer than the index — run `archive index` to refresh",
-                live - total_docs
-            );
-        }
-
+        let materialize_start = Instant::now();
+        let mut materialized = 0usize;
         for (doc, score) in ranked.into_iter().take(limit) {
             let Ok(message_id): Result<Id, _> = doc.try_from_inline() else {
                 continue;
@@ -1492,13 +1523,24 @@ fn run_search_standalone(
                 },
                 snippet(&content, 120)
             );
+            materialized += 1;
         }
+        tracing::info!(
+            materialized,
+            elapsed_ms = materialize_start.elapsed().as_millis() as u64,
+            "search results materialized"
+        );
         Ok(())
     })();
 
+    let close_start = Instant::now();
     let close_result = repo
         .close()
         .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    tracing::info!(
+        elapsed_ms = close_start.elapsed().as_millis() as u64,
+        "search repository close complete"
+    );
     match (res, close_result) {
         (Err(err), _) => Err(err),
         (Ok(()), Err(err)) => Err(err),
@@ -1661,6 +1703,49 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
+    // Search owns one repository for its whole read path. Opening a fresh
+    // `Pile` rebuilds its in-memory record index, so resolving the branch in
+    // a throwaway repository and reopening for the query doubles cold-start
+    // work on archive-scale piles.
+    if let Command::Search {
+        text,
+        limit,
+        case_sensitive,
+        exact,
+    } = &cmd
+    {
+        let search_open_start = Instant::now();
+        let mut repo = common::open_repo(&pile_path)?;
+        tracing::info!(
+            elapsed_ms = search_open_start.elapsed().as_millis() as u64,
+            "search repository open complete"
+        );
+
+        let branch_resolution_start = Instant::now();
+        let branch_id = if let Some(hex) = cli.branch_id.as_deref() {
+            Id::from_hex(hex.trim()).ok_or_else(|| anyhow!("invalid branch id '{hex}'"))?
+        } else {
+            repo.ensure_branch(&cli.branch, None)
+                .map_err(|e| anyhow!("ensure archive branch: {e:?}"))?
+        };
+        common::validate_branch_for_read(&mut repo, branch_id, &cli.branch)?;
+        tracing::info!(
+            elapsed_ms = branch_resolution_start.elapsed().as_millis() as u64,
+            "search branch resolution complete"
+        );
+
+        return run_search_standalone(
+            repo,
+            &pile_path,
+            branch_id,
+            text.clone(),
+            *limit,
+            *case_sensitive,
+            *exact,
+        );
+    }
+
+    let branch_resolution_start = Instant::now();
     let branch_id = common::with_repo(&pile_path, |repo| {
         if let Some(hex) = cli.branch_id.as_deref() {
             return Id::from_hex(hex.trim())
@@ -1669,6 +1754,10 @@ fn main() -> Result<()> {
         repo.ensure_branch(&cli.branch, None)
             .map_err(|e| anyhow!("ensure archive branch: {e:?}"))
     })?;
+    tracing::info!(
+        elapsed_ms = branch_resolution_start.elapsed().as_millis() as u64,
+        "command branch resolution complete"
+    );
     if let Command::Import { source, path } = cmd {
         return run_import_jobs(source, path.as_deref(), &pile_path, &cli.branch, branch_id);
     }
@@ -1687,23 +1776,6 @@ fn main() -> Result<()> {
             limit,
             with_tools,
             persona.as_deref(),
-        );
-    }
-    if let Command::Search {
-        text,
-        limit,
-        case_sensitive,
-        exact,
-    } = cmd
-    {
-        return run_search_standalone(
-            &pile_path,
-            branch_id,
-            &cli.branch,
-            text,
-            limit,
-            case_sensitive,
-            exact,
         );
     }
     if let Command::Index = cmd {

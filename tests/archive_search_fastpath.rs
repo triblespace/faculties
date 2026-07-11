@@ -177,6 +177,27 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         "author name resolved; got:\n{stdout}"
     );
 
+    // A search process refreshes the pile record index exactly once. The
+    // trace assertion is structural rather than timing-based, so it remains
+    // stable on slow CI hosts. A zero-result-limit query also has no reason
+    // to validate/load the large content rollup used only for hit display.
+    let out = run_archive(&path, &["--trace", "search", "--limit", "0", "beta"]);
+    assert!(
+        out.status.success(),
+        "traced search failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("pile record refresh complete").count(),
+        1,
+        "search must open/refresh its pile once; trace:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("content rollup attached"),
+        "limit-zero search must not load the result rollup; trace:\n{stdout}"
+    );
+
     // ── 4. a rare term hits exactly its one document ──────────────────────
     let out = run_archive(&path, &["search", "epsilon"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -235,6 +256,48 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     assert!(
         stdout.contains("symbol delta") && !stdout.contains("symbol beta"),
         "a newer emoji scalar must be indexed too; got:\n{stdout}"
+    );
+
+    // A commit after indexing invalidates the branch rollup. Even when the
+    // stale BM25 segments return no hits, search must report that the index
+    // needs refresh rather than silently accepting an empty answer.
+    {
+        let mut pile = Pile::open(&path).expect("reopen temp pile");
+        pile.refresh().expect("refresh temp pile");
+        let mut repo = Repository::new(pile, SigningKey::generate(&mut OsRng), TribleSet::new())
+            .expect("reopen repo");
+        let mut ws = repo.pull(branch_id).expect("pull archive branch");
+        let author = *fucid();
+        let author_name = ws.put::<LongString, _>("Later Tester".to_owned());
+        let content = ws.put::<LongString, _>("postindexbeacon".to_owned());
+        let message = *fucid();
+        let when = Epoch::from_gregorian_tai(2026, 1, 1, 0, 1, 0, 0);
+        let created_at: Inline<inlineencodings::NsTAIInterval> =
+            (when, when).try_to_inline().unwrap();
+        let mut change = TribleSet::new();
+        change += entity! { ExclusiveId::force_ref(&author) @
+            metadata::tag: archive::kind_author,
+            archive::author_name: author_name,
+        };
+        change += entity! { ExclusiveId::force_ref(&message) @
+            metadata::tag: archive::kind_message,
+            archive::author: author,
+            archive::content: content,
+            metadata::created_at: created_at,
+        };
+        ws.commit(change, "append synthetic post-index message");
+        repo.push(&mut ws).expect("push post-index message");
+        repo.close().expect("close repo");
+    }
+    let out = run_archive(&path, &["search", "postindexbeacon"]);
+    assert!(
+        !out.status.success(),
+        "stale index must not silently return an empty result"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no content rollup"),
+        "stale-index diagnostic missing; stderr={stderr}"
     );
 
     let _ = std::fs::remove_file(&path);
