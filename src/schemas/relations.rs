@@ -3,7 +3,9 @@
 //! Used by `relations.rs` (the faculty CLI) and by any faculty that
 //! needs to resolve a person by label or alias (e.g. `message.rs`).
 
-use triblespace::macros::id_hex;
+use std::collections::HashSet;
+use triblespace::core::metadata;
+use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
 pub const DEFAULT_BRANCH: &str = "relations";
@@ -13,8 +15,7 @@ pub const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 /// A group is an addressable party (like a person) whose membership is a
 /// set of `group::member` edges. Sending a message to a group id delivers
 /// to every member; a watcher wakes if a message is addressed to it OR to
-/// a group it belongs to. `liora-cc` (colony broadcast) is just the
-/// all-zooids group.
+/// a group it belongs to. `liora` is the all-zooids broadcast group.
 pub const KIND_GROUP: Id = id_hex!("2CEE877C6C996CE66B4572CE8863DF04");
 
 /// Soft-retirement events. Retiring a relation is monotonic (append-only):
@@ -36,6 +37,23 @@ pub mod group {
         // Membership edge: group -> member (a person/window id). Repeated.
         "EF5B6F8429FA30D503BA8B8F3ABD5FD9" as member: inlineencodings::GenId;
     }
+}
+
+/// Return every directly-addressable group that contains `member`.
+///
+/// Message readers use this alongside the member's own id so broadcast
+/// delivery, unread state, and watcher wakeups all share the same recipient
+/// semantics.
+pub fn groups_for_member(space: &TribleSet, member: Id) -> HashSet<Id> {
+    find!(
+        group_id: Id,
+        pattern!(space, [{
+            ?group_id @
+                metadata::tag: &KIND_GROUP,
+                group::member: member,
+        }])
+    )
+    .collect()
 }
 
 pub mod relations {
@@ -73,5 +91,43 @@ pub mod relations {
         // Subject of a retire/unretire event: retirement-event -> person.
         // See KIND_RETIRE_ID / KIND_UNRETIRE_ID above.
         "C9D3F48C660DADBDBFA32F30F595415A" as subject: inlineencodings::GenId;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace::macros::entity;
+
+    #[test]
+    fn groups_for_member_requires_membership_and_group_kind() {
+        let member = ufoid().id;
+        let other_member = ufoid().id;
+        let first_group = ufoid().id;
+        let second_group = ufoid().id;
+        let non_group = ufoid().id;
+        let mut space = TribleSet::new();
+
+        space += entity! { ExclusiveId::force_ref(&first_group) @
+            metadata::tag: &KIND_GROUP,
+            group::member: member,
+        };
+        space += entity! { ExclusiveId::force_ref(&second_group) @
+            metadata::tag: &KIND_GROUP,
+            group::member: member,
+            group::member: other_member,
+        };
+        space += entity! { ExclusiveId::force_ref(&non_group) @
+            group::member: member,
+        };
+
+        assert_eq!(
+            groups_for_member(&space, member),
+            HashSet::from([first_group, second_group])
+        );
+        assert_eq!(
+            groups_for_member(&space, other_member),
+            HashSet::from([second_group])
+        );
     }
 }

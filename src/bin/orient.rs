@@ -5,11 +5,12 @@ use chrono::{
 };
 use clap::{CommandFactory, Parser, Subcommand};
 use faculties::schemas::mail::{mail, KIND_MESSAGE as KIND_MAIL_MESSAGE, KIND_SPAM};
+use faculties::schemas::message::is_inbox_message;
 use faculties::schemas::orient::{
     KIND_GOAL_ID, KIND_MESSAGE_ID, KIND_ORIENT_CHECKPOINT_ID,
     KIND_READ_ID, KIND_STATUS_ID, board, local, orient_state,
 };
-use faculties::schemas::relations::relations as rel_attrs;
+use faculties::schemas::relations::{groups_for_member, relations as rel_attrs};
 use faculties::schemas::status::{KIND_STATUS_UPDATE, status as status_attrs};
 use hifitime::Epoch;
 use std::collections::HashMap;
@@ -456,10 +457,14 @@ fn cmd_show(
                 let relations_space = relations_ws
                     .checkout(..)
                     .map_err(|e| anyhow!("checkout relations: {e:?}"))?;
+                let reader_groups = groups_for_member(&relations_space, reader_id);
 
                 let unread: Vec<&MessageRow> = all_messages
                     .iter()
-                    .filter(|msg| msg.to == reader_id && !reads.contains_key(&(msg.id, reader_id)))
+                    .filter(|msg| {
+                        is_inbox_message(msg.from, msg.to, reader_id, &reader_groups)
+                            && !reads.contains_key(&(msg.id, reader_id))
+                    })
                     .take(message_limit)
                     .collect();
 
@@ -700,20 +705,12 @@ fn load_watched_view(
     // Groups this persona belongs to — a message addressed to one of them
     // is news for the persona too (this is how broadcasts/colony work,
     // replacing the old liora-cc magic id).
-    let my_groups: std::collections::HashSet<Id> = find!(
-        gid: Id,
-        pattern!(&relations_space, [{ ?gid @
-            metadata::tag: &faculties::schemas::relations::KIND_GROUP,
-            faculties::schemas::relations::group::member: persona_id,
-        }])
-    )
-    .collect();
+    let my_groups = groups_for_member(&relations_space, persona_id);
     let unread: std::collections::BTreeSet<Id> = message_rows
         .into_iter()
         .filter(|msg| {
             // your own sends never wake you — including to a group you're in.
-            msg.from != persona_id
-                && (msg.to == persona_id || my_groups.contains(&msg.to))
+            is_inbox_message(msg.from, msg.to, persona_id, &my_groups)
                 && !reads.contains_key(&(msg.id, persona_id))
         })
         .map(|msg| msg.id)

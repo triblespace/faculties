@@ -4,9 +4,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::message::{
     DEFAULT_BRANCH, DEFAULT_RELATIONS_BRANCH, KIND_MESSAGE_ID, KIND_PERSON_ID, KIND_READ_ID,
-    KIND_SPECS, local, relations_schema,
+    KIND_SPECS, is_inbox_message, local, relations_schema,
 };
-use faculties::schemas::relations::KIND_GROUP;
+use faculties::schemas::relations::{KIND_GROUP, groups_for_member};
 use hifitime::Epoch;
 use rand_core::OsRng;
 use std::collections::{HashMap, HashSet};
@@ -524,10 +524,11 @@ fn cmd_list(
 
         let now_key = interval_key(epoch_interval(now_epoch()));
         let reader_id = resolve_person_id(&relations_space, &reader)?;
+        let reader_groups = groups_for_member(&relations_space, reader_id);
         let mut shown = 0usize;
 
         for msg in messages {
-            let incoming = msg.to == reader_id;
+            let incoming = is_inbox_message(msg.from, msg.to, reader_id, &reader_groups);
             let outgoing = msg.from == reader_id;
             if !incoming && !outgoing {
                 continue;

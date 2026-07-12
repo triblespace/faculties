@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Group broadcasts are first-class inbox messages.** `message list` and
+  `orient show` now include messages addressed to any group the reader belongs
+  to, matching `orient wait` wakeups and keeping read acknowledgements scoped
+  to the individual reader.
 - **Widgets are enabled by default.** A stock `cargo build`, `cargo test`, or
   `cargo install --bins` now includes the GORBIE viewer/capture surface, so the
   shipped widget examples compile in the default configuration. Use
