@@ -3,14 +3,17 @@
 //! Builds a fresh temporary pile with a handful of synthetic archive
 //! messages, then drives the REAL `archive` binary:
 //!
-//! 1. `archive search` before `archive index` errors (no segments yet).
+//! 1. `archive list` and `archive search` before `archive index` error rather
+//!    than checking out the raw archive.
 //! 2. `archive index` replays source commits into Succinct + BM25 LSM leaves.
-//! 3. `archive search <term>` returns exactly the messages whose content
+//! 3. `archive list --limit N` returns the newest N messages from the
+//!    Succinct union, with bounded selection memory and no source checkout.
+//! 4. `archive search <term>` returns exactly the messages whose content
 //!    contains `<term>`, BM25-ranked, with each hit's author + content
 //!    snippet resolved through the cross-segment Succinct union and per-hit
 //!    blob gets, with NO full `ws.checkout(..)` of the branch on the query
 //!    path.
-//! 4. Standalone and repeated Unicode symbols are regular indexed terms,
+//! 5. Standalone and repeated Unicode symbols are regular indexed terms,
 //!    not an accidental request for the archive-scale exact scan.
 //!
 //! The exact ranking equivalence to the old monolithic index is proven
@@ -165,7 +168,21 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         repo.close().expect("close");
     }
 
-    // ── 1. search before index: no segments yet → clean error ─────────────
+    // ── 1. indexed reads before index: clean errors, never raw fallback ───
+    let out = run_archive(&path, &["list", "--limit", "1"]);
+    assert!(
+        !out.status.success(),
+        "list before index must fail instead of checking out raw history; stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Succinct index")
+            && stderr.contains("stale")
+            && stderr.contains("archive index"),
+        "expected stale Succinct coverage hint, got: {stderr}"
+    );
+
     let out = run_archive(&path, &["search", "beta"]);
     assert!(
         !out.status.success(),
@@ -189,6 +206,32 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     assert!(
         stdout.contains("Succinct and BM25 indexes now cover HEAD"),
         "index summary: {stdout}"
+    );
+
+    // List attaches the certified Succinct snapshot, keeps only the newest
+    // two records, then fetches blobs for those winners. Fixture timestamps
+    // increase with the document ordinal, so H and G win and F is excluded.
+    let out = run_archive(&path, &["list", "--limit", "2"]);
+    assert!(
+        out.status.success(),
+        "indexed list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("symbol delta 🪐") && stdout.contains("symbol gamma 🔭"),
+        "list must return the two newest messages; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("symbol beta 🧭"),
+        "list limit must exclude the third-newest message; got:\n{stdout}"
+    );
+
+    let out = run_archive(&path, &["list", "--limit", "0"]);
+    assert!(
+        out.status.success() && out.stdout.is_empty(),
+        "zero-limit list must validate the index but emit nothing; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
     // The uncertified legacy segment was replaced, not retained beside the
@@ -420,6 +463,16 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         stderr.contains("BM25 index") && stderr.contains("stale"),
         "stale-index diagnostic missing; stderr={stderr}"
     );
+    let out = run_archive(&path, &["list", "--limit", "1"]);
+    assert!(
+        !out.status.success(),
+        "stale list must fail instead of returning old indexed or new raw data"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Succinct index") && stderr.contains("stale"),
+        "stale-list diagnostic missing; stderr={stderr}"
+    );
 
     // Repair walks only the uncovered commit, then the new message is
     // searchable through the two-segment unions.
@@ -438,6 +491,16 @@ fn bm25_fast_path_resolves_content_without_checkout() {
     assert!(
         String::from_utf8_lossy(&out.stdout).contains("postindexbeacon"),
         "repaired commit must be searchable"
+    );
+    let out = run_archive(&path, &["list", "--limit", "2"]);
+    assert!(
+        out.status.success(),
+        "list after repair failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("postindexbeacon"),
+        "repaired recent message must be listable through the Succinct union"
     );
 
     // A completed rerun is a true no-op: it appends no duplicate corpus and
@@ -487,6 +550,14 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         assert!(manifest.covers_head(repo.pull(branch_id).expect("pull source").head()));
         manifest.adopt_segment(Inline::<Handle<UnknownBlob>>::new([0xB6; 32]), 0);
         replace_manifest(&mut head_set, kind_id, &manifest);
+
+        let succinct_kind = SuccinctRollup::new();
+        let succinct_kind_id = succinct_kind.kind_id();
+        let mut succinct_manifest = Manifest::from_tribles(&head_set, succinct_kind_id);
+        assert!(succinct_manifest.covers_head(repo.pull(branch_id).expect("pull source").head()));
+        succinct_manifest.adopt_segment(Inline::<Handle<UnknownBlob>>::new([0xB7; 32]), 0);
+        replace_manifest(&mut head_set, succinct_kind_id, &succinct_manifest);
+
         let new_head: Inline<Handle<SimpleArchive>> = repo
             .storage_mut()
             .put(head_set)
@@ -499,6 +570,17 @@ fn bm25_fast_path_resolves_content_without_checkout() {
         ));
         repo.close().expect("close corrupt-manifest repo");
     }
+    let out = run_archive(&path, &["list", "--limit", "1"]);
+    assert!(
+        !out.status.success(),
+        "list must not fall back to raw history when a certified segment is missing"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("attach Succinct segments"),
+        "missing-segment list diagnostic: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     let out = run_archive(&path, &["index"]);
     assert!(
         out.status.success(),

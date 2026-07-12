@@ -1,6 +1,6 @@
-
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::{Ordering as CmpOrdering, Reverse};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::io::{BufRead, Read};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -708,7 +708,7 @@ enum Command {
         /// Optional path override for this source (or backup root for `all`).
         path: Option<PathBuf>,
     },
-    /// List the most recent messages.
+    /// List the most recent messages through the Succinct index.
     List {
         #[arg(long, default_value_t = 50)]
         limit: usize,
@@ -721,19 +721,12 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
-    /// Search message content (BM25-ranked via the index; see `--exact`).
+    /// Search message content through the BM25 and Succinct indexes.
     Search {
         #[arg(help = "Query text. Use @path for file input or @- for stdin.")]
         text: String,
         #[arg(long, default_value_t = 50)]
         limit: usize,
-        /// Use case-sensitive matching (implies --exact).
-        #[arg(long)]
-        case_sensitive: bool,
-        /// Exact substring scan over every message blob instead of the
-        /// BM25 index — slow at archive scale, but needs no index.
-        #[arg(long)]
-        exact: bool,
     },
     /// Build or repair the Succinct and BM25 LSM indexes.
     /// Replays only uncovered commits and checkpoints after each one, so an
@@ -1043,6 +1036,35 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
 fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
     let (lower, _upper): (Epoch, Epoch) = interval.try_from_inline().unwrap();
     lower.to_tai_duration().total_nanoseconds()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecentMessage {
+    key: i128,
+    message_id: Id,
+    author_id: Id,
+    content_handle: Inline<Handle<LongString>>,
+    created_at: Inline<NsTAIInterval>,
+}
+
+impl PartialEq for RecentMessage {
+    fn eq(&self, other: &Self) -> bool {
+        (self.key, self.message_id) == (other.key, other.message_id)
+    }
+}
+
+impl Eq for RecentMessage {}
+
+impl PartialOrd for RecentMessage {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RecentMessage {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        (self.key, self.message_id).cmp(&(other.key, other.message_id))
+    }
 }
 
 fn load_longstring(
@@ -1717,8 +1739,156 @@ fn author_role_from_index<P: TriblePattern>(
     Ok(Some(load_longstring(ws, handle)?))
 }
 
+/// Read one immutable branch-pin snapshot and its source commit HEAD.
+///
+/// Index coverage and segment handles must be interpreted against the same
+/// branch metadata tribles. Rereading the mutable pin between those checks
+/// would admit a stale index if a writer advanced the source concurrently.
+fn read_archive_branch_snapshot(
+    repo: &mut common::Repo,
+    branch_id: Id,
+) -> Result<(TribleSet, Option<Inline<Handle<SimpleArchive>>>)> {
+    let branch_meta_handle = repo
+        .storage_mut()
+        .head(branch_id)
+        .map_err(|e| anyhow!("read archive branch head: {e:?}"))?
+        .ok_or_else(|| anyhow!("archive branch is missing"))?;
+    let branch_reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow!("open branch metadata reader: {e:?}"))?;
+    let branch_meta: TribleSet = branch_reader
+        .get(branch_meta_handle)
+        .map_err(|e| anyhow!("load archive branch metadata: {e:?}"))?;
+    let source_head = find!(
+        (head: Inline<Handle<SimpleArchive>>),
+        pattern!(&branch_meta, [{ _?branch @ triblespace::core::repo::head: ?head }])
+    )
+    .at_most_one()
+    .map_err(|_| anyhow!("archive branch metadata has ambiguous source HEADs"))?
+    .map(|(head,)| head);
+    Ok((branch_meta, source_head))
+}
+
+/// List recent messages from the certified Succinct LSM snapshot.
+///
+/// This path deliberately has no raw-repository fallback. It retains only the
+/// newest `limit` records while scanning the compact index, so `--limit`
+/// bounds result-selection memory even though the current index has no
+/// chronological range cursor yet. Message and author blobs are fetched only
+/// for the selected rows.
+fn run_list_standalone(
+    mut repo: common::Repo,
+    pile_path: &Path,
+    branch_id: Id,
+    limit: usize,
+) -> Result<()> {
+    let res = (|| -> Result<()> {
+        let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
+        let kind = SuccinctRollup::new();
+        let manifest = Manifest::from_tribles(&branch_meta, kind.kind_id());
+        if !manifest.covers_head(source_head) {
+            bail!(
+                "Succinct index {} is stale at {:?}, source HEAD is {:?}; run `archive index`",
+                SuccinctRollup::KIND_ID_HEX,
+                manifest.covered,
+                source_head
+            );
+        }
+        if manifest.segments.is_empty() {
+            bail!("no Succinct archive segments on this pile yet — run `archive index`");
+        }
+
+        let attach_start = Instant::now();
+        let segments = {
+            let mut home = IndexHome::new(repo.storage_mut(), branch_id, kind);
+            home.attach_manifest(&manifest)
+                .map_err(|e| anyhow!("attach Succinct segments: {e}"))?
+        };
+        tracing::info!(
+            segments = segments.len(),
+            elapsed_ms = attach_start.elapsed().as_millis() as u64,
+            "Succinct manifest and segments attached"
+        );
+        let succinct = SuccinctRollup::union(&segments);
+
+        let select_start = Instant::now();
+        let mut scanned = 0usize;
+        let mut recent = BinaryHeap::new();
+        if limit != 0 {
+            for (message_id, author_id, content_handle, created_at) in find!(
+                (
+                    message: Id,
+                    author: Id,
+                    content: Inline<Handle<LongString>>,
+                    created_at: Inline<NsTAIInterval>
+                ),
+                pattern!(&succinct, [{
+                    ?message @
+                        common::metadata::tag: common::archive::kind_message,
+                        common::archive::author: ?author,
+                        common::archive::content: ?content,
+                        common::metadata::created_at: ?created_at,
+                }])
+            ) {
+                scanned += 1;
+                recent.push(Reverse(RecentMessage {
+                    key: interval_key(created_at),
+                    message_id,
+                    author_id,
+                    content_handle,
+                    created_at,
+                }));
+                if recent.len() > limit {
+                    recent.pop();
+                }
+            }
+        }
+        let mut records: Vec<_> = recent.into_iter().map(|Reverse(record)| record).collect();
+        records.sort_unstable_by(|a, b| b.cmp(a));
+        tracing::info!(
+            scanned,
+            selected = records.len(),
+            elapsed_ms = select_start.elapsed().as_millis() as u64,
+            "recent archive messages selected"
+        );
+
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull workspace for blob reads: {e:?}"))?;
+        for record in records {
+            let name = author_name_from_index(&mut ws, &succinct, record.author_id)?;
+            let role = author_role_from_index(&mut ws, &succinct, record.author_id)?;
+            let content = load_longstring(&mut ws, record.content_handle)?;
+            let (lower, _upper): (Epoch, Epoch) = record.created_at.try_from_inline().unwrap();
+            let role = role.as_deref().unwrap_or("");
+            println!(
+                "{} {} {} {}",
+                &format!("{:x}", record.message_id)[..8],
+                lower,
+                if role.is_empty() {
+                    name
+                } else {
+                    format!("{name} ({role})")
+                },
+                snippet(&content, 120)
+            );
+        }
+        Ok(())
+    })();
+
+    let close_result = repo
+        .close()
+        .map_err(|e| anyhow!("close pile {}: {e:?}", pile_path.display()));
+    match (res, close_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 /// Search is dispatched standalone so the fast BM25 path never pays the
-/// full-branch `ws.checkout(..)` the other read commands do.
+/// full-branch `ws.checkout(..)` the remaining read commands do.
 ///
 /// Fast path (default / BM25): attach the branch-head BM25 and Succinct
 /// index-home segments, require both coverage certificates to equal the source
@@ -1726,45 +1896,19 @@ fn author_role_from_index<P: TriblePattern>(
 /// cross-segment Succinct union. No checkout or monolithic content rollup is
 /// involved.
 ///
-/// `--exact` / `--case_sensitive` keep the substring scan, which is
-/// inherently a full-content pass and still checks out the branch.
 fn run_search_standalone(
     mut repo: common::Repo,
     pile_path: &Path,
     branch_id: Id,
     text: String,
     limit: usize,
-    case_sensitive: bool,
-    exact: bool,
 ) -> Result<()> {
     let text = load_value_or_file(&text, "search text")?;
     let res = (|| -> Result<()> {
-        if exact || case_sensitive {
-            return exact_scan(&mut repo, branch_id, &text, limit, case_sensitive);
-        }
-
         // Read the mutable branch pin exactly once. The source HEAD and both
         // manifests below are therefore one consistent snapshot; attaching a
         // manifest never races by rereading the pin.
-        let branch_meta_handle = repo
-            .storage_mut()
-            .head(branch_id)
-            .map_err(|e| anyhow!("read archive branch head: {e:?}"))?
-            .ok_or_else(|| anyhow!("archive branch is missing"))?;
-        let branch_reader = repo
-            .storage_mut()
-            .reader()
-            .map_err(|e| anyhow!("open branch metadata reader: {e:?}"))?;
-        let branch_meta: TribleSet = branch_reader
-            .get(branch_meta_handle)
-            .map_err(|e| anyhow!("load archive branch metadata: {e:?}"))?;
-        let source_head = find!(
-            (head: Inline<Handle<SimpleArchive>>),
-            pattern!(&branch_meta, [{ _?branch @ triblespace::core::repo::head: ?head }])
-        )
-        .at_most_one()
-        .map_err(|_| anyhow!("archive branch metadata has ambiguous source HEADs"))?
-        .map(|(head,)| head);
+        let (branch_meta, source_head) = read_archive_branch_snapshot(&mut repo, branch_id)?;
 
         // Parse and validate both coverage certificates before touching any
         // segment blob. A stale manifest may contain obsolete or missing
@@ -1797,10 +1941,7 @@ fn run_search_standalone(
             );
         }
         if bm25_manifest.segments.is_empty() {
-            bail!(
-                "no BM25 search segments on this pile yet — run `archive index` \
-                 first, or use --exact for a substring scan"
-            );
+            bail!("no BM25 search segments on this pile yet — run `archive index`");
         }
         if succinct_manifest.segments.is_empty() {
             bail!("no Succinct archive segments on this pile yet — run `archive index`");
@@ -1917,74 +2058,6 @@ fn run_search_standalone(
         (Ok(()), Err(err)) => Err(err),
         (Ok(()), Ok(())) => Ok(()),
     }
-}
-
-/// Substring / case-sensitive scan fallback — inherently a full-content
-/// pass, so it still checks out the branch. Slow at archive scale but
-/// needs no index.
-fn exact_scan(
-    repo: &mut common::Repo,
-    branch_id: Id,
-    text: &str,
-    limit: usize,
-    case_sensitive: bool,
-) -> Result<()> {
-    let mut ws = repo
-        .pull(branch_id)
-        .map_err(|e| anyhow!("pull workspace: {e:?}"))?;
-    let catalog = ws.checkout(..).context("checkout workspace")?;
-
-    let needle = if case_sensitive {
-        text.to_string()
-    } else {
-        text.to_lowercase()
-    };
-
-    let mut matches = Vec::new();
-    for (message_id, author_id, content_handle, created_at) in find!(
-        (
-            message: Id,
-            author: Id,
-            content: Inline<Handle<LongString>>,
-            created_at: Inline<NsTAIInterval>
-        ),
-        pattern!(&catalog, [{
-            ?message @
-                common::metadata::tag: common::archive::kind_message,
-                common::archive::author: ?author,
-                common::archive::content: ?content,
-                common::metadata::created_at: ?created_at,
-        }])
-    ) {
-        let content = load_longstring(&mut ws, content_handle)?;
-        let haystack = if case_sensitive {
-            content.clone()
-        } else {
-            content.to_lowercase()
-        };
-        if haystack.contains(&needle) {
-            matches.push((interval_key(created_at), message_id, author_id, created_at, content));
-        }
-    }
-    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    for (_key, message_id, author_id, created_at, content) in matches.into_iter().rev().take(limit) {
-        let name = author_name(&mut ws, &catalog, author_id)?;
-        let role = author_role(&mut ws, &catalog, author_id)?;
-        let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
-        let role = role.as_deref().unwrap_or("");
-        println!(
-            "{} {} {} {}",
-            &format!("{message_id:x}")[..8],
-            lower,
-            if role.is_empty() {
-                name
-            } else {
-                format!("{name} ({role})")
-            },
-            snippet(&content, 120)
-        );
-    }
-    Ok(())
 }
 
 fn remove_legacy_rollup(set: &mut TribleSet) -> bool {
@@ -2710,22 +2783,22 @@ fn main() -> Result<()> {
         return Ok(());
     };
 
-    // Search owns one repository for its whole read path. Opening a fresh
+    // Indexed reads own one repository for their whole path. Opening a fresh
     // `Pile` rebuilds its in-memory record index, so resolving the branch in
     // a throwaway repository and reopening for the query doubles cold-start
     // work on archive-scale piles.
-    if let Command::Search {
-        text,
-        limit,
-        case_sensitive,
-        exact,
-    } = &cmd
-    {
-        let search_open_start = Instant::now();
+    let standalone_read = match &cmd {
+        Command::List { .. } => Some("list"),
+        Command::Search { .. } => Some("search"),
+        _ => None,
+    };
+    if let Some(operation) = standalone_read {
+        let open_start = Instant::now();
         let mut repo = common::open_repo(&pile_path)?;
         tracing::info!(
-            elapsed_ms = search_open_start.elapsed().as_millis() as u64,
-            "search repository open complete"
+            operation,
+            elapsed_ms = open_start.elapsed().as_millis() as u64,
+            "indexed-read repository open complete"
         );
 
         let branch_resolution_start = Instant::now();
@@ -2737,19 +2810,18 @@ fn main() -> Result<()> {
         };
         common::validate_branch_for_read(&mut repo, branch_id, &cli.branch)?;
         tracing::info!(
+            operation,
             elapsed_ms = branch_resolution_start.elapsed().as_millis() as u64,
-            "search branch resolution complete"
+            "indexed-read branch resolution complete"
         );
 
-        return run_search_standalone(
-            repo,
-            &pile_path,
-            branch_id,
-            text.clone(),
-            *limit,
-            *case_sensitive,
-            *exact,
-        );
+        return match &cmd {
+            Command::List { limit } => run_list_standalone(repo, &pile_path, branch_id, *limit),
+            Command::Search { text, limit } => {
+                run_search_standalone(repo, &pile_path, branch_id, text.clone(), *limit)
+            }
+            _ => unreachable!("standalone read dispatch changed after classification"),
+        };
     }
 
     let branch_resolution_start = Instant::now();
@@ -2799,53 +2871,8 @@ fn main() -> Result<()> {
 
         match cmd {
             Command::Import { .. } => unreachable!("import is handled before opening the branch"),
-            Command::List { limit } => {
-                let mut records = Vec::new();
-                for (message_id, author_id, content_handle, created_at) in find!(
-                    (
-                        message: Id,
-                        author: Id,
-                        content: Inline<Handle<LongString>>,
-                        created_at: Inline<NsTAIInterval>
-                    ),
-                    pattern!(&catalog, [{
-                        ?message @
-                            common::metadata::tag: common::archive::kind_message,
-                            common::archive::author: ?author,
-                            common::archive::content: ?content,
-                            common::metadata::created_at: ?created_at,
-                    }])
-                ) {
-                    records.push((
-                        interval_key(created_at),
-                        message_id,
-                        author_id,
-                        content_handle,
-                        created_at,
-                    ));
-                }
-                records.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                let take = limit.min(records.len());
-                for (_key, message_id, author_id, content_handle, created_at) in
-                    records.into_iter().rev().take(take)
-                {
-                    let name = author_name(&mut ws, &catalog, author_id)?;
-                    let role = author_role(&mut ws, &catalog, author_id)?;
-                    let content = load_longstring(&mut ws, content_handle)?;
-                    let (lower, _upper): (Epoch, Epoch) = created_at.try_from_inline().unwrap();
-                    let role = role.as_deref().unwrap_or("");
-                    println!(
-                        "{} {} {} {}",
-                        &format!("{message_id:x}")[..8],
-                        lower,
-                        if role.is_empty() {
-                            name
-                        } else {
-                            format!("{name} ({role})")
-                        },
-                        snippet(&content, 120)
-                    );
-                }
+            Command::List { .. } => {
+                unreachable!("indexed list is handled before the raw checkout path")
             }
             Command::Show { id } => {
                 let message_id = resolve_message_id(&catalog, &id)?;
