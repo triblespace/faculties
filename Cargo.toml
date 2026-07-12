@@ -125,7 +125,7 @@ imagine = ["dep:mary", "mary/flux", "dep:image"]
 voice = ["dep:mary", "mary/speak"]
 # Opt-in WGPU acceleration for large SuccinctArchive LSM carries. The normal
 # archive binary remains GPU-free; enabling this feature selects the reusable
-# CubeCL 0.9 WGPU backend with canonical CPU fallback.
+# shared CubeCL 0.10 WGPU backend with canonical CPU fallback.
 gpu-succinct = ["dep:triblespace-gpu", "triblespace-gpu/wgpu"]
 
 [dependencies]
