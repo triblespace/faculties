@@ -269,9 +269,16 @@ fn collect_messages(conv_id: &str, records: &[JsonValue]) -> Vec<MessageRecord> 
         
         let (role, author) = match source {
             "USER_EXPLICIT" | "USER_INPUT" => ("user", "user"),
-            "MODEL" => ("assistant", "assistant"),
+            "MODEL" => {
+                if t == "PLANNER_RESPONSE" {
+                    ("assistant", "assistant")
+                } else {
+                    // Tool responses in Antigravity are source=MODEL, type=TOOL_NAME
+                    ("system", "system")
+                }
+            },
             "SYSTEM" => {
-                if t == "TOOL_CALL" || t == "TOOL_RESPONSE" {
+                if t == "TOOL_CALL" || t == "TOOL_RESPONSE" || t == "SYSTEM_MESSAGE" {
                     ("system", "system")
                 } else {
                     continue;
