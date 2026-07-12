@@ -29,6 +29,10 @@ All notable changes to this project will be documented in this file.
   validates BM25 + Succinct coverage from one branch-head snapshot before any
   attachment and reads the succinct segments only when lexical hits need
   materialising; the legacy monolithic rollup is no longer rebuilt or consulted.
+  A dedicated archive build can opt large Succinct carries into the reusable
+  WGPU backend with `--no-default-features --features gpu-succinct`; the normal
+  build stays GPU-free, canonical segment bytes are shared, and returned
+  accelerator errors retry on CPU before any manifest replacement.
 - **Archive and memory BM25 search can retrieve standalone Unicode
   symbols.** The shared tokenizer now indexes non-ASCII symbol graphemes,
   so queries such as emoji take the normal indexed path instead of yielding
