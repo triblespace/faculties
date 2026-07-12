@@ -15,8 +15,10 @@ use tracing::info_span;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 use triblespace::core::repo::index_home::{
-    clear_manifest, set_coverage, IndexHome, IndexKind, Manifest, SuccinctRollup,
+    clear_manifest, replace_manifest, set_coverage, IndexHome, IndexKind, Manifest,
+    SuccinctRollup,
 };
+use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{
     ancestors, commits_topological, difference, CommitSelector, PushResult,
 };
@@ -739,6 +741,8 @@ enum Command {
     /// Build or repair the Succinct and BM25 LSM indexes.
     /// Replays only uncovered commits and checkpoints after each one, so an
     /// interrupted run resumes without rebuilding already-covered history.
+    /// Legacy Succinct segments are upgraded in place to persisted Rank9
+    /// sidecars, one manifest checkpoint at a time, without replaying facts.
     Index {
         /// Maximum source commits being prepared or waiting for ordered
         /// publication. Defaults to the square root of the active Rayon
@@ -2530,6 +2534,412 @@ mod prebuilt_leaf_parity_tests {
     }
 }
 
+/// Validate a manifest without retaining every attached segment at once.
+///
+/// Legacy Succinct attachments build Rank9 directories in heap. Keeping the
+/// complete forest alive merely to answer "is it readable?" would duplicate
+/// the migration's peak working set, so validation deliberately drops each
+/// attachment before loading the next segment.
+fn validate_manifest_segments<K>(
+    storage: &mut Pile,
+    manifest: &Manifest,
+    kind: &K,
+) -> Result<()>
+where
+    K: IndexKind,
+{
+    let reader = storage
+        .reader()
+        .map_err(|err| anyhow!("open index validation reader: {err:?}"))?;
+    for entry in &manifest.segments {
+        let blob = reader.get(entry.blob).map_err(|err| {
+            anyhow!(
+                "load index segment level {} seq {}: {err:?}",
+                entry.level,
+                entry.seq
+            )
+        })?;
+        kind.try_attach(blob).map_err(|err| {
+            anyhow!(
+                "attach index segment level {} seq {}: {err}",
+                entry.level,
+                entry.seq
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Rewrite immutable segments one at a time and checkpoint each replacement
+/// with the branch pin's ordinary compare-and-swap.
+///
+/// The replacement blob is stored before the new branch metadata is
+/// published. An interruption can therefore leave an unreferenced blob for a
+/// later reachability compaction, but can never leave a manifest pointing at
+/// a partial payload. A rerun reads the already-checkpointed manifest and
+/// skips every unchanged segment.
+fn rewrite_manifest_segments_checkpointed<F>(
+    storage: &mut Pile,
+    branch_id: Id,
+    branch_meta_handle: &mut Inline<Handle<SimpleArchive>>,
+    branch_meta: &mut TribleSet,
+    kind: Id,
+    mut rewrite: F,
+) -> Result<usize>
+where
+    F: FnMut(
+        Blob<triblespace::core::blob::encodings::UnknownBlob>,
+    ) -> Result<(
+        Blob<triblespace::core::blob::encodings::UnknownBlob>,
+        bool,
+    )>,
+{
+    let mut manifest = Manifest::from_tribles(branch_meta, kind);
+    let segment_count = manifest.segments.len();
+    let mut rewritten = 0usize;
+
+    for position in 0..segment_count {
+        let entry = manifest.segments[position];
+        let blob: Blob<triblespace::core::blob::encodings::UnknownBlob> = storage
+            .reader()
+            .map_err(|err| anyhow!("open segment migration reader: {err:?}"))?
+            .get(entry.blob)
+            .map_err(|err| {
+                anyhow!(
+                    "load index segment level {} seq {}: {err:?}",
+                    entry.level,
+                    entry.seq
+                )
+            })?;
+        let (replacement, changed) = rewrite(blob).with_context(|| {
+            format!(
+                "rewrite index segment level {} seq {}",
+                entry.level, entry.seq
+            )
+        })?;
+        if !changed {
+            continue;
+        }
+
+        let replacement_handle = storage
+            .put(replacement)
+            .map_err(|err| anyhow!("store rewritten index segment: {err:?}"))?;
+        if replacement_handle == entry.blob {
+            bail!(
+                "segment rewriter reported a change for unchanged level {} seq {}",
+                entry.level,
+                entry.seq
+            );
+        }
+        manifest.segments[position].blob = replacement_handle;
+        replace_manifest(branch_meta, kind, &manifest);
+
+        let new_meta: Inline<Handle<SimpleArchive>> = storage
+            .put(branch_meta.clone())
+            .map_err(|err| anyhow!("store rewritten index manifest: {err:?}"))?;
+        match storage
+            .update(branch_id, Some(*branch_meta_handle), Some(new_meta))
+            .map_err(|err| anyhow!("publish rewritten index manifest: {err:?}"))?
+        {
+            PushResult::Success() => {
+                *branch_meta_handle = new_meta;
+                // The blob and metadata puts must be durable before this pin
+                // replacement is advertised as a resumable checkpoint.
+                storage
+                    .flush()
+                    .map_err(|err| anyhow!("flush rewritten index checkpoint: {err:?}"))?;
+            }
+            PushResult::Conflict(_) => {
+                bail!(
+                    "archive branch changed during segment migration; rerun to resume from the last checkpoint"
+                )
+            }
+        }
+
+        rewritten += 1;
+        eprintln!(
+            "  …rewrote segment {}/{} (level {}, seq {}) and checkpointed it",
+            position + 1,
+            segment_count,
+            entry.level,
+            entry.seq
+        );
+    }
+
+    Ok(rewritten)
+}
+
+#[cfg(test)]
+mod rank9_manifest_migration_tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use anybytes::Bytes;
+    use triblespace::core::blob::encodings::UnknownBlob;
+
+    use super::*;
+
+    fn temp_pile() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "archive-rank9-manifest-migration-{}-{nanos}.pile",
+            std::process::id()
+        ))
+    }
+
+    fn put_unknown(pile: &mut Pile, payload: &[u8]) -> Inline<Handle<UnknownBlob>> {
+        pile.put(Blob::<UnknownBlob>::new(Bytes::from_source(
+            payload.to_vec(),
+        )))
+        .unwrap()
+    }
+
+    fn payloads_by_seq(
+        pile: &mut Pile,
+        head: &TribleSet,
+        kind: Id,
+    ) -> Vec<(u64, u64, Vec<u8>)> {
+        let reader = pile.reader().unwrap();
+        Manifest::from_tribles(head, kind)
+            .segments
+            .into_iter()
+            .map(|entry| {
+                let blob: Blob<UnknownBlob> = reader.get(entry.blob).unwrap();
+                (entry.level, entry.seq, blob.bytes.as_ref().to_vec())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn segment_rewrite_checkpoints_resume_and_preserve_manifest_state() {
+        let path = temp_pile();
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let branch_id = *fucid();
+        let kind = *fucid();
+        let other_kind = *fucid();
+
+        let old_zero = put_unknown(&mut pile, b"old-zero");
+        let already_new = put_unknown(&mut pile, b"new-one");
+        let old_two = put_unknown(&mut pile, b"old-two");
+        let other_blob = put_unknown(&mut pile, b"other-kind");
+        let covered: Inline<Handle<SimpleArchive>> = pile.put(TribleSet::new()).unwrap();
+
+        let mut manifest = Manifest::default();
+        manifest.adopt_segment(old_zero, 0);
+        manifest.adopt_segment(already_new, 2);
+        manifest.adopt_segment(old_two, 0);
+        manifest.set_covered(vec![covered]);
+        let expected_shape: Vec<_> = manifest
+            .segments
+            .iter()
+            .map(|entry| (entry.level, entry.seq))
+            .collect();
+
+        let mut other_manifest = Manifest::default();
+        other_manifest.adopt_segment(other_blob, 7);
+        other_manifest.set_covered(vec![covered]);
+        let expected_other = other_manifest.to_tribles(other_kind);
+
+        let mut branch_meta = manifest.to_tribles(kind);
+        branch_meta += expected_other.clone();
+        let mut branch_meta_handle: Inline<Handle<SimpleArchive>> =
+            pile.put(branch_meta.clone()).unwrap();
+        assert!(matches!(
+            pile.update(branch_id, None, Some(branch_meta_handle)).unwrap(),
+            PushResult::Success()
+        ));
+
+        let mut old_seen = 0usize;
+        let interrupted = rewrite_manifest_segments_checkpointed(
+            &mut pile,
+            branch_id,
+            &mut branch_meta_handle,
+            &mut branch_meta,
+            kind,
+            |blob| {
+                if !blob.bytes.as_ref().starts_with(b"old-") {
+                    return Ok((blob, false));
+                }
+                old_seen += 1;
+                if old_seen == 2 {
+                    bail!("synthetic interruption");
+                }
+                let mut bytes = blob.bytes.as_ref().to_vec();
+                bytes[..3].copy_from_slice(b"new");
+                Ok((
+                    Blob::<UnknownBlob>::new(Bytes::from_source(bytes)),
+                    true,
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{interrupted:#}").contains("synthetic interruption"));
+        assert_eq!(pile.head(branch_id).unwrap(), Some(branch_meta_handle));
+        let landed_after_interruption: TribleSet = pile
+            .reader()
+            .unwrap()
+            .get(branch_meta_handle)
+            .unwrap();
+        assert_eq!(landed_after_interruption, branch_meta);
+
+        // Resume from the durable branch state rather than the helper's
+        // in-memory copies.
+        pile.close().unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        branch_meta_handle = pile.head(branch_id).unwrap().unwrap();
+        branch_meta = pile
+            .reader()
+            .unwrap()
+            .get(branch_meta_handle)
+            .unwrap();
+        assert_eq!(
+            payloads_by_seq(&mut pile, &branch_meta, kind),
+            vec![
+                (0, 0, b"new-zero".to_vec()),
+                (0, 2, b"old-two".to_vec()),
+                (2, 1, b"new-one".to_vec()),
+            ]
+        );
+
+        let resumed = rewrite_manifest_segments_checkpointed(
+            &mut pile,
+            branch_id,
+            &mut branch_meta_handle,
+            &mut branch_meta,
+            kind,
+            |blob| {
+                if !blob.bytes.as_ref().starts_with(b"old-") {
+                    return Ok((blob, false));
+                }
+                let mut bytes = blob.bytes.as_ref().to_vec();
+                bytes[..3].copy_from_slice(b"new");
+                Ok((
+                    Blob::<UnknownBlob>::new(Bytes::from_source(bytes)),
+                    true,
+                ))
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed, 1);
+
+        let final_manifest = Manifest::from_tribles(&branch_meta, kind);
+        assert_eq!(
+            final_manifest
+                .segments
+                .iter()
+                .map(|entry| (entry.level, entry.seq))
+                .collect::<Vec<_>>(),
+            expected_shape
+        );
+        assert_eq!(final_manifest.covered, vec![covered]);
+        assert_eq!(
+            Manifest::from_tribles(&branch_meta, other_kind).to_tribles(other_kind),
+            expected_other
+        );
+        assert_eq!(
+            payloads_by_seq(&mut pile, &branch_meta, kind),
+            vec![
+                (0, 0, b"new-zero".to_vec()),
+                (0, 2, b"new-two".to_vec()),
+                (2, 1, b"new-one".to_vec()),
+            ]
+        );
+
+        let head_before_idempotent_rerun = branch_meta_handle;
+        let length_before_idempotent_rerun = std::fs::metadata(&path).unwrap().len();
+        let unchanged = rewrite_manifest_segments_checkpointed(
+            &mut pile,
+            branch_id,
+            &mut branch_meta_handle,
+            &mut branch_meta,
+            kind,
+            |blob| Ok((blob, false)),
+        )
+        .unwrap();
+        assert_eq!(unchanged, 0);
+        assert_eq!(branch_meta_handle, head_before_idempotent_rerun);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            length_before_idempotent_rerun
+        );
+
+        pile.close().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn segment_rewrite_conflict_never_publishes_the_candidate_manifest() {
+        let path = temp_pile();
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let branch_id = *fucid();
+        let kind = *fucid();
+        let concurrent_kind = *fucid();
+
+        let old_blob = put_unknown(&mut pile, b"old-segment");
+        let mut manifest = Manifest::default();
+        manifest.adopt_segment(old_blob, 3);
+        let mut branch_meta = manifest.to_tribles(kind);
+        let mut branch_meta_handle: Inline<Handle<SimpleArchive>> =
+            pile.put(branch_meta.clone()).unwrap();
+        assert!(matches!(
+            pile.update(branch_id, None, Some(branch_meta_handle)).unwrap(),
+            PushResult::Success()
+        ));
+
+        let mut concurrent = Pile::open(&path).unwrap();
+        let concurrent_blob = put_unknown(&mut concurrent, b"concurrent-segment");
+        let mut concurrent_manifest = Manifest::default();
+        concurrent_manifest.adopt_segment(concurrent_blob, 9);
+        let mut concurrent_meta = branch_meta.clone();
+        concurrent_meta += concurrent_manifest.to_tribles(concurrent_kind);
+        let concurrent_head: Inline<Handle<SimpleArchive>> =
+            concurrent.put(concurrent_meta.clone()).unwrap();
+        let expected_old_head = branch_meta_handle;
+
+        let conflict = rewrite_manifest_segments_checkpointed(
+            &mut pile,
+            branch_id,
+            &mut branch_meta_handle,
+            &mut branch_meta,
+            kind,
+            |blob| {
+                assert!(matches!(
+                    concurrent
+                        .update(branch_id, Some(expected_old_head), Some(concurrent_head))
+                        .unwrap(),
+                    PushResult::Success()
+                ));
+                let mut bytes = blob.bytes.as_ref().to_vec();
+                bytes[..3].copy_from_slice(b"new");
+                Ok((
+                    Blob::<UnknownBlob>::new(Bytes::from_source(bytes)),
+                    true,
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{conflict:#}").contains("changed during segment migration"));
+
+        let actual_head = pile.head(branch_id).unwrap().unwrap();
+        assert_eq!(actual_head, concurrent_head);
+        let actual_meta: TribleSet = pile.reader().unwrap().get(actual_head).unwrap();
+        assert_eq!(actual_meta, concurrent_meta);
+        assert_eq!(
+            Manifest::from_tribles(&actual_meta, kind).segments[0].blob,
+            old_blob
+        );
+
+        concurrent.close().unwrap();
+        pile.close().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Build or repair the archive's two derived indexes by replaying source
 /// commits, never by checking out their union. Every source commit is one
 /// logical LSM leaf; large commit payloads are physically sharded under one
@@ -2596,14 +3006,13 @@ fn run_index_standalone(
             && (!succinct_manifest.segments.is_empty() || !bm25_manifest.segments.is_empty());
         let candidate_resume = same_frontier && frontier_is_reachable && !has_uncertified_segments;
         let manifests_readable = if candidate_resume {
-            let succinct_result = {
-                let mut home = IndexHome::new(repo.storage_mut(), branch_id, succinct_format);
-                home.attach_manifest(&succinct_manifest)
-            };
-            let bm25_result = {
-                let mut home = IndexHome::new(repo.storage_mut(), branch_id, bm25.clone());
-                home.attach_manifest(&bm25_manifest)
-            };
+            let succinct_result = validate_manifest_segments(
+                repo.storage_mut(),
+                &succinct_manifest,
+                &succinct_format,
+            );
+            let bm25_result =
+                validate_manifest_segments(repo.storage_mut(), &bm25_manifest, &bm25);
             match (succinct_result, bm25_result) {
                 (Ok(_), Ok(_)) => true,
                 (succinct_result, bm25_result) => {
@@ -2631,6 +3040,33 @@ fn run_index_standalone(
             clear_manifest(&mut branch_meta, bm25.kind_id());
             Vec::new()
         };
+
+        // The current writer already emits persisted Rank9/select sidecars.
+        // Bring older live segments to that layout without replaying source
+        // commits: copy their canonical raw prefix, serialize the indexes that
+        // the legacy attach already built, and CAS each manifest replacement.
+        // Existing V2 segments return byte-for-byte unchanged and cause no CAS.
+        let migrated_rank9 = if resume {
+            rewrite_manifest_segments_checkpointed(
+                repo.storage_mut(),
+                branch_id,
+                &mut branch_meta_handle,
+                &mut branch_meta,
+                succinct_format.kind_id(),
+                |blob| {
+                    succinct_format
+                        .upgrade_rank9_sidecars(blob)
+                        .map_err(|err| anyhow!("upgrade Succinct Rank9 sidecars: {err}"))
+                },
+            )?
+        } else {
+            0
+        };
+        if migrated_rank9 != 0 {
+            eprintln!(
+                "  migrated {migrated_rank9} Succinct segment(s) to persisted Rank9 sidecars"
+            );
+        }
         let removed_legacy = remove_legacy_rollup(&mut branch_meta);
 
         let commits = if frontier.as_slice() == [target_head] {
