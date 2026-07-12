@@ -2001,6 +2001,10 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
             commits.len()
         );
         for (i, commit) in commits.iter().copied().enumerate() {
+            if i == 0 {
+                eprintln!("  starting commit 1/{} ({commit:?})", commits.len());
+            }
+            let commit_started = Instant::now();
             common::index_archive_commit(
                 repo.storage_mut(),
                 commit,
@@ -2026,7 +2030,15 @@ fn run_index_standalone(pile_path: &Path, branch_id: Id, branch_name: &str) -> R
                     bail!("archive branch changed during indexing; rerun to resume from coverage")
                 }
             }
-            if (i + 1) % 100 == 0 || i + 1 == commits.len() {
+            let commit_elapsed = commit_started.elapsed();
+            if commit_elapsed.as_secs() >= 5 {
+                eprintln!(
+                    "  …{}/{} commit {commit:?} indexed and checkpointed in {:.1?}",
+                    i + 1,
+                    commits.len(),
+                    commit_elapsed,
+                );
+            } else if (i + 1) % 100 == 0 || i + 1 == commits.len() {
                 eprintln!("  …{}/{} commits indexed", i + 1, commits.len());
             }
         }
