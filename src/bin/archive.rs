@@ -751,6 +751,11 @@ enum Command {
         #[arg(long, env = "ARCHIVE_INDEX_PREPARE_IN_FLIGHT")]
         prepare_in_flight: Option<NonZeroUsize>,
     },
+    /// One-shot pre-cutover migration: remove unpublished erased index-home
+    /// manifests and the legacy monolithic rollup from branch metadata.
+    /// Source commits are not modified. Safe to rerun: once the soft state is
+    /// absent, this command performs no blob put, pin update, or flush.
+    StripLegacyIndexManifest,
     /// List imported conversations.
     Imports {
         format: Option<String>,
@@ -1838,6 +1843,312 @@ fn read_archive_branch_snapshot(
     .map_err(|_| anyhow!("archive branch metadata has ambiguous source HEADs"))?
     .map(|(head,)| head);
     Ok((branch_meta, source_head))
+}
+
+#[derive(Debug)]
+struct LegacyIndexStripPlan {
+    metadata: TribleSet,
+    source_head: Option<Inline<Handle<SimpleArchive>>>,
+    legacy_subjects: usize,
+    removed_facts: usize,
+    removed_rollups: usize,
+}
+
+#[derive(Debug)]
+struct LegacyIndexStripOutcome {
+    old_metadata: Inline<Handle<SimpleArchive>>,
+    new_metadata: Inline<Handle<SimpleArchive>>,
+    source_head: Option<Inline<Handle<SimpleArchive>>>,
+    legacy_subjects: usize,
+    removed_facts: usize,
+    removed_rollups: usize,
+    changed: bool,
+}
+
+fn source_head_from_branch_metadata(
+    metadata: &TribleSet,
+) -> Result<Option<Inline<Handle<SimpleArchive>>>> {
+    find!(
+        (head: Inline<Handle<SimpleArchive>>),
+        pattern!(metadata, [{ _?branch @ triblespace::core::repo::head: ?head }])
+    )
+    .at_most_one()
+    .map_err(|_| anyhow!("archive branch metadata has ambiguous source HEADs"))
+    .map(|head| head.map(|(head,)| head))
+}
+
+/// Construct the exact metadata subtraction used by the one-shot migration.
+///
+/// Old index-home entities are recognized solely by their unpublished
+/// `seg_kind` attribute. Every fact on such a subject is removed, including
+/// attributes unknown to this binary. The monolithic `rollup` attribute is
+/// different: it lives on the branch entity alongside the source HEAD and
+/// signatures, so only that attribute's facts are removed.
+fn plan_legacy_index_strip(metadata: &TribleSet) -> Result<LegacyIndexStripPlan> {
+    let source_head = source_head_from_branch_metadata(metadata)?;
+    let legacy_entities: HashSet<Id> = find!(
+        entity: Id,
+        pattern!(metadata, [{ ?entity @ triblespace::core::repo::index_home::seg_kind: _?kind }])
+    )
+    .collect();
+
+    let mut candidate = TribleSet::new();
+    let mut removed_facts = 0usize;
+    let mut removed_rollups = 0usize;
+    for fact in metadata.iter() {
+        let is_rollup = fact.a() == &triblespace::core::repo::rollup.id();
+        if legacy_entities.contains(fact.e()) || is_rollup {
+            removed_facts += 1;
+            if is_rollup {
+                removed_rollups += 1;
+            }
+        } else {
+            candidate.insert(fact);
+        }
+    }
+
+    // Assert the preservation contract independently of the subtraction:
+    // every original unrelated fact survived, every targeted fact vanished,
+    // and no candidate fact came from outside the original metadata.
+    for fact in metadata.iter() {
+        let targeted = legacy_entities.contains(fact.e())
+            || fact.a() == &triblespace::core::repo::rollup.id();
+        let survived = candidate.contains(fact);
+        if (targeted && survived) || (!targeted && !survived) {
+            bail!(
+                "internal error: legacy strip did not preserve the exact unrelated metadata subset"
+            );
+        }
+    }
+    if !candidate.difference(metadata).is_empty() {
+        bail!("internal error: legacy strip introduced metadata facts");
+    }
+    let candidate_source_head = source_head_from_branch_metadata(&candidate)?;
+    if candidate_source_head != source_head {
+        bail!(
+            "refusing legacy strip: source HEAD changed from {:?} to {:?}",
+            source_head,
+            candidate_source_head
+        );
+    }
+
+    Ok(LegacyIndexStripPlan {
+        metadata: candidate,
+        source_head,
+        legacy_subjects: legacy_entities.len(),
+        removed_facts,
+        removed_rollups,
+    })
+}
+
+/// Apply the one-shot strip through the branch pin's ordinary compare-and-swap.
+/// The successful pin replacement is flushed before it is reported.
+fn strip_legacy_index_manifest_checkpointed(
+    storage: &mut Pile,
+    branch_id: Id,
+) -> Result<LegacyIndexStripOutcome> {
+    let old_metadata = storage
+        .head(branch_id)
+        .map_err(|err| anyhow!("read archive branch head: {err:?}"))?
+        .ok_or_else(|| anyhow!("archive branch is missing"))?;
+    let metadata: TribleSet = storage
+        .reader()
+        .map_err(|err| anyhow!("open archive metadata reader: {err:?}"))?
+        .get(old_metadata)
+        .map_err(|err| anyhow!("load archive branch metadata: {err:?}"))?;
+    let plan = plan_legacy_index_strip(&metadata)?;
+
+    if plan.removed_facts == 0 {
+        return Ok(LegacyIndexStripOutcome {
+            old_metadata,
+            new_metadata: old_metadata,
+            source_head: plan.source_head,
+            legacy_subjects: 0,
+            removed_facts: 0,
+            removed_rollups: 0,
+            changed: false,
+        });
+    }
+
+    let new_metadata: Inline<Handle<SimpleArchive>> = storage
+        .put(plan.metadata)
+        .map_err(|err| anyhow!("store stripped archive metadata: {err:?}"))?;
+    match storage
+        .update(branch_id, Some(old_metadata), Some(new_metadata))
+        .map_err(|err| anyhow!("publish stripped archive metadata: {err:?}"))?
+    {
+        PushResult::Success() => storage
+            .flush()
+            .map_err(|err| anyhow!("flush stripped archive metadata: {err:?}"))?,
+        PushResult::Conflict(actual) => {
+            bail!(
+                "archive branch changed during legacy index strip (current metadata: {:?}); rerun after writers are stopped",
+                actual
+            )
+        }
+    }
+
+    Ok(LegacyIndexStripOutcome {
+        old_metadata,
+        new_metadata,
+        source_head: plan.source_head,
+        legacy_subjects: plan.legacy_subjects,
+        removed_facts: plan.removed_facts,
+        removed_rollups: plan.removed_rollups,
+        changed: true,
+    })
+}
+
+fn run_strip_legacy_index_manifest(
+    pile_path: &Path,
+    branch_id: Id,
+    branch_name: &str,
+) -> Result<()> {
+    let mut repo = common::open_repo(pile_path)?;
+    let result = (|| -> Result<()> {
+        common::validate_branch_for_read(&mut repo, branch_id, branch_name)?;
+        let outcome =
+            strip_legacy_index_manifest_checkpointed(repo.storage_mut(), branch_id)?;
+        if outcome.changed {
+            println!(
+                "stripped {} legacy index subject(s), {} metadata fact(s), and {} rollup fact(s)",
+                outcome.legacy_subjects, outcome.removed_facts, outcome.removed_rollups
+            );
+        } else {
+            println!("legacy index manifest and rollup already absent; no write performed");
+        }
+        println!(
+            "branch metadata: {} -> {}",
+            hex::encode(outcome.old_metadata.raw),
+            hex::encode(outcome.new_metadata.raw)
+        );
+        match outcome.source_head {
+            Some(head) => println!("source HEAD: {}", hex::encode(head.raw)),
+            None => println!("source HEAD: none"),
+        }
+        Ok(())
+    })();
+
+    let close_result = repo
+        .close()
+        .map_err(|err| anyhow!("close pile {}: {err:?}", pile_path.display()));
+    match (result, close_result) {
+        (Err(err), _) => Err(err),
+        (Ok(()), Err(err)) => Err(err),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod legacy_index_strip_tests {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::repo::index_home::{Manifest, seg_blob, seg_kind};
+    use triblespace::prelude::blobencodings::SuccinctArchiveBlob;
+
+    use super::*;
+
+    fn temp_pile() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "archive-strip-legacy-index-{}-{nanos}.pile",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn strips_complete_legacy_subjects_and_rollup_then_is_a_no_write_noop() {
+        let path = temp_pile();
+        std::fs::File::create(&path).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let branch_id = *fucid();
+        let kind = *fucid();
+        let branch_tag = *fucid();
+        let legacy_extra_tag = *fucid();
+        let unrelated_entity = *fucid();
+        let unrelated_tag = *fucid();
+
+        let source_head: Inline<Handle<SimpleArchive>> =
+            pile.put(TribleSet::new()).unwrap();
+        let segment = Inline::<Handle<UnknownBlob>>::new([0x51; 32]);
+        let rollup = Inline::<Handle<SuccinctArchiveBlob>>::new([0x72; 32]);
+
+        let mut legacy = Manifest::default();
+        legacy.adopt_segment(segment, 0);
+        legacy.set_covered(vec![source_head]);
+        let legacy_facts = legacy.to_tribles(kind);
+        let legacy_segment_entity = find!(
+            entity: Id,
+            pattern!(&legacy_facts, [{ ?entity @ seg_kind: kind, seg_blob: segment }])
+        )
+        .next()
+        .unwrap();
+
+        let mut expected = entity! { ExclusiveId::force_ref(&branch_id) @
+            triblespace::core::repo::head: source_head,
+            triblespace::core::metadata::tag: branch_tag,
+        }
+        .into_facts();
+        expected += entity! { ExclusiveId::force_ref(&unrelated_entity) @
+            triblespace::core::metadata::tag: unrelated_tag,
+        };
+
+        let mut metadata = expected.clone();
+        metadata += entity! { ExclusiveId::force_ref(&branch_id) @
+            triblespace::core::repo::rollup: rollup,
+        };
+        metadata += legacy_facts;
+        // This attribute is unknown to the old manifest parser, but must still
+        // disappear because migration removes the complete legacy subject.
+        metadata += entity! { ExclusiveId::force_ref(&legacy_segment_entity) @
+            triblespace::core::metadata::tag: legacy_extra_tag,
+        };
+
+        let plan = plan_legacy_index_strip(&metadata).unwrap();
+        assert_eq!(plan.metadata, expected);
+        assert_eq!(plan.source_head, Some(source_head));
+        assert_eq!(plan.legacy_subjects, 2);
+        assert_eq!(plan.removed_rollups, 1);
+        assert!(plan.removed_facts > plan.legacy_subjects);
+
+        let old_metadata: Inline<Handle<SimpleArchive>> = pile.put(metadata).unwrap();
+        assert!(matches!(
+            pile.update(branch_id, None, Some(old_metadata)).unwrap(),
+            PushResult::Success()
+        ));
+        pile.flush().unwrap();
+
+        let first = strip_legacy_index_manifest_checkpointed(&mut pile, branch_id).unwrap();
+        assert!(first.changed);
+        assert_eq!(first.old_metadata, old_metadata);
+        assert_ne!(first.new_metadata, old_metadata);
+        assert_eq!(first.source_head, Some(source_head));
+        assert_eq!(pile.head(branch_id).unwrap(), Some(first.new_metadata));
+        let landed: TribleSet = pile
+            .reader()
+            .unwrap()
+            .get(first.new_metadata)
+            .unwrap();
+        assert_eq!(landed, expected);
+
+        let length_before_noop = std::fs::metadata(&path).unwrap().len();
+        let second = strip_legacy_index_manifest_checkpointed(&mut pile, branch_id).unwrap();
+        let length_after_noop = std::fs::metadata(&path).unwrap().len();
+        assert!(!second.changed);
+        assert_eq!(second.old_metadata, first.new_metadata);
+        assert_eq!(second.new_metadata, first.new_metadata);
+        assert_eq!(second.source_head, Some(source_head));
+        assert_eq!(length_after_noop, length_before_noop);
+        assert_eq!(pile.head(branch_id).unwrap(), Some(first.new_metadata));
+
+        pile.close().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// List recent messages from the certified Succinct LSM snapshot.
@@ -3447,6 +3758,9 @@ fn main() -> Result<()> {
     if let Command::Index { prepare_in_flight } = cmd {
         return run_index_standalone(&pile_path, branch_id, &cli.branch, prepare_in_flight);
     }
+    if let Command::StripLegacyIndexManifest = cmd {
+        return run_strip_legacy_index_manifest(&pile_path, branch_id, &cli.branch);
+    }
 
     let (mut repo, branch_id) = common::open_repo_for_read(&pile_path, branch_id, &cli.branch)?;
 
@@ -3511,6 +3825,9 @@ fn main() -> Result<()> {
             }
             Command::Index { .. } => {
                 unreachable!("index is handled before opening the branch")
+            }
+            Command::StripLegacyIndexManifest => {
+                unreachable!("legacy index stripping is handled before opening the branch")
             }
             Command::Imports { format, limit } => {
                 let format_filter = format.map(|s| s.to_lowercase());
