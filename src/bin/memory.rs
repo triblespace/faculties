@@ -572,14 +572,13 @@ fn cmd_embed(pile_path: &Path) -> Result<()> {
                 eprintln!("  embedded {}/{total}", i + 1);
             }
         }
-        let delta = change.clone();
         ws.commit(change, "memory embed");
         repo.push(&mut ws).map_err(|e| anyhow!("push failed: {e:?}"))?;
         // Refresh the persisted HNSW segment so `memory similar` queries the
         // graph instead of rebuilding it. Best-effort: the segment is soft
         // state (recomputable from the commit chain), so a failure here warns
         // but doesn't fail the embed.
-        if let Err(e) = embeddings::update_index(repo.storage_mut(), branch_id, &delta) {
+        if let Err(e) = embeddings::refresh_index(repo, branch_id) {
             eprintln!("memory: warning: HNSW index refresh failed (similar will fall back): {e:#}");
         }
         println!(
@@ -617,6 +616,7 @@ fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
         let mut ws = repo
             .pull(branch_id)
             .map_err(|e| anyhow!("pull memory branch: {e:?}"))?;
+        let expected_head = ws.head();
         let space = ws.checkout(..).context("checkout memory branch")?;
 
         let superseded = superseded_ids(&space);
@@ -628,6 +628,7 @@ fn cmd_similar(pile_path: &Path, args: &[String]) -> Result<()> {
         let ranked: Vec<(f32, Id)> = match embeddings::nearest_via_index(
             repo.storage_mut(),
             branch_id,
+            expected_head,
             &qv,
             0.0,
         )? {

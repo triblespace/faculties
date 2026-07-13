@@ -2756,12 +2756,11 @@ fn cmd_embed(repo: &mut Repo, bid: Id) -> Result<()> {
             eprintln!("  embedded {}/{total}", i + 1);
         }
     }
-    let delta = change.clone();
     ws.commit(change, "wiki embed");
     repo.push(&mut ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
     // Refresh the persisted HNSW segment so `wiki similar` queries the graph
     // instead of rebuilding it. Best-effort (soft state): warn on failure.
-    if let Err(e) = embeddings::update_index(repo.storage_mut(), bid, &delta) {
+    if let Err(e) = embeddings::refresh_index(repo, bid) {
         eprintln!("wiki: warning: HNSW index refresh failed (similar will fall back): {e:#}");
     }
     println!("embedded {total} fragments into the shared nomic space.");
@@ -2784,6 +2783,7 @@ fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
     );
 
     let mut ws = repo.pull(bid).map_err(|e| anyhow::anyhow!("pull: {e:?}"))?;
+    let expected_head = ws.head();
     let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let latest = latest_versions(&space);
 
@@ -2808,6 +2808,7 @@ fn cmd_similar(repo: &mut Repo, bid: Id, query: String) -> Result<()> {
     let ranked: Vec<(f32, Id)> = match embeddings::nearest_via_index(
         repo.storage_mut(),
         bid,
+        expected_head,
         &qv,
         0.0,
     )

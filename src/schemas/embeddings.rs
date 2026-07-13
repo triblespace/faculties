@@ -19,16 +19,25 @@
 //! a clean break (new dim → new type), never a silent dimension clash.
 
 use anybytes::View;
+use itertools::Itertools;
 use triblespace::core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::inline::{Encodes, InlineEncoding};
 use triblespace::core::metadata::{self, MetaDescribe};
+use triblespace::core::patch::PATCH;
+use triblespace::core::repo::index_home::{
+    append_range, set_index_frontier, strip_recipe_manifest, CommitRange, IndexHome, IndexKind,
+    Manifest,
+};
+use triblespace::core::repo::pile::{Pile, PileReader};
+use triblespace::core::repo::{
+    ancestors, commits_topological, difference, BlobStore, CommitSelector, PinStore, PushResult,
+    Repository, Workspace,
+};
 use triblespace::core::trible::Fragment;
+use triblespace::core::trible::TribleSet;
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
-use triblespace::core::repo::index_home::IndexHome;
-use triblespace::core::repo::{BlobStore, PinStore};
-use triblespace::core::trible::TribleSet;
 use triblespace_search::hnsw::HNSWBuilder;
 use triblespace_search::index_hnsw::{nearest_across, HnswRollup};
 use triblespace_search::schemas::{put_embedding, Embedding};
@@ -249,25 +258,202 @@ pub fn embedding_rollup<R>(reader: R) -> HnswRollup<R> {
     HnswRollup::new(reader, DIM, attr::embedding.id())
 }
 
-/// Append/refresh the persisted HNSW segment for `branch` from a delta of
-/// freshly-embedded `entity -> attr::embedding` tribles (typically the change
-/// a `memory embed` / `wiki embed` just committed). Size-tiered merge is
-/// handled inside the index-home machinery — this just calls `update_index`.
-///
-/// Best-effort: the segment is soft state (recomputable from the commit chain,
-/// GC-able), so callers may log-and-continue on error rather than fail the
-/// embed.
-pub fn update_index<S>(storage: &mut S, branch: Id, delta: &TribleSet) -> anyhow::Result<()>
-where
-    S: BlobStore + PinStore,
-{
+type CommitHandle = Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>;
+
+fn commit_projection(reader: &PileReader, commit: CommitHandle) -> anyhow::Result<TribleSet> {
+    let metadata: TribleSet = reader
+        .get(commit)
+        .map_err(|e| anyhow::anyhow!("read commit {commit:?}: {e:?}"))?;
+    let content = find!(
+        (content: CommitHandle),
+        pattern!(&metadata, [{ triblespace::core::repo::content: ?content }])
+    )
+    .at_most_one()
+    .map_err(|_| anyhow::anyhow!("commit {commit:?} has ambiguous content"))?
+    .map(|(content,)| content);
+    match content {
+        Some(content) => reader
+            .get(content)
+            .map_err(|e| anyhow::anyhow!("read commit projection {commit:?}: {e:?}")),
+        None => Ok(TribleSet::new()),
+    }
+}
+
+fn advance_frontier(
+    ws: &mut Workspace<Pile>,
+    frontier: &mut Vec<CommitHandle>,
+    commit: CommitHandle,
+) -> anyhow::Result<()> {
+    let metadata: TribleSet = ws
+        .get(commit)
+        .map_err(|e| anyhow::anyhow!("read commit metadata {commit:?}: {e:?}"))?;
+    let parents: std::collections::HashSet<[u8; 32]> = find!(
+        (parent: CommitHandle),
+        pattern!(&metadata, [{ triblespace::core::repo::parent: ?parent }])
+    )
+    .map(|(parent,)| parent.raw)
+    .collect();
+    frontier.retain(|tip| !parents.contains(&tip.raw));
+    frontier.push(commit);
+    frontier.sort_unstable_by_key(|tip| tip.raw);
+    frontier.dedup_by_key(|tip| tip.raw);
+    Ok(())
+}
+
+fn inspect_hnsw_manifest(
+    storage: &mut Pile,
+    branch_meta: &TribleSet,
+    reachable: &PATCH<32>,
+    rollup: &HnswRollup<PileReader>,
+) -> anyhow::Result<Vec<CommitHandle>> {
     let reader = storage
         .reader()
-        .map_err(|e| anyhow::anyhow!("index-home reader: {e:?}"))?;
-    let rollup = embedding_rollup(reader);
-    let mut home = IndexHome::new(storage, branch, rollup);
-    home.update_index(delta)
-        .map_err(|e| anyhow::anyhow!("update hnsw index: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("typed HNSW manifest reader: {e:?}"))?;
+    let manifest = Manifest::from_tribles(branch_meta, &reader, rollup)
+        .map_err(|e| anyhow::anyhow!("parse typed HNSW manifest: {e}"))?;
+    if let Some(foreign) = manifest
+        .frontier()
+        .iter()
+        .find(|tip| reachable.get(&tip.raw).is_none())
+    {
+        anyhow::bail!("HNSW frontier tip {foreign:?} is not an ancestor of branch HEAD");
+    }
+    manifest
+        .audit_exact_cover(&reader)
+        .map_err(|e| anyhow::anyhow!("audit typed HNSW range cover: {e}"))?;
+    for range in manifest.ranges() {
+        for artifact in range.artifacts() {
+            rollup.attach(&reader, artifact).map_err(|e| {
+                anyhow::anyhow!("attach HNSW artifact from {:?}: {e}", range.range())
+            })?;
+        }
+    }
+    Ok(manifest.frontier().to_vec())
+}
+
+/// Bring the persisted HNSW recipe for `branch` exactly to its source HEAD.
+///
+/// This is deliberately repository-aware rather than accepting a naked
+/// trible delta: every derived artifact is certified by the actual immutable
+/// source commit it came from. Missing history is replayed parents-first,
+/// including artifact-free ranges for commits with no embeddings. A malformed
+/// HNSW recipe is soft state, so only that recipe is stripped and rebuilt;
+/// unrelated typed manifests and unknown facts are retained. Each successful
+/// range/frontier checkpoint is flushed before the next commit.
+pub fn refresh_index(repo: &mut Repository<Pile>, branch: Id) -> anyhow::Result<()> {
+    let mut ws = repo
+        .pull(branch)
+        .map_err(|e| anyhow::anyhow!("pull embedding branch: {e:?}"))?;
+    let target = ws
+        .head()
+        .ok_or_else(|| anyhow::anyhow!("embedding branch has no source commits"))?;
+    let reachable = ancestors(target)
+        .select(&mut ws)
+        .map_err(|e| anyhow::anyhow!("walk embedding commit DAG: {e}"))?;
+
+    let mut branch_meta_handle = repo
+        .storage_mut()
+        .head(branch)
+        .map_err(|e| anyhow::anyhow!("read embedding branch pin: {e:?}"))?
+        .ok_or_else(|| anyhow::anyhow!("embedding branch is missing"))?;
+    let mut branch_meta: TribleSet = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow::anyhow!("embedding branch reader: {e:?}"))?
+        .get(branch_meta_handle)
+        .map_err(|e| anyhow::anyhow!("read embedding branch metadata: {e:?}"))?;
+    let pinned_source = find!(
+        head: CommitHandle,
+        pattern!(&branch_meta, [{ _?branch @ triblespace::core::repo::head: ?head }])
+    )
+    .at_most_one()
+    .map_err(|_| anyhow::anyhow!("embedding branch metadata has ambiguous source HEADs"))?;
+    if pinned_source != Some(target) {
+        anyhow::bail!(
+            "embedding branch changed during HNSW refresh: pulled {target:?}, pinned {pinned_source:?}"
+        );
+    }
+
+    let source_reader = repo
+        .storage_mut()
+        .reader()
+        .map_err(|e| anyhow::anyhow!("HNSW source reader: {e:?}"))?;
+    let rollup = embedding_rollup(source_reader.clone());
+    let mut frontier = match inspect_hnsw_manifest(
+        repo.storage_mut(),
+        &branch_meta,
+        &reachable,
+        &rollup,
+    ) {
+        Ok(frontier) => frontier,
+        Err(error) => {
+            let recipe = Manifest::new(&rollup)
+                .map_err(|e| anyhow::anyhow!("construct HNSW recipe: {e}"))?
+                .recipe();
+            strip_recipe_manifest(&mut branch_meta, recipe);
+            eprintln!(
+                "discarding only invalid HNSW recipe {recipe:x}; rebuilding from source commits: {error:#}"
+            );
+            Vec::new()
+        }
+    };
+
+    let commits = if frontier.is_empty() {
+        commits_topological(&mut ws, reachable.clone())
+    } else {
+        commits_topological(
+            &mut ws,
+            difference(reachable.clone(), ancestors(frontier.clone())),
+        )
+    }
+    .map_err(|e| anyhow::anyhow!("order uncovered embedding commits: {e}"))?;
+    if commits.is_empty() {
+        return Ok(());
+    }
+
+    for commit in commits {
+        let projection = commit_projection(&source_reader, commit)?;
+        append_range(
+            repo.storage_mut(),
+            &rollup,
+            &projection,
+            CommitRange::leaf(commit),
+            &mut branch_meta,
+        )
+        .map_err(|e| anyhow::anyhow!("append typed HNSW range {commit:?}: {e}"))?;
+        advance_frontier(&mut ws, &mut frontier, commit)?;
+        set_index_frontier(
+            repo.storage_mut(),
+            &rollup,
+            &mut branch_meta,
+            frontier.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("advance typed HNSW frontier: {e}"))?;
+
+        let next_meta: CommitHandle = repo
+            .storage_mut()
+            .put(branch_meta.clone())
+            .map_err(|e| anyhow::anyhow!("store HNSW checkpoint: {e:?}"))?;
+        match repo
+            .storage_mut()
+            .update(branch, Some(branch_meta_handle), Some(next_meta))
+            .map_err(|e| anyhow::anyhow!("publish HNSW checkpoint: {e:?}"))?
+        {
+            PushResult::Success() => branch_meta_handle = next_meta,
+            PushResult::Conflict(_) => {
+                anyhow::bail!("embedding branch changed during HNSW refresh; rerun to resume")
+            }
+        }
+        repo.storage_mut()
+            .flush()
+            .map_err(|e| anyhow::anyhow!("flush HNSW checkpoint: {e:?}"))?;
+    }
+
+    let final_frontier =
+        inspect_hnsw_manifest(repo.storage_mut(), &branch_meta, &reachable, &rollup)?;
+    if final_frontier.as_slice() != [target] {
+        anyhow::bail!("HNSW traversal ended at frontier {final_frontier:?}, expected {target:?}");
+    }
     Ok(())
 }
 
@@ -283,29 +469,74 @@ where
 pub fn nearest_via_index<S>(
     storage: &mut S,
     branch: Id,
+    expected_head: Option<CommitHandle>,
     query: &[f32],
     floor: f32,
 ) -> anyhow::Result<Option<Vec<(f32, [u8; 32])>>>
 where
     S: BlobStore + PinStore,
 {
-    let rollup = {
-        let reader = storage
+    if DIM == 0 {
+        anyhow::bail!("embedding dimension must be greater than zero");
+    }
+    if query.len() != DIM {
+        anyhow::bail!(
+            "query embedding has dimension {}, expected {DIM}",
+            query.len()
+        );
+    }
+    if query.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("query embedding contains a non-finite value");
+    }
+    if !floor.is_finite() {
+        anyhow::bail!("query score floor must be finite");
+    }
+    // Interpret the source HEAD and typed manifest from one immutable branch
+    // pin snapshot. A later concurrent push cannot make an older accelerator
+    // look current merely because a second pin read raced ahead.
+    let branch_meta_handle = storage
+        .head(branch)
+        .map_err(|e| anyhow::anyhow!("read embedding branch pin: {e:?}"))?;
+    let branch_meta = match branch_meta_handle {
+        Some(handle) => storage
             .reader()
-            .map_err(|e| anyhow::anyhow!("index-home reader: {e:?}"))?;
-        embedding_rollup(reader)
+            .map_err(|e| anyhow::anyhow!("embedding branch reader: {e:?}"))?
+            .get(handle)
+            .map_err(|e| anyhow::anyhow!("read embedding branch metadata: {e:?}"))?,
+        None => TribleSet::new(),
     };
+    let source_head = find!(
+        head: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>,
+        pattern!(&branch_meta, [{ _?branch @ triblespace::core::repo::head: ?head }])
+    )
+    .at_most_one()
+    .map_err(|_| anyhow::anyhow!("embedding branch metadata has ambiguous source HEADs"))?;
+    if source_head != expected_head {
+        return Ok(None);
+    }
+    let rollup = embedding_rollup(
+        storage
+            .reader()
+            .map_err(|e| anyhow::anyhow!("index-home reader: {e:?}"))?,
+    );
+    let manifest_reader = storage
+        .reader()
+        .map_err(|e| anyhow::anyhow!("typed HNSW manifest reader: {e:?}"))?;
+    let manifest = Manifest::from_tribles(&branch_meta, &manifest_reader, &rollup)
+        .map_err(|e| anyhow::anyhow!("read typed HNSW manifest: {e}"))?;
+    if !manifest.claims_head(expected_head) {
+        return Ok(None);
+    }
+    if manifest
+        .ranges()
+        .iter()
+        .all(|range| range.artifacts().is_empty())
+    {
+        return Ok(Some(Vec::new()));
+    }
     let segments = {
         let mut home = IndexHome::new(storage, branch, rollup);
-        if home
-            .read_manifest()
-            .map_err(|e| anyhow::anyhow!("read hnsw manifest: {e}"))?
-            .segments
-            .is_empty()
-        {
-            return Ok(None);
-        }
-        home.attach_all()
+        home.attach_manifest(&manifest)
             .map_err(|e| anyhow::anyhow!("attach hnsw segments: {e}"))?
     };
     // Stage the query vector so `candidates_above` can resolve it by handle.
@@ -316,7 +547,8 @@ where
     let reader = storage
         .reader()
         .map_err(|e| anyhow::anyhow!("index reader: {e:?}"))?;
-    let rows = nearest_across(&segments, &reader, qh, query, floor)
+    let rows = nearest_across(&segments, &reader, qh, floor)
+        .map_err(|e| anyhow::anyhow!("query typed HNSW artifacts: {e}"))?
         .into_iter()
         .map(|(cos, h)| (cos, h.raw))
         .collect();
