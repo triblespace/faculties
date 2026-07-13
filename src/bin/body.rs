@@ -1,31 +1,13 @@
 //! `body` — the Reachy Mini body: perception in, action out, and the
 //! deliberate sensory/touch captures it keeps in the pile.
-//!
-//! Renamed from `senses` (2026-06-16). The faculty is both afferent
-//! (`pose`/`look`/`feel`) and efferent (`wake`/`sleep`/`gesture`) — the whole
-//! embodied loop a vision-language-action model closes.
-//!
-//! Architecture (Rust-tightness audit): the daemon exposes a full REST surface
-//! on :8000, so proprioception, motion, and the touch sense (`feel`, via the
-//! mic-array direction-of-arrival) are pure Rust over reqwest — no Python, no
-//! websocket. The single Python island is the camera frame grab (`look`):
-//! frame pixels only flow over the daemon's WebRTC/GStreamer pipeline, so a
-//! thin embedded shim pulls one frame. That shim is the obvious target for a
-//! native gstreamer-rs path once the VLA loop needs the continuous stream.
-//!
-//! The lite body has no IMU and won't engage gravity-compensation, and its
-//! head holds stiff — so a gentle pet barely moves the encoders. The body's
-//! touch sense is therefore the MIC ARRAY: a hand sweeping the head registers
-//! as the sound's direction-of-arrival sweeping across the array. `feel` hears
-//! your hand as a sound travelling over the head.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use faculties::schemas::body::{BODY_BRANCH_NAME, KIND_CAPTURE, KIND_INTENT, capture, intent};
-use hifitime::Epoch;
-use hifitime::efmt::Formatter;
+use faculties::schemas::body::{capture, intent, BODY_BRANCH_NAME, KIND_CAPTURE, KIND_INTENT};
 use hifitime::efmt::consts::ISO8601;
+use hifitime::efmt::Formatter;
+use hifitime::Epoch;
 use rand_core::OsRng;
 use std::path::{Path, PathBuf};
 use std::process::Command as PCommand;
@@ -34,13 +16,15 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{Repository, Workspace};
 use triblespace::prelude::*;
 
+use nalgebra::{Matrix4, Vector3};
+use faculties::reachy_kinematics::Kinematics;
+
 type RawHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::LongString>>;
 
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
 const DEFAULT_PYTHON: &str = "/Users/jp/Desktop/chatbot/liora/reachy-venv/bin/python";
 
-/// The embedded frame-grab shim — written to a temp file at runtime.
 const FRAME_SHIM: &str = include_str!("body_frame.py");
 
 // ── CLI ──────────────────────────────────────────────────────────────────
@@ -51,111 +35,67 @@ const FRAME_SHIM: &str = include_str!("body_frame.py");
     about = "The Reachy Mini body: perception in, action out, deliberate captures to the pile"
 )]
 struct Cli {
-    /// Path to the pile file
     #[arg(long, env = "PILE")]
     pile: PathBuf,
-    /// Branch id (hex). Overrides name-based lookup.
     #[arg(long)]
     branch_id: Option<String>,
-    /// Daemon base URL
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
-    /// Python interpreter for the frame-grab shim (the reachy venv)
     #[arg(long, env = "REACHY_PYTHON", default_value = DEFAULT_PYTHON)]
     python: String,
+    /// Acknowledge that this unfinished backend talks directly to the motor
+    /// bus. The Reachy daemon must be stopped before using read-only probes.
+    #[arg(long)]
+    experimental_native_serial: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Read the body's current proprioceptive state (head pose, body yaw,
-    /// antennas, audio direction) and daemon status. Read-only.
     Pose,
-    /// Feel for a touch: a hand sweeping the head registers as the audio
-    /// direction-of-arrival sweeping across the mic array. Reports what was
-    /// felt; `--keep` remembers it as a touch capture in the pile.
     Feel {
-        /// Seconds to feel for — one window, or the whole session under --loop
-        /// (default 12; loop default 300).
         #[arg(long)]
         secs: Option<f64>,
-        /// Keep feeling in short windows and answer each touch — a petting
-        /// session. Ctrl-C to stop.
         #[arg(long = "loop")]
         loop_: bool,
-        /// Remember a felt touch as a capture in the pile.
         #[arg(long)]
         keep: bool,
-        /// Answer a felt touch with a gentle antenna-wiggle.
         #[arg(long)]
         respond: bool,
-        /// A note for the kept touch ("a gentle pet from JP").
         #[arg(long)]
         note: Option<String>,
     },
-    /// Make a gentle gesture: nod, shake, wiggle, perk, look-left,
-    /// look-right, center.
     Gesture {
-        /// Gesture name.
         name: String,
     },
-    /// Set or read the current INTENT — gemma's reasoned instruction that
-    /// conditions the VLA (the perceive→reason→act seam). With text: writes a
-    /// timestamped intent on the body branch. Without: prints the LATEST intent
-    /// text to stdout (what the control loop reads each cycle), time to stderr.
     Intent {
-        /// The instruction to set ("lean into the touch, perk the antennas").
-        /// Omit to read the latest intent instead.
         text: Option<String>,
     },
-    /// Capture one camera frame into the pile and return a handle. Stores the
-    /// proprioceptive pose alongside the frame so it can be grounded later.
     Look {
-        /// Why you chose to remember this moment (the deliberate note).
         #[arg(long)]
         note: Option<String>,
     },
-    /// List deliberate captures kept in the pile.
     List,
-    /// Extract a capture's payload. Use @- for stdout, or omit for a default name.
     Get {
-        /// Capture entity id (or prefix).
         id: String,
-        /// Output path. Omit for a default name, @- for stdout.
         output: Option<String>,
     },
-    /// Gentle wake-up motion (daemon-defined, bounded).
     Wake,
-    /// Gentle go-to-sleep motion (daemon-defined, bounded).
     Sleep,
-    /// Emit a RAW observation for a VLA loop as JSON: a native-resolution
-    /// frame + the 9-real state vector + the touch channel. No resize, no
-    /// normalize — the body stays dumb, the VLA owns preprocessing.
     Observe {
-        /// Where to write the frame PNG (default a temp path).
         #[arg(long)]
         frame: Option<PathBuf>,
-        /// Skip the camera frame (state + touch only — fast).
         #[arg(long)]
         no_frame: bool,
     },
-    /// Execute an ABSOLUTE pose target in raw SDK units — 9 reals
-    /// `x,y,z,roll,pitch,yaw,body_yaw,ant_l,ant_r` — as a single pose, or a
-    /// chunk (JSON array of 9-real arrays via @file / @-) streamed as waypoints.
     Act {
-        /// "x,y,z,roll,pitch,yaw,body_yaw,ant_l,ant_r", or @file / @- for a chunk.
-        /// `allow_hyphen_values` so a negative-leading pose (e.g. "-0.01,...")
-        /// isn't mis-parsed as a flag — the VLA emits negative values constantly.
         #[arg(allow_hyphen_values = true)]
         pose: String,
-        /// Seconds for a single smooth move (goto). Ignored when streaming a chunk.
         #[arg(long, default_value_t = 0.5)]
         duration: f64,
-        /// Seconds between chunk waypoints (set_target streaming).
         #[arg(long, default_value_t = 0.04)]
         dt: f64,
-        /// Single pose: snap immediately (set_target) instead of a smooth goto.
         #[arg(long)]
         now: bool,
     },
@@ -195,142 +135,355 @@ fn http() -> reqwest::blocking::Client {
 
 fn daemon_get(daemon: &str, path: &str) -> Result<serde_json::Value> {
     let url = format!("{daemon}{path}");
-    let resp = http()
-        .get(&url)
-        .send()
-        .with_context(|| format!("GET {url} — is the Reachy Mini daemon running?"))?;
+    let resp = http().get(&url).send()?;
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
     if !status.is_success() {
-        bail!("GET {url} → {status}: {body}");
+        bail!("GET {url} -> {status}");
     }
     serde_json::from_str(&body).with_context(|| format!("parse JSON from {url}"))
 }
 
-fn daemon_post(daemon: &str, path: &str) -> Result<()> {
-    let url = format!("{daemon}{path}");
-    let resp = http()
-        .post(&url)
-        .send()
-        .with_context(|| format!("POST {url} — is the Reachy Mini daemon running?"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        bail!("POST {url} → {status}: {body}");
-    }
+// ── Native Rust Motor Control ───────────────────────────────────────────
+
+#[allow(dead_code)]
+fn enable_torque(port: &mut dyn serialport::SerialPort) -> Result<()> {
+    let mut dph = rustypot::DynamixelProtocolHandler::v2();
+    let ids: Vec<u8> = (10..=18).collect();
+    let byte_data = vec![vec![1]; ids.len()];
+    dph.sync_write(port, &ids, 64, &byte_data)
+        .map_err(|e| anyhow::anyhow!("enable torque: {:?}", e))?;
     Ok(())
 }
 
-fn daemon_post_json(daemon: &str, path: &str, body: &serde_json::Value) -> Result<()> {
-    let url = format!("{daemon}{path}");
-    let resp = http()
-        .post(&url)
-        .json(body)
-        .send()
-        .with_context(|| format!("POST {url} — is the Reachy Mini daemon running?"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let b = resp.text().unwrap_or_default();
-        bail!("POST {url} → {status}: {b}");
-    }
-    Ok(())
-}
-
-/// Move the head / antennas / body over `duration` seconds, then wait for it
-/// to land. Angles in radians, translations in metres; `None` leaves a channel
-/// at the daemon's discretion. Bounded, gentle — the lite can't hurt itself.
-#[allow(clippy::too_many_arguments)]
-fn goto(
-    daemon: &str,
-    head: Option<(f64, f64, f64, f64, f64, f64)>, // x,y,z,roll,pitch,yaw
-    antennas: Option<[f64; 2]>,
-    body_yaw: Option<f64>,
-    duration: f64,
-) -> Result<()> {
-    let mut req = serde_json::Map::new();
-    if let Some((x, y, z, roll, pitch, yaw)) = head {
-        req.insert(
-            "head_pose".into(),
-            serde_json::json!({"x":x,"y":y,"z":z,"roll":roll,"pitch":pitch,"yaw":yaw}),
+fn init_kinematics() -> Kinematics {
+    let config = include_str!("../../assets/kinematics_data.json");
+    let json: serde_json::Value = serde_json::from_str(config).unwrap();
+    let mal = json["motor_arm_length"].as_f64().unwrap();
+    let rl = json["rod_length"].as_f64().unwrap();
+    let mut kinematics = Kinematics::new(mal, rl);
+    for m in json["motors"].as_array().unwrap() {
+        let bp = m["branch_position"].as_array().unwrap();
+        let bp_vec = Vector3::new(
+            bp[0].as_f64().unwrap(),
+            bp[1].as_f64().unwrap(),
+            bp[2].as_f64().unwrap(),
         );
+
+        let t = m["T_motor_world"].as_array().unwrap();
+        let mut t_mat = Matrix4::zeros();
+        for i in 0..4 {
+            let row = t[i].as_array().unwrap();
+            for j in 0..4 {
+                t_mat[(i, j)] = row[j].as_f64().unwrap();
+            }
+        }
+
+        let sol = if m["solution"].as_f64().unwrap() != 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
+        kinematics.add_branch(bp_vec, t_mat.try_inverse().unwrap(), sol);
     }
-    if let Some(a) = antennas {
-        req.insert("antennas".into(), serde_json::json!(a));
-    }
-    if let Some(by) = body_yaw {
-        req.insert("body_yaw".into(), serde_json::json!(by));
-    }
-    req.insert("duration".into(), serde_json::json!(duration));
-    daemon_post_json(daemon, "/api/move/goto", &serde_json::Value::Object(req))?;
-    std::thread::sleep(Duration::from_secs_f64(duration + 0.05));
-    Ok(())
+
+    let hz = json["head_z_offset"].as_f64().unwrap();
+    let t_world_platform = nalgebra::Matrix4::new_translation(&Vector3::new(0.0, 0.0, hz));
+    kinematics.reset_forward_kinematics(t_world_platform);
+    kinematics
 }
 
-/// A small happy antenna-wiggle — the body's way of answering a touch.
-fn wiggle(daemon: &str) -> Result<()> {
-    for _ in 0..2 {
-        goto(daemon, None, Some([0.5, -0.5]), None, 0.22)?;
-        goto(daemon, None, Some([-0.5, 0.5]), None, 0.22)?;
-    }
-    goto(daemon, None, Some([0.0, 0.0]), None, 0.22)
+fn open_serial() -> Result<Box<dyn serialport::SerialPort>> {
+    serialport::new("/dev/cu.usbmodem5AF71345631", 1_000_000)
+        .timeout(Duration::from_millis(50))
+        .open()
+        .context("open serial port")
 }
 
-fn cmd_gesture(daemon: &str, name: &str) -> Result<()> {
-    let n = name.to_lowercase();
-    match n.as_str() {
-        "nod" | "yes" => {
-            goto(daemon, Some((0., 0., 0., 0., 0.18, 0.)), None, None, 0.4)?;
-            goto(daemon, Some((0., 0., 0., 0., -0.05, 0.)), None, None, 0.4)?;
-            goto(daemon, Some((0., 0., 0., 0., 0., 0.)), None, None, 0.4)?;
-        }
-        "shake" | "no" => {
-            goto(daemon, Some((0., 0., 0., 0., 0., 0.3)), None, None, 0.4)?;
-            goto(daemon, Some((0., 0., 0., 0., 0., -0.3)), None, None, 0.5)?;
-            goto(daemon, Some((0., 0., 0., 0., 0., 0.)), None, None, 0.4)?;
-        }
-        "wiggle" | "happy" => wiggle(daemon)?,
-        "perk" => goto(daemon, None, Some([0.7, 0.7]), None, 0.4)?,
-        "look-left" => goto(daemon, Some((0., 0., 0., 0., 0., 0.4)), None, None, 0.6)?,
-        "look-right" => goto(daemon, Some((0., 0., 0., 0., 0., -0.4)), None, None, 0.6)?,
-        "center" | "rest" => {
-            goto(daemon, Some((0., 0., 0., 0., 0., 0.)), Some([0., 0.]), Some(0.), 0.6)?
-        }
-        _ => bail!(
-            "unknown gesture '{name}' — try: nod, shake, wiggle, perk, look-left, look-right, center"
-        ),
-    }
-    println!("{n}");
-    Ok(())
+fn require_native_backend_ready() -> Result<()> {
+    bail!(
+        "native Reachy serial access is quarantined: this branch preserves an experiment, not a usable hardware backend"
+    )
 }
 
-/// Set an immediate absolute target (no interpolation) — the streaming
-/// primitive for a VLA action chunk. Head pose (x,y,z,roll,pitch,yaw),
-/// body yaw, antennas [l,r], all in raw SDK units. `None` leaves a channel.
-fn set_target(
-    daemon: &str,
+const OFFSETS: [i32; 9] = [0, 1024, -1024, 1024, -1024, 1024, -1024, 0, 0];
+
+fn read_state(port: &mut dyn serialport::SerialPort, kine: &mut Kinematics) -> Result<[f64; 9]> {
+    let mut dph = rustypot::DynamixelProtocolHandler::v2();
+    let ids: Vec<u8> = (10..=18).collect();
+    let data = dph
+        .sync_read(port, &ids, 132, 4)
+        .map_err(|e| anyhow::anyhow!("sync read present_position: {:?}", e))?;
+    if data.len() != 9 {
+        bail!("Failed to read from all 9 motors, only got {}", data.len());
+    }
+
+    let mut rads = [0.0; 9];
+    for (i, bytes) in data.iter().enumerate() {
+        let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i32;
+        let actual_raw = raw - OFFSETS[i];
+        rads[i] =
+            (2.0 * std::f64::consts::PI * (actual_raw as f64) / 4096.0) - std::f64::consts::PI;
+    }
+
+    let body_yaw = rads[0];
+    let stewart = vec![rads[1], rads[2], rads[3], rads[4], rads[5], rads[6]];
+    let ant_l = rads[8]; // ID 18
+    let ant_r = rads[7]; // ID 17
+
+    let t_plat = kine.forward_kinematics(stewart, Some(-body_yaw));
+
+    let x = t_plat[(0, 3)];
+    let y = t_plat[(1, 3)];
+    let z = t_plat[(2, 3)];
+
+    let rot = t_plat.fixed_view::<3, 3>(0, 0);
+    let (roll, pitch, yaw) =
+        nalgebra::Rotation3::from_matrix_unchecked(rot.into_owned()).euler_angles();
+
+    Ok([x, y, z, roll, pitch, yaw, body_yaw, ant_l, ant_r])
+}
+
+fn set_target_motor(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
     head: Option<(f64, f64, f64, f64, f64, f64)>,
     antennas: Option<[f64; 2]>,
     body_yaw: Option<f64>,
 ) -> Result<()> {
-    let mut req = serde_json::Map::new();
-    if let Some((x, y, z, roll, pitch, yaw)) = head {
-        req.insert(
-            "target_head_pose".into(),
-            serde_json::json!({"x":x,"y":y,"z":z,"roll":roll,"pitch":pitch,"yaw":yaw}),
-        );
+    let current_state = read_state(port, kine)?;
+    let h = head.unwrap_or((
+        current_state[0],
+        current_state[1],
+        current_state[2],
+        current_state[3],
+        current_state[4],
+        current_state[5],
+    ));
+    let by = body_yaw.unwrap_or(current_state[6]);
+    let a = antennas.unwrap_or([current_state[7], current_state[8]]);
+
+    let rot = nalgebra::Rotation3::from_euler_angles(h.3, h.4, h.5);
+    let mut t_plat = rot.to_homogeneous();
+    t_plat[(0, 3)] = h.0;
+    t_plat[(1, 3)] = h.1;
+    t_plat[(2, 3)] = h.2;
+
+    let stewart_angles = kine.inverse_kinematics_safe(t_plat, Some(-by), None, None);
+
+    let mut rads = vec![0.0; 9];
+    rads[0] = -stewart_angles[0]; // body yaw (negated back)
+    rads[1] = stewart_angles[1];
+    rads[2] = stewart_angles[2];
+    rads[3] = stewart_angles[3];
+    rads[4] = stewart_angles[4];
+    rads[5] = stewart_angles[5];
+    rads[6] = stewart_angles[6];
+    rads[7] = a[1]; // ID 17 is right
+    rads[8] = a[0]; // ID 18 is left
+
+    let mut dph = rustypot::DynamixelProtocolHandler::v2();
+    let ids: Vec<u8> = (10..=18).collect();
+    let mut byte_data = Vec::new();
+    for (i, rad) in rads.iter().enumerate() {
+        let mut actual_raw =
+            (4096.0 * (std::f64::consts::PI + rad) / (2.0 * std::f64::consts::PI)) as i32;
+        actual_raw += OFFSETS[i];
+        let raw_u32 = actual_raw.clamp(0, 4095) as u32;
+        byte_data.push(raw_u32.to_le_bytes().to_vec());
     }
-    if let Some(a) = antennas {
-        req.insert("target_antennas".into(), serde_json::json!(a));
-    }
-    if let Some(by) = body_yaw {
-        req.insert("target_body_yaw".into(), serde_json::json!(by));
-    }
-    daemon_post_json(daemon, "/api/move/set_target", &serde_json::Value::Object(req))
+
+    dph.sync_write(port, &ids, 116, &byte_data)
+        .map_err(|e| anyhow::anyhow!("sync write goal_position: {:?}", e))?;
+    Ok(())
 }
 
-/// Grab one native-resolution camera frame to `out_png` via the embedded
-/// shim. Returns (width, height). The one Python island; never hangs `look`
-/// or `observe` (45s cap on cold WebRTC negotiation).
+fn goto(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
+    head: Option<(f64, f64, f64, f64, f64, f64)>,
+    antennas: Option<[f64; 2]>,
+    body_yaw: Option<f64>,
+    duration: f64,
+) -> Result<()> {
+    let start_state = read_state(port, kine)?;
+    let target = [
+        head.map(|h| h.0).unwrap_or(start_state[0]),
+        head.map(|h| h.1).unwrap_or(start_state[1]),
+        head.map(|h| h.2).unwrap_or(start_state[2]),
+        head.map(|h| h.3).unwrap_or(start_state[3]),
+        head.map(|h| h.4).unwrap_or(start_state[4]),
+        head.map(|h| h.5).unwrap_or(start_state[5]),
+        body_yaw.unwrap_or(start_state[6]),
+        antennas.map(|a| a[0]).unwrap_or(start_state[7]),
+        antennas.map(|a| a[1]).unwrap_or(start_state[8]),
+    ];
+
+    if duration <= 0.05 {
+        return set_target_motor(port, kine, head, antennas, body_yaw);
+    }
+
+    let steps = (duration * 50.0).max(1.0) as usize;
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let ease = t * t * (3.0 - 2.0 * t);
+        let mut interp = [0.0; 9];
+        for j in 0..9 {
+            interp[j] = start_state[j] + (target[j] - start_state[j]) * ease;
+        }
+        set_target_motor(
+            port,
+            kine,
+            Some((
+                interp[0], interp[1], interp[2], interp[3], interp[4], interp[5],
+            )),
+            Some([interp[7], interp[8]]),
+            Some(interp[6]),
+        )?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+fn wiggle(port: &mut dyn serialport::SerialPort, kine: &mut Kinematics) -> Result<()> {
+    for _ in 0..2 {
+        goto(port, kine, None, Some([0.5, -0.5]), None, 0.22)?;
+        goto(port, kine, None, Some([-0.5, 0.5]), None, 0.22)?;
+    }
+    goto(port, kine, None, Some([0.0, 0.0]), None, 0.22)
+}
+
+fn cmd_gesture(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
+    name: &str,
+) -> Result<()> {
+    match name.to_lowercase().as_str() {
+        "nod" | "yes" => {
+            goto(
+                port,
+                kine,
+                Some((0., 0., 0., 0., 0.18, 0.)),
+                None,
+                None,
+                0.4,
+            )?;
+            goto(
+                port,
+                kine,
+                Some((0., 0., 0., 0., -0.05, 0.)),
+                None,
+                None,
+                0.4,
+            )?;
+            goto(port, kine, Some((0., 0., 0., 0., 0., 0.)), None, None, 0.4)?;
+        }
+        "shake" | "no" => {
+            goto(port, kine, Some((0., 0., 0., 0., 0., 0.3)), None, None, 0.4)?;
+            goto(
+                port,
+                kine,
+                Some((0., 0., 0., 0., 0., -0.3)),
+                None,
+                None,
+                0.5,
+            )?;
+            goto(port, kine, Some((0., 0., 0., 0., 0., 0.)), None, None, 0.4)?;
+        }
+        "wiggle" | "happy" => wiggle(port, kine)?,
+        "perk" => goto(port, kine, None, Some([0.7, 0.7]), None, 0.4)?,
+        "look-left" => goto(port, kine, Some((0., 0., 0., 0., 0., 0.4)), None, None, 0.6)?,
+        "look-right" => goto(
+            port,
+            kine,
+            Some((0., 0., 0., 0., 0., -0.4)),
+            None,
+            None,
+            0.6,
+        )?,
+        "center" | "rest" => goto(
+            port,
+            kine,
+            Some((0., 0., 0., 0., 0., 0.)),
+            Some([0., 0.]),
+            Some(0.),
+            0.6,
+        )?,
+        _ => bail!("unknown gesture '{name}'"),
+    }
+    Ok(())
+}
+
+fn cmd_pose(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
+    daemon: &str,
+) -> Result<()> {
+    let s = read_state(port, kine)?;
+    println!(
+        "Head     : x={:.3} y={:.3} z={:.3} (metres)",
+        s[0], s[1], s[2]
+    );
+    println!(
+        "           roll={:.3} pitch={:.3} yaw={:.3} (rad)",
+        s[3], s[4], s[5]
+    );
+    println!(
+        "           roll={:.1}° pitch={:.1}° yaw={:.1}°",
+        s[3].to_degrees(),
+        s[4].to_degrees(),
+        s[5].to_degrees()
+    );
+    println!("Body yaw : {:.3} rad ({:.1}°)", s[6], s[6].to_degrees());
+    println!("Antennas : l={:.3} r={:.3} (rad)", s[7], s[8]);
+
+    // Warn if daemon is dead
+    if daemon_get(daemon, "/api/state/doa").is_err() {
+        println!(
+            "\n[Warning] Audio Daemon is unreachable at {daemon} — audio touch sensing is offline."
+        );
+    } else {
+        println!("\nAudio Daemon is active.");
+    }
+    Ok(())
+}
+
+fn cmd_observe(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
+    daemon: &str,
+    python: &str,
+    frame: Option<&Path>,
+    no_frame: bool,
+) -> Result<()> {
+    let state = read_state(port, kine)?;
+    let touch = daemon_get(daemon, "/api/state/doa").ok();
+    let (frame_path, fw, fh) = if no_frame {
+        (None, 0u64, 0u64)
+    } else {
+        let p = frame
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::temp_dir().join("body_observe.png"));
+        let (w, h) = grab_frame(python, &p)?;
+        (Some(p), w, h)
+    };
+    let obs = serde_json::json!({
+        "t": format_time(interval_key(now_tai())),
+        "frame": frame_path.as_ref().map(|p| p.display().to_string()),
+        "frame_size": [fw, fh],
+        "state": state,
+        "state_layout": ["head_x_m","head_y_m","head_z_m","head_roll_rad","head_pitch_rad","head_yaw_rad","body_yaw_rad","antenna_l_rad","antenna_r_rad"],
+        "touch": touch.map(|d| serde_json::json!({
+            "doa_angle_rad": d["angle"].as_f64(),
+            "doa_speech": d["speech_detected"].as_bool(),
+        })),
+        "raw": true,
+        "note": "no resize/normalize — VLA owns preprocessing",
+    });
+    println!("{}", serde_json::to_string_pretty(&obs)?);
+    Ok(())
+}
+
 fn grab_frame(python: &str, out_png: &Path) -> Result<(u64, u64)> {
     let shim_path = std::env::temp_dir().join("body_frame.py");
     std::fs::write(&shim_path, FRAME_SHIM).context("write frame shim")?;
@@ -339,65 +492,37 @@ fn grab_frame(python: &str, out_png: &Path) -> Result<(u64, u64)> {
         .arg(out_png)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("run frame shim with {python}"))?;
+        .spawn()?;
     let deadline = Instant::now() + Duration::from_secs(45);
     loop {
-        if child.try_wait().context("poll frame shim")?.is_some() {
+        if child.try_wait()?.is_some() {
             break;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            bail!("frame grab timed out after 45s (cold WebRTC negotiation stalled — retry)");
+            bail!("frame grab timed out");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let output = child.wait_with_output().context("collect frame shim output")?;
+    let output = child.wait_with_output()?;
     if !output.status.success() {
-        bail!("frame grab failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+        bail!("frame grab failed");
     }
     let dims = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(dims
         .split_once('x')
-        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+        .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
         .unwrap_or((0, 0)))
 }
 
-/// Read the raw 9-real proprioceptive state vector
-/// [x,y,z,roll,pitch,yaw, body_yaw, ant_l, ant_r] in raw SDK units
-/// (REST gives head xyz in metres, angles in radians).
-fn read_state(daemon: &str) -> Result<[f64; 9]> {
-    let s = daemon_get(daemon, "/api/state/full")?;
-    let h = &s["head_pose"];
-    let g = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap_or(0.0);
-    let ant = s["antennas_position"].as_array().cloned().unwrap_or_default();
-    Ok([
-        g(h, "x"), g(h, "y"), g(h, "z"),
-        g(h, "roll"), g(h, "pitch"), g(h, "yaw"),
-        s["body_yaw"].as_f64().unwrap_or(0.0),
-        ant.first().and_then(|v| v.as_f64()).unwrap_or(0.0),
-        ant.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0),
-    ])
-}
-
 fn open_repo(path: &Path) -> Result<Repository<Pile>> {
-    let mut pile = Pile::open(path)
-        .map_err(|e| anyhow::anyhow!("open pile {}: {e:?}", path.display()))?;
-    if let Err(err) = pile.refresh() {
+    let mut pile = Pile::open(path)?;
+    if let Err(e) = pile.refresh() {
         let _ = pile.close();
-        return Err(match err {
-            triblespace::core::repo::pile::ReadError::CorruptPile { valid_length } => anyhow::anyhow!(
-                "pile corrupt at byte {valid_length}: refusing to auto-repair (a stale binary \
-                 could truncate newer data). If, and only if, the tail is a genuinely torn write, truncate it explicitly (DESTRUCTIVE) with: trible pile amputate {}",
-                path.display()
-            ),
-            other => anyhow::anyhow!("refresh pile {}: {other:?}", path.display()),
-        });
+        bail!("refresh pile: {:?}", e);
     }
     let signing_key = SigningKey::generate(&mut OsRng);
-    Repository::new(pile, signing_key, TribleSet::new())
-        .map_err(|err| anyhow::anyhow!("create repository: {err:?}"))
+    Repository::new(pile, signing_key, TribleSet::new()).map_err(|e| anyhow::anyhow!("{:?}", e))
 }
 
 fn with_body<T>(
@@ -410,77 +535,54 @@ fn with_body<T>(
         Id::from_hex(hex.trim()).ok_or_else(|| anyhow::anyhow!("invalid branch id '{hex}'"))?
     } else {
         repo.ensure_branch(BODY_BRANCH_NAME, None)
-            .map_err(|e| anyhow::anyhow!("ensure body branch: {e:?}"))?
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?
     };
     let mut ws = repo
         .pull(branch_id)
-        .map_err(|e| anyhow::anyhow!("pull body workspace: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let result = f(&mut repo, &mut ws);
-    let close_res = repo.close().map_err(|e| anyhow::anyhow!("close pile: {e:?}"));
-    if let Err(err) = close_res {
-        if result.is_ok() {
-            return Err(err);
-        }
-        eprintln!("warning: failed to close pile cleanly: {err:#}");
-    }
+    let _ = repo.close();
     result
 }
 
-// ── feel: the mic-array touch sense ────────────────────────────────────────
-
-/// What a touch looked like over the felt window.
-#[allow(dead_code)]
 struct Felt {
     samples: usize,
-    sweeps: usize,        // count of >SWEEP_DEG moves within a ~SWEEP_WIN window
-    angle_min: f64,       // degrees
+    sweeps: usize,
+    angle_min: f64,
     angle_max: f64,
-    max_speed: f64,       // deg/s
-    head_deflect: f64,    // rad, max yaw/roll/pitch range
+    max_speed: f64,
+    head_deflect: f64,
     speech_ticks: usize,
     signature_json: String,
 }
 
 impl Felt {
     fn touched(&self) -> bool {
-        // A real touch physically DISPLACES the head — the encoders move far
-        // past the rest floor (calibrated: ambient ≤6 mrad, JP's real pet
-        // swung roll ~177 mrad). Ambient sound only wanders the mic DOA and
-        // can't move the head, so head displacement is the pet-specific gate.
-        // (The mic sweep is reported as corroboration, never as the trigger —
-        // it false-positives on room noise.)
         self.head_deflect > 0.02
     }
 }
 
-/// Sample the mic-array DOA (and the head encoders) for `secs` and summarise
-/// the touch signature.
-fn feel_window(daemon: &str, secs: f64) -> Felt {
-    const SWEEP_DEG: f64 = 15.0; // a "sweep" = this much DOA travel…
-    const SWEEP_WIN: f64 = 0.6; // …within this window (s)
-    let client = http();
+fn feel_window(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
+    daemon: &str,
+    secs: f64,
+) -> Felt {
+    const SWEEP_DEG: f64 = 15.0;
+    const SWEEP_WIN: f64 = 0.6;
     let start = Instant::now();
     let dur = Duration::from_secs_f64(secs);
 
-    let mut t_series: Vec<f64> = Vec::new();
-    let mut a_series: Vec<f64> = Vec::new(); // degrees
+    let mut t_series = Vec::new();
+    let mut a_series = Vec::new();
     let mut speech_ticks = 0usize;
     let (mut rmin, mut rmax) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut pmin, mut pmax) = (f64::INFINITY, f64::NEG_INFINITY);
     let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
 
-    let get = |path: &str| -> Option<serde_json::Value> {
-        client
-            .get(format!("{daemon}{path}"))
-            .send()
-            .ok()
-            .and_then(|r| r.text().ok())
-            .and_then(|b| serde_json::from_str(&b).ok())
-    };
-
     while start.elapsed() < dur {
         let t = start.elapsed().as_secs_f64();
-        if let Some(d) = get("/api/state/doa") {
+        if let Ok(d) = daemon_get(daemon, "/api/state/doa") {
             if let Some(a) = d["angle"].as_f64() {
                 t_series.push(t);
                 a_series.push(a.to_degrees());
@@ -489,23 +591,20 @@ fn feel_window(daemon: &str, secs: f64) -> Felt {
                 speech_ticks += 1;
             }
         }
-        if let Some(s) = get("/api/state/full") {
-            let h = &s["head_pose"];
-            if let (Some(r), Some(p), Some(y)) =
-                (h["roll"].as_f64(), h["pitch"].as_f64(), h["yaw"].as_f64())
-            {
-                rmin = rmin.min(r);
-                rmax = rmax.max(r);
-                pmin = pmin.min(p);
-                pmax = pmax.max(p);
-                ymin = ymin.min(y);
-                ymax = ymax.max(y);
-            }
+        if let Ok(s) = read_state(port, kine) {
+            let r = s[3];
+            let p = s[4];
+            let y = s[5];
+            rmin = rmin.min(r);
+            rmax = rmax.max(r);
+            pmin = pmin.min(p);
+            pmax = pmax.max(p);
+            ymin = ymin.min(y);
+            ymax = ymax.max(y);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // sweep count: non-overlapping windows whose DOA span exceeds SWEEP_DEG
     let mut sweeps = 0usize;
     let mut i = 0usize;
     while i < a_series.len() {
@@ -519,12 +618,12 @@ fn feel_window(daemon: &str, secs: f64) -> Felt {
         }
         if hi - lo > SWEEP_DEG {
             sweeps += 1;
-            i = j; // consume the window
+            i = j;
         } else {
             i += 1;
         }
     }
-    // peak angular speed
+
     let mut max_speed = 0.0f64;
     for k in 1..a_series.len() {
         let dt = t_series[k] - t_series[k - 1];
@@ -532,6 +631,7 @@ fn feel_window(daemon: &str, secs: f64) -> Felt {
             max_speed = max_speed.max(((a_series[k] - a_series[k - 1]) / dt).abs());
         }
     }
+
     let angle_min = a_series.iter().cloned().fold(f64::INFINITY, f64::min);
     let angle_max = a_series.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let head_deflect = (rmax - rmin).max(pmax - pmin).max(ymax - ymin).max(0.0);
@@ -551,10 +651,22 @@ fn feel_window(daemon: &str, secs: f64) -> Felt {
     Felt {
         samples: a_series.len(),
         sweeps,
-        angle_min: if angle_min.is_finite() { angle_min } else { 0.0 },
-        angle_max: if angle_max.is_finite() { angle_max } else { 0.0 },
+        angle_min: if angle_min.is_finite() {
+            angle_min
+        } else {
+            0.0
+        },
+        angle_max: if angle_max.is_finite() {
+            angle_max
+        } else {
+            0.0
+        },
         max_speed,
-        head_deflect: if head_deflect.is_finite() { head_deflect } else { 0.0 },
+        head_deflect: if head_deflect.is_finite() {
+            head_deflect
+        } else {
+            0.0
+        },
         speech_ticks,
         signature_json,
     }
@@ -582,9 +694,8 @@ fn keep_felt(
 ) -> Result<()> {
     let pose_h: TextHandle = ws.put(felt.signature_json.clone());
     let note_h: Option<TextHandle> = note
-        .map(|n| n.to_string())
-        .or_else(|| Some("a touch on the head".to_string()))
-        .map(|n| ws.put(n));
+        .map(|n| ws.put(n.to_string()))
+        .or_else(|| Some(ws.put("a touch on the head".to_string())));
     let frag = entity! {
         metadata::tag: &KIND_CAPTURE,
         metadata::created_at: now_tai(),
@@ -592,18 +703,46 @@ fn keep_felt(
         capture::pose: pose_h,
         capture::note?: note_h,
     };
-    let id = frag.root().expect("capture id");
+    let id = frag.root().unwrap();
     ws.commit(frag, "body feel");
-    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
+    repo.push(ws).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     println!("  kept it — {}", &fmt_id(id)[..12]);
     Ok(())
 }
 
-/// Set a new intent, or (with no text) print the latest one. The intent
-/// channel is the pile-native seam between perception/reason (gemma) and action
-/// (the VLA): writes append a timestamped KIND_INTENT on the body branch; the
-/// reader is coordinate-and-cursor — the most recent `metadata::created_at`
-/// wins. Latest text goes to stdout so a control loop can read it directly.
+fn cmd_feel(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
+    repo: &mut Repository<Pile>,
+    ws: &mut Workspace<Pile>,
+    daemon: &str,
+    secs: Option<f64>,
+    loop_: bool,
+    keep: bool,
+    respond: bool,
+    note: Option<&str>,
+) -> Result<()> {
+    let s = secs.unwrap_or(if loop_ { 300.0 } else { 12.0 });
+    let deadline = Instant::now() + Duration::from_secs_f64(s);
+    println!("Feeling for touches...");
+    while Instant::now() < deadline {
+        let f = feel_window(port, kine, daemon, 1.0);
+        if f.touched() {
+            report_felt(&f);
+            if keep {
+                keep_felt(repo, ws, &f, note)?;
+            }
+            if respond {
+                wiggle(port, kine)?;
+            }
+        }
+        if !loop_ {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn cmd_intent(
     repo: &mut Repository<Pile>,
     ws: &mut Workspace<Pile>,
@@ -656,187 +795,47 @@ fn cmd_intent(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_feel(
-    repo: &mut Repository<Pile>,
-    ws: &mut Workspace<Pile>,
-    daemon: &str,
-    secs: Option<f64>,
-    loop_: bool,
-    keep: bool,
-    respond: bool,
-    note: Option<&str>,
-) -> Result<()> {
-    if loop_ {
-        let session = secs.unwrap_or(300.0);
-        println!("feeling continuously for {session:.0}s — pet the top of my head whenever; Ctrl-C to stop.");
-        let start = Instant::now();
-        let mut felt_count = 0usize;
-        while start.elapsed().as_secs_f64() < session {
-            let felt = feel_window(daemon, 3.0);
-            if felt.samples > 0 && felt.touched() {
-                felt_count += 1;
-                report_felt(&felt);
-                if respond {
-                    if let Err(e) = wiggle(daemon) {
-                        eprintln!("  (couldn't wiggle back: {e})");
-                    }
-                }
-                if keep {
-                    keep_felt(repo, ws, &felt, note)?;
-                }
-            }
-        }
-        println!(
-            "(stopped — felt {felt_count} touch{} this session)",
-            if felt_count == 1 { "" } else { "es" }
-        );
-        return Ok(());
-    }
-
-    let secs = secs.unwrap_or(12.0);
-    println!("feeling for {secs:.0}s — touch the top of my head…");
-    let felt = feel_window(daemon, secs);
-    if felt.samples == 0 {
-        bail!("felt nothing back from the daemon — is the Reachy Mini running?");
-    }
-    if felt.touched() {
-        report_felt(&felt);
-        if respond {
-            if let Err(e) = wiggle(daemon) {
-                eprintln!("  (couldn't wiggle back: {e})");
-            }
-        }
-        if keep {
-            keep_felt(repo, ws, &felt, note)?;
-        }
-    } else {
-        println!(
-            "quiet — I didn't feel a touch. (head still to {:.0} mrad over {} samples.)",
-            felt.head_deflect * 1000.0,
-            felt.samples
-        );
-    }
-    Ok(())
-}
-
-// ── commands ───────────────────────────────────────────────────────────────
-
-fn cmd_pose(daemon: &str) -> Result<()> {
-    let state = daemon_get(daemon, "/api/state/full")?;
-    let status = daemon_get(daemon, "/api/daemon/status").unwrap_or_default();
-
-    let hp = &state["head_pose"];
-    let f = |k: &str| hp[k].as_f64().unwrap_or(f64::NAN);
-    println!("head pose:");
-    println!("  position   x={:+.4} y={:+.4} z={:+.4} (m)", f("x"), f("y"), f("z"));
-    println!(
-        "  rotation   roll={:+.4} pitch={:+.4} yaw={:+.4} (rad)",
-        f("roll"), f("pitch"), f("yaw")
-    );
-    if let Some(by) = state["body_yaw"].as_f64() {
-        println!("body yaw:    {by:+.4} rad");
-    }
-    if let Some(ant) = state["antennas_position"].as_array() {
-        let vals: Vec<String> = ant.iter().map(|v| format!("{:+.4}", v.as_f64().unwrap_or(f64::NAN))).collect();
-        println!("antennas:    [{}] rad", vals.join(", "));
-    }
-    // live mic-array direction-of-arrival (the touch/sound sense)
-    if let Ok(d) = daemon_get(daemon, "/api/state/doa") {
-        if let Some(a) = d["angle"].as_f64() {
-            let sp = if d["speech_detected"].as_bool().unwrap_or(false) { " (speech)" } else { "" };
-            println!("audio dir:   {:.0}°{sp}", a.to_degrees());
-        }
-    }
-    if let Some(ts) = state["timestamp"].as_str() {
-        println!("daemon time: {ts}");
-    }
-    if let Some(name) = status["robot_name"].as_str() {
-        let st = status["state"].as_str().unwrap_or("?");
-        let cam = status["camera_specs_name"].as_str().unwrap_or("?");
-        println!("body:        {name} ({st}), camera={cam}");
-    }
-    Ok(())
-}
-
 fn cmd_look(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
     repo: &mut Repository<Pile>,
     ws: &mut Workspace<Pile>,
-    daemon: &str,
+    _daemon: &str,
     python: &str,
     note: Option<&str>,
 ) -> Result<()> {
-    let tmp = std::env::temp_dir();
-    let shim_path = tmp.join("body_frame.py");
-    std::fs::write(&shim_path, FRAME_SHIM).context("write frame shim")?;
-    let out_png = tmp.join(format!("body_capture_{}.png", std::process::id()));
+    let state = read_state(port, kine)?;
+    let p = std::env::temp_dir().join("body_look.png");
+    grab_frame(python, &p)?;
+    let bytes = std::fs::read(&p)?;
+    let frame_h: RawHandle = ws.put(bytes);
 
-    let mut child = PCommand::new(python)
-        .arg(&shim_path)
-        .arg(&out_png)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("run frame shim with {python}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-    loop {
-        if child.try_wait().context("poll frame shim")?.is_some() {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("frame grab timed out after 45s (cold WebRTC negotiation stalled — retry)");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    let output = child.wait_with_output().context("collect frame shim output")?;
-    if !output.status.success() {
-        bail!("frame grab failed: {}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    let dims = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let (w, h) = dims
-        .split_once('x')
-        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
-        .unwrap_or((0, 0));
-
-    let bytes = std::fs::read(&out_png).with_context(|| format!("read {}", out_png.display()))?;
-    let nbytes = bytes.len();
-    let _ = std::fs::remove_file(&out_png);
-
-    let pose_json = daemon_get(daemon, "/api/state/full").map(|v| v.to_string()).unwrap_or_default();
-
-    let frame_h: RawHandle = ws.put::<blobencodings::RawBytes, _>(bytes);
+    let pose_json = serde_json::json!({
+        "state": state,
+        "state_layout": ["head_x_m","head_y_m","head_z_m","head_roll_rad","head_pitch_rad","head_yaw_rad","body_yaw_rad","antenna_l_rad","antenna_r_rad"]
+    }).to_string();
     let pose_h: TextHandle = ws.put(pose_json);
     let note_h: Option<TextHandle> = note.map(|n| ws.put(n.to_string()));
-    let w_val: Inline<inlineencodings::U256BE> = w.to_inline();
-    let h_val: Inline<inlineencodings::U256BE> = h.to_inline();
 
     let frag = entity! {
         metadata::tag: &KIND_CAPTURE,
         metadata::created_at: now_tai(),
-        capture::frame: frame_h,
-        capture::mime: "image/png",
         capture::modality: "vision",
-        capture::width: w_val,
-        capture::height: h_val,
+        capture::frame: frame_h,
         capture::pose: pose_h,
         capture::note?: note_h,
     };
-    let cap_id = frag.root().expect("capture has an id");
+    let id = frag.root().unwrap();
     ws.commit(frag, "body look");
-    repo.push(ws).map_err(|e| anyhow::anyhow!("push: {e:?}"))?;
-
-    println!("captured {w}x{h} vision frame ({} KiB)", nbytes / 1024);
-    println!("  id   {}", fmt_id(cap_id));
-    if let Some(n) = note {
-        println!("  note {n}");
-    }
+    repo.push(ws).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    println!("Captured look — {}", &fmt_id(id)[..12]);
     Ok(())
 }
 
 fn cmd_list(ws: &mut Workspace<Pile>) -> Result<()> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let mut rows: Vec<(i128, Id, String, String)> = Vec::new();
     for (cid, modality, created) in find!(
         (c: Id, m: String, t: Inline<inlineencodings::NsTAIInterval>),
@@ -866,14 +865,20 @@ fn cmd_list(ws: &mut Workspace<Pile>) -> Result<()> {
     }
     for (k, cid, modality, note) in rows {
         let when = format_time(k);
-        let suffix = if note.is_empty() { String::new() } else { format!("  — {note}") };
+        let suffix = if note.is_empty() {
+            String::new()
+        } else {
+            format!("  — {note}")
+        };
         println!("{}  {:<6}  {when}{suffix}", &fmt_id(cid)[..12], modality);
     }
     Ok(())
 }
 
 fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<()> {
-    let space = ws.checkout(..).map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
+    let space = ws
+        .checkout(..)
+        .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?;
     let needle = id.to_lowercase();
     let cap_id = find!(
         (c: Id),
@@ -896,7 +901,9 @@ fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<(
 
     if output == Some("@-") {
         use std::io::Write;
-        std::io::stdout().write_all(bytes.as_ref()).context("write to stdout")?;
+        std::io::stdout()
+            .write_all(bytes.as_ref())
+            .context("write to stdout")?;
     } else {
         let out_path = output
             .map(PathBuf::from)
@@ -908,53 +915,26 @@ fn cmd_get(ws: &mut Workspace<Pile>, id: &str, output: Option<&str>) -> Result<(
     Ok(())
 }
 
-// ── VLA interface: raw observe / absolute act ──────────────────────────────
-
-fn cmd_observe(daemon: &str, python: &str, frame: Option<&Path>, no_frame: bool) -> Result<()> {
-    let state = read_state(daemon)?;
-    let touch = daemon_get(daemon, "/api/state/doa").ok();
-    let (frame_path, fw, fh) = if no_frame {
-        (None, 0u64, 0u64)
-    } else {
-        let p = frame
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::env::temp_dir().join("body_observe.png"));
-        let (w, h) = grab_frame(python, &p)?;
-        (Some(p), w, h)
-    };
-    let obs = serde_json::json!({
-        "t": format_time(interval_key(now_tai())),
-        "frame": frame_path.as_ref().map(|p| p.display().to_string()),
-        "frame_size": [fw, fh],
-        "state": state,
-        "state_layout": ["head_x_m","head_y_m","head_z_m","head_roll_rad","head_pitch_rad","head_yaw_rad","body_yaw_rad","antenna_l_rad","antenna_r_rad"],
-        "touch": touch.map(|d| serde_json::json!({
-            "doa_angle_rad": d["angle"].as_f64(),
-            "doa_speech": d["speech_detected"].as_bool(),
-        })),
-        "raw": true,
-        "note": "no resize/normalize — VLA owns preprocessing",
-    });
-    println!("{}", serde_json::to_string_pretty(&obs)?);
-    Ok(())
-}
-
 fn parse_pose(s: &str) -> Result<[f64; 9]> {
     let v: Vec<f64> = s
         .split(',')
         .map(|x| x.trim().parse::<f64>())
         .collect::<std::result::Result<_, _>>()
-        .map_err(|e| anyhow::anyhow!("bad pose number: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("bad pose: {e}"))?;
     if v.len() != 9 {
-        bail!(
-            "pose needs 9 reals (x,y,z,roll,pitch,yaw,body_yaw,ant_l,ant_r), got {}",
-            v.len()
-        );
+        bail!("pose needs 9 reals");
     }
     Ok([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]])
 }
 
-fn cmd_act(daemon: &str, pose: &str, duration: f64, dt: f64, now: bool) -> Result<()> {
+fn cmd_act(
+    port: &mut dyn serialport::SerialPort,
+    kine: &mut Kinematics,
+    pose: &str,
+    duration: f64,
+    dt: f64,
+    now: bool,
+) -> Result<()> {
     if let Some(spec) = pose.strip_prefix('@') {
         let text = if spec == "-" {
             use std::io::Read;
@@ -962,34 +942,38 @@ fn cmd_act(daemon: &str, pose: &str, duration: f64, dt: f64, now: bool) -> Resul
             std::io::stdin().read_to_string(&mut s)?;
             s
         } else {
-            std::fs::read_to_string(spec).with_context(|| format!("read chunk {spec}"))?
+            std::fs::read_to_string(spec)?
         };
-        let chunk: Vec<Vec<f64>> =
-            serde_json::from_str(&text).context("parse chunk JSON (array of 9-real arrays)")?;
-        let n = chunk.len();
-        for (i, row) in chunk.into_iter().enumerate() {
-            if row.len() != 9 {
-                bail!("chunk waypoint {i} needs 9 reals, got {}", row.len());
-            }
-            set_target(
-                daemon,
+        let chunk: Vec<Vec<f64>> = serde_json::from_str(&text)?;
+        for row in chunk {
+            set_target_motor(
+                port,
+                kine,
                 Some((row[0], row[1], row[2], row[3], row[4], row[5])),
                 Some([row[7], row[8]]),
                 Some(row[6]),
             )?;
             std::thread::sleep(Duration::from_secs_f64(dt));
         }
-        println!("streamed {n} waypoints @ {dt:.3}s");
     } else {
         let p = parse_pose(pose)?;
-        let head = Some((p[0], p[1], p[2], p[3], p[4], p[5]));
-        let ant = Some([p[7], p[8]]);
         if now {
-            set_target(daemon, head, ant, Some(p[6]))?;
-            println!("snapped to pose");
+            set_target_motor(
+                port,
+                kine,
+                Some((p[0], p[1], p[2], p[3], p[4], p[5])),
+                Some([p[7], p[8]]),
+                Some(p[6]),
+            )?;
         } else {
-            goto(daemon, head, ant, Some(p[6]), duration)?;
-            println!("moved to pose over {duration:.2}s");
+            goto(
+                port,
+                kine,
+                Some((p[0], p[1], p[2], p[3], p[4], p[5])),
+                Some([p[7], p[8]]),
+                Some(p[6]),
+                duration,
+            )?;
         }
     }
     Ok(())
@@ -1002,40 +986,114 @@ fn main() -> Result<()> {
     let daemon = cli.daemon.clone();
     let python = cli.python.clone();
 
+    // Commands that don't need motors
+    if let Some(Command::List) = cli.command {
+        return with_body(&pile, branch, |_repo, ws| cmd_list(ws));
+    }
+    if let Some(Command::Get { id, output }) = &cli.command {
+        return with_body(&pile, branch, |_repo, ws| {
+            cmd_get(ws, id, output.as_deref())
+        });
+    }
+    if let Some(Command::Intent { text }) = &cli.command {
+        return with_body(&pile, branch, |repo, ws| {
+            cmd_intent(repo, ws, text.as_deref())
+        });
+    }
+
+    if cli.command.is_none() {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    }
+
+    let motion_requested = matches!(
+        cli.command.as_ref(),
+        Some(Command::Wake | Command::Sleep | Command::Gesture { .. } | Command::Act { .. })
+    ) || matches!(
+        cli.command.as_ref(),
+        Some(Command::Feel { respond: true, .. })
+    );
+    if motion_requested {
+        bail!(
+            "native Reachy actuation is quarantined: present goals are not pinned and the coordinate/limit mapping has not been validated"
+        );
+    }
+    if !cli.experimental_native_serial {
+        bail!(
+            "the unfinished native serial probe is disabled by default; stop the Reachy daemon, then pass --experimental-native-serial for read-only commands"
+        );
+    }
+    require_native_backend_ready()?;
+
+    let mut port = open_serial()?;
+    let mut kine = init_kinematics();
+
     match cli.command {
-        None => {
-            Cli::command().print_help().ok();
-            println!();
-        }
-        Some(Command::Pose) => cmd_pose(&daemon)?,
-        Some(Command::Wake) => {
-            daemon_post(&daemon, "/api/move/play/wake_up")?;
-            println!("waking up");
-        }
-        Some(Command::Sleep) => {
-            daemon_post(&daemon, "/api/move/play/goto_sleep")?;
-            println!("going to sleep");
-        }
-        Some(Command::Feel { secs, loop_, keep, respond, note }) => {
-            with_body(&pile, branch, |repo, ws| {
-                cmd_feel(repo, ws, &daemon, secs, loop_, keep, respond, note.as_deref())
-            })?
-        }
-        Some(Command::Gesture { name }) => cmd_gesture(&daemon, &name)?,
-        Some(Command::Intent { text }) => with_body(&pile, branch, |repo, ws| cmd_intent(repo, ws, text.as_deref()))?,
-        Some(Command::Observe { frame, no_frame }) => {
-            cmd_observe(&daemon, &python, frame.as_deref(), no_frame)?
-        }
-        Some(Command::Act { pose, duration, dt, now }) => {
-            cmd_act(&daemon, &pose, duration, dt, now)?
-        }
-        Some(Command::Look { note }) => {
-            with_body(&pile, branch, |repo, ws| cmd_look(repo, ws, &daemon, &python, note.as_deref()))?
-        }
-        Some(Command::List) => with_body(&pile, branch, |_repo, ws| cmd_list(ws))?,
-        Some(Command::Get { id, output }) => {
-            with_body(&pile, branch, |_repo, ws| cmd_get(ws, &id, output.as_deref()))?
-        }
+        Some(Command::Pose) => cmd_pose(port.as_mut(), &mut kine, &daemon)?,
+        Some(Command::Wake) => goto(
+            port.as_mut(),
+            &mut kine,
+            Some((0.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
+            Some([0.0, 0.0]),
+            Some(0.0),
+            1.5,
+        )?,
+        Some(Command::Sleep) => goto(
+            port.as_mut(),
+            &mut kine,
+            Some((0.0, 0.0, -0.05, 0.0, 0.4, 0.0)),
+            Some([-0.5, 0.5]),
+            Some(0.0),
+            1.5,
+        )?,
+        Some(Command::Feel {
+            secs,
+            loop_,
+            keep,
+            respond,
+            note,
+        }) => with_body(&pile, branch, |repo, ws| {
+            cmd_feel(
+                port.as_mut(),
+                &mut kine,
+                repo,
+                ws,
+                &daemon,
+                secs,
+                loop_,
+                keep,
+                respond,
+                note.as_deref(),
+            )
+        })?,
+        Some(Command::Gesture { name }) => cmd_gesture(port.as_mut(), &mut kine, &name)?,
+        Some(Command::Observe { frame, no_frame }) => cmd_observe(
+            port.as_mut(),
+            &mut kine,
+            &daemon,
+            &python,
+            frame.as_deref(),
+            no_frame,
+        )?,
+        Some(Command::Act {
+            pose,
+            duration,
+            dt,
+            now,
+        }) => cmd_act(port.as_mut(), &mut kine, &pose, duration, dt, now)?,
+        Some(Command::Look { note }) => with_body(&pile, branch, |repo, ws| {
+            cmd_look(
+                port.as_mut(),
+                &mut kine,
+                repo,
+                ws,
+                &daemon,
+                &python,
+                note.as_deref(),
+            )
+        })?,
+        _ => {}
     }
     Ok(())
 }

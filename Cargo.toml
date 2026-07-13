@@ -185,6 +185,9 @@ mary = { path = "../mary", default-features = false, optional = true }
 # imagine-only: the `image` crate, matching mary's flux feature, so the
 # RgbImage the pipeline returns can be `.save()`d to a PNG here.
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+rustypot = "1.5.0"
+serialport = "4.9.0"
+nalgebra = "0.32.3"
 
 # ── patches ────────────────────────────────────────────────────────────────
 # `[patch]` only takes effect from the *root* crate of a build, so mary's own

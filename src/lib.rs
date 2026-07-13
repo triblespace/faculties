@@ -18,6 +18,7 @@ pub const GIT_VERSION: &str = concat!(
 
 pub mod schemas;
 pub mod tokens;
+pub mod reachy_kinematics;
 
 #[cfg(feature = "widgets")]
 pub mod widgets;
