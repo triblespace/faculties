@@ -355,10 +355,8 @@ impl ReviewSettlement {
         let goal = exactly_one(&self.tasks)?;
         let actor = exactly_one(&self.actors)?;
         let created_at = exactly_one(&self.created_at)?;
-        let (expected, mode) = match (
-            self.attestations.is_empty(),
-            self.override_events.as_slice(),
-        ) {
+        let (expected, mode) = match (self.attestations.is_empty(), self.override_events.as_slice())
+        {
             (false, []) => (
                 review_attestation_settlement_fragment(
                     request,
@@ -487,7 +485,8 @@ fn interval_key(interval: IntervalValue) -> i128 {
 /// explicitly supersede it instead of letting it disappear.
 fn repair_frontier(all: Vec<Id>, edges: Vec<(Id, Id)>) -> Vec<Id> {
     let all_set: HashSet<Id> = all.iter().copied().collect();
-    let mut predecessors: std::collections::HashMap<Id, Vec<Id>> = std::collections::HashMap::new();
+    let mut predecessors: std::collections::HashMap<Id, Vec<Id>> =
+        std::collections::HashMap::new();
     let mut superseded = HashSet::new();
     for (new, old) in edges {
         if all_set.contains(&new) && all_set.contains(&old) {
@@ -516,7 +515,10 @@ fn repair_frontier(all: Vec<Id>, edges: Vec<(Id, Id)>) -> Vec<Id> {
 
 /// Deterministic latest status event for one goal. Ties on timestamp are
 /// broken by intrinsic/extrinsic event id so merged replicas agree.
-pub fn latest_status_event(space: &TribleSet, goal_id: Id) -> Option<(Id, String, IntervalValue)> {
+pub fn latest_status_event(
+    space: &TribleSet,
+    goal_id: Id,
+) -> Option<(Id, String, IntervalValue)> {
     find!(
         (event: Id, status: String, at: IntervalValue),
         pattern!(space, [{ ?event @
@@ -526,7 +528,9 @@ pub fn latest_status_event(space: &TribleSet, goal_id: Id) -> Option<(Id, String
             metadata::created_at: ?at,
         }])
     )
-    .max_by(|left, right| (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0)))
+    .max_by(|left, right| {
+        (interval_key(left.2), left.0).cmp(&(interval_key(right.2), right.0))
+    })
 }
 
 pub fn review_request(space: &TribleSet, request_id: Id) -> Option<ReviewRequest> {
@@ -617,7 +621,8 @@ pub fn review_override(space: &TribleSet, override_id: Id) -> Option<ReviewOverr
 }
 
 fn review_settlement(space: &TribleSet, settlement_id: Id) -> Option<ReviewSettlement> {
-    if !exists!(pattern!(space, [{ settlement_id @ metadata::tag: &KIND_REVIEW_SETTLEMENT_ID }])) {
+    if !exists!(pattern!(space, [{ settlement_id @ metadata::tag: &KIND_REVIEW_SETTLEMENT_ID }]))
+    {
         return None;
     }
     Some(ReviewSettlement {
@@ -766,7 +771,9 @@ fn valid_settlements(space: &TribleSet, request: &ReviewRequest) -> Vec<ValidSet
         let Some(mode) = settlement.canonical_mode() else {
             continue;
         };
-        if settlement.requests.as_slice() != [request.id] || settlement.tasks.as_slice() != [goal] {
+        if settlement.requests.as_slice() != [request.id]
+            || settlement.tasks.as_slice() != [goal]
+        {
             continue;
         }
         if mode == SettlementMode::Attestations
@@ -786,7 +793,8 @@ fn valid_settlements(space: &TribleSet, request: &ReviewRequest) -> Vec<ValidSet
                 };
                 if !request.required.contains(&reviewer)
                     || !attestation_satisfies(&attestation, request.id, reviewer, author)
-                    || active_attestation_ids_for_reviewer(space, request.id, reviewer).as_slice()
+                    || active_attestation_ids_for_reviewer(space, request.id, reviewer)
+                        .as_slice()
                         != [*attestation_id]
                     || !reviewers.insert(reviewer)
                 {
@@ -882,7 +890,9 @@ pub fn evaluate_request(
     let request = review_request(space, request_id)?;
     let settlements = valid_settlements(space, &request);
     let mut invalid = Vec::new();
-    if !request.tags.contains(&KIND_STATUS_ID) || request.statuses.as_slice() != [REVIEW_STATUS] {
+    if !request.tags.contains(&KIND_STATUS_ID)
+        || request.statuses.as_slice() != [REVIEW_STATUS]
+    {
         invalid.push("request must also be the goal's review status event".to_string());
     }
     if request.goals.len() != 1 {
@@ -1147,8 +1157,14 @@ mod tests {
         let report = format!("review report from {reviewer:x}")
             .to_blob()
             .get_handle();
-        let fragment =
-            review_attestation_fragment(request, reviewer, verdict, report, supersedes, now());
+        let fragment = review_attestation_fragment(
+            request,
+            reviewer,
+            verdict,
+            report,
+            supersedes,
+            now(),
+        );
         let id = fragment.root().expect("intrinsic review attestation");
         *space += fragment;
         id
@@ -1182,9 +1198,27 @@ mod tests {
             &[],
             "git+https://example.test/repo@1111111111111111111111111111111111111111",
         );
-        add_attestation(&mut space, request, reviewers[0], VERDICT_ABSTAIN, &[]);
-        add_attestation(&mut space, request, reviewers[1], VERDICT_APPROVE, &[]);
-        add_attestation(&mut space, request, reviewers[2], VERDICT_APPROVE, &[]);
+        add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_ABSTAIN,
+            &[],
+        );
+        add_attestation(
+            &mut space,
+            request,
+            reviewers[1],
+            VERDICT_APPROVE,
+            &[],
+        );
+        add_attestation(
+            &mut space,
+            request,
+            reviewers[2],
+            VERDICT_APPROVE,
+            &[],
+        );
 
         assert!(matches!(
             evaluate_request(&space, request, &active).unwrap().state,
@@ -1212,7 +1246,13 @@ mod tests {
             &[],
         );
         for reviewer in &reviewers[1..] {
-            add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]);
+            add_attestation(
+                &mut space,
+                request,
+                *reviewer,
+                VERDICT_APPROVE,
+                &[],
+            );
         }
         assert!(matches!(
             evaluate_request(&space, request, &active).unwrap().state,
@@ -1286,7 +1326,13 @@ mod tests {
             "urn:revision:first",
         );
         for reviewer in reviewers {
-            add_attestation(&mut space, first, reviewer, VERDICT_APPROVE, &[]);
+            add_attestation(
+                &mut space,
+                first,
+                reviewer,
+                VERDICT_APPROVE,
+                &[],
+            );
         }
         let second = add_request(
             &mut space,
@@ -1326,10 +1372,28 @@ mod tests {
             &[],
             "urn:revision:forked-attestation",
         );
-        let left = add_attestation(&mut space, request, reviewers[0], VERDICT_APPROVE, &[]);
-        let right = add_attestation(&mut space, request, reviewers[0], VERDICT_ABSTAIN, &[]);
+        let left = add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_APPROVE,
+            &[],
+        );
+        let right = add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_ABSTAIN,
+            &[],
+        );
         for reviewer in &reviewers[1..] {
-            add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]);
+            add_attestation(
+                &mut space,
+                request,
+                *reviewer,
+                VERDICT_APPROVE,
+                &[],
+            );
         }
         assert!(matches!(
             evaluate_request(&space, request, &active).unwrap().state,
@@ -1366,8 +1430,13 @@ mod tests {
             let id = add_attestation(&mut space, request, reviewer, VERDICT_APPROVE, &[]);
             evidence.push(id);
         }
-        let fragment =
-            review_attestation_settlement_fragment(request, goal, reviewers[0], &evidence, now());
+        let fragment = review_attestation_settlement_fragment(
+            request,
+            goal,
+            reviewers[0],
+            &evidence,
+            now(),
+        );
         let settlement = fragment.root().expect("intrinsic review settlement");
         space += fragment;
 
@@ -1405,10 +1474,17 @@ mod tests {
         );
         let evidence: Vec<Id> = reviewers
             .iter()
-            .map(|reviewer| add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]))
+            .map(|reviewer| {
+                add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[])
+            })
             .collect();
-        let fragment =
-            review_attestation_settlement_fragment(request, goal, reviewers[0], &evidence, now());
+        let fragment = review_attestation_settlement_fragment(
+            request,
+            goal,
+            reviewers[0],
+            &evidence,
+            now(),
+        );
         let settlement = fragment.root().expect("intrinsic review settlement");
         space += fragment;
 
@@ -1469,7 +1545,13 @@ mod tests {
             &[],
             "urn:revision:sealed-attestation",
         );
-        let patched = add_attestation(&mut space, request, reviewers[0], VERDICT_APPROVE, &[]);
+        let patched = add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_APPROVE,
+            &[],
+        );
         for reviewer in &reviewers[1..] {
             add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]);
         }
@@ -1503,7 +1585,13 @@ mod tests {
             VERDICT_REQUEST_CHANGES,
             &[],
         );
-        let patched = add_attestation(&mut space, request, reviewers[0], VERDICT_APPROVE, &[]);
+        let patched = add_attestation(
+            &mut space,
+            request,
+            reviewers[0],
+            VERDICT_APPROVE,
+            &[],
+        );
         for reviewer in &reviewers[1..] {
             add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]);
         }
@@ -1602,7 +1690,9 @@ mod tests {
         );
         let approvals: Vec<Id> = reviewers
             .iter()
-            .map(|reviewer| add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]))
+            .map(|reviewer| {
+                add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[])
+            })
             .collect();
         add_attestation(
             &mut space,
@@ -1611,8 +1701,13 @@ mod tests {
             VERDICT_REQUEST_CHANGES,
             &[approvals[0]],
         );
-        space +=
-            review_attestation_settlement_fragment(request, goal, reviewers[0], &approvals, now());
+        space += review_attestation_settlement_fragment(
+            request,
+            goal,
+            reviewers[0],
+            &approvals,
+            now(),
+        );
 
         assert!(matches!(
             evaluate_request(&space, request, &known).unwrap().state,
@@ -1634,10 +1729,17 @@ mod tests {
         );
         let evidence: Vec<Id> = reviewers
             .iter()
-            .map(|reviewer| add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[]))
+            .map(|reviewer| {
+                add_attestation(&mut space, request, *reviewer, VERDICT_APPROVE, &[])
+            })
             .collect();
-        let fragment =
-            review_attestation_settlement_fragment(request, goal, reviewers[0], &evidence, now());
+        let fragment = review_attestation_settlement_fragment(
+            request,
+            goal,
+            reviewers[0],
+            &evidence,
+            now(),
+        );
         let settlement = fragment.root().expect("intrinsic review settlement");
         space += fragment;
         let unrelated_request = ufoid().id;
@@ -1667,8 +1769,13 @@ mod tests {
         let override_fragment = review_override_fragment(request, authority, reason, now());
         let override_id = override_fragment.root().expect("intrinsic review override");
         space += override_fragment;
-        let settlement_fragment =
-            review_override_settlement_fragment(request, goal, authority, override_id, now());
+        let settlement_fragment = review_override_settlement_fragment(
+            request,
+            goal,
+            authority,
+            override_id,
+            now(),
+        );
         let settlement = settlement_fragment
             .root()
             .expect("intrinsic override settlement");
@@ -1701,7 +1808,13 @@ mod tests {
         let override_fragment = review_override_fragment(request, authority, reason, now());
         let override_id = override_fragment.root().expect("intrinsic review override");
         space += override_fragment;
-        space += review_override_settlement_fragment(request, goal, authority, override_id, now());
+        space += review_override_settlement_fragment(
+            request,
+            goal,
+            authority,
+            override_id,
+            now(),
+        );
         space += entity! { ExclusiveId::force_ref(&override_id) @
             metadata::tag: &KIND_NOTE_ID,
         };
@@ -1889,13 +2002,10 @@ mod tests {
         // A snapshot that dropped reviewers[2] (e.g. a caller that forgot to
         // include soft-retired members): the frozen roster now has an "unknown"
         // member and the gate refuses rather than settling.
-        let incomplete: HashSet<Id> = [reviewers[0], reviewers[1], authority]
-            .into_iter()
-            .collect();
+        let incomplete: HashSet<Id> =
+            [reviewers[0], reviewers[1], authority].into_iter().collect();
         assert!(matches!(
-            evaluate_request(&space, request, &incomplete)
-                .unwrap()
-                .state,
+            evaluate_request(&space, request, &incomplete).unwrap().state,
             ReviewGateState::Invalid { .. }
         ));
         // Sanity: a complete snapshot over the identical space is Ready.
