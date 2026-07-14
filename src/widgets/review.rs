@@ -395,7 +395,10 @@ fn build_settlement_view(
             override_reason: None,
         },
         ReviewProjection::Bound(evaluation) => {
-            let required = evaluation.request.required.len();
+            // The live (effective) roster the gate actually uses, so the count
+            // and reviewer cards match a group's CURRENT composition, not the
+            // frozen open-time snapshot.
+            let required = evaluation.effective_required.len();
             let author_id = evaluation.request.author();
             let target = evaluation
                 .request
@@ -481,8 +484,7 @@ fn build_settlement_view(
                 .map(|settlement| settlement.attestations.as_slice());
             let retired = retired_person_ids(&live.relations_space);
             let reviewers = evaluation
-                .request
-                .required
+                .effective_required
                 .iter()
                 .copied()
                 .map(|reviewer| {

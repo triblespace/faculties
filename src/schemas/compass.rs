@@ -1855,6 +1855,67 @@ mod tests {
     }
 
     #[test]
+    fn groupless_request_id_is_unchanged_by_the_optional_group_seal() {
+        // BACKWARD COMPAT: a request with no group must hash EXACTLY as it did
+        // before the optional `review::group` seal existed, so requests already
+        // in the pile stay canonical after the binary is upgraded. The `?:`
+        // optional attribute must omit entirely (not emit a null marker) on None.
+        let goal = ufoid().id;
+        let author = ufoid().id;
+        let target: TextHandle = "urn:revision:compat".to_blob().get_handle();
+        let reviewers = sorted_unique(vec![author, ufoid().id]);
+        let ts = now();
+        let with_none =
+            review_request_fragment(goal, author, target, &reviewers, &[], &[], None, ts).root();
+        // The exact pre-seal shape: no `review::group` attribute at all.
+        let legacy = entity! { _ @
+            metadata::tag: &KIND_REVIEW_REQUEST_ID,
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &goal,
+            board::status: REVIEW_STATUS,
+            board::by: &author,
+            metadata::iri: target,
+            review::required*: reviewers.iter(),
+            metadata::created_at: ts,
+        }
+        .root();
+        assert_eq!(
+            with_none, legacy,
+            "optional group seal perturbed a groupless request's identity"
+        );
+    }
+
+    #[test]
+    fn legacy_settlement_id_is_unchanged_by_the_optional_roster_seal() {
+        // BACKWARD COMPAT (settlement side): a groupless settlement sealing no
+        // snapshot/roster must hash EXACTLY as before, so already-settled
+        // legacy reviews stay canonical after upgrade.
+        let request = ufoid().id;
+        let goal = ufoid().id;
+        let actor = ufoid().id;
+        let evidence = sorted_unique(vec![ufoid().id, ufoid().id]);
+        let ts = now();
+        let with_empty =
+            review_attestation_settlement_fragment(request, goal, actor, &evidence, None, &[], ts)
+                .root();
+        let legacy = entity! { _ @
+            metadata::tag: &KIND_REVIEW_SETTLEMENT_ID,
+            metadata::tag: &KIND_STATUS_ID,
+            review::request: &request,
+            review::attestation*: evidence.iter(),
+            board::task: &goal,
+            board::status: DONE_STATUS,
+            board::by: &actor,
+            metadata::created_at: ts,
+        }
+        .root();
+        assert_eq!(
+            with_empty, legacy,
+            "optional roster seal perturbed a legacy settlement's identity"
+        );
+    }
+
+    #[test]
     fn roster_transition_classifies_added_removed_and_retained() {
         let a = ufoid().id;
         let b = ufoid().id;

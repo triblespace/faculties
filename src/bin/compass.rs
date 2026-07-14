@@ -1913,7 +1913,7 @@ fn render_review_evaluation(
         ReviewGateState::Blocked { submitted, reasons } => {
             format!(
                 "BLOCKED — {submitted}/{} submitted — {}",
-                evaluation.request.required.len(),
+                evaluation.effective_required.len(),
                 reasons.join("; ")
             )
         }
@@ -1941,10 +1941,12 @@ fn render_review_evaluation(
         for settlement in settlements {
             match settlement.mode {
                 SettlementMode::Attestations => {
+                    // The certificate's OWN sealed proof size (one attestation
+                    // per sealed-roster member), not the current live roster.
                     println!(
                         "- {:x} ({} reviewers)",
                         settlement.id,
-                        evaluation.request.required.len()
+                        settlement.attestations.len()
                     );
                     for evidence in &settlement.attestations {
                         println!("    sealed attestation {:x}", evidence);

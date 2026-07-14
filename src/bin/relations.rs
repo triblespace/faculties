@@ -195,6 +195,12 @@ enum GroupCmd {
     },
     /// One-time: give legacy anchor-direct groups their initial snapshot.
     Migrate,
+    /// Heal a forked group: mint one child superseding every concurrent head,
+    /// carrying the UNION of their members (edit down afterward if intended).
+    Reconcile {
+        /// Group label or id
+        group: String,
+    },
     /// List groups and their members
     List,
     /// Show a group's members
@@ -1246,6 +1252,52 @@ fn cmd_group_migrate(pile: &Path, branch_id: Id) -> Result<()> {
     Ok(())
 }
 
+fn cmd_group_reconcile(pile: &Path, branch_id: Id, group: String) -> Result<()> {
+    let (gid, healed) = with_repo(pile, |repo| {
+        let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+        let space = ws.checkout(..).map_err(|e| anyhow!("checkout: {e:?}"))?;
+        let gid = resolve_group_id(&space, &group)?;
+        let heads = match resolve_group_head(&space, gid) {
+            GroupHead::Forked(heads) => heads,
+            GroupHead::Unique(_) => return Ok((gid, false)),
+            GroupHead::Missing => bail!(
+                "group {} has no snapshot yet; run `relations group migrate`",
+                fmt_id(gid)
+            ),
+            GroupHead::Invalid(reason) => bail!(
+                "group {} is invalid ({reason}); a corrupt snapshot graph cannot be reconciled",
+                fmt_id(gid)
+            ),
+        };
+        // The UNION of every fork head's members: reconciliation drops no member
+        // silently. Prune afterward with `group remove` if that was intended.
+        let mut members: Vec<Id> = Vec::new();
+        for &head in &heads {
+            members.extend(find!(m: Id, pattern!(&space, [{ head @ group::member: ?m }])));
+        }
+        members.sort();
+        members.dedup();
+        // Every canonical fork head carries the same name unless a concurrent
+        // rename diverged; take the first head's name (a rename fork is rare and
+        // the operator can rename after healing).
+        let name = person_label(&mut ws, &space, heads[0])
+            .ok_or_else(|| anyhow!("fork head {} has no name", fmt_id(heads[0])))?;
+        let label = normalize_label(&name)?;
+        let key = normalize_lookup_key(&name)?;
+        // One intrinsic child superseding EVERY head => a single un-superseded head.
+        let (change, _) = mint_group_snapshot(&mut ws, gid, &members, &label, &key, &heads);
+        ws.commit(change, "relations group reconcile");
+        repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+        Ok((gid, true))
+    })?;
+    if healed {
+        println!("Reconciled forked group {} into a single head.", fmt_id(gid));
+    } else {
+        println!("Group {} is not forked; nothing to reconcile.", fmt_id(gid));
+    }
+    Ok(())
+}
+
 fn cmd_group_list(pile: &Path, branch_id: Id) -> Result<()> {
     with_repo(pile, |repo| {
         let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
@@ -1426,6 +1478,7 @@ fn main() -> Result<()> {
             }
             GroupCmd::Rename { group, name } => cmd_group_rename(&cli.pile, branch_id, group, name),
             GroupCmd::Migrate => cmd_group_migrate(&cli.pile, branch_id),
+            GroupCmd::Reconcile { group } => cmd_group_reconcile(&cli.pile, branch_id, group),
             GroupCmd::List => cmd_group_list(&cli.pile, branch_id),
             GroupCmd::Show { group } => cmd_group_show(&cli.pile, branch_id, group),
         },
@@ -1629,5 +1682,45 @@ mod tests {
         assert_eq!(resolve(pile.path(), b, "Squad").expect("resolve squad"), anchor);
         assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
         assert_eq!(members(pile.path(), b, anchor), vec![bob]);
+    }
+
+    /// Commit one content-canonical snapshot of `anchor` (tagging the anchor).
+    /// Two divergent no-predecessor snapshots of the same anchor produce a fork.
+    fn seed_snapshot(pile: &Path, branch_id: Id, anchor: Id, name: &str, members: &[Id], preds: &[Id]) {
+        with_repo(pile, |repo| {
+            let mut ws = repo.pull(branch_id).map_err(|e| anyhow!("pull: {e:?}"))?;
+            let handle = ws.put(name.to_string());
+            let mut change = TribleSet::new();
+            change += entity! { ExclusiveId::force_ref(&anchor) @ metadata::tag: &KIND_GROUP };
+            change += group_snapshot_fragment(anchor, handle, members, preds);
+            ws.commit(change, "seed snapshot");
+            repo.push(&mut ws).map_err(|e| anyhow!("push: {e:?}"))?;
+            Ok(())
+        })
+        .expect("seed snapshot");
+    }
+
+    #[test]
+    fn reconcile_heals_a_fork_into_one_head_with_the_union_of_members() {
+        let pile = TestPile::new();
+        let b = branch(pile.path());
+        let anchor = ufoid().id;
+        let m1 = ufoid().id;
+        let m2 = ufoid().id;
+        // Two replicas edited the same anchor concurrently and divergently: two
+        // un-superseded heads with different members => Forked.
+        seed_snapshot(pile.path(), b, anchor, "crew", &[m1], &[]);
+        seed_snapshot(pile.path(), b, anchor, "crew", &[m1, m2], &[]);
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Forked(_)));
+        // While forked, ordinary edits fail closed.
+        assert!(cmd_group_add(pile.path(), b, fmt_id(anchor), fmt_id(m2)).is_err());
+
+        cmd_group_reconcile(pile.path(), b, fmt_id(anchor)).expect("reconcile");
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
+        // The union of both heads' members survives (nothing silently dropped).
+        assert_eq!(members(pile.path(), b, anchor), sorted(vec![m1, m2]));
+        // Reconcile on a healthy group is a visible no-op.
+        cmd_group_reconcile(pile.path(), b, fmt_id(anchor)).expect("reconcile no-op");
+        assert!(matches!(head(pile.path(), b, anchor), GroupHead::Unique(_)));
     }
 }
