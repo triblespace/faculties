@@ -16,7 +16,19 @@ All notable changes to this project will be documented in this file.
   settlements or visibly reasoned break-glass overrides. Requests and verdicts
   use explicit supersession heads: explicitly opening a successor candidate
   stales prior evidence, concurrent successors remain visible forks, and no
-  mutable approval flag is stored. Opening/settling are themselves the
+  mutable approval flag is stored. Same-target roster migration uses the
+  dedicated `review supersede` transition: it preserves the exact candidate,
+  author, and override authority, refuses to remove any reviewer with even
+  stale or malformed submitted evidence, retains the old proof history, and
+  requires fresh successor attestations. `review open` cannot bypass that
+  guard with same-target author, roster, or override changes: append-only
+  target membership makes every unmarked same-target successor invalid even
+  if its predecessor is later backpatched. Same-target fork repair is
+  deliberately refused; collapsing a fork requires a genuinely changed
+  immutable target. Sealed roster-predecessor links revalidate the complete
+  same-target lineage after replica merges, so a settlement on any ancestor,
+  or evidence from an ancestor reviewer removed by any later roster, closes
+  the successor. Opening/settling are themselves the
   `review`/`done` status events. Orient derives outstanding assignments from
   those same heads, wakes peer reviewers on a new or refreshed candidate,
   keeps the author's obligation visible in its snapshot, stays quiet for other

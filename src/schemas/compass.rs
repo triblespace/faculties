@@ -88,6 +88,11 @@ pub mod review {
         "5C18CCC8D073A201659DCEA0564CE0DF" as verdict: inlineencodings::ShortString;
         /// A newer request or attestation explicitly replaces these heads.
         "8EAF3178069E8E9215C419FD1D125F4B" as supersedes: inlineencodings::GenId;
+        /// Identity-sealed predecessor of an exact same-target roster successor.
+        /// The canonical roster-successor fragment also names this as its sole
+        /// `supersedes` edge, distinguishing the guarded transition from an
+        /// ordinary changed-target successor without trusting mutable history.
+        "FC923070BDBAEB9E1F5AC5D4ADE3156C" as roster_predecessor: inlineencodings::GenId;
         /// Settlement -> exact attestation evidence used (repeated).
         "7BF4989BFA09875884BF89E165B2C913" as attestation: inlineencodings::GenId;
         /// Settlement -> exact break-glass override event used.
@@ -123,6 +128,35 @@ pub fn review_request_fragment(
         review::required*: required.iter(),
         review::override_authority*: override_authorities.iter(),
         review::supersedes*: supersedes.iter(),
+        metadata::created_at: created_at,
+    }
+}
+
+/// Construct a request that changes only the frozen roster of one exact,
+/// unsettled predecessor. The dedicated predecessor marker is part of the
+/// successor's intrinsic identity and is repeated as its sole supersession
+/// edge; evaluation can therefore enforce this narrower transition even if
+/// facts about the predecessor arrive or are backpatched after replicas merge.
+pub fn review_roster_successor_fragment(
+    goal: Id,
+    author: Id,
+    target: TextHandle,
+    required: &[Id],
+    override_authorities: &[Id],
+    predecessor: Id,
+    created_at: IntervalValue,
+) -> Fragment {
+    entity! { _ @
+        metadata::tag: &KIND_REVIEW_REQUEST_ID,
+        metadata::tag: &KIND_STATUS_ID,
+        board::task: &goal,
+        board::status: REVIEW_STATUS,
+        board::by: &author,
+        metadata::iri: target,
+        review::required*: required.iter(),
+        review::override_authority*: override_authorities.iter(),
+        review::supersedes: &predecessor,
+        review::roster_predecessor: &predecessor,
         metadata::created_at: created_at,
     }
 }
@@ -214,6 +248,7 @@ pub struct ReviewRequest {
     pub required: Vec<Id>,
     pub override_authorities: Vec<Id>,
     pub supersedes: Vec<Id>,
+    pub roster_predecessors: Vec<Id>,
     pub created_at: Vec<IntervalValue>,
 }
 
@@ -236,16 +271,35 @@ impl ReviewRequest {
         {
             return None;
         }
-        review_request_fragment(
-            self.goal()?,
-            self.author()?,
-            self.target()?,
-            &self.required,
-            &self.override_authorities,
-            &self.supersedes,
-            exactly_one(&self.created_at)?,
-        )
-        .root()
+        let goal = self.goal()?;
+        let author = self.author()?;
+        let target = self.target()?;
+        let created_at = exactly_one(&self.created_at)?;
+        match self.roster_predecessors.as_slice() {
+            [] => review_request_fragment(
+                goal,
+                author,
+                target,
+                &self.required,
+                &self.override_authorities,
+                &self.supersedes,
+                created_at,
+            )
+            .root(),
+            [predecessor] if self.supersedes.as_slice() == [*predecessor] => {
+                review_roster_successor_fragment(
+                    goal,
+                    author,
+                    target,
+                    &self.required,
+                    &self.override_authorities,
+                    *predecessor,
+                    created_at,
+                )
+                .root()
+            }
+            _ => None,
+        }
     }
 
     pub fn is_canonical(&self) -> bool {
@@ -559,6 +613,9 @@ pub fn review_request(space: &TribleSet, request_id: Id) -> Option<ReviewRequest
     let supersedes = sorted_unique(
         find!(v: Id, pattern!(space, [{ request_id @ review::supersedes: ?v }])).collect(),
     );
+    let roster_predecessors = sorted_unique(
+        find!(v: Id, pattern!(space, [{ request_id @ review::roster_predecessor: ?v }])).collect(),
+    );
     let created_at = sorted_unique(
         find!(v: IntervalValue, pattern!(space, [{ request_id @ metadata::created_at: ?v }]))
             .collect(),
@@ -573,6 +630,7 @@ pub fn review_request(space: &TribleSet, request_id: Id) -> Option<ReviewRequest
         required,
         override_authorities,
         supersedes,
+        roster_predecessors,
         created_at,
     })
 }
@@ -686,6 +744,27 @@ pub fn all_attestation_ids_for_request(space: &TribleSet, request_id: Id) -> Vec
         find!(id: Id, pattern!(space, [{ ?id @
             metadata::tag: &KIND_REVIEW_ATTESTATION_ID,
             review::request: &request_id,
+        }]))
+        .collect(),
+    )
+}
+
+/// Every attestation entity ever attributed to one reviewer on one request.
+///
+/// Unlike `active_attestation_ids_for_reviewer`, this intentionally includes
+/// superseded, forked, and non-canonical records. Same-target roster changes
+/// use the complete immutable history so an old vote cannot be made invisible
+/// merely by moving the attestation frontier.
+pub fn all_attestation_ids_for_reviewer(
+    space: &TribleSet,
+    request_id: Id,
+    reviewer_id: Id,
+) -> Vec<Id> {
+    sorted_unique(
+        find!(id: Id, pattern!(space, [{ ?id @
+            metadata::tag: &KIND_REVIEW_ATTESTATION_ID,
+            review::request: &request_id,
+            board::by: &reviewer_id,
         }]))
         .collect(),
     )
@@ -844,6 +923,237 @@ fn settlement_ids_for_request(space: &TribleSet, request_id: Id) -> Vec<Id> {
     )
 }
 
+/// Reject an ordinary successor that reuses any direct predecessor target.
+///
+/// The successor's target is identity-sealed, while target facts on an older
+/// request are append-only. Membership is therefore monotone: once this rule
+/// recognizes a same-target transition, no later backpatch can make it look
+/// like an ordinary changed-target revision. We deliberately reject even an
+/// otherwise identical same-target ordinary successor. Same-target evolution
+/// has one explicit protocol, the identity-marked roster transition below.
+fn ordinary_same_target_invalid_reasons(
+    space: &TribleSet,
+    request: &ReviewRequest,
+) -> Vec<String> {
+    if !request.roster_predecessors.is_empty() {
+        return Vec::new();
+    }
+    let Some(target) = request.target() else {
+        return Vec::new();
+    };
+    let mut reasons = Vec::new();
+    for predecessor_id in &request.supersedes {
+        if find!(observed: TextHandle, pattern!(space, [{ *predecessor_id @ metadata::iri: ?observed }]))
+            .any(|observed| observed == target)
+        {
+            reasons.push(format!(
+                "ordinary successor reuses superseded request {predecessor_id:x}'s exact target and must use the sealed roster_predecessor protocol; same-target ordinary revision and fork repair are deliberately forbidden"
+            ));
+        }
+    }
+    reasons
+}
+
+/// Validate an identity-marked same-target roster-successor lineage.
+///
+/// Every marker edge must form one canonical, acyclic, same-target chain. The
+/// whole chain remains proof-relevant: a settlement on any ancestor closes
+/// later roster migration, and evidence submitted by a reviewer on any
+/// ancestor can never be discarded by removing that reviewer farther down the
+/// chain. This transitive check prevents add-then-remove laundering and is
+/// repeated after replica merges so late ancestor evidence fails closed.
+fn roster_successor_invalid_reasons(
+    space: &TribleSet,
+    request: &ReviewRequest,
+    known_people: &HashSet<Id>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if request.roster_predecessors.is_empty() {
+        return ordinary_same_target_invalid_reasons(space, request);
+    }
+
+    let mut newest_to_oldest = vec![request.clone()];
+    let mut visited = HashSet::from([request.id]);
+    let mut cursor = request.clone();
+    loop {
+        let predecessor_id = match cursor.roster_predecessors.as_slice() {
+            [] => break,
+            [predecessor] => *predecessor,
+            _ => {
+                reasons.push(format!(
+                    "roster lineage node {:x} must name exactly one sealed roster_predecessor",
+                    cursor.id
+                ));
+                return reasons;
+            }
+        };
+        if cursor.supersedes.as_slice() != [predecessor_id] {
+            reasons.push(format!(
+                "roster lineage node {:x}'s roster_predecessor must also be its sole supersedes edge",
+                cursor.id
+            ));
+        }
+        if !visited.insert(predecessor_id) {
+            reasons.push(format!(
+                "roster predecessor lineage contains a cycle at {predecessor_id:x}"
+            ));
+            return reasons;
+        }
+        if !cursor.is_canonical() {
+            reasons.push(format!(
+                "roster lineage node {:x} is non-canonical",
+                cursor.id
+            ));
+            return reasons;
+        }
+        let Some(predecessor) = review_request(space, predecessor_id) else {
+            reasons.push(format!(
+                "roster predecessor {predecessor_id:x} is missing or not a review request"
+            ));
+            return reasons;
+        };
+        if predecessor
+            .roster_predecessors
+            .iter()
+            .any(|older| visited.contains(older))
+        {
+            reasons.push(format!(
+                "roster predecessor lineage contains a cycle through {predecessor_id:x}"
+            ));
+            return reasons;
+        }
+        if !predecessor.is_canonical() {
+            reasons.push(format!(
+                "roster predecessor {predecessor_id:x} is non-canonical"
+            ));
+            return reasons;
+        }
+        newest_to_oldest.push(predecessor.clone());
+        cursor = predecessor;
+    }
+
+    if let Some(root) = newest_to_oldest.last() {
+        reasons.extend(
+            ordinary_same_target_invalid_reasons(space, root)
+                .into_iter()
+                .map(|reason| format!("invalid roster-lineage root {:x}: {reason}", root.id)),
+        );
+    }
+
+    newest_to_oldest.reverse();
+    let lineage = newest_to_oldest;
+    for node in &lineage {
+        let Some(author) = node.author() else {
+            reasons.push(format!(
+                "roster lineage node {:x} does not seal exactly one author",
+                node.id
+            ));
+            continue;
+        };
+        if !node.required.contains(&author)
+            || !node.required.iter().any(|reviewer| *reviewer != author)
+        {
+            reasons.push(format!(
+                "roster lineage node {:x} has an invalid frozen roster",
+                node.id
+            ));
+        }
+        if node.override_authorities.len() > 1 || node.override_authorities.contains(&author) {
+            reasons.push(format!(
+                "roster lineage node {:x} has an invalid frozen override authority",
+                node.id
+            ));
+        }
+        if node
+            .required
+            .iter()
+            .chain(node.override_authorities.iter())
+            .any(|person| !known_people.contains(person))
+        {
+            reasons.push(format!(
+                "roster lineage node {:x} contains unknown frozen people",
+                node.id
+            ));
+        }
+    }
+
+    for edge in lineage.windows(2) {
+        let predecessor = &edge[0];
+        let successor = &edge[1];
+        if successor.roster_predecessors.as_slice() != [predecessor.id]
+            || successor.supersedes.as_slice() != [predecessor.id]
+        {
+            reasons.push(format!(
+                "roster lineage edge {:x} -> {:x} is not identity-sealed",
+                predecessor.id, successor.id
+            ));
+        }
+        if predecessor.goal() != successor.goal() {
+            reasons.push(format!(
+                "roster successor {:x} must preserve predecessor {:x}'s exact goal",
+                successor.id, predecessor.id
+            ));
+        }
+        if predecessor.target() != successor.target() {
+            reasons.push(format!(
+                "roster successor {:x} must preserve predecessor {:x}'s exact target",
+                successor.id, predecessor.id
+            ));
+        }
+        if predecessor.author() != successor.author() {
+            reasons.push(format!(
+                "roster successor must preserve author across predecessor {:x} -> successor {:x}",
+                predecessor.id, successor.id
+            ));
+        }
+        if predecessor.override_authorities != successor.override_authorities {
+            reasons.push(format!(
+                "roster successor {:x} must preserve predecessor {:x}'s override authority",
+                successor.id, predecessor.id
+            ));
+        }
+        if predecessor.required == successor.required {
+            reasons.push(format!(
+                "roster successor {:x} must actually change predecessor {:x}'s frozen roster",
+                successor.id, predecessor.id
+            ));
+        }
+    }
+
+    for ancestor in lineage.iter().take(lineage.len().saturating_sub(1)) {
+        let settlements = settlement_ids_for_request(space, ancestor.id);
+        if !settlements.is_empty() {
+            reasons.push(format!(
+                "roster successor requires unsettled predecessor history, but ancestor {:x} has {} settlement record(s)",
+                ancestor.id,
+                settlements.len()
+            ));
+        }
+    }
+
+    for successor_index in 1..lineage.len() {
+        let successor = &lineage[successor_index];
+        for ancestor in &lineage[..successor_index] {
+            for removed in ancestor
+                .required
+                .iter()
+                .filter(|reviewer| !successor.required.contains(reviewer))
+            {
+                let evidence = all_attestation_ids_for_reviewer(space, ancestor.id, *removed);
+                if !evidence.is_empty() {
+                    reasons.push(format!(
+                        "roster successor removes reviewer {removed:x} at {:x}, but ancestor {:x} has {} submitted attestation record(s) by the reviewer",
+                        successor.id,
+                        ancestor.id,
+                        evidence.len()
+                    ));
+                }
+            }
+        }
+    }
+    reasons
+}
+
 fn status_event_is_predecessor_of_request(
     space: &TribleSet,
     event: Id,
@@ -910,6 +1220,11 @@ pub fn evaluate_request(
     if !request.is_canonical() {
         invalid.push("request id does not seal its proof-defining fields".to_string());
     }
+    invalid.extend(roster_successor_invalid_reasons(
+        space,
+        &request,
+        known_people,
+    ));
     if let Some(goal) = request.goal() {
         if !exists!(pattern!(space, [{ goal @ metadata::tag: &KIND_GOAL_ID }])) {
             invalid.push("request must name an entity tagged as a goal".to_string());
@@ -1146,6 +1461,30 @@ mod tests {
         id
     }
 
+    fn add_roster_successor(
+        space: &mut TribleSet,
+        goal: Id,
+        author: Id,
+        required: &[Id],
+        authorities: &[Id],
+        predecessor: Id,
+        target: &str,
+    ) -> Id {
+        let target_handle = target.to_string().to_blob().get_handle();
+        let fragment = review_roster_successor_fragment(
+            goal,
+            author,
+            target_handle,
+            required,
+            authorities,
+            predecessor,
+            now(),
+        );
+        let id = fragment.root().expect("intrinsic roster successor");
+        *space += fragment;
+        id
+    }
+
     fn add_attestation(
         space: &mut TribleSet,
         request: Id,
@@ -1165,6 +1504,31 @@ mod tests {
             now(),
         );
         let id = fragment.root().expect("intrinsic review attestation");
+        *space += fragment;
+        id
+    }
+
+    fn settle_request(
+        space: &mut TribleSet,
+        goal: Id,
+        request: Id,
+        author: Id,
+        required: &[Id],
+    ) -> Id {
+        let evidence = required
+            .iter()
+            .map(|reviewer| {
+                let verdict = if *reviewer == author {
+                    VERDICT_ABSTAIN
+                } else {
+                    VERDICT_APPROVE
+                };
+                add_attestation(space, request, *reviewer, verdict, &[])
+            })
+            .collect::<Vec<_>>();
+        let fragment =
+            review_attestation_settlement_fragment(request, goal, author, &evidence, now());
+        let id = fragment.root().expect("intrinsic review settlement");
         *space += fragment;
         id
     }
@@ -1601,6 +1965,591 @@ mod tests {
                 vec![(goal, second)]
             );
         }
+    }
+
+    #[test]
+    fn late_old_attestation_invalidates_same_target_roster_successor() {
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let target = "urn:revision:same-target-roster";
+        let predecessor = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            target,
+        );
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers[..2],
+            &[authority],
+            predecessor,
+            target,
+        );
+        let evidence = [
+            add_attestation(
+                &mut space,
+                successor,
+                reviewers[0],
+                VERDICT_ABSTAIN,
+                &[],
+            ),
+            add_attestation(
+                &mut space,
+                successor,
+                reviewers[1],
+                VERDICT_APPROVE,
+                &[],
+            ),
+        ];
+        space += review_attestation_settlement_fragment(
+            successor,
+            goal,
+            reviewers[0],
+            &evidence,
+            now(),
+        );
+        assert!(matches!(
+            evaluate_request(&space, successor, &known).unwrap().state,
+            ReviewGateState::Settled { .. }
+        ));
+
+        let late = add_attestation(
+            &mut space,
+            predecessor,
+            reviewers[2],
+            VERDICT_APPROVE,
+            &[],
+        );
+        assert_eq!(
+            all_attestation_ids_for_reviewer(&space, predecessor, reviewers[2]),
+            vec![late]
+        );
+        match evaluate_request(&space, successor, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(reasons
+                .iter()
+                .any(|reason| reason.contains("roster successor removes reviewer"))),
+            other => panic!("late predecessor evidence must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn late_old_override_settlement_invalidates_same_target_roster_successor() {
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let target = "urn:revision:same-target-late-override";
+        let predecessor = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            target,
+        );
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers[..2],
+            &[authority],
+            predecessor,
+            target,
+        );
+        assert!(matches!(
+            evaluate_request(&space, successor, &known).unwrap().state,
+            ReviewGateState::Pending {
+                submitted: 0,
+                required: 2
+            }
+        ));
+
+        let reason = "offline override".to_string().to_blob().get_handle();
+        let override_event = review_override_fragment(predecessor, authority, reason, now());
+        let override_id = override_event.root().expect("intrinsic override fixture");
+        space += override_event;
+        space += review_override_settlement_fragment(
+            predecessor,
+            goal,
+            authority,
+            override_id,
+            now(),
+        );
+        match evaluate_request(&space, successor, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(reasons
+                .iter()
+                .any(|reason| reason.contains("requires unsettled predecessor"))),
+            other => panic!("late predecessor settlement must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transitive_add_then_remove_cannot_launder_ancestor_dissent() {
+        let (mut space, goal, reviewers, authority, known) = fixture_with_reviewers::<4>();
+        let target = "urn:revision:transitive-roster-dissent";
+        let grandparent = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers[..3],
+            &[authority],
+            &[],
+            target,
+        );
+        add_attestation(
+            &mut space,
+            grandparent,
+            reviewers[2],
+            VERDICT_REQUEST_CHANGES,
+            &[],
+        );
+        let parent = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            grandparent,
+            target,
+        );
+        let successor_roster = [reviewers[0], reviewers[1], reviewers[3]];
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &successor_roster,
+            &[authority],
+            parent,
+            target,
+        );
+
+        match evaluate_request(&space, successor, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|reason| {
+                    reason.contains("removes reviewer")
+                        && reason.contains(&format!("{:x}", grandparent))
+                }),
+                "grandparent dissent was not retained: {reasons:?}"
+            ),
+            other => panic!("transitive reviewer removal must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn late_grandparent_evidence_invalidates_a_settled_roster_descendant() {
+        let (mut space, goal, reviewers, authority, known) = fixture_with_reviewers::<4>();
+        let target = "urn:revision:late-grandparent-evidence";
+        let grandparent = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers[..3],
+            &[authority],
+            &[],
+            target,
+        );
+        let parent = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            grandparent,
+            target,
+        );
+        let successor_roster = [reviewers[0], reviewers[1], reviewers[3]];
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &successor_roster,
+            &[authority],
+            parent,
+            target,
+        );
+        settle_request(
+            &mut space,
+            goal,
+            successor,
+            reviewers[0],
+            &successor_roster,
+        );
+        assert!(matches!(
+            evaluate_request(&space, successor, &known).unwrap().state,
+            ReviewGateState::Settled { .. }
+        ));
+
+        add_attestation(
+            &mut space,
+            grandparent,
+            reviewers[2],
+            VERDICT_REQUEST_CHANGES,
+            &[],
+        );
+        match evaluate_request(&space, successor, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|reason| {
+                    reason.contains("removes reviewer")
+                        && reason.contains(&format!("{:x}", grandparent))
+                }),
+                "late grandparent evidence did not invalidate settlement: {reasons:?}"
+            ),
+            other => panic!("late grandparent evidence must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn late_grandparent_settlement_invalidates_a_settled_roster_descendant() {
+        let (mut space, goal, reviewers, authority, known) = fixture_with_reviewers::<4>();
+        let target = "urn:revision:late-grandparent-settlement";
+        let grandparent = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers[..3],
+            &[authority],
+            &[],
+            target,
+        );
+        let parent = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            grandparent,
+            target,
+        );
+        let successor_roster = [reviewers[0], reviewers[1], reviewers[3]];
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &successor_roster,
+            &[authority],
+            parent,
+            target,
+        );
+        settle_request(
+            &mut space,
+            goal,
+            successor,
+            reviewers[0],
+            &successor_roster,
+        );
+        assert!(matches!(
+            evaluate_request(&space, successor, &known).unwrap().state,
+            ReviewGateState::Settled { .. }
+        ));
+
+        let reason = "late grandparent override".to_string().to_blob().get_handle();
+        let override_event = review_override_fragment(grandparent, authority, reason, now());
+        let override_id = override_event.root().expect("intrinsic override fixture");
+        space += override_event;
+        space += review_override_settlement_fragment(
+            grandparent,
+            goal,
+            authority,
+            override_id,
+            now(),
+        );
+        match evaluate_request(&space, successor, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|reason| {
+                    reason.contains("unsettled predecessor history")
+                        && reason.contains(&format!("{:x}", grandparent))
+                }),
+                "late grandparent settlement did not invalidate descendant: {reasons:?}"
+            ),
+            other => panic!("late grandparent settlement must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn same_target_successor_cannot_rewrite_the_frozen_author() {
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let target = "urn:revision:same-target-author";
+        let predecessor = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            target,
+        );
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[1],
+            &reviewers[1..],
+            &[authority],
+            predecessor,
+            target,
+        );
+
+        match evaluate_request(&space, successor, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(reasons
+                .iter()
+                .any(|reason| reason.contains("roster successor must preserve")
+                    && reason.contains("author"))),
+            other => panic!("same-target author rewrite must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmarked_same_target_frozen_field_rewrites_are_monotonically_invalid() {
+        for rewrite in ["author", "roster", "override"] {
+            let (mut space, goal, reviewers, authority, mut known) = fixture();
+            let replacement_authority = ufoid().id;
+            known.insert(replacement_authority);
+            let target = format!("urn:revision:unmarked-{rewrite}-change");
+            let predecessor = add_request(
+                &mut space,
+                goal,
+                reviewers[0],
+                &reviewers,
+                &[authority],
+                &[],
+                &target,
+            );
+            let (author, required, authorities) = match rewrite {
+                "author" => (reviewers[1], reviewers[1..].to_vec(), vec![authority]),
+                "roster" => (reviewers[0], reviewers[..2].to_vec(), vec![authority]),
+                "override" => (reviewers[0], reviewers.to_vec(), vec![replacement_authority]),
+                _ => unreachable!(),
+            };
+            let successor = add_request(
+                &mut space,
+                goal,
+                author,
+                &required,
+                &authorities,
+                &[predecessor],
+                &target,
+            );
+
+            match evaluate_request(&space, successor, &known).unwrap().state {
+                ReviewGateState::Invalid { reasons } => assert!(
+                    reasons
+                        .iter()
+                        .any(|reason| reason.contains("must use the sealed roster_predecessor")),
+                    "missing monotone same-target rejection for {rewrite}: {reasons:?}"
+                ),
+                other => panic!("unmarked {rewrite} rewrite must fail closed, got {other:?}"),
+            }
+
+            let injected = format!("urn:revision:unmarked-{rewrite}-backpatch")
+                .to_blob()
+                .get_handle();
+            space += entity! { ExclusiveId::force_ref(&predecessor) @
+                metadata::iri: injected,
+            };
+            match evaluate_request(&space, successor, &known).unwrap().state {
+                ReviewGateState::Invalid { reasons } => assert!(
+                    reasons
+                        .iter()
+                        .any(|reason| reason.contains("must use the sealed roster_predecessor")),
+                    "predecessor backpatch reopened {rewrite} rewrite: {reasons:?}"
+                ),
+                other => panic!(
+                    "predecessor backpatch must not reopen {rewrite} rewrite, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn unmarked_same_target_identical_policy_reset_is_invalid() {
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let target = "urn:revision:unmarked-identical-reset";
+        let predecessor = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            target,
+        );
+        let reset = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[predecessor],
+            target,
+        );
+
+        match evaluate_request(&space, reset, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(reasons
+                .iter()
+                .any(|reason| reason.contains("same-target ordinary revision"))),
+            other => panic!("identical-policy same-target reset must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roster_marker_fails_closed_for_missing_backpatched_or_different_target_predecessor() {
+        {
+            let (mut space, goal, reviewers, authority, known) = fixture();
+            let missing = ufoid().id;
+            let successor = add_roster_successor(
+                &mut space,
+                goal,
+                reviewers[0],
+                &reviewers[..2],
+                &[authority],
+                missing,
+                "urn:revision:missing-roster-predecessor",
+            );
+            match evaluate_request(&space, successor, &known).unwrap().state {
+                ReviewGateState::Invalid { reasons } => assert!(reasons
+                    .iter()
+                    .any(|reason| reason.contains("missing or not a review request"))),
+                other => panic!("missing roster predecessor must fail closed, got {other:?}"),
+            }
+        }
+
+        {
+            let (mut space, goal, reviewers, authority, known) = fixture();
+            let target = "urn:revision:backpatched-roster-predecessor";
+            let predecessor = add_request(
+                &mut space,
+                goal,
+                reviewers[0],
+                &reviewers,
+                &[authority],
+                &[],
+                target,
+            );
+            let successor = add_roster_successor(
+                &mut space,
+                goal,
+                reviewers[0],
+                &reviewers[..2],
+                &[authority],
+                predecessor,
+                target,
+            );
+            let other_target = "urn:revision:injected-target"
+                .to_string()
+                .to_blob()
+                .get_handle();
+            space += entity! { ExclusiveId::force_ref(&predecessor) @
+                metadata::iri: other_target,
+            };
+            match evaluate_request(&space, successor, &known).unwrap().state {
+                ReviewGateState::Invalid { reasons } => assert!(reasons
+                    .iter()
+                    .any(|reason| reason.contains("roster predecessor")
+                        && reason.contains("non-canonical"))),
+                other => panic!("backpatched roster predecessor must fail closed, got {other:?}"),
+            }
+        }
+
+        {
+            let (mut space, goal, reviewers, authority, known) = fixture();
+            let predecessor = add_request(
+                &mut space,
+                goal,
+                reviewers[0],
+                &reviewers,
+                &[authority],
+                &[],
+                "urn:revision:roster-target-a",
+            );
+            let successor = add_roster_successor(
+                &mut space,
+                goal,
+                reviewers[0],
+                &reviewers[..2],
+                &[authority],
+                predecessor,
+                "urn:revision:roster-target-b",
+            );
+            match evaluate_request(&space, successor, &known).unwrap().state {
+                ReviewGateState::Invalid { reasons } => assert!(reasons
+                    .iter()
+                    .any(|reason| reason.contains("exact target"))),
+                other => panic!("changed-target roster marker must fail closed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn roster_predecessor_cycle_fails_closed_before_trusting_backpatched_edges() {
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let target = "urn:revision:roster-lineage-cycle";
+        let predecessor = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            target,
+        );
+        let successor = add_roster_successor(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers[..2],
+            &[authority],
+            predecessor,
+            target,
+        );
+        space += entity! { ExclusiveId::force_ref(&predecessor) @
+            review::supersedes: &successor,
+            review::roster_predecessor: &successor,
+        };
+
+        match evaluate_request(&space, successor, &known).unwrap().state {
+            ReviewGateState::Invalid { reasons } => assert!(
+                reasons.iter().any(|reason| reason.contains("cycle")),
+                "backpatched roster cycle was not surfaced: {reasons:?}"
+            ),
+            other => panic!("roster predecessor cycle must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_changed_target_successor_tolerates_old_history_backpatch() {
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let predecessor = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:ordinary-target-a",
+        );
+        let successor = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[predecessor],
+            "urn:revision:ordinary-target-b",
+        );
+        let injected = "urn:revision:ordinary-old-backpatch"
+            .to_string()
+            .to_blob()
+            .get_handle();
+        space += entity! { ExclusiveId::force_ref(&predecessor) @ metadata::iri: injected };
+
+        assert!(matches!(
+            evaluate_request(&space, successor, &known).unwrap().state,
+            ReviewGateState::Pending {
+                submitted: 0,
+                required: 3
+            }
+        ));
     }
 
     #[test]

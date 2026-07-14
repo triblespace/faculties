@@ -2,14 +2,15 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::SigningKey;
 use faculties::schemas::compass::{
-    active_attestation_ids_for_reviewer, active_request_ids_for_goal, all_request_ids_for_goal,
-    board, evaluate_goal, evaluate_request, latest_status_event, review_attestation_fragment,
+    active_attestation_ids_for_reviewer, active_request_ids_for_goal,
+    all_attestation_ids_for_reviewer, all_request_ids_for_goal, board, evaluate_goal,
+    evaluate_request, latest_status_event, review_attestation_fragment,
     review_attestation_settlement_fragment, review_override_fragment,
     review_override_settlement_fragment, review_request, review_request_fragment,
-    ReviewEvaluation, ReviewGateState, ReviewProjection, SettlementMode, DEFAULT_STATUSES,
-    KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
-    KIND_REVIEW_REQUEST_ID, KIND_SPECS, KIND_STATUS_ID, REVIEW_STATUS, VERDICT_ABSTAIN,
-    VERDICT_APPROVE, VERDICT_REQUEST_CHANGES,
+    review_roster_successor_fragment, ReviewEvaluation, ReviewGateState, ReviewProjection,
+    SettlementMode, DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
+    KIND_PRIORITIZE_ID, KIND_REVIEW_REQUEST_ID, KIND_SPECS, KIND_STATUS_ID, REVIEW_STATUS,
+    VERDICT_ABSTAIN, VERDICT_APPROVE, VERDICT_REQUEST_CHANGES,
 };
 use faculties::schemas::relations::{
     active_person_ids, group, person_ids, relations as rel_attrs, KIND_GROUP, KIND_PERSON_ID,
@@ -141,6 +142,14 @@ enum ReviewCommand {
         /// Optional independent person allowed to record a reasoned break-glass settlement.
         #[arg(long)]
         override_authority: Vec<String>,
+    },
+    /// Replace one current request's roster without changing its exact candidate.
+    Supersede {
+        /// Exact request id or unique prefix (not a goal id).
+        request: String,
+        /// Relations group whose active members become the successor's frozen roster.
+        #[arg(long)]
+        review_group: String,
     },
     /// Submit or replace this persona's attestation for one exact request.
     Submit {
@@ -1411,21 +1420,62 @@ fn cmd_review_open(
             let goal_id = resolve_task_id(&goal_input, &space)?;
             let heads = active_request_ids_for_goal(&space, goal_id);
 
-            if let [head] = heads.as_slice() {
-                if let Some(existing) = review_request(&space, *head) {
-                    let existing_target = request_target(&mut ws, &existing);
+            let sealed_target = target.clone().to_blob().get_handle();
+            let mut parsed_heads = Vec::with_capacity(heads.len());
+            let mut same_target_heads = Vec::new();
+            for head in &heads {
+                let existing = review_request(&space, *head).ok_or_else(|| {
+                    anyhow::anyhow!("current review head {head:x} is not a readable request")
+                })?;
+                if existing.targets.contains(&sealed_target) {
+                    same_target_heads.push(*head);
+                }
+                parsed_heads.push(existing);
+            }
+
+            if !same_target_heads.is_empty() {
+                if let ([head], [existing]) = (heads.as_slice(), parsed_heads.as_slice()) {
                     let structurally_current = evaluate_request(&space, *head, &known_people)
                         .is_some_and(|evaluation| {
                             !matches!(evaluation.state, ReviewGateState::Invalid { .. })
                         });
-                    if structurally_current
-                        && existing_target == target
-                        && existing.author() == Some(author)
+                    let same_frozen_fields = existing.author() == Some(author)
                         && existing.required == required
-                        && existing.override_authorities == override_authorities
-                    {
+                        && existing.override_authorities == override_authorities;
+                    if structurally_current && same_frozen_fields {
                         return Ok((*head, false));
                     }
+                    if !structurally_current {
+                        bail!(
+                            "current review head {head:x} is malformed; same-target rewriting is forbidden. A repair with a genuinely changed immutable target must preserve its frozen author/roster/override fields, or use a new goal"
+                        );
+                    }
+                    bail!(
+                        "same-target review fields cannot be rewritten through `review open`; use `compass review supersede {head:x} --review-group <group>` from the frozen author to replace only the roster safely"
+                    );
+                }
+                let ids = same_target_heads
+                    .iter()
+                    .map(|id| format!("{id:x}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "same-target fork repair is deliberately unsupported: target already occurs on current head(s) {ids}. Use a genuinely changed immutable target absent from every current head (or a future explicit same-target repair protocol)"
+                );
+            }
+
+            if let ([head], [existing]) = (heads.as_slice(), parsed_heads.as_slice()) {
+                let structurally_current = evaluate_request(&space, *head, &known_people)
+                    .is_some_and(|evaluation| {
+                        !matches!(evaluation.state, ReviewGateState::Invalid { .. })
+                    });
+                let same_frozen_fields = existing.author() == Some(author)
+                    && existing.required == required
+                    && existing.override_authorities == override_authorities;
+                if !structurally_current && !same_frozen_fields {
+                    bail!(
+                        "current review head {head:x} is malformed; a changed-target repair must preserve its frozen author/roster/override fields"
+                    );
                 }
             }
 
@@ -1463,6 +1513,159 @@ fn cmd_review_open(
     } else {
         println!("Review request {request_id:x} is already current for that exact target");
     }
+    Ok(())
+}
+
+fn cmd_review_supersede(
+    pile: &Path,
+    branch_id: Id,
+    request_input: String,
+    review_group: String,
+    persona: Option<&str>,
+) -> Result<()> {
+    let persona = persona.ok_or_else(|| {
+        anyhow::anyhow!("review supersede requires --persona <label-or-hex> or $PERSONA")
+    })?;
+
+    let (successor_id, predecessor_id) = with_repo(pile, |repo| {
+        let mut relations_ws = relations_workspace(repo)?;
+        let relations_space = relations_ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout relations: {e:?}"))?;
+        let active_people = active_person_ids(&relations_space);
+        let known_people = person_ids(&relations_space);
+        let actor = resolve_active_person(&relations_space, &active_people, persona)?;
+        let group_id = resolve_group_id(&relations_space, &review_group)?;
+        let mut required = find!(
+            member: Id,
+            pattern!(&relations_space, [{ group_id @ group::member: ?member }])
+        )
+        .collect::<Vec<_>>();
+        required.sort();
+        required.dedup();
+
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        loop {
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout board: {e:?}"))?;
+            let predecessor_id = resolve_request_id(&request_input, &space)?;
+            let predecessor = review_request(&space, predecessor_id)
+                .ok_or_else(|| anyhow::anyhow!("review request {predecessor_id:x} is malformed"))?;
+            let goal = predecessor.goal().ok_or_else(|| {
+                anyhow::anyhow!("review request {predecessor_id:x} does not name one goal")
+            })?;
+            if active_request_ids_for_goal(&space, goal).as_slice() != [predecessor_id] {
+                bail!(
+                    "review request {predecessor_id:x} is not the unique current review head"
+                );
+            }
+            let evaluation = evaluate_request(&space, predecessor_id, &known_people)
+                .ok_or_else(|| anyhow::anyhow!("review request {predecessor_id:x} is malformed"))?;
+            match &evaluation.state {
+                ReviewGateState::Invalid { reasons } => bail!(
+                    "cannot supersede malformed review request {predecessor_id:x}: {}",
+                    reasons.join("; ")
+                ),
+                ReviewGateState::Settled { .. } => {
+                    bail!("cannot supersede settled review request {predecessor_id:x}")
+                }
+                ReviewGateState::Pending { .. }
+                | ReviewGateState::Blocked { .. }
+                | ReviewGateState::Ready => {}
+            }
+            let author = evaluation
+                .request
+                .author()
+                .expect("non-invalid review request has one author");
+            if actor != author {
+                bail!(
+                    "only frozen request author {author:x} may supersede review request {predecessor_id:x}"
+                );
+            }
+            validate_frozen_review_roster(&required, author, &active_people)?;
+            if required == evaluation.request.required {
+                bail!("selected review group freezes the existing roster; no successor is needed");
+            }
+
+            for removed in evaluation
+                .request
+                .required
+                .iter()
+                .filter(|reviewer| !required.contains(reviewer))
+            {
+                let submitted = all_attestation_ids_for_reviewer(
+                    &space,
+                    predecessor_id,
+                    *removed,
+                );
+                if !submitted.is_empty() {
+                    let evidence = submitted
+                        .iter()
+                        .map(|id| format!("{id:x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    bail!(
+                        "cannot remove reviewer {removed:x}: request {predecessor_id:x} has {} submitted attestation record(s) by that reviewer ({evidence})",
+                        submitted.len()
+                    );
+                }
+            }
+
+            let target = evaluation
+                .request
+                .target()
+                .expect("non-invalid review request has one target");
+            let now = epoch_interval(now_epoch());
+            let successor = review_roster_successor_fragment(
+                goal,
+                author,
+                target,
+                &required,
+                &evaluation.request.override_authorities,
+                predecessor_id,
+                now,
+            );
+            let successor_id = successor
+                .root()
+                .expect("a review request fragment has one intrinsic root");
+            let mut candidate_space = space.clone().into_facts();
+            candidate_space += successor;
+            let candidate = evaluate_request(&candidate_space, successor_id, &known_people)
+                .ok_or_else(|| anyhow::anyhow!("prospective roster successor is malformed"))?;
+            if let ReviewGateState::Invalid { reasons } = candidate.state {
+                bail!(
+                    "cannot create unsafe roster successor {successor_id:x}: {}",
+                    reasons.join("; ")
+                );
+            }
+            let successor = review_roster_successor_fragment(
+                goal,
+                author,
+                target,
+                &required,
+                &evaluation.request.override_authorities,
+                predecessor_id,
+                now,
+            );
+            let mut change = TribleSet::new();
+            change += ensure_kind_entities(&mut ws)?;
+            change += successor;
+            ws.commit(change, "supersede review roster");
+            match repo
+                .try_push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review roster successor: {e:?}"))?
+            {
+                None => return Ok((successor_id, predecessor_id)),
+                Some(conflict) => ws = conflict,
+            }
+        }
+    })?;
+
+    println!("Superseded review request {predecessor_id:x} with {successor_id:x}");
+    println!("Target and frozen author are unchanged; every successor reviewer must attest anew");
     Ok(())
 }
 
@@ -2188,6 +2391,16 @@ fn main() -> Result<()> {
                 override_authority,
                 cli.persona.as_deref(),
             ),
+            ReviewCommand::Supersede {
+                request,
+                review_group,
+            } => cmd_review_supersede(
+                &cli.pile,
+                branch_id,
+                request,
+                review_group,
+                cli.persona.as_deref(),
+            ),
             ReviewCommand::Submit {
                 request,
                 verdict,
@@ -2227,7 +2440,12 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faculties::schemas::compass::review;
+    use faculties::schemas::relations::KIND_RETIRE_ID;
     use std::fs::File;
+
+    const TEST_TARGET: &str =
+        "urn:blake3:1111111111111111111111111111111111111111111111111111111111111111";
 
     struct TestPile(PathBuf);
 
@@ -2314,6 +2532,19 @@ mod tests {
         .expect("evaluate CLI review fixture")
     }
 
+    fn active_request_ids_for_goal_in_pile(pile: &Path, branch_id: Id, goal: Id) -> Vec<Id> {
+        with_repo(pile, |repo| {
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout compass: {e:?}"))?;
+            Ok(active_request_ids_for_goal(&space, goal))
+        })
+        .expect("load active CLI request heads")
+    }
+
     fn add_active_cli_person(pile: &Path) -> Id {
         with_repo(pile, |repo| {
             let branch = repo
@@ -2334,6 +2565,125 @@ mod tests {
         .expect("add active CLI person")
     }
 
+    fn add_cli_group(pile: &Path, members: &[Id]) -> Id {
+        with_repo(pile, |repo| {
+            let branch = repo
+                .ensure_branch("relations", None)
+                .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+            let mut ws = repo
+                .pull(branch)
+                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+            let group_id = ufoid().id;
+            let fragment = entity! { ExclusiveId::force_ref(&group_id) @
+                metadata::tag: &KIND_GROUP,
+                group::member*: members.iter(),
+            };
+            ws.commit(fragment, "seed alternate review roster");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push alternate review roster: {e:?}"))?;
+            Ok(group_id)
+        })
+        .expect("add CLI group")
+    }
+
+    fn retire_cli_person(pile: &Path, person: Id) {
+        with_repo(pile, |repo| {
+            let branch = repo
+                .ensure_branch("relations", None)
+                .map_err(|e| anyhow::anyhow!("ensure relations branch: {e:?}"))?;
+            let mut ws = repo
+                .pull(branch)
+                .map_err(|e| anyhow::anyhow!("pull relations: {e:?}"))?;
+            let event = ufoid();
+            let fragment = entity! { &event @
+                metadata::tag: &KIND_RETIRE_ID,
+                rel_attrs::subject: &person,
+                metadata::created_at: epoch_interval(now_epoch()),
+            };
+            ws.commit(fragment, "retire review fixture person");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push retirement: {e:?}"))?;
+            Ok(())
+        })
+        .expect("retire CLI person")
+    }
+
+    fn inject_cli_attestation(
+        pile: &Path,
+        branch_id: Id,
+        request: Id,
+        reviewer: Id,
+        verdict: &str,
+        supersedes: &[Id],
+    ) -> Id {
+        with_repo(pile, |repo| {
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            let report = ws.put(format!("fixture evidence {}", ufoid().id));
+            let fragment = review_attestation_fragment(
+                request,
+                reviewer,
+                verdict,
+                report,
+                supersedes,
+                epoch_interval(now_epoch()),
+            );
+            let id = fragment.root().expect("intrinsic fixture attestation");
+            ws.commit(fragment, "inject review evidence fixture");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review evidence fixture: {e:?}"))?;
+            Ok(id)
+        })
+        .expect("inject CLI attestation")
+    }
+
+    fn inject_cli_request_successor(
+        pile: &Path,
+        branch_id: Id,
+        predecessor_id: Id,
+        target: &str,
+    ) -> Id {
+        with_repo(pile, |repo| {
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout compass: {e:?}"))?;
+            let predecessor = review_request(&space, predecessor_id)
+                .ok_or_else(|| anyhow::anyhow!("missing predecessor fixture"))?;
+            let fragment = review_request_fragment(
+                predecessor.goal().expect("fixture goal"),
+                predecessor.author().expect("fixture author"),
+                ws.put(target.to_string()),
+                &predecessor.required,
+                &predecessor.override_authorities,
+                &[predecessor_id],
+                epoch_interval(now_epoch()),
+            );
+            let id = fragment.root().expect("intrinsic fixture successor");
+            ws.commit(fragment, "inject review successor fixture");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push review successor fixture: {e:?}"))?;
+            Ok(id)
+        })
+        .expect("inject CLI request successor")
+    }
+
+    fn backpatch_cli_entity(pile: &Path, branch_id: Id, fragment: Fragment) {
+        with_repo(pile, |repo| {
+            let mut ws = repo
+                .pull(branch_id)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            ws.commit(fragment, "backpatch malformed review fixture");
+            repo.push(&mut ws)
+                .map_err(|e| anyhow::anyhow!("push malformed review fixture: {e:?}"))?;
+            Ok(())
+        })
+        .expect("backpatch CLI entity")
+    }
+
     fn open_cli_review_as(
         pile: &Path,
         branch_id: Id,
@@ -2346,8 +2696,7 @@ mod tests {
             pile,
             branch_id,
             format!("{goal:x}"),
-            "urn:blake3:1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
+            TEST_TARGET.to_string(),
             false,
             format!("{group_id:x}"),
             Vec::new(),
@@ -2462,6 +2811,726 @@ mod tests {
         let err = open_cli_review_as(missing_author_pile.path(), branch, goal, outsider, group)
             .unwrap_err();
         assert!(format!("{err:#}").contains("must include the author persona"));
+    }
+
+    #[test]
+    fn cli_safe_roster_supersession_preserves_target_history_and_override() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, triad) = seed_cli_review(pile.path(), 3).unwrap();
+        let authority = add_active_cli_person(pile.path());
+        cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            TEST_TARGET.to_string(),
+            false,
+            format!("{triad:x}"),
+            vec![format!("{authority:x}")],
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        let predecessor = cli_evaluation(pile.path(), branch, goal).request.id;
+        for (reviewer, verdict) in [
+            (reviewers[0], VerdictArg::Abstain),
+            (reviewers[1], VerdictArg::Approve),
+        ] {
+            cmd_review_submit(
+                pile.path(),
+                branch,
+                format!("{predecessor:x}"),
+                verdict,
+                "evidence on the frozen triad".to_string(),
+                Some(&format!("{reviewer:x}")),
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Pending {
+                submitted: 2,
+                required: 3
+            }
+        ));
+
+        retire_cli_person(pile.path(), reviewers[2]);
+        let pair = add_cli_group(pile.path(), &reviewers[..2]);
+
+        let bypass = cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            TEST_TARGET.to_string(),
+            false,
+            format!("{pair:x}"),
+            vec![format!("{authority:x}")],
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{bypass:#}").contains("same-target review fields cannot be rewritten"));
+
+        cmd_review_supersede(
+            pile.path(),
+            branch,
+            format!("{predecessor:x}"),
+            format!("{pair:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        let successor = cli_evaluation(pile.path(), branch, goal).request.id;
+        assert_ne!(successor, predecessor);
+
+        with_repo(pile.path(), |repo| {
+            let mut board_ws = repo
+                .pull(branch)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            let board_space = board_ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout compass: {e:?}"))?;
+            let old = review_request(&board_space, predecessor).expect("historical request");
+            let new = review_request(&board_space, successor).expect("successor request");
+            let mut expected_pair = reviewers[..2].to_vec();
+            expected_pair.sort();
+            assert!(old.is_canonical());
+            assert!(new.is_canonical());
+            assert_eq!(old.required.len(), 3);
+            assert_eq!(new.required, expected_pair);
+            assert_eq!(new.goal(), old.goal());
+            assert_eq!(new.author(), old.author());
+            assert_eq!(new.target(), old.target());
+            assert_eq!(new.override_authorities, vec![authority]);
+            assert_eq!(new.supersedes, vec![predecessor]);
+            assert_eq!(new.roster_predecessors, vec![predecessor]);
+            assert_eq!(request_target(&mut board_ws, &old), TEST_TARGET);
+            assert_eq!(request_target(&mut board_ws, &new), TEST_TARGET);
+            assert_eq!(
+                active_request_ids_for_goal(&board_space, goal),
+                vec![successor]
+            );
+            assert_eq!(all_request_ids_for_goal(&board_space, goal).len(), 2);
+            assert_eq!(
+                all_attestation_ids_for_reviewer(
+                    &board_space,
+                    predecessor,
+                    reviewers[0]
+                )
+                .len(),
+                1
+            );
+            assert_eq!(
+                all_attestation_ids_for_reviewer(
+                    &board_space,
+                    predecessor,
+                    reviewers[1]
+                )
+                .len(),
+                1
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Pending {
+                submitted: 0,
+                required: 2
+            }
+        ));
+
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{successor:x}"),
+            VerdictArg::Abstain,
+            "fresh author attestation".to_string(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        cmd_review_submit(
+            pile.path(),
+            branch,
+            format!("{successor:x}"),
+            VerdictArg::Approve,
+            "fresh independent attestation".to_string(),
+            Some(&format!("{:x}", reviewers[1])),
+        )
+        .unwrap();
+        cmd_review_settle(
+            pile.path(),
+            branch,
+            format!("{successor:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        assert!(matches!(
+            cli_evaluation(pile.path(), branch, goal).state,
+            ReviewGateState::Settled { .. }
+        ));
+
+        assert!(Cli::try_parse_from([
+            "compass",
+            "--pile",
+            "fixture.pile",
+            "review",
+            "supersede",
+            "abcd",
+            "--review-group",
+            "review-pair",
+            "--target",
+            TEST_TARGET,
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn cli_open_rejects_all_same_target_rewrites_and_same_target_fork_repair() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, triad) = seed_cli_review(pile.path(), 3).unwrap();
+        let base = open_cli_review(pile.path(), branch, goal, &reviewers, triad).unwrap();
+
+        let idempotent = open_cli_review(pile.path(), branch, goal, &reviewers, triad).unwrap();
+        assert_eq!(idempotent, base);
+        with_repo(pile.path(), |repo| {
+            let mut ws = repo
+                .pull(branch)
+                .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+            let space = ws
+                .checkout(..)
+                .map_err(|e| anyhow::anyhow!("checkout compass: {e:?}"))?;
+            assert_eq!(all_request_ids_for_goal(&space, goal), vec![base]);
+            Ok(())
+        })
+        .unwrap();
+
+        let author_rewrite = cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            TEST_TARGET.to_string(),
+            false,
+            format!("{triad:x}"),
+            Vec::new(),
+            Some(&format!("{:x}", reviewers[1])),
+        )
+        .unwrap_err();
+        assert!(format!("{author_rewrite:#}").contains("same-target review fields"));
+
+        let pair = add_cli_group(pile.path(), &reviewers[..2]);
+        let roster_rewrite = cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            TEST_TARGET.to_string(),
+            false,
+            format!("{pair:x}"),
+            Vec::new(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{roster_rewrite:#}").contains("same-target review fields"));
+
+        let override_rewrite = cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            TEST_TARGET.to_string(),
+            false,
+            format!("{triad:x}"),
+            vec![format!("{:x}", reviewers[2])],
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{override_rewrite:#}").contains("same-target review fields"));
+        assert_eq!(
+            active_request_ids_for_goal_in_pile(pile.path(), branch, goal),
+            vec![base]
+        );
+
+        let left_target =
+            "urn:blake3:7777777777777777777777777777777777777777777777777777777777777777";
+        let right_target =
+            "urn:blake3:8888888888888888888888888888888888888888888888888888888888888888";
+        let repair_target =
+            "urn:blake3:9999999999999999999999999999999999999999999999999999999999999999";
+        let left = inject_cli_request_successor(pile.path(), branch, base, left_target);
+        let right = inject_cli_request_successor(pile.path(), branch, base, right_target);
+        let same_target_fork_repair = cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            left_target.to_string(),
+            false,
+            format!("{triad:x}"),
+            Vec::new(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{same_target_fork_repair:#}")
+            .contains("same-target fork repair is deliberately unsupported"));
+        let mut fork = vec![left, right];
+        fork.sort();
+        assert_eq!(
+            active_request_ids_for_goal_in_pile(pile.path(), branch, goal),
+            fork
+        );
+
+        cmd_review_open(
+            pile.path(),
+            branch,
+            format!("{goal:x}"),
+            repair_target.to_string(),
+            false,
+            format!("{triad:x}"),
+            Vec::new(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        let repaired = active_request_ids_for_goal_in_pile(pile.path(), branch, goal);
+        assert_eq!(repaired.len(), 1);
+        assert!(!repaired.contains(&left));
+        assert!(!repaired.contains(&right));
+    }
+
+    #[test]
+    fn cli_supersede_rejects_transitive_add_then_remove_evidence_laundering() {
+        let pile = TestPile::new();
+        let (branch, goal, reviewers, all_four) = seed_cli_review(pile.path(), 4).unwrap();
+        let triad = add_cli_group(pile.path(), &reviewers[..3]);
+        let grandparent =
+            open_cli_review(pile.path(), branch, goal, &reviewers[..3], triad).unwrap();
+        inject_cli_attestation(
+            pile.path(),
+            branch,
+            grandparent,
+            reviewers[2],
+            VERDICT_REQUEST_CHANGES,
+            &[],
+        );
+
+        cmd_review_supersede(
+            pile.path(),
+            branch,
+            format!("{grandparent:x}"),
+            format!("{all_four:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        let parent = active_request_ids_for_goal_in_pile(pile.path(), branch, goal)[0];
+        let without_dissenter =
+            add_cli_group(pile.path(), &[reviewers[0], reviewers[1], reviewers[3]]);
+        let err = cmd_review_supersede(
+            pile.path(),
+            branch,
+            format!("{parent:x}"),
+            format!("{without_dissenter:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("cannot create unsafe roster successor"));
+        assert!(rendered.contains(&format!("{grandparent:x}")));
+        assert_eq!(
+            active_request_ids_for_goal_in_pile(pile.path(), branch, goal),
+            vec![parent]
+        );
+    }
+
+    #[test]
+    fn cli_supersede_never_drops_any_submitted_evidence() {
+        for case in [
+            "approve",
+            "dissent",
+            "abstain",
+            "unknown",
+            "malformed",
+            "fork",
+            "historical-stale",
+        ] {
+            let pile = TestPile::new();
+            let (branch, goal, reviewers, triad) = seed_cli_review(pile.path(), 3).unwrap();
+            let predecessor =
+                open_cli_review(pile.path(), branch, goal, &reviewers, triad).unwrap();
+            let removed = reviewers[2];
+            let expected_records = match case {
+                "approve" => {
+                    inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_APPROVE,
+                        &[],
+                    );
+                    1
+                }
+                "dissent" => {
+                    inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_REQUEST_CHANGES,
+                        &[],
+                    );
+                    1
+                }
+                "abstain" => {
+                    inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_ABSTAIN,
+                        &[],
+                    );
+                    1
+                }
+                "unknown" => {
+                    inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        "shrug",
+                        &[],
+                    );
+                    1
+                }
+                "malformed" => {
+                    let id = inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_APPROVE,
+                        &[],
+                    );
+                    backpatch_cli_entity(
+                        pile.path(),
+                        branch,
+                        entity! { ExclusiveId::force_ref(&id) @ review::verdict: "also" },
+                    );
+                    1
+                }
+                "fork" => {
+                    inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_APPROVE,
+                        &[],
+                    );
+                    inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_REQUEST_CHANGES,
+                        &[],
+                    );
+                    2
+                }
+                "historical-stale" => {
+                    let old = inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_APPROVE,
+                        &[],
+                    );
+                    inject_cli_attestation(
+                        pile.path(),
+                        branch,
+                        predecessor,
+                        removed,
+                        VERDICT_APPROVE,
+                        &[old],
+                    );
+                    2
+                }
+                _ => unreachable!(),
+            };
+            let pair = add_cli_group(pile.path(), &reviewers[..2]);
+            with_repo(pile.path(), |repo| {
+                let mut ws = repo
+                    .pull(branch)
+                    .map_err(|e| anyhow::anyhow!("pull compass: {e:?}"))?;
+                let space = ws
+                    .checkout(..)
+                    .map_err(|e| anyhow::anyhow!("checkout compass: {e:?}"))?;
+                assert_eq!(
+                    all_attestation_ids_for_reviewer(&space, predecessor, removed).len(),
+                    expected_records,
+                    "case {case}"
+                );
+                Ok(())
+            })
+            .unwrap();
+            let err = cmd_review_supersede(
+                pile.path(),
+                branch,
+                format!("{predecessor:x}"),
+                format!("{pair:x}"),
+                Some(&format!("{:x}", reviewers[0])),
+            )
+            .unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains("cannot remove reviewer"), "case {case}: {message}");
+            assert!(
+                message.contains(&format!("{expected_records} submitted attestation record")),
+                "case {case}: {message}"
+            );
+            assert_eq!(
+                active_request_ids_for_goal_in_pile(pile.path(), branch, goal),
+                vec![predecessor],
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn cli_supersede_requires_a_valid_active_roster_and_the_frozen_author() {
+        let author_only_pile = TestPile::new();
+        let (branch, goal, reviewers, triad) =
+            seed_cli_review(author_only_pile.path(), 3).unwrap();
+        let predecessor = open_cli_review(
+            author_only_pile.path(),
+            branch,
+            goal,
+            &reviewers,
+            triad,
+        )
+        .unwrap();
+        let author_only = add_cli_group(author_only_pile.path(), &reviewers[..1]);
+        let err = cmd_review_supersede(
+            author_only_pile.path(),
+            branch,
+            format!("{predecessor:x}"),
+            format!("{author_only:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("at least one distinct non-author reviewer"));
+
+        let missing_author_pile = TestPile::new();
+        let (branch, goal, reviewers, triad) =
+            seed_cli_review(missing_author_pile.path(), 3).unwrap();
+        let predecessor = open_cli_review(
+            missing_author_pile.path(),
+            branch,
+            goal,
+            &reviewers,
+            triad,
+        )
+        .unwrap();
+        let missing_author = add_cli_group(missing_author_pile.path(), &reviewers[1..]);
+        let err = cmd_review_supersede(
+            missing_author_pile.path(),
+            branch,
+            format!("{predecessor:x}"),
+            format!("{missing_author:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("must include the author persona"));
+
+        let inactive_pile = TestPile::new();
+        let (branch, goal, reviewers, triad) = seed_cli_review(inactive_pile.path(), 3).unwrap();
+        let predecessor =
+            open_cli_review(inactive_pile.path(), branch, goal, &reviewers, triad).unwrap();
+        let inactive_group = add_cli_group(inactive_pile.path(), &reviewers[..2]);
+        retire_cli_person(inactive_pile.path(), reviewers[1]);
+        let err = cmd_review_supersede(
+            inactive_pile.path(),
+            branch,
+            format!("{predecessor:x}"),
+            format!("{inactive_group:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("inactive or non-person members"));
+
+        let wrong_author_pile = TestPile::new();
+        let (branch, goal, reviewers, triad) =
+            seed_cli_review(wrong_author_pile.path(), 3).unwrap();
+        let predecessor = open_cli_review(
+            wrong_author_pile.path(),
+            branch,
+            goal,
+            &reviewers,
+            triad,
+        )
+        .unwrap();
+        let pair = add_cli_group(wrong_author_pile.path(), &reviewers[..2]);
+        let outsider = add_active_cli_person(wrong_author_pile.path());
+        let err = cmd_review_supersede(
+            wrong_author_pile.path(),
+            branch,
+            format!("{predecessor:x}"),
+            format!("{pair:x}"),
+            Some(&format!("{outsider:x}")),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("only frozen request author"));
+    }
+
+    #[test]
+    fn cli_supersede_refuses_settled_stale_forked_and_malformed_requests() {
+        let settled_pile = TestPile::new();
+        let (branch, goal, reviewers, pair) = seed_cli_review(settled_pile.path(), 2).unwrap();
+        let request =
+            open_cli_review(settled_pile.path(), branch, goal, &reviewers, pair).unwrap();
+        for (reviewer, verdict) in [
+            (reviewers[0], VerdictArg::Abstain),
+            (reviewers[1], VerdictArg::Approve),
+        ] {
+            cmd_review_submit(
+                settled_pile.path(),
+                branch,
+                format!("{request:x}"),
+                verdict,
+                "settlement fixture".to_string(),
+                Some(&format!("{reviewer:x}")),
+            )
+            .unwrap();
+        }
+        cmd_review_settle(
+            settled_pile.path(),
+            branch,
+            format!("{request:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        let third = add_active_cli_person(settled_pile.path());
+        let larger = add_cli_group(
+            settled_pile.path(),
+            &[reviewers[0], reviewers[1], third],
+        );
+        let err = cmd_review_supersede(
+            settled_pile.path(),
+            branch,
+            format!("{request:x}"),
+            format!("{larger:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("cannot supersede settled"));
+
+        let stale_pile = TestPile::new();
+        let (branch, goal, reviewers, triad) = seed_cli_review(stale_pile.path(), 3).unwrap();
+        let stale = open_cli_review(stale_pile.path(), branch, goal, &reviewers, triad).unwrap();
+        let current = inject_cli_request_successor(
+            stale_pile.path(),
+            branch,
+            stale,
+            "urn:blake3:2222222222222222222222222222222222222222222222222222222222222222",
+        );
+        let pair = add_cli_group(stale_pile.path(), &reviewers[..2]);
+        let err = cmd_review_supersede(
+            stale_pile.path(),
+            branch,
+            format!("{stale:x}"),
+            format!("{pair:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not the unique current review head"));
+        assert_eq!(
+            active_request_ids_for_goal_in_pile(stale_pile.path(), branch, goal),
+            vec![current]
+        );
+
+        let forked_pile = TestPile::new();
+        let (branch, goal, reviewers, triad) = seed_cli_review(forked_pile.path(), 3).unwrap();
+        let base = open_cli_review(forked_pile.path(), branch, goal, &reviewers, triad).unwrap();
+        let left = inject_cli_request_successor(
+            forked_pile.path(),
+            branch,
+            base,
+            "urn:blake3:3333333333333333333333333333333333333333333333333333333333333333",
+        );
+        let right = inject_cli_request_successor(
+            forked_pile.path(),
+            branch,
+            base,
+            "urn:blake3:4444444444444444444444444444444444444444444444444444444444444444",
+        );
+        let pair = add_cli_group(forked_pile.path(), &reviewers[..2]);
+        let err = cmd_review_supersede(
+            forked_pile.path(),
+            branch,
+            format!("{left:x}"),
+            format!("{pair:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not the unique current review head"));
+        let mut expected = vec![left, right];
+        expected.sort();
+        assert_eq!(
+            active_request_ids_for_goal_in_pile(forked_pile.path(), branch, goal),
+            expected
+        );
+
+        let malformed_pile = TestPile::new();
+        let (branch, goal, reviewers, triad) = seed_cli_review(malformed_pile.path(), 3).unwrap();
+        let malformed =
+            open_cli_review(malformed_pile.path(), branch, goal, &reviewers, triad).unwrap();
+        let injected_target =
+            "urn:blake3:5555555555555555555555555555555555555555555555555555555555555555"
+                .to_string()
+                .to_blob()
+                .get_handle();
+        backpatch_cli_entity(
+            malformed_pile.path(),
+            branch,
+            entity! { ExclusiveId::force_ref(&malformed) @ metadata::iri: injected_target },
+        );
+        let pair = add_cli_group(malformed_pile.path(), &reviewers[..2]);
+        let err = cmd_review_supersede(
+            malformed_pile.path(),
+            branch,
+            format!("{malformed:x}"),
+            format!("{pair:x}"),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("cannot supersede malformed"));
+        assert_eq!(
+            active_request_ids_for_goal_in_pile(malformed_pile.path(), branch, goal),
+            vec![malformed]
+        );
+
+        let bypass = cmd_review_open(
+            malformed_pile.path(),
+            branch,
+            format!("{goal:x}"),
+            TEST_TARGET.to_string(),
+            false,
+            format!("{pair:x}"),
+            Vec::new(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap_err();
+        assert!(format!("{bypass:#}").contains("must preserve its frozen author/roster/override"));
+
+        cmd_review_open(
+            malformed_pile.path(),
+            branch,
+            format!("{goal:x}"),
+            "urn:blake3:6666666666666666666666666666666666666666666666666666666666666666"
+                .to_string(),
+            false,
+            format!("{triad:x}"),
+            Vec::new(),
+            Some(&format!("{:x}", reviewers[0])),
+        )
+        .unwrap();
+        assert_ne!(
+            active_request_ids_for_goal_in_pile(malformed_pile.path(), branch, goal),
+            vec![malformed]
+        );
     }
 
     #[test]

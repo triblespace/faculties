@@ -117,9 +117,25 @@ After a commit, rebase, or other candidate change, the author must run
 supersedes all current request heads. Old approvals stay visible but become
 stale; Orient re-notifies the peer reviewers. Concurrent successor requests
 do not race by timestamp: both remain heads, the bench says
-`FORKED · GATE CLOSED`, and the next `review open` supersedes both.
+`FORKED · GATE CLOSED`. `review open` supersedes both only when given a
+genuinely changed immutable target absent from every head; same-target fork
+repair is deliberately refused until a separate explicit protocol exists.
 Attestation edits use the same rule, so a concurrent verdict fork is also
 visible and repairable.
+
+If the candidate target is unchanged but the active reviewer group must be
+re-frozen, the author uses
+`compass review supersede "$REQUEST" --review-group <group>`. This is not a
+revision change: it accepts only the unique current unsettled request, keeps
+its exact goal/target/author/override authority, and refuses to remove anyone
+who has ever submitted evidence on it. The linked successor inherits no votes;
+all of its reviewers attest afresh. Same-target changes through `review open`
+are rejected monotonically from append-only predecessor target membership, so
+author, roster, override, and fork rewrites cannot evade the historical-
+evidence guard after a backpatch. Every successor seals its roster predecessor,
+and projection validates the full marker lineage: a settlement on any ancestor
+or evidence from an ancestor reviewer removed anywhere later invalidates the
+descendant fail-closed, including add-then-remove and late-grandparent cases.
 
 == Break-glass
 

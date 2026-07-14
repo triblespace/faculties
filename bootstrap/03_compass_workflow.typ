@@ -81,9 +81,36 @@ Requests and attestations use explicit `supersedes` edges. After a commit,
 rebase, or other candidate change, run `review open` again with the new exact
 target. That successor request supersedes every current request head, makes
 the old evidence stale, and automatically re-notifies the peer reviewers.
-Concurrent successors remain an honest visible fork and fail closed; the
-next open/submit supersedes all fork heads to repair it. No mutable "current"
-or "approved" flag exists.
+Concurrent successors remain an honest visible fork and fail closed. A new
+`review open` may supersede all fork heads only with a genuinely changed
+immutable target absent from every head. Same-target fork repair is
+deliberately refused until it has its own explicit proof protocol. No mutable
+"current" or "approved" flag exists.
+
+Changing only the roster for the *same* immutable target is a narrower,
+fail-closed operation:
+
+```sh
+compass review supersede "$REQUEST" --review-group review-pair
+```
+
+Only the frozen author may do this, and the named request must be the unique,
+unsettled, structurally valid head. The successor preserves the exact goal,
+target, author, and break-glass authority. A reviewer may be removed only if
+they have never submitted any attestation entity for the old request — stale,
+forked, malformed, unknown, abstaining, approving, and change-request evidence
+all count. The old request and every old attestation remain immutable history;
+every member of the successor roster starts pending and must attest anew.
+`review open` refuses every same-target ordinary successor, including author,
+roster, override, and fork rewrites. This remains monotone under append-only
+predecessor backpatches because the successor target is sealed and the old
+target fact cannot disappear. Identity-sealed roster-predecessor markers let
+the projection validate the complete same-target lineage after merge. A
+settlement on any ancestor closes every descendant; if a later roster removes
+a reviewer present on any ancestor, every attestation entity that reviewer
+submitted on that ancestor counts. This catches add-then-remove chains and
+late grandparent evidence instead of letting them disappear behind an
+immediate-predecessor check.
 
 Request, attestation, override, and settlement IDs are derived from all of
 their proof-defining fields. Append-only back-patching therefore makes an
