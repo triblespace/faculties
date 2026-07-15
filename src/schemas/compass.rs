@@ -945,11 +945,11 @@ fn attestation_satisfies(
 /// its sealed roster is malformed or (for a group request) fails to anchor to
 /// the canonical snapshot it names.
 ///
-/// - Group request: the settlement must seal exactly one snapshot and a
-///   non-empty member set. With a relations space, that snapshot must be a
-///   canonical snapshot of THIS request's group whose members are exactly the
-///   sealed set (authoritative anchor); without one, the sealed set is trusted
-///   cooperatively — the same trust level as unsigned attestations.
+/// - Group request: AUTHORITATIVE-ONLY. It requires a relations space and fails
+///   CLOSED without one (never trusts sealed members cooperatively). The
+///   settlement must seal exactly one snapshot and a non-empty member set, that
+///   snapshot must be a canonical snapshot of THIS request's real KIND_GROUP
+///   anchor, and its members must equal the sealed set.
 /// - Legacy (groupless) request: the settlement must seal nothing; the roster
 ///   is the request's frozen `required`, sealed by its own intrinsic id.
 fn settled_roster(
@@ -959,6 +959,10 @@ fn settled_roster(
 ) -> Option<Vec<Id>> {
     match request.group() {
         Some(group) => {
+            // Grouped settlements are AUTHORITATIVE-ONLY: without a relations
+            // space we cannot anchor the sealed roster, so fail closed (never
+            // trust sealed members cooperatively).
+            let rel = relations_space?;
             let [snapshot] = settlement.settled_snapshots.as_slice() else {
                 return None;
             };
@@ -966,18 +970,16 @@ fn settled_roster(
             if members.is_empty() {
                 return None;
             }
-            if let Some(rel) = relations_space {
-                // Anchor the sealed roster to a canonical snapshot of THIS
-                // request's group, and require the group to be a real
-                // KIND_GROUP anchor (the same protocol boundary the live gate
-                // enforces) — a settled request skips the gate's roster check.
-                if !exists!(pattern!(rel, [{ group @ metadata::tag: &REL_KIND_GROUP }])) {
-                    return None;
-                }
-                match snapshot_composition(rel, *snapshot) {
-                    Some((anchor, snap_members)) if anchor == group && snap_members == members => {}
-                    _ => return None,
-                }
+            // Anchor the sealed roster to a canonical snapshot of THIS request's
+            // group, and require the group to be a real KIND_GROUP anchor (the
+            // same protocol boundary the live gate enforces) — a settled request
+            // skips the gate's roster check.
+            if !exists!(pattern!(rel, [{ group @ metadata::tag: &REL_KIND_GROUP }])) {
+                return None;
+            }
+            match snapshot_composition(rel, *snapshot) {
+                Some((anchor, snap_members)) if anchor == group && snap_members == members => {}
+                _ => return None,
             }
             Some(members)
         }
@@ -1001,6 +1003,14 @@ fn valid_settlements(
     let Some(author) = request.author() else {
         return Vec::new();
     };
+    // FAIL CLOSED / non-authoritative: a GROUPED request cannot be validated
+    // without a relations space (the KIND_GROUP anchor and snapshot anchoring
+    // are both unavailable), so it yields NO valid settlement rather than
+    // trusting sealed data cooperatively. Authoritative callers always pass a
+    // relations space; the groupless (legacy) path stays self-contained.
+    if request.group().is_some() && relations_space.is_none() {
+        return Vec::new();
+    }
     let mut valid = Vec::new();
     let ids = sorted_unique(
         find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_REVIEW_SETTLEMENT_ID }]))
@@ -1089,6 +1099,11 @@ fn valid_settlements(
                     && event.reasons.len() == 1
                     && event.created_at.len() == 1
                     && event.is_canonical()
+                    // ONE certificate per override: the settlement's time must
+                    // equal the event's, so the event id — which already seals
+                    // its time — determines a single canonical settlement rather
+                    // than one per arbitrary settlement `created_at`.
+                    && settlement.created_at == event.created_at
                 {
                     valid.push(ValidSettlement {
                         id,
@@ -1418,6 +1433,96 @@ pub fn roster_transition(frozen_required: &[Id], effective_required: &[Id]) -> R
         added: effective.difference(&frozen).copied().collect(),
         removed: frozen.difference(&effective).copied().collect(),
     }
+}
+
+/// Protocol/integrity blockers that forbid CREATING a break-glass override,
+/// SEPARATED from live-roster-resolution health. This is the shared eligibility
+/// projection the override command consults, so it neither ignores a blanket
+/// `Invalid` gate nor duplicates an incomplete checklist. An EMPTY result means
+/// the request is override-eligible.
+///
+/// It checks the request's IMMUTABLE identity + frozen protocol fields:
+/// canonical sole current head, a real goal that is the goal's CURRENT exact
+/// review status event (so a request detached by a newer `doing` status cannot
+/// be resurrected by override), a valid frozen roster (includes the author and
+/// at least one distinct non-author reviewer, all known people), a well-formed
+/// frozen authority set, and — if grouped — a real KIND_GROUP anchor (failing
+/// CLOSED when grouped and no relations space is available). It deliberately
+/// IGNORES the current group HEAD health (Forked/Missing/Invalid), because
+/// break-glass exists precisely to resolve a broken live roster.
+pub fn override_creation_blockers(
+    space: &TribleSet,
+    request: &ReviewRequest,
+    known_people: &HashSet<Id>,
+    relations_space: Option<&TribleSet>,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if !request.is_canonical() {
+        blockers.push("request does not seal its proof-defining fields".to_string());
+    }
+    let Some(goal) = request.goal() else {
+        blockers.push("request must name exactly one goal".to_string());
+        return blockers;
+    };
+    if active_request_ids_for_goal(space, goal).as_slice() != [request.id] {
+        blockers.push("request is stale or forked (not the sole current head)".to_string());
+    }
+    if !exists!(pattern!(space, [{ goal @ metadata::tag: &KIND_GOAL_ID }])) {
+        blockers.push("request must name an entity tagged as a goal".to_string());
+    }
+    // The request must be the goal's CURRENT exact review status event; a newer
+    // status (e.g. `doing`) that detaches it forbids resurrecting it by override.
+    let bound = latest_status_event(space, goal).is_some_and(|(event, status, _)| {
+        (event == request.id && status == REVIEW_STATUS)
+            || status_event_is_predecessor_of_request(space, event, request)
+    });
+    if !bound {
+        blockers.push("request is not the goal's current exact review status event".to_string());
+    }
+    let Some(author) = request.author() else {
+        blockers.push("request must name exactly one author".to_string());
+        return blockers;
+    };
+    // A valid FROZEN roster, independent of the current group head.
+    if !request.required.contains(&author) {
+        blockers.push("frozen review roster must include the author".to_string());
+    }
+    if !request.required.iter().any(|reviewer| *reviewer != author) {
+        blockers.push(
+            "frozen review roster must include at least one distinct non-author reviewer"
+                .to_string(),
+        );
+    }
+    if request.required.iter().any(|id| !known_people.contains(id)) {
+        blockers.push("frozen review roster contains unknown people".to_string());
+    }
+    // A well-formed frozen authority set.
+    if request.override_authorities.len() > 1 {
+        blockers.push("review freezes more than one break-glass authority".to_string());
+    }
+    if request.override_authorities.contains(&author) {
+        blockers.push("review author cannot be their own break-glass authority".to_string());
+    }
+    if request
+        .override_authorities
+        .iter()
+        .any(|id| !known_people.contains(id))
+    {
+        blockers.push("override roster contains unknown people".to_string());
+    }
+    // A real group anchor — fail CLOSED when grouped with no relations space.
+    if let Some(group) = request.group() {
+        match relations_space {
+            Some(rel) => {
+                if !exists!(pattern!(rel, [{ group @ metadata::tag: &REL_KIND_GROUP }])) {
+                    blockers.push(format!("review group {group:x} is not a KIND_GROUP anchor"));
+                }
+            }
+            None => blockers
+                .push("cannot verify the group anchor without a relations space".to_string()),
+        }
+    }
+    blockers
 }
 
 pub fn evaluate_request(
@@ -2444,6 +2549,147 @@ mod tests {
             matches!(eval.state, ReviewGateState::Invalid { .. }),
             "non-KIND_GROUP imposter anchor was accepted: {:?}",
             eval.state
+        );
+    }
+
+    #[test]
+    fn override_creation_is_blocked_on_a_stale_detached_request() {
+        // Seam: a canonical sole request detached by a newer `doing` status must
+        // not be resurrectable by override.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let request = add_request(
+            &mut space,
+            goal,
+            reviewers[0],
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:stale-override",
+        );
+        let moved = ufoid();
+        space += entity! { &moved @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &goal,
+            board::status: "doing",
+            metadata::created_at: later(),
+        };
+        let req = review_request(&space, request).expect("request readable");
+        let blockers = override_creation_blockers(&space, &req, &known, None);
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("current exact review status")),
+            "stale detached request was override-eligible: {blockers:?}"
+        );
+    }
+
+    #[test]
+    fn override_creation_is_blocked_on_an_author_only_roster() {
+        // Seam: a groupless canonical request with a malformed (author-only)
+        // frozen roster must not be override-eligible.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let request = add_request(
+            &mut space,
+            goal,
+            author,
+            &[author],
+            &[authority],
+            &[],
+            "urn:revision:author-only",
+        );
+        let req = review_request(&space, request).expect("request readable");
+        let blockers = override_creation_blockers(&space, &req, &known, None);
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("distinct non-author reviewer")),
+            "author-only roster was override-eligible: {blockers:?}"
+        );
+    }
+
+    #[test]
+    fn one_override_event_yields_exactly_one_certificate() {
+        // Seam: the same override event wrapped with two settlement created_at
+        // values must yield ONE valid certificate, not two.
+        let (mut space, goal, reviewers, authority, known) = fixture();
+        let author = reviewers[0];
+        let request = add_request(
+            &mut space,
+            goal,
+            author,
+            &reviewers,
+            &[authority],
+            &[],
+            "urn:revision:one-cert",
+        );
+        let reason: TextHandle = "break glass".to_blob().get_handle();
+        let override_event = review_override_fragment(request, authority, reason, now());
+        let override_id = override_event.root().expect("intrinsic override");
+        space += override_event;
+        // Two settlements for the SAME event, different created_at.
+        space += review_override_settlement_fragment(request, goal, authority, override_id, now());
+        space +=
+            review_override_settlement_fragment(request, goal, authority, override_id, later());
+        match evaluate_request(&space, request, &known).unwrap().state {
+            ReviewGateState::Settled { settlements } => assert_eq!(
+                settlements.len(),
+                1,
+                "one override event produced {} certificates",
+                settlements.len()
+            ),
+            other => panic!("expected Settled with one certificate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_grouped_override_is_not_settled_without_relations() {
+        // Seam: a grouped request must fail CLOSED (non-authoritative) when
+        // evaluated without a relations space — an imposter/unverifiable group
+        // must not read as Settled via the no-relations public path.
+        use crate::schemas::relations::{group_snapshot_fragment, KIND_GROUP as REL_KIND_GROUP};
+        let (mut space, goal, reviewers, authority, known) = pair_fixture();
+        let author = reviewers[0];
+        let group = ufoid().id;
+        let target: TextHandle = "urn:revision:grouped-noreln".to_blob().get_handle();
+        let request_fragment = review_request_fragment(
+            goal,
+            author,
+            target,
+            &sorted_unique(reviewers.to_vec()),
+            &[authority],
+            &[],
+            Some(group),
+            now(),
+        );
+        let request = request_fragment.root().expect("intrinsic request");
+        space += request_fragment;
+        let reason: TextHandle = "break glass".to_blob().get_handle();
+        let override_event = review_override_fragment(request, authority, reason, now());
+        let override_id = override_event.root().expect("intrinsic override");
+        space += override_event;
+        space += review_override_settlement_fragment(request, goal, authority, override_id, now());
+        // No relations => fail closed, NOT Settled.
+        assert!(
+            !matches!(
+                evaluate_request(&space, request, &known).unwrap().state,
+                ReviewGateState::Settled { .. }
+            ),
+            "grouped override settled without a relations space"
+        );
+        // With a real KIND_GROUP present, the authoritative path settles it.
+        let mut relations = TribleSet::new();
+        relations += entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &REL_KIND_GROUP };
+        let name: TextHandle = "roster".to_blob().get_handle();
+        relations += group_snapshot_fragment(group, name, &reviewers, &[]);
+        assert!(
+            matches!(
+                evaluate_request_live(&space, request, &known, &relations)
+                    .unwrap()
+                    .state,
+                ReviewGateState::Settled { .. }
+            ),
+            "grouped override not settled with a real group + relations"
         );
     }
 

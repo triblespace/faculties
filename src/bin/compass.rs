@@ -7,7 +7,8 @@ use faculties::schemas::compass::{
     evaluate_request_live, latest_status_event, review_attestation_fragment,
     review_attestation_settlement_fragment, review_override_fragment,
     review_override_settlement_fragment, review_request, review_request_fragment,
-    review_roster_successor_fragment, ReviewEvaluation, ReviewGateState, ReviewProjection,
+    override_creation_blockers, review_roster_successor_fragment, ReviewEvaluation,
+    ReviewGateState, ReviewProjection,
     SettlementMode, DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_REVIEW_REQUEST_ID, KIND_SPECS, KIND_STATUS_ID, REVIEW_STATUS,
     VERDICT_ABSTAIN, VERDICT_APPROVE, VERDICT_REQUEST_CHANGES,
@@ -2271,49 +2272,26 @@ fn cmd_review_override(
             if let ReviewGateState::Settled { settlements } = &evaluation.state {
                 return Ok((settlements[0].id, false));
             }
-            // Break-glass eligibility is INTEGRITY-ONLY. It must work precisely
-            // when the live roster is Forked/Missing/Invalid — that is exactly
-            // what break-glass is FOR — so it NEVER rejects on roster
-            // resolution (an `Invalid` gate caused by a forked/broken group is
-            // still overridable). It DOES require the request's own integrity:
-            // canonical identity, the sole current head, a well-formed frozen
-            // authority set, and (if grouped) a REAL KIND_GROUP anchor — with no
-            // healthy head required.
+            // Break-glass eligibility comes from ONE shared protocol projection
+            // (`override_creation_blockers`), NOT a duplicated checklist and NOT
+            // the blanket `Invalid` gate. It separates immutable request/protocol
+            // errors — which forbid override — from live-roster-resolution health
+            // (a Forked/Missing/Invalid current group is STILL overridable, since
+            // that is exactly what break-glass is for).
             let request = &evaluation.request;
-            if !request.is_canonical() {
+            let blockers =
+                override_creation_blockers(&space, request, &known_people, Some(&relations_space));
+            if !blockers.is_empty() {
                 bail!(
-                    "break-glass cannot override a non-canonical request {:x}",
-                    request.id
+                    "break-glass override is not eligible for request {:x}: {}",
+                    request.id,
+                    blockers.join("; ")
                 );
             }
-            if !request_is_active(&space, request.id) {
-                bail!(
-                    "request {:x} is stale or forked; override the sole current exact request instead",
-                    request.id
-                );
-            }
-            let goal = request
-                .goal()
-                .ok_or_else(|| anyhow::anyhow!("review request has no unique goal"))?;
-            let author = request
-                .author()
-                .ok_or_else(|| anyhow::anyhow!("review request has no unique author"))?;
-            if request.override_authorities.len() > 1 {
-                bail!(
-                    "review request {:x} freezes more than one break-glass authority",
-                    request.id
-                );
-            }
-            if request.override_authorities.contains(&author) {
-                bail!("review author cannot be their own break-glass authority");
-            }
-            if let Some(group) = request.group() {
-                if !exists!(pattern!(&relations_space, [{ group @ metadata::tag: &KIND_GROUP }])) {
-                    bail!(
-                        "review group {group:x} is not a KIND_GROUP anchor; break-glass still requires a real group"
-                    );
-                }
-            }
+            // Eligibility guaranteed a unique goal; the acting persona must be
+            // one of the frozen authorities (actor-specific, beyond the shared
+            // request-level projection).
+            let goal = request.goal().expect("eligibility guaranteed a unique goal");
             if !request.override_authorities.contains(&actor) {
                 bail!("persona {actor:x} is not a frozen override authority for this request");
             }
