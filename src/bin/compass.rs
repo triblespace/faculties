@@ -7,8 +7,8 @@ use faculties::schemas::compass::{
     evaluate_request_live, latest_status_event, review_attestation_fragment,
     review_attestation_settlement_fragment, review_override_fragment,
     review_override_settlement_fragment, review_request, review_request_fragment,
-    override_creation_blockers, review_roster_successor_fragment, ReviewEvaluation,
-    ReviewGateState, ReviewProjection,
+    interval_ord_key, override_creation_blockers, review_roster_successor_fragment,
+    ReviewEvaluation, ReviewGateState, ReviewProjection,
     SettlementMode, DEFAULT_STATUSES, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_REVIEW_REQUEST_ID, KIND_SPECS, KIND_STATUS_ID, REVIEW_STATUS,
     VERDICT_ABSTAIN, VERDICT_APPROVE, VERDICT_REQUEST_CHANGES,
@@ -234,13 +234,6 @@ fn epoch_interval(epoch: Epoch) -> IntervalValue {
 fn interval_key(interval: IntervalValue) -> i128 {
     let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
     lower
-}
-
-/// Total order over an interval — `(lower, upper)` — so the settle command
-/// picks the SAME maximal evidence time the schema validator does (see
-/// `faculties::schemas::compass::interval_ord_key`).
-fn interval_ord_key(interval: IntervalValue) -> (i128, i128) {
-    interval.try_from_inline().unwrap()
 }
 
 fn format_interval(interval: IntervalValue) -> String {
