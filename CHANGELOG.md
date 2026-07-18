@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **The nomic embedder's tokenizer loads from a native tokenizer GRAPH.**
+  `load_text_embedder` constructs the `tokenizers::Tokenizer` directly from
+  the tokenizer graph in the text model pile
+  (`mary::persist::load_tokenizer_from_pile` → the `tokenizers` builders) —
+  no tokenizer.json parse, no temp-file materialization, no network at
+  runtime. The json blob import (`memory import-tokenizer`) is retained for
+  provenance and now also builds the graph; the new `memory ingest-tokenizer`
+  upgrades a blob-only pile in place (append-only, idempotent). Piles without
+  a graph fall back to the blob with a stderr warning. Requires mary ≥
+  8e0f023 (tokenizer-graph merge).
 - **Compass is workflow-neutral again.** The never-released structured review
   gate has been removed wholesale: no review status coupling, request,
   attestation, verdict, settlement, override, watermark, or dedicated review

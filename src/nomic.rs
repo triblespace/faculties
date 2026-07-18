@@ -11,14 +11,22 @@
 //! artifact — `tokenizer.json` fell out of it once and silently broke
 //! `memory similar` on a machine whose weights pile was fine. The model pile
 //! is the durable store, so everything the embedder needs at runtime lives
-//! there: mary's `embed_persist` writes the weight graph, and
-//! [`import_tokenizer`] appends the `tokenizer.json` bytes once as a
-//! content-addressed blob under [`attr::tokenizer_json`]. Loading
-//! materializes the blob to a content-addressed temp file (mary's loader
-//! takes a path) — if the temp file is cleaned, it regenerates from the pile.
+//! there: mary's `embed_persist` writes the weight graph, and the tokenizer
+//! lives beside it as a NATIVE TOKENIZER GRAPH (`mary::tokenizer`) — vocab,
+//! merges, added tokens, and the normalizer/pre-tok/decoder config tail all
+//! as tribles. Loading is construct-from-graph
+//! (`mary::persist::load_tokenizer_from_pile`): the parts are queried and fed
+//! to the `tokenizers` builders — no JSON parse, no temp file, no network.
+//!
+//! The graph is the CANONICAL tokenizer source. The `tokenizer.json` blob
+//! ([`attr::tokenizer_json`], via [`import_tokenizer`]) is retained as import
+//! provenance and as a fallback: if a pile predates the graph,
+//! [`load_text_embedder`] warns on stderr and materializes the blob to a temp
+//! file — run [`ingest_tokenizer_graph`] (`memory ingest-tokenizer`) once to
+//! build the graph and retire the fallback.
 //!
 //! Vision needs no tokenizer today (its pile is weights-only), but any future
-//! side-asset follows the same pattern: an attribute here, a blob in the
+//! side-asset follows the same pattern: a graph (or at minimum a blob) in the
 //! model pile, never a hub-cache side-file.
 
 use std::path::{Path, PathBuf};
@@ -154,12 +162,94 @@ pub fn import_tokenizer(pile_path: &Path, tokenizer_json: &Path, model_name: &st
         Ok(())
     })();
     let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
+    result.and(close_res)?;
+    // The blob is provenance; the GRAPH is the canonical source — build it in
+    // the same breath so a fresh import is immediately graph-loadable.
+    ingest_tokenizer_graph(pile_path)
+}
+
+/// Build the tokenizer GRAPH in a model pile from its stored `tokenizer.json`
+/// blob — the one-time step that makes the graph the canonical tokenizer
+/// source (the blob stays as import provenance). Append-only and idempotent:
+/// a pile that already carries a tokenizer graph is left untouched.
+///
+/// The graph fragment's blobs (token pieces, patterns) are staged in the
+/// workspace and shipped with the commit; the tokenizer root is linked from
+/// the blob entity via `mary::tokenizer::attrs::tokenizer` so provenance
+/// (source blob → derived graph) is explicit.
+pub fn ingest_tokenizer_graph(pile_path: &Path) -> Result<()> {
+    let mut repo = open_model_repo(pile_path)?;
+    let result = (|| {
+        let branch_id = repo
+            .lookup_branch("main")
+            .map_err(|e| anyhow!("lookup main: {e:?}"))?
+            .ok_or_else(|| anyhow!("model pile has no 'main' branch"))?;
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow!("pull main: {e:?}"))?;
+        let space = ws.checkout(..).context("checkout model pile main")?;
+        if let Some(root) = mary::tokenizer::find_tokenizer(space.facts()) {
+            println!(
+                "tokenizer graph already present in {} (root {root:X}) — nothing to do",
+                pile_path.display()
+            );
+            return Ok(());
+        }
+        let Some((blob_entity, handle)) = find!(
+            (e: Id, h: Inline<Handle<LongString>>),
+            pattern!(space.facts(), [{ ?e @ attr::tokenizer_json: ?h }])
+        )
+        .next() else {
+            bail!(
+                "no tokenizer.json blob in {} — import one first with \
+                 `memory import-tokenizer <path/to/tokenizer.json>`",
+                pile_path.display()
+            );
+        };
+        let json: View<str> = ws
+            .get(handle)
+            .map_err(|e| anyhow!("read tokenizer blob: {e:?}"))?;
+
+        let frag = mary::tokenizer::save_tokenizer_json(
+            json.as_bytes(),
+            NOMIC_TEXT_MODEL,
+            &mut ws.staged,
+        )
+        .map_err(|e| anyhow!("build tokenizer graph: {e}"))?;
+        let root = frag
+            .root()
+            .ok_or_else(|| anyhow!("tokenizer fragment has no root"))?;
+        let facts: TribleSet = frag.into_facts();
+
+        // Report what the graph holds before committing it.
+        use mary::tokenizer::attrs as tok;
+        let n_vocab = find!((v: Id), pattern!(&facts, [{ root @ tok::vocab: ?v }])).count();
+        let n_merges = find!((m: Id), pattern!(&facts, [{ root @ tok::merge: ?m }])).count();
+        let n_added = find!((a: Id), pattern!(&facts, [{ root @ tok::added: ?a }])).count();
+        let n_tribles = facts.len();
+
+        let mut change = facts;
+        change += entity! { ExclusiveId::force_ref(&blob_entity) @
+            tok::tokenizer: root,
+        };
+        ws.commit(change, "ingest tokenizer graph from stored tokenizer.json");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow!("push tokenizer graph: {e:?}"))?;
+        println!(
+            "ingested tokenizer graph into {}: root {root:X}, {n_vocab} vocab + {n_merges} \
+             merges + {n_added} added tokens, {n_tribles} tribles (+1 provenance link)",
+            pile_path.display()
+        );
+        Ok(())
+    })();
+    let close_res = repo.close().map_err(|e| anyhow!("close pile: {e:?}"));
     result.and(close_res)
 }
 
-/// Materialize the pile-stored tokenizer.json to a content-addressed temp
-/// file (mary's loader wants a path). Cheap when already materialized; the
-/// file regenerates from the pile whenever the temp dir is cleaned.
+/// FALLBACK PATH ONLY (the canonical source is the tokenizer graph):
+/// materialize the pile-stored tokenizer.json blob to a content-addressed
+/// temp file (mary's json loader wants a path). Cheap when already
+/// materialized; regenerates from the pile whenever the temp dir is cleaned.
 fn materialize_tokenizer(pile_path: &Path) -> Result<PathBuf> {
     let mut repo = open_model_repo(pile_path)?;
     let result = (|| {
@@ -194,12 +284,33 @@ fn materialize_tokenizer(pile_path: &Path) -> Result<PathBuf> {
 }
 
 /// nomic-embed-text-v1.5, fully from the text model pile: weight graph AND
-/// tokenizer. Self-contained and eviction-proof — no HF hub, no cache.
+/// tokenizer GRAPH. Self-contained and eviction-proof — no HF hub, no cache,
+/// no tokenizer.json in the runtime path.
+///
+/// The tokenizer is constructed from the graph
+/// (`mary::persist::load_tokenizer_from_pile`). Piles that predate the graph
+/// fall back to the stored tokenizer.json blob with a stderr warning — run
+/// `memory ingest-tokenizer` once to build the graph and silence it.
 pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
     let pile = text_pile();
-    let tokenizer = materialize_tokenizer(&pile)?;
-    mary::embed::load_nomic_text_from_pile(&pile, &tokenizer, mary::embed::default_device())
-        .map_err(|e| anyhow!("load nomic text embedder from pile {}: {e:?}", pile.display()))
+    let device = mary::embed::default_device();
+    let keymap = mary::persist::load_keymap_from_pile(&pile)
+        .map_err(|e| anyhow!("load nomic text weights from pile {}: {e:?}", pile.display()))?;
+    match mary::persist::load_tokenizer_from_pile(&pile) {
+        Ok(tokenizer) => mary::embed::nomic_text_from_parts(keymap, tokenizer, device)
+            .map_err(|e| anyhow!("build nomic text embedder from pile {}: {e:?}", pile.display())),
+        Err(err) => {
+            eprintln!(
+                "memory: no tokenizer graph in {} ({err}); falling back to the stored \
+                 tokenizer.json blob — run `memory ingest-tokenizer` once to build the graph",
+                pile.display()
+            );
+            let tokenizer = materialize_tokenizer(&pile)?;
+            mary::embed::load_nomic_text_from_keymap(keymap, &tokenizer, device).map_err(|e| {
+                anyhow!("load nomic text embedder from pile {}: {e:?}", pile.display())
+            })
+        }
+    }
 }
 
 /// nomic-embed-vision-v1.5 from the vision model pile — co-embedded into the
