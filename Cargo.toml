@@ -102,7 +102,7 @@ required-features = ["widgets"]
 # `local-embed` and `widgets` are default: semantic recall is core to the being
 # knowing itself, and the GORBIE viewer is part of the normal office surface.
 # A stock `cargo install --path faculties --bins` must ship both.
-default = ["local-embed", "widgets"]
+default = ["local-embed", "widgets", "audio"]
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
 widgets = [
     "dep:GORBIE",
@@ -122,7 +122,11 @@ imagine = ["dep:mary", "mary/flux", "dep:image"]
 # drift stale against the pile format (the staleness class that truncated memory
 # on 2026-06-30). Weights load from a durable standalone pile (QWEN3TTS_PILE);
 # mary/speak = qwen3tts port + the pile persist/load seam.
-voice = ["dep:mary", "mary/speak"]
+# Native audio device enumeration + playback sink (rodio/cpal). Default so
+# stock installs keep `voice devices`/routing; excluded on audio-less servers
+# (FreeBSD build class, 2026-07-21) via --no-default-features.
+audio = ["dep:rodio"]
+voice = ["dep:mary", "mary/speak", "audio"]
 # Opt-in WGPU acceleration for large SuccinctArchive LSM carries. The normal
 # archive binary remains GPU-free; enabling this feature selects the reusable
 # shared CubeCL 0.10 WGPU backend with canonical CPU fallback.
@@ -159,7 +163,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rayon = "1.10"              # archive
 regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
-rodio = { version = "0.22", default-features = false, features = ["playback"] }  # voice (NATIVE audio: cpal device enumeration always; in-process playback sink under `voice` — no afplay/ffplay/SwitchAudioSource subprocesses)
+rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
 rrule = "0.14"              # planner
 scraper = "0.23"            # archive
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web

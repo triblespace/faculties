@@ -261,6 +261,7 @@ impl AudioDevice {
 /// macOS) — the SAME namespace the playback sink opens devices from, so a
 /// name that routes here is a name `open_named_sink` can actually play on
 /// (the system_profiler/playback name-mismatch class can't exist).
+#[cfg(feature = "audio")]
 fn detect_output_devices() -> Result<Vec<AudioDevice>> {
     use rodio::cpal::traits::{DeviceTrait, HostTrait};
     let host = rodio::cpal::default_host();
@@ -283,6 +284,14 @@ fn detect_output_devices() -> Result<Vec<AudioDevice>> {
         });
     }
     Ok(devices)
+}
+
+/// Audio-less builds (`--no-default-features`, the FreeBSD server class):
+/// same signature, fails loud. Every caller compiles unchanged; any
+/// device-touching subcommand reports the missing capability honestly.
+#[cfg(not(feature = "audio"))]
+fn detect_output_devices() -> Result<Vec<AudioDevice>> {
+    anyhow::bail!("audio device support not compiled into this build (enable the `audio` feature)")
 }
 
 /// Connected devices whose name contains `pat` (case-insensitive), in
