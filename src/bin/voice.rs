@@ -4,7 +4,7 @@
 //!
 //! Extracted from `body` (2026-06-30). The body is the physical Reachy loop
 //! (pose/look/feel/act); the voice is its own organ — synthesis (Qwen3-TTS via
-//! mary, cloning the voice grown from "No No, No Yes") plus output routing.
+//! mary) plus output routing.
 //! Utterances and the routing config live on the pile's `voice` branch.
 //!
 //! Two channels, each a hard contract, not a soft preference:
@@ -68,7 +68,7 @@ type U256 = Inline<inlineencodings::U256BE>;
 const DEFAULT_DAEMON: &str = "http://localhost:8000";
 
 // Qwen3-TTS voice assets — used by the in-process `mary::speak` call (the
-// `voice` feature). The voice was grown from "No No, No Yes" (F5 remains in
+// `voice` feature). The reference voice asset (F5 lineage remains in
 // mary as the voice-origin lineage); every utterance clones the v2 reference
 // kit: an 11.46 s clean-boundary clip (24 kHz render of `ref_liora_v2.wav`),
 // its EXACT transcript, and the clip's codec frames. Weights load from a

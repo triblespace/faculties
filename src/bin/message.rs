@@ -236,7 +236,7 @@ fn resolve_person_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
 /// Resolve a message RECIPIENT: a person or a group. On an exact-label tie
 /// between a group and person aliases, the group wins — addressing a
 /// broadcast set by its name is virtually always the intent (e.g. the
-/// `liora` group vs. stray personal aliases). Ties among multiple groups
+/// the broadcast group vs. stray aliases). Ties among multiple groups
 /// or with no group stay hard errors, listing the claimants.
 fn resolve_recipient_id(relations_space: &TribleSet, input: &str) -> Result<Id> {
     let trimmed = input.trim();

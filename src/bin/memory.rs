@@ -45,7 +45,7 @@ use triblespace::prelude::*;
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
              memory context [<budget>] [--chars N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — antichain cover over ALL memories, coarse→fine to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate); --about biases detail toward memories relevant to <query> by MEANING (semantic, via `memory embed`; falls back to lexical `memory index`); --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). Filter/remove decide eligibility, --about weights detail among the eligible, budget decides coarseness; they compose. NOTE: gating is chunk-level — a surviving COARSE ancestor's pre-written summary may still mention removed material. Unembedded+un-lexically-scorable chunks are kept (fail-open) with a stderr warning.\n  \
-             memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/liora/cover/<KEY>/`, NOT the pile\n  \
+             memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
              memory cover reset [--session KEY]   — rewind the cursor to 0 (does NOT regenerate the stored cover)\n  \
@@ -1857,7 +1857,7 @@ fn build_context_cover(
 // answers "fully ingested?" through its exit code; `cover reset` rewinds
 // without regenerating. This is ephemeral harness plumbing, NOT knowledge — it
 // must never touch the pile. State lives under
-// `${XDG_CACHE_HOME:-$HOME/.cache}/liora/cover/<session>/` as `cover.txt`
+// `${XDG_CACHE_HOME:-$HOME/.cache}/faculties/cover/<session>/` as `cover.txt`
 // (the stored cover, byte-exact) plus `cursor.json` (the read offset).
 
 const COVER_DEFAULT_CHARS: usize = 400_000;
@@ -1884,7 +1884,7 @@ struct CoverCursor {
 }
 
 /// State directory for one cover session:
-/// `${XDG_CACHE_HOME:-$HOME/.cache}/liora/cover/<key>`. The key becomes a
+/// `${XDG_CACHE_HOME:-$HOME/.cache}/faculties/cover/<key>`. The key becomes a
 /// directory name, so path-shaped keys are rejected outright.
 fn cover_session_dir(key: &str) -> Result<PathBuf> {
     if key.is_empty() || key == "." || key == ".." || key.contains('/') || key.contains('\\') {
@@ -1898,7 +1898,7 @@ fn cover_session_dir(key: &str) -> Result<PathBuf> {
             PathBuf::from(home).join(".cache")
         }
     };
-    Ok(base.join("liora").join("cover").join(key))
+    Ok(base.join("faculties").join("cover").join(key))
 }
 
 /// How many chunks a cover of `total_chars` splits into at `chunk_chars`.
@@ -3006,7 +3006,7 @@ mod tests {
     }
 
     /// A fresh cover-state dir under the system temp dir, removed on drop —
-    /// the tests never touch the real `~/.cache/liora/cover/`.
+    /// the tests never touch the real `~/.cache/faculties/cover/`.
     struct TestStateDir(PathBuf);
 
     impl TestStateDir {

@@ -4,7 +4,7 @@
 //!
 //! Extracted from `body` (2026-06-30): speaking is its own organ, not a limb of
 //! the Reachy body. The body stays the physical Reachy loop (pose/look/feel/act);
-//! the voice owns synthesis (F5/mary, grown from "No No, No Yes") and output
+//! the voice owns synthesis (F5/mary) and output
 //! routing. Utterances and routing config live on the `voice` branch.
 //!
 //! Two channels, each a hard contract — NOT a soft preference:
