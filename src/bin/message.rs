@@ -90,6 +90,18 @@ enum Command {
         /// Reader id or label.
         by: String,
     },
+    /// Mark ALL unread inbox messages for a reader as read, in ONE commit.
+    /// The one-at-a-time `ack` is fine for a message or two, but a loud colony
+    /// accretes a deep unread backlog that per-message acks can't clear
+    /// efficiently (each is its own pile commit); this bulk path writes every
+    /// read record in a single commit.
+    AckAll {
+        /// Reader id or label.
+        by: String,
+        /// Only ack messages from this sender (id/label); default: all senders.
+        #[arg(long)]
+        from: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +447,98 @@ fn cmd_ack(
     })
 }
 
+/// Bulk analogue of [`cmd_ack`]: mark every unread inbox message for `by` (a
+/// message directed to the reader or a group they belong to, with no existing
+/// read record for them) as read in a SINGLE commit. Optionally restricted to
+/// one sender via `from`. Reuses the exact inbox/unread predicate `cmd_list`
+/// renders, so what it clears is exactly what `list --unread` shows.
+fn cmd_ack_all(
+    pile: &Path,
+    branch_id: Id,
+    relations_branch_id: Id,
+    by: String,
+    from: Option<String>,
+) -> Result<()> {
+    with_repo(pile, |repo| {
+        let (relations_space, _relations_ws) = load_relations(repo, relations_branch_id)?;
+        let reader_id = resolve_person_id(&relations_space, &by)?;
+        let reader_groups = groups_for_member(&relations_space, reader_id);
+        let from_filter = from
+            .as_deref()
+            .map(|f| resolve_person_id(&relations_space, f))
+            .transpose()?;
+
+        let mut ws = repo
+            .pull(branch_id)
+            .map_err(|e| anyhow::anyhow!("pull workspace: {e:?}"))?;
+        let mut change = ensure_metadata(&mut ws)?;
+        let space = ws
+            .checkout(..)
+            .map_err(|e| anyhow::anyhow!("checkout: {e:?}"))?
+            .into_facts();
+
+        // Messages this reader has already read (any read record with them as
+        // reader) — the set we skip.
+        let mut read_set: std::collections::HashSet<Id> = std::collections::HashSet::new();
+        for (_read_id, message_id, reader) in find!(
+            (read_id: Id, message_id: Id, reader: Id),
+            pattern!(&space, [{
+                ?read_id @
+                metadata::tag: &KIND_READ_ID,
+                local::about_message: ?message_id,
+                local::reader: ?reader,
+            }])
+        ) {
+            if reader == reader_id {
+                read_set.insert(message_id);
+            }
+        }
+
+        let now = epoch_interval(now_epoch());
+        let mut acked = 0usize;
+        for (message_id, msg_from, msg_to) in find!(
+            (message_id: Id, msg_from: Id, msg_to: Id),
+            pattern!(&space, [{
+                ?message_id @
+                metadata::tag: &KIND_MESSAGE_ID,
+                local::from: ?msg_from,
+                local::to: ?msg_to,
+            }])
+        ) {
+            if !is_inbox_message(msg_from, msg_to, reader_id, &reader_groups) {
+                continue; // not in this reader's inbox
+            }
+            if read_set.contains(&message_id) {
+                continue; // already read
+            }
+            if let Some(f) = from_filter {
+                if msg_from != f {
+                    continue; // sender filter
+                }
+            }
+            let read_id = ufoid();
+            change += entity! { &read_id @
+                metadata::tag: &KIND_READ_ID,
+                local::about_message: message_id,
+                local::reader: reader_id,
+                local::read_at: now,
+            };
+            acked += 1;
+        }
+
+        if acked == 0 {
+            println!("No unread messages for {reader_id}.");
+            return Ok(());
+        }
+        ws.commit(change, "local messages bulk read");
+        repo.push(&mut ws)
+            .map_err(|e| anyhow::anyhow!("push bulk read: {e:?}"))?;
+        drop(ws);
+        println!("Marked {acked} message(s) as read by {reader_id}.");
+        Ok(())
+    })
+}
+
 fn cmd_list(
     pile: &Path,
     branch_id: Id,
@@ -634,6 +738,13 @@ fn main() -> Result<()> {
             relations_branch_id,
             id,
             by,
+        ),
+        Command::AckAll { by, from } => cmd_ack_all(
+            &cli.pile,
+            message_branch_id,
+            relations_branch_id,
+            by,
+            from,
         ),
     }
 }
