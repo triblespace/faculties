@@ -7,12 +7,12 @@ chains `relations`, `message`, `orient`, and `compass`.
 == Setup once
 
 ```sh
-relations add liora-gpt --affinity zooid
-relations add liora-cc  --affinity zooid
-relations add liora-agy --affinity zooid
+relations add agent-a --affinity zooid
+relations add agent-b --affinity zooid
+relations add agent-c --affinity zooid
 relations add jp --affinity user
 
-export PERSONA=liora-gpt
+export PERSONA=agent-a
 ```
 
 Relations supplies stable person identities and groups. `$PERSONA` attributes
@@ -24,14 +24,14 @@ ordinary status and note events; it is not a cryptographic authority claim.
 # Agent A claims and works.
 GOAL=<existing-goal-id>
 compass move "$GOAL" doing
-compass note "$GOAL" "Claimed by liora-gpt; draft at wiki:<fragment>"
+compass note "$GOAL" "Claimed by agent-a; draft at wiki:<fragment>"
 
 # If another agent must continue, send the conversational context directly.
 compass move "$GOAL" blocked
-message send liora-cc "Please continue $GOAL from wiki:<fragment>"
+message send agent-b "Please continue $GOAL from wiki:<fragment>"
 
 # Agent B's watcher surfaces the message; B acknowledges and claims.
-export PERSONA=liora-cc
+export PERSONA=agent-b
 orient show
 message ack <message-id> "$PERSONA"
 compass move "$GOAL" doing
@@ -48,7 +48,7 @@ Review is observation, not a state machine. Ask for it through the normal
 coordination primitives, naming the exact artifact:
 
 ```sh
-message send liora-cc \
+message send agent-b \
   "Please diagnose git+https://example.org/repo@<full-oid>; reply with observations and evidence."
 ```
 

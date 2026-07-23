@@ -49,7 +49,7 @@ files get <hash> @- > /tmp/check.pdf
     independently.
   - Tag conventions: keep tags lowercase, short, durable.
     Topic tags (`compression`, `auth`) live longer than
-    project tags (`liora-q2-experiment`).
+    project tags (`proj-q2-experiment`).
 
 == When NOT to use files
 

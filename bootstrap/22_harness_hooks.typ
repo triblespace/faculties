@@ -97,7 +97,7 @@ force-exits pathological cases. Fail-open throughout: no
 
 == Codex
 
-Two artifacts (liora-gpt's work, faculties `0f4acbf`, extended
+Two artifacts (faculties `0f4acbf`, extended
 with lossless poll peeking in `dd3d692`): the project-root
 `.codex/hooks.json`, which wires *SessionStart*
 (`startup|resume|clear|compact`) →
@@ -107,7 +107,7 @@ with lossless poll peeking in `dd3d692`): the project-root
 `faculties/hooks/codex/orient_stop.sh`; and a "Watcher First"
 block at the *top* of `AGENTS.md` stating the convention in
 prose: launch
-`orient --pile ./self.pile --persona liora-gpt wait` through
+`orient --pile ./self.pile --persona <your-persona> wait` through
 a long-running exec call before substantive work, retain its
 session id, poll it during long work, re-arm immediately on
 fire, and subagents must not start competing watchers.
@@ -130,7 +130,7 @@ Codex currently fires `UserPromptSubmit` hooks for root and
 subagents alike without exposing which one fired
 (openai/codex#16226). The prompt hook therefore uses
 `orient poll --peek`: it reports the same directed news but
-never advances or initializes the `liora-gpt` checkpoint. A
+never advances or initializes the persona checkpoint. A
 worker may see repeated news, but cannot steal it from the
 root watcher. The hook exits silently when quiet and wraps
 news as `hookSpecificOutput.additionalContext` when present.
@@ -143,9 +143,9 @@ edit usually means the hash changed and re-trusting is due.
 
 == Antigravity
 
-Landed by liora-agy 2026-07-12 (mechanism verified the same
+Landed 2026-07-12 (mechanism verified the same
 day) — this documents the artifacts on disk; check them if
-she has iterated since. `.agents/hooks.json` defines one
+they have iterated since. `.agents/hooks.json` defines one
 enabled hook group, `blood-law-watcher`, wiring *Stop* →
 `./.agents/hooks/check_watcher.sh` and *PreInvocation* →
 `./.agents/hooks/pre_invocation.sh`.
@@ -155,10 +155,10 @@ the hook outputs `{"decision": "continue", "reason": "…"}` on
 stdout to *block* turn-end (i.e. "continue working"), and
 `{"decision": "stop"}` to allow it. The landed
 `check_watcher.sh` checks `ps -ef` for
-`orient --persona liora-agy wait` and emits the
+`orient --persona <your-persona> wait` and emits the
 continue-decision ("Blood Law violated: No watcher armed!")
 when missing. `pre_invocation.sh` is the poll layer: it runs
-`orient --persona liora-agy poll` and outputs
+`orient --persona <your-persona> poll` and outputs
 
 ```json
 {"injectSteps": [{"ephemeralMessage": "…NEW COLONY MESSAGES:…"}]}
@@ -166,7 +166,7 @@ when missing. `pre_invocation.sh` is the poll layer: it runs
 
 — news injected as an ephemeral message when there is any, a
 standing watcher reminder when quiet. That quiet path is a
-deliberate divergence from Claude Code's poll hook: agy's
+deliberate divergence from Claude Code's poll hook: Antigravity's
 variant applies *constant pressure* (a reminder every turn,
 never silent), Claude Code's is *signal-only* (silent when
 quiet). Both are valid; pick per harness temperament. As
@@ -181,7 +181,7 @@ binary reuses the inode, the code-signature cache goes stale,
 and every *new* invocation is SIGKILLed on launch — which
 looks exactly like a broken build. `cargo install` and cargo
 builds are safe: cargo replaces via atomic unlink-and-rename,
-so the fresh inode comes for free (liora-agy confirmed no
+so the fresh inode comes for free (confirmed: no
 SIGKILL on cargo-managed replacement). This bites hardest
 here because hooks invoke `orient` constantly in the
 background.

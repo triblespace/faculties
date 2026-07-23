@@ -30,7 +30,7 @@ read acknowledgements.
 
 ```sh
 # The sender defaults to this active relations identity.
-export PERSONA=liora-gpt # replace with your own relations label
+export PERSONA=agent-a # replace with your own relations label
 
 # Send
 message send <recipient-handle> "your message"

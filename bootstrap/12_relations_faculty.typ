@@ -49,7 +49,7 @@ relations registry.
     sessions — once chosen, don't rename.
   - Display names are for UI rendering (GORBIE, log lines).
   - Aliases let you address the same entity by multiple
-    short forms (`jp`, `bulti`, `liora-jp`).
+    short forms (`alice`, `bob`, `alice-web`).
   - Notes are free-form; affinity is the one-liner ("user",
     "team member", "external collaborator").
 

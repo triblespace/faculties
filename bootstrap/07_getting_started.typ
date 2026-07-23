@@ -21,7 +21,7 @@ and starting to do work.
 If you're inheriting an existing project (vs. starting fresh),
 look for a `wiki --pile ./self.pile show <id>` "letter from
 the previous instance" or similar onboarding handoff in the
-local pile — projects like Liora seed one as the first thing
+local pile — many projects seed one as the first thing
 to read. `wiki search "letter"` or `wiki list --tag
 onboarding` from your local pile should surface it.
 

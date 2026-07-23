@@ -58,7 +58,7 @@ trivial next actions; the conversation is the right level for those.
 == Tags
 
 Compass tags work like wiki tags. Common ones are `#meta`, `#bootstrap`, and
-`#parking`, plus project-specific tags such as `#liora` or `#deploy`.
+`#parking`, plus project-specific tags such as `#myproject` or `#deploy`.
 Tag a goal with a persona's relations label to address it to that persona;
 Orient can surface that as directed news.
 
