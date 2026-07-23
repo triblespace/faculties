@@ -280,9 +280,9 @@ fn resolve_named(ws: &mut Workspace<Pile>, space: &TribleSet, kind: Id, input: &
 }
 
 fn password() -> Result<Vec<u8>> {
-    std::env::var("LIORA_SECRETS_PW")
+    std::env::var("FACULTIES_SECRETS_PW")
         .map(|s| s.into_bytes())
-        .map_err(|_| anyhow::anyhow!("set LIORA_SECRETS_PW to the identity password"))
+        .map_err(|_| anyhow::anyhow!("set FACULTIES_SECRETS_PW to the identity password"))
 }
 
 // ── enumerate (the engine does the work) ──────────────────────────────────────
@@ -521,7 +521,7 @@ enum SecretCmd {
         value: String,
     },
     /// Get the latest version of a named secret, as a given identity
-    /// (needs LIORA_SECRETS_PW).
+    /// (needs FACULTIES_SECRETS_PW).
     Get {
         #[arg(long)]
         scope: String,
@@ -540,7 +540,7 @@ enum SecretCmd {
         scope: Option<String>,
     },
     /// Re-wrap a named secret's DEK to recipients added after it was created.
-    /// Run as an existing recipient (needs LIORA_SECRETS_PW to unlock the DEK).
+    /// Run as an existing recipient (needs FACULTIES_SECRETS_PW to unlock the DEK).
     Share {
         #[arg(long)]
         scope: String,

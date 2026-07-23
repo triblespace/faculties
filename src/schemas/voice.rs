@@ -1,4 +1,4 @@
-//! Voice schema: Liora's voice organ — speech out, on two channels, with a
+//! Voice schema: a text-to-speech faculty — speech out, on two channels, with a
 //! pile-backed routing policy that decides which audio device each channel
 //! plays through.
 //!

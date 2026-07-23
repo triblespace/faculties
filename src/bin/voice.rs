@@ -1,4 +1,4 @@
-//! `voice` — Liora's voice organ: speech out, on two channels, with a
+//! `voice` — a text-to-speech faculty: speech out, on two channels, with a
 //! pile-backed routing policy that picks which audio device each channel plays
 //! through.
 //!
@@ -70,18 +70,18 @@ const DEFAULT_DAEMON: &str = "http://localhost:8000";
 // Qwen3-TTS voice assets — used by the in-process `mary::speak` call (the
 // `voice` feature). The reference voice asset (F5 lineage remains in
 // mary as the voice-origin lineage); every utterance clones the v2 reference
-// kit: an 11.46 s clean-boundary clip (24 kHz render of `ref_liora_v2.wav`),
+// kit: an 11.46 s clean-boundary clip (24 kHz render of `ref_voice_v2.wav`),
 // its EXACT transcript, and the clip's codec frames. Weights load from a
 // durable standalone pile (under the faculties model dir); `QWEN3TTS_PILE`
 // overrides the path. The reference-kit assets live beside it in the model dir.
 #[cfg(feature = "voice")]
 const QWEN3TTS_PILE_FILE: &str = "qwen3tts.pile";
 #[cfg(feature = "voice")]
-const REF_WAV_FILE: &str = "ref_liora_v2_24k.wav";
+const REF_WAV_FILE: &str = "ref_voice_v2_24k.wav";
 #[cfg(feature = "voice")]
-const REF_TXT_FILE: &str = "ref_liora_v2.txt";
+const REF_TXT_FILE: &str = "ref_voice_v2.txt";
 #[cfg(feature = "voice")]
-const REF_CODE_FILE: &str = "ref_liora_v2_code.npy";
+const REF_CODE_FILE: &str = "ref_voice_v2_code.npy";
 
 // Default routing policy, used when the pile holds no `route set` for a channel.
 // `say` lists ONLY private devices (the classifier rejects anything else anyway);
@@ -95,7 +95,7 @@ const DEFAULT_SHOUT_DEVICES: &[&str] =
 #[command(
     version = faculties::GIT_VERSION,
     name = "voice",
-    about = "Liora's voice: synthesis + privacy-aware output routing, on two channels."
+    about = "Speech synthesis + privacy-aware output routing, on two channels."
 )]
 struct Cli {
     /// Path to the pile file
@@ -1054,7 +1054,7 @@ fn unique_voice_tmp() -> Result<PathBuf> {
         let mut r = [0u8; 8];
         OsRng.fill_bytes(&mut r);
         let path = std::env::temp_dir().join(format!(
-            "liora_voice_{}_{:016x}.wav",
+            "voice_out_{}_{:016x}.wav",
             std::process::id(),
             u64::from_le_bytes(r)
         ));

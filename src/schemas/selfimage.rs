@@ -1,4 +1,4 @@
-//! Liora's self-image domain attributes — the labels her self-image dataset
+//! Self-image domain attributes — the labels a self-image dataset
 //! hangs on `mary::dataset` Samples.
 //!
 //! These are deliberately SEPARATE from the generic `mary::dataset` schema: that

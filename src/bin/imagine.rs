@@ -1,4 +1,4 @@
-//! `imagine` — Liora's IMAGINATION faculty: text → image via mary's ported
+//! `imagine` — an image-generation faculty: text → image via mary's ported
 //! FLUX.2 pipeline (Burn / Metal-GPU). A generated PNG is printed to stdout so a
 //! Claude-Code reader can `Read` it; with `--remember <when>` the image is also
 //! stored as a wordless `ctx::image` memory at a time-coordinate (shelling out
@@ -22,7 +22,7 @@ use clap::Parser;
 #[command(
     version = faculties::GIT_VERSION,
     name = "imagine",
-    about = "Liora's imagination: text → image via mary's FLUX.2 pipeline."
+    about = "Image generation: text → image via mary's FLUX.2 pipeline."
 )]
 struct Cli {
     /// The text prompt to imagine.

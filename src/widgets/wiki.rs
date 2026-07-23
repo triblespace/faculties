@@ -20,7 +20,7 @@
 //! - Version navigation (prev/next/latest) on fragments with history
 //! - `files:` link handling — resolves a 32-char entity id or 64-char
 //!   content hash to a file blob (against the optional files workspace),
-//!   writes it to `$TMPDIR/liora-files/`, and opens it via the platform
+//!   writes it to `$TMPDIR/faculties-files/`, and opens it via the platform
 //!   `open` command.
 
 use std::collections::{BTreeMap, HashSet};
@@ -319,7 +319,7 @@ impl WikiLive {
         Some((handle, name))
     }
 
-    /// Resolve `files:<hex>`, write the blob to `$TMPDIR/liora-files/<name>`,
+    /// Resolve `files:<hex>`, write the blob to `$TMPDIR/faculties-files/<name>`,
     /// and fire `open` on it. Logs errors to stderr rather than surfacing
     /// them through the UI (this is a best-effort side channel).
     fn open_file(&self, files_ws: Option<&mut Workspace<Pile>>, hex: &str) {
@@ -336,7 +336,7 @@ impl WikiLive {
 
         let result = (|| -> Result<std::path::PathBuf, String> {
             let blob: Blob<RawBytes> = ws.get(handle).map_err(|e| format!("get blob: {e:?}"))?;
-            let tmp_dir = std::env::temp_dir().join("liora-files");
+            let tmp_dir = std::env::temp_dir().join("faculties-files");
             std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
             let path = tmp_dir.join(&name);
             std::fs::write(&path, &*blob.bytes).map_err(|e| format!("write: {e}"))?;

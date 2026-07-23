@@ -31,11 +31,11 @@ pub const KIND_CAPTURE: Id = id_hex!("9C26C6EFD09EB2A401EF009FE9229E16");
 // speaking is its own organ. Utterances now live on the pile's `voice` branch
 // (see `schemas::voice`). The body is the physical Reachy loop only.
 
-/// Tag for an INTENT — the being's reasoned instruction to itself: gemma's
+/// Tag for an INTENT — a reasoned instruction (the perceive-then-reason model output): gemma's
 /// perceive+reason output, the language the VLA is conditioned on. Unlike the
 /// raw perception stream (ephemeral, periphery principle), intent is DELIBERATE
 /// and kept — it fires only on salience (a handful a minute, never per-frame),
-/// so the log is sparse and worth keeping: the being's auditable, replayable
+/// so the log is sparse and worth keeping: an auditable, replayable
 /// train of thought. The VLA reads the LATEST intent — coordinate-and-cursor on
 /// the canonical `metadata::created_at` (every kept entity carries it), no
 /// shared mutable state, monotonic.

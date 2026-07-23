@@ -426,12 +426,12 @@ impl FilesViewer {
 }
 
 /// Extract `entity_id` (a file or directory) from the pile into
-/// `$TMPDIR/liora-files/` and fire the platform `open` command on the
+/// `$TMPDIR/faculties-files/` and fire the platform `open` command on the
 /// result — same flow the wiki widget uses for `files:` links, but
 /// extended to handle directory roots by recursing through
 /// `file::children`. Best-effort: errors log to stderr.
 fn open_entity(ws: &mut Workspace<Pile>, space: &TribleSet, entity_id: Id) {
-    let tmp_dir = std::env::temp_dir().join("liora-files");
+    let tmp_dir = std::env::temp_dir().join("faculties-files");
     if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
         eprintln!("[files] mkdir {}: {e}", tmp_dir.display());
         return;
@@ -587,7 +587,7 @@ fn render_import_card(
                         }
 
                         // OPEN — extracts the import's root file or
-                        // directory tree to $TMPDIR/liora-files/ and
+                        // directory tree to $TMPDIR/faculties-files/ and
                         // fires the platform opener, mirroring the
                         // wiki widget's files:-link behaviour.
                         // `Align::Min` cross-axis: Center would feed

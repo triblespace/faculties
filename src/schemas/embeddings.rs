@@ -1,6 +1,6 @@
 //! The shared multimodal embedding space.
 //!
-//! ONE space for everything Liora perceives or generates — file images,
+//! ONE space for everything the agent perceives or generates — file images,
 //! photos, memory-chunk prose — so all four search directions
 //! (text→text, text→image, image→text, image→image) are just cosine in one
 //! HNSW. The space is nomic's *aligned* text+vision latent (768-d):

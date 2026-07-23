@@ -17,7 +17,7 @@ pub const GIT_VERSION: &str = concat!(
 );
 
 /// The directory holding the durable model piles and voice reference assets
-/// (`nomic_text.pile`, `qwen3tts.pile`, `ref_liora_v2_24k.wav`, …).
+/// (`nomic_text.pile`, `qwen3tts.pile`, `ref_voice_v2_24k.wav`, …).
 ///
 /// Resolution: the `FACULTIES_MODEL_DIR` environment variable overrides it;
 /// otherwise it defaults to `$HOME/.cache/faculties/models` (with `HOME`
