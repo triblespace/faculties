@@ -26,7 +26,7 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use crate::atlas::AtlasEntry;
-use crate::widgets::storage::{DatasetRevision, DatasetView};
+use crate::widgets::storage::DatasetView;
 use triblespace::core::id::Id;
 
 // ── Palette ──────────────────────────────────────────────────────────
@@ -59,49 +59,6 @@ fn mix(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
             .clamp(0.0, 255.0) as u8
     };
     egui::Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
-}
-
-// ── Row struct ───────────────────────────────────────────────────────
-
-struct AtlasLive {
-    cached_revision: DatasetRevision,
-    entries: Vec<AtlasEntry>,
-    /// All name variants keyed by entity id, used to resolve tag chips
-    /// without manufacturing a preferred label.
-    names_by_id: BTreeMap<Id, Vec<String>>,
-    diagnostic: Option<String>,
-}
-
-// ── Live snapshot ────────────────────────────────────────────────────
-
-impl AtlasLive {
-    fn refresh(dataset: DatasetView<'_>) -> Self {
-        match crate::atlas::named_entries(dataset.reader, dataset.facts) {
-            Ok(mut entries) => {
-                entries.sort_by(|left, right| {
-                    atlas_sort_key(left)
-                        .cmp(&atlas_sort_key(right))
-                        .then_with(|| left.id.cmp(&right.id))
-                });
-                let names_by_id = entries
-                    .iter()
-                    .map(|entry| (entry.id, entry.names.clone()))
-                    .collect();
-                AtlasLive {
-                    cached_revision: dataset.revision,
-                    entries,
-                    names_by_id,
-                    diagnostic: None,
-                }
-            }
-            Err(error) => AtlasLive {
-                cached_revision: dataset.revision,
-                entries: Vec::new(),
-                names_by_id: BTreeMap::new(),
-                diagnostic: Some(format!("Atlas query failed: {error:#}")),
-            },
-        }
-    }
 }
 
 fn atlas_sort_key(entry: &AtlasEntry) -> Vec<String> {
@@ -140,13 +97,11 @@ fn entry_matches_search(entry: &AtlasEntry, needle: &str) -> bool {
 
 // ── Widget ───────────────────────────────────────────────────────────
 
-pub struct AtlasViewer {
-    live: Option<AtlasLive>,
-}
+pub struct AtlasViewer {}
 
 impl Default for AtlasViewer {
     fn default() -> Self {
-        Self { live: None }
+        Self {}
     }
 }
 
@@ -156,39 +111,52 @@ impl AtlasViewer {
     }
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(l) => l.cached_revision != dataset.revision,
+        // Query the current dataset at the point of use.  The projection is
+        // operation-local and never retained as a second mutable catalogue;
+        // a later render therefore sees additive names, tags and members
+        // without a revision gate or stale cache.
+        let (entries, names_by_id, diagnostic) =
+            match crate::atlas::named_entries(dataset.reader, dataset.facts) {
+            Ok(mut entries) => {
+                entries.sort_by(|left, right| {
+                    atlas_sort_key(left)
+                        .cmp(&atlas_sort_key(right))
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                let names_by_id = entries
+                    .iter()
+                    .map(|entry| (entry.id, entry.names.clone()))
+                    .collect();
+                (entries, names_by_id, None)
+            }
+            Err(error) => (
+                Vec::new(),
+                BTreeMap::new(),
+                Some(format!("Atlas query failed: {error:#}")),
+            ),
         };
-        if need_refresh {
-            self.live = Some(AtlasLive::refresh(dataset));
-        }
 
         ctx.section("Atlas", |ctx| {
-            let Some(live) = self.live.as_ref() else {
-                return;
-            };
-
             let mut search = ctx.search();
             let needle = search.query().to_lowercase();
             let search_active = !needle.is_empty();
             let visible: Vec<&AtlasEntry> = if search_active {
-                live.entries
+                entries
                     .iter()
                     .filter(|e| entry_matches_search(e, &needle))
                     .collect()
             } else {
-                live.entries.iter().collect()
+                entries.iter().collect()
             };
 
             ctx.grid(|g| {
-                if let Some(diagnostic) = &live.diagnostic {
+                if let Some(diagnostic) = &diagnostic {
                     g.full(|ctx| render_diagnostic(ctx.ui_mut(), diagnostic));
                     return;
                 }
                 g.full(|ctx| {
                     let ui = ctx.ui_mut();
-                    let total = live.entries.len();
+                    let total = entries.len();
                     let shown = visible.len();
                     let label = if search_active {
                         format!("{shown} / {total} NAMED ENTITIES")
@@ -207,7 +175,7 @@ impl AtlasViewer {
                     );
                 });
 
-                if live.entries.is_empty() {
+                if entries.is_empty() {
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         ui.add_space(16.0);
@@ -241,7 +209,7 @@ impl AtlasViewer {
                     g.full(|ctx| {
                         let ui = ctx.ui_mut();
                         let pre_y = ui.cursor().min.y;
-                        render_entry_card(ui, entry, &live.names_by_id, &needle, is_focused);
+                        render_entry_card(ui, entry, &names_by_id, &needle, is_focused);
                         if let Some(info) = match_info {
                             if info.should_scroll_to {
                                 let post_y = ui.cursor().min.y;
