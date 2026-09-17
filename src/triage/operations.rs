@@ -28,12 +28,19 @@ impl Triage {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self { storage }
     }
-    fn with_snapshot(&self, operation: impl FnOnce(&TriageSnapshot) -> Result<()>) -> Result<()> {
-        let snapshot = self.storage.with_pile(TriageSnapshot::load)?;
+    fn with_snapshot(
+        &self,
+        scopes: &[TriageScope],
+        include_secrets: bool,
+        operation: impl FnOnce(&TriageSnapshot) -> Result<()>,
+    ) -> Result<()> {
+        let snapshot = self.storage.with_pile(|pile, signer| {
+            TriageSnapshot::load(pile, signer, scopes, include_secrets)
+        })?;
         operation(&snapshot)
     }
     pub fn scan(&self, options: &InspectOptions, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| {
+        self.with_snapshot(&TriageScope::ALL, true, |snapshot| {
             scan(
                 snapshot,
                 self.storage.path(),
@@ -45,24 +52,40 @@ impl Triage {
         })
     }
     pub fn loops(&self, recent: usize, min_repeat: usize, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| loops(snapshot, recent, min_repeat, out))
+        self.with_snapshot(&[TriageScope::Cognition], false, |snapshot| {
+            loops(snapshot, recent, min_repeat, out)
+        })
     }
     pub fn timeline(&self, recent: usize, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| timeline(snapshot, recent, out))
+        self.with_snapshot(&[TriageScope::Cognition], false, |snapshot| {
+            timeline(snapshot, recent, out)
+        })
     }
     pub fn cover(&self, full: bool, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| cover(snapshot, full, out))
+        self.with_snapshot(
+            &[TriageScope::Headspace, TriageScope::Memory],
+            true,
+            |snapshot| cover(snapshot, full, out),
+        )
     }
     pub fn chunk(&self, id: &str, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| chunk(snapshot, id, out))
+        self.with_snapshot(&[TriageScope::Memory], false, |snapshot| {
+            chunk(snapshot, id, out)
+        })
     }
     pub fn turn(&self, turn: usize, full: bool, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| self::turn(snapshot, turn, full, out))
+        self.with_snapshot(&[TriageScope::Cognition], false, |snapshot| {
+            self::turn(snapshot, turn, full, out)
+        })
     }
     /// Raw mode is formatted reconstructed context-candidate JSON, not an
     /// original-byte export. Every candidate is retained, as in normal mode.
     pub fn context(&self, turn: usize, full: bool, raw: bool, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| context(snapshot, turn, full, raw, out))
+        self.with_snapshot(
+            &[TriageScope::Cognition, TriageScope::Headspace],
+            true,
+            |snapshot| context(snapshot, turn, full, raw, out),
+        )
     }
 }
 
@@ -108,6 +131,45 @@ use triblespace::prelude::*;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type Interval = Inline<inlineencodings::NsTAIInterval>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TriageScope {
+    Cognition,
+    Headspace,
+    Memory,
+    Relations,
+    Messages,
+}
+
+impl TriageScope {
+    const ALL: [Self; 5] = [
+        Self::Cognition,
+        Self::Headspace,
+        Self::Memory,
+        Self::Relations,
+        Self::Messages,
+    ];
+
+    const fn id(self) -> Id {
+        match self {
+            Self::Cognition => COGNITION_SCOPE_ID,
+            Self::Headspace => HEADSPACE_SCOPE_ID,
+            Self::Memory => MEMORY_SCOPE_ID,
+            Self::Relations => RELATIONS_SCOPE_ID,
+            Self::Messages => MESSAGE_SCOPE_ID,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cognition => "Cognition",
+            Self::Headspace => "Headspace",
+            Self::Memory => "Memory",
+            Self::Relations => "Relations",
+            Self::Messages => "Message",
+        }
+    }
+}
+
 /// One canonical collection value observed through the frozen pile prefix.
 struct CollectionView {
     facts: FactArchive,
@@ -127,27 +189,36 @@ impl CollectionView {
 struct TriageSnapshot {
     store_snapshot: PileSnapshot,
     collections: BTreeMap<Id, FactArchive>,
-    secrets: SecretsSnapshot<PileSnapshot>,
+    secrets: Option<SecretsSnapshot<PileSnapshot>>,
 }
 
 impl TriageSnapshot {
-    fn load(pile: &mut Pile, signer: &ed25519_dalek::SigningKey) -> Result<Self> {
+    fn load(
+        pile: &mut Pile,
+        signer: &ed25519_dalek::SigningKey,
+        scopes: &[TriageScope],
+        include_secrets: bool,
+    ) -> Result<Self> {
         // Loading is deliberately strict: a diagnostic read must never mint a
         // new identity, create a pile, or admit somebody else's COMMITs.
         let mut registered = Vec::new();
         let mut sources = Vec::new();
         let mut succinct = Vec::new();
         let mut rank9 = Vec::new();
-        for (scope, label) in [
-            (COGNITION_SCOPE_ID, "Cognition"),
-            (HEADSPACE_SCOPE_ID, "Headspace"),
-            (MEMORY_SCOPE_ID, "Memory"),
-            (RELATIONS_SCOPE_ID, "Relations"),
-            (MESSAGE_SCOPE_ID, "Message"),
-        ] {
-            let source =
-                crate::collection_names::open_configured(pile, scope, signer.verifying_key())
-                    .with_context(|| format!("register {label} collection"))?;
+        let mut selected = Vec::new();
+        for scope in scopes.iter().copied() {
+            if selected.contains(&scope) {
+                continue;
+            }
+            selected.push(scope);
+            let collection_scope = scope.id();
+            let label = scope.label();
+            let source = crate::collection_names::open_configured(
+                pile,
+                collection_scope,
+                signer.verifying_key(),
+            )
+            .with_context(|| format!("register {label} collection"))?;
             let descriptor_snapshot = pile.snapshot()?;
             let policy = source.policy(&descriptor_snapshot)?;
             drop(descriptor_snapshot);
@@ -157,14 +228,16 @@ impl TriageSnapshot {
             let rank9_collection = pile
                 .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct_collection, (), policy)
                 .with_context(|| format!("register Rank9 {label} collection"))?;
-            registered.push((scope, label));
+            registered.push((collection_scope, label));
             sources.push(source);
             succinct.push(succinct_collection);
             rank9.push(rank9_collection);
         }
 
-        let secrets_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
-        let secrets = pollster::block_on(async {
+        let secrets_collection = include_secrets
+            .then(|| open_secrets_collection_read(pile, signer.verifying_key()))
+            .transpose()?;
+        let (store_snapshot, secrets) = pollster::block_on(async {
             for ((_, label), source) in registered.iter().zip(&sources) {
                 drop(
                     pile.ensure(*source, signer)
@@ -172,19 +245,26 @@ impl TriageSnapshot {
                         .with_context(|| format!("ensure {label} source collection"))?,
                 );
             }
-            drop(
-                pile.ensure(secrets_collection.source(), signer)
-                    .await
-                    .context("ensure Secrets source collection")?,
-            );
-            let before = pile
-                .snapshot()
-                .context("freeze shared Triage support snapshot")?;
-            let secrets_support = secrets_collection
-                .source()
-                .admitted(&before)
-                .context("admit Secrets collection support")?;
-            drop(before);
+            if let Some(secrets_collection) = secrets_collection {
+                drop(
+                    pile.ensure(secrets_collection.source(), signer)
+                        .await
+                        .context("ensure Secrets source collection")?,
+                );
+            }
+            let secrets_support = if let Some(secrets_collection) = secrets_collection {
+                let before = pile
+                    .snapshot()
+                    .context("freeze shared Triage support snapshot")?;
+                let support = secrets_collection
+                    .source()
+                    .admitted(&before)
+                    .context("admit Secrets collection support")?;
+                drop(before);
+                Some((secrets_collection, support))
+            } else {
+                None
+            };
 
             for (index, (_, label)) in registered.iter().enumerate() {
                 drop(
@@ -198,20 +278,27 @@ impl TriageSnapshot {
                         .with_context(|| format!("maintain {label} fact archive"))?,
                 );
             }
-            let store_snapshot = secrets_collection
-                .ensure_exact(pile, signer, &secrets_support)
-                .await
-                .context("ensure configured Secrets collection")?;
-            let secrets =
-                secret_storage::snapshot_exact(store_snapshot, secrets_collection, secrets_support)
-                    .context("attach exact Secrets collection")?;
-            Ok::<_, anyhow::Error>(secrets)
+            if let Some((secrets_collection, secrets_support)) = secrets_support {
+                let store_snapshot = secrets_collection
+                    .ensure_exact(pile, signer, &secrets_support)
+                    .await
+                    .context("ensure configured Secrets collection")?;
+                let secrets = secret_storage::snapshot_exact(
+                    store_snapshot,
+                    secrets_collection,
+                    secrets_support,
+                )
+                .context("attach exact Secrets collection")?;
+                Ok::<_, anyhow::Error>((secrets.store_snapshot().clone(), Some(secrets)))
+            } else {
+                let store_snapshot = pile.snapshot().context("freeze Triage snapshot")?;
+                Ok::<_, anyhow::Error>((store_snapshot, None))
+            }
         })?;
 
-        // Secrets attachment already owns the one later immutable snapshot.
-        // Reuse it so facts, attachments, and credentials inhabit literally
-        // the same known-prefix observation.
-        let store_snapshot = secrets.store_snapshot().clone();
+        // All selected fact archives attach to this one final immutable
+        // observation. Secrets owns the same snapshot when requested; readers
+        // which do not need credentials avoid opening or maintaining Secrets.
         let mut collections = BTreeMap::new();
         for ((scope, label), collection) in registered.iter().zip(&rank9) {
             let archive = store_snapshot
@@ -232,7 +319,7 @@ impl TriageSnapshot {
     #[cfg(test)]
     fn open(pile_path: &Path, key: Option<&Path>) -> Result<Self> {
         crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned))
-            .with_pile(Self::load)
+            .with_pile(|pile, signer| Self::load(pile, signer, &TriageScope::ALL, true))
     }
 
     fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {
@@ -252,14 +339,16 @@ impl TriageSnapshot {
     }
 
     fn headspace(&self) -> Result<(CollectionView, TriageHeadspace)> {
-        let secrets = self.secrets();
+        let secrets = self.secrets()?;
         let view = self.view(HEADSPACE_SCOPE_ID, "Headspace")?;
         let projected = triage_model::project_headspace(view.source(), secrets)?;
         Ok((view, projected))
     }
 
-    fn secrets(&self) -> &SecretsSnapshot<PileSnapshot> {
-        &self.secrets
+    fn secrets(&self) -> Result<&SecretsSnapshot<PileSnapshot>> {
+        self.secrets
+            .as_ref()
+            .context("Secrets collection was not requested for this Triage operation")
     }
 
     fn memory(&self) -> Result<CollectionView> {
@@ -399,7 +488,7 @@ fn scan(
 ) -> Result<()> {
     let cognition = snapshot.cognition()?;
     let headspace_view = snapshot.view(HEADSPACE_SCOPE_ID, "Headspace")?;
-    let secrets = snapshot.secrets();
+    let secrets = snapshot.secrets()?;
     let relations = snapshot.relations()?;
     let messages = snapshot.messages()?;
     let now = now_key()?;
@@ -1430,7 +1519,7 @@ mod tests {
         snapshot.cognition().unwrap();
         assert_eq!(
             snapshot.store_snapshot.instant(),
-            snapshot.secrets.instant()
+            snapshot.secrets.as_ref().unwrap().instant()
         );
         drop(snapshot);
         let maintained = std::fs::metadata(&fixture.pile).unwrap().len();
