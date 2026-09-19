@@ -372,7 +372,15 @@ struct LoadedContext {
 
 struct LoadedComb {
     memory: LoadedMemory,
-    comb: CollectionView,
+    comb: CombView,
+}
+
+/// The Comb read straight from its source collection: a few hundred cursor
+/// commits, unioned. No derived image stands between a cursor commit and
+/// the next call that asks for it, so nothing here waits on maintenance
+/// authority the signer may not hold.
+struct CombView {
+    facts: TribleSet,
 }
 
 struct LoadedProvenance {
@@ -575,50 +583,44 @@ impl MemoryStorage<'_> {
                     .context("register Rank9 Memory collection")?;
                 let comb_source =
                     open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-                let comb_policy = comb_source
-                    .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
-                    .context("read Comb collection policy")?;
-                let comb_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
-                    .context("register Succinct Comb collection")?;
-                let comb_collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
-                    .context("register Rank9 Comb collection")?;
-                let admission = pile
-                    .snapshot()
-                    .context("freeze Memory/Comb WRITE admission")?;
+                let admission = pile.snapshot().context("freeze Memory WRITE admission")?;
                 let subject = signer.verifying_key();
-                for (succinct, rank9, label) in [
-                    (memory_succinct, memory_collection, "Memory"),
-                    (comb_succinct, comb_collection, "Comb"),
-                ] {
-                    if succinct
-                        .writer_is_admitted(&admission, subject)
-                        .with_context(|| format!("check Succinct {label} WRITE admission"))?
-                    {
-                        drop(
-                            pile.maintain(succinct, signer)
-                                .await
-                                .with_context(|| format!("maintain Succinct {label} collection"))?,
-                        );
-                    }
-                    if rank9
-                        .writer_is_admitted(&admission, subject)
-                        .with_context(|| format!("check Rank9 {label} WRITE admission"))?
-                    {
-                        drop(
-                            pile.maintain(rank9, signer)
-                                .await
-                                .with_context(|| format!("maintain Rank9 {label} collection"))?,
-                        );
-                    }
+                if memory_succinct
+                    .writer_is_admitted(&admission, subject)
+                    .context("check Succinct Memory WRITE admission")?
+                {
+                    drop(
+                        pile.maintain(memory_succinct, signer)
+                            .await
+                            .context("maintain Succinct Memory collection")?,
+                    );
+                }
+                if memory_collection
+                    .writer_is_admitted(&admission, subject)
+                    .context("check Rank9 Memory WRITE admission")?
+                {
+                    drop(
+                        pile.maintain(memory_collection, signer)
+                            .await
+                            .context("maintain Rank9 Memory collection")?,
+                    );
                 }
                 let store_snapshot = pile
                     .snapshot()
-                    .context("freeze maintained Memory/Comb snapshot")?;
+                    .context("freeze maintained Memory and Comb snapshot")?;
                 let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-                let comb = Self::attach_collection(comb_collection, &store_snapshot, "Comb")?;
-                Ok(LoadedComb { memory, comb })
+                // The Comb is read from its source: a cursor committed a
+                // moment ago is in this snapshot, whoever may maintain the
+                // derived images.
+                let facts = store_snapshot
+                    .collection(comb_source)
+                    .context("observe Comb source collection")?
+                    .view::<TribleSet>()
+                    .context("read Comb source collection")?;
+                Ok(LoadedComb {
+                    memory,
+                    comb: CombView { facts },
+                })
             });
             result
         })
@@ -3110,9 +3112,13 @@ mod tests {
                 warm
             );
         }
+        assert_eq!(
+            find!(id: Id, pattern!(&comb.comb.facts, [{ ?id @ metadata::tag: &marker }]))
+                .collect::<Vec<_>>(),
+            vec![*marker],
+        );
         for facts in [
             &context.embeddings.as_ref().unwrap().facts,
-            &comb.comb.facts,
             &provenance.cognition.facts,
             &provenance.archive.facts,
         ] {
