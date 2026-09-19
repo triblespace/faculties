@@ -256,7 +256,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
-#[cfg(test)]
 use triblespace::core::collection::observed_store::{DependencyTracker, ObservedStore};
 use triblespace::core::collection::Support;
 use triblespace::core::collection::{
