@@ -656,15 +656,15 @@ mod tests {
         pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
             &signer,
             old,
-            (source.data(), source.fingerprint()),
-            (source.data(), source.fingerprint()),
+            source.data(),
+            source.data(),
             source.data(),
         )))
         .unwrap();
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             old,
-            (source.data(), source.fingerprint()),
+            source.data(),
             missing_data(5),
         )))
         .unwrap();

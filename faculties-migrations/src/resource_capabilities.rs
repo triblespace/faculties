@@ -223,10 +223,13 @@ fn prepare(
                     let commit =
                         CollectionCommit::sign(signer, new, commit.data(), commit.metadata());
                     let record = CollectionRecord::Commit(commit);
-                    if snapshot
-                        .record(record.fingerprint())
+                    if !snapshot
+                        .select_records(&BTreeSet::from([CollectionRecordSelector::CommitMember(
+                            new,
+                            commit.data(),
+                        )]))
                         .context("look up exact successor COMMIT")?
-                        != Some(record)
+                        .contains(&record)
                         && missing.insert(commit)
                     {
                         root.missing_commits += 1;
@@ -510,15 +513,15 @@ mod tests {
         pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
             &signer,
             old,
-            (source.data(), source.fingerprint()),
-            (source.data(), source.fingerprint()),
+            source.data(),
+            source.data(),
             source.data(),
         )))
         .unwrap();
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             old,
-            (source.data(), source.fingerprint()),
+            source.data(),
             Inline::new([5; 32]),
         )))
         .unwrap();
@@ -539,12 +542,13 @@ mod tests {
         assert!(after.starts_with(&before));
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert_eq!(
-            snapshot
-                .record(CollectionRecord::Commit(source).fingerprint())
-                .unwrap(),
-            Some(CollectionRecord::Commit(source))
-        );
+        assert!(snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::CommitMember(
+                old,
+                source.data(),
+            )]))
+            .unwrap()
+            .contains(&CollectionRecord::Commit(source)));
         let target = snapshot
             .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
                 root.new,
@@ -568,6 +572,70 @@ mod tests {
         let replay = publish_path(&path, Some(&key), None, false).unwrap();
         assert_eq!(replay.appended_commits, 0);
         assert_eq!(fs::read(&path).unwrap(), after);
+    }
+
+    #[test]
+    fn same_payload_with_other_attestations_still_needs_exact_successor_commit() {
+        let (_directory, path, key, signer) = fixture();
+        let old = old_handle("wiki", signer.verifying_key());
+        let source = sparse_commit(&signer, old, 0x51);
+        let mut pile = open_pile_strict(&path).unwrap();
+        pile.insert(CollectionRecord::Commit(source)).unwrap();
+        let new = successor(
+            &mut pile,
+            faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        let other_author = CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[0x61; 32]),
+            new,
+            source.data(),
+            source.metadata(),
+        ));
+        let other_metadata = CollectionRecord::Commit(CollectionCommit::sign(
+            &signer,
+            new,
+            source.data(),
+            Inline::new([0x62; 32]),
+        ));
+        pile.insert(other_author).unwrap();
+        pile.insert(other_metadata).unwrap();
+        pile.close().unwrap();
+
+        let plan = plan_path(&path, Some(&key), None, false).unwrap();
+        assert_eq!(plan.missing_commits(), 1);
+        let root = plan.roots.iter().find(|root| root.name == "wiki").unwrap();
+        assert_eq!(root.target_commits, 2);
+        let first = publish_path(&path, Some(&key), None, false).unwrap();
+        assert_eq!(first.appended_commits, 1);
+        assert!(first.plan.settled());
+
+        let expected = CollectionRecord::Commit(CollectionCommit::sign(
+            &signer,
+            new,
+            source.data(),
+            source.metadata(),
+        ));
+        let mut pile = open_pile_strict(&path).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let records = snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::CommitMember(
+                new,
+                source.data(),
+            )]))
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        for record in [other_author, other_metadata, expected] {
+            assert!(records.contains(&record));
+        }
+        drop(snapshot);
+        pile.close().unwrap();
+
+        let before = fs::read(&path).unwrap();
+        let replay = publish_path(&path, Some(&key), None, false).unwrap();
+        assert_eq!(replay.appended_commits, 0);
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 
     #[test]
@@ -603,10 +671,13 @@ mod tests {
         ));
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert_eq!(
-            snapshot.record(expected.fingerprint()).unwrap(),
-            Some(expected)
-        );
+        assert!(snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::CommitMember(
+                target,
+                source.data(),
+            )]))
+            .unwrap()
+            .contains(&expected));
         assert_eq!(
             snapshot.get::<TribleSet, SimpleArchive>(data).unwrap(),
             *facts.facts()
@@ -669,10 +740,13 @@ mod tests {
                 source.data(),
                 source.metadata(),
             ));
-            assert_eq!(
-                snapshot.record(expected.fingerprint()).unwrap(),
-                Some(expected)
-            );
+            assert!(snapshot
+                .select_records(&BTreeSet::from([CollectionRecordSelector::CommitMember(
+                    target,
+                    source.data(),
+                )]))
+                .unwrap()
+                .contains(&expected));
         }
         assert_eq!(snapshot.proofs().unwrap().count(), 0);
         drop(snapshot);
@@ -832,10 +906,12 @@ mod tests {
         );
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert_eq!(
-            snapshot.record(original.fingerprint()).unwrap(),
-            Some(original)
-        );
+        assert!(snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                unrelated,
+            )]))
+            .unwrap()
+            .contains(&original));
         drop(snapshot);
         pile.close().unwrap();
     }
