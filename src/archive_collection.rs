@@ -789,12 +789,13 @@ mod tests {
         )
         .collect()
     }
+    use crate::storage::discovered_records;
     use crate::storage::initialize_signer;
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use tempfile::TempDir;
     use triblespace::core::blob::IntoBlob;
-    use triblespace::core::collection::{discover_collection_records, simplearchive_union};
+    use triblespace::core::collection::simplearchive_union;
 
     fn projection(locator: &str, text: &str) -> Fragment {
         let fact = blockdag::text_fact(
@@ -1395,7 +1396,7 @@ mod tests {
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let records = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         let derives: Vec<_> = records
             .derives()
@@ -1560,7 +1561,7 @@ mod tests {
             .unwrap();
         let records = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         let derive = records
             .derives()
@@ -1613,7 +1614,7 @@ mod tests {
         let target = test_target(&mut pile, source, &pile_path, &key);
         let records = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         let derives: Vec<_> = records
             .derives()
@@ -1820,7 +1821,7 @@ mod tests {
         CollectionStore::insert(&mut pile, CollectionRecord::Derive(derive)).unwrap();
         let bm25_records = |pile: &mut Pile| {
             let store_snapshot = pile.snapshot().unwrap();
-            let records = discover_collection_records(&store_snapshot).unwrap();
+            let records = discovered_records(&store_snapshot).unwrap();
             (
                 records
                     .derives()
@@ -1894,7 +1895,7 @@ mod tests {
         drop(first);
         let first_records = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         let first_derives = first_records
             .derives()
@@ -1920,7 +1921,7 @@ mod tests {
         assert_eq!(full.cover().len(), 1);
         let full_records = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         let full_derives = full_records
             .derives()
@@ -1933,7 +1934,7 @@ mod tests {
         );
         let records_before = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         let counts_before = (
             records_before.derives().len(),
@@ -1949,7 +1950,7 @@ mod tests {
         drop(retry);
         let records_after = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         assert_eq!(
             (records_after.derives().len(), records_after.merges().len()),
@@ -2011,7 +2012,7 @@ mod tests {
         drop(ready);
         let records = {
             let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
+            discovered_records(&store_snapshot).unwrap()
         };
         assert_eq!(
             records

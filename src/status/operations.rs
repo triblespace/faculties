@@ -557,8 +557,7 @@ mod tests {
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let store_snapshot = pile.snapshot()?;
                 assert!(collection.admitted(&store_snapshot)?.is_empty());
-                let discovered =
-                    triblespace::core::collection::discover_collection_records(&store_snapshot)?;
+                let discovered = crate::storage::discovered_records(&store_snapshot)?;
                 let resident = discovered
                     .commits()
                     .iter()

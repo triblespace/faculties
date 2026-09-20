@@ -1060,8 +1060,7 @@ fn foreign_scan_commits_are_stored_but_inert_without_write_admission() {
 
     let mut pile = open_pile_strict(&store.pile).unwrap();
     let store_snapshot = pile.snapshot().unwrap();
-    let records =
-        triblespace::core::collection::discover_collection_records(&store_snapshot).unwrap();
+    let records = crate::storage::discovered_records(&store_snapshot).unwrap();
     let stored = records
         .commits()
         .iter()

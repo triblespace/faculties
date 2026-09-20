@@ -1233,6 +1233,54 @@ mod tests {
     }
 }
 
+/// The records of one snapshot by kind, for tests that count what a write
+/// published. Tests may walk records; nothing on a read or maintenance path
+/// does.
+#[cfg(test)]
+pub(crate) struct DiscoveredRecords {
+    commits: Vec<triblespace::core::collection::CollectionCommit>,
+    merges: Vec<triblespace::core::collection::CollectionMerge>,
+    derives: Vec<triblespace::core::collection::CollectionDerive>,
+}
+
+#[cfg(test)]
+impl DiscoveredRecords {
+    pub(crate) fn commits(&self) -> &[triblespace::core::collection::CollectionCommit] {
+        &self.commits
+    }
+
+    pub(crate) fn merges(&self) -> &[triblespace::core::collection::CollectionMerge] {
+        &self.merges
+    }
+
+    pub(crate) fn derives(&self) -> &[triblespace::core::collection::CollectionDerive] {
+        &self.derives
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn discovered_records<S: triblespace::core::collection::CollectionRead>(
+    snapshot: &S,
+) -> anyhow::Result<DiscoveredRecords> {
+    use triblespace::core::collection::CollectionRecord;
+    let mut discovered = DiscoveredRecords {
+        commits: Vec::new(),
+        merges: Vec::new(),
+        derives: Vec::new(),
+    };
+    for record in snapshot
+        .records()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+    {
+        match record.map_err(|error| anyhow::anyhow!("{error}"))? {
+            CollectionRecord::Commit(commit) => discovered.commits.push(commit),
+            CollectionRecord::Merge(merge) => discovered.merges.push(merge),
+            CollectionRecord::Derive(derive) => discovered.derives.push(derive),
+        }
+    }
+    Ok(discovered)
+}
+
 /// What the maintenance worker does between a write and a read, for tests:
 /// carry the source's commits through its Succinct and Rank9 chain. Reads
 /// attach what was carried and never maintain, so a test that writes and

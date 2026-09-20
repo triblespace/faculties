@@ -559,7 +559,7 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
 mod tests {
     use std::fs::File;
 
-    use triblespace::core::collection::discover_collection_records;
+    use crate::storage::discovered_records;
     use triblespace::prelude::SnapshotSource;
 
     use super::*;
@@ -743,7 +743,7 @@ mod tests {
 
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let records = discover_collection_records(&store_snapshot).unwrap();
+        let records = discovered_records(&store_snapshot).unwrap();
         assert_eq!(records.commits().len(), 2);
         pile.close().unwrap();
     }

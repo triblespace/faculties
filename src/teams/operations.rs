@@ -3862,8 +3862,7 @@ mod tests {
         // rejected publication must not make any collection commit visible.
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
-        let records =
-            triblespace::core::collection::discover_collection_records(&store_snapshot).unwrap();
+        let records = crate::storage::discovered_records(&store_snapshot).unwrap();
         assert!(records.commits().is_empty());
     }
 
