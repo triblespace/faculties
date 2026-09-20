@@ -355,7 +355,9 @@ impl HealthObservation {
     }
 
     pub(super) fn news(&self, _persona: Id, report: &HealthReport) -> News {
-        let pending = report.attention.pending(self.presentations.view());
+        let pending = report
+            .attention
+            .pending_health(self.facts.view(), self.presentations.view());
         if pending.is_empty() {
             return News::Quiet;
         }
@@ -414,7 +416,14 @@ fn state_name(component: Id, state: Id) -> &'static str {
     }
 }
 
-fn attention_state_name(component: Id, state: Id) -> &'static str {
+fn attention_state_name(component: Id, state: Id, recovered: bool) -> &'static str {
+    if recovered {
+        return if component == schema::COLLECTION {
+            "recovered; converged at observed pairwise roots"
+        } else {
+            "recovered; current"
+        };
+    }
     match state {
         schema::UNKNOWN if component == schema::COLLECTION => {
             "pairwise-root comparison unavailable beyond progress grace"
@@ -423,6 +432,124 @@ fn attention_state_name(component: Id, state: Id) -> &'static str {
             "pairwise roots remain divergent without observed progress beyond grace"
         }
         _ => state_name(component, state),
+    }
+}
+
+/// Has this observer already seen this qualitative health episode?
+///
+/// The receipt names the exact condition entity that was delivered, while the
+/// health producer may replace that entity to publish fresh counters. Join the
+/// two collections on the stable episode fields and deliberately leave those
+/// counters out. This is why receipts are a queryable Rank9 projection rather
+/// than an entity-id membership set.
+fn health_episode_presented(facts: &FactArchive, presented: &FactArchive, event: Id) -> bool {
+    if event_presented(presented, event) {
+        return true;
+    }
+
+    for (node, session, state, started_at) in find!(
+        (node: Id, session: Id, state: Id, started_at: IntervalValue),
+        pattern!(facts, [{ event @
+            metadata::tag: &schema::KIND_CONDITION,
+            attrs::node: ?node,
+            attrs::session: ?session,
+            attrs::state: ?state,
+            metadata::started_at: ?started_at,
+        }])
+    ) {
+        for component in [schema::HOST, schema::STORE, schema::COLLECTION, schema::DHT] {
+            if !exists!(pattern!(facts, [{ event @ metadata::tag: &component }])) {
+                continue;
+            }
+            for lifecycle in [schema::KIND_ALERT, schema::KIND_RECOVERED] {
+                if !exists!(pattern!(facts, [{ event @ metadata::tag: &lifecycle }])) {
+                    continue;
+                }
+                if component != schema::COLLECTION {
+                    if exists!((prior: Id), and!(
+                        pattern!(facts, [{ ?prior @
+                            metadata::tag: &schema::KIND_CONDITION,
+                            metadata::tag: &component,
+                            metadata::tag: &lifecycle,
+                            attrs::node: &node,
+                            attrs::session: &session,
+                            attrs::state: &state,
+                            metadata::started_at: &started_at,
+                        }]),
+                        pattern!(presented, [{ _?receipt @ presentation::event: ?prior }]),
+                    )) {
+                        return true;
+                    }
+                    continue;
+                }
+
+                for collection in find!(
+                    collection: Inline<inlineencodings::Handle<SimpleArchive>>,
+                    pattern!(facts, [{ event @ attrs::collection: ?collection }])
+                ) {
+                    let peers: Vec<_> = find!(
+                        peer: ed25519_dalek::VerifyingKey,
+                        pattern!(facts, [{ event @ attrs::peer: ?peer }])
+                    )
+                    .collect();
+                    if peers.is_empty() {
+                        for prior in find!(
+                            prior: Id,
+                            and!(
+                                pattern!(facts, [{ ?prior @
+                                    metadata::tag: &schema::KIND_CONDITION,
+                                    metadata::tag: &component,
+                                    metadata::tag: &lifecycle,
+                                    attrs::node: &node,
+                                    attrs::session: &session,
+                                    attrs::state: &state,
+                                    attrs::collection: &collection,
+                                    metadata::started_at: &started_at,
+                                }]),
+                                pattern!(presented, [{ _?receipt @ presentation::event: ?prior }]),
+                            )
+                        ) {
+                            if !exists!(pattern!(facts, [{ prior @ attrs::peer: _?peer }])) {
+                                return true;
+                            }
+                        }
+                    } else {
+                        for peer in peers {
+                            if exists!((prior: Id), and!(
+                                pattern!(facts, [{ ?prior @
+                                    metadata::tag: &schema::KIND_CONDITION,
+                                    metadata::tag: &component,
+                                    metadata::tag: &lifecycle,
+                                    attrs::node: &node,
+                                    attrs::session: &session,
+                                    attrs::state: &state,
+                                    attrs::collection: &collection,
+                                    attrs::peer: peer,
+                                    metadata::started_at: &started_at,
+                                }]),
+                                pattern!(presented, [{ _?receipt @ presentation::event: ?prior }]),
+                            )) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+impl AttentionView {
+    fn pending_health(&self, facts: &FactArchive, presented: &FactArchive) -> Self {
+        Self {
+            events: self
+                .events
+                .iter()
+                .filter(|(event, _)| !health_episode_presented(facts, presented, **event))
+                .map(|(event, detail)| (*event, detail.clone()))
+                .collect(),
+        }
     }
 }
 
@@ -533,22 +660,28 @@ fn render_health(
             let scope = format!("{collection_scope}{peer_scope}");
             let detail = format!("{component_name}{scope}: {}", state_name(component, state));
             conditions.insert(detail.clone());
-            // Recovery is retained in the append-only health report, but it is
-            // normal daemon exhaust: only an active alert asks the agent to act.
-            if fresh
-                && exists!(pattern!(facts, [{ condition @ metadata::tag: &schema::KIND_ALERT }]))
-            {
+            let alert = exists!(pattern!(facts, [{
+                condition @ metadata::tag: &schema::KIND_ALERT
+            }]));
+            let recovered = exists!(pattern!(facts, [{
+                condition @ metadata::tag: &schema::KIND_RECOVERED
+            }]));
+            if fresh && (alert || recovered) {
                 attention.insert(AttentionEvent::Health {
                     event: condition,
                     detail: format!(
                         "observer [{observer}] {component_name}{scope}: {}",
-                        attention_state_name(component, state)
+                        attention_state_name(component, state, recovered)
                     ),
                     collection_group: if component == schema::COLLECTION && collections.len() == 1 {
-                        let issue = match state {
-                            schema::UNKNOWN => Some(CollectionSyncIssue::ComparisonUnavailable),
-                            schema::STALLED => Some(CollectionSyncIssue::DivergenceStalled),
-                            _ => None,
+                        let issue = if recovered {
+                            Some(CollectionSyncIssue::Recovered)
+                        } else {
+                            match state {
+                                schema::UNKNOWN => Some(CollectionSyncIssue::ComparisonUnavailable),
+                                schema::STALLED => Some(CollectionSyncIssue::DivergenceStalled),
+                                _ => None,
+                            }
                         };
                         issue.map(|issue| CollectionSyncGroup {
                             observer: observer.to_owned(),
@@ -588,7 +721,7 @@ fn render_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schema::{Component, Condition, Recorder, State};
+    use schema::{Component, Condition, Evidence, Measurement, Recorder, State};
     use triblespace::core::blob::Blob;
     use triblespace::core::collection::{
         records::empty_metadata_handle, CollectionCommit, CollectionRecord, CollectionStore,
@@ -1468,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_is_stable_attention_and_recovery_is_quiet() {
+    fn failure_and_recovery_are_each_reported_once() {
         let mut f = Fixture::new();
         let persona = *fucid();
         let mut recorder = Recorder::new(f.signer.verifying_key());
@@ -1497,15 +1630,15 @@ mod tests {
                 .record(at(20.0), [condition(State::Current, false)])
                 .unwrap(),
         );
-        let recovered = f.observe_at(at(21.0)).report();
-        assert!(recovered.attention.is_empty());
-        assert!(recovered
-            .text
-            .contains("converged at observed pairwise roots"));
-        assert!(matches!(
-            f.observe_at(at(21.0)).news(persona, &recovered),
-            News::Quiet
-        ));
+        let recovered = f.observe_at(at(21.0));
+        let recovered_report = recovered.report();
+        assert_eq!(recovered_report.attention.ids().len(), 1);
+        let recovery_ids: Vec<_> = recovered_report.attention.ids().collect();
+        let recovery_news = recovered.news(persona, &recovered_report);
+        assert!(
+            matches!(&recovery_news, News::Report { text, .. } if text.contains("recovered; converged"))
+        );
+        save_presentations(&mut f.store, &f.signer, recovery_ids).unwrap();
         f.publish(
             recorder
                 .record(at(30.0), [condition(State::Current, false)])
@@ -1524,6 +1657,92 @@ mod tests {
                 .unwrap(),
         );
         assert!(f.observe_at(at(41.0)).report().attention.is_empty());
+    }
+
+    #[test]
+    fn counter_changes_do_not_repeat_an_episode_and_a_later_failure_is_new() {
+        let mut f = Fixture::new();
+        let persona = *fucid();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        let measurement = |state, alert, resident_blobs| Measurement {
+            condition: Condition {
+                component: Component::Store,
+                collection: None,
+                peer: None,
+                state,
+                alert,
+            },
+            evidence: Evidence {
+                resident_blobs: Some(resident_blobs),
+                ..Evidence::default()
+            },
+        };
+
+        f.publish(
+            recorder
+                .record_measurements(at(0.0), [measurement(State::Stalled, true, 17)])
+                .unwrap(),
+        );
+        let first = f.observe_at(at(1.0));
+        let first_report = first.report();
+        let first_ids: Vec<_> = first_report.attention.ids().collect();
+        assert_eq!(first_ids.len(), 1);
+        save_presentations(&mut f.store, &f.signer, first_ids.clone()).unwrap();
+
+        f.publish(
+            recorder
+                .record_measurements(at(10.0), [measurement(State::Stalled, true, 18)])
+                .unwrap(),
+        );
+        let changed = f.observe_at(at(11.0));
+        let changed_report = changed.report();
+        let changed_ids: Vec<_> = changed_report.attention.ids().collect();
+        assert_eq!(changed_ids.len(), 1);
+        assert_ne!(
+            changed_ids, first_ids,
+            "fresh counters replace the condition entity"
+        );
+        assert!(matches!(
+            changed.news(persona, &changed_report),
+            News::Quiet
+        ));
+
+        f.publish(
+            recorder
+                .record_measurements(at(20.0), [measurement(State::Current, false, 19)])
+                .unwrap(),
+        );
+        let recovered = f.observe_at(at(21.0));
+        let recovered_report = recovered.report();
+        let recovered_ids: Vec<_> = recovered_report.attention.ids().collect();
+        assert_eq!(recovered_ids.len(), 1);
+        assert!(matches!(
+            recovered.news(persona, &recovered_report),
+            News::Report { .. }
+        ));
+        save_presentations(&mut f.store, &f.signer, recovered_ids).unwrap();
+
+        f.publish(
+            recorder
+                .record_measurements(at(30.0), [measurement(State::Current, false, 20)])
+                .unwrap(),
+        );
+        let changed_recovery = f.observe_at(at(31.0));
+        assert!(matches!(
+            changed_recovery.news(persona, &changed_recovery.report()),
+            News::Quiet
+        ));
+
+        f.publish(
+            recorder
+                .record_measurements(at(40.0), [measurement(State::Stalled, true, 21)])
+                .unwrap(),
+        );
+        let next_failure = f.observe_at(at(41.0));
+        assert!(matches!(
+            next_failure.news(persona, &next_failure.report()),
+            News::Report { .. }
+        ));
     }
 
     #[test]

@@ -250,7 +250,6 @@ use hifitime::Epoch;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use triblespace::core::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -728,16 +727,16 @@ impl ReceiptSource {
         Ok(ReceiptObservation { collection, view })
     }
 
-    /// Carry this run's own receipts into the membership set. A run that is
+    /// Carry this run's own receipts into the queryable projection. A run that is
     /// about to report does this before observing, so a re-armed run does not
     /// report an event it already reported. The background maintainer derives
-    /// the same set; this call only closes the window between the commit and
-    /// that maintainer's next pass. A signer without WRITE attaches the set as
-    /// it stands.
+    /// the same projection; this call only closes the window between the commit
+    /// and that maintainer's next pass. A signer without WRITE attaches the
+    /// projection as it stands.
     async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         let snapshot = pile
             .snapshot()
-            .context("freeze Orient receipt membership authority")?;
+            .context("freeze Orient receipt projection authority")?;
         let subject = signer.verifying_key();
         let admitted = self
             .succinct
@@ -767,7 +766,7 @@ impl ReceiptSource {
     }
 }
 
-/// Refresh the receipt membership set before the observation that decides what
+/// Refresh the receipt projection before the observation that decides what
 /// to report. Best effort by construction: the projection makes the read exact,
 /// it is not a precondition of it, so a failure is reported and the run goes on
 /// — see `observe_snapshot`, where projection lag may repeat an event and never
@@ -2684,6 +2683,7 @@ fn insert_note_goal(notes: &mut BTreeMap<Id, Id>, note_id: Id, goal_id: Id) {
 enum CollectionSyncIssue {
     ComparisonUnavailable,
     DivergenceStalled,
+    Recovered,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2701,6 +2701,9 @@ impl CollectionSyncGroup {
             }
             CollectionSyncIssue::DivergenceStalled => {
                 "collections remain divergent without observed progress beyond grace"
+            }
+            CollectionSyncIssue::Recovered => {
+                "collections recovered and converged at observed pairwise roots"
             }
         };
         format!(
@@ -4840,11 +4843,10 @@ mod tests {
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use triblespace::core::blob::encodings::entity_id_set;
     use triblespace::core::blob::encodings::succinctarchive::{
         OrderedUniverse, SuccinctArchive, UnionArchive,
     };
-    use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+    use triblespace::core::blob::{Blob, IntoBlob};
     use triblespace::core::collection::{
         records::empty_metadata_handle, CollectionCommit, CollectionRecord, CollectionStore,
     };
