@@ -12,7 +12,7 @@ use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use faculties::spec::CliRequest;
-use faculties::storage::{carry_scope, initialize_signer, publish_fragment};
+use faculties::storage::{initialize_signer, publish_fragment};
 use triblespace::core::metadata;
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::*;
@@ -40,8 +40,6 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, AtlasEntry) {
     };
     fragment += entity! { &member @ metadata::tag: &id };
     publish_fragment(&pile, Some(&key), DEFAULT_SCOPE_ID, fragment).unwrap();
-    // Reads see what the worker carried; the test is the worker here.
-    carry_scope(&pile, Some(&key), DEFAULT_SCOPE_ID).unwrap();
     let expected = AtlasEntry {
         id: id.id,
         names: vec!["Alpha".into(), "Beta".into()],
@@ -90,7 +88,6 @@ fn direct_store_reads_owned_variants_and_refreshes_between_operations() {
     let name = addition.put::<UTF8String, _>("Gamma".to_owned());
     addition += entity! { ExclusiveId::force_ref(&expected.id) @ metadata::name: name };
     publish_fragment(&pile, Some(&key), DEFAULT_SCOPE_ID, addition).unwrap();
-    carry_scope(&pile, Some(&key), DEFAULT_SCOPE_ID).unwrap();
     let mut after = expected.clone();
     after.names.push("Gamma".into());
     assert_eq!(store.show(&format!("{:x}", expected.id)).unwrap(), after);

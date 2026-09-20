@@ -477,13 +477,6 @@ mod tests {
         habits::publish(&pile, Some(&key), successor).unwrap();
 
         let storage = Storage::new(pile.clone(), Some(key.clone()));
-        storage
-            .with_pile(|pile, signer| {
-                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                crate::storage::carry_facts(pile, source, signer);
-                Ok(())
-            })
-            .unwrap();
         let (definitions, superseded) = with_habits(&storage, |session| {
             Ok((
                 habits::definitions(&session.reader, &session.facts)?,

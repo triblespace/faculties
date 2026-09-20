@@ -9,9 +9,7 @@ use faculties::decide::{
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
 use faculties::schemas::decide::DEFAULT_SCOPE_ID;
-use faculties::storage::{
-    carry_scope, initialize_signer, load_signer, open_pile_strict, publish_fragment,
-};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict, publish_fragment};
 use hifitime::Epoch;
 use std::fs;
 use std::path::PathBuf;
@@ -48,10 +46,6 @@ impl Fixture {
         let count = source.admitted(&pile.snapshot().unwrap()).unwrap().len();
         pile.close().unwrap();
         count
-    }
-    /// Reads see what the worker carried; the test is the worker here.
-    fn carry(&self) {
-        carry_scope(&self.pile, Some(&self.key), DEFAULT_SCOPE_ID).unwrap();
     }
     fn cli(&self, args: &[&str]) -> cli::Cli {
         cli::Cli::try_parse_from(
@@ -95,7 +89,6 @@ fn direct_receipts_preserve_evidence_gates_result_and_closed_state() {
         .propose("@-", Some("@/literal-context"), None)
         .unwrap();
     let id = format!("{:x}", proposed.decision);
-    fixture.carry();
     assert!(decide
         .resolve(&id, "no evidence", Some(RESULT_BENIGN), false)
         .is_err());
@@ -104,7 +97,6 @@ fn direct_receipts_preserve_evidence_gates_result_and_closed_state() {
         .factor(&id, "@/literal-pro", FactorSide::Pro)
         .unwrap();
     let con = decide.factor(&id, "@-", FactorSide::Con).unwrap();
-    fixture.carry();
     let receipt = decide
         .resolve(
             &id,
@@ -123,7 +115,6 @@ fn direct_receipts_preserve_evidence_gates_result_and_closed_state() {
     assert_eq!(receipt.result, Some(RESULT_BENIGN));
     assert!(!receipt.forced);
     assert!(receipt.predecessors.is_empty());
-    fixture.carry();
     let detail = decide.show(&id).unwrap();
     assert_eq!(detail.genesis.id, proposed.genesis);
     assert_eq!(detail.title, "@-");
@@ -173,7 +164,6 @@ fn reconcile_cites_every_divergent_head_and_does_not_resolve_agreement_again() {
             fragment,
         )
         .unwrap();
-        fixture.carry();
         let detail = decide.show(&id).unwrap();
         assert_eq!(detail.outcomes.len(), 2);
         assert!(decide
@@ -198,7 +188,6 @@ fn reconcile_cites_every_divergent_head_and_does_not_resolve_agreement_again() {
                     .collect::<std::collections::BTreeSet<_>>(),
                 [left, right].into_iter().collect()
             );
-            fixture.carry();
             assert!(matches!(
                 decide.show(&id).unwrap().resolution,
                 Resolution::Unique(_)
@@ -224,7 +213,6 @@ fn mcp_literal_prose_and_cli_file_input_share_the_same_operations() {
         )
     })
     .unwrap();
-    fixture.carry();
     let decide = fixture.operations();
     let first = decide.list(ListOptions::default()).unwrap().remove(0).id;
     assert_eq!(
@@ -236,7 +224,6 @@ fn mcp_literal_prose_and_cli_file_input_share_the_same_operations() {
         Some(marker.as_str())
     );
     collect(|out| cli::execute(fixture.cli(&["propose", &marker]), out)).unwrap();
-    fixture.carry();
     assert!(decide
         .list(ListOptions::default())
         .unwrap()
@@ -253,7 +240,6 @@ fn mcp_literal_prose_and_cli_file_input_share_the_same_operations() {
         )
     })
     .unwrap();
-    fixture.carry();
     let forced = collect(|out| {
         fixture.adapter().call(
             "decide_resolve",
@@ -265,7 +251,6 @@ fn mcp_literal_prose_and_cli_file_input_share_the_same_operations() {
     })
     .unwrap();
     assert!(forced.contains("explicitly forced"));
-    fixture.carry();
     for (tool, args, cli_args) in [
         (
             "decide_show",
@@ -357,7 +342,6 @@ fn output_failure_never_retries_a_proposal() {
     assert!(error.to_string().contains("sink failed"));
     assert_eq!(emissions, 1);
     assert_eq!(fixture.commits(), 1);
-    fixture.carry();
     assert_eq!(
         fixture
             .operations()

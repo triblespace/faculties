@@ -8,10 +8,8 @@ use std::path::PathBuf;
 use base64::Engine as _;
 use faculties::mcp::Server;
 use faculties::relations::{person_fragment, ProfileInput};
-use faculties::schemas::{
-    compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, relations::DEFAULT_SCOPE_ID,
-};
-use faculties::storage::{carry_scope, initialize_signer, publish_fragment};
+use faculties::schemas::relations::DEFAULT_SCOPE_ID;
+use faculties::storage::{initialize_signer, publish_fragment};
 use faculties::{compass, message, wiki};
 use serde_json::{json, Value};
 use triblespace::prelude::*;
@@ -168,8 +166,6 @@ fn one_session_writes_and_reads_all_three_faculties() {
             "id": goal, "status": "doing", "persona": "alice"
         }),
     );
-    // Reads see what the worker carried; the test is the worker here.
-    carry_scope(&pile, Some(&key), COMPASS_SCOPE_ID).unwrap();
     let shown = text(&call(&mut server, "compass_show", json!({"id": goal})));
     assert!(shown.contains(literal), "{shown}");
     assert!(shown.contains("doing"), "{shown}");

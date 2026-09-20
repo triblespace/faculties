@@ -9,8 +9,7 @@ use faculties::relations::{
 };
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 use faculties::storage::{
-    carry_scope, initialize_signer, load_signer, open_pile_strict, publish_fragment,
-    read_fact_collection,
+    initialize_signer, load_signer, open_pile_strict, publish_fragment, read_fact_collection,
 };
 use serde_json::{json, Value};
 use std::fs;
@@ -55,10 +54,6 @@ impl Fixture {
     }
     fn publish(&self, fragment: Fragment) {
         publish_fragment(&self.pile, Some(&self.key), DEFAULT_SCOPE_ID, fragment).unwrap();
-    }
-    /// Reads see what the worker carried; the test is the worker here.
-    fn carry(&self) {
-        carry_scope(&self.pile, Some(&self.key), DEFAULT_SCOPE_ID).unwrap();
     }
     fn cli(&self, arguments: &[&str]) -> String {
         let mut command = Command::new(env!("CARGO_BIN_EXE_relations"));
@@ -121,7 +116,6 @@ fn native_write_receipts_and_true_noops_do_not_require_text_parsing() {
         relations::lifecycle_head(&facts, added.person).unwrap(),
         Head::Unique(added.lifecycle)
     );
-    fixture.carry(); // the worker warms the derived views before the no-op
     operations.show(&id).unwrap();
     let length = fs::metadata(&fixture.pile).unwrap().len();
     let unchanged = operations.set(&id, ProfilePatch::default(), &[]).unwrap();
@@ -167,7 +161,6 @@ fn cli_mcp_and_native_reads_preserve_all_profile_fields_and_clear_semantics() {
             "profile_urls":["https://example.test/ada"]
         }
     })).unwrap();
-    fixture.carry();
     let operations = fixture.relations();
     assert_eq!(fixture.cli(&["show", &id]), operations.show(&id).unwrap());
     assert_eq!(
@@ -234,7 +227,6 @@ fn lifecycle_commands_keep_retirement_filters_and_restore_alias() {
         .person;
     let id = format!("{person:x}");
     call(&fixture.mcp(), "relations_retire", json!({"person":id})).unwrap();
-    fixture.carry();
     assert_eq!(
         fixture.relations().list(50, PeopleFilter::Active).unwrap(),
         "No people.\n"
@@ -254,7 +246,6 @@ fn lifecycle_commands_keep_retirement_filters_and_restore_alias() {
             .unwrap()
             .starts_with("active:")
     );
-    fixture.carry();
     assert!(!fixture
         .relations()
         .show(&id)
@@ -295,7 +286,6 @@ fn group_and_identity_frontends_share_exact_members_and_noop_outcomes() {
     )
     .unwrap()
     .contains("already represented"));
-    fixture.carry();
     assert_eq!(
         fixture.cli(&["group", "show", "crew"]),
         call(&faculty, "relations_group_show", json!({"group":"crew"})).unwrap()
@@ -333,7 +323,6 @@ fn group_and_identity_frontends_share_exact_members_and_noop_outcomes() {
     fixture.cli(&["group", "add", "new crew", &second_id]);
     fixture.cli(&["group", "remove", "new crew", &second_id]);
     fixture.cli(&["group", "rename", "new crew", "final crew"]);
-    fixture.carry();
     assert_eq!(
         operations.group_show("final crew").unwrap(),
         fixture.cli(&["group", "show", "final crew"])
@@ -366,7 +355,6 @@ fn profile_forks_require_an_explicit_base_and_preserve_every_predecessor() {
     fixture.publish(
         relations::profile_fragment(added.person, profile("Right"), &[added.profile]).unwrap(),
     );
-    fixture.carry();
     let faculty = fixture.mcp();
     assert!(operations
         .show(&id)
@@ -410,7 +398,6 @@ fn group_and_identity_reconciliation_keep_concurrent_evidence() {
         relations::group_snapshot_fragment(group.group, "right", &[second], &[group.snapshot])
             .unwrap(),
     );
-    fixture.carry();
     assert!(call(
         &fixture.mcp(),
         "relations_group_reconcile",
@@ -436,7 +423,6 @@ fn group_and_identity_reconciliation_keep_concurrent_evidence() {
     assert_eq!(current.predecessors.len(), 2);
     fixture.publish(relations::identity_verdict_fragment(first, second, true, &[]).unwrap());
     fixture.publish(relations::identity_verdict_fragment(first, second, false, &[]).unwrap());
-    fixture.carry();
     assert!(operations
         .identity_list()
         .unwrap()
@@ -482,7 +468,6 @@ fn mcp_profile_prose_and_group_names_are_literal_host_independent_values() {
         json!({"name":"@-"}),
     )
     .unwrap();
-    fixture.carry();
     let shown = fixture.relations().show(&id).unwrap();
     assert_eq!(shown.matches(&literal).count(), 2);
     assert!(!shown.contains("HOST FILE CONTENT"));
@@ -581,7 +566,6 @@ fn ambiguous_selectors_stay_visible_and_output_failure_does_not_repeat_writes() 
         .relations()
         .add(profile("Shared"), None, &[])
         .unwrap();
-    fixture.carry();
     assert!(fixture.relations().show("Shared").is_err());
     assert!(call(
         &fixture.mcp(),

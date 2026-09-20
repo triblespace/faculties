@@ -7,12 +7,9 @@ use faculties::body::{self, Body, CaptureInput, Signal};
 use faculties::files::presentation::ViewOptions;
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
-use faculties::storage::{
-    carry_facts, initialize_signer, load_signer, open_pile_strict, publish_fragment,
-};
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict, publish_fragment};
 use std::fs;
 use std::path::PathBuf;
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -53,22 +50,6 @@ impl Fixture {
         pile.close().unwrap();
         count
     }
-    /// Reads see what the worker carried; the test is the worker here. Body's
-    /// worker carries the fact chain and the intent register.
-    fn carry(&self) {
-        let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = open_pile_strict(&self.pile).unwrap();
-        let source = faculties::collection_names::open_configured(
-            &mut pile,
-            faculties::schemas::body::DEFAULT_SCOPE_ID,
-            signer.verifying_key(),
-        )
-        .unwrap();
-        carry_facts(&mut pile, source, &signer);
-        let register = body::intent_register_collection(&mut pile, signer.verifying_key()).unwrap();
-        drop(pollster::block_on(pile.maintain(register, &signer)).unwrap());
-        pile.close().unwrap();
-    }
 }
 fn json(value: serde_json::Value) -> Bytes {
     serde_json::to_vec(&value).unwrap().into()
@@ -108,7 +89,6 @@ fn direct_capture_returns_identity_and_preserves_original_bytes() {
     let body = fixture.body();
     let original: Bytes = vec![0, 255, 4, 5].into();
     let receipt = body.capture(&vision(original.clone())).unwrap();
-    fixture.carry();
     let id = format!("{:x}", receipt.id);
     assert_eq!(fixture.commits(), 1);
     assert_eq!(body.get(&id).unwrap().bytes, original);
@@ -127,7 +107,6 @@ fn resident_mcp_capture_export_and_bounded_view_are_distinct() {
     let image = png();
     let output = parts(|out| adapter.call("body_capture",json(serde_json::json!({"modality":"vision","data_base64":base64::engine::general_purpose::STANDARD.encode(&image),"mime":"image/png","width":2,"height":1,"pose":"@/not-a-file","note":"@-"})),out)).unwrap();
     assert!(output.iter().all(|p| matches!(p, Part::Text { .. })));
-    fixture.carry();
     let id = format!("{:x}", fixture.body().list().unwrap()[0].id);
     let output =
         parts(|out| adapter.call("body_get", json(serde_json::json!({"id":id})), out)).unwrap();
@@ -164,7 +143,6 @@ fn touch_and_intent_strings_are_literal_and_read_does_not_execute_them() {
         )
     })
     .unwrap();
-    fixture.carry();
     let touch = fixture.body().list().unwrap().remove(0);
     assert_eq!(touch.modality, "touch");
     assert_eq!(touch.note, "@-");
@@ -182,7 +160,6 @@ fn touch_and_intent_strings_are_literal_and_read_does_not_execute_them() {
         )
     })
     .unwrap();
-    fixture.carry();
     assert_eq!(fixture.body().intent().unwrap().unwrap().text, literal);
     assert!(!missing.exists());
     assert_eq!(
@@ -208,7 +185,6 @@ fn list_does_not_dereference_unselected_frames_or_poses() {
         Fragment::from(fragment.facts().clone()),
     )
     .unwrap();
-    fixture.carry();
     assert_eq!(fixture.body().list().unwrap().len(), 1);
     assert!(fixture.body().get(&format!("{id:x}")).is_err());
 }
@@ -267,7 +243,6 @@ fn emitter_failure_does_not_republish_capture_and_cli_export_is_exact() {
     assert_eq!(fixture.commits(), 1);
     let raw: Bytes = vec![0, 255, 2].into();
     let receipt = fixture.body().capture(&vision(raw.clone())).unwrap();
-    fixture.carry();
     let cli = body::cli::Cli::try_parse_from([
         "body",
         "--pile",

@@ -171,7 +171,8 @@ impl Fixture {
     }
 
     /// Carry this signer's private receipts through the Succinct and Rank9
-    /// chain Orient reads them from; the test is the worker here.
+    /// chain Orient reads them from: a raw commit into the private receipt
+    /// collection is the worker's to carry.
     fn maintain_receipts(&self, key: &Path) {
         let signer = faculties::storage::load_signer(&self.pile, Some(key)).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();

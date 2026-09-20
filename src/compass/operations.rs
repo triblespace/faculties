@@ -1809,7 +1809,6 @@ mod tests {
             None,
         )
         .unwrap();
-        carry_storage(storage);
         let goal = storage
             .with_view(|facts, _, _| Ok(*compass::goal_ids(facts).iter().next().unwrap()))
             .unwrap();
@@ -1834,6 +1833,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // A raw commit is the worker's to carry; no faculty write ensured it.
         carry_storage(storage);
         storage
             .with_view(|facts, _, status_register| {
@@ -1852,7 +1852,6 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
 
         move_goal(storage, format!("{goal:x}"), "doing".to_owned(), None).unwrap();
-        carry_storage(storage);
         storage
             .with_view(|facts, _, status_register| {
                 assert_eq!(

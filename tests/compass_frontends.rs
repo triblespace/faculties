@@ -510,8 +510,6 @@ fn cli_mcp_and_direct_reads_agree() {
             },
         )
         .unwrap();
-    // Reads see what the worker carried; the test is the worker here.
-    fixture.carry();
     let id = format!("{:x}", goal.goal);
     let faculty = fixture.mcp();
     assert_eq!(
@@ -603,8 +601,6 @@ fn mcp_title_and_notes_are_literal_even_when_a_matching_host_file_exists() {
         "compass_note",
         serde_json::json!({"id":id,"note":literal}),
     );
-    // Reads see what the worker carried; the test is the worker here.
-    fixture.carry();
     let shown = fixture.operations().show(&id).unwrap();
     assert!(shown.contains(&format!("Title: {literal}")));
     assert!(shown.contains("  @-"));
@@ -631,19 +627,15 @@ fn cli_keeps_file_stdin_and_literal_escape_input_conventions() {
     let (facts, _) = fixture.snapshot();
     let goal = *compass::goal_ids(&facts).iter().next().unwrap();
     let id = format!("{goal:x}");
-    // Reads see what the worker carried; the test is the worker here.
-    fixture.carry();
     assert!(fixture
         .operations()
         .show(&id)
         .unwrap()
         .contains("note from file"));
     fixture.cli(&["note", &id, "@@-"], None);
-    fixture.carry();
     assert!(fixture.operations().show(&id).unwrap().contains("  @-"));
     fixture.cli(&["add", "@-"], Some("title from stdin"));
     fixture.cli(&["add", "@@literal title"], None);
-    fixture.carry();
     let listed = fixture
         .operations()
         .list(ListOptions {

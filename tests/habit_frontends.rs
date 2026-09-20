@@ -6,8 +6,7 @@ use faculties::habits::{self, DeclaredState, Habits};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
 use faculties::relations::{ProfileInput, Relations};
-use faculties::schemas::habit::DEFAULT_SCOPE_ID;
-use faculties::storage::{carry_scope, initialize_signer};
+use faculties::storage::initialize_signer;
 use serde_json::json;
 
 fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
@@ -17,11 +16,6 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
     std::fs::File::create(&pile).unwrap();
     initialize_signer(&pile, Some(&key)).unwrap();
     (directory, pile, key)
-}
-
-/// Reads see what the worker carried; the test is the worker here.
-fn carry(pile: &Path, key: &Path) {
-    carry_scope(pile, Some(key), DEFAULT_SCOPE_ID).unwrap();
 }
 
 fn call(faculty: &dyn Faculty, name: &str, args: serde_json::Value) -> String {
@@ -109,7 +103,6 @@ fn explicit_persona_targets_are_literal_and_shared_by_cli_and_mcp() {
         ],
     );
     assert!(added.contains(&cc_id) && added.contains(&gpt_id), "{added}");
-    carry(&pile, &key);
     let operations = Habits::new(pile.clone(), Some(key.clone()));
     let observed = operations.show("scoped").unwrap();
     let mut expected = vec![cc, gpt];
@@ -165,7 +158,6 @@ fn absent_or_empty_persona_targets_are_global_even_with_ambient_persona() {
         json!({"label":"mcp-empty", "when":"every 1h", "nudge":"everyone", "personas":[]}),
     );
     assert!(empty.contains("personas: everyone"), "{empty}");
-    carry(&pile, &key);
     let operations = Habits::new(pile.clone(), Some(key.clone()));
     for label in ["cli-global", "mcp-global", "mcp-empty"] {
         assert!(operations
@@ -203,7 +195,6 @@ fn mcp_listing_is_passive_and_evaluation_is_explicit() {
             &[],
         )
         .unwrap();
-    carry(&pile, &key);
     let mcp = habits::mcp::Habits::new(pile.clone(), Some(key.clone()));
     let passive = call(&mcp, "habit_list", json!({}));
     assert!(passive.contains("unevaluated"), "{passive}");
@@ -249,7 +240,6 @@ fn literal_prose_and_resident_script_bytes_are_preserved_without_execution() {
         "habit_add",
         json!({"label":"literal", "when":"when @script", "nudge":"@/not-a-file", "script_base64":base64::engine::general_purpose::STANDARD.encode(script)}),
     );
-    carry(&pile, &key);
     let operations = Habits::new(pile, Some(key));
     let observed = operations.show("literal").unwrap();
     assert_eq!(observed.definition.nudge, "@/not-a-file");
@@ -265,7 +255,6 @@ fn definition_history_label_ambiguity_and_state_noops_survive_both_frontends() {
     let first = operations
         .add("repeat", "every 1h", "first", None, &[], &[])
         .unwrap();
-    carry(&pile, &key);
     let duplicate = operations
         .add("repeat", "every 1h", "first", None, &[], &[])
         .unwrap();
@@ -274,7 +263,6 @@ fn definition_history_label_ambiguity_and_state_noops_survive_both_frontends() {
     let second = operations
         .add("repeat", "every 1h", "second", None, &[], &[])
         .unwrap();
-    carry(&pile, &key);
     assert!(operations.show("repeat").is_err());
     let joined = operations
         .add(
@@ -286,7 +274,6 @@ fn definition_history_label_ambiguity_and_state_noops_survive_both_frontends() {
             &[],
         )
         .unwrap();
-    carry(&pile, &key);
     assert_eq!(operations.list(false).unwrap().entries.len(), 1);
     assert!(
         operations
@@ -296,21 +283,18 @@ fn definition_history_label_ambiguity_and_state_noops_survive_both_frontends() {
     );
     let mcp = habits::mcp::Habits::new(pile.clone(), Some(key.clone()));
     assert!(call(&mcp, "habit_pause", json!({"habit":"repeat"})).contains("paused"));
-    carry(&pile, &key);
     assert!(operations
         .set_state("repeat", DeclaredState::Paused)
         .unwrap()
         .event
         .is_none());
     assert!(call(&mcp, "habit_resume", json!({"habit":"repeat"})).contains("active"));
-    carry(&pile, &key);
     assert!(operations
         .set_state("repeat", DeclaredState::Active)
         .unwrap()
         .event
         .is_none());
     assert!(call(&mcp, "habit_done", json!({"habit":"repeat"})).contains("done repeat"));
-    carry(&pile, &key);
     // Historical lookup keeps every definition: a unique active label is not
     // a unique historical label. State-changing calls above target active heads.
     assert!(operations.show("repeat").is_err());
@@ -389,7 +373,6 @@ fn delivery_failure_does_not_repeat_an_authored_definition() {
         )
         .unwrap_err();
     assert!(format!("{error:#}").contains("broken transport"));
-    carry(&pile, &key);
     let operations = Habits::new(pile, Some(key));
     let report = operations.list(false).unwrap();
     assert_eq!(report.entries.len(), 1);

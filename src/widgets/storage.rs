@@ -912,17 +912,6 @@ mod tests {
             ),
         )
         .unwrap();
-        crate::storage::Storage::new(path.to_path_buf(), None)
-            .with_pile(|pile, signer| {
-                let source = crate::collection_names::open_configured(
-                    pile,
-                    crate::schemas::cognition::DEFAULT_SCOPE_ID,
-                    signer.verifying_key(),
-                )?;
-                crate::storage::carry_facts(pile, source, signer);
-                Ok(())
-            })
-            .unwrap();
     }
 
     fn publish_malformed_status(path: &Path) {
