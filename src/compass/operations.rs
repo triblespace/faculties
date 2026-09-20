@@ -1354,6 +1354,36 @@ mod tests {
         }
     }
 
+    /// What the maintenance worker does between a write and a read: carry
+    /// the source's commits through the chain and the status register. Reads
+    /// attach what was carried and never maintain.
+    fn carry(pile: &mut Pile, source: Collection<SimpleArchive>, signer: &SigningKey) {
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let status = compass::status_register_collection(pile, signer.verifying_key()).unwrap();
+        pollster::block_on(async {
+            drop(pile.maintain(succinct, signer).await.unwrap());
+            drop(pile.maintain(rank9, signer).await.unwrap());
+            drop(pile.maintain(status, signer).await.unwrap());
+        });
+    }
+
+    fn carry_storage(storage: CompassStorage<'_>) {
+        storage
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+                carry(pile, source, signer);
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn sparse_view(
         mut fragment: Fragment,
     ) -> (
@@ -1372,6 +1402,7 @@ mod tests {
         )
         .unwrap();
         store.pile.commit(source, &signer, fragment).unwrap();
+        carry(&mut store.pile, source, &signer);
         let view = pollster::block_on(compass::materialize_indexed_collection(
             &mut store.pile,
             &signer,
@@ -1793,6 +1824,7 @@ mod tests {
             None,
         )
         .unwrap();
+        carry_storage(storage);
         let goal = storage
             .with_view(|facts, _, _| Ok(*compass::goal_ids(facts).iter().next().unwrap()))
             .unwrap();
@@ -1817,6 +1849,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        carry_storage(storage);
         storage
             .with_view(|facts, _, status_register| {
                 assert_eq!(
@@ -1834,6 +1867,7 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
 
         move_goal(storage, format!("{goal:x}"), "doing".to_owned(), None).unwrap();
+        carry_storage(storage);
         storage
             .with_view(|facts, _, status_register| {
                 assert_eq!(

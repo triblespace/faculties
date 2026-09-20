@@ -51,12 +51,9 @@ impl Cognition {
             drop(descriptor_snapshot);
             let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
             let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-            let snapshot = pollster::block_on(async {
-                drop(pile.ensure(source, signer).await?);
-                drop(pile.maintain(succinct, signer).await?);
-                pile.maintain(rank9, signer).await
-            })
-            .context("maintain Cognition fact collection")?;
+            let snapshot = pile
+                .snapshot()
+                .context("freeze resident Cognition fact collection")?;
             let facts = snapshot
                 .collection(rank9)
                 .context("observe Cognition Rank9 collection")?

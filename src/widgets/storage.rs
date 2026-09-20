@@ -726,46 +726,12 @@ async fn load_inputs_from_pile(
             })
             .transpose()?;
 
-        for (_, label, source, _, _) in &collections {
-            drop(
-                pile.ensure(*source, signer)
-                    .await
-                    .map_err(|error| format!("ensure {label} source collection: {error:#}"))?,
-            );
-        }
-        for (_, label, _, succinct, rank9) in &collections {
-            drop(
-                pile.maintain(*succinct, signer).await.map_err(|error| {
-                    format!("maintain Succinct {label} fact archive: {error:#}")
-                })?,
-            );
-            drop(
-                pile.maintain(*rank9, signer)
-                    .await
-                    .map_err(|error| format!("maintain Rank9 {label} fact archive: {error:#}"))?,
-            );
-        }
-
+        // The viewer reads what the maintenance worker has carried and never
+        // maintains. Positive indexes are independently maintained query
+        // relations: their support need not equal fact support to admit only
+        // known winners.
         for (scope, _, _, _, rank9) in collections {
             by_scope.insert(scope, rank9);
-        }
-
-        // Positive indexes are independently maintained query relations. Their
-        // support need not equal fact support to admit only known winners.
-        if let Some(target) = compass_register {
-            drop(
-                pile.maintain(target, signer)
-                    .await
-                    .map_err(|error| format!("maintain Compass status register: {error}"))?,
-            );
-        }
-
-        if let Some(target) = wiki_latest {
-            drop(
-                pile.maintain(target, signer)
-                    .await
-                    .map_err(|error| format!("maintain Wiki supersession index: {error}"))?,
-            );
         }
 
         let secrets = if let Some(collection) = secrets_collection {
@@ -946,6 +912,17 @@ mod tests {
             ),
         )
         .unwrap();
+        crate::storage::Storage::new(path.to_path_buf(), None)
+            .with_pile(|pile, signer| {
+                let source = crate::collection_names::open_configured(
+                    pile,
+                    crate::schemas::cognition::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                crate::storage::carry_facts(pile, source, signer);
+                Ok(())
+            })
+            .unwrap();
     }
 
     fn publish_malformed_status(path: &Path) {
@@ -1207,6 +1184,7 @@ mod tests {
             author_fragment + root_fragment + successor_fragment,
         )
         .unwrap();
+        crate::wiki::carry_for_tests(&mut pile, &signer);
         let collection =
             crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
                 .unwrap();

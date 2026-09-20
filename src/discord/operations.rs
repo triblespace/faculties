@@ -344,12 +344,9 @@ impl DiscordStorage<'_> {
                     (),
                     policy,
                 )?;
-                let store_snapshot = pollster::block_on(async {
-                    drop(pile.ensure(collection, signer).await?);
-                    drop(pile.maintain(maintained_succinct, signer).await?);
-                    pile.maintain(maintained_rank9, signer).await
-                })
-                .context("maintain Discord fact collection")?;
+                let store_snapshot = pile
+                    .snapshot()
+                    .context("freeze resident Discord fact collection")?;
                 let facts = store_snapshot
                     .collection(maintained_rank9)
                     .context("observe maintained Discord fact collection")?

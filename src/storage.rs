@@ -1232,3 +1232,28 @@ mod tests {
         assert_eq!(fs::metadata(&files.pile).unwrap().len(), before);
     }
 }
+
+/// What the maintenance worker does between a write and a read, for tests:
+/// carry the source's commits through its Succinct and Rank9 chain. Reads
+/// attach what was carried and never maintain, so a test that writes and
+/// then reads says here what the worker would have done in between.
+#[cfg(test)]
+pub(crate) fn carry_facts<S>(pile: &mut S, source: Collection<SimpleArchive>, signer: &SigningKey)
+where
+    S: triblespace::core::repo::Store + AsyncBlobStoreAcquire + Send,
+{
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+    let succinct = pile
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .unwrap();
+    pollster::block_on(async {
+        drop(pile.maintain(succinct, signer).await.unwrap());
+        drop(pile.maintain(rank9, signer).await.unwrap());
+    });
+}

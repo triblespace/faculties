@@ -372,6 +372,7 @@ mod tests {
             )
             .unwrap();
             pile.commit(collection, &signer, fragment).unwrap();
+            crate::wiki::carry_for_tests(&mut pile, &signer);
             pile.close().unwrap();
         }
 

@@ -543,8 +543,9 @@ pub fn latest_intent<P: TriblePattern>(
     .min_by_key(|row| (row.created_at, row.text)))
 }
 
-/// Maintain Body's explicit mapping hops, then attach resident facts and
-/// known intent winners from one immutable store observation.
+/// Attach Body's resident facts and known intent winners from one immutable
+/// store observation. A read attaches what the maintenance worker has carried
+/// and never maintains.
 pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -554,28 +555,7 @@ pub async fn materialize_indexed_collection(
     let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
     let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let target = intent_register_collection(pile, signer.verifying_key())?;
-
-    drop(
-        pile.ensure(source, signer)
-            .await
-            .context("ensure Body source collection")?,
-    );
-    drop(
-        pile.maintain(succinct, signer)
-            .await
-            .context("maintain Body Succinct collection")?,
-    );
-    let ready = pile
-        .maintain(rank9, signer)
-        .await
-        .context("maintain Body fact collection")?;
-    drop(ready);
-    drop(
-        pile.maintain(target, signer)
-            .await
-            .map_err(|error| anyhow!("maintain Body intent register: {error}"))?,
-    );
-    let store_snapshot = pile.snapshot()?;
+    let store_snapshot = pile.snapshot().context("freeze resident Body targets")?;
     let facts = store_snapshot
         .collection(rank9)
         .context("observe maintained Body fact collection")?
@@ -593,6 +573,15 @@ pub async fn materialize_indexed_collection(
         store_snapshot,
         intents,
     })
+}
+
+/// The worker's carry for tests: the fact chain and the intent register.
+#[cfg(test)]
+pub(crate) fn carry_for_tests(pile: &mut Pile, signer: &SigningKey) {
+    let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+    crate::storage::carry_facts(pile, source, signer);
+    let target = intent_register_collection(pile, signer.verifying_key()).unwrap();
+    drop(pollster::block_on(pile.maintain(target, signer)).unwrap());
 }
 
 #[cfg(test)]
@@ -659,6 +648,7 @@ mod tests {
             });
             let first_id = first.root().unwrap();
             pile.commit(source, &signer, first).unwrap();
+            carry_for_tests(&mut pile, &signer);
             let before = materialize_indexed_collection(&mut pile, &signer)
                 .await
                 .unwrap();

@@ -318,12 +318,9 @@ fn with_habits<T>(
             pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
         let maintained_rank9 =
             pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(maintained_succinct, (), policy)?;
-        let reader = pollster::block_on(async {
-            drop(pile.ensure(collection, signer).await?);
-            drop(pile.maintain(maintained_succinct, signer).await?);
-            pile.maintain(maintained_rank9, signer).await
-        })
-        .context("maintain Habit fact collection")?;
+        let reader = pile
+            .snapshot()
+            .context("freeze resident Habit fact collection")?;
         let facts = reader
             .collection(maintained_rank9)
             .context("observe maintained Habit fact collection")?
@@ -475,6 +472,13 @@ mod tests {
         habits::publish(&pile, Some(&key), successor).unwrap();
 
         let storage = Storage::new(pile.clone(), Some(key.clone()));
+        storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                crate::storage::carry_facts(pile, source, signer);
+                Ok(())
+            })
+            .unwrap();
         let (definitions, superseded) = with_habits(&storage, |session| {
             Ok((
                 habits::definitions(&session.reader, &session.facts)?,

@@ -1639,38 +1639,19 @@ pub fn materialize_collection(
 }
 
 /// Capture one durable Wiki snapshot with shard-preserving facts and its
-/// maintained supersession index.
+/// supersession index, as the maintenance worker has carried them.
 ///
-/// Ordinary maintenance advances the fact derivation hops and latest relation
-/// independently, then attaches them through one immutable snapshot. Positive
-/// latest membership never admits states unseen by a lagging index. Normal
-/// reads therefore never flatten the collection or validate a closed-world
-/// catalog before asking their actual query.
+/// A read attaches and never maintains. Positive latest membership never
+/// admits states unseen by a lagging index. Normal reads therefore never
+/// flatten the collection or validate a closed-world catalog before asking
+/// their actual query.
 pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let policy = collection.policy(&pile.snapshot()?)?;
     let succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
     let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let target = latest_collection(pile, signer.verifying_key())?;
-    drop(
-        pile.ensure(collection, signer)
-            .await
-            .context("ensure Wiki source collection")?,
-    );
-    drop(
-        pile.maintain(succinct, signer)
-            .await
-            .context("maintain Wiki Succinct collection")?,
-    );
-    drop(
-        pile.maintain(rank9, signer)
-            .await
-            .context("maintain Wiki fact collection")?,
-    );
-    let store_snapshot = pile
-        .maintain(target, signer)
-        .await
-        .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
+    let store_snapshot = pile.snapshot().context("freeze resident Wiki targets")?;
     let facts = store_snapshot
         .collection(rank9)
         .context("observe Wiki fact collection")?
@@ -1734,6 +1715,15 @@ pub fn commit_collection(
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Wiki collection fragment: {error}"))
+}
+
+/// The worker's carry for tests: the fact chain and the supersession index.
+#[cfg(test)]
+pub(crate) fn carry_for_tests(pile: &mut Pile, signer: &SigningKey) {
+    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+    crate::storage::carry_facts(pile, collection, signer);
+    let target = latest_collection(pile, signer.verifying_key()).unwrap();
+    drop(pollster::block_on(pile.maintain(target, signer)).unwrap());
 }
 
 #[cfg(test)]

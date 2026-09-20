@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Reads attach what the maintenance worker carried and never maintain. Every
+  read helper (compass, body, wiki, habits, discord, decide, cognition, atlas,
+  relations' read-only calls, the widgets viewer) used to ensure its source and
+  maintain its chain before attaching, guarded by "when the signer is
+  admitted"; under one-of-three roots every host key is admitted everywhere,
+  so every read paid the chain's catch-up as a writer. Measured on sky,
+  2026-09-20: a compass read cost 49 s, 13.5 s with a key nobody admits, and
+  956 s for the first read after a note. A read now freezes a snapshot and
+  attaches the resident views; write paths keep their maintenance; a commit
+  nobody has carried yet waits for the worker, like one nobody has synced.
+  With core's frontier in the coverage index, `compass show` on the live
+  26 GB pile takes 4.4 s and prints what the old read printed in 877 s.
+  Tests that wrote and then read call a worker stand-in in between.
+
 - Add `code`: a source catalogue that answers questions grep structurally
   cannot. An ITEM is one declaration identified by its normalized token stream
   and NOTHING else, so byte-identical code in two files is one item with two

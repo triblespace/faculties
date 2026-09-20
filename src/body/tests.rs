@@ -89,6 +89,13 @@ fn equal_time_intents_coexist_and_higher_event_id_wins() {
         capture::pose: pose,
     };
     storage.publish(capture).unwrap();
+    storage
+        .storage
+        .with_pile(|pile, signer| {
+            body_model::carry_for_tests(pile, signer);
+            Ok(())
+        })
+        .unwrap();
 
     storage
         .with_indexed_view(|snapshot| {
@@ -137,6 +144,7 @@ fn indexed_snapshots_are_attached_to_their_exact_cover() {
     let first_id = first.root().unwrap();
     let collection = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
     pile.commit(collection, &signer, first).unwrap();
+    body_model::carry_for_tests(&mut pile, &signer);
     let before = pollster::block_on(body_model::materialize_indexed_collection(
         &mut pile, &signer,
     ))
@@ -152,6 +160,7 @@ fn indexed_snapshots_are_attached_to_their_exact_cover() {
     let second = intent_fragment("second", at_unix(1_760_000_000.0));
     let second_id = second.root().unwrap();
     pile.commit(collection, &signer, second).unwrap();
+    body_model::carry_for_tests(&mut pile, &signer);
     let after = pollster::block_on(body_model::materialize_indexed_collection(
         &mut pile, &signer,
     ))

@@ -490,6 +490,7 @@ mod tests {
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         wiki::commit_collection(&mut pile, &signer, fragment).unwrap();
+        wiki::carry_for_tests(&mut pile, &signer);
         pile.close().unwrap();
 
         let mut storage = StorageState::new(&pile_path);

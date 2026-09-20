@@ -1085,13 +1085,22 @@ where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    materialize_indexed_source(pile, source, signer).await
+    materialize_indexed_source(pile, source).await
 }
 
+/// Attach the resident Compass views: the fact archive carried over the
+/// source and the status register.
+///
+/// A read attaches what the maintenance worker has carried and never
+/// maintains. Under one-of-three roots every host key is admitted everywhere,
+/// so a read that maintained when admitted paid the whole chain's catch-up on
+/// every call: measured on sky, 2026-09-20, 49 seconds against 13.5 seconds
+/// for the attach-only branch, and 956 seconds for the first read after a
+/// write. A commit nobody has carried yet waits for the worker, like one
+/// nobody has synced.
 async fn materialize_indexed_source<S>(
     pile: &mut S,
     source: Collection<blobencodings::SimpleArchive>,
-    signer: &SigningKey,
 ) -> Result<CompassSnapshot<S::Snapshot>>
 where
     S: Store + AsyncBlobStoreAcquire + Send,
@@ -1100,38 +1109,7 @@ where
     let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
     let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
     let status_target = status_register_for_source(pile, source)?;
-    let admitted = {
-        let snapshot = pile
-            .snapshot()
-            .context("freeze Compass admission snapshot")?;
-        let subject = signer.verifying_key();
-        succinct
-            .writer_is_admitted(&snapshot, subject)
-            .context("check Compass Succinct WRITE admission")?
-            && rank9
-                .writer_is_admitted(&snapshot, subject)
-                .context("check Compass Rank9 WRITE admission")?
-            && status_target
-                .writer_is_admitted(&snapshot, subject)
-                .context("check Compass status WRITE admission")?
-    };
-    let store_snapshot = if admitted {
-        drop(
-            pile.maintain(succinct, signer)
-                .await
-                .context("maintain Compass Succinct collection")?,
-        );
-        drop(
-            pile.maintain(rank9, signer)
-                .await
-                .context("maintain Compass fact collection")?,
-        );
-        pile.maintain(status_target, signer)
-            .await
-            .context("maintain Compass status register")?
-    } else {
-        pile.snapshot().context("freeze resident Compass targets")?
-    };
+    let store_snapshot = pile.snapshot().context("freeze resident Compass targets")?;
     let fact_archive = store_snapshot
         .collection(rank9)
         .context("observe Compass fact collection")?
@@ -1183,8 +1161,28 @@ mod tests {
         (value, value).try_to_inline().unwrap()
     }
 
+    /// What the maintenance worker does between reads: carry the source's
+    /// commits through the chain and the status register.
+    async fn carry(
+        store: &mut MemoryRepo,
+        source: Collection<blobencodings::SimpleArchive>,
+        signer: &SigningKey,
+    ) {
+        let policy = source.policy(&store.snapshot().unwrap()).unwrap();
+        let succinct = store
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        let status = status_register_for_source(store, source).unwrap();
+        drop(store.maintain(succinct, signer).await.unwrap());
+        drop(store.maintain(rank9, signer).await.unwrap());
+        drop(store.maintain(status, signer).await.unwrap());
+    }
+
     #[test]
-    fn indexed_read_without_write_keeps_resident_targets_and_owner_reads_advance() {
+    fn indexed_reads_attach_what_the_worker_carried_and_never_publish() {
         pollster::block_on(async {
             let owner = SigningKey::from_bytes(&[23; 32]);
             let reader = SigningKey::from_bytes(&[24; 32]);
@@ -1195,7 +1193,8 @@ mod tests {
             let (mut first, goal) = goal_fragment("earlier", vec![], None, at(1)).unwrap();
             first += status_fragment(goal, "todo", None, at(1)).unwrap();
             store.commit(source, &owner, first).unwrap();
-            let warm = materialize_indexed_source(&mut store, source, &owner)
+            carry(&mut store, source, &owner).await;
+            let warm = materialize_indexed_source(&mut store, source)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1221,36 +1220,41 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
 
-            let resident = materialize_indexed_source(&mut store, source, &reader)
-                .await
-                .unwrap();
-            assert_eq!(
-                find!(id: Id, pattern!(resident.facts(), [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
-                    .collect::<BTreeSet<_>>(),
-                BTreeSet::from([goal]),
-            );
-            assert_eq!(
-                crate::schemas::compass::latest_status_event(
-                    resident.facts(),
-                    resident.status_register(),
-                    goal,
-                )
-                .unwrap()
-                .1,
-                "todo",
-            );
-            assert_eq!(
-                resident
-                    .store_snapshot()
-                    .records()
+            // Neither an unadmitted reader nor the owner advances the chain on
+            // a read; both see what was carried, and publish nothing.
+            for _signer in [&reader, &owner] {
+                let resident = materialize_indexed_source(&mut store, source)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    find!(id: Id, pattern!(resident.facts(), [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([goal]),
+                );
+                assert_eq!(
+                    crate::schemas::compass::latest_status_event(
+                        resident.facts(),
+                        resident.status_register(),
+                        goal,
+                    )
                     .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap(),
-                before,
-                "a reader must not publish maintenance equations",
-            );
+                    .1,
+                    "todo",
+                );
+                assert_eq!(
+                    resident
+                        .store_snapshot()
+                        .records()
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap(),
+                    before,
+                    "a reader must not publish maintenance equations",
+                );
+            }
 
-            let current = materialize_indexed_source(&mut store, source, &owner)
+            carry(&mut store, source, &owner).await;
+            let current = materialize_indexed_source(&mut store, source)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1272,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_owner_read_keeps_warm_targets_with_a_cold_new_source_member() {
+    fn indexed_read_keeps_carried_targets_with_a_cold_new_source_member() {
         pollster::block_on(async {
             let owner = SigningKey::from_bytes(&[25; 32]);
             let mut store = MemoryRepo::default();
@@ -1282,11 +1286,7 @@ mod tests {
             let (mut first, goal) = goal_fragment("resident goal", vec![], None, at(1)).unwrap();
             first += status_fragment(goal, "todo", None, at(1)).unwrap();
             store.commit(source, &owner, first).unwrap();
-            drop(
-                materialize_indexed_source(&mut store, source, &owner)
-                    .await
-                    .unwrap(),
-            );
+            carry(&mut store, source, &owner).await;
 
             let (mut later, new_goal) = goal_fragment("cold goal", vec![], None, at(2)).unwrap();
             later += status_fragment(new_goal, "todo", None, at(2)).unwrap();
@@ -1308,7 +1308,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
 
-            let resident = materialize_indexed_source(&mut store, source, &owner)
+            let resident = materialize_indexed_source(&mut store, source)
                 .await
                 .unwrap();
             assert_eq!(goal_ids(resident.facts()), BTreeSet::from([goal]));
@@ -1334,9 +1334,11 @@ mod tests {
                 "a cold source member must not require a new read-side equation",
             );
 
-            // Normal catch-up remains available once these exact bytes arrive.
+            // Normal catch-up remains available once these exact bytes arrive
+            // and the worker has carried them.
             assert_eq!(store.commit(source, &owner, later).unwrap(), arriving);
-            let current = materialize_indexed_source(&mut store, source, &owner)
+            carry(&mut store, source, &owner).await;
+            let current = materialize_indexed_source(&mut store, source)
                 .await
                 .unwrap();
             assert_eq!(goal_ids(current.facts()), BTreeSet::from([goal, new_goal]));

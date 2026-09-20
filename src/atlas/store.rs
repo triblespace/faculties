@@ -96,12 +96,9 @@ impl Store {
                 (),
                 policy,
             )?;
-            let store_snapshot = pollster::block_on(async {
-                drop(pile.ensure(source, signer).await?);
-                drop(pile.maintain(collection_succinct, signer).await?);
-                pile.maintain(collection_rank9, signer).await
-            })
-            .context("maintain Atlas fact collection")?;
+            let store_snapshot = pile
+                .snapshot()
+                .context("freeze resident Atlas fact collection")?;
             let facts = store_snapshot
                 .collection(collection_rank9)
                 .context("observe maintained Atlas fact collection")?

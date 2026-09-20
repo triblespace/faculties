@@ -1035,23 +1035,10 @@ fn with_relations_view<T>(
     let facts_succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
     let facts_rank9 =
         pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
-    // Mutation preparation keeps its existing ensure/maintain contract. Only
-    // read operations may use replicated views while their producer catches up.
-    let maintain = if read_only {
-        let snapshot = pile.snapshot()?;
-        let subject = signer.verifying_key();
-        facts_succinct
-            .writer_is_admitted(&snapshot, subject)
-            .map_err(|error| anyhow::anyhow!("check Relations Succinct WRITE admission: {error}"))?
-            && facts_rank9
-                .writer_is_admitted(&snapshot, subject)
-                .map_err(|error| {
-                    anyhow::anyhow!("check Relations Rank9 WRITE admission: {error}")
-                })?
-    } else {
-        true
-    };
-    let reader = if maintain {
+    // Mutation preparation keeps its existing ensure/maintain contract. A
+    // read attaches what the maintenance worker has carried and never
+    // maintains, whoever the signer is.
+    let reader = if !read_only {
         runtime
             .block_on(async {
                 drop(pile.ensure(collection, signer).await?);
@@ -1243,7 +1230,8 @@ mod tests {
             relations::person_fragment(first, profile("Ada")).unwrap().0,
         )
         .unwrap();
-        // The owner's ordinary read maintains the newly authored person.
+        // The worker carries the newly authored person; a read attaches it.
+        crate::storage::carry_facts(&mut pile, source, &owner);
         with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
             assert!(list_people(storage, 20, false, false)?.contains("Ada"));
             Ok(())
@@ -1302,6 +1290,8 @@ mod tests {
             before
         );
 
+        // Once the worker has carried the second person, every reader sees it.
+        crate::storage::carry_facts(&mut pile, source, &owner);
         with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
             assert_eq!(
                 relations::person_anchors(storage.facts),
