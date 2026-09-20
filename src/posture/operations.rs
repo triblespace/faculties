@@ -2243,8 +2243,16 @@ impl PostureStorage<'_> {
             "policy",
             |pile, collection, signer| {
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
-                pile.commit(collection, signer, fragment)
-                    .context("commit authored Posture policy fragment")
+                let commit = pile
+                    .commit(collection, signer, fragment)
+                    .context("commit authored Posture policy fragment")?;
+                drop(
+                    pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                        .context(
+                            "Posture policy facts were committed, but ensuring their derived views failed",
+                        )?,
+                );
+                Ok(commit)
             },
         )
     }
@@ -2252,8 +2260,16 @@ impl PostureStorage<'_> {
     fn publish_scan(&self, mut fragment: Fragment, description: &str) -> Result<CollectionCommit> {
         self.with_store(DEFAULT_SCAN_SCOPE_ID, "scan", |pile, collection, signer| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            pile.commit(collection, signer, fragment)
-                .context("commit authored Posture scan fragment")
+            let commit = pile
+                .commit(collection, signer, fragment)
+                .context("commit authored Posture scan fragment")?;
+            drop(
+                pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                    .context(
+                    "Posture scan facts were committed, but ensuring their derived views failed",
+                )?,
+            );
+            Ok(commit)
         })
     }
 

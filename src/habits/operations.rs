@@ -288,21 +288,26 @@ impl HabitSession<'_> {
     }
 }
 
-/// Publish the fragment; derived query views advance when a reader prepares
-/// them.
+/// Publish first, then ensure the derived views before reporting success.
 ///
 /// Source publication remains unconditional: an unadmitted COMMIT is still a
-/// raw ledger entry, not an admitted Habit fact. The command's selected read
-/// view is left immutable; subsequent observers maintain and attach the views
-/// themselves.
+/// raw ledger entry, not an admitted Habit fact. Ensuring never grants the
+/// signer authority it did not already have. The command's selected read view
+/// is left immutable; subsequent observers attach the newly ensured view.
 pub(super) fn commit_habit_fragment(
     pile: &mut Pile,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    pile.commit(collection, signer, fragment)
-        .context("commit Habit fragment")
+    let commit = pile
+        .commit(collection, signer, fragment)
+        .context("commit Habit fragment")?;
+    drop(
+        pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+            .context("Habit facts were committed, but ensuring their derived views failed")?,
+    );
+    Ok(commit)
 }
 
 fn with_habits<T>(

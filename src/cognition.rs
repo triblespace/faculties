@@ -167,6 +167,14 @@ pub fn publish_events_with_storage(
                 })?;
             commits.push(commit);
         }
+        if !commits.is_empty() {
+            drop(
+                pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                    .context(
+                        "Cognition facts were committed, but ensuring their derived views failed",
+                    )?,
+            );
+        }
         Ok(commits)
     })
 }

@@ -529,8 +529,34 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
             let expected_wiki = seed.wiki.facts().clone();
             let expected_compass = seed.compass.facts().clone();
             let wiki_commit = wiki_model::commit_collection(pile, signer, seed.wiki)?;
+            async {
+                let source = crate::collection_names::open_configured(
+                    pile,
+                    crate::schemas::wiki::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                let latest = wiki_model::latest_for_source(pile, source)?;
+                crate::storage::seed_derived(pile, latest, source.handle(), signer).await?;
+                crate::storage::ensure_derived(pile, source, signer).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await
+            .context("Bootstrap facts were committed, but ensuring their derived views failed")?;
             let compass_commit = compass::commit_collection(pile, signer, seed.compass)
                 .context("Wiki bootstrap facts were committed, but Compass publication failed")?;
+            async {
+                let source = crate::collection_names::open_configured(
+                    pile,
+                    crate::schemas::compass::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                let status = compass::status_register_collection(pile, signer.verifying_key())?;
+                crate::storage::seed_derived(pile, status, source.handle(), signer).await?;
+                crate::storage::ensure_derived(pile, source, signer).await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await
+            .context("Bootstrap facts were committed, but ensuring their derived views failed")?;
 
             let wiki_after = wiki_model::materialize_indexed_collection(pile, signer)
                 .await

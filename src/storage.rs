@@ -14,6 +14,11 @@
 //! - **Publication and discovery.** [`publish_fragment`] / [`publish_fragments`]
 //!   commit whole fragments into one scoped collection; [`discover_target`]
 //!   reports what a scope already holds.
+//! - **Derived upkeep.** A write calls [`ensure_derived`] after its commit so
+//!   the commit is readable through every view derived from its collection,
+//!   found from the store's own listing rather than a list kept per faculty;
+//!   the maintenance daemon, or [`carry_facts`] standing in for it, calls
+//!   [`maintain_derived`] to carry those views to their fixed points.
 //!
 //! This module was carved out of the storage cutover, which is where these
 //! primitives were first written. The cutover itself now lives in the separate
@@ -28,20 +33,29 @@ use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+};
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead,
-    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, Support,
+    ensure_derived as core_ensure_derived, maintain_derived as core_maintain_derived, realize_as,
+    Collection, CollectionCommit, CollectionDerivation, CollectionDerive, CollectionHandle,
+    CollectionMerge, CollectionRead, CollectionRealizationError, CollectionRecord,
+    CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, CoreRealizer, Derived,
+    RealizeDerived, Realized, Support, Upkeep, UpkeepReport,
 };
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::hash::Handle;
+use triblespace::core::inline::InlineEncoding;
+use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StorageClose,
-    StoreRead,
+    Store, StoreRead,
 };
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
+use triblespace_search::portable_bm25::PortableBM25Blob;
 
 /// The shard-preserving logical view used for ordinary Faculty fact queries.
 pub type FactArchive = UnionArchive<OrderedUniverse>;
@@ -621,6 +635,12 @@ pub fn publish_fragments(
             commits.push(
                 pile.commit(collection, &signer, fragment)
                     .context("publish native collection fragment")?,
+            );
+        }
+        if !commits.is_empty() {
+            drop(
+                pollster::block_on(ensure_derived(&mut pile, collection, &signer))
+                    .context("fragments were committed, but ensuring their derived views failed")?,
             );
         }
         Ok(commits)
@@ -1323,26 +1343,148 @@ pub(crate) fn discovered_records<S: triblespace::core::collection::CollectionRea
     Ok(discovered)
 }
 
-/// What the maintenance worker does between a write and a read: carry the
-/// source's commits through its Succinct and Rank9 chain, as the daemon
-/// would. Reads attach what was carried and never maintain, so a test or a
-/// tool that writes and then reads calls this to stand in for the worker.
+/// What the maintenance worker does between a write and a read: carry every
+/// collection derived from `source` to its fixed point, as the daemon would.
+/// Reads attach what was carried and never maintain, so a test or a tool
+/// that writes and then reads calls this to stand in for the worker.
 pub fn carry_facts<S>(pile: &mut S, source: Collection<SimpleArchive>, signer: &SigningKey)
 where
-    S: triblespace::core::repo::Store + AsyncBlobStoreAcquire + Send,
+    S: Store + AsyncBlobStoreAcquire + Send,
 {
-    use triblespace::core::blob::encodings::succinctarchive::{
-        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-    };
-    let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+    drop(pollster::block_on(maintain_derived(pile, source, signer)).unwrap());
+}
+
+/// The realizer for every derived encoding a faculty binary carries: the
+/// core's own, and the search crate's BM25 index through its canonical
+/// mapping. A target whose descriptor names a mapping this binary does not
+/// know, such as the Files semantic index without its model or the Archive's
+/// own BM25 mapping, is named in the report and left to whoever registered
+/// it; nothing is guessed at.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FacultiesRealizer;
+
+impl<S> RealizeDerived<S> for FacultiesRealizer
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
+    async fn realize(
+        &mut self,
+        store: &mut S,
+        derived: &Derived,
+        signer: &SigningKey,
+        upkeep: Upkeep,
+    ) -> Result<Realized, CollectionRealizationError> {
+        if derived.representation == <PortableBM25Blob as MetaDescribe>::id() {
+            return realize_as::<S, PortableBM25Blob>(store, derived, signer, upkeep).await;
+        }
+        CoreRealizer.realize(store, derived, signer, upkeep).await
+    }
+}
+
+/// Register the Succinct and Rank9 pair every faculty source is read through.
+fn fact_pair<S>(
+    pile: &mut S,
+    source: Collection<SimpleArchive>,
+) -> Result<(
+    Collection<SuccinctArchiveBlob>,
+    Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+)>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
+    let snapshot = pile.snapshot().context("freeze the source policy")?;
+    let policy = source
+        .policy(&snapshot)
+        .map_err(|error| anyhow!("read the source collection policy: {error}"))?;
+    drop(snapshot);
     let succinct = pile
         .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
+        .map_err(|error| anyhow!("register the Succinct collection: {error}"))?;
     let rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-        .unwrap();
-    pollster::block_on(async {
-        drop(pile.maintain(succinct, signer).await.unwrap());
-        drop(pile.maintain(rank9, signer).await.unwrap());
-    });
+        .map_err(|error| anyhow!("register the Rank9 collection: {error}"))?;
+    Ok((succinct, rank9))
+}
+
+/// Realize a derived collection once if nothing lists it yet.
+///
+/// A derived collection joins a store's listing with its first record, and
+/// until then no pass over what derives from its source can find it. So
+/// whoever registers one realizes it right then, for the commits already
+/// there; from then on every write's [`ensure_derived`] finds it. `source` is
+/// the collection `target` derives from. Costs one listing when the target
+/// is already listed, which is every time but the first.
+pub async fn seed_derived<S, T>(
+    pile: &mut S,
+    target: Collection<T>,
+    source: CollectionHandle,
+    signer: &SigningKey,
+) -> Result<Realized>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+    T: CollectionDerivation + MetaDescribe,
+    Handle<T>: InlineEncoding,
+{
+    let listed = pile
+        .snapshot()
+        .context("freeze the store for its collection listing")?
+        .collections()
+        .map_err(|error| anyhow!("list the store's collections: {error}"))?
+        .contains(&target.handle());
+    if listed {
+        return Ok(Realized::Done);
+    }
+    // The realizer reads the mapping from the descriptors; the algorithm
+    // named here is not consulted.
+    let derived = Derived {
+        handle: target.handle(),
+        source,
+        representation: <T as MetaDescribe>::id(),
+        algorithm: None,
+    };
+    realize_as::<S, T>(pile, &derived, signer, Upkeep::Ensure)
+        .await
+        .map_err(|error| anyhow!("seed a newly registered derived collection: {error}"))
+}
+
+/// What a write does after its commit into `source`: register the Succinct
+/// and Rank9 pair over it, seed them if the store does not list them yet,
+/// then realize the missing images of every collection derived from
+/// `source`, transitively, so the write is readable through every view. No
+/// merge is published; the maintenance daemon carries the leaves to their
+/// fixed points later. The first call over a source with a backlog pays for
+/// that backlog, and that is the price of the first call.
+pub async fn ensure_derived<S>(
+    pile: &mut S,
+    source: Collection<SimpleArchive>,
+    signer: &SigningKey,
+) -> Result<UpkeepReport>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
+    let (succinct, rank9) = fact_pair(pile, source)?;
+    seed_derived(pile, succinct, source.handle(), signer).await?;
+    seed_derived(pile, rank9, succinct.handle(), signer).await?;
+    core_ensure_derived(pile, source.handle(), signer, &mut FacultiesRealizer)
+        .await
+        .map_err(|error| anyhow!("ensure the collections derived from the source: {error}"))
+}
+
+/// Carry every collection derived from `source` to its fixed point, each
+/// after its own source, as the maintenance daemon does. The pair is
+/// registered and seeded first, like [`ensure_derived`].
+pub async fn maintain_derived<S>(
+    pile: &mut S,
+    source: Collection<SimpleArchive>,
+    signer: &SigningKey,
+) -> Result<UpkeepReport>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
+    let (succinct, rank9) = fact_pair(pile, source)?;
+    seed_derived(pile, succinct, source.handle(), signer).await?;
+    seed_derived(pile, rank9, succinct.handle(), signer).await?;
+    core_maintain_derived(pile, source.handle(), signer, &mut FacultiesRealizer)
+        .await
+        .map_err(|error| anyhow!("maintain the collections derived from the source: {error}"))
 }

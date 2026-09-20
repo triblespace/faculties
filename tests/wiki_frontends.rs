@@ -440,7 +440,7 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
     fixture.wiki().list(&ListOptions::default()).unwrap();
     fixture
         .wiki()
-        .create("not projected yet", "New source support.", &[], false)
+        .create("projected at once", "New source support.", &[], false)
         .unwrap();
     let owner = faculties::storage::load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
     let writer_key = fixture.directory.path().join("source-writer.key");
@@ -482,9 +482,10 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
             .writer_is_admitted(&snapshot, writer.verifying_key())
             .unwrap());
         if input == source {
+            // Both of the owner's creates were ensured by the writes themselves.
             assert_eq!(
                 snapshot.collection(rank9).unwrap().support().unwrap().len(),
-                1
+                2
             );
             assert_eq!(source.admitted(&snapshot).unwrap().len(), 2);
         }
@@ -598,9 +599,18 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
         .output()
         .unwrap();
     assert!(!edited.status.success());
-    assert!(String::from_utf8_lossy(&edited.stderr).contains("maintain Wiki Succinct collection"));
+    assert!(String::from_utf8_lossy(&edited.stderr)
+        .contains("frontier-changing edits need Wiki views that stand for every admitted commit"));
     assert_eq!(records(), after);
 
+    // The worker carries the writer's source commits; only then does the
+    // owner's read see them, since a read attaches and never maintains.
+    faculties::storage::carry_scope(
+        &fixture.pile,
+        Some(&fixture.key),
+        faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+    )
+    .unwrap();
     let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
     assert!(listing.contains("source writer"));
     assert!(listing.contains("imported by source writer"));

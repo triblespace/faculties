@@ -1674,21 +1674,30 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
 /// This remains an explicit migration/import boundary for callers that need a
 /// closed-world diagnostic oracle. It is deliberately not the ordinary query
 /// path; normal commands use [`query_snapshot`] and query its [`FactArchive`]
-/// directly.
+/// directly. Because it is an import's preparation and not a read, it ensures
+/// the Wiki's derived views first, so the supersession index it validates
+/// stands for every admitted revision a signer admitted to it can image; a
+/// signer who cannot is told so by the support check, never guessed around.
 pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<WikiSnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let target = latest_collection(pile, signer.verifying_key())?;
+    drop(
+        crate::storage::seed_derived(pile, target, collection.handle(), signer)
+            .await
+            .context("seed the Wiki supersession index")?,
+    );
+    drop(
+        crate::storage::ensure_derived(pile, collection, signer)
+            .await
+            .context("ensure the Wiki views before materializing")?,
+    );
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
     let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
         .context("read Wiki collection")?;
-    let target = latest_collection(pile, signer.verifying_key())?;
-    let maintained = pile
-        .maintain(target, signer)
-        .await
-        .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
-    let latest = maintained
+    let latest = store_snapshot
         .collection(target)
         .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?;
     if latest.support().map_err(|error| anyhow!("{error}"))? != &cover {

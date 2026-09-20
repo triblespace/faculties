@@ -185,6 +185,16 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
+        drop(
+            pollster::block_on(crate::storage::ensure_derived(
+                self.pile.borrow_mut(),
+                self.collection,
+                &self.signer,
+            ))
+            .context(
+                "Archive projection unit was committed, but ensuring its derived views failed",
+            )?,
+        );
         Ok(Some(commit))
     }
 }

@@ -266,8 +266,15 @@ impl WikiStorage<'_> {
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer, runtime| {
             let collection = runtime.block_on(open_source(pile, scope, signer.verifying_key()))?;
-            pile.commit(collection, signer, fragment)
-                .context("publish native collection fragment")
+            let commit = pile
+                .commit(collection, signer, fragment)
+                .context("publish native collection fragment")?;
+            runtime
+                .block_on(crate::storage::ensure_derived(pile, collection, signer))
+                .context(
+                    "Wiki auxiliary fragment was committed, but ensuring its derived views failed",
+                )?;
+            Ok(commit)
         })
     }
 
@@ -288,8 +295,18 @@ impl WikiStorage<'_> {
                 "publishing a Wiki fragment requires source collection WRITE"
             );
             drop(snapshot);
-            pile.commit(collection, signer, fragment)
-                .context("publish Wiki fragment")
+            let commit = pile
+                .commit(collection, signer, fragment)
+                .context("publish Wiki fragment")?;
+            runtime
+                .block_on(async {
+                    let latest = wiki_model::latest_for_source(pile, collection)?;
+                    crate::storage::seed_derived(pile, latest, collection.handle(), signer).await?;
+                    crate::storage::ensure_derived(pile, collection, signer).await?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .context("Wiki fragment was committed, but ensuring its derived views failed")?;
+            Ok(commit)
         })
     }
 
@@ -299,10 +316,12 @@ impl WikiStorage<'_> {
     }
 }
 
-/// Read preparation maintains available inputs when permitted and otherwise
-/// uses resident rollups. It never hydrates the whole source first. Update
-/// preparation keeps the complete pre-edit maintenance path: a stale frontier
-/// is not a substitute for the frontier an edit is about to supersede.
+/// Preparation attaches the views as they stand, whatever the signer may
+/// write: a write ensures its own images after its commit, and the
+/// maintenance worker carries the rest. It never hydrates the whole source
+/// first. Update preparation acquires the sources and then refuses a view
+/// that does not stand for every admitted commit: a stale frontier is not a
+/// substitute for the frontier an edit is about to supersede.
 async fn views_in<T>(
     pile: &mut FacultyStore,
     wiki_source: Collection<blobencodings::SimpleArchive>,
@@ -343,72 +362,23 @@ async fn views_in<T>(
             .with_context(|| format!("register {label} Rank9 collection"))?;
         auxiliaries.push((source, succinct, rank9, label));
     }
-    let maintain = if preparation == Preparation::Update {
-        true
-    } else {
-        let snapshot = pile.snapshot().context("freeze Wiki admission snapshot")?;
-        let subject = signer.verifying_key();
-        let mut admitted = wiki_succinct
-            .writer_is_admitted(&snapshot, subject)
-            .context("check Wiki Succinct WRITE admission")?
-            && wiki_rank9
-                .writer_is_admitted(&snapshot, subject)
-                .context("check Wiki Rank9 WRITE admission")?
-            && latest
-                .writer_is_admitted(&snapshot, subject)
-                .context("check Wiki latest WRITE admission")?;
-        for (_, succinct, rank9, label) in &auxiliaries {
-            admitted &= succinct
-                .writer_is_admitted(&snapshot, subject)
-                .with_context(|| format!("check {label} Succinct WRITE admission"))?
-                && rank9
-                    .writer_is_admitted(&snapshot, subject)
-                    .with_context(|| format!("check {label} Rank9 WRITE admission"))?;
-        }
-        admitted
-    };
-    if maintain {
-        if preparation == Preparation::Update {
-            drop(
-                pile.ensure(wiki_source, signer)
-                    .await
-                    .context("ensure Wiki source collection")?,
-            );
-            for (source, _, _, label) in &auxiliaries {
-                drop(
-                    pile.ensure(*source, signer)
-                        .await
-                        .with_context(|| format!("ensure {label} source collection"))?,
-                );
-            }
-        }
+    if preparation == Preparation::Update {
+        // An edit supersedes the frontier it reads, so its sources are
+        // acquired first. The views themselves are attached as they stand
+        // and checked for completeness below; a read never maintains, and a
+        // write ensures its own images after its commit.
         drop(
-            pile.maintain(wiki_succinct, signer)
+            pile.ensure(wiki_source, signer)
                 .await
-                .context("maintain Wiki Succinct collection")?,
+                .context("ensure Wiki source collection")?,
         );
-        drop(
-            pile.maintain(wiki_rank9, signer)
-                .await
-                .context("maintain Wiki Rank9 collection")?,
-        );
-        for (_, succinct, rank9, label) in &auxiliaries {
+        for (source, _, _, label) in &auxiliaries {
             drop(
-                pile.maintain(*succinct, signer)
+                pile.ensure(*source, signer)
                     .await
-                    .with_context(|| format!("maintain {label} Succinct collection"))?,
-            );
-            drop(
-                pile.maintain(*rank9, signer)
-                    .await
-                    .with_context(|| format!("maintain {label} Rank9 collection"))?,
+                    .with_context(|| format!("ensure {label} source collection"))?,
             );
         }
-        drop(
-            pile.maintain(latest, signer)
-                .await
-                .context("maintain Wiki supersession index")?,
-        );
     }
 
     // Positive membership makes latest a normal joined relation. Missing
@@ -417,14 +387,40 @@ async fn views_in<T>(
     let reader = pile
         .snapshot()
         .context("freeze Wiki and auxiliary snapshot")?;
-    let facts = reader
+    let observed_facts = reader
         .collection(wiki_rank9)
-        .context("observe Wiki fact collection")?
+        .context("observe Wiki fact collection")?;
+    let observed_latest = reader
+        .collection(latest)
+        .context("observe Wiki supersession index")?;
+    if preparation == Preparation::Update {
+        // A stale frontier is not a substitute for the frontier an edit is
+        // about to supersede: both views must stand for every admitted
+        // commit, and what the worker has not carried yet is not this
+        // edit's to guess.
+        let admitted = wiki_source
+            .admitted(&reader)
+            .context("resolve admitted Wiki commits")?;
+        for (name, support) in [
+            ("fact", observed_facts.support()),
+            ("supersession", observed_latest.support()),
+        ] {
+            let support = support.with_context(|| format!("resolve Wiki {name} support"))?;
+            let waiting = admitted
+                .difference(support)
+                .with_context(|| format!("compare Wiki {name} support"))?
+                .len();
+            anyhow::ensure!(
+                waiting == 0,
+                "frontier-changing edits need Wiki views that stand for every admitted \
+                 commit; {waiting} await the maintenance worker in the {name} index"
+            );
+        }
+    }
+    let facts = observed_facts
         .view::<FactArchive>()
         .context("read Wiki fact collection")?;
-    let latest = reader
-        .collection(latest)
-        .context("observe Wiki supersession index")?
+    let latest = observed_latest
         .view::<LatestIndex>()
         .context("read Wiki supersession index")?;
     let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
@@ -2211,6 +2207,22 @@ mod tests {
                 storage: &self.storage,
             }
         }
+
+        /// The maintenance worker's carry: every view derived from the Wiki
+        /// source, and from each auxiliary source given, as the daemon does
+        /// between a raw commit and a read. A read attaches what was carried
+        /// and never maintains; a publish ensures its own images itself.
+        fn carry(&self, auxiliaries: &[Collection<blobencodings::SimpleArchive>]) {
+            self.storage
+                .with_pile(|pile, signer| {
+                    crate::wiki::carry_for_tests(pile, signer);
+                    for &source in auxiliaries {
+                        crate::storage::carry_facts(pile, source, signer);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -2297,7 +2309,7 @@ mod tests {
     }
 
     #[test]
-    fn read_without_write_keeps_resident_frontier_and_owner_read_advances() {
+    fn reads_keep_the_resident_frontier_until_the_worker_carries() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let source = storage
@@ -2325,18 +2337,23 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let current = storage
-            .with_pile(|pile, signer, runtime| {
-                runtime.block_on(views_in(
-                    pile,
-                    source,
-                    signer,
-                    Preparation::Read,
-                    &[],
-                    |view, _| Ok(view.clone()),
-                ))
-            })
-            .unwrap();
+        // A raw commit is the worker's to carry; no read images it.
+        fixture.carry(&[]);
+        let owner_read = || {
+            storage
+                .with_pile(|pile, signer, runtime| {
+                    runtime.block_on(views_in(
+                        pile,
+                        source,
+                        signer,
+                        Preparation::Read,
+                        &[],
+                        |view, _| Ok(view.clone()),
+                    ))
+                })
+                .unwrap()
+        };
+        let current = owner_read();
         let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();
         let mut successor = Fragment::empty();
         let next = stage_revision(
@@ -2411,18 +2428,28 @@ mod tests {
             })
             .unwrap();
 
-        let current = storage
-            .with_pile(|pile, signer, runtime| {
-                runtime.block_on(views_in(
-                    pile,
-                    source,
-                    signer,
-                    Preparation::Read,
-                    &[],
-                    |view, _| Ok(view.clone()),
-                ))
-            })
-            .unwrap();
+        // The owner's read attaches the views exactly as the non-writer's
+        // does: the frontier the worker last carried, and nothing advanced.
+        let resident = owner_read();
+        let entry = wiki_model::entry(&resident.facts, &resident.latest, root).unwrap();
+        assert_eq!(
+            entry
+                .frontier
+                .iter()
+                .map(|head| head.id)
+                .collect::<Vec<_>>(),
+            [root]
+        );
+        assert_eq!(
+            revision_content(&resident.reader, &entry.frontier[0]).unwrap(),
+            "old body"
+        );
+        assert!(!wiki_model::revision_ids(&resident.facts).contains(&next));
+
+        // The worker's carry is what advances them; then both readers see
+        // the new revision.
+        fixture.carry(&[]);
+        let current = owner_read();
         let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();
         assert_eq!(
             entry
@@ -2436,6 +2463,32 @@ mod tests {
             revision_content(&current.reader, &entry.frontier[0]).unwrap(),
             "new body"
         );
+        reader
+            .with_store(|pile, signer, runtime| {
+                let carried = runtime.block_on(views_in(
+                    pile,
+                    source,
+                    signer,
+                    Preparation::Read,
+                    &[],
+                    |view, _| Ok(view.clone()),
+                ))?;
+                let entry = wiki_model::entry(&carried.facts, &carried.latest, root).unwrap();
+                assert_eq!(
+                    entry
+                        .frontier
+                        .iter()
+                        .map(|head| head.id)
+                        .collect::<Vec<_>>(),
+                    [next]
+                );
+                assert_eq!(
+                    revision_content(&carried.reader, &entry.frontier[0])?,
+                    "new body"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -2475,6 +2528,9 @@ mod tests {
                     Ok((source, auxiliary))
                 })
                 .unwrap();
+            // A raw commit is the worker's to carry, the Files marker's too;
+            // every member is still warm here, so the carry needs no cold bytes.
+            fixture.carry(&[auxiliary]);
             let warm = storage
                 .with_pile(|pile, signer, runtime| {
                     runtime.block_on(views_in(
@@ -3353,6 +3409,8 @@ mod tests {
         .unwrap();
         pile.commit(collection, &signer, author_fragment + legacy)
             .unwrap();
+        // A raw commit is the worker's to carry; the read attaches what stands.
+        crate::wiki::carry_for_tests(&mut pile, &signer);
         pile.close().unwrap();
 
         let storage = fixture.storage();

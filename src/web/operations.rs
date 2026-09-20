@@ -359,6 +359,10 @@ impl WebStorage<'_> {
             let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit Web observation")?;
+            drop(
+                pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                    .context("Web facts were committed, but ensuring their derived views failed")?,
+            );
             Ok(())
         })
     }

@@ -341,8 +341,10 @@ impl Storage {
                     pile.derive::<SuccinctArchiveBlob>(relations_collection, (), policy.clone())?;
                 let relations_rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
-                // Advance ordinary fact chains, then observe them through the
-                // same final target snapshot as the configured Secrets view.
+                // Acquire the sources' commits, then attach the views as they
+                // stand through the same final target snapshot as the
+                // configured Secrets view. A read never maintains; a write
+                // ensures its own images after its commit.
                 let secrets = pollster::block_on(async {
                     for (label, source) in [
                         ("Mail", mail_collection),
@@ -356,46 +358,6 @@ impl Storage {
                                 .with_context(|| format!("ensure {label} source collection"))?,
                         );
                     }
-                    drop(
-                        pile.maintain(mail_succinct, &self.signer)
-                            .await
-                            .context("maintain Mail fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(mail_rank9, &self.signer)
-                            .await
-                            .context("maintain Mail fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(files_succinct, &self.signer)
-                            .await
-                            .context("maintain Files fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(files_rank9, &self.signer)
-                            .await
-                            .context("maintain Files fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(decide_succinct, &self.signer)
-                            .await
-                            .context("maintain Decide fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(decide_rank9, &self.signer)
-                            .await
-                            .context("maintain Decide fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(relations_succinct, &self.signer)
-                            .await
-                            .context("maintain Relations fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(relations_rank9, &self.signer)
-                            .await
-                            .context("maintain Relations fact collection")?,
-                    );
 
                     let secrets = secret_storage::ensure_and_snapshot(
                         pile,
@@ -485,6 +447,14 @@ impl Storage {
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
             self.published.set(true);
+            drop(
+                pollster::block_on(crate::storage::ensure_derived(
+                    pile,
+                    collection,
+                    &self.signer,
+                ))
+                .context("Mail facts were committed, but ensuring their derived views failed")?,
+            );
             Ok(())
         })
     }

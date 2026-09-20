@@ -59,6 +59,16 @@ impl RelationsStorage<'_> {
             self.pile
                 .commit(self.collection, self.signer, fragment)
                 .context("commit authored Relations fragment")?;
+            drop(
+                pollster::block_on(crate::storage::ensure_derived(
+                    self.pile,
+                    self.collection,
+                    self.signer,
+                ))
+                .context(
+                    "Relations facts were committed, but ensuring their derived views failed",
+                )?,
+            );
         }
         Ok(result)
     }

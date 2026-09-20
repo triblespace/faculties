@@ -313,8 +313,10 @@ impl CompassStorage<'_> {
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            // Register every representation before maintenance, then freeze
-            // one query snapshot for this action.
+            // Register every representation and attach the resident views
+            // through one query snapshot for this action; the write authors,
+            // commits, then ensures the derived views it must be readable
+            // through. Reads never maintain.
             let compass_source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
             let descriptors = pile
                 .snapshot()
@@ -357,31 +359,6 @@ impl CompassStorage<'_> {
                 None
             };
 
-            let (maintain_compass, maintain_relations) = if preparation == Preparation::Complete {
-                (true, relation_collections.is_some())
-            } else {
-                let snapshot = pile
-                    .snapshot()
-                    .context("freeze Compass mutation admission snapshot")?;
-                let subject = signer.verifying_key();
-                let compass = compass_succinct
-                    .writer_is_admitted(&snapshot, subject)
-                    .context("check Compass Succinct WRITE admission")?
-                    && compass_rank9
-                        .writer_is_admitted(&snapshot, subject)
-                        .context("check Compass Rank9 WRITE admission")?;
-                let relations = if let Some((_, succinct, rank9)) = relation_collections {
-                    succinct
-                        .writer_is_admitted(&snapshot, subject)
-                        .context("check Relations Succinct WRITE admission for Compass")?
-                        && rank9
-                            .writer_is_admitted(&snapshot, subject)
-                            .context("check Relations Rank9 WRITE admission for Compass")?
-                } else {
-                    false
-                };
-                (compass, relations)
-            };
             runtime.block_on(async {
                 if preparation == Preparation::Complete {
                     drop(
@@ -397,30 +374,6 @@ impl CompassStorage<'_> {
                         );
                     }
                 }
-                if maintain_compass {
-                    drop(
-                        pile.maintain(compass_succinct, signer)
-                            .await
-                            .context("maintain Compass Succinct collection")?,
-                    );
-                    drop(
-                        pile.maintain(compass_rank9, signer)
-                            .await
-                            .context("maintain Compass Rank9 collection")?,
-                    );
-                }
-                if maintain_relations {
-                    if let Some((_, succinct, rank9)) = relation_collections {
-                        drop(pile.maintain(succinct, signer).await.context(
-                            "maintain Relations Succinct collection for Compass persona",
-                        )?);
-                        drop(
-                            pile.maintain(rank9, signer).await.context(
-                                "maintain Relations Rank9 collection for Compass persona",
-                            )?,
-                        );
-                    }
-                }
                 Ok::<_, anyhow::Error>(())
             })?;
             // Attach every view through one immutable post-maintenance store
@@ -429,9 +382,30 @@ impl CompassStorage<'_> {
             let reader = pile
                 .snapshot()
                 .context("freeze maintained Compass/Relations snapshot")?;
-            let facts = reader
+            let observed = reader
                 .collection(compass_rank9)
-                .context("observe Compass fact collection")?
+                .context("observe Compass fact collection")?;
+            if preparation == Preparation::Complete {
+                // A priority change reasons over every goal, so the view it
+                // reads must stand for every admitted commit; what the
+                // worker has not carried yet is not this write's to guess.
+                let support = observed
+                    .support()
+                    .context("resolve Compass fact collection support")?;
+                let admitted = compass_source
+                    .admitted(&reader)
+                    .context("resolve admitted Compass commits")?;
+                let waiting = admitted
+                    .difference(support)
+                    .context("compare Compass support")?
+                    .len();
+                anyhow::ensure!(
+                    waiting == 0,
+                    "priority changes need Compass views that stand for every admitted \
+                     commit; {waiting} await the maintenance worker"
+                );
+            }
+            let facts = observed
                 .view::<FactArchive>()
                 .context("read Compass fact collection")?;
             let by = if let (Some(persona), Some((_, _, rank9))) = (persona, relation_collections) {
@@ -464,6 +438,17 @@ impl CompassStorage<'_> {
                 );
                 drop(snapshot);
                 compass::commit_collection(pile, signer, fragment)?;
+                let status = compass::status_register_collection(pile, signer.verifying_key())?;
+                runtime
+                    .block_on(async {
+                        storage::seed_derived(pile, status, compass_source.handle(), signer)
+                            .await?;
+                        storage::ensure_derived(pile, compass_source, signer).await?;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .context(
+                        "Compass fragment was committed, but ensuring its derived views failed",
+                    )?;
             }
             Ok(value)
         })

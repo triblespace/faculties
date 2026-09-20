@@ -173,8 +173,9 @@ impl Message {
 }
 
 /// The facts one operation queries: its frozen Rank9 view, for reads and
-/// edits alike. Maintenance happens before selection and after publication,
-/// never by mixing a later raw COMMIT into these facts.
+/// edits alike. A write ensures its derived views after publication; reads
+/// attach what the maintenance worker carried and never maintain, so a later
+/// raw COMMIT is never mixed into these facts.
 type MessageFacts = FactArchive;
 
 struct MessageStorage<'a> {
@@ -212,11 +213,13 @@ impl MessageStorage<'_> {
             self.pile
                 .commit(self.collection, self.signer, fragment)
                 .context("commit authored Message fragment")?;
-            maintain_fact_chain(self.pile, self.signer, self.collection, "Message")
-                .await
-                .context(
-                    "Message fragment was committed, but maintaining its query views failed",
-                )?;
+            drop(
+                crate::storage::ensure_derived(self.pile, self.collection, self.signer)
+                    .await
+                    .context(
+                        "Message fragment was committed, but ensuring its derived views failed",
+                    )?,
+            );
         }
         Ok(value)
     }
@@ -701,18 +704,17 @@ fn with_storage<T>(
 
 async fn message_views(
     pile: &mut FacultyStore,
-    signer: &SigningKey,
+    _signer: &SigningKey,
     relations_source: Collection<SimpleArchive>,
     message_source: Collection<SimpleArchive>,
 ) -> Result<(FacultySnapshot, MessageFacts, MessageFacts)> {
     let trace = std::env::var_os("MESSAGE_RESIDUAL_TRACE").is_some();
     let started = std::time::Instant::now();
-    // Persona lookup needs the same eager observation as Message itself.
-    // Each chain checks its own derived WRITE; neither inherits the other's
-    // authority and source publication still checks source WRITE separately.
-    let relations_rank9 = maintain_fact_chain(pile, signer, relations_source, "Relations").await?;
-    let message_rank9 = maintain_fact_chain(pile, signer, message_source, "Message").await?;
-    let maintained_at = started.elapsed();
+    // Reads attach what the maintenance worker carried and never maintain:
+    // each chain is only registered here so its Rank9 handle can be attached.
+    let relations_rank9 = register_fact_chain(pile, relations_source, "Relations")?;
+    let message_rank9 = register_fact_chain(pile, message_source, "Message")?;
+    let registered_at = started.elapsed();
     // Both query views retain their selected support. Later selected-text
     // acquisition may add bytes, but never replaces these frozen facts.
     let reader = pile.snapshot().context("freeze Message observation")?;
@@ -731,17 +733,18 @@ async fn message_views(
     let attached_at = started.elapsed();
     if trace {
         eprintln!(
-            "views: prepared in {:.2?}, attached in {:.2?}",
-            maintained_at,
-            attached_at - maintained_at
+            "views: registered in {:.2?}, attached in {:.2?}",
+            registered_at,
+            attached_at - registered_at
         );
     }
     Ok((reader, relation_facts, message_facts))
 }
 
-async fn maintain_fact_chain(
+/// Register the Succinct and Rank9 pair over `source` and return the Rank9
+/// handle a reader attaches. Registration only: nothing is maintained here.
+fn register_fact_chain(
     pile: &mut FacultyStore,
-    signer: &SigningKey,
     source: Collection<SimpleArchive>,
     name: &'static str,
 ) -> Result<Collection<Rank9AcceleratedSuccinctArchiveBlob>> {
@@ -758,33 +761,6 @@ async fn maintain_fact_chain(
     let rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
         .with_context(|| format!("register {name} Rank9 collection"))?;
-    let admitted = {
-        let snapshot = pile
-            .snapshot()
-            .with_context(|| format!("freeze {name} WRITE admission"))?;
-        let subject = signer.verifying_key();
-        succinct
-            .writer_is_admitted(&snapshot, subject)
-            .map_err(|error| anyhow::anyhow!("check {name} Succinct WRITE admission: {error}"))?
-            && rank9
-                .writer_is_admitted(&snapshot, subject)
-                .map_err(|error| anyhow::anyhow!("check {name} Rank9 WRITE admission: {error}"))?
-    };
-    // One-edge maintenance uses resident immediate-source inputs, never an
-    // acquisition of a cold root just to read a warm target. A signer without
-    // derived WRITE keeps the resident-view/source-publication fallback.
-    if admitted {
-        drop(
-            pile.maintain(succinct, signer)
-                .await
-                .with_context(|| format!("maintain {name} Succinct collection"))?,
-        );
-        drop(
-            pile.maintain(rank9, signer)
-                .await
-                .with_context(|| format!("maintain {name} Rank9 collection"))?,
-        );
-    }
     Ok(rank9)
 }
 
@@ -1282,7 +1258,9 @@ mod tests {
             CollectionRecord::Commit(commit) if commit.collection() == message_source.handle()
         )));
 
-        // The owner can subsequently maintain these admitted source writes.
+        // The worker carries the sender's admitted source writes with the
+        // owner's authority; any reader then sees them.
+        carry(&mut pile, &runtime, message_source, &owner);
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -1428,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_maintain_each_chain_only_with_its_own_write_authority() {
+    fn reads_attach_each_chain_as_its_own_worker_carried_it() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -1504,8 +1482,9 @@ mod tests {
         };
         let before = records(&mut pile);
 
-        // The Message owner eagerly carries Message even for a read, but
-        // cannot carry Relations using its unrelated Message authority.
+        // A read attaches what each chain's worker carried and publishes
+        // nothing, whatever authority the reader holds: the fresh commits in
+        // both chains wait for their carries.
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -1518,15 +1497,12 @@ mod tests {
             relations::person_anchors(&relation_facts),
             BTreeSet::from([first_person])
         );
-        assert_eq!(
-            visible(&message_facts),
-            BTreeSet::from([first_message, second_message])
-        );
-        let maintained = records(&mut pile);
-        assert_ne!(maintained, before, "the read maintains Message");
+        assert_eq!(visible(&message_facts), BTreeSet::from([first_message]));
+        assert_eq!(records(&mut pile), before, "a read publishes nothing");
 
-        // Repeating the same read is idempotent; Relations still waits for a
-        // principal authorized to carry that chain.
+        // Once the Message worker carries the fresh message, the same read
+        // sees it; Relations still waits for its own worker.
+        carry(&mut pile, &runtime, message_source, &message_owner);
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -1543,9 +1519,8 @@ mod tests {
             visible(&message_facts),
             BTreeSet::from([first_message, second_message])
         );
-        assert_eq!(records(&mut pile), maintained);
-        // Once the Relations maintainer carries the fresh person, the same
-        // read sees it.
+        // Once the Relations worker carries the fresh person, the same read
+        // sees it.
         carry(&mut pile, &runtime, relations_source, &relations_owner);
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
@@ -1945,6 +1920,7 @@ mod tests {
         let id = envelope.root().unwrap();
         pile.commit(message_source, &owner, envelope).unwrap();
         carry(&mut pile, &runtime, relations_source, &owner);
+        carry(&mut pile, &runtime, message_source, &owner);
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -2117,7 +2093,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_eagerly_maintain_authorized_message_and_relations_chains() {
+    fn reads_attach_what_the_worker_carried_and_publish_nothing() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -2227,22 +2203,32 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        assert_ne!(before, after, "the read carries the resident source writes");
-        assert!(after.difference(&before).all(|record| matches!(
-            record,
-            CollectionRecord::Derive(_) | CollectionRecord::Merge(_)
-        )));
         assert_eq!(
-            visible(&message_facts),
-            BTreeSet::from([first_id, second_id])
+            before, after,
+            "a read publishes nothing, even for the owner"
         );
-        assert!(relations::person_anchors(&relation_facts).contains(&later_person));
+        assert_eq!(visible(&message_facts), BTreeSet::from([first_id]));
+        assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
         assert_eq!(visible(&old_messages), BTreeSet::from([first_id]));
         assert!(!relations::person_anchors(&old_relations).contains(&later_person));
         assert_eq!(pile.snapshot().unwrap().wants().unwrap().count(), 0);
         assert!(pile.health().started_at.is_none());
 
-        // Repeating the same authorized read has no new work to publish.
+        // The worker carries the fresh commits; the same read then sees them
+        // and, repeated, has no new work to publish.
+        carry(&mut pile, &runtime, relations_source, &owner);
+        carry(&mut pile, &runtime, message_source, &owner);
+        let after = pile
+            .snapshot()
+            .unwrap()
+            .select_records(&selectors)
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert!(after.difference(&before).all(|record| matches!(
+            record,
+            CollectionRecord::Derive(_) | CollectionRecord::Merge(_)
+        )));
         let bytes_after = std::fs::metadata(file.path()).unwrap().len();
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
@@ -2307,8 +2293,10 @@ mod tests {
             .0;
         }
         pile.commit(relations_source, &owner, people).unwrap();
-        // No external worker or fixture carry: preparing the operation must
-        // first make the raw Relations names available to sender resolution.
+        // The worker carries the names a sender is resolved against; each
+        // send then ensures its own images before it returns, which is the
+        // property under test.
+        carry(&mut pile, &runtime, relations_source, &owner);
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -2417,7 +2405,7 @@ mod tests {
     }
 
     #[test]
-    fn post_commit_maintenance_failure_names_the_already_published_fragment() {
+    fn post_commit_ensure_failure_names_the_already_published_fragment() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -2441,7 +2429,7 @@ mod tests {
             .unwrap();
         // This admitted but malformed input arrives after the operation's
         // frozen view. It cannot prevent the raw COMMIT; it does prevent
-        // completing the subsequent Succinct maintenance.
+        // ensuring the Succinct image after the commit.
         let raw: Inline<inlineencodings::Handle<UnknownBlob>> =
             pile.put(Bytes::from_source(vec![0_u8])).unwrap();
         let malformed: Inline<inlineencodings::Handle<SimpleArchive>> = raw.transmute();
@@ -2473,9 +2461,8 @@ mod tests {
             .unwrap_err();
         let text = format!("{error:#}");
         assert!(
-            text.contains("Message fragment was committed, but maintaining its query views failed")
+            text.contains("Message fragment was committed, but ensuring its derived views failed")
         );
-        assert!(text.contains("maintain Message Succinct collection"));
         let after = pile.snapshot().unwrap();
         let admitted = message_source.admitted(&after).unwrap();
         assert_eq!(admitted.len(), before.len() + 1);

@@ -159,13 +159,13 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
             },
         )
         .unwrap();
-    // Reads see what the worker carried; the test is the worker here. Both
-    // input chains hold the goal and its note before the pending goal lands.
+    // The worker carries both input chains; the owner's next add is ensured
+    // by the write itself, so it is readable without a carry.
     fixture.carry();
     fixture.operations().list(ListOptions::default()).unwrap();
     let pending = fixture
         .operations()
-        .add("not projected yet", AddOptions::default())
+        .add("projected at once", AddOptions::default())
         .unwrap();
 
     let owner = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
@@ -213,7 +213,7 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
                 .view::<faculties::storage::FactArchive>()
                 .unwrap();
             assert!(compass::goal_ids(&facts).contains(&first.goal));
-            assert!(!compass::goal_ids(&facts).contains(&pending.goal));
+            assert!(compass::goal_ids(&facts).contains(&pending.goal));
         }
     }
     let status = compass::status_register_collection(&mut pile, owner.verifying_key()).unwrap();
@@ -359,9 +359,8 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
         !priority.status.success(),
         "priority changes retain complete-source preparation"
     );
-    assert!(
-        String::from_utf8_lossy(&priority.stderr).contains("maintain Compass Succinct collection")
-    );
+    assert!(String::from_utf8_lossy(&priority.stderr)
+        .contains("priority changes need Compass views that stand for every admitted commit"));
     assert_eq!(records(), after);
 
     // The worker carries the writer's appended actions; only now do the

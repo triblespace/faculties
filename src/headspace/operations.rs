@@ -70,13 +70,13 @@ impl std::error::Error for CredentialUpdateError {
 }
 
 /// Typed context keeps Secrets-first error reporting honest when the reference
-/// COMMIT succeeded but its derived query targets could not be maintained.
+/// COMMIT succeeded but its derived views could not be ensured.
 #[derive(Debug)]
 struct HeadspaceCommitted;
 
 impl std::fmt::Display for HeadspaceCommitted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Headspace facts were committed; eager maintenance failed")
+        f.write_str("Headspace facts were committed, but ensuring their derived views failed")
     }
 }
 
@@ -270,6 +270,14 @@ impl Storage {
             )?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
+            drop(
+                pollster::block_on(crate::storage::ensure_derived(
+                    pile,
+                    collection,
+                    &self.signer,
+                ))
+                .context(HeadspaceCommitted)?,
+            );
             Ok(())
         })
     }

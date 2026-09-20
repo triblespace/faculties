@@ -251,13 +251,26 @@ fn with_files_store<T>(
     })
 }
 
+fn ensure_files_after_commit(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<()> {
+    drop(
+        runtime
+            .block_on(crate::storage::ensure_derived(store, collection, signer))
+            .context("Files facts were committed, but ensuring their derived views failed")?,
+    );
+    Ok(())
+}
+
 /// Attach one immutable shard-preserving Files view for commands whose result
 /// or mutation depends on facts already present in the collection.
 ///
-/// A signer that holds WRITE on the derived targets maintains them first, so
-/// a file saved a minute ago is visible; one that does not attaches the views
-/// as they stand, maintained here earlier or replicated from a node that may.
-/// Maintenance is a writer's exhaust, never a reader's obligation: on
+/// The views are attached as they stand: what a write ensured after its own
+/// commit, what the maintenance worker carried, or what replicated from a
+/// node that did. A read never maintains, whatever it may write: on
 /// 2026-09-14 a read on stars failed for want of WRITE on the Files Succinct
 /// target, and the answer is not wider rights.
 fn with_files_view<T>(
@@ -306,44 +319,9 @@ fn files_view_in<T>(
         let rank9 = store
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .context("register Files Rank9 collection")?;
-        let admitted = {
-            let snapshot = store
-                .snapshot()
-                .context("freeze Files admission snapshot")?;
-            let subject = signer.verifying_key();
-            succinct
-                .writer_is_admitted(&snapshot, subject)
-                .map_err(|error| anyhow::anyhow!("check Files Succinct WRITE admission: {error}"))?
-                && rank9
-                    .writer_is_admitted(&snapshot, subject)
-                    .map_err(|error| {
-                        anyhow::anyhow!("check Files Rank9 WRITE admission: {error}")
-                    })?
-        };
-        let reader = if admitted {
-            runtime.block_on(async {
-                drop(
-                    store
-                        .ensure(collection, signer)
-                        .await
-                        .context("ensure Files source collection")?,
-                );
-                drop(
-                    store
-                        .maintain(succinct, signer)
-                        .await
-                        .context("maintain Files Succinct collection")?,
-                );
-                store
-                    .maintain(rank9, signer)
-                    .await
-                    .context("maintain Files Rank9 collection")
-            })?
-        } else {
-            store
-                .snapshot()
-                .context("freeze the Files views as they stand")?
-        };
+        let reader = store
+            .snapshot()
+            .context("freeze the Files views as they stand")?;
         let space = reader
             .collection(rank9)
             .context("observe Files fact collection")?
@@ -768,6 +746,7 @@ fn cmd_add(
 
     pile.commit(collection, signer, change)
         .context("commit Files import")?;
+    ensure_files_after_commit(pile, collection, signer, runtime)?;
 
     // A saved image is searchable the moment it is saved, where this machine
     // can embed it (JP, 2026-09-12: saving an image should embed it, no skip
@@ -811,6 +790,7 @@ fn cmd_fetch(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
     url: &str,
     mime_override: Option<&str>,
     name_override: Option<&str>,
@@ -881,6 +861,7 @@ fn cmd_fetch(
     let content = content_handle_of(change.facts(), file_id).context("staged file content")?;
     pile.commit(collection, signer, change)
         .context("commit fetched file")?;
+    ensure_files_after_commit(pile, collection, signer, runtime)?;
     out.line(format!(
         "{}  {}  ({})",
         handle_hex(content),
@@ -1085,6 +1066,7 @@ fn cmd_tag<P: TriblePattern>(
     let change = entity! { ExclusiveId::force_ref(&eid) @ file::tag: tag_name };
     pile.commit(collection, signer, change)
         .context("commit Files tag")?;
+    ensure_files_after_commit(pile, collection, signer, runtime)?;
 
     out.line(format!("Tagged {name} with '{tag_name}'"))?;
     Ok(())
@@ -1520,6 +1502,7 @@ fn cmd_embed7b<P: TriblePattern>(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
     space: &P,
     reader: &PileSnapshot,
     force: bool,
@@ -1615,6 +1598,7 @@ fn cmd_embed7b<P: TriblePattern>(
 
     pile.commit(collection, signer, change)
         .context("commit Files 7b embeddings")?;
+    ensure_files_after_commit(pile, collection, signer, runtime)?;
 
     out.line(format!(
         "7b-embedded {embedded} unique images → {assigned} file entities (of {total_imgs} pending){}",
@@ -1726,6 +1710,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
     space: &P,
     reader: &PileSnapshot,
     force: bool,
@@ -1863,6 +1848,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
 
     pile.commit(collection, signer, change)
         .context("commit Files PDF page embeddings")?;
+    ensure_files_after_commit(pile, collection, signer, runtime)?;
 
     out.line(format!(
         "7b-embedded {pages_embedded} pages across {pdfs_done} PDFs (of {pending_pdfs} pending){}",
@@ -2347,10 +2333,11 @@ impl Files {
         tags: &[String],
     ) -> Result<Id> {
         let (change, file_id, _) = stage_byte_import(bytes, name, mime, tags, "resident bytes")?;
-        with_files_store(&self.storage, |store, collection, signer, _runtime| {
+        with_files_store(&self.storage, |store, collection, signer, runtime| {
             store
                 .commit(collection, signer, change)
                 .context("commit Files byte import")?;
+            ensure_files_after_commit(store, collection, signer, runtime)?;
             Ok(file_id)
         })
     }
@@ -2382,11 +2369,12 @@ impl Files {
 
     pub fn fetch(&self, options: &FetchOptions<'_>, out: &mut Out<'_>) -> Result<()> {
         anyhow::ensure!(options.max_bytes > 0, "max_bytes must be positive");
-        with_files_store(&self.storage, |store, collection, signer, _runtime| {
+        with_files_store(&self.storage, |store, collection, signer, runtime| {
             cmd_fetch(
                 store,
                 collection,
                 signer,
+                runtime,
                 options.url,
                 options.mime,
                 options.name,
@@ -2462,12 +2450,13 @@ impl Files {
         // boundaries; never retry the whole operation after partial publication.
         with_files_view(
             &self.storage,
-            |store, collection, signer, facts, snapshot, _runtime| {
+            |store, collection, signer, facts, snapshot, runtime| {
                 if options.pdf {
                     cmd_embed7b_pdf(
                         store,
                         collection,
                         signer,
+                        runtime,
                         facts,
                         snapshot,
                         options.force,
@@ -2481,6 +2470,7 @@ impl Files {
                         store,
                         collection,
                         signer,
+                        runtime,
                         facts,
                         snapshot,
                         options.force,
@@ -3396,7 +3386,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_without_write_attaches_the_files_views_as_they_stand() {
+    fn every_reader_attaches_the_files_views_as_they_stand() {
         let test_pile = TestPile::new();
         let owner = Storage::new(test_pile.path.clone(), None);
         let first = file_capability::stage(b"first".to_vec(), "first.txt", "text/plain").unwrap();
@@ -3405,35 +3395,39 @@ mod tests {
         let first_id = first.root().unwrap();
         let second_id = second.root().unwrap();
 
+        fn file_ids(space: &FactArchive) -> BTreeSet<Id> {
+            find!(
+                entity: Id,
+                pattern!(space, [{ ?entity @ metadata::tag: &KIND_FILE }])
+            )
+            .collect()
+        }
+
+        // The first fixture is a raw commit the worker has carried into the
+        // views; the second is a raw commit nobody has carried yet.
         with_files_store(&owner, |store, collection, signer, _| {
             store
                 .commit(collection, signer, first)
                 .context("commit first fixture")?;
-            Ok(())
-        })
-        .unwrap();
-        // The owner holds WRITE on the derived targets and maintains them.
-        with_files_view(&owner, |_, _, _, space, _, _| {
-            let ids = find!(
-                entity: Id,
-                pattern!(space, [{ ?entity @ metadata::tag: &KIND_FILE }])
-            )
-            .collect::<BTreeSet<_>>();
-            assert_eq!(ids, BTreeSet::from([first_id]));
-            Ok(())
-        })
-        .unwrap();
-        // A second commit that nobody has maintained into the views yet.
-        with_files_store(&owner, |store, collection, signer, _| {
+            // A raw commit is the worker's to carry, never a reader's.
+            crate::storage::carry_facts(store, collection, signer);
             store
                 .commit(collection, signer, second)
                 .context("commit second fixture")?;
             Ok(())
         })
         .unwrap();
+        // The owner holds WRITE on the derived targets and still attaches the
+        // views exactly as they stand: a read maintains nothing.
+        with_files_view(&owner, |_, _, _, space, _, _| {
+            assert_eq!(file_ids(space), BTreeSet::from([first_id]));
+            Ok(())
+        })
+        .unwrap();
 
         // A second key without WRITE reads the owner's collection: it must
-        // neither fail for want of rights nor publish maintenance it may not.
+        // neither fail for want of rights nor publish maintenance it may not,
+        // and it sees exactly what the owner saw.
         let reader_key = test_pile.dir.join("reader.key");
         initialize_signer(&test_pile.path, Some(&reader_key)).unwrap();
         let reader = Storage::new(test_pile.path.clone(), Some(reader_key));
@@ -3448,16 +3442,40 @@ mod tests {
                     signer,
                     runtime,
                     |_, _, _, space, _, _| {
-                        let ids = find!(
-                            entity: Id,
-                            pattern!(space, [{ ?entity @ metadata::tag: &KIND_FILE }])
-                        )
-                        .collect::<BTreeSet<_>>();
+                        let ids = file_ids(space);
                         assert!(ids.contains(&first_id), "the maintained view is readable");
                         assert!(
                             !ids.contains(&second_id),
                             "a reader without WRITE attaches the views as they stand"
                         );
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+
+        // Once the worker carries the second commit, both readers see it.
+        with_files_store(&owner, |store, collection, signer, _| {
+            crate::storage::carry_facts(store, collection, signer);
+            Ok(())
+        })
+        .unwrap();
+        with_files_view(&owner, |_, _, _, space, _, _| {
+            assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
+            Ok(())
+        })
+        .unwrap();
+        reader
+            .with_store(|store, signer, runtime| {
+                let collection = open(store, DEFAULT_SCOPE_ID, authority)
+                    .context("open the owner's Files collection")?;
+                files_view_in(
+                    store,
+                    collection,
+                    signer,
+                    runtime,
+                    |_, _, _, space, _, _| {
+                        assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
                         Ok(())
                     },
                 )
@@ -3483,6 +3501,8 @@ mod tests {
             store
                 .commit(collection, signer, second)
                 .context("commit second fixture")?;
+            // A raw commit is the worker's to carry.
+            crate::storage::carry_facts(store, collection, signer);
             Ok(())
         })
         .unwrap();
@@ -3538,10 +3558,14 @@ mod tests {
             let first = store
                 .commit(collection, signer, file.clone())
                 .context("first replay")?;
+            // A raw commit is the worker's to carry; carrying after each
+            // replay is what makes the view's count below an idempotence claim.
+            crate::storage::carry_facts(store, collection, signer);
             let second = store
                 .commit(collection, signer, file)
                 .context("second replay")?;
             assert_eq!(first, second);
+            crate::storage::carry_facts(store, collection, signer);
             Ok(())
         })
         .unwrap();

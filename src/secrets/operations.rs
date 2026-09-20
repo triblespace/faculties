@@ -2,7 +2,7 @@
 use crate::clock;
 use crate::secrets::{self, storage as secret_storage};
 use crate::storage::{open_secrets_collection, open_secrets_collection_read};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
 use std::path::PathBuf;
@@ -45,6 +45,14 @@ impl Secrets {
                 plaintext,
                 clock::point_now()?,
             )?;
+            drop(
+                pollster::block_on(crate::storage::ensure_derived(
+                    pile,
+                    collection.source(),
+                    signer,
+                ))
+                .context("Encrypted secret was committed, but ensuring its derived views failed")?,
+            );
             Ok(secret)
         })
     }
@@ -98,6 +106,18 @@ impl Secrets {
                 selected,
                 clock::now()?,
             )?;
+            if count != 0 {
+                drop(
+                    pollster::block_on(crate::storage::ensure_derived(
+                        pile,
+                        collection.source(),
+                        signer,
+                    ))
+                    .context(
+                        "Recipient envelopes were committed, but ensuring their derived views failed",
+                    )?,
+                );
+            }
             Ok(count)
         })
     }

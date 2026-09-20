@@ -1096,8 +1096,9 @@ where
 /// so a read that maintained when admitted paid the whole chain's catch-up on
 /// every call: measured on sky, 2026-09-20, 49 seconds against 13.5 seconds
 /// for the attach-only branch, and 956 seconds for the first read after a
-/// write. A commit nobody has carried yet waits for the worker, like one
-/// nobody has synced.
+/// write. A write ensures its own images before it returns, so its author
+/// reads it back at once; a commit that arrived by sync and that nobody has
+/// imaged yet waits for the worker, like one nobody has synced.
 async fn materialize_indexed_source<S>(
     pile: &mut S,
     source: Collection<blobencodings::SimpleArchive>,
@@ -1131,10 +1132,11 @@ where
 
 /// Publish one complete Compass action through an already-open pile.
 ///
-/// Maintained status artifacts are deliberately attached at read boundaries.
-/// Once this returns, the authoritative commit is durable; cache maintenance
-/// must never turn that success into an error which tempts a caller to retry
-/// the semantic action.
+/// This is the commit and nothing else. The write path that calls it then
+/// ensures the views derived from the Compass source, so the action is
+/// readable through them before the command returns; a failure there is
+/// reported as "committed, but ensuring failed", because the commit is
+/// durable and must not be retried.
 pub fn commit_collection<S>(
     pile: &mut S,
     signer: &SigningKey,

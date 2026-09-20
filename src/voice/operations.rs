@@ -211,6 +211,14 @@ impl VoiceSession<'_> {
             .pile
             .commit(self.collection, self.signer, fragment)
             .context("commit Voice fragment")?;
+        drop(
+            pollster::block_on(crate::storage::ensure_derived(
+                self.pile,
+                self.collection,
+                self.signer,
+            ))
+            .context("Voice facts were committed, but ensuring their derived views failed")?,
+        );
         Ok(commit)
     }
 }
