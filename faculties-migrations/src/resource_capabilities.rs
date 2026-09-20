@@ -223,12 +223,15 @@ fn prepare(
                     let commit =
                         CollectionCommit::sign(signer, new, commit.data(), commit.metadata());
                     let record = CollectionRecord::Commit(commit);
-                    if snapshot
-                        .record(record.fingerprint())
+                    // The successor member's producers are indexed; the exact
+                    // re-signed COMMIT is either one of them or still missing.
+                    let present = snapshot
+                        .select_records(&BTreeSet::from([
+                            CollectionRecordSelector::ProducedMember(new, commit.data()),
+                        ]))
                         .context("look up exact successor COMMIT")?
-                        != Some(record)
-                        && missing.insert(commit)
-                    {
+                        .contains(&record);
+                    if !present && missing.insert(commit) {
                         root.missing_commits += 1;
                     }
                 }
@@ -483,6 +486,20 @@ mod tests {
         pile.put::<SimpleArchive, _>(facts).unwrap()
     }
 
+    /// Whether `record` is one of the indexed producers of its own member.
+    fn holds(snapshot: &PileSnapshot, record: CollectionRecord) -> bool {
+        let CollectionRecord::Commit(commit) = record else {
+            unreachable!("only COMMIT records are probed here")
+        };
+        snapshot
+            .select_records(&BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                commit.collection(),
+                commit.data(),
+            )]))
+            .unwrap()
+            .contains(&record)
+    }
+
     #[test]
     fn predecessor_matches_live_core_35ec1817_descriptor_handles() {
         // Public identity and exact handles independently observed from the
@@ -539,12 +556,7 @@ mod tests {
         assert!(after.starts_with(&before));
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert_eq!(
-            snapshot
-                .record(CollectionRecord::Commit(source).fingerprint())
-                .unwrap(),
-            Some(CollectionRecord::Commit(source))
-        );
+        assert!(holds(&snapshot, CollectionRecord::Commit(source)));
         let target = snapshot
             .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
                 root.new,
@@ -603,10 +615,7 @@ mod tests {
         ));
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert_eq!(
-            snapshot.record(expected.fingerprint()).unwrap(),
-            Some(expected)
-        );
+        assert!(holds(&snapshot, expected));
         assert_eq!(
             snapshot.get::<TribleSet, SimpleArchive>(data).unwrap(),
             *facts.facts()
@@ -669,10 +678,7 @@ mod tests {
                 source.data(),
                 source.metadata(),
             ));
-            assert_eq!(
-                snapshot.record(expected.fingerprint()).unwrap(),
-                Some(expected)
-            );
+            assert!(holds(&snapshot, expected));
         }
         assert_eq!(snapshot.proofs().unwrap().count(), 0);
         drop(snapshot);
@@ -832,10 +838,7 @@ mod tests {
         );
         let mut pile = open_pile_strict(&path).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert_eq!(
-            snapshot.record(original.fingerprint()).unwrap(),
-            Some(original)
-        );
+        assert!(holds(&snapshot, original));
         drop(snapshot);
         pile.close().unwrap();
     }
