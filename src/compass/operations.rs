@@ -382,30 +382,16 @@ impl CompassStorage<'_> {
             let reader = pile
                 .snapshot()
                 .context("freeze maintained Compass/Relations snapshot")?;
-            let observed = reader
+            // No read refuses for being behind. There is no globally
+            // consistent state to be behind of: another node holds commits
+            // this one has never seen, so "stands for every admitted commit"
+            // is a closed-world claim, and refusing on it would only narrow
+            // the branching of one entity's history a little. A priority
+            // change reads what it can see, like everything else, and
+            // ensures its own images after it commits.
+            let facts = reader
                 .collection(compass_rank9)
-                .context("observe Compass fact collection")?;
-            if preparation == Preparation::Complete {
-                // A priority change reasons over every goal, so the view it
-                // reads must stand for every admitted commit; what the
-                // worker has not carried yet is not this write's to guess.
-                let support = observed
-                    .support()
-                    .context("resolve Compass fact collection support")?;
-                let admitted = compass_source
-                    .admitted(&reader)
-                    .context("resolve admitted Compass commits")?;
-                let waiting = admitted
-                    .difference(support)
-                    .context("compare Compass support")?
-                    .len();
-                anyhow::ensure!(
-                    waiting == 0,
-                    "priority changes need Compass views that stand for every admitted \
-                     commit; {waiting} await the maintenance worker"
-                );
-            }
-            let facts = observed
+                .context("observe Compass fact collection")?
                 .view::<FactArchive>()
                 .context("read Compass fact collection")?;
             let by = if let (Some(persona), Some((_, _, rank9))) = (persona, relation_collections) {

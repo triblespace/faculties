@@ -393,30 +393,11 @@ async fn views_in<T>(
     let observed_latest = reader
         .collection(latest)
         .context("observe Wiki supersession index")?;
-    if preparation == Preparation::Update {
-        // A stale frontier is not a substitute for the frontier an edit is
-        // about to supersede: both views must stand for every admitted
-        // commit, and what the worker has not carried yet is not this
-        // edit's to guess.
-        let admitted = wiki_source
-            .admitted(&reader)
-            .context("resolve admitted Wiki commits")?;
-        for (name, support) in [
-            ("fact", observed_facts.support()),
-            ("supersession", observed_latest.support()),
-        ] {
-            let support = support.with_context(|| format!("resolve Wiki {name} support"))?;
-            let waiting = admitted
-                .difference(support)
-                .with_context(|| format!("compare Wiki {name} support"))?
-                .len();
-            anyhow::ensure!(
-                waiting == 0,
-                "frontier-changing edits need Wiki views that stand for every admitted \
-                 commit; {waiting} await the maintenance worker in the {name} index"
-            );
-        }
-    }
+    // No read refuses for being behind. There is no globally consistent
+    // state to be behind of, so "stands for every admitted commit" is a
+    // closed-world claim; an edit made from the frontier this node can see
+    // branches that entity's history a little, which is what a monotone
+    // store is for. The edit ensures its own images after it commits.
     let facts = observed_facts
         .view::<FactArchive>()
         .context("read Wiki fact collection")?;
@@ -2406,20 +2387,20 @@ mod tests {
                     "a reader must not publish maintenance equations",
                 );
 
-                // A pre-edit operation cannot silently replace its full
-                // current-frontier preparation with the read-only fallback.
-                let update = runtime.block_on(views_in(
-                    pile,
-                    source,
-                    signer,
-                    Preparation::Update,
-                    &[],
-                    |_, _| Ok(()),
-                ));
-                assert!(
-                    update.is_err(),
-                    "updating the missing rollups requires WRITE"
-                );
+                // An edit's preparation reads the same frontier and refuses
+                // nothing for being behind: there is no globally consistent
+                // state to be behind of. It acquires the source's payloads
+                // and publishes no equation of its own.
+                runtime
+                    .block_on(views_in(
+                        pile,
+                        source,
+                        signer,
+                        Preparation::Update,
+                        &[],
+                        |_, _| Ok(()),
+                    ))
+                    .unwrap();
                 assert_eq!(
                     pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?,
                     before,

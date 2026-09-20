@@ -589,18 +589,28 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
         "failed append operations must publish no records"
     );
 
-    // Frontier-changing edits retain the stricter contract in this slice.
+    // An edit supersedes the frontier this node can see, and no read refuses
+    // for being behind: there is no globally consistent state to be behind
+    // of. Editing from a frontier another node has already moved branches
+    // that entry's history, which is what a monotone store is for.
     let edited = command(&writer_key)
         .args([
             "edit",
             &format!("{first:x}"),
-            "do not edit from a stale frontier",
+            "edit from the frontier this node can see",
         ])
         .output()
         .unwrap();
-    assert!(!edited.status.success());
-    assert!(String::from_utf8_lossy(&edited.stderr)
-        .contains("frontier-changing edits need Wiki views that stand for every admitted commit"));
+    assert!(edited.status.success(), "{edited:?}");
+    let after_edit = records();
+    let edits: Vec<_> = after_edit.difference(&after).copied().collect();
+    assert_eq!(edits.len(), 1);
+    assert!(edits.iter().all(|record| matches!(record,
+        CollectionRecord::Commit(commit)
+            if commit.collection() == source.handle()
+                && commit.public_key().raw == writer.verifying_key().to_bytes()
+    )));
+    let after = after_edit;
     assert_eq!(records(), after);
 
     // The worker carries the writer's source commits; only then does the

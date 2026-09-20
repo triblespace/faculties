@@ -346,6 +346,10 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
     ));
     let after = after_forward_reference;
 
+    // A priority change reads the frontier this node can see and publishes
+    // over it. No read refuses for being behind: there is no globally
+    // consistent state to be behind of, and a source-only writer is as
+    // entitled to that frontier as anyone.
     let priority = command(&writer_key)
         .args([
             "prioritize",
@@ -355,12 +359,16 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
         ])
         .output()
         .unwrap();
-    assert!(
-        !priority.status.success(),
-        "priority changes retain complete-source preparation"
-    );
-    assert!(String::from_utf8_lossy(&priority.stderr)
-        .contains("priority changes need Compass views that stand for every admitted commit"));
+    assert!(priority.status.success(), "{priority:?}");
+    let after_priority = records();
+    let prioritized: Vec<_> = after_priority.difference(&after).copied().collect();
+    assert_eq!(prioritized.len(), 1);
+    assert!(matches!(prioritized[0],
+        CollectionRecord::Commit(commit)
+            if commit.collection() == source.handle()
+                && commit.public_key().raw == writer.verifying_key().to_bytes()
+    ));
+    let after = after_priority;
     assert_eq!(records(), after);
 
     // The worker carries the writer's appended actions; only now do the
