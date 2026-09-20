@@ -1685,12 +1685,16 @@ pub async fn materialize_indexed_collection(
         .context("read Wiki collection")?;
     let target = latest_collection(pile, signer.verifying_key())?;
     let maintained = pile
-        .maintain_exact(target, signer, &cover)
+        .maintain(target, signer)
         .await
         .map_err(|error| anyhow!("maintain Wiki supersession index: {error}"))?;
     let latest = maintained
-        .collection_exact(target, &cover)
-        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
+        .collection(target)
+        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?;
+    if latest.support().map_err(|error| anyhow!("{error}"))? != &cover {
+        bail!("Wiki supersession index stands on a different support than the facts read");
+    }
+    let latest = latest
         .view::<LatestIndex>()
         .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
     // This explicit migration/import projection retains the complete-facts

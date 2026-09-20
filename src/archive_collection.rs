@@ -20,7 +20,6 @@ use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBl
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
-    Support,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
@@ -30,7 +29,6 @@ use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
-#[cfg(test)]
 use triblespace_search::portable_bm25::PortableBM25Blob;
 
 use crate::archive_bm25;
@@ -378,35 +376,45 @@ struct EnsuredBm25 {
     index: archive_bm25::ArchiveBM25View,
 }
 
-/// Maintain the BM25 representation for one explicit foundational support.
-/// Provenance records are neither part of this value nor required to replay it.
-async fn ensure_bm25_exact(
+/// Register the BM25 derivation over the Archive source.
+fn bm25_target(
     pile: &mut Pile,
-    support: &Support,
+    source: Collection<SimpleArchive>,
+    signer: &SigningKey,
+) -> Result<Collection<PortableBM25Blob>> {
+    pile.derive_with(
+        source,
+        archive_bm25::ArchiveBlockTextBm25Mapping,
+        crate::collection_names::private_policy(signer.verifying_key()),
+    )
+    .context("register Archive BM25 derivation")
+}
+
+/// Maintain the BM25 representation so it stands for everything the Archive
+/// source stands on, and read it back from the maintained snapshot.
+/// Provenance records are neither part of this value nor required to replay it.
+async fn ensure_bm25(
+    pile: &mut Pile,
+    source: Collection<SimpleArchive>,
     signer: &SigningKey,
 ) -> Result<EnsuredBm25> {
-    let target = pile
-        .derive_with(
-            support.collection(),
-            archive_bm25::ArchiveBlockTextBm25Mapping,
-            crate::collection_names::private_policy(signer.verifying_key()),
-        )
-        .context("register Archive BM25 derivation")?;
+    let target = bm25_target(pile, source, signer)?;
     let maintained = pile
-        .maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer, support)
+        .maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer)
         .await
-        .context("maintain exact Archive BM25 cover")?;
+        .context("maintain Archive BM25 cover")?;
     let attached = maintained
-        .collection_exact(target, support)
-        .context("attach exact Archive BM25 cover")?;
+        .collection(target)
+        .context("attach Archive BM25 cover")?;
+    let support = attached.support().context("resolve Archive BM25 support")?;
     let index = attached
         .view::<archive_bm25::ArchiveBM25View>()
-        .context("read exact Archive BM25 cover")?;
+        .context("read Archive BM25 cover")?;
     Ok(EnsuredBm25 {
         report: Bm25IndexReport {
             source_elements: support.len(),
             cover_segments: attached.cover().len(),
-            source_collection: support.collection().handle(),
+            source_collection: source.handle(),
             target_collection: target.handle(),
         },
         index,
@@ -429,19 +437,20 @@ pub fn ensure_bm25_index_with_storage(
     storage.with_pile(|pile, signer| {
         pollster::block_on(async {
             let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let observed = ensure_facts(pile, source, signer).await?;
-            let support = observed
-                .support()
-                .context("resolve Archive support for BM25 indexing")?;
-            Ok(ensure_bm25_exact(pile, support, signer).await?.report)
+            drop(ensure_facts(pile, source, signer).await?);
+            Ok(ensure_bm25(pile, source, signer).await?.report)
         })
     })
 }
 
-/// Prepare fact and search values for the same exact support. The returned
-/// collection snapshot exposes the usual fact view and blob reader; callers
-/// explicitly prepare a BM25 query and join document ids to whatever facts
-/// their operation needs. Attaching the search cover does not serialize its union.
+/// Prepare fact and search values that stand for the same support. Both are
+/// derived from the one Archive source, both are maintained here, and both are
+/// attached from one snapshot, so they agree by construction; a commit that
+/// lands between the two maintenance passes is caught by comparing the two
+/// supports and maintaining once more. The returned collection snapshot
+/// exposes the usual fact view and blob reader; callers explicitly prepare a
+/// BM25 query and join document ids to whatever facts their operation needs.
+/// Attaching the search cover does not serialize its union.
 pub async fn ensure_search_local(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
@@ -464,20 +473,48 @@ pub fn ensure_search_local_with_storage(
     storage.with_pile(|pile, signer| {
         pollster::block_on(async {
             let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let observed = ensure_facts(pile, source, signer).await?;
-            let support = observed
-                .support()
-                .context("resolve exact Archive search support")?;
-            let ensured = ensure_bm25_exact(pile, support, signer).await?;
-            // Search maintenance may have acquired referenced text payloads. Attach
-            // the fact view through the final reader while retaining exact support.
-            let after = pile
-                .snapshot()
-                .context("freeze prepared Archive search snapshot")?;
-            let observed = after
-                .collection_exact(observed.cover().collection(), support)
-                .context("reattach exact Archive search facts")?;
-            Ok((observed, ensured.index))
+            let target = bm25_target(pile, source, signer)?;
+            let mut attempts = 0;
+            loop {
+                let facts_target = ensure_facts(pile, source, signer).await?.cover().collection();
+                drop(
+                    pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer)
+                        .await
+                        .context("maintain Archive BM25 cover")?,
+                );
+                // One snapshot for both views: search maintenance may have
+                // acquired referenced text payloads, and the facts are read
+                // through that same reader.
+                let after = pile
+                    .snapshot()
+                    .context("freeze prepared Archive search snapshot")?;
+                let facts = after
+                    .collection(facts_target)
+                    .context("attach Archive search facts")?;
+                let search = after
+                    .collection(target)
+                    .context("attach Archive BM25 cover")?;
+                let facts_support = facts
+                    .support()
+                    .context("resolve Archive facts support")?;
+                let search_support = search
+                    .support()
+                    .context("resolve Archive BM25 support")?;
+                if facts_support == search_support {
+                    let index = search
+                        .view::<archive_bm25::ArchiveBM25View>()
+                        .context("read Archive BM25 cover")?;
+                    return Ok((facts, index));
+                }
+                attempts += 1;
+                if attempts >= 3 {
+                    bail!(
+                        "Archive facts and search stand on different supports after {attempts} passes: {} against {} members",
+                        facts_support.len(),
+                        search_support.len()
+                    );
+                }
+            }
         })
     })
 }
@@ -1599,9 +1636,8 @@ mod tests {
             .support()
             .unwrap()
             .clone();
-        let attached = store_snapshot
-            .collection_exact(target, &source_support)
-            .unwrap();
+        let attached = store_snapshot.collection(target).unwrap();
+        assert_eq!(attached.support().unwrap(), &source_support);
         assert_eq!(attached.cover().len(), 1);
         pile.close().unwrap();
 
@@ -1834,50 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn bm25_frozen_cover_excludes_a_later_admitted_commit() {
-        let directory = TempDir::new().unwrap();
-        let pile_path = directory.path().join("archive.pile");
-        std::fs::File::create(&pile_path).unwrap();
-        let key = directory.path().join("archive.key");
-        let signer = initialize_archive_fixture(&pile_path, &key);
-
-        let first = commit_projection(&pile_path, &key, "session:frozen", "frozen needle");
-        let frozen = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        let later = commit_projection(&pile_path, &key, "session:later", "later needle");
-
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let ensured = pollster::block_on(ensure_bm25_exact(
-            &mut pile,
-            frozen.support().unwrap(),
-            &signer,
-        ))
-        .unwrap();
-
-        assert_eq!(ensured.report.source_elements, 1);
-        drop(ensured);
-        pile.close().unwrap();
-        drop(frozen);
-
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let source = test_source(&mut pile, &pile_path, &key);
-        let target = test_target(&mut pile, source, &pile_path, &key);
-        let records = {
-            let store_snapshot = pile.snapshot().unwrap();
-            discover_collection_records(&store_snapshot).unwrap()
-        };
-        let inputs: BTreeSet<_> = records
-            .derives()
-            .iter()
-            .filter(|claim| claim.collection() == target.handle())
-            .map(|claim| claim.input())
-            .collect();
-        assert_eq!(inputs, BTreeSet::from([first.data()]));
-        assert!(!inputs.contains(&later.data()));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn bm25_exact_maintenance_derives_only_the_residual_and_reuses_its_merge() {
+    fn bm25_maintenance_derives_only_the_residual_and_reuses_its_merge() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -1887,25 +1880,16 @@ mod tests {
         let first_archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
         let first_support = first_archive.support().unwrap().clone();
         drop(first_archive);
-        commit_projection(&pile_path, &key, "session:second", "second residual");
-        let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        let full_support = archive.support().unwrap().clone();
-        drop(archive);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
         let first_snapshot = pollster::block_on(
-            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                target,
-                &signer,
-                &first_support,
-            ),
+            pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
         )
         .unwrap();
-        let first = first_snapshot
-            .collection_exact(target, &first_support)
-            .unwrap();
+        let first = first_snapshot.collection(target).unwrap();
+        assert_eq!(first.support().unwrap(), &first_support);
         assert_eq!(first.cover().len(), 1);
         drop(first);
         let first_records = {
@@ -1918,18 +1902,21 @@ mod tests {
             .filter(|claim| claim.collection() == target.handle())
             .count();
         assert_eq!(first_derives, 1);
+        pile.close().unwrap();
 
+        commit_projection(&pile_path, &key, "session:second", "second residual");
+        let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
+        let full_support = archive.support().unwrap().clone();
+        drop(archive);
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let source = test_source(&mut pile, &pile_path, &key);
+        let target = test_target(&mut pile, source, &pile_path, &key);
         let full_snapshot = pollster::block_on(
-            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                target,
-                &signer,
-                &full_support,
-            ),
+            pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
         )
         .unwrap();
-        let full = full_snapshot
-            .collection_exact(target, &full_support)
-            .unwrap();
+        let full = full_snapshot.collection(target).unwrap();
+        assert_eq!(full.support().unwrap(), &full_support);
         assert_eq!(full.cover().len(), 1);
         let full_records = {
             let store_snapshot = pile.snapshot().unwrap();
@@ -1953,16 +1940,11 @@ mod tests {
             records_before.merges().len(),
         );
         let retry_snapshot = pollster::block_on(
-            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                target,
-                &signer,
-                &full_support,
-            ),
+            pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
         )
         .unwrap();
-        let retry = retry_snapshot
-            .collection_exact(target, &full_support)
-            .unwrap();
+        let retry = retry_snapshot.collection(target).unwrap();
+        assert_eq!(retry.support().unwrap(), &full_support);
         assert_eq!(retry.cover().len(), 1, "the admitted MERGE is reused");
         drop(retry);
         let records_after = {
@@ -1978,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
+    fn maintenance_recovers_a_pending_derive_with_a_missing_output() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2013,16 +1995,11 @@ mod tests {
             .is_none());
 
         let ready_snapshot = pollster::block_on(
-            pile.maintain_exact_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                target,
-                &signer,
-                &source_support,
-            ),
+            pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
         )
         .unwrap();
-        let ready = ready_snapshot
-            .collection_exact(target, &source_support)
-            .unwrap();
+        let ready = ready_snapshot.collection(target).unwrap();
+        assert_eq!(ready.support().unwrap(), &source_support);
         assert_eq!(
             ready
                 .cover()

@@ -687,23 +687,24 @@ impl TeamsSession {
                 .await
                 .context("refresh configured Secrets collection for Teams")?;
         let reader = secrets.store_snapshot().clone();
-        // Credential-only refreshes retain the session's Teams support;
-        // Teams commits observe the ordinary view at this final snapshot.
-        let observed = match support.as_ref() {
-            Some(support) => reader.collection_exact(self.rank9, support),
-            None => reader.collection(self.rank9),
+        // A credential-only refresh keeps the session's Teams facts and
+        // support as they were selected; only Secrets and the reader move.
+        // A Teams commit observes the ordinary view at this final snapshot.
+        if support.is_none() {
+            let observed = reader
+                .collection(self.rank9)
+                .context("attach Teams through Secrets snapshot")?;
+            let support = observed
+                .support()
+                .context("resolve Teams support through Secrets snapshot")?
+                .clone();
+            let facts = observed
+                .view::<FactArchive>()
+                .context("read Teams through Secrets snapshot")?;
+            drop(observed);
+            self.support = support;
+            self.facts = facts;
         }
-        .context("attach Teams through Secrets snapshot")?;
-        let support = observed
-            .support()
-            .context("resolve Teams support through Secrets snapshot")?
-            .clone();
-        let facts = observed
-            .view::<FactArchive>()
-            .context("read Teams through Secrets snapshot")?;
-        drop(observed);
-        self.support = support;
-        self.facts = facts;
         self.reader = reader;
         self.secrets = secrets;
         Ok(())

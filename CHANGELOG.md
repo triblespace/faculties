@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- The exact collection API is gone from core, and with it every place a
+  faculty asked for a support: the archive search maintains its fact view
+  and its BM25 index, attaches both from one snapshot and compares their
+  supports, maintaining once more if a commit landed between; the wiki
+  supersession index is read the same way; a Teams credential-only refresh
+  keeps the session's facts and support; the secrets collection's ensure and
+  maintain are the plain calls, its exact variants and `snapshot_exact` gone,
+  and it ensures the source root first when the derived levels do not yet
+  cover every admitted commit, so a missing payload is reported, not hidden.
+
 - Reads attach what the maintenance worker carried and never maintain. Every
   read helper (compass, body, wiki, habits, discord, decide, cognition, atlas,
   relations' read-only calls, the widgets viewer) used to ensure its source and

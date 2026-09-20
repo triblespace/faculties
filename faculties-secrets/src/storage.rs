@@ -16,7 +16,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{
     Collection, CollectionHandle, CollectionPolicy, CollectionRealizationError,
-    CollectionSnapshotExt, CollectionStoreExt, Support,
+    CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::SnapshotSource;
@@ -97,134 +97,80 @@ impl SecretsCollection {
         self.rank9
     }
 
-    /// Ensure both physical encodings for one exact foundational support.
-    ///
-    /// This constructs only what the requested support needs. It does not run
-    /// LSM compaction policy or widen the caller's explicit support.
-    pub async fn ensure_exact<S>(
-        self,
-        store: &mut S,
-        signer: &SigningKey,
-        support: &triblespace::core::collection::Support,
-    ) -> Result<S::Snapshot>
+    /// Ensure the source root when the derived encodings do not yet stand for
+    /// every admitted commit: a payload the root cannot fetch is then reported
+    /// rather than hidden behind an empty derived view. A commit the derived
+    /// encodings already stand for is never fetched again.
+    async fn ensure_source_if_behind<S>(self, store: &mut S, signer: &SigningKey) -> Result<()>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        drop(
-            store
-                .ensure_exact(self.succinct, signer, support)
-                .await
-                .context("ensure Succinct Secrets collection")?,
-        );
-        store
-            .ensure_exact(self.rank9, signer, support)
-            .await
-            .context("ensure Rank9 Secrets collection")
+        let before = store
+            .snapshot()
+            .context("freeze Secrets source selection")?;
+        let admitted = self
+            .source
+            .admitted(&before)
+            .context("admit Secrets source support")?;
+        let succinct = before
+            .collection(self.succinct)
+            .context("observe resident Succinct Secrets support")?
+            .support()
+            .context("resolve resident Succinct Secrets support")?
+            .clone();
+        let rank9 = before
+            .collection(self.rank9)
+            .context("observe resident Rank9 Secrets support")?
+            .support()
+            .context("resolve resident Rank9 Secrets support")?
+            .clone();
+        let covered = succinct.union(&rank9)?;
+        drop(before);
+        if !admitted.is_subset(&covered)? {
+            drop(
+                store
+                    .ensure(self.source, signer)
+                    .await
+                    .context("ensure Secrets source collection")?,
+            );
+        }
+        Ok(())
     }
 
-    /// Realize missing support without reconstructing already endorsed inputs.
+    /// Make both derived encodings stand for everything the source stands
+    /// on, without carrying them.
     pub async fn ensure<S>(self, store: &mut S, signer: &SigningKey) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        let before = store.snapshot().context("freeze Secrets work selection")?;
-        let admitted = self
-            .source
-            .admitted(&before)
-            .context("admit Secrets source support")?;
-        let succinct = before
-            .collection(self.succinct)
-            .context("observe resident Succinct Secrets support")?
-            .support()
-            .context("resolve resident Succinct Secrets support")?
-            .clone();
-        let rank9 = before
-            .collection(self.rank9)
-            .context("observe resident Rank9 Secrets support")?
-            .support()
-            .context("resolve resident Rank9 Secrets support")?
-            .clone();
-        let resident = succinct.union(&rank9)?;
-        let missing = admitted.difference(&resident)?;
-        let support = admitted.union(&resident)?;
-        drop(before);
-
-        // Existing coarse Succinct members remain whole even if part of their
-        // support is already in Rank9. Only new root support needs this hop.
-        if !missing.is_empty() {
-            drop(
-                store
-                    .ensure_exact(self.succinct, signer, &missing)
-                    .await
-                    .context("ensure missing Succinct Secrets support")?,
-            );
-        }
+        self.ensure_source_if_behind(store, signer).await?;
+        drop(
+            store
+                .ensure(self.succinct, signer)
+                .await
+                .context("ensure Succinct Secrets collection")?,
+        );
         store
-            .ensure_exact(self.rank9, signer, &support)
+            .ensure(self.rank9, signer)
             .await
             .context("ensure Rank9 Secrets collection")
     }
 
-    /// Maintain both derived lattices for one exact foundational support.
-    pub async fn maintain_exact<S>(
-        self,
-        store: &mut S,
-        signer: &SigningKey,
-        support: &triblespace::core::collection::Support,
-    ) -> Result<S::Snapshot>
-    where
-        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
-    {
-        drop(
-            store
-                .maintain_exact(self.succinct, signer, support)
-                .await
-                .context("maintain Succinct Secrets collection")?,
-        );
-        store
-            .maintain_exact(self.rank9, signer, support)
-            .await
-            .context("maintain Rank9 Secrets collection")
-    }
-
-    /// Maintain resident and new support without demanding target-only ancestors.
+    /// Make both derived encodings stand for everything the source stands
+    /// on, then carry each to its LSM fixed point.
     pub async fn maintain<S>(self, store: &mut S, signer: &SigningKey) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        let before = store.snapshot().context("freeze Secrets work selection")?;
-        let admitted = self
-            .source
-            .admitted(&before)
-            .context("admit Secrets source support")?;
-        let succinct = before
-            .collection(self.succinct)
-            .context("observe resident Succinct Secrets support")?
-            .support()
-            .context("resolve resident Succinct Secrets support")?
-            .clone();
-        let rank9 = before
-            .collection(self.rank9)
-            .context("observe resident Rank9 Secrets support")?
-            .support()
-            .context("resolve resident Rank9 Secrets support")?
-            .clone();
-        let resident = succinct.union(&rank9)?;
-        let missing = admitted.difference(&resident)?;
-        let source_work = succinct.union(&missing)?;
-        let support = admitted.union(&resident)?;
-        drop(before);
-
-        if !source_work.is_empty() {
-            drop(
-                store
-                    .maintain_exact(self.succinct, signer, &source_work)
-                    .await
-                    .context("maintain Succinct Secrets collection")?,
-            );
-        }
+        self.ensure_source_if_behind(store, signer).await?;
+        drop(
+            store
+                .maintain(self.succinct, signer)
+                .await
+                .context("maintain Succinct Secrets collection")?,
+        );
         store
-            .maintain_exact(self.rank9, signer, &support)
+            .maintain(self.rank9, signer)
             .await
             .context("maintain Rank9 Secrets collection")
     }
@@ -252,43 +198,6 @@ where
             observed
                 .view::<SecretsFacts>()
                 .context("read maintained Secrets collection")?,
-        )
-    };
-    Ok(SecretsSnapshot::new(
-        store_snapshot,
-        collection.handle(),
-        support,
-        facts,
-    ))
-}
-
-/// Attach the already-realized Rank9 collection to its exact frozen support.
-///
-/// Use this when the caller intentionally limits the result to an explicit
-/// support. Ordinary reads use [`snapshot`] and reflect the actual returned
-/// store snapshot, including other already-certified target members.
-pub fn snapshot_exact<R>(
-    store_snapshot: R,
-    collection: SecretsCollection,
-    support: Support,
-) -> Result<SecretsSnapshot<R>>
-where
-    R: StoreRead,
-{
-    let observed = store_snapshot
-        .collection_exact(collection.rank9, &support)
-        .context("attach exact maintained Secrets collection")?;
-    let support = observed
-        .support()
-        .context("resolve exact Secrets snapshot support")?
-        .clone();
-    let facts = if observed.cover().is_empty() {
-        None
-    } else {
-        Some(
-            observed
-                .view::<SecretsFacts>()
-                .context("read exact maintained Secrets collection")?,
         )
     };
     Ok(SecretsSnapshot::new(
@@ -630,151 +539,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_snapshot_hydrates_cold_data_without_widening_support_during_derivation() {
-        pollster::block_on(async {
-            let authority = SigningKey::generate(&mut OsRng);
-            let left_writer = SigningKey::generate(&mut OsRng);
-            let right_writer = SigningKey::generate(&mut OsRng);
-            let mut store = AcquiringStore::default();
-            let collection = SecretsCollection::register(
-                &mut store,
-                "cold-and-concurrent",
-                direct_policy(authority.verifying_key()),
-            )
-            .unwrap();
-
-            let (left_secret, left_commit, left_blobs) =
-                detached_secret_commit(collection.source(), &left_writer, "left", b"cold", at(30));
-            for blob in &left_blobs {
-                store.offer(blob);
-            }
-            store.insert(CollectionRecord::Commit(left_commit)).unwrap();
-
-            let left_proof = CapabilityProof::new(
-                CapabilityResource::from(collection.handle()),
-                &authority,
-                write_capability(),
-                left_writer.verifying_key(),
-            );
-            store.insert_proof(left_proof).unwrap();
-
-            let (right_secret, right_commit, right_blobs) = detached_secret_commit(
-                collection.source(),
-                &right_writer,
-                "right",
-                b"concurrent",
-                at(31),
-            );
-            let right_proof = CapabilityProof::new(
-                CapabilityResource::from(collection.handle()),
-                &authority,
-                write_capability(),
-                right_writer.verifying_key(),
-            );
-
-            // A producer already validated and realized the right-hand input.
-            // Build that honest witness chain where its WRITE proof is present,
-            // then replicate records and blobs without replicating the proof.
-            let mut right_staging = MemoryRepo::default();
-            let descriptors = store.snapshot().unwrap();
-            for info in descriptors.blobs() {
-                let info = info.unwrap();
-                right_staging
-                    .put::<UnknownBlob, _>(
-                        descriptors
-                            .get::<Blob<UnknownBlob>, _>(info.handle)
-                            .unwrap(),
-                    )
-                    .unwrap();
-            }
-            for blob in right_blobs {
-                right_staging.put::<UnknownBlob, _>(blob).unwrap();
-            }
-            right_staging
-                .insert(CollectionRecord::Commit(right_commit))
-                .unwrap();
-            right_staging.insert_proof(right_proof.clone()).unwrap();
-            let right_support = collection
-                .source()
-                .cover([Handle::<SimpleArchive>::from_hash(right_commit.data())]);
-            drop(
-                collection
-                    .ensure_exact(&mut right_staging, &authority, &right_support)
-                    .await
-                    .unwrap(),
-            );
-            let realized = right_staging.snapshot().unwrap();
-            for info in realized.blobs() {
-                let info = info.unwrap();
-                store
-                    .inner
-                    .put::<UnknownBlob, _>(
-                        realized.get::<Blob<UnknownBlob>, _>(info.handle).unwrap(),
-                    )
-                    .unwrap();
-            }
-            for record in realized.records().unwrap() {
-                store.inner.insert(record.unwrap()).unwrap();
-            }
-
-            let before = store.snapshot().unwrap();
-            assert!(!collection
-                .source()
-                .writer_is_admitted(&before, right_writer.verifying_key())
-                .unwrap());
-            assert_eq!(
-                before
-                    .collection_exact(collection.rank9(), &right_support)
-                    .unwrap()
-                    .support()
-                    .unwrap(),
-                &right_support,
-            );
-            assert!(snapshot(before, collection).unwrap().contains(right_secret));
-
-            // The caller explicitly requests only left. This proof arrives
-            // during the first mapping edge and must not widen that exact
-            // request across the second edge. An ordinary target snapshot,
-            // unlike this exact observation, already includes right above.
-            store.inject_proof_on_derive = Some(right_proof);
-            let left_support = collection
-                .source()
-                .cover([Handle::<SimpleArchive>::from_hash(left_commit.data())]);
-            drop(
-                store
-                    .ensure_exact(collection.source(), &authority, &left_support)
-                    .await
-                    .unwrap(),
-            );
-            let first_snapshot = collection
-                .ensure_exact(&mut store, &authority, &left_support)
-                .await
-                .unwrap();
-            let first = snapshot_exact(first_snapshot, collection, left_support.clone()).unwrap();
-            assert!(first.contains(left_secret));
-            assert!(!first.contains(right_secret));
-            assert_eq!(first.support(), &left_support);
-            assert!(store.acquired.contains(&left_commit.data()));
-            assert!(store.inject_proof_on_derive.is_none());
-            assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
-            drop(first);
-
-            let second = ensure_and_snapshot(&mut store, collection, &authority)
-                .await
-                .unwrap();
-            assert!(second.contains(left_secret));
-            assert!(second.contains(right_secret));
-            assert_eq!(
-                second.support(),
-                &collection.source().cover([
-                    Handle::<SimpleArchive>::from_hash(left_commit.data()),
-                    Handle::<SimpleArchive>::from_hash(right_commit.data()),
-                ]),
-            );
-        });
-    }
-
-    #[test]
     fn ordinary_reads_reuse_derived_endorsements_without_ancestral_proof_or_payloads() {
         pollster::block_on(async {
             for rank9_ready in [false, true] {
@@ -810,14 +574,14 @@ mod tests {
                     .cover([Handle::<SimpleArchive>::from_hash(commit.data())]);
                 drop(
                     staging
-                        .ensure_exact(collection.succinct(), &authority, &support)
+                        .ensure(collection.succinct(), &authority)
                         .await
                         .unwrap(),
                 );
                 if rank9_ready {
                     drop(
                         staging
-                            .ensure_exact(collection.rank9(), &authority, &support)
+                            .ensure(collection.rank9(), &authority)
                             .await
                             .unwrap(),
                     );
@@ -854,14 +618,32 @@ mod tests {
                 assert!(!before
                     .contains_blob(Handle::<UnknownBlob>::from_hash(metadata))
                     .unwrap());
+                // Without the writer's grant the fold admits nothing beneath the
+                // images, so maintenance owes nothing here: nothing is fetched
+                // or published. A read still answers through the record walk
+                // when the rank9 image is resident; that walk goes with the
+                // record-walk removal, and this assertion flips to false then.
                 assert_eq!(
                     snapshot(before.clone(), collection)
                         .unwrap()
                         .contains(secret),
-                    rank9_ready,
+                    rank9_ready
                 );
                 let records_before = before.records().unwrap().count();
+                let observed = ensure_and_snapshot(&mut store, collection, &authority)
+                    .await
+                    .unwrap();
+                assert_eq!(observed.contains(secret), rank9_ready);
+                assert!(store.acquired.is_empty());
+                assert_eq!(
+                    store.snapshot().unwrap().records().unwrap().count(),
+                    records_before
+                );
 
+                // The grant arrives: the replicated images stand for the commit
+                // at once, without its payload or metadata bytes, and only the
+                // missing rank9 image is published.
+                store.insert_proof(proof).unwrap();
                 let observed = ensure_and_snapshot(&mut store, collection, &authority)
                     .await
                     .unwrap();
@@ -869,14 +651,13 @@ mod tests {
                 assert_eq!(observed.support(), &support);
                 assert!(store.acquired.is_empty());
                 let after = store.snapshot().unwrap();
-                assert!(!collection
-                    .source()
-                    .writer_is_admitted(&after, writer.verifying_key())
-                    .unwrap());
                 assert_eq!(
                     after.records().unwrap().count(),
                     records_before + usize::from(!rank9_ready),
                 );
+                assert!(!after
+                    .contains_blob(Handle::<UnknownBlob>::from_hash(commit.data()))
+                    .unwrap());
 
                 let maintained = maintain_and_snapshot(&mut store, collection, &authority)
                     .await
@@ -884,20 +665,6 @@ mod tests {
                 assert!(maintained.contains(secret));
                 assert_eq!(maintained.support(), &support);
                 assert!(store.acquired.is_empty());
-
-                // Even once root admission becomes possible, existing target
-                // support must prevent reacquiring its absent source payload.
-                store.insert_proof(proof).unwrap();
-                let again = ensure_and_snapshot(&mut store, collection, &authority)
-                    .await
-                    .unwrap();
-                assert!(again.contains(secret));
-                assert!(store.acquired.is_empty());
-                assert!(!store
-                    .snapshot()
-                    .unwrap()
-                    .contains_blob(Handle::<UnknownBlob>::from_hash(commit.data()))
-                    .unwrap());
             }
         });
     }
