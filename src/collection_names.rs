@@ -23,7 +23,8 @@ use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{
     descriptor, generation, records::CollectionHandle, AdmissionPolicy, Collection,
-    CollectionPolicy, CollectionRead, CollectionRegistrationError, CollectionStoreExt,
+    CollectionPolicy, CollectionRead, CollectionRecordSelector, CollectionRegistrationError,
+    CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
@@ -237,7 +238,53 @@ where
     let snapshot = storage
         .snapshot()
         .context("freeze store while opening configured collection descriptor")?;
-    open_exact_in(&snapshot, scope, handle)
+    let collection = open_exact_in(&snapshot, scope, handle)?;
+    if let Some(warning) = empty_beside_content(&snapshot, scope, handle) {
+        eprintln!("warning: {warning}");
+    }
+    Ok(collection)
+}
+
+/// The silent failure a re-mint produces, made audible: the configured
+/// generation holds nothing while other generations of the same name hold
+/// records. Not a refusal, because an empty new generation beside dead ones
+/// is also what a deliberate cutover looks like the moment before its drain,
+/// and for some names (orient) the old content is never meant to be carried.
+/// Costs one indexed probe on a healthy host; the whole-store detector runs
+/// only when the configured generation is empty.
+fn empty_beside_content<S>(snapshot: &S, scope: Id, handle: CollectionHandle) -> Option<String>
+where
+    S: CollectionRead + BlobStoreGet,
+{
+    let selected = std::collections::BTreeSet::from([CollectionRecordSelector::Collection(handle)]);
+    if !snapshot
+        .select_records(&selected)
+        .map(|records| records.is_empty())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let report = generation::named_generations(snapshot, handle).ok()??;
+    if !report.strands_records() {
+        return None;
+    }
+    let holding = report
+        .siblings()
+        .iter()
+        .filter(|sibling| sibling.commits() > 0)
+        .count();
+    Some(format!(
+        "{} names an empty generation of {:?} (blake3:{}) while {} other generation(s) in this \
+         pile hold {} record(s); if this host was meant to read them, drain them into this \
+         generation (trible pile collection migrate --into blake3:{} --siblings) or configure \
+         the generation that holds them",
+        override_env_name(scope),
+        require_name(scope),
+        hex::encode(handle.raw),
+        holding,
+        report.stranded_records(),
+        hex::encode(handle.raw),
+    ))
 }
 
 /// Open the operator-selected exact descriptor for a reader, or construct the
@@ -457,6 +504,46 @@ mod tests {
         // The same host's own generation, reopened, is not "another".
         open_configured(&mut store, scope, mac.verifying_key())
             .expect("reopening the generation that holds the content");
+    }
+
+    /// A configured generation that reads empty while a same-named sibling
+    /// holds records is the re-mint failure that ran silently four times;
+    /// it is now said out loud, and only then.
+    #[test]
+    fn an_empty_configured_generation_beside_content_is_named_not_silent() {
+        use triblespace::core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
+
+        let scope = decide::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        let mac = SigningKey::from_bytes(&[73; 32]);
+        let sky = SigningKey::from_bytes(&[74; 32]);
+        let old = open(&mut store, scope, mac.verifying_key()).unwrap();
+        let new = open(&mut store, scope, sky.verifying_key()).unwrap();
+
+        // Both empty: nothing to say.
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(empty_beside_content(&snapshot, scope, new.handle()), None);
+
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &mac,
+                old.handle(),
+                Inline::new([1; 32]),
+                Inline::new([2; 32]),
+            )))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        // The generation holding the content is fine to configure.
+        assert_eq!(empty_beside_content(&snapshot, scope, old.handle()), None);
+        // The empty one beside it is named, with the remedy.
+        let warning = empty_beside_content(&snapshot, scope, new.handle())
+            .expect("an empty generation beside content is said out loud");
+        assert!(
+            warning.contains(&hex::encode(new.handle().raw)),
+            "{warning}"
+        );
+        assert!(warning.contains("--siblings"), "{warning}");
+        assert!(warning.contains(&override_env_name(scope)), "{warning}");
     }
 
     /// The guard refuses an unadmitted writer and says enough to fix it.
