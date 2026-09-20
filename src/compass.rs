@@ -22,7 +22,9 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
-use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{
+    CollectionCommit, CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
+};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
@@ -84,7 +86,7 @@ pub fn status_register_collection<S>(
 ) -> Result<Collection<LwwRegisterBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
     status_register_for_source(store, source)
@@ -1162,7 +1164,7 @@ pub fn commit_collection<S>(
 ) -> Result<CollectionCommit>
 where
     S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreGet,
+    S::Snapshot: BlobStoreGet + CollectionRead,
 {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)

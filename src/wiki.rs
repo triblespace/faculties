@@ -21,7 +21,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
 use triblespace::core::collection::latest::{LatestBlob, LatestIndex};
-use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{
+    CollectionCommit, CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
+};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::query::TriblePattern;
@@ -261,7 +263,7 @@ pub fn latest_collection<S>(
 ) -> Result<Collection<LatestBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
     latest_for_source(store, source)

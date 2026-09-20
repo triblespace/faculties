@@ -21,7 +21,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{CollectionRead, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -113,7 +113,7 @@ pub fn intent_register_collection<S>(
 ) -> Result<Collection<LwwRegisterBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
     let snapshot = store

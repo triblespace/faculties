@@ -22,8 +22,8 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{
-    descriptor, records::CollectionHandle, AdmissionPolicy, Collection, CollectionPolicy,
-    CollectionRegistrationError, CollectionStoreExt,
+    descriptor, generation, records::CollectionHandle, AdmissionPolicy, Collection,
+    CollectionPolicy, CollectionRead, CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
@@ -191,10 +191,47 @@ pub fn open_configured<S>(
 ) -> anyhow::Result<Collection<SimpleArchive>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CollectionRead,
 {
     let Some(handle) = configured_handle(scope)? else {
-        return open(storage, scope, authority).context("register signer-private descriptor");
+        let collection =
+            open(storage, scope, authority).context("register signer-private descriptor")?;
+        // A host with no configured handle must not quietly start a new
+        // generation beside ones the other hosts already write to. The private
+        // descriptor is only content until something commits to it, so
+        // registering it costs nothing; using it here would.
+        let snapshot = storage
+            .snapshot()
+            .context("freeze store to look for other generations of this name")?;
+        if let Some(report) = generation::named_generations(&snapshot, collection.handle())
+            .map_err(|error| anyhow!("look for other generations: {error}"))?
+        {
+            if report.strands_records() {
+                let variable = override_env_name(scope);
+                let siblings: Vec<String> = report
+                    .siblings()
+                    .iter()
+                    .filter(|sibling| sibling.commits() > 0)
+                    .map(|sibling| {
+                        format!(
+                            "blake3:{} ({} commit(s))",
+                            hex::encode(sibling.handle().raw),
+                            sibling.commits()
+                        )
+                    })
+                    .collect();
+                bail!(
+                    "{} is not configured on this host and this pile already holds {} \
+                     generation(s) of {:?} with content: {}. Set {variable} to the one \
+                     this host should use instead of starting another.",
+                    variable,
+                    siblings.len(),
+                    require_name(scope),
+                    siblings.join(", ")
+                );
+            }
+        }
+        return Ok(collection);
     };
 
     let snapshot = storage
@@ -379,6 +416,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host with no configured handle may mint the private descriptor on an
+    /// empty pile, but not beside a generation of the same name that already
+    /// holds content: that is how a fourth generation would start by accident.
+    #[test]
+    fn open_configured_refuses_to_start_a_generation_beside_one_with_content() {
+        use triblespace::core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
+
+        let scope = decide::DEFAULT_SCOPE_ID;
+        let variable = override_env_name(scope);
+        assert!(
+            std::env::var_os(&variable).is_none(),
+            "{variable} must be unset for this test"
+        );
+        let mut store = MemoryRepo::default();
+        let mac = SigningKey::from_bytes(&[71; 32]);
+        let sky = SigningKey::from_bytes(&[72; 32]);
+
+        // An empty pile: the private descriptor is the only generation.
+        let first = open_configured(&mut store, scope, mac.verifying_key())
+            .expect("the first generation on an empty pile");
+        // Still fine while nobody has committed anything anywhere.
+        open_configured(&mut store, scope, sky.verifying_key())
+            .expect("a second descriptor is only content until something commits");
+
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &mac,
+                first.handle(),
+                Inline::new([1; 32]),
+                Inline::new([2; 32]),
+            )))
+            .unwrap();
+        let error = open_configured(&mut store, scope, sky.verifying_key())
+            .expect_err("a generation with content exists; refuse to start another")
+            .to_string();
+        assert!(error.contains(&variable), "{error}");
+        assert!(error.contains(&hex::encode(first.handle().raw)), "{error}");
+        // The same host's own generation, reopened, is not "another".
+        open_configured(&mut store, scope, mac.verifying_key())
+            .expect("reopening the generation that holds the content");
+    }
 
     /// The guard refuses an unadmitted writer and says enough to fix it.
     ///
