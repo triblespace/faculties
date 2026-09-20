@@ -368,21 +368,14 @@ impl PlannerStorage<'_> {
         })
     }
 
+    /// How many distinct payloads the planner's collection stands on. A
+    /// write that changes nothing adds none.
     #[cfg(test)]
-    fn commit_count(&self) -> Result<usize> {
+    fn payload_count(&self) -> Result<usize> {
         self.storage.with_pile(|pile, signer| {
-            let author = signer.verifying_key().to_bytes();
-            let result = (|| {
-                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let store_snapshot = pile.snapshot()?;
-                let cover = collection.admitted(&store_snapshot)?;
-                Ok(cover
-                    .commits(&store_snapshot)?
-                    .iter()
-                    .filter(|commit| commit.public_key().raw == author)
-                    .count())
-            })();
-            result
+            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let store_snapshot = pile.snapshot()?;
+            Ok(collection.admitted(&store_snapshot)?.len())
         })
     }
 }

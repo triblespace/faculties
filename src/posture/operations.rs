@@ -2201,29 +2201,20 @@ impl PostureStorage<'_> {
         Ok((policy, scans, decisions))
     }
 
-    /// The signed COMMITs this key authored in `scope`. Tests use it to check
-    /// that one scan is one atomic COMMIT; ordinary reads never need it.
+    /// How many distinct payloads the `scope` collection stands on. Tests
+    /// use it to check that one scan is one payload; ordinary reads never
+    /// need it.
     #[cfg(test)]
-    fn authored_commits(&self, scope: Id, label: &str) -> Result<Vec<CollectionCommit>> {
+    fn admitted_payloads(&self, scope: Id, label: &str) -> Result<usize> {
         self.storage.with_pile(|pile, signer| {
-            let author = signer.verifying_key().to_bytes();
-            let result = (|| {
-                let collection = open_configured(pile, scope, signer.verifying_key())?;
-                let store_snapshot = pile
-                    .snapshot()
-                    .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
-                let commits = collection
-                    .admitted(&store_snapshot)
-                    .with_context(|| format!("admit Posture {label} collection"))?
-                    .commits(&store_snapshot)
-                    .with_context(|| format!("read admitted Posture {label} commits"))?;
-                Ok(commits
-                    .iter()
-                    .copied()
-                    .filter(|commit| commit.public_key().raw == author)
-                    .collect())
-            })();
-            result
+            let collection = open_configured(pile, scope, signer.verifying_key())?;
+            let store_snapshot = pile
+                .snapshot()
+                .with_context(|| format!("freeze admitted Posture {label} store snapshot"))?;
+            Ok(collection
+                .admitted(&store_snapshot)
+                .with_context(|| format!("admit Posture {label} collection"))?
+                .len())
         })
     }
 

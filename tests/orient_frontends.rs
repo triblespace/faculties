@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use triblespace::core::blob::encodings::entity_id_set::EntityIdSetBlob;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -171,24 +170,18 @@ impl Fixture {
         self.maintain_receipts(&self.key);
     }
 
+    /// Carry this signer's private receipts through the Succinct and Rank9
+    /// chain Orient reads them from; the test is the worker here.
     fn maintain_receipts(&self, key: &Path) {
         let signer = faculties::storage::load_signer(&self.pile, Some(key)).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
-        let policy = faculties::collection_names::private_policy(signer.verifying_key());
         let source = pile
             .collection(
                 faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
-                policy.clone(),
+                faculties::collection_names::private_policy(signer.verifying_key()),
             )
             .unwrap();
-        let ids = pile
-            .derive::<EntityIdSetBlob>(
-                source,
-                faculties::schemas::orient::presentation::event.id(),
-                policy,
-            )
-            .unwrap();
-        drop(pollster::block_on(pile.maintain(ids, &signer)).unwrap());
+        faculties::storage::carry_facts(&mut pile, source, &signer);
         pile.close().unwrap();
     }
 
@@ -387,6 +380,9 @@ fn daemon_retains_due_habit_baseline_across_other_news_and_own_receipts() {
     )
     .unwrap();
     f.publish(faculties::schemas::habit::DEFAULT_SCOPE_ID, habit);
+    // The worker carried the habit before the daemon arms; the daemon's
+    // own upkeep then only has to carry what arrives while it runs.
+    f.maintain();
     let mut parts = Vec::new();
     f.orient()
         .daemon(
@@ -406,7 +402,11 @@ fn daemon_retains_due_habit_baseline_across_other_news_and_own_receipts() {
         )
         .unwrap();
     let report = text(&parts);
-    assert_eq!(report.matches("News: habit [").count(), 1, "{report}");
+    assert_eq!(
+        report.matches("News: habit became due: ").count(),
+        1,
+        "{report}"
+    );
     assert!(report.contains("unrelated to unchanged due clock"));
     assert_eq!(
         parts.len(),
@@ -450,7 +450,11 @@ fn daemon_cli_has_one_callback_channel_and_failure_does_not_acknowledge() {
             "callback output must not duplicate news"
         );
         let delivered = fs::read_to_string(report).unwrap();
-        assert_eq!(delivered.matches("News: new message from ").count(), 1);
+        assert_eq!(delivered.matches("News: new message [").count(), 1);
+        assert!(
+            delivered.contains(&format!("] from observer-{:x}", f.sender)),
+            "{delivered}"
+        );
         assert_eq!(f.presented().contains(&event), success);
     }
 }

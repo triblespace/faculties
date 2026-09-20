@@ -620,20 +620,17 @@ mod tests {
                     .unwrap());
                 // Without the writer's grant the fold admits nothing beneath the
                 // images, so maintenance owes nothing here: nothing is fetched
-                // or published. A read still answers through the record walk
-                // when the rank9 image is resident; that walk goes with the
-                // record-walk removal, and this assertion flips to false then.
-                assert_eq!(
-                    snapshot(before.clone(), collection)
-                        .unwrap()
-                        .contains(secret),
-                    rank9_ready
-                );
+                // or published, and a read stands for nothing either, however
+                // resident the rank9 image is. No walk certifies an image from
+                // what its producer named.
+                assert!(!snapshot(before.clone(), collection)
+                    .unwrap()
+                    .contains(secret));
                 let records_before = before.records().unwrap().count();
                 let observed = ensure_and_snapshot(&mut store, collection, &authority)
                     .await
                     .unwrap();
-                assert_eq!(observed.contains(secret), rank9_ready);
+                assert!(!observed.contains(secret));
                 assert!(store.acquired.is_empty());
                 assert_eq!(
                     store.snapshot().unwrap().records().unwrap().count(),

@@ -5,7 +5,7 @@ use faculties::discord::{self, Discord, PullOptions, ReadOptions};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::schemas::{archive::archive, discord::discord as schema};
-use faculties::storage::{initialize_signer, publish_fragment};
+use faculties::storage::{carry_scope, initialize_signer, publish_fragment};
 use hifitime::Epoch;
 use serde_json::{json, Value};
 use std::{fs, path::PathBuf, process::Command};
@@ -46,6 +46,13 @@ impl Fixture {
             Some(&self.key),
             faculties::schemas::discord::DEFAULT_SCOPE_ID,
             fragment,
+        )
+        .unwrap();
+        // Reads see what the worker carried; the test is the worker here.
+        carry_scope(
+            &self.pile,
+            Some(&self.key),
+            faculties::schemas::discord::DEFAULT_SCOPE_ID,
         )
         .unwrap();
     }

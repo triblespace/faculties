@@ -133,6 +133,9 @@ fn note_metadata_is_stored_and_rendered_without_hiding_history() {
 
     let person = stdout(run(relations, &pile.path, &["add", "ledger-author"]));
     let person_id = id_after("person: ", &person);
+    // Reads see what the worker carried; the test is the worker here, and
+    // each action's preparation reads what the one before it wrote.
+    pile.maintain_attention();
 
     let added = stdout(run(
         compass,
@@ -150,6 +153,7 @@ fn note_metadata_is_stored_and_rendered_without_hiding_history() {
     let first_note = id_after("Added note ", &added);
     assert_eq!(goal_id.len(), 32);
     assert_eq!(first_note.len(), 32);
+    pile.maintain_attention();
 
     let added_note = stdout(run(
         compass,
@@ -169,6 +173,7 @@ fn note_metadata_is_stored_and_rendered_without_hiding_history() {
         ],
     ));
     let second_note = id_after("Added note ", &added_note);
+    pile.maintain_attention();
 
     let shown = stdout(run(compass, &pile.path, &["show", &goal_id]));
     assert!(shown.contains(&format!("[{first_note}]")));

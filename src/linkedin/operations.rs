@@ -385,21 +385,14 @@ impl RelationsStorage<'_> {
         self.update("test relations input", |_| Ok((Some(fragment), ())))
     }
 
+    /// How many distinct payloads the relations collection stands on. An
+    /// ingest that changes nothing adds none.
     #[cfg(test)]
-    fn commit_count(&self) -> Result<usize> {
+    fn payload_count(&self) -> Result<usize> {
         self.storage.with_pile(|pile, signer| {
-            let author = signer.verifying_key().to_bytes();
-            let result = (|| {
-                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let store_snapshot = pile.snapshot()?;
-                let cover = collection.admitted(&store_snapshot)?;
-                Ok(cover
-                    .commits(&store_snapshot)?
-                    .iter()
-                    .filter(|commit| commit.public_key().raw == author)
-                    .count())
-            })();
-            result
+            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let store_snapshot = pile.snapshot()?;
+            Ok(collection.admitted(&store_snapshot)?.len())
         })
     }
 }
@@ -1336,8 +1329,8 @@ mod tests {
             self.storage().publish(fragment).unwrap();
         }
 
-        fn commit_count(&self) -> usize {
-            self.storage().commit_count().unwrap()
+        fn payload_count(&self) -> usize {
+            self.storage().payload_count().unwrap()
         }
     }
 
@@ -1548,7 +1541,7 @@ mod tests {
         ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
         let first = fixture.view();
         let first_head = relations::current_profile(&first.facts, person).unwrap().id;
-        let first_commits = fixture.commit_count();
+        let first_commits = fixture.payload_count();
         let profile = relations::current_profile(&first.facts, person).unwrap();
         let profile = relations::profile_input(&first.reader, &profile).unwrap();
         assert_eq!(profile.profile_urls, ["linkedin.com/in/ada"]);
@@ -1562,7 +1555,7 @@ mod tests {
                 .id,
             first_head
         );
-        assert_eq!(fixture.commit_count(), first_commits);
+        assert_eq!(fixture.payload_count(), first_commits);
     }
 
     #[test]
@@ -1598,7 +1591,7 @@ mod tests {
         ingest(fixture.storage(), &rows, false).unwrap();
         let first = fixture.view();
         let head = relations::current_profile(&first.facts, person).unwrap().id;
-        let commits = fixture.commit_count();
+        let commits = fixture.payload_count();
 
         ingest(fixture.storage(), &rows, false).unwrap();
         let second = fixture.view();
@@ -1608,7 +1601,7 @@ mod tests {
                 .id,
             head
         );
-        assert_eq!(fixture.commit_count(), commits);
+        assert_eq!(fixture.payload_count(), commits);
     }
 
     #[test]
@@ -1622,7 +1615,7 @@ mod tests {
         let head = relations::current_profile(&before.facts, person)
             .unwrap()
             .id;
-        let commits = fixture.commit_count();
+        let commits = fixture.payload_count();
 
         let equivalent = connection(
             "Exact Person",
@@ -1636,7 +1629,7 @@ mod tests {
             relations::current_profile(&after.facts, person).unwrap().id,
             head
         );
-        assert_eq!(fixture.commit_count(), commits);
+        assert_eq!(fixture.payload_count(), commits);
         let snapshot = relations::current_profile(&after.facts, person).unwrap();
         let value = relations::profile_input(&after.reader, &snapshot).unwrap();
         assert_eq!(value.profile_urls, [exact_url]);
@@ -1644,9 +1637,9 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_publishes_no_collection_commit() {
+    fn dry_run_adds_no_payload() {
         let fixture = Fixture::new();
-        let before = fixture.commit_count();
+        let before = fixture.payload_count();
         let row = connection(
             "Ada Lovelace",
             "https://linkedin.com/in/ada",
@@ -1655,7 +1648,7 @@ mod tests {
 
         ingest(fixture.storage(), &[row], true).unwrap();
 
-        assert_eq!(fixture.commit_count(), before);
+        assert_eq!(fixture.payload_count(), before);
         assert!(relations::person_anchors(&fixture.view().facts).is_empty());
     }
 
@@ -1728,15 +1721,15 @@ mod tests {
         let mut row = connection("Ada Lovelace", "linkedin.com/in/ada", "");
         row.company = "Analytical Engines".to_owned();
         ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
-        let before = fixture.commit_count();
+        let before = fixture.payload_count();
 
         ingest(fixture.storage(), std::slice::from_ref(&row), false).unwrap();
-        assert_eq!(fixture.commit_count(), before);
+        assert_eq!(fixture.payload_count(), before);
 
         row.company = "Difference Engines".to_owned();
         let error = ingest(fixture.storage(), &[row], false).unwrap_err();
         assert!(format!("{error:#}").contains("company"));
-        assert_eq!(fixture.commit_count(), before);
+        assert_eq!(fixture.payload_count(), before);
     }
 
     #[test]

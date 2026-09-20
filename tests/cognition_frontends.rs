@@ -47,6 +47,13 @@ fn direct_cli_and_mcp_checks_agree_for_empty_and_authored_collections() {
                 faculties::clock::point(hifitime::Epoch::from_tai_seconds(42.0)).unwrap(),
             );
             cognition::publish_event(&fixture.pile, Some(&fixture.key), event).unwrap();
+            // Reads see what the worker carried; the test is the worker here.
+            faculties::storage::carry_scope(
+                &fixture.pile,
+                Some(&fixture.key),
+                faculties::schemas::cognition::DEFAULT_SCOPE_ID,
+            )
+            .unwrap();
         }
         let report = fixture.cognition().check().unwrap();
         assert_eq!(report.facts == 0, !populated);
@@ -140,6 +147,8 @@ fn check_validates_known_selected_attachments_and_emits_no_false_success() {
     .unwrap();
     // An externally received collection may reference a locally absent payload.
     pile.commit(collection, &signer, fragment).unwrap();
+    // Reads see what the worker carried; the test is the worker here.
+    faculties::storage::carry_facts(&mut pile, collection, &signer);
     pile.close().unwrap();
     assert!(fixture.cognition().check().is_err());
     let mut emitted = 0;

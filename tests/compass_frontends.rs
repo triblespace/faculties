@@ -8,11 +8,14 @@ use std::process::{Command, Stdio};
 
 use anybytes::Bytes;
 use anyhow::{bail, Result};
+use faculties::collection_names::open_configured;
 use faculties::compass::{self, AddOptions, Compass, ListOptions, NoteOptions};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::schemas::compass::{board, KIND_NOTE_ID, KIND_STATUS_ID};
-use faculties::storage::{initialize_signer, load_signer, publish_fragment};
+use faculties::storage::{
+    carry_facts, initialize_signer, load_signer, open_pile_strict, publish_fragment,
+};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
@@ -51,6 +54,26 @@ impl Fixture {
         let result = compass::materialize_collection(&mut pile, &signer).unwrap();
         pile.close().unwrap();
         result
+    }
+
+    /// What the maintenance worker does between a write and a read: carry
+    /// the Compass and Relations sources through their fact chains and the
+    /// Compass status register. Reads see what the worker carried; the test
+    /// is the worker here.
+    fn carry(&self) {
+        let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
+        let mut pile = open_pile_strict(&self.pile).unwrap();
+        for scope in [
+            faculties::schemas::compass::DEFAULT_SCOPE_ID,
+            faculties::schemas::relations::DEFAULT_SCOPE_ID,
+        ] {
+            let source = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
+            carry_facts(&mut pile, source, &signer);
+        }
+        let status =
+            compass::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
+        pollster::block_on(async { drop(pile.maintain(status, &signer).await.unwrap()) });
+        pile.close().unwrap();
     }
 
     fn cli(&self, arguments: &[&str], stdin: Option<&str>) -> String {
@@ -136,6 +159,9 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
             },
         )
         .unwrap();
+    // Reads see what the worker carried; the test is the worker here. Both
+    // input chains hold the goal and its note before the pending goal lands.
+    fixture.carry();
     fixture.operations().list(ListOptions::default()).unwrap();
     let pending = fixture
         .operations()
@@ -338,6 +364,9 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
     );
     assert_eq!(records(), after);
 
+    // The worker carries the writer's appended actions; only now do the
+    // owner's reads, and the writer's prefix resolution, see them.
+    fixture.carry();
     let listing = fixture
         .operations()
         .list(ListOptions {
@@ -482,6 +511,8 @@ fn cli_mcp_and_direct_reads_agree() {
             },
         )
         .unwrap();
+    // Reads see what the worker carried; the test is the worker here.
+    fixture.carry();
     let id = format!("{:x}", goal.goal);
     let faculty = fixture.mcp();
     assert_eq!(
@@ -573,6 +604,8 @@ fn mcp_title_and_notes_are_literal_even_when_a_matching_host_file_exists() {
         "compass_note",
         serde_json::json!({"id":id,"note":literal}),
     );
+    // Reads see what the worker carried; the test is the worker here.
+    fixture.carry();
     let shown = fixture.operations().show(&id).unwrap();
     assert!(shown.contains(&format!("Title: {literal}")));
     assert!(shown.contains("  @-"));
@@ -599,15 +632,19 @@ fn cli_keeps_file_stdin_and_literal_escape_input_conventions() {
     let (facts, _) = fixture.snapshot();
     let goal = *compass::goal_ids(&facts).iter().next().unwrap();
     let id = format!("{goal:x}");
+    // Reads see what the worker carried; the test is the worker here.
+    fixture.carry();
     assert!(fixture
         .operations()
         .show(&id)
         .unwrap()
         .contains("note from file"));
     fixture.cli(&["note", &id, "@@-"], None);
+    fixture.carry();
     assert!(fixture.operations().show(&id).unwrap().contains("  @-"));
     fixture.cli(&["add", "@-"], Some("title from stdin"));
     fixture.cli(&["add", "@@literal title"], None);
+    fixture.carry();
     let listed = fixture
         .operations()
         .list(ListOptions {

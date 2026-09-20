@@ -72,7 +72,7 @@ fn event_and_initial_note_publish_as_one_signed_mutation() {
         .update("add event", |_| Ok((Some(fragment), ())))
         .unwrap();
 
-    assert_eq!(storage.commit_count().unwrap(), 1);
+    assert_eq!(storage.payload_count().unwrap(), 1);
     storage
         .with_view(|loaded| {
             assert!(planner_model::event(&loaded.facts, event).is_some());
@@ -156,7 +156,7 @@ fn exact_reingest_does_not_publish_another_authored_commit() {
     ingest(storage, &documents).unwrap();
     ingest(storage, &documents).unwrap();
 
-    assert_eq!(storage.commit_count().unwrap(), 1);
+    assert_eq!(storage.payload_count().unwrap(), 1);
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn conflicting_same_batch_uid_fails_before_any_signed_commit() {
     .unwrap_err();
 
     assert!(format!("{error:#}").contains("conflicting immutable fields"));
-    assert_eq!(storage.commit_count().unwrap(), 0);
+    assert_eq!(storage.payload_count().unwrap(), 0);
     storage
         .with_view(|loaded| {
             assert!(planner_model::event_ids(&loaded.facts).is_empty());
@@ -209,7 +209,7 @@ fn cancel_adds_one_assertion_without_mutating_baseline_status() {
     cancel(storage, &fmt_id(event_id)).unwrap();
     cancel(storage, &fmt_id(event_id)).unwrap();
 
-    assert_eq!(storage.commit_count().unwrap(), 2);
+    assert_eq!(storage.payload_count().unwrap(), 2);
     storage
         .with_view(|loaded| {
             assert_eq!(

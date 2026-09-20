@@ -258,9 +258,8 @@ fn canonical_policy_write_and_registered_reads_are_idempotent() {
     let view = storage.policy_view().unwrap();
     assert_eq!(
         storage
-            .authored_commits(DEFAULT_POLICY_SCOPE_ID, "policy")
-            .unwrap()
-            .len(),
+            .admitted_payloads(DEFAULT_POLICY_SCOPE_ID, "policy")
+            .unwrap(),
         1
     );
     let channel = channel_by_name(&view.reader, &view.facts, "PUBLIC-RELEASE")
@@ -524,9 +523,8 @@ fn complete_scan_is_one_atomic_commit_with_explicit_outcomes_and_omissions() {
     assert_eq!(
         store
             .storage()
-            .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
-            .unwrap()
-            .len(),
+            .admitted_payloads(DEFAULT_SCAN_SCOPE_ID, "scan")
+            .unwrap(),
         1
     );
     let outcomes = find!(
@@ -1052,11 +1050,13 @@ fn foreign_scan_commits_are_stored_but_inert_without_write_admission() {
 
     let view = store.storage().scan_view().unwrap();
     assert!(all_scan_ids(&view.facts).is_empty());
-    assert!(store
-        .storage()
-        .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        store
+            .storage()
+            .admitted_payloads(DEFAULT_SCAN_SCOPE_ID, "scan")
+            .unwrap(),
+        0
+    );
 
     let mut pile = open_pile_strict(&store.pile).unwrap();
     let store_snapshot = pile.snapshot().unwrap();
@@ -1119,9 +1119,8 @@ fn unauthorized_duplicate_claim_does_not_poison_scan_atomicity() {
     assert_eq!(
         store
             .storage()
-            .authored_commits(DEFAULT_SCAN_SCOPE_ID, "scan")
-            .unwrap()
-            .len(),
+            .admitted_payloads(DEFAULT_SCAN_SCOPE_ID, "scan")
+            .unwrap(),
         2,
     );
 }

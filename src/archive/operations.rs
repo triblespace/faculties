@@ -1359,14 +1359,11 @@ mod tests {
         )
     }
 
-    fn archive_root_count(fixture: &Fixture) -> usize {
+    /// How many root payloads the archive stands on: one per imported
+    /// source, none more for a repeated or refused import.
+    fn archive_root_payloads(fixture: &Fixture) -> usize {
         let observed = storage(fixture).load().unwrap();
-        observed
-            .support()
-            .unwrap()
-            .commits(observed.snapshot())
-            .unwrap()
-            .len()
+        observed.support().unwrap().len()
     }
 
     fn projection_ids(facts: &FactArchive) -> Vec<Id> {
@@ -1530,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn new_source_importers_each_publish_one_validated_commit() {
+    fn new_source_importers_each_add_one_root_payload() {
         let fixture = fixture();
 
         let chatgpt = fixture._directory.path().join("conversations.json");
@@ -1540,7 +1537,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &chatgpt, CliImportSource::ChatGpt).unwrap();
-        assert_eq!(archive_root_count(&fixture), 1);
+        assert_eq!(archive_root_payloads(&fixture), 1);
 
         let claude_web = fixture._directory.path().join("claude-web.json");
         fs::write(
@@ -1549,7 +1546,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &claude_web, CliImportSource::ClaudeWeb).unwrap();
-        assert_eq!(archive_root_count(&fixture), 2);
+        assert_eq!(archive_root_payloads(&fixture), 2);
 
         let copilot = fixture._directory.path().join("copilot.json");
         fs::write(
@@ -1558,7 +1555,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &copilot, CliImportSource::Copilot).unwrap();
-        assert_eq!(archive_root_count(&fixture), 3);
+        assert_eq!(archive_root_payloads(&fixture), 3);
 
         let agy = fixture._directory.path().join("transcript_full.jsonl");
         fs::write(
@@ -1570,7 +1567,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &agy, CliImportSource::Agy).unwrap();
-        assert_eq!(archive_root_count(&fixture), 4);
+        assert_eq!(archive_root_payloads(&fixture), 4);
 
         let gemini = fixture._directory.path().join("My Activity.html");
         fs::write(
@@ -1586,7 +1583,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &gemini, CliImportSource::Gemini).unwrap();
-        assert_eq!(archive_root_count(&fixture), 5);
+        assert_eq!(archive_root_payloads(&fixture), 5);
 
         assert_eq!(
             projection_ids(
@@ -1618,7 +1615,7 @@ mod tests {
         .unwrap();
 
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        assert_eq!(archive_root_count(&fixture), 1);
+        assert_eq!(archive_root_payloads(&fixture), 1);
         let archive = storage(&fixture).load().unwrap();
         assert_eq!(
             projection_ids(&archive.view::<FactArchive>().unwrap()).len(),
@@ -1628,7 +1625,7 @@ mod tests {
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
 
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        assert_eq!(archive_root_count(&fixture), 1);
+        assert_eq!(archive_root_payloads(&fixture), 1);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
     }
 
@@ -1722,7 +1719,7 @@ mod tests {
         let error =
             run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap_err();
         assert!(format!("{error:#}").contains("conflicting semantic payloads"));
-        assert_eq!(archive_root_count(&fixture), 0);
+        assert_eq!(archive_root_payloads(&fixture), 0);
     }
 
     #[test]

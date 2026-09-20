@@ -1204,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_duplicate_claim_is_provenance_not_an_admitted_archive_root() {
+    fn unauthorized_duplicate_claim_is_not_an_admitted_archive_root() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -1231,16 +1231,6 @@ mod tests {
             projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
             1
         );
-        let support = snapshot.support().unwrap().clone();
-        drop(snapshot);
-
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let store_snapshot = pile.snapshot().unwrap();
-        let claims = support.commits(&store_snapshot).unwrap();
-        assert_eq!(claims.len(), 2);
-        assert!(claims.contains(&admitted));
-        assert!(claims.contains(&duplicate));
-        pile.close().unwrap();
     }
 
     #[test]
@@ -2090,10 +2080,16 @@ mod tests {
             .unwrap();
         let after = pile.snapshot().unwrap();
         assert!(after.collection(rank9).unwrap().cover().is_empty());
-        assert!(source.cover([data]).commits(&after).unwrap().is_empty());
-        let facts = rank9
-            .cover([member])
-            .materialize::<FactArchive, _>(&after)
+        assert!(source.admitted(&after).unwrap().is_empty());
+        // The view is built straight from the resident member through the
+        // collection's own descriptor, as an attached snapshot would build it.
+        let descriptor = Fragment::from(after.get::<TribleSet, _>(rank9.handle()).unwrap());
+        let facts =
+            <FactArchive as triblespace::core::collection::TryFromCover<_>>::try_from_cover(
+                &rank9.cover([member]),
+                &descriptor,
+                &after,
+            )
             .unwrap();
         let mut output = Vec::new();
         assert_eq!(

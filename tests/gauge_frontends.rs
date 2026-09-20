@@ -1,10 +1,11 @@
 use faculties::gauge::{self, Gauge};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
-use faculties::storage::initialize_signer;
+use faculties::storage::{carry_facts, initialize_signer, load_signer, open_pile_strict};
 use faculties::wiki::Wiki;
 use serde_json::json;
 use std::process::Command;
+use triblespace::core::collection::CollectionStoreExt;
 
 #[test]
 fn observations_measure_the_wiki_frontier_and_both_frontends_present_them() {
@@ -26,6 +27,23 @@ fn observations_measure_the_wiki_frontier_and_both_frontends_present_them() {
         )
         .unwrap();
     wiki.create("alone", "孤独", &[], true).unwrap();
+    // Reads see what the worker carried; the test is the worker here. Gauge
+    // reads the Wiki fact chain and its supersession index.
+    {
+        let signer = load_signer(&pile, Some(&key)).unwrap();
+        let mut store = open_pile_strict(&pile).unwrap();
+        let source = faculties::collection_names::open_configured(
+            &mut store,
+            faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        carry_facts(&mut store, source, &signer);
+        let latest =
+            faculties::wiki::latest_collection(&mut store, signer.verifying_key()).unwrap();
+        drop(pollster::block_on(store.maintain(latest, &signer)).unwrap());
+        store.close().unwrap();
+    }
     let gauge = Gauge::new(pile.clone(), Some(key.clone()));
     let health = gauge.health().unwrap();
     assert_eq!((health.entries, health.states, health.forks), (3, 3, 0));

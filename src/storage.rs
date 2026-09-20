@@ -590,6 +590,20 @@ pub fn publish_fragment(
 /// pile is closed even if a later publication fails. Replaying a prefix or the
 /// whole sequence is idempotent because both blobs and collection records are
 /// content addressed.
+/// Stand in for the maintenance worker on one pile file: open it, carry the
+/// `scope` collection's commits through its derived chain with the pile's
+/// signer, and close it. A read that follows sees what a write before it
+/// published, exactly as it would after the daemon's next pass.
+pub fn carry_scope(pile_path: &Path, key_path: Option<&Path>, scope: Id) -> Result<()> {
+    let signer = load_signer(pile_path, key_path)?;
+    let mut pile = open_pile_strict(pile_path)?;
+    let collection =
+        crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+            .context("open native collection descriptor")?;
+    carry_facts(&mut pile, collection, &signer);
+    finish_pile(pile, Ok(()))
+}
+
 pub fn publish_fragments(
     pile_path: &Path,
     key_path: Option<&Path>,
@@ -1084,7 +1098,8 @@ mod tests {
     }
 
     #[test]
-    fn fact_read_uses_endorsed_rollup_without_ancestor_payloads_or_write_proofs() {
+    fn fact_read_stands_for_nothing_beneath_unadmitted_commits_and_reads_the_rollup_once_they_are_admitted(
+    ) {
         use triblespace::core::blob::IntoBlob;
         use triblespace::core::repo::BlobStorePut;
 
@@ -1127,6 +1142,33 @@ mod tests {
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         assert!(collection.admitted(&snapshot).unwrap().is_empty());
+        for commit in &commits {
+            assert!(!snapshot
+                .contains_blob(Handle::<SimpleArchive>::from_hash(commit.data()))
+                .unwrap());
+        }
+        // The owner's MERGE is believed, but the commits it joins are signed
+        // by a key nothing here admits, so the node it produces has no row to
+        // stand on: the collection stands for nothing, and the read says so.
+        let (facts, support) = read_fact_collection(collection, &snapshot).unwrap();
+        assert_eq!(facts.len(), 0);
+        assert!(support.is_empty());
+
+        // Admitted commits for the same payloads make the rollup stand. The
+        // input payloads never become resident: the read is the joined blob,
+        // and its support is what the commits stand for.
+        for commit in &commits {
+            store
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &owner,
+                    collection.handle(),
+                    commit.data(),
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+        }
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(collection.admitted(&snapshot).unwrap().len(), 2);
         for commit in &commits {
             assert!(!snapshot
                 .contains_blob(Handle::<SimpleArchive>::from_hash(commit.data()))
@@ -1281,12 +1323,11 @@ pub(crate) fn discovered_records<S: triblespace::core::collection::CollectionRea
     Ok(discovered)
 }
 
-/// What the maintenance worker does between a write and a read, for tests:
-/// carry the source's commits through its Succinct and Rank9 chain. Reads
-/// attach what was carried and never maintain, so a test that writes and
-/// then reads says here what the worker would have done in between.
-#[cfg(test)]
-pub(crate) fn carry_facts<S>(pile: &mut S, source: Collection<SimpleArchive>, signer: &SigningKey)
+/// What the maintenance worker does between a write and a read: carry the
+/// source's commits through its Succinct and Rank9 chain, as the daemon
+/// would. Reads attach what was carried and never maintain, so a test or a
+/// tool that writes and then reads calls this to stand in for the worker.
+pub fn carry_facts<S>(pile: &mut S, source: Collection<SimpleArchive>, signer: &SigningKey)
 where
     S: triblespace::core::repo::Store + AsyncBlobStoreAcquire + Send,
 {

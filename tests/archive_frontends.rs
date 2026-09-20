@@ -87,12 +87,7 @@ impl Fixture {
             Some(&self.key),
         ))
         .unwrap();
-        observed
-            .support()
-            .unwrap()
-            .commits(observed.snapshot())
-            .unwrap()
-            .len()
+        observed.support().unwrap().len()
     }
 }
 fn text(parts: &[Part]) -> String {

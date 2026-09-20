@@ -2,13 +2,18 @@
 //! All payloads are local text; the tests need no network, models, or hardware.
 
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use faculties::compass::{AddOptions, Compass};
+use anyhow::Context as _;
+use faculties::collection_names::open_configured;
+use faculties::compass::{status_register_collection, AddOptions, Compass};
 use faculties::mcp::catalog::{Catalog, Config};
 use faculties::mcp::Server;
-use faculties::storage::initialize_signer;
+use faculties::schemas::body::DEFAULT_SCOPE_ID as BODY_SCOPE_ID;
+use faculties::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
+use faculties::storage::{carry_facts, carry_scope, initialize_signer, Storage};
 use serde_json::{json, Value};
+use triblespace::core::collection::CollectionStoreExt as _;
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -35,6 +40,25 @@ impl Fixture {
         config.key = Some(self.key.clone());
         Catalog::new(config)
     }
+}
+
+/// Reads see what the worker carried; the test is the worker here. A Compass
+/// read attaches the fact chain and the status register, so carry both. The
+/// carry goes through its own open of the pile file, as a worker's would; the
+/// live catalog observes it on its next operation.
+fn carry_compass(pile: &Path, key: &Path) {
+    Storage::new(pile.to_owned(), Some(key.to_owned()))
+        .with_pile(|pile, signer| {
+            let source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+            carry_facts(pile, source, signer);
+            let status = status_register_collection(pile, signer.verifying_key())?;
+            drop(
+                pollster::block_on(pile.maintain(status, signer))
+                    .context("maintain Compass status register")?,
+            );
+            Ok(())
+        })
+        .unwrap();
 }
 
 fn request(server: &mut Server<'_>, value: Value) -> Option<Value> {
@@ -114,6 +138,7 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
             "compass_add",
             json!({"title": "shared-pile-record"}),
         ));
+        carry_compass(&fixture.pile, &fixture.key);
 
         // Reopening the configured pathname cannot find the original data.
         // The explicit signer path remains valid, independently of that name.
@@ -140,6 +165,7 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
             "body_capture",
             json!({"modality": "touch", "pose": "fixture pose", "note": "first resident touch"}),
         );
+        carry_scope(&renamed, Some(&fixture.key), BODY_SCOPE_ID).unwrap();
         let captures = text(&call(&mut second, "body_list", json!({})));
         assert!(captures.contains("first resident touch"), "{captures}");
         assert!(!captures.contains("second resident touch"), "{captures}");
@@ -196,6 +222,7 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
             "body_capture",
             json!({"modality": "touch", "pose": "fixture pose", "note": "second resident touch"}),
         );
+        carry_scope(&renamed, Some(&fixture.key), BODY_SCOPE_ID).unwrap();
         let captures = text(&call(&mut second, "body_list", json!({})));
         assert!(captures.contains("first resident touch"), "{captures}");
         assert!(captures.contains("second resident touch"), "{captures}");
@@ -213,6 +240,7 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
             "compass_move",
             json!({"id": goal, "status": "doing", "persona": "alice"}),
         );
+        carry_compass(&renamed, &fixture.key);
         let overview = text(&call(
             &mut second,
             "orient_show",
@@ -250,6 +278,7 @@ fn a_live_catalog_observes_later_appends_from_an_independent_writer() {
     Compass::new(fixture.pile.clone(), Some(fixture.key.clone()))
         .add("later external append", AddOptions::default())
         .unwrap();
+    carry_compass(&fixture.pile, &fixture.key);
 
     let after = text(&call(&mut server, "compass_list", json!({})));
     assert!(after.contains("later external append"), "{after}");
@@ -274,6 +303,8 @@ fn independently_configured_catalogs_keep_their_piles_isolated() {
         "compass_add",
         json!({"title": "right-only-goal"}),
     );
+    carry_compass(&left_fixture.pile, &left_fixture.key);
+    carry_compass(&right_fixture.pile, &right_fixture.key);
 
     for _ in 0..2 {
         let left_goals = text(&call(&mut left, "compass_list", json!({})));
