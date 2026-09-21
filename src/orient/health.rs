@@ -1844,6 +1844,83 @@ mod tests {
     }
 
     #[test]
+    fn collection_episode_receipts_survive_counters_and_reader_restart() {
+        // Exercise receipt overlap independently of the temporary collection
+        // attention gate. An empty report from that gate would prove nothing.
+        for peer in [None, Some(SigningKey::from_bytes(&[72; 32]).verifying_key())] {
+            for state in [State::Unknown, State::Stalled] {
+                let mut f = Fixture::new();
+                let persona = *fucid();
+                let collection = f.sources.health.source.handle();
+                let mut recorder = Recorder::new(f.signer.verifying_key());
+                let mut first_event = None;
+                // Alert, counter-only changes, recovery, more counters, then
+                // a genuinely new failure after recovery.
+                for (step, condition_state, alert, expect_news) in [
+                    (0, state, true, true),
+                    (1, state, true, false),
+                    (2, state, true, false),
+                    (3, State::Current, false, true),
+                    (4, State::Current, false, false),
+                    (5, state, true, true),
+                ] {
+                    let fragment = recorder.record_measurements(
+                        at(step as f64 * 10.0),
+                        [Measurement {
+                            condition: Condition {
+                                component: Component::Collection,
+                                collection: Some(collection),
+                                peer,
+                                state: condition_state,
+                                alert,
+                            },
+                            evidence: Evidence {
+                                local_records: Some(100 + step),
+                                remote_records: Some(80 + step),
+                                ..Evidence::default()
+                            },
+                        }],
+                    ).unwrap();
+                    let event = find!(event: Id, pattern!(fragment.facts(), [{
+                        ?event @ metadata::tag: &schema::KIND_CONDITION
+                    }])).next().unwrap();
+                    if step == 0 {
+                        first_event = Some(event);
+                    } else {
+                        assert_ne!(Some(event), first_event);
+                    }
+                    f.publish(fragment);
+                    if step == 2 {
+                        f.sources = HealthSources::open(
+                            &mut f.store, &f.signer, Duration::from_secs(60),
+                        ).unwrap();
+                    }
+                    let observation = f.observe_at(at(step as f64 * 10.0 + 1.0));
+                    let mut attention = AttentionView::default();
+                    attention.insert(AttentionEvent::Health {
+                        event,
+                        detail: "collection episode regression".to_owned(),
+                        collection_group: None,
+                    });
+                    let report = HealthReport {
+                        text: String::new(),
+                        attention,
+                        next_change: None,
+                    };
+                    let news = observation.news(persona, &report);
+                    assert_eq!(
+                        matches!(news, News::Report { .. }), expect_news,
+                        "peer={peer:?}, state={state:?}, step={step}",
+                    );
+                    if let News::Report { events, .. } = news {
+                        save_presentations(&mut f.store, &f.signer, events).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn news_groups_collection_sync_alerts_with_the_same_observer_and_peer() {
         let mut f = Fixture::new();
         let persona = *fucid();
