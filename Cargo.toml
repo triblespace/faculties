@@ -279,9 +279,9 @@ burn-tensor = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb527
 burn-train = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
 burn-vision = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
 burn-wgpu = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-cubecl-runtime = { path = "../cubecl-fork/cubecl-runtime" }
-cubecl-cuda = { path = "../cubecl-fork/cubecl-cuda" }
-cubecl-wgpu = { path = "../cubecl-fork/cubecl-wgpu" }
+cubecl-runtime = { path = "../cubecl-graph/cubecl-runtime" }
+cubecl-cuda = { path = "../cubecl-graph/cubecl-cuda" }
+cubecl-wgpu = { path = "../cubecl-graph/cubecl-wgpu" }
 triblespace-core = { path = "../triblespace-rs/triblespace-core" }
 
 # Debug info was 94.7% of a debug binary here: the `trible` test binary
