@@ -394,6 +394,37 @@ impl HealthObservation {
     }
 }
 
+/// Collection-sync conditions do not wake anyone, and that is the rule this file
+/// already states a few lines above: "Wait/poll are an attention channel, not a
+/// health dashboard." The collection component slipped through it.
+///
+/// What this deliberately does NOT touch, because a peer cut off from the swarm
+/// must still be able to notice and reconnect -- if health cannot wake it, its
+/// silence reads as health and it stalls forever:
+///
+///   * the observer-stale event, a separate insertion in the `!fresh` branch,
+///     which is exactly the "this node can no longer see the swarm" signal;
+///   * every non-collection component, DHT publication among them;
+///   * `show`, which still renders every condition. Nothing is hidden here;
+///     these simply stop being a reason to interrupt someone.
+///
+/// Measured 2026-09-21: one `orient show` carried 517 condition lines -- 314
+/// converged, 179 unknown, 16 stalled -- against three piles that verify 26/26
+/// complete with replication quiescent. Delivered as attention, that filled a
+/// waiting session's callback queue to its 100-submission cap and killed its
+/// delivery daemon. Whether those unknowns and stalls are real, or an instrument
+/// that cannot tell quiescence from a stall, is a separate open investigation;
+/// until it lands they are not worth a wake.
+///
+/// Set TRIBLESPACE_ORIENT_COLLECTION_SYNC_NEWS=1 to restore the old behaviour.
+fn collection_sync_may_wake(component: Id) -> bool {
+    component != schema::COLLECTION
+        || matches!(
+            std::env::var("TRIBLESPACE_ORIENT_COLLECTION_SYNC_NEWS").as_deref(),
+            Ok("1")
+        )
+}
+
 fn component_name(component: Id) -> Option<&'static str> {
     match component {
         schema::HOST => Some("event loop"),
@@ -666,7 +697,7 @@ fn render_health(
             let recovered = exists!(pattern!(facts, [{
                 condition @ metadata::tag: &schema::KIND_RECOVERED
             }]));
-            if fresh && (alert || recovered) {
+            if fresh && (alert || recovered) && collection_sync_may_wake(component) {
                 attention.insert(AttentionEvent::Health {
                     event: condition,
                     detail: format!(
@@ -801,6 +832,23 @@ mod tests {
         }
     }
 
+    /// A non-collection alerting fixture.
+    ///
+    /// Collection-sync conditions no longer reach `attention` (see
+    /// `collection_sync_may_wake`), so every test about the *generic* alerting
+    /// machinery -- receipts, poll views, private membership, once-only episode
+    /// reporting -- uses this instead. `condition` stays on Collection for the
+    /// tests that genuinely assert collection-sync wording and grouping.
+    fn store_condition(state: State, alert: bool) -> Condition {
+        Condition {
+            component: Component::Store,
+            collection: None,
+            peer: None,
+            state,
+            alert,
+        }
+    }
+
     fn at(seconds: f64) -> Epoch {
         Epoch::from_unix_seconds(1_700_000_000.0 + seconds)
     }
@@ -917,7 +965,10 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(clock::now().unwrap(), [condition(State::Stalled, true)])
+                .record(
+                    clock::now().unwrap(),
+                    [store_condition(State::Stalled, true)],
+                )
                 .unwrap(),
         );
         let health = f.sources.observe(&mut f.store, &f.signer).unwrap();
@@ -999,7 +1050,10 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(clock::now().unwrap(), [condition(State::Stalled, true)])
+                .record(
+                    clock::now().unwrap(),
+                    [store_condition(State::Stalled, true)],
+                )
                 .unwrap(),
         );
         let receipts = f.sources.presentations.source;
@@ -1145,7 +1199,10 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(clock::now().unwrap(), [condition(State::Stalled, true)])
+                .record(
+                    clock::now().unwrap(),
+                    [store_condition(State::Stalled, true)],
+                )
                 .unwrap(),
         );
         let mut parts = Vec::new();
@@ -1425,7 +1482,7 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(at(0.0), [condition(State::Stalled, true)])
+                .record(at(0.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
         assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
@@ -1454,7 +1511,7 @@ mod tests {
 
         f.publish(
             recorder
-                .record(at(2.0), [condition(State::Current, false)])
+                .record(at(2.0), [store_condition(State::Current, false)])
                 .unwrap(),
         );
         {
@@ -1491,7 +1548,7 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(at(0.0), [condition(State::Stalled, true)])
+                .record(at(0.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
         assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
@@ -1600,6 +1657,47 @@ mod tests {
         assert!(!report.text.contains("report too old"));
     }
 
+    /// The collection-sync hotfix, pinned in both directions.
+    ///
+    /// A collection-sync condition still renders in the report `show` prints --
+    /// nothing is hidden -- but it no longer becomes attention, so it wakes
+    /// nobody. Every other component must still wake, which is the half that
+    /// keeps a peer cut off from the swarm able to notice and reconnect.
+    #[test]
+    fn collection_sync_renders_but_does_not_wake_while_other_components_do() {
+        let mut f = Fixture::new();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(at(0.0), [condition(State::Stalled, true)])
+                .unwrap(),
+        );
+        let collection = f.observe_at(at(1.0)).report();
+        assert!(
+            collection.attention.is_empty(),
+            "collection sync must not wake anyone, got {:?}",
+            collection.attention.ids().collect::<Vec<_>>()
+        );
+        assert!(
+            collection.text.contains("collection sync"),
+            "the condition must still be visible to `show`: {}",
+            collection.text
+        );
+
+        let mut other = Fixture::new();
+        let mut other_recorder = Recorder::new(other.signer.verifying_key());
+        other.publish(
+            other_recorder
+                .record(at(0.0), [store_condition(State::Stalled, true)])
+                .unwrap(),
+        );
+        assert_eq!(
+            other.observe_at(at(1.0)).report().attention.ids().len(),
+            1,
+            "a non-collection component must still wake"
+        );
+    }
+
     #[test]
     fn failure_and_recovery_are_each_reported_once() {
         let mut f = Fixture::new();
@@ -1607,7 +1705,7 @@ mod tests {
         let mut recorder = Recorder::new(f.signer.verifying_key());
         f.publish(
             recorder
-                .record(at(0.0), [condition(State::Stalled, true)])
+                .record(at(0.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
         let failure = f.observe_at(at(1.0)).report();
@@ -1615,7 +1713,7 @@ mod tests {
         save_presentations(&mut f.store, &f.signer, failure.attention.ids()).unwrap();
         f.publish(
             recorder
-                .record(at(10.0), [condition(State::Stalled, true)])
+                .record(at(10.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
         let heartbeat = f.observe_at(at(11.0));
@@ -1627,7 +1725,7 @@ mod tests {
 
         f.publish(
             recorder
-                .record(at(20.0), [condition(State::Current, false)])
+                .record(at(20.0), [store_condition(State::Current, false)])
                 .unwrap(),
         );
         let recovered = f.observe_at(at(21.0));
@@ -1636,12 +1734,12 @@ mod tests {
         let recovery_ids: Vec<_> = recovered_report.attention.ids().collect();
         let recovery_news = recovered.news(persona, &recovered_report);
         assert!(
-            matches!(&recovery_news, News::Report { text, .. } if text.contains("recovered; converged"))
+            matches!(&recovery_news, News::Report { text, .. } if text.contains("recovered; current"))
         );
         save_presentations(&mut f.store, &f.signer, recovery_ids).unwrap();
         f.publish(
             recorder
-                .record(at(30.0), [condition(State::Current, false)])
+                .record(at(30.0), [store_condition(State::Current, false)])
                 .unwrap(),
         );
         let heartbeat = f.observe_at(at(31.0));
@@ -1653,7 +1751,7 @@ mod tests {
         let mut restarted = Recorder::new(f.signer.verifying_key());
         f.publish(
             restarted
-                .record(at(40.0), [condition(State::Current, false)])
+                .record(at(40.0), [store_condition(State::Current, false)])
                 .unwrap(),
         );
         assert!(f.observe_at(at(41.0)).report().attention.is_empty());
