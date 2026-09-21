@@ -177,142 +177,8 @@ pub fn configured_handle(scope: Id) -> anyhow::Result<Option<CollectionHandle>> 
         .transpose()
 }
 
-/// A host is about to start a new generation of a name that other generations
-/// already hold records under, because this key may write none of them.
-///
-/// Not a refusal. An unconfigured faculty on a pile with any history would
-/// never run, and a deliberate cutover looks exactly like this the moment
-/// before its drain. But it is the shape of the accident that stranded five
-/// generations, so it says so, names them, and names the variable that settles
-/// it.
-fn unwritable_siblings_warning(
-    scope: Id,
-    siblings: &[generation::GenerationRecords],
-) -> Option<String> {
-    let listed: Vec<String> = siblings
-        .iter()
-        .filter(|sibling| sibling.commits() > 0)
-        .map(|sibling| {
-            format!(
-                "blake3:{} ({} commit(s))",
-                hex::encode(sibling.handle().raw),
-                sibling.commits()
-            )
-        })
-        .collect();
-    if listed.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "starting a new generation of {:?} beside {} that already hold records \
-         and that this key may not write: {}. Set {} if this host should use one \
-         of them instead.",
-        require_name(scope),
-        listed.len(),
-        listed.join(", "),
-        override_env_name(scope),
-    ))
-}
-
-/// Resolve this faculty's collection by NAME, for a host with no exact handle
-/// configured.
-///
-/// A collection's identity is the handle of its descriptor, so every descriptor
-/// change mints a new collection under the same name and leaves the previous one
-/// resident. A host with no configured handle therefore has to choose between
-/// generations, and the only thing it has to choose by is the name.
-///
-/// It chooses among the generations this key could actually write:
-///
-/// - none: use the signer-private descriptor. This host starts the name.
-/// - one: use it. There is nothing to be ambiguous about.
-/// - several: refuse, and name them. Picking one silently is how a write lands
-///   in a generation nobody else reads.
-///
-/// Scoping the candidates to what this key may write is what makes the ordinary
-/// case unambiguous rather than merely diagnosable. A retired generation whose
-/// policy admits some other host alone is not a candidate here, so a deployment
-/// that has moved to a shared policy resolves cleanly while a genuine fork still
-/// refuses.
-///
-/// This replaces a refusal that fired whenever a same-named sibling held records
-/// at all, which made an unconfigured faculty unusable on any pile with history.
-fn resolve_by_name<S>(
-    storage: &mut S,
-    scope: Id,
-    authority: VerifyingKey,
-) -> anyhow::Result<Collection<SimpleArchive>>
-where
-    S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot:
-        StoreSnapshot + BlobStoreGet + CollectionRead + CapabilityProofRead,
-{
-    // The private descriptor is only content until something commits to it, so
-    // registering it costs nothing whether or not it turns out to be the one.
-    let private = open(storage, scope, authority).context("register signer-private descriptor")?;
-    let snapshot = storage
-        .snapshot()
-        .context("freeze store to resolve this collection by name")?;
-    let Some(report) = generation::named_generations(&snapshot, private.handle())
-        .map_err(|error| anyhow!("look for other generations of this name: {error}"))?
-    else {
-        return Ok(private);
-    };
-
-    let mut writable = Vec::new();
-    for sibling in report.siblings() {
-        if sibling.commits() == 0 {
-            continue;
-        }
-        let candidate = open_exact_in(&snapshot, scope, sibling.handle())?;
-        let admitted = candidate
-            .writer_is_admitted(&snapshot, authority)
-            .map_err(|error| {
-                anyhow!("check WRITE admission on a same-named generation: {error}")
-            })?;
-        if admitted {
-            writable.push(sibling);
-        }
-    }
-
-    match writable.as_slice() {
-        [] => {
-            // Nothing here this key may write, so this host starts the name.
-            // That is the accident the old refusal existed to prevent, and it
-            // is still worth saying out loud -- just not worth refusing over,
-            // because refusing made an unconfigured faculty unusable on any
-            // pile with history. Warn, name the siblings, and proceed.
-            if let Some(warning) = unwritable_siblings_warning(scope, report.siblings()) {
-                eprintln!("warning: {warning}");
-            }
-            Ok(private)
-        }
-        [only] => open_exact_in(&snapshot, scope, only.handle()),
-        several => {
-            let variable = override_env_name(scope);
-            let listed: Vec<String> = several
-                .iter()
-                .map(|sibling| {
-                    format!(
-                        "blake3:{} ({} commit(s))",
-                        hex::encode(sibling.handle().raw),
-                        sibling.commits()
-                    )
-                })
-                .collect();
-            bail!(
-                "{:?} is ambiguous on this host: {} generations of that name hold records that \
-                 this key may write: {}. Set {variable} to the one this host should use.",
-                require_name(scope),
-                listed.len(),
-                listed.join(", ")
-            )
-        }
-    }
-}
-
-/// Open the operator-selected exact descriptor, or resolve this faculty's
-/// collection by name when no override is present.
+/// Open the operator-selected exact descriptor, or construct the ordinary
+/// signer-private faculty descriptor when no override is present.
 ///
 /// The override path is non-registering: its canonical descriptor must already
 /// be resident and carry the name assigned to this faculty scope. Local
@@ -326,11 +192,47 @@ pub fn open_configured<S>(
 ) -> anyhow::Result<Collection<SimpleArchive>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot:
-        StoreSnapshot + BlobStoreGet + CollectionRead + CapabilityProofRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + CollectionRead,
 {
     let Some(handle) = configured_handle(scope)? else {
-        return resolve_by_name(storage, scope, authority);
+        let collection =
+            open(storage, scope, authority).context("register signer-private descriptor")?;
+        // A host with no configured handle must not quietly start a new
+        // generation beside ones the other hosts already write to. The private
+        // descriptor is only content until something commits to it, so
+        // registering it costs nothing; using it here would.
+        let snapshot = storage
+            .snapshot()
+            .context("freeze store to look for other generations of this name")?;
+        if let Some(report) = generation::named_generations(&snapshot, collection.handle())
+            .map_err(|error| anyhow!("look for other generations: {error}"))?
+        {
+            if report.strands_records() {
+                let variable = override_env_name(scope);
+                let siblings: Vec<String> = report
+                    .siblings()
+                    .iter()
+                    .filter(|sibling| sibling.commits() > 0)
+                    .map(|sibling| {
+                        format!(
+                            "blake3:{} ({} commit(s))",
+                            hex::encode(sibling.handle().raw),
+                            sibling.commits()
+                        )
+                    })
+                    .collect();
+                bail!(
+                    "{} is not configured on this host and this pile already holds {} \
+                     generation(s) of {:?} with content: {}. Set {variable} to the one \
+                     this host should use instead of starting another.",
+                    variable,
+                    siblings.len(),
+                    require_name(scope),
+                    siblings.join(", ")
+                );
+            }
+        }
+        return Ok(collection);
     };
 
     let snapshot = storage
@@ -562,14 +464,11 @@ where
 mod tests {
     use super::*;
 
-    /// The name resolves to the generation this key may write.
-    ///
-    /// This is the case these hosts actually have: every host's key is a root of
-    /// the shared generation, so an unconfigured faculty finds it instead of
-    /// starting its own beside it. The refusal this replaced fired here, which
-    /// made an unconfigured faculty unusable on any pile with history.
+    /// A host with no configured handle may mint the private descriptor on an
+    /// empty pile, but not beside a generation of the same name that already
+    /// holds content: that is how a fourth generation would start by accident.
     #[test]
-    fn one_writable_sibling_is_what_the_name_resolves_to() {
+    fn open_configured_refuses_to_start_a_generation_beside_one_with_content() {
         use triblespace::core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
 
         let scope = decide::DEFAULT_SCOPE_ID;
@@ -579,128 +478,32 @@ mod tests {
             "{variable} must be unset for this test"
         );
         let mut store = MemoryRepo::default();
-        let sky = SigningKey::from_bytes(&[81; 32]);
-
-        // A generation any key may write, holding content. The shared shape.
-        let shared = store
-            .collection(
-                require_name(scope),
-                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
-            )
-            .expect("register a shared generation");
-        store
-            .insert(CollectionRecord::Commit(CollectionCommit::sign(
-                &sky,
-                shared.handle(),
-                Inline::new([1; 32]),
-                Inline::new([2; 32]),
-            )))
-            .unwrap();
-
-        let resolved = open_configured(&mut store, scope, sky.verifying_key())
-            .expect("a writable same-named generation resolves by name");
-        assert_eq!(
-            resolved.handle(),
-            shared.handle(),
-            "the name must resolve to the writable generation, not a fresh private one"
-        );
-    }
-
-    /// A generation this key may NOT write is not a candidate at all.
-    ///
-    /// The host keeps its own descriptor, and says out loud that it is starting
-    /// a name others already hold records under, because that is the shape of
-    /// the accident which stranded five generations. A warning, not a refusal:
-    /// a deliberate cutover looks exactly like this the moment before its drain.
-    #[test]
-    fn a_sibling_this_key_cannot_write_is_not_a_candidate() {
-        use triblespace::core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
-
-        let scope = decide::DEFAULT_SCOPE_ID;
-        let mut store = MemoryRepo::default();
         let mac = SigningKey::from_bytes(&[71; 32]);
         let sky = SigningKey::from_bytes(&[72; 32]);
 
-        let theirs = open(&mut store, scope, mac.verifying_key()).unwrap();
+        // An empty pile: the private descriptor is the only generation.
+        let first = open_configured(&mut store, scope, mac.verifying_key())
+            .expect("the first generation on an empty pile");
+        // Still fine while nobody has committed anything anywhere.
+        open_configured(&mut store, scope, sky.verifying_key())
+            .expect("a second descriptor is only content until something commits");
+
         store
             .insert(CollectionRecord::Commit(CollectionCommit::sign(
                 &mac,
-                theirs.handle(),
+                first.handle(),
                 Inline::new([1; 32]),
                 Inline::new([2; 32]),
             )))
             .unwrap();
-
-        let mine = open_configured(&mut store, scope, sky.verifying_key())
-            .expect("a generation this key cannot write is not a candidate");
-        assert_ne!(
-            mine.handle(),
-            theirs.handle(),
-            "a key may not resolve to a generation it cannot write"
-        );
-
-        // The same host's own generation, reopened, is the one it resolves to.
-        let reopened = open_configured(&mut store, scope, mac.verifying_key())
-            .expect("reopening the generation that holds the content");
-        assert_eq!(reopened.handle(), theirs.handle());
-
-        // And the accident is named rather than silent.
-        let snapshot = store.snapshot().unwrap();
-        let report = generation::named_generations(&snapshot, mine.handle())
-            .unwrap()
-            .expect("a same-named sibling exists");
-        let warning = unwritable_siblings_warning(scope, report.siblings())
-            .expect("starting a name others hold is said out loud");
-        assert!(
-            warning.contains(&hex::encode(theirs.handle().raw)),
-            "{warning}"
-        );
-        assert!(warning.contains(&override_env_name(scope)), "{warning}");
-    }
-
-    /// Two writable generations of one name is a genuine fork, and the only
-    /// honest answer is to refuse and name them both.
-    #[test]
-    fn several_writable_siblings_refuse_and_name_themselves() {
-        use triblespace::core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
-
-        let scope = decide::DEFAULT_SCOPE_ID;
-        let mut store = MemoryRepo::default();
-        let sky = SigningKey::from_bytes(&[91; 32]);
-
-        // Two descriptors this key may write, differing only in how they say
-        // so, which is enough to make them different collections.
-        let policies = [
-            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
-            CollectionPolicy::new(
-                AdmissionPolicy::Open,
-                AdmissionPolicy::direct(sky.verifying_key()),
-            ),
-        ];
-        let mut handles = Vec::new();
-        for (tag, policy) in policies.into_iter().enumerate() {
-            let tag = tag as u8 + 3;
-            let shared = store
-                .collection(require_name(scope), policy)
-                .expect("register a writable generation");
-            store
-                .insert(CollectionRecord::Commit(CollectionCommit::sign(
-                    &sky,
-                    shared.handle(),
-                    Inline::new([tag; 32]),
-                    Inline::new([2; 32]),
-                )))
-                .unwrap();
-            handles.push(shared.handle());
-        }
-
         let error = open_configured(&mut store, scope, sky.verifying_key())
-            .expect_err("two writable generations of one name is ambiguous")
+            .expect_err("a generation with content exists; refuse to start another")
             .to_string();
-        assert!(error.contains(&override_env_name(scope)), "{error}");
-        for handle in handles {
-            assert!(error.contains(&hex::encode(handle.raw)), "{error}");
-        }
+        assert!(error.contains(&variable), "{error}");
+        assert!(error.contains(&hex::encode(first.handle().raw)), "{error}");
+        // The same host's own generation, reopened, is not "another".
+        open_configured(&mut store, scope, mac.verifying_key())
+            .expect("reopening the generation that holds the content");
     }
 
     /// A configured generation that reads empty while a same-named sibling
