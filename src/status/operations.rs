@@ -317,7 +317,7 @@ fn commit_status(
         .commit(collection, signer, fragment)
         .context("commit authored Status event")?;
     drop(
-        pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+        pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
             .context("Status facts were committed, but ensuring their derived views failed")?,
     );
     Ok(commit)

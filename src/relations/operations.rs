@@ -60,7 +60,7 @@ impl RelationsStorage<'_> {
                 .commit(self.collection, self.signer, fragment)
                 .context("commit authored Relations fragment")?;
             drop(
-                pollster::block_on(crate::storage::ensure_derived(
+                pollster::block_on(crate::storage::ensure_downstream(
                     self.pile,
                     self.collection,
                     self.signer,

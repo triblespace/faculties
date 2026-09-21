@@ -1274,7 +1274,7 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
         pile.commit(collection, &signer, fragment)
             .context("commit the utterance")?;
         drop(
-            pollster::block_on(crate::storage::ensure_derived(
+            pollster::block_on(crate::storage::ensure_downstream(
                 &mut pile, collection, &signer,
             ))
             .context("Duplex utterance was committed, but ensuring its derived views failed")?,

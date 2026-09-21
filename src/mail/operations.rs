@@ -448,7 +448,7 @@ impl Storage {
                 .with_context(|| format!("commit collection {scope:x}"))?;
             self.published.set(true);
             drop(
-                pollster::block_on(crate::storage::ensure_derived(
+                pollster::block_on(crate::storage::ensure_downstream(
                     pile,
                     collection,
                     &self.signer,

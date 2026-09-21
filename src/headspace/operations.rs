@@ -271,7 +271,7 @@ impl Storage {
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
             drop(
-                pollster::block_on(crate::storage::ensure_derived(
+                pollster::block_on(crate::storage::ensure_downstream(
                     pile,
                     collection,
                     &self.signer,

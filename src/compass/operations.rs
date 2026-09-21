@@ -429,7 +429,7 @@ impl CompassStorage<'_> {
                     .block_on(async {
                         storage::seed_derived(pile, status, compass_source.handle(), signer)
                             .await?;
-                        storage::ensure_derived(pile, compass_source, signer).await?;
+                        storage::ensure_downstream(pile, compass_source, signer).await?;
                         Ok::<_, anyhow::Error>(())
                     })
                     .context(

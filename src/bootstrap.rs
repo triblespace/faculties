@@ -537,7 +537,7 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                 )?;
                 let latest = wiki_model::latest_for_source(pile, source)?;
                 crate::storage::seed_derived(pile, latest, source.handle(), signer).await?;
-                crate::storage::ensure_derived(pile, source, signer).await?;
+                crate::storage::ensure_downstream(pile, source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             }
             .await
@@ -552,7 +552,7 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                 )?;
                 let status = compass::status_register_collection(pile, signer.verifying_key())?;
                 crate::storage::seed_derived(pile, status, source.handle(), signer).await?;
-                crate::storage::ensure_derived(pile, source, signer).await?;
+                crate::storage::ensure_downstream(pile, source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             }
             .await

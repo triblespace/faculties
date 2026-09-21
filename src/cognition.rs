@@ -169,7 +169,7 @@ pub fn publish_events_with_storage(
         }
         if !commits.is_empty() {
             drop(
-                pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context(
                         "Cognition facts were committed, but ensuring their derived views failed",
                     )?,

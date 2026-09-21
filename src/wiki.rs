@@ -1690,7 +1690,7 @@ pub async fn materialize_indexed_collection(
             .context("seed the Wiki supersession index")?,
     );
     drop(
-        crate::storage::ensure_derived(pile, collection, signer)
+        crate::storage::ensure_downstream(pile, collection, signer)
             .await
             .context("ensure the Wiki views before materializing")?,
     );

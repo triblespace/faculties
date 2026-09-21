@@ -2247,7 +2247,7 @@ impl PostureStorage<'_> {
                     .commit(collection, signer, fragment)
                     .context("commit authored Posture policy fragment")?;
                 drop(
-                    pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                    pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                         .context(
                             "Posture policy facts were committed, but ensuring their derived views failed",
                         )?,
@@ -2264,7 +2264,7 @@ impl PostureStorage<'_> {
                 .commit(collection, signer, fragment)
                 .context("commit authored Posture scan fragment")?;
             drop(
-                pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context(
                     "Posture scan facts were committed, but ensuring their derived views failed",
                 )?,

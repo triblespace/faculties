@@ -214,7 +214,7 @@ impl MessageStorage<'_> {
                 .commit(self.collection, self.signer, fragment)
                 .context("commit authored Message fragment")?;
             drop(
-                crate::storage::ensure_derived(self.pile, self.collection, self.signer)
+                crate::storage::ensure_downstream(self.pile, self.collection, self.signer)
                     .await
                     .context(
                         "Message fragment was committed, but ensuring its derived views failed",

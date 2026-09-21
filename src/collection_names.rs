@@ -374,7 +374,7 @@ where
     Some(format!(
         "{} names an empty generation of {:?} (blake3:{}) while {} other generation(s) in this \
          pile hold {} record(s); if this host was meant to read them, drain them into this \
-         generation (trible pile collection migrate --into blake3:{} --siblings) or configure \
+         generation (trible pile collection adopt --into blake3:{} --siblings) or configure \
          the generation that holds them",
         override_env_name(scope),
         require_name(scope),

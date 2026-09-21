@@ -186,7 +186,7 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
         drop(
-            pollster::block_on(crate::storage::ensure_derived(
+            pollster::block_on(crate::storage::ensure_downstream(
                 self.pile.borrow_mut(),
                 self.collection,
                 &self.signer,

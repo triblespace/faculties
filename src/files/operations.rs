@@ -259,7 +259,7 @@ fn ensure_files_after_commit(
 ) -> Result<()> {
     drop(
         runtime
-            .block_on(crate::storage::ensure_derived(store, collection, signer))
+            .block_on(crate::storage::ensure_downstream(store, collection, signer))
             .context("Files facts were committed, but ensuring their derived views failed")?,
     );
     Ok(())

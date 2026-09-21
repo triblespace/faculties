@@ -333,7 +333,7 @@ impl BodyStorage<'_> {
             pollster::block_on(async {
                 let intents = super::intent_register_collection(pile, signer.verifying_key())?;
                 crate::storage::seed_derived(pile, intents, collection.handle(), signer).await?;
-                crate::storage::ensure_derived(pile, collection, signer).await?;
+                crate::storage::ensure_downstream(pile, collection, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
             .context("Body facts were committed, but ensuring its derived views failed")?;

@@ -750,7 +750,7 @@ impl MemoryStorage<'_> {
             let collection = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored Memory fragment")?;
-            pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context("Memory fragment was committed, but ensuring its derived views failed")
                 .map(drop)
         })
@@ -762,7 +762,7 @@ impl MemoryStorage<'_> {
             let collection = open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored embedding observations")?;
-            pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context("Embedding observations were committed, but ensuring derived views failed")
                 .map(drop)
         })
@@ -773,7 +773,7 @@ impl MemoryStorage<'_> {
             let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored Comb cursor")?;
-            pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context("Comb cursor was committed, but ensuring its derived views failed")
                 .map(drop)
         })

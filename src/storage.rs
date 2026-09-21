@@ -14,11 +14,11 @@
 //! - **Publication and discovery.** [`publish_fragment`] / [`publish_fragments`]
 //!   commit whole fragments into one scoped collection; [`discover_target`]
 //!   reports what a scope already holds.
-//! - **Derived upkeep.** A write calls [`ensure_derived`] after its commit so
+//! - **Derived upkeep.** A write calls [`ensure_downstream`] after its commit so
 //!   the commit is readable through every view derived from its collection,
 //!   found from the store's own listing rather than a list kept per faculty;
 //!   the maintenance daemon, or [`carry_facts`] standing in for it, calls
-//!   [`maintain_derived`] to carry those views to their fixed points.
+//!   [`maintain_downstream`] to carry those views to their fixed points.
 //!
 //! This module was carved out of the storage cutover, which is where these
 //! primitives were first written. The cutover itself now lives in the separate
@@ -37,11 +37,11 @@ use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace::core::collection::{
-    ensure_derived as core_ensure_derived, maintain_derived as core_maintain_derived, realize_as,
-    Collection, CollectionCommit, CollectionDerivation, CollectionDerive, CollectionHandle,
-    CollectionMerge, CollectionRead, CollectionRealizationError, CollectionRecord,
-    CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt, CoreRealizer, Derived,
-    RealizeDerived, Realized, Support, Upkeep, UpkeepReport,
+    ensure_downstream as core_ensure_downstream, maintain_downstream as core_maintain_downstream,
+    realize_as, Collection, CollectionCommit, CollectionDerivation, CollectionDerive,
+    CollectionHandle, CollectionMerge, CollectionRead, CollectionRealizationError,
+    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt,
+    CoreRealizer, Derived, RealizeDerived, Realized, Support, Upkeep, UpkeepReport,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -639,7 +639,7 @@ pub fn publish_fragments(
         }
         if !commits.is_empty() {
             drop(
-                pollster::block_on(ensure_derived(&mut pile, collection, &signer))
+                pollster::block_on(ensure_downstream(&mut pile, collection, &signer))
                     .context("fragments were committed, but ensuring their derived views failed")?,
             );
         }
@@ -1351,7 +1351,7 @@ pub fn carry_facts<S>(pile: &mut S, source: Collection<SimpleArchive>, signer: &
 where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
-    drop(pollster::block_on(maintain_derived(pile, source, signer)).unwrap());
+    drop(pollster::block_on(maintain_downstream(pile, source, signer)).unwrap());
 }
 
 /// The realizer for every derived encoding a faculty binary carries: the
@@ -1411,7 +1411,7 @@ where
 /// A derived collection joins a store's listing with its first record, and
 /// until then no pass over what derives from its source can find it. So
 /// whoever registers one realizes it right then, for the commits already
-/// there; from then on every write's [`ensure_derived`] finds it. `source` is
+/// there; from then on every write's [`ensure_downstream`] finds it. `source` is
 /// the collection `target` derives from. Costs one listing when the target
 /// is already listed, which is every time but the first.
 pub async fn seed_derived<S, T>(
@@ -1454,7 +1454,7 @@ where
 /// merge is published; the maintenance daemon carries the leaves to their
 /// fixed points later. The first call over a source with a backlog pays for
 /// that backlog, and that is the price of the first call.
-pub async fn ensure_derived<S>(
+pub async fn ensure_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
     signer: &SigningKey,
@@ -1465,15 +1465,15 @@ where
     let (succinct, rank9) = fact_pair(pile, source)?;
     seed_derived(pile, succinct, source.handle(), signer).await?;
     seed_derived(pile, rank9, succinct.handle(), signer).await?;
-    core_ensure_derived(pile, source.handle(), signer, &mut FacultiesRealizer)
+    core_ensure_downstream(pile, source.handle(), signer, &mut FacultiesRealizer)
         .await
         .map_err(|error| anyhow!("ensure the collections derived from the source: {error}"))
 }
 
 /// Carry every collection derived from `source` to its fixed point, each
 /// after its own source, as the maintenance daemon does. The pair is
-/// registered and seeded first, like [`ensure_derived`].
-pub async fn maintain_derived<S>(
+/// registered and seeded first, like [`ensure_downstream`].
+pub async fn maintain_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
     signer: &SigningKey,
@@ -1484,7 +1484,7 @@ where
     let (succinct, rank9) = fact_pair(pile, source)?;
     seed_derived(pile, succinct, source.handle(), signer).await?;
     seed_derived(pile, rank9, succinct.handle(), signer).await?;
-    core_maintain_derived(pile, source.handle(), signer, &mut FacultiesRealizer)
+    core_maintain_downstream(pile, source.handle(), signer, &mut FacultiesRealizer)
         .await
         .map_err(|error| anyhow!("maintain the collections derived from the source: {error}"))
 }

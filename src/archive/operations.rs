@@ -1235,7 +1235,7 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
             let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("publish archive replay cursor")?;
-            pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context(
                     "Archive replay cursor was committed, but ensuring its derived views failed",
                 )

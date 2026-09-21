@@ -270,7 +270,7 @@ impl WikiStorage<'_> {
                 .commit(collection, signer, fragment)
                 .context("publish native collection fragment")?;
             runtime
-                .block_on(crate::storage::ensure_derived(pile, collection, signer))
+                .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context(
                     "Wiki auxiliary fragment was committed, but ensuring its derived views failed",
                 )?;
@@ -302,7 +302,7 @@ impl WikiStorage<'_> {
                 .block_on(async {
                     let latest = wiki_model::latest_for_source(pile, collection)?;
                     crate::storage::seed_derived(pile, latest, collection.handle(), signer).await?;
-                    crate::storage::ensure_derived(pile, collection, signer).await?;
+                    crate::storage::ensure_downstream(pile, collection, signer).await?;
                     Ok::<_, anyhow::Error>(())
                 })
                 .context("Wiki fragment was committed, but ensuring its derived views failed")?;

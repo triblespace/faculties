@@ -393,7 +393,7 @@ impl DecideStorage<'_> {
             pile.commit(collection, signer, fragment)
                 .context("commit authored Decide fragment")?;
             drop(
-                pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+                pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context(
                         "Decide facts were committed, but ensuring their derived views failed",
                     )?,

@@ -304,7 +304,7 @@ pub(super) fn commit_habit_fragment(
         .commit(collection, signer, fragment)
         .context("commit Habit fragment")?;
     drop(
-        pollster::block_on(crate::storage::ensure_derived(pile, collection, signer))
+        pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
             .context("Habit facts were committed, but ensuring their derived views failed")?,
     );
     Ok(commit)
