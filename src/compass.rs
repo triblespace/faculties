@@ -29,7 +29,7 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource, StoreSnapshot};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -1144,7 +1144,7 @@ pub fn commit_collection<S>(
 ) -> Result<CollectionCommit>
 where
     S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreGet + CollectionRead,
+    S::Snapshot: StoreSnapshot + BlobStoreGet + CollectionRead + CapabilityProofRead,
 {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
