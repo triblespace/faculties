@@ -13,11 +13,12 @@
 
 use ed25519_dalek::VerifyingKey;
 
-use triblespace::core::blob::IntoBlob;
 use triblespace::core::collection::descriptor;
-use triblespace::core::collection::records::{collection_name, CollectionHandle};
+use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
+use triblespace::core::metadata;
+use triblespace::core::query::register::{maximal, ObservationOrder};
 use triblespace::core::query::TriblePattern;
 use triblespace::prelude::*;
 
@@ -42,41 +43,81 @@ pub fn handle(authority: VerifyingKey) -> CollectionHandle {
     )
 }
 
-/// The exact descriptor this pile's configuration resolves `name` to.
+/// The collection this pile configures faculty `scope` to use.
 ///
-/// Open world throughout. A name with no entry is `None` rather than an error,
-/// because that is every host not yet configured. A name with SEVERAL entries
-/// is also `None`, and deliberately: two entries disagreeing about which
-/// collection a name means is exactly the case where guessing is worst, and the
-/// schema language cannot forbid the second entry anyway. Picking the first
-/// match would make the answer depend on iteration order.
-pub fn resolve_in<P>(facts: &P, name: &str) -> Option<CollectionHandle>
+/// Configuration is a REGISTER, not a table keyed by name. The faculty brings
+/// its own stable scope id; that id anchors the register, and the states of
+/// that register are ordered by the ordinary `metadata::supersedes` DAG. The
+/// current configuration is the state nothing supersedes.
+///
+/// Keying on identity rather than on a name is the point. A name would have to
+/// be hashed to be looked up, two faculties could claim one name, and a name
+/// says nothing about which thing it configures. A scope id is already each
+/// schema's stable identifier and every faculty already holds its own.
+///
+/// Ordering by supersession is the other half. Reconfiguring writes a state
+/// that supersedes the last one, so an ordinary change is unambiguous and
+/// needs no clock, no counter and no retraction -- the store stays append-only
+/// and the history of what this host was pointed at stays readable.
+///
+/// The pattern proposes and the register filters: `maximal` never proposes
+/// candidates, it only kills dominated ones, so the planner orders around the
+/// anchor lookup exactly as it would any other relation.
+///
+/// # What is refused
+///
+/// Genuinely CONCURRENT states -- two configurations neither of which
+/// supersedes the other -- are an error rather than a guess. Manufacturing an
+/// order between them is the one thing this substrate refuses to do on a
+/// reader's behalf, and picking one would silently point a host at a
+/// collection nobody chose, which is the exact failure this mechanism exists
+/// to end. The fix is one write that supersedes both.
+///
+/// Concurrent states that select the SAME collection are not a conflict. They
+/// agree, and a duplicate is not a fault in a store that cannot reach
+/// consensus at write time; erroring on one would assume a coordination we do
+/// not have.
+pub fn configured_in<P>(facts: &P, scope: Id) -> anyhow::Result<Option<CollectionHandle>>
 where
-    P: TriblePattern + ?Sized,
+    P: TriblePattern + Sync,
 {
-    let named = name_handle(name);
-    let mut found = find!(
-        (entry: Id, selected: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>),
-        pattern!(facts, [{ ?entry @
-            collection_name: named,
-            crate::schemas::config::config::resolves_to: ?selected,
-        }])
+    let order = ObservationOrder::new(facts, metadata::supersedes.id());
+    let mut heads: Vec<CollectionHandle> = find!(
+        (
+            state: Id,
+            selected: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>
+        ),
+        and!(
+            pattern!(facts, [{ ?state @
+                crate::schemas::config::config::anchor: scope,
+                crate::schemas::config::config::selects: ?selected,
+            }]),
+            maximal(state, &order),
+        )
     )
-    .map(|(_, selected)| selected);
+    .map(|(_, selected)| selected)
+    .collect();
 
-    let first = found.next()?;
-    // A second row means the configuration contradicts itself.
-    found.next().is_none().then_some(first)
-}
+    heads.sort_unstable();
+    heads.dedup();
 
-/// Content address of a collection name, the way a descriptor stores it.
-///
-/// `collection_name` is a `Handle<UTF8String>`, so looking one up means hashing
-/// the name rather than comparing text. Pure, and the same bytes a descriptor
-/// would carry -- which is what lets a configuration entry and a descriptor be
-/// joined on the same value.
-fn name_handle(name: &str) -> Inline<inlineencodings::Handle<blobencodings::UTF8String>> {
-    IntoBlob::<blobencodings::UTF8String>::to_blob(name.to_owned()).get_handle()
+    match heads.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        several => {
+            let listed = several
+                .iter()
+                .map(|handle| format!("blake3:{}", hex::encode(handle.raw)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "the {COLLECTION_NAME} collection holds {} concurrent configurations for scope \
+                 {scope:X} and none supersedes the others: {listed}. Write one state that \
+                 supersedes them rather than letting a reader pick.",
+                several.len()
+            )
+        }
+    }
 }
 
 /// Which source a resolved handle came from, and whether they disagreed.
@@ -153,6 +194,98 @@ mod tests {
             handle(key(2)),
             "one pile's configuration must not be another's"
         );
+    }
+
+    fn descriptor(byte: u8) -> CollectionHandle {
+        Inline::new([byte; 32])
+    }
+
+    /// One configuration state for `scope`, optionally superseding others.
+    fn state(id: &Id, scope: Id, selected: CollectionHandle, supersedes: &[Id]) -> TribleSet {
+        let mut facts = entity! { ExclusiveId::force_ref(id) @
+            crate::schemas::config::config::anchor: scope,
+            crate::schemas::config::config::selects: selected,
+        }
+        .facts()
+        .clone();
+        for earlier in supersedes {
+            facts.union(
+                entity! { ExclusiveId::force_ref(id) @
+                    metadata::supersedes: ExclusiveId::force_ref(earlier),
+                }
+                .facts()
+                .clone(),
+            );
+        }
+        facts
+    }
+
+    #[test]
+    fn an_unconfigured_faculty_resolves_to_nothing_rather_than_failing() {
+        let facts = TribleSet::new();
+        assert_eq!(configured_in(&facts, genid().id).unwrap(), None);
+    }
+
+    #[test]
+    fn one_state_is_the_configuration() {
+        let scope = genid().id;
+        let other = genid().id;
+        let facts = state(&genid().id, scope, descriptor(0xAB), &[]);
+
+        assert_eq!(
+            configured_in(&facts, scope).unwrap(),
+            Some(descriptor(0xAB))
+        );
+        assert_eq!(
+            configured_in(&facts, other).unwrap(),
+            None,
+            "one faculty's register must not answer for another's"
+        );
+    }
+
+    /// The behaviour a name-keyed table could not express: reconfiguring is an
+    /// ordinary append that supersedes, not an edit and not a contradiction.
+    #[test]
+    fn a_superseding_state_wins_and_the_old_one_stays_readable() {
+        let scope = genid().id;
+        let first = genid().id;
+        let second = genid().id;
+
+        let mut facts = state(&first, scope, descriptor(0xAB), &[]);
+        facts.union(state(&second, scope, descriptor(0xCD), &[first]));
+
+        assert_eq!(
+            configured_in(&facts, scope).unwrap(),
+            Some(descriptor(0xCD)),
+            "the head is the state nothing supersedes"
+        );
+    }
+
+    /// Duplicates are physics in a store that cannot reach consensus at write
+    /// time. Two concurrent states that agree are not a conflict.
+    #[test]
+    fn concurrent_states_selecting_the_same_collection_still_resolve() {
+        let scope = genid().id;
+        let mut facts = state(&genid().id, scope, descriptor(0xAB), &[]);
+        facts.union(state(&genid().id, scope, descriptor(0xAB), &[]));
+
+        assert_eq!(
+            configured_in(&facts, scope).unwrap(),
+            Some(descriptor(0xAB))
+        );
+    }
+
+    /// And the case the substrate refuses to guess at.
+    #[test]
+    fn concurrent_states_that_disagree_are_an_error_not_a_guess() {
+        let scope = genid().id;
+        let mut facts = state(&genid().id, scope, descriptor(0xAB), &[]);
+        facts.union(state(&genid().id, scope, descriptor(0xCD), &[]));
+
+        let error = configured_in(&facts, scope).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("concurrent"), "{text}");
+        assert!(text.contains("supersede"), "{text}");
     }
 
     #[test]

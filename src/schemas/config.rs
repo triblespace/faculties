@@ -50,16 +50,29 @@ pub const DEFAULT_SCOPE_ID: Id = id_hex!("EDB5C6AC5E1219CEEB4C2E283BF7E4C8");
 pub mod config {
     use super::*;
     attributes! {
-        /// The exact collection descriptor this host resolves a name to.
+        /// Which faculty's configuration this state is a version of.
         ///
-        /// A descriptor handle rather than a label, for the same reason
-        /// `collection_source` is one in the core: a configuration entry must
-        /// name one exact collection and must not be able to claim a name it
-        /// does not resolve. The subject carries the ordinary
-        /// `collection_name`, so an entry reads as "the collection called X is
-        /// this descriptor".
+        /// The register's anchor. A faculty brings its own stable scope id and
+        /// asks for the current state of *that* register, so configuration is
+        /// keyed by identity rather than by a name -- a name would have to be
+        /// hashed, could collide, and says nothing about which thing it is the
+        /// configuration OF.
+        ///
+        /// This is the identity half the register module argues for: an
+        /// attribute meaning "the configuration of faculty F", after which no
+        /// scoping knob is wanted, because a state that is not in the register
+        /// simply does not carry this fact.
         ///
         /// Minted with `trible genid` on 2026-09-22.
-        "6408236D3CE210AD714FA2DA7EB9025C" as resolves_to: inlineencodings::Handle<blobencodings::SimpleArchive>;
+        "74027DA8641D5E3EECDC59089BF5D989" as anchor: inlineencodings::GenId;
+
+        /// The exact collection descriptor this state selects.
+        ///
+        /// A descriptor handle rather than a label, for the same reason
+        /// `collection_source` is one in the core: it names one exact
+        /// collection and cannot claim to be something it is not.
+        ///
+        /// Minted with `trible genid` on 2026-09-22.
+        "6408236D3CE210AD714FA2DA7EB9025C" as selects: inlineencodings::Handle<blobencodings::SimpleArchive>;
     }
 }
