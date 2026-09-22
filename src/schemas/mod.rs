@@ -7,6 +7,7 @@ pub mod body;
 pub mod code;
 pub mod cognition;
 pub mod compass;
+pub mod config;
 pub mod decide;
 pub mod discord;
 pub mod embeddings;
