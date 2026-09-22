@@ -567,6 +567,51 @@ explicit frontend modules live in the library. `habit` uses the `habits`
 Rust module. The GUI family shares `viewer` composition instead of copying
 widget setup or invoking a capture subprocess.
 
+### Trigger candidate: checks on events or genuine timers
+
+The `trigger` library and CLI are an **unactivated migration candidate**, not
+yet an additional MCP faculty or a replacement notification service. They
+record a durable execution intent before starting a check and a separate
+result afterward. Successful empty stdout is quiet, successful nonempty
+stdout is the message, and a nonzero exit, signal, timeout or output-limit
+failure is a failed check. Standard error is retained as evidence. An
+acknowledgement or historical Habit completion does not move the schedule.
+
+`add --every 3d --check 'printf ...'` defines a genuine periodic reminder.
+`add-event --event repo-refs-changed --context advisory --check ...` defines
+interest in an explicit event. `emit-event` routes an event name, persona,
+context and caller-owned occurrence ID to matching live checks; redelivery
+with that ID reuses the stored result. `run-event` invokes an exact definition.
+Both take explicit execution directory/input and bounded execution options.
+An unfinished intent remains unknown rather than automatically running again.
+This is not distributed exactly-once execution: an owner must serialize intake.
+
+Repository conditions are **not** converted into hourly reminders. Ref,
+worktree, index and relevant file changes should invalidate the affected
+check; the check distinguishes a new issue, a resolution and unchanged
+evidence. A retained revision with an owner and reason is not new stranded
+work. Age-based conditions need a deadline at the age threshold, rather than
+a periodic whole-workspace scan. Behind-upstream discovery needs a remote
+notification or a fetch performed outside its read-only comparison. The
+repository inspection library compares captured local commit IDs and never
+claims that cached refs establish remote freshness.
+
+Event sources, condition-episode/disposition integration and Orient result
+delivery are still pending. No command above installs or starts an observer.
+Orient remains the sole asynchronous notification delivery owner. Native
+disclosure checks are available as `trigger disclosure ...`; post-commit is
+foreground advisory work, whereas pre-push returns a synchronous verdict.
+
+The candidate routes both Posture policy and scan facts to one Trigger root,
+preserving their existing schema and external Decide references. **Do not
+install it over an existing deployment until the family-source migration and
+configuration transition have been verified.** Historical Habit/Posture roots,
+their attachments and their attribution must remain intact. Old `when`
+scripts use a different exit-status convention and must be converted
+deliberately, not made executable merely by copying their facts. Existing
+pause assertions, including a paused stranded-work check, must survive that
+conversion. The legacy live setup is unchanged while this candidate is built.
+
 ### Secrets: replication, publication, and key delivery
 
 Secrets keeps three rights separate: collection READ replicates encrypted

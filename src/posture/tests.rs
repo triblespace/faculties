@@ -258,7 +258,7 @@ fn canonical_policy_write_and_registered_reads_are_idempotent() {
     let view = storage.policy_view().unwrap();
     assert_eq!(
         storage
-            .admitted_payloads(DEFAULT_POLICY_SCOPE_ID, "policy")
+            .admitted_payloads(DEFAULT_TRIGGER_SCOPE_ID, "policy")
             .unwrap(),
         1
     );
@@ -271,9 +271,8 @@ fn canonical_policy_write_and_registered_reads_are_idempotent() {
     );
     drop(view);
 
-    // Opening a never-seen scope registers and offers its descriptor
-    // closure. That one store operation is distinct from materialization;
-    // once registered, repeated snapshots are pure.
+    // Policy and scan are projections of the same registered Trigger source;
+    // opening the scan projection must not create a second source.
     storage.scan_view().unwrap();
     let after_registration = std::fs::metadata(&store.pile).unwrap().len();
     cmd_vocab_add(
@@ -294,7 +293,7 @@ fn canonical_policy_write_and_registered_reads_are_idempotent() {
     assert_eq!(
         std::fs::metadata(&store.pile).unwrap().len(),
         after_registration,
-        "materializing either registered collection must not mutate the pile"
+        "materializing either Trigger projection must not mutate the pile"
     );
 
     let missing_key = store._directory.path().join("missing.key");
@@ -307,6 +306,104 @@ fn canonical_policy_write_and_registered_reads_are_idempotent() {
         std::fs::metadata(&store.pile).unwrap().len(),
         after_registration
     );
+}
+
+#[test]
+fn shared_trigger_keeps_policy_scans_and_existing_decide_clearances() {
+    let store = TestStore::new();
+    let storage = store.storage();
+    let policy = cmd_vocab_add(storage, "private-example", "public", None).unwrap();
+    let (files, omissions) = sample_scan_inputs();
+    let (mut fragment, scan) = build_scan_fragment(
+        Path::new("shared-trigger-corpus"),
+        &files,
+        &omissions,
+        point_interval(Epoch::from_unix_seconds(1_250.0)),
+        Some(policy.channel_id),
+        IMPLEMENTED.iter().copied().collect(),
+    );
+    let finding = find!(
+        finding: Id,
+        pattern!(fragment.facts(), [{ ?finding @ metadata::tag: &KIND_FINDING }])
+    )
+    .next()
+    .unwrap();
+    let legacy = genid().id;
+    fragment += entity! {
+        metadata::tag: KIND_LEGACY_BRIDGE,
+        posture::sighting_of: finding,
+        posture::occurrence: legacy,
+    };
+
+    // The decision predates the Trigger publication and names the retained
+    // legacy occurrence. Neither its identity nor its old prose verdict is
+    // rewritten to make the new collection work.
+    let decision = genid().id;
+    let proposed = decide::decision_fragment(
+        decision,
+        "Existing clearance",
+        None,
+        Some(legacy),
+        point_interval(Epoch::from_unix_seconds(1_200.0)),
+    )
+    .unwrap()
+    .0;
+    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposed, "existing decision");
+    let resolved = decide::resolution_fragment(
+        decision,
+        "benign",
+        None,
+        true,
+        &[],
+        &[],
+        point_interval(Epoch::from_unix_seconds(1_201.0)),
+    )
+    .unwrap()
+    .0;
+    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, resolved, "existing resolution");
+    storage
+        .publish_scan(fragment, "shared Trigger observation")
+        .unwrap();
+
+    let (view, decisions) = storage.scan_and_decide_views().unwrap();
+    assert!(exists!(pattern!(&view.facts, [{
+        (policy.member) @ metadata::tag: &KIND_TERM
+    }])));
+    assert!(exists!(pattern!(&view.facts, [{
+        scan @ metadata::tag: &KIND_SCAN
+    }])));
+    assert!(exists!(pattern!(&view.facts, [{
+        finding @ metadata::tag: &KIND_FINDING
+    }])));
+    assert!(!exists!(pattern!(&view.facts, [{
+        decision @ metadata::tag: &crate::schemas::decide::KIND_DECISION
+    }])));
+    assert!(exists!(pattern!(&decisions.facts, [{
+        decision @ metadata::tag: &crate::schemas::decide::KIND_DECISION
+    }])));
+    assert_eq!(
+        storage.admitted_payloads(DEFAULT_TRIGGER_SCOPE_ID, "Trigger").unwrap(),
+        2
+    );
+    assert_eq!(
+        storage.admitted_payloads(DEFAULT_DECIDE_SCOPE_ID, "Decide").unwrap(),
+        2
+    );
+    drop((view, decisions));
+
+    let capability = Posture::with_storage(store.storage.clone());
+    let visible = capability.list(ListOptions::default()).unwrap();
+    assert_eq!(visible.hidden, 1);
+    assert!(visible.groups.is_empty());
+    let all = capability
+        .list(ListOptions {
+            include_resolved: true,
+            ..ListOptions::default()
+        })
+        .unwrap();
+    assert_eq!(all.groups.len(), 1);
+    assert_eq!(all.groups[0].examples[0].id, finding);
+    assert_eq!(capability.scans().unwrap()[0].id, scan);
 }
 
 #[test]
@@ -329,7 +426,7 @@ fn sibling_policy_revisions_remain_visible_and_block_consumers() {
         &BTreeSet::from([right_term]),
         &BTreeSet::from([base]),
     );
-    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, fragment, "forked policy fixture");
+    store.publish_raw(DEFAULT_TRIGGER_SCOPE_ID, fragment, "forked policy fixture");
 
     let view = store.storage().policy_view().unwrap();
     match resolve_policy_head(&view.facts, channel).unwrap() {
@@ -355,7 +452,7 @@ fn one_revision_preserves_parallel_annotations_of_the_same_term() {
         &BTreeSet::new(),
     );
     store.publish_raw(
-        DEFAULT_POLICY_SCOPE_ID,
+        DEFAULT_TRIGGER_SCOPE_ID,
         fragment,
         "ambiguous policy fixture",
     );
@@ -391,7 +488,7 @@ fn exemplar_identity_excludes_embedding_exhaust_and_role_changes_replace_members
         &BTreeSet::from([exemplar]),
         &BTreeSet::new(),
     );
-    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, first, "first exemplar exhaust");
+    store.publish_raw(DEFAULT_TRIGGER_SCOPE_ID, first, "first exemplar exhaust");
 
     let mut second = Fragment::empty();
     let second_channel = append_channel(&mut second, "public-release");
@@ -405,7 +502,7 @@ fn exemplar_identity_excludes_embedding_exhaust_and_role_changes_replace_members
     assert_eq!(channel, second_channel);
     assert_eq!(exemplar, same_exemplar);
     store.publish_raw(
-        DEFAULT_POLICY_SCOPE_ID,
+        DEFAULT_TRIGGER_SCOPE_ID,
         second,
         "replacement exemplar exhaust",
     );
@@ -458,7 +555,7 @@ fn exemplar_identity_excludes_embedding_exhaust_and_role_changes_replace_members
         &members,
         &head.into_iter().collect(),
     );
-    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, role_change, "exemplar role change");
+    store.publish_raw(DEFAULT_TRIGGER_SCOPE_ID, role_change, "exemplar role change");
     let view = store.storage().policy_view().unwrap();
     let (_, current) = policy_members(&view.facts, channel).unwrap();
     assert!(current.contains(&benign));
@@ -488,7 +585,7 @@ fn exemplar_identity_excludes_embedding_exhaust_and_role_changes_replace_members
         &BTreeSet::new(),
     );
     invalid.publish_raw(
-        DEFAULT_POLICY_SCOPE_ID,
+        DEFAULT_TRIGGER_SCOPE_ID,
         ambiguous,
         "ambiguous exemplar roles",
     );
@@ -523,7 +620,7 @@ fn complete_scan_is_one_atomic_commit_with_explicit_outcomes_and_omissions() {
     assert_eq!(
         store
             .storage()
-            .admitted_payloads(DEFAULT_SCAN_SCOPE_ID, "scan")
+            .admitted_payloads(DEFAULT_TRIGGER_SCOPE_ID, "scan")
             .unwrap(),
         1
     );
@@ -930,6 +1027,7 @@ fn the_gate_refuses_and_the_smoke_alarm_never_does() {
         store.storage(),
         repo.path(),
         Path::new("posture-fixture"),
+        &[],
         "github-public",
         Some("example"),
         false,
@@ -941,8 +1039,8 @@ fn the_gate_refuses_and_the_smoke_alarm_never_does() {
     let post_commit = std::fs::read_to_string(hooks.join("post-commit")).unwrap();
 
     // Neither flag installs both: they are two halves of one habit.
-    assert!(pre_push.contains("Installed by `posture hook`"));
-    assert!(post_commit.contains("Installed by `posture hook`"));
+    assert!(pre_push.contains("Installed by faculties disclosure hook."));
+    assert!(post_commit.contains("Installed by faculties disclosure hook."));
 
     // The gate reads what the push ADDS, and refuses.
     assert!(pre_push.contains("--not $already_there"));
@@ -953,13 +1051,13 @@ fn the_gate_refuses_and_the_smoke_alarm_never_does() {
     // every exit it can reach is zero, including the one where its own
     // tooling is missing.
     assert!(post_commit.contains("HEAD --not HEAD^@"));
-    // It must not make anyone WAIT either: one pile open is 142s of CPU,
-    // and a commit that pauses for two minutes is a commit nobody makes.
-    assert!(
-        post_commit.contains("| tee -a \"$LOG\" &"),
-        "the audit has to run detached or the hook is unusable on a real pile"
-    );
-    assert!(post_commit.contains("mkdir \"$LOCK\""));
+    // Advisory describes the verdict, not an implicit detached owner. This
+    // source intentionally makes the commit wait for its check to finish.
+    assert!(post_commit.contains("commit waits for this check"));
+    assert!(!post_commit.contains("tee -a"));
+    assert!(!post_commit.contains("$LOG"));
+    assert!(!post_commit.contains("$LOCK"));
+    assert!(!post_commit.contains(" &\n"));
     assert!(
         !post_commit.contains("exit 1"),
         "a post-commit hook that exits non-zero changes nothing git does and \
@@ -975,6 +1073,7 @@ fn the_gate_refuses_and_the_smoke_alarm_never_does() {
         store.storage(),
         single.path(),
         Path::new("posture-fixture"),
+        &[],
         "github-public",
         None,
         false,
@@ -1000,6 +1099,7 @@ fn a_foreign_hook_of_either_name_is_never_clobbered() {
             store.storage(),
             repo.path(),
             Path::new("posture-fixture"),
+            &[],
             "github-public",
             None,
             false,
@@ -1025,6 +1125,84 @@ fn posture_cli_has_no_parallel_verdict_commands() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn trigger_hooks_use_explicit_prefix_effective_path_and_distinct_verdicts() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let store = TestStore::new();
+    let repo = git_audit_fixture();
+    git_fixture(repo.path(), &["config", "core.hooksPath", ".custom-hooks"]);
+    let executable = write_hook(repo.path(), "renamed ' frontend", r#"#!/bin/sh
+printf '%s\n' "$FACULTIES_TRIGGER_CONTEXT" "$@" > "$FAKE_TRACE"
+exit "$FAKE_VERDICT"
+"#).unwrap();
+    let channel = "public ' literal $(not-a-command)";
+    let report = install_hooks(store.storage(), repo.path(), &executable,
+        &["disclosure"], channel, None, false, false).unwrap();
+    let hooks = repo.path().join(".custom-hooks");
+    assert_eq!(report.installed, vec![hooks.join("pre-push"), hooks.join("post-commit")]);
+    assert!(!repo.path().join(".git/hooks/pre-push").exists());
+    let script = std::fs::read_to_string(hooks.join("pre-push")).unwrap();
+    assert!(script.contains("\"$POSTURE\" 'disclosure' git --channel"));
+
+    let trace = repo.path().join("fixture-trace");
+    let advisory = Command::new("sh").arg(hooks.join("post-commit"))
+        .current_dir(repo.path()).env("FAKE_TRACE", &trace).env("FAKE_VERDICT", "23")
+        .output().unwrap();
+    assert!(advisory.status.success(), "advisory failure must not veto the commit");
+    let arguments = std::fs::read_to_string(&trace).unwrap();
+    let words: Vec<_> = arguments.lines().collect();
+    assert_eq!(&words[..5], &["advisory-event", "disclosure", "git", "--channel", channel]);
+    assert!(String::from_utf8(advisory.stderr).unwrap().contains("commit is retained"));
+
+    let head = git_fixture(repo.path(), &["rev-parse", "HEAD"]);
+    let mut gate = Command::new("sh").arg(hooks.join("pre-push"))
+        .args(["origin", "example.invalid"]).current_dir(repo.path())
+        .env("FAKE_TRACE", &trace).env("FAKE_VERDICT", "23")
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    writeln!(gate.stdin.take().unwrap(),
+        "refs/heads/main {head} refs/heads/main 0000000000000000000000000000000000000000").unwrap();
+    let gate = gate.wait_with_output().unwrap();
+    assert_eq!(gate.status.code(), Some(1), "the gate must reject a denying check");
+    let arguments = std::fs::read_to_string(&trace).unwrap();
+    let words: Vec<_> = arguments.lines().collect();
+    assert_eq!(&words[..5], &["synchronous-event", "disclosure", "git", "--channel", channel]);
+    assert!(!repo.path().join(".git/posture-post-commit.log").exists());
+    assert!(!repo.path().join(".git/posture-post-commit.lock").exists());
+}
+
+#[test]
+fn foreign_hooks_at_effective_absolute_path_preserve_the_whole_install() {
+    let store = TestStore::new();
+    let repo = git_audit_fixture();
+    let hooks = tempfile::tempdir().unwrap();
+    git_fixture(repo.path(), &["config", "core.hooksPath", hooks.path().to_str().unwrap()]);
+    let foreign = "#!/bin/sh\n# foreign owner\n";
+    std::fs::write(hooks.path().join("post-commit"), foreign).unwrap();
+    let error = install_hooks(store.storage(), repo.path(), Path::new("renamed"),
+        &["disclosure"], "public", None, false, false).unwrap_err();
+    assert!(error.to_string().contains("refusing to overwrite"));
+    assert_eq!(std::fs::read_to_string(hooks.path().join("post-commit")).unwrap(), foreign);
+    assert!(!hooks.path().join("pre-push").exists());
+    assert!(!repo.path().join(".git/hooks/pre-push").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_marker_does_not_allow_overwriting_a_symlink_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("original");
+    let content = "#!/bin/sh\n# Installed by `posture hook`\n";
+    std::fs::write(&target, content).unwrap();
+    std::os::unix::fs::symlink(&target, directory.path().join("pre-push")).unwrap();
+    let error = refuse_foreign_hook(directory.path(), "pre-push").unwrap_err();
+    assert!(error.to_string().contains("symlink"));
+    assert_eq!(std::fs::read_to_string(target).unwrap(), content);
+}
+
 #[test]
 fn foreign_scan_commits_are_stored_but_inert_without_write_admission() {
     let store = TestStore::new();
@@ -1040,7 +1218,7 @@ fn foreign_scan_commits_are_stored_but_inert_without_write_admission() {
     let mut pile = open_pile_strict(&store.pile).unwrap();
     let local = crate::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
     let collection =
-        open_configured(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
+        open_configured(&mut pile, DEFAULT_TRIGGER_SCOPE_ID, local.verifying_key()).unwrap();
     let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
     // Publication is an unconditional local ledger append. Admission is a
     // separate read concern rooted in this collection's immutable WRITE
@@ -1053,7 +1231,7 @@ fn foreign_scan_commits_are_stored_but_inert_without_write_admission() {
     assert_eq!(
         store
             .storage()
-            .admitted_payloads(DEFAULT_SCAN_SCOPE_ID, "scan")
+            .admitted_payloads(DEFAULT_TRIGGER_SCOPE_ID, "scan")
             .unwrap(),
         0
     );
@@ -1092,7 +1270,7 @@ fn unauthorized_duplicate_claim_does_not_poison_scan_atomicity() {
     let mut pile = open_pile_strict(&store.pile).unwrap();
     let local = crate::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
     let collection =
-        open_configured(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
+        open_configured(&mut pile, DEFAULT_TRIGGER_SCOPE_ID, local.verifying_key()).unwrap();
     let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
     let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
     assert_eq!(duplicate.data(), admitted.data());
@@ -1119,7 +1297,7 @@ fn unauthorized_duplicate_claim_does_not_poison_scan_atomicity() {
     assert_eq!(
         store
             .storage()
-            .admitted_payloads(DEFAULT_SCAN_SCOPE_ID, "scan")
+            .admitted_payloads(DEFAULT_TRIGGER_SCOPE_ID, "scan")
             .unwrap(),
         2,
     );
@@ -1151,7 +1329,7 @@ fn additive_legacy_policy_facts_are_inert_beside_canonical_shadows() {
         &BTreeSet::from([term]),
         &BTreeSet::new(),
     );
-    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, fragment, "additive policy fixture");
+    store.publish_raw(DEFAULT_TRIGGER_SCOPE_ID, fragment, "additive policy fixture");
 
     let view = store.storage().policy_view().unwrap();
     assert_eq!(
@@ -1170,7 +1348,7 @@ fn additive_legacy_policy_facts_are_inert_beside_canonical_shadows() {
 
     let unknown = entity! { metadata::tag: genid().id };
     store.publish_raw(
-        DEFAULT_POLICY_SCOPE_ID,
+        DEFAULT_TRIGGER_SCOPE_ID,
         unknown,
         "unrecognized policy fixture",
     );

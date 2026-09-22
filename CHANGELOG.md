@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Stage the Trigger library/CLI candidate: durable bounded check execution,
+  completion-independent timers, event-context routing and replay, and one
+  destination for existing Posture policy/scans with Decide links preserved.
+  Native Git hooks retain advisory post-commit and synchronous pre-push
+  semantics without detached log forwarding. Repository inspection compares
+  captured cached-ref commits without fetching. Repository observers,
+  condition-episode/disposition handling, Orient integration and the verified
+  provenance-preserving live migration are not activated by this candidate.
+
 - The exact collection API is gone from core, and with it every place a
   faculty asked for a support: the archive search maintains its fact view
   and its BM25 index, attaches both from one snapshot and compares their

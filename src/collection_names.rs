@@ -36,7 +36,7 @@ use triblespace::core::trible::TribleSet;
 use crate::schemas::{
     atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings, files,
     habit, headspace, mail, memory, message, orient, planner, posture, relations, status,
-    swarm_health, teams, voice, web, wiki,
+    swarm_health, teams, trigger, voice, web, wiki,
 };
 use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
 
@@ -90,6 +90,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
             swarm_health::COLLECTION_NAME,
         ),
         (teams::DEFAULT_SCOPE_ID, "teams"),
+        (trigger::DEFAULT_SCOPE_ID, "trigger"),
         (voice::COLLECTION_SCOPE_ID, "voice"),
         (web::DEFAULT_SCOPE_ID, "web"),
         (wiki::DEFAULT_SCOPE_ID, "wiki"),

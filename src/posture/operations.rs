@@ -13,11 +13,11 @@ use crate::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECIDE_SCOPE_ID;
 #[cfg(any(feature = "local-embed", test))]
 use crate::schemas::embeddings::{self, Embedding768};
 use crate::schemas::posture::{
-    modality, posture, DEFAULT_POLICY_SCOPE_ID, DEFAULT_SCAN_SCOPE_ID, DOC_UNSUPPORTED,
-    EXEMPLAR_PROTECTED, KIND_CHANNEL, KIND_DOCUMENT, KIND_FINDING, KIND_LEGACY_BRIDGE,
-    KIND_OMISSION, KIND_POLICY_REVISION, KIND_SCAN, KIND_SIGHTING, KIND_TERM, OUTCOME_EXAMINED,
-    OUTCOME_PARSE_FAILED,
+    modality, posture, DOC_UNSUPPORTED, EXEMPLAR_PROTECTED, KIND_CHANNEL, KIND_DOCUMENT,
+    KIND_FINDING, KIND_LEGACY_BRIDGE, KIND_OMISSION, KIND_POLICY_REVISION, KIND_SCAN,
+    KIND_SIGHTING, KIND_TERM, OUTCOME_EXAMINED, OUTCOME_PARSE_FAILED,
 };
+use crate::schemas::trigger::DEFAULT_SCOPE_ID as DEFAULT_TRIGGER_SCOPE_ID;
 #[cfg(test)]
 use crate::schemas::posture::{CARRIER_CONTAINER_MEMBER, CARRIER_GIT_BLOB, CARRIER_GIT_COMMIT};
 #[cfg(any(feature = "local-embed", test))]
@@ -367,12 +367,13 @@ impl Posture {
     ) -> Result<SweepReport> {
         cmd_sweep(self.storage(), root, channel, all, history)
     }
-    /// Explicit host mutation. The executable to install is a caller choice,
-    /// not the embedding Rust program's current executable.
+    /// Explicit host mutation. Executable and subcommand prefix are caller
+    /// choices, not guesses from the embedding program's filename.
     pub fn install_hooks(
         &self,
         repo: &Path,
         executable: &Path,
+        subcommands: &[&str],
         channel: &str,
         remote_match: Option<&str>,
         pre_push: bool,
@@ -382,6 +383,7 @@ impl Posture {
             self.storage(),
             repo,
             executable,
+            subcommands,
             channel,
             remote_match,
             pre_push,
@@ -2177,28 +2179,16 @@ impl PostureStorage<'_> {
         })
     }
 
+    /// Policy, scans, and finding bridges are projections of one Trigger view.
+    /// Decide remains separate, observed at the same frozen store watermark.
     fn scan_and_decide_views(&self) -> Result<(CollectionView, CollectionView)> {
         let mut views = self.load_scopes(&[
-            (DEFAULT_SCAN_SCOPE_ID, "scan"),
+            (DEFAULT_TRIGGER_SCOPE_ID, "Trigger"),
             (DEFAULT_DECIDE_SCOPE_ID, "Decide"),
         ])?;
         let decisions = views.pop().expect("two requested Posture views");
         let scans = views.pop().expect("two requested Posture views");
         Ok((scans, decisions))
-    }
-
-    fn policy_scan_and_decide_views(
-        &self,
-    ) -> Result<(CollectionView, CollectionView, CollectionView)> {
-        let mut views = self.load_scopes(&[
-            (DEFAULT_POLICY_SCOPE_ID, "policy"),
-            (DEFAULT_SCAN_SCOPE_ID, "scan"),
-            (DEFAULT_DECIDE_SCOPE_ID, "Decide"),
-        ])?;
-        let decisions = views.pop().expect("three requested Posture views");
-        let scans = views.pop().expect("three requested Posture views");
-        let policy = views.pop().expect("three requested Posture views");
-        Ok((policy, scans, decisions))
     }
 
     /// How many distinct payloads the `scope` collection stands on. Tests
@@ -2219,13 +2209,13 @@ impl PostureStorage<'_> {
     }
 
     fn policy_view(&self) -> Result<CollectionView> {
-        self.load_scope(DEFAULT_POLICY_SCOPE_ID, "policy")
+        self.load_scope(DEFAULT_TRIGGER_SCOPE_ID, "Trigger")
     }
 
     /// Scans are queried as open-world observations; publication is already
     /// one atomic collection COMMIT by construction.
     fn scan_view(&self) -> Result<CollectionView> {
-        self.load_scope(DEFAULT_SCAN_SCOPE_ID, "scan")
+        self.load_scope(DEFAULT_TRIGGER_SCOPE_ID, "Trigger")
     }
 
     #[cfg(test)]
@@ -2239,7 +2229,7 @@ impl PostureStorage<'_> {
         description: &str,
     ) -> Result<CollectionCommit> {
         self.with_store(
-            DEFAULT_POLICY_SCOPE_ID,
+            DEFAULT_TRIGGER_SCOPE_ID,
             "policy",
             |pile, collection, signer| {
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
@@ -2258,7 +2248,7 @@ impl PostureStorage<'_> {
     }
 
     fn publish_scan(&self, mut fragment: Fragment, description: &str) -> Result<CollectionCommit> {
-        self.with_store(DEFAULT_SCAN_SCOPE_ID, "scan", |pile, collection, signer| {
+        self.with_store(DEFAULT_TRIGGER_SCOPE_ID, "scan", |pile, collection, signer| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
             let commit = pile
                 .commit(collection, signer, fragment)
@@ -4719,8 +4709,10 @@ fn cmd_git(
         );
     }
     let range = revisions.join(" ");
-    let (policy_view, scan_view, decisions) = storage.policy_scan_and_decide_views()?;
-    let policy = channel_terms_from_view(&policy_view, channel)?;
+    // Policy and scan facts share Trigger. Maintain and freeze that source
+    // once, so both queries use precisely the same observation.
+    let (view, decisions) = storage.scan_and_decide_views()?;
+    let policy = channel_terms_from_view(&view, channel)?;
     let (channel_id, terms) = match policy {
         Some((channel_id, terms)) => (Some(channel_id), terms),
         None => (None, Vec::new()),
@@ -4742,7 +4734,7 @@ fn cmd_git(
     let settled = settled_findings(
         &decisions.reader,
         &decisions.facts,
-        legacy_bridges(&scan_view.facts),
+        legacy_bridges(&view.facts),
     )?;
     let findings = hits
         .iter()
@@ -4815,7 +4807,7 @@ fn cmd_git(
                 .filter(|hit| {
                     !settled.hides_any(
                         modality::PROTECTED_TERM,
-                        findings_at(&scan_view.facts, modality::PROTECTED_TERM, &hit.location),
+                        findings_at(&view.facts, modality::PROTECTED_TERM, &hit.location),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4830,7 +4822,7 @@ fn cmd_git(
             !settled.hides_any(
                 modality::UNSAFE_ATTRIBUTE_ID,
                 findings_at(
-                    &scan_view.facts,
+                    &view.facts,
                     modality::UNSAFE_ATTRIBUTE_ID,
                     &hit.location,
                 ),
@@ -4879,10 +4871,15 @@ fn cmd_git(
 ///
 /// Both are installed by default because they are two halves of one habit;
 /// `--pre-push` or `--post-commit` installs just that one.
+/// Both checks run in the foreground. A commit waits for its advisory check
+/// to finish, but that check cannot veto it. No detached writer, notification
+/// owner or log-forwarder is installed, and no timeout is imposed by this
+/// native disclosure command.
 fn install_hooks(
     storage: PostureStorage<'_>,
     repo: &Path,
     executable: &Path,
+    subcommands: &[&str],
     channel: &str,
     remote_match: Option<&str>,
     pre_push: bool,
@@ -4894,35 +4891,34 @@ fn install_hooks(
         (false, false) => (true, true),
         pair => pair,
     };
-    let git_dir = {
+    let hooks = {
         let out = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
-            .args(["rev-parse", "--git-dir"])
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "hooks"])
             .output()
             .map_err(|e| anyhow!("run git: {e}"))?;
         if !out.status.success() {
             anyhow::bail!("{} is not a git repository", repo.display());
         }
-        let rel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let p = PathBuf::from(&rel);
-        if p.is_absolute() {
-            p
-        } else {
-            repo.join(p)
+        let output = String::from_utf8(out.stdout).context("Git hooks path is not UTF-8")?;
+        let path = PathBuf::from(output.strip_suffix('\n').unwrap_or(&output));
+        if !path.is_absolute() {
+            bail!("Git did not resolve an absolute effective hooks path: {}", path.display());
         }
+        path
     };
-    let hooks = git_dir.join("hooks");
     std::fs::create_dir_all(&hooks).map_err(|e| anyhow!("create {}: {e}", hooks.display()))?;
 
-    let exe = executable.display().to_string();
-    let pile = storage.storage.path().display().to_string();
-    let key = storage
-        .storage
-        .key_path()
-        .map(Path::display)
-        .map(|path| path.to_string())
-        .unwrap_or_default();
+    // The frontend supplies the argument prefix explicitly. It is never
+    // inferred from the binary filename, which may be renamed or symlinked.
+    let prefix = subcommands.iter().map(|argument| format!("{} ", shell_word(argument)))
+        .collect::<String>();
+    let exe = shell_word(executable.to_str().context("hook executable path is not UTF-8")?);
+    let pile = shell_word(storage.storage.path().to_str().context("hook pile path is not UTF-8")?);
+    let key = shell_word(storage.storage.key_path().map(|path| {
+        path.to_str().context("hook key path is not UTF-8")
+    }).transpose()?.unwrap_or(""));
 
     // Shared by both hooks so they cannot drift apart on the one thing that
     // matters most: what happens when the tooling is missing. `verdict` is the
@@ -4957,15 +4953,16 @@ fi"#
     // such ref yet — a brand-new branch.
     let pre_push_script = format!(
         r#"#!/bin/sh
-# Installed by `posture hook`. Audits what is about to cross into a channel.
+# Installed by faculties disclosure hook. Audits what crosses into a channel.
 # Bypass with --no-verify, but read what it says first.
 set -e
-POSTURE="{exe}"
-PILE="{pile}"
-KEY="{key}"
-CHANNEL="{channel}"
+POSTURE={exe}
+PILE={pile}
+KEY={key}
+CHANNEL={channel}
 ZERO=0000000000000000000000000000000000000000
-REMOTE_MATCH="{remote_match}"
+REMOTE_MATCH={remote_match}
+export FACULTIES_TRIGGER_CONTEXT=synchronous-event
 
 # git passes the remote NAME as $1 and its URL as $2. A channel describes a
 # destination, so a push to a remote this channel does not cover must be skipped
@@ -5013,9 +5010,9 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     fi
     if [ -n "$KEY" ]; then
         PILE="$PILE" TRIBLESPACE_KEY="$KEY" \
-            "$POSTURE" git --channel "$CHANNEL" $revisions || status=1
+            "$POSTURE" {prefix}git --channel "$CHANNEL" $revisions || status=1
     else
-        PILE="$PILE" "$POSTURE" git --channel "$CHANNEL" $revisions || status=1
+        PILE="$PILE" "$POSTURE" {prefix}git --channel "$CHANNEL" $revisions || status=1
     fi
 done
 
@@ -5029,116 +5026,52 @@ exit $status
         exe = exe,
         pile = pile,
         key = key,
-        channel = channel,
-        remote_match = remote_match.unwrap_or(""),
+        channel = shell_word(channel),
+        remote_match = shell_word(remote_match.unwrap_or("")),
         missing = missing_tooling(
             "Refusing the push rather than passing an unchecked one.",
             "1"
         ),
     );
 
-    // ADVISORY, and every line below follows from that. The commit already
-    // exists; there is no verdict to hand back, only news to deliver early
-    // enough to be worth having.
-    //
-    // DETACHED, and that follows from advisory too. The audit costs one pile
-    // open, which on a real pile is not small: 142s of CPU to read a one-line
-    // commit, measured. A commit that pauses for two minutes is a commit
-    // nobody makes, and this hook would be deleted within the day. Since there
-    // is no verdict to wait for, nothing is gained by making anyone wait —
-    // `git commit --amend` stays cheap until the push, not for the next two
-    // minutes. So git returns immediately and the report arrives when it does,
-    // in the terminal and in a log beside the hook so it cannot be lost.
+    // Advisory is a verdict distinction, not a reason to create a detached
+    // writer. Git waits for this check to finish; every reachable exit remains
+    // zero, including a failed or unavailable check.
     let post_commit_script = format!(
         r#"#!/bin/sh
-# Installed by `posture hook`. Audits the commit that just happened, so a leak
-# is news while `git commit --amend` is still the whole remedy.
-#
-# ADVISORY. It never fails a commit — the commit already exists, so a non-zero
-# exit would change nothing git does and would only train you to ignore it.
-# The gate that actually refuses is the pre-push hook.
-#
-# It does NOT consult a remote-match: a commit has no destination yet, so it
-# always audits against '{channel}'. Erring toward telling you is the right
-# error for something that cannot block.
-POSTURE="{exe}"
-PILE="{pile}"
-KEY="{key}"
-CHANNEL="{channel}"
+# Installed by faculties disclosure hook. Audits the commit just made.
+# Advisory: the commit waits for this check, but no result can veto it.
+# No background writer, log-forwarder, notification owner, or timer.
+POSTURE={exe}
+PILE={pile}
+KEY={key}
+CHANNEL={channel}
+export FACULTIES_TRIGGER_CONTEXT=advisory-event
 
 {missing}
 
-GIT_DIR_PATH=$(git rev-parse --git-dir)
-LOG="$GIT_DIR_PATH/posture-post-commit.log"
-LOCK="$GIT_DIR_PATH/posture-post-commit.lock"
-
-# Just the commit that was made. `HEAD^@` is all of HEAD's parents, so on a
-# merge this is the merge commit alone rather than the entire branch it brought
-# in — those commits were news when they were made, and re-announcing them on
-# every merge is how an alarm becomes wallpaper. A root commit has no parent to
-# subtract.
+# HEAD^@ excludes every parent so a merge checks only its own commit.
 if git rev-parse --verify --quiet HEAD^1 >/dev/null 2>&1; then
     revisions="HEAD --not HEAD^@"
 else
     revisions="HEAD"
 fi
-head_sha=$(git rev-parse HEAD)
 
-# `mkdir` is the atomic test-and-set every shell has. Two audits of one pile at
-# once would only make both slower; the one already running is announced rather
-# than silently dropped, because a smoke alarm that quietly does nothing is
-# worse than no smoke alarm.
-if ! mkdir "$LOCK" 2>/dev/null; then
-    echo "posture: an audit of an earlier commit is still running, so $(git rev-parse --short HEAD) was NOT checked."
-    echo "         Re-run it yourself with:  posture git HEAD --not HEAD^@ --channel $CHANNEL"
-    echo "         (or remove a stale lock:  rmdir \"$LOCK\")"
-    exit 0
+status=0
+if [ -n "$KEY" ]; then
+    PILE="$PILE" TRIBLESPACE_KEY="$KEY" \
+        "$POSTURE" {prefix}git --channel "$CHANNEL" $revisions || status=$?
+else
+    PILE="$PILE" "$POSTURE" {prefix}git --channel "$CHANNEL" $revisions || status=$?
 fi
-
-# Detached. Deliberately unquoted revisions: they are revision arguments and
-# must reach git separately.
-{{
-    if [ -n "$KEY" ]; then
-        report=$(PILE="$PILE" TRIBLESPACE_KEY="$KEY" \
-            "$POSTURE" git --channel "$CHANNEL" $revisions 2>&1)
-    else
-        report=$(PILE="$PILE" "$POSTURE" git --channel "$CHANNEL" $revisions 2>&1)
-    fi
-    found=$?
-    rmdir "$LOCK" 2>/dev/null
-
-    if [ "$found" = 0 ]; then
-        # Quiet on a clean commit. The full coverage report after every single
-        # commit is noise, and noise is how this hook gets removed.
-        echo ""
-        echo "posture: nothing flagged in $(git rev-parse --short "$head_sha" 2>/dev/null) for '$CHANNEL' (narrow by"
-        echo "         construction — \`posture git HEAD --not HEAD^@\` prints what it did not check)."
-        exit 0
-    fi
-
-    echo ""
-    echo "posture: COMMIT $(git rev-parse --short "$head_sha" 2>/dev/null) carries something the '$CHANNEL' channel protects."
-    echo ""
-    printf '%s\n' "$report" | sed 's/^/  /'
-    echo ""
-    echo "  It is not pushed yet, so the whole remedy is still cheap:"
-    echo "    git commit --amend        (fix the content, keep the commit)"
-    echo "  or, if the material is genuinely fine for this channel:"
-    echo "    decide propose \"<what this is>\" --context \"<why it is fine>\" --about <finding id>"
-    echo "    decide resolve <decision> \"<the reasoning>\" --result benign"
-    echo ""
-    echo "  Nothing is blocked. The pre-push hook is what will refuse."
-}} 2>&1 | tee -a "$LOG" &
-
-# Advisory to the end: never non-zero, and never a wait.
+if [ "$status" != 0 ]; then
+    echo "posture: advisory check failed or returned a denying verdict; the commit is retained." >&2
+fi
 exit 0
 "#,
-        exe = exe,
-        pile = pile,
-        key = key,
-        channel = channel,
+        channel = shell_word(channel),
         missing = missing_tooling(
-            "Reporting nothing rather than pretending this commit was checked.",
+            "The commit is retained; this advisory check could not run.",
             "0"
         ),
     );
@@ -5175,16 +5108,28 @@ exit 0
 /// side effect of a command that reads like a setup step.
 fn refuse_foreign_hook(hooks: &Path, name: &str) -> Result<()> {
     let path = hooks.join(name);
-    if path.exists() {
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if !existing.contains("Installed by `posture hook`") {
-            anyhow::bail!(
-                "{} already exists and was not written by posture; refusing to overwrite it",
-                path.display()
-            );
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("{} is a symlink; refusing to overwrite its target", path.display());
         }
+        Ok(_) => {}
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    if !existing.contains("Installed by `posture hook`") &&
+        !existing.contains("Installed by faculties disclosure hook.") {
+        anyhow::bail!(
+            "{} already exists and was not written by posture; refusing to overwrite it",
+            path.display()
+        );
     }
     Ok(())
+}
+
+/// One literal POSIX shell word, including empty strings and apostrophes.
+fn shell_word(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Write one hook, executable.
@@ -5577,15 +5522,15 @@ fn cmd_sweep(
     all: bool,
     history: bool,
 ) -> Result<SweepReport> {
-    let (policy_view, scan_view, decisions) = storage.policy_scan_and_decide_views()?;
-    let terms = channel_terms_from_view(&policy_view, channel)?
+    let (view, decisions) = storage.scan_and_decide_views()?;
+    let terms = channel_terms_from_view(&view, channel)?
         .map(|(_, terms)| terms)
         .unwrap_or_default();
     let lexical_checked = !terms.is_empty();
     let settled = settled_findings(
         &decisions.reader,
         &decisions.facts,
-        legacy_bridges(&scan_view.facts),
+        legacy_bridges(&view.facts),
     )?;
 
     let mut repos = Vec::new();
@@ -5702,7 +5647,7 @@ fn cmd_sweep(
                     .filter(|hit| {
                         !settled.hides_any(
                             modality::PROTECTED_TERM,
-                            findings_at(&scan_view.facts, modality::PROTECTED_TERM, &hit.location),
+                            findings_at(&view.facts, modality::PROTECTED_TERM, &hit.location),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -5715,7 +5660,7 @@ fn cmd_sweep(
                 !settled.hides_any(
                     modality::UNSAFE_ATTRIBUTE_ID,
                     findings_at(
-                        &scan_view.facts,
+                        &view.facts,
                         modality::UNSAFE_ATTRIBUTE_ID,
                         &hit.location,
                     ),
@@ -5760,11 +5705,12 @@ fn policy_and_scan_actions_are_one_commit_a_preparing_reader_observes() {
     std::fs::File::create(&pile).unwrap();
     crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
     let capability = Posture::new(pile, Some(key));
-    let assert_projected = |scope: Id, expected: Id, kind: Id| {
+    let assert_projected = |expected: Id, kind: Id, expected_payloads: usize| {
         capability
             .storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, scope, signer.verifying_key())?;
+                let source =
+                    open_configured(pile, DEFAULT_TRIGGER_SCOPE_ID, signer.verifying_key())?;
                 let policy = source.policy(&pile.snapshot()?)?;
                 let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
                 let rank9 =
@@ -5782,8 +5728,8 @@ fn policy_and_scan_actions_are_one_commit_a_preparing_reader_observes() {
                 .any(|id| id == expected));
                 assert_eq!(
                     source.admitted(&snapshot)?.len(),
-                    1,
-                    "the action remains one COMMIT"
+                    expected_payloads,
+                    "each action appends one payload to the shared Trigger collection"
                 );
                 Ok(())
             })
@@ -5793,7 +5739,7 @@ fn policy_and_scan_actions_are_one_commit_a_preparing_reader_observes() {
         .vocab_add("private-example", "public", None)
         .unwrap();
     assert!(policy.published);
-    assert_projected(DEFAULT_POLICY_SCOPE_ID, policy.member, KIND_TERM);
+    assert_projected(policy.member, KIND_TERM, 1);
     let scan = capability
         .scan(
             "generated input",
@@ -5804,7 +5750,7 @@ fn policy_and_scan_actions_are_one_commit_a_preparing_reader_observes() {
             false,
         )
         .unwrap();
-    assert_projected(DEFAULT_SCAN_SCOPE_ID, scan.scan_id.unwrap(), KIND_SCAN);
+    assert_projected(scan.scan_id.unwrap(), KIND_SCAN, 2);
 }
 
 #[cfg(test)]

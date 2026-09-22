@@ -13,10 +13,8 @@ use faculties::out::{Out, Part};
 use faculties::posture::{
     self, cli, mcp, DocumentInput, FileOutcome, ListOptions, Posture, VocabularyState,
 };
-use faculties::schemas::posture::{
-    modality, DEFAULT_POLICY_SCOPE_ID, DEFAULT_SCAN_SCOPE_ID, DOC_UNSUPPORTED, OUTCOME_EXAMINED,
-    OUTCOME_PARSE_FAILED,
-};
+use faculties::schemas::posture::{modality, DOC_UNSUPPORTED, OUTCOME_EXAMINED, OUTCOME_PARSE_FAILED};
+use faculties::schemas::trigger::DEFAULT_SCOPE_ID as DEFAULT_TRIGGER_SCOPE_ID;
 use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 use triblespace::prelude::*;
 
@@ -166,7 +164,7 @@ fn resident_and_path_scans_share_content_located_findings_and_coverage() {
         )
         .unwrap();
     let local = posture.scan_path(&input, false).unwrap();
-    assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 2);
+    assert_eq!(fixture.commits(DEFAULT_TRIGGER_SCOPE_ID), 2);
     assert_eq!(
         resident.files[0].findings[0].location,
         local.files[0].findings[0].location
@@ -221,7 +219,7 @@ fn native_mcp_names_are_literal_and_read_frontends_agree() {
         fs::read(&sentinel).unwrap(),
         b"sentinel is not a document input"
     );
-    assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 1);
+    assert_eq!(fixture.commits(DEFAULT_TRIGGER_SCOPE_ID), 1);
     let scan = fixture.operations().scans().unwrap().remove(0).id;
     let scan = format!("{scan:x}");
     for (tool, args, cli_args) in [
@@ -257,7 +255,7 @@ fn vocabulary_receipts_are_typed_idempotent_and_mcp_prose_is_literal() {
         .unwrap();
     assert!(!again.published);
     assert_eq!(first.member, again.member);
-    assert_eq!(fixture.commits(DEFAULT_POLICY_SCOPE_ID), 1);
+    assert_eq!(fixture.commits(DEFAULT_TRIGGER_SCOPE_ID), 1);
     let response = collect(|out| {
         fixture.adapter().call(
             "posture_vocab_add",
@@ -360,7 +358,7 @@ fn output_failure_does_not_retry_a_scan_publication() {
     })).unwrap_err();
     assert!(error.to_string().contains("emitter closed"));
     assert_eq!(emissions, 1);
-    assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 1);
+    assert_eq!(fixture.commits(DEFAULT_TRIGGER_SCOPE_ID), 1);
     assert_eq!(fixture.operations().scans().unwrap().len(), 1);
 }
 

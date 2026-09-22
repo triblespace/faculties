@@ -94,6 +94,7 @@ pub mod storage;
 pub mod teams;
 pub mod tokens;
 pub mod triage;
+pub mod trigger;
 pub mod turntaking;
 pub mod viewer;
 pub mod voice;

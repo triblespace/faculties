@@ -30,6 +30,7 @@ pub mod status;
 pub use triblespace_net::health_record as swarm_health;
 pub mod teams;
 pub mod triage;
+pub mod trigger;
 pub mod voice;
 pub mod web;
 pub mod wiki;

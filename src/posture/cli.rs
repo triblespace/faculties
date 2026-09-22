@@ -20,7 +20,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Walk a path and record candidate redaction points
     Scan {
         /// File or directory to examine
@@ -148,7 +148,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
-enum VocabCommand {
+pub(crate) enum VocabCommand {
     /// Protect a term from a channel
     Add {
         term: String,
@@ -187,7 +187,19 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return out.text(Cli::command().render_help().to_string());
     };
-    let posture = Posture::new(cli.pile, cli.key);
+    execute_command(cli.pile, cli.key, command, &[], out)
+}
+
+/// The Trigger frontend reuses this grammar and native dispatcher; it does
+/// not invoke another faculty process or reconstruct an argv vector.
+pub(crate) fn execute_command(
+    pile: PathBuf,
+    key: Option<PathBuf>,
+    command: Command,
+    subcommands: &[&str],
+    out: &mut Out<'_>,
+) -> Result<()> {
+    let posture = Posture::new(pile, key);
     match command {
         Command::Scan { path, dry_run } => {
             presentation::scan(&posture.scan_path(&path, dry_run)?, out)
@@ -280,6 +292,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 &posture.install_hooks(
                     &repo,
                     &executable,
+                    subcommands,
                     &channel,
                     remote_match.as_deref(),
                     pre_push,
