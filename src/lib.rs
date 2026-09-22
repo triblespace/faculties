@@ -87,6 +87,7 @@ pub mod posture_policy;
 pub mod reason;
 pub mod relations;
 pub mod schemas;
+pub mod self_config;
 pub mod spec;
 pub mod status;
 pub mod storage;

@@ -213,6 +213,7 @@ tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed 
 rrule = "0.14"              # planner
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
 serde_json = "1"            # discord, teams, triage, web
+toml = "0.8"                # self.toml, the one external plaintext configuration
 tracing = "0.1"             # archive
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # archive
 typst = "0.14"              # wiki

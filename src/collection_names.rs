@@ -165,16 +165,50 @@ fn parse_override(variable: &str, raw: OsString) -> anyhow::Result<CollectionHan
     Ok(Inline::new(bytes))
 }
 
-/// Exact descriptor override selected for `scope`, if the operator supplied
-/// one.
+/// Exact descriptor selected for `scope`, from the environment or from
+/// `self.toml`, if either supplies one.
 ///
 /// Invalid values fail loudly. Falling back to a signer-private descriptor in
 /// that case would silently fork a shared collection into a different identity.
+///
+/// The environment WINS, because pinning one collection for one command is
+/// ordinary and has to keep working. But an environment value that DISAGREES
+/// with the file says so, because the disagreement is the interesting case: a
+/// process environment is a copy taken when the process started and does not
+/// update when the file is edited, so a long-lived shell can carry a whole
+/// retired generation while every config file on every host reads correctly.
+/// An absent variable already refuses loudly; before this, a stale one was
+/// simply accepted, because a retired handle is still a well-formed handle.
+///
+/// The two are compared as PARSED handles rather than as text, so that
+/// `blake3:AB…` and `ab…` are recognised as the same handle rather than
+/// reported as drift. A warning that fires on every call is noise, and noise
+/// is what stops anyone reading the one that matters.
 pub fn configured_handle(scope: Id) -> anyhow::Result<Option<CollectionHandle>> {
     let variable = override_env_name(scope);
-    std::env::var_os(&variable)
-        .map(|raw| parse_override(&variable, raw))
-        .transpose()
+    let name = require_name(scope);
+    let from_file = crate::self_config::collection(name)?;
+    let file_label = format!(
+        "{} [collections] {name}",
+        crate::self_config::path().display()
+    );
+
+    match (std::env::var_os(&variable), from_file) {
+        (Some(raw), Some(file)) => {
+            let env_text = raw.to_string_lossy().trim().to_owned();
+            let from_env = parse_override(&variable, raw)?;
+            let from_file_handle = parse_override(&file_label, file.clone().into())?;
+            if crate::self_config::decide(true, true, from_env == from_file_handle)
+                == Some(crate::self_config::Source::EnvironmentOverridesFile)
+            {
+                crate::self_config::report_override_divergence(&variable, &env_text, file.trim());
+            }
+            Ok(Some(from_env))
+        }
+        (Some(raw), None) => Ok(Some(parse_override(&variable, raw)?)),
+        (None, Some(file)) => Ok(Some(parse_override(&file_label, file.into())?)),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Open the operator-selected exact descriptor, or construct the ordinary
