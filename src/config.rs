@@ -257,6 +257,36 @@ mod tests {
         );
     }
 
+    /// Why the supersession edges must sit INSIDE the identity core.
+    ///
+    /// The intrinsic id is BLAKE3 over the entity's own sorted rows, so it is
+    /// a function of exactly what the `entity!` block contains. If the edges
+    /// are added afterwards as an annotation, they are not in the core, and a
+    /// revert re-mints the id of the state it is reverting TO -- the same
+    /// entity would then both supersede and be superseded by the newer one,
+    /// closing a cycle in a graph whose whole job is to be acyclic.
+    ///
+    /// This test pins the collision that causes it. The writer's answer is to
+    /// carry the edges in the core, so "select H again, replacing H2" is a
+    /// different statement from "select H" and mints a different state.
+    #[test]
+    fn reverting_would_collide_unless_supersession_is_in_the_core() {
+        let scope = genid().id;
+        let original = entity! {
+            crate::schemas::config::config::anchor: scope,
+            crate::schemas::config::config::selects: descriptor(0xAB),
+        };
+        let reverted_without_edges_in_core = entity! {
+            crate::schemas::config::config::anchor: scope,
+            crate::schemas::config::config::selects: descriptor(0xAB),
+        };
+        assert_eq!(
+            original.root(),
+            reverted_without_edges_in_core.root(),
+            "a revert that states only (anchor, selects) IS the earlier state"
+        );
+    }
+
     /// And a DIFFERENT statement is a different state, which is what keeps a
     /// revert from closing a cycle in the supersession DAG.
     #[test]
