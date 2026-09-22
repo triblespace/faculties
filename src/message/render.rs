@@ -1,6 +1,8 @@
 //! Shared text presentation of owned Message operation results.
 use super::operations::interval_key;
-use super::{AcknowledgedMessages, Acknowledgement, MessageList, MessageStatus, SentMessage};
+use super::{
+    AcknowledgedMessages, Acknowledgement, MessageList, MessageStatus, MessageText, SentMessage,
+};
 use crate::out::Out;
 use anyhow::Result;
 
@@ -33,8 +35,17 @@ fn truncate_single_line(text: &str, max: usize) -> String {
     output
 }
 
-fn render_list_body(text: &str) -> String {
-    text.replace('\r', "").replace('\n', "\\n")
+fn render_list_body(body: &MessageText) -> String {
+    match body {
+        MessageText::Text(text) => text.replace('\r', "").replace('\n', "\\n"),
+        // Named by handle, so a reader can ask a peer for exactly these bytes.
+        MessageText::Unavailable(handle) => {
+            format!("[text not here yet: blake3:{}]", hex::encode(handle.raw))
+        }
+        MessageText::Undecodable(handle) => {
+            format!("[text is not UTF-8: blake3:{}]", hex::encode(handle.raw))
+        }
+    }
 }
 
 pub(super) fn sent(sent: &SentMessage, text: &str, out: &mut Out<'_>) -> Result<()> {

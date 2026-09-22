@@ -15,7 +15,7 @@ mod render;
 
 pub use operations::{
     AckAllOptions, AcknowledgedMessages, Acknowledgement, ListOptions, Message, MessageList,
-    MessageObservation, MessageStatus, SendOptions, SentMessage,
+    MessageObservation, MessageStatus, MessageText, SendOptions, SentMessage,
 };
 
 use anyhow::{bail, Context, Result};

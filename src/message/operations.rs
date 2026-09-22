@@ -98,6 +98,28 @@ pub enum MessageStatus {
     ReadByRecipient,
 }
 
+/// A text blob as a reader can report it.
+///
+/// Two of the three ways a text can fail to show are facts about the DATA, and
+/// a reader reports them rather than refusing: the bytes have not arrived, or
+/// they are not text. The envelope is still a valid, signed message -- who sent
+/// it, to whom, when -- and it can still be read and acknowledged. Refusing the
+/// whole inbox because one body is missing turned a single record that synced
+/// ahead of its blob into a reader that could show nothing at all.
+///
+/// The third way is NOT a variant: the store itself failing to acquire says
+/// nothing about the message and everything about the reader, so it stays an
+/// error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MessageText {
+    /// The text, decoded.
+    Text(String),
+    /// Not resident, and acquisition found no copy. It may still arrive.
+    Unavailable(TextHandle),
+    /// Resident, but not UTF-8.
+    Undecodable(TextHandle),
+}
+
 /// One envelope as this reader saw it. Every field is a column of the query
 /// that selected it: nothing is loaded before a question is asked, and the
 /// exact sender and recipient anchors stay as written even when delivery and
@@ -108,7 +130,7 @@ pub struct MessageObservation {
     pub from: Id,
     pub to: Id,
     pub created_at: IntervalValue,
-    pub body: String,
+    pub body: MessageText,
     pub from_label: String,
     pub to_label: String,
     pub incoming: bool,
@@ -399,23 +421,23 @@ where
     )
 }
 
-async fn acquire_text<S>(store: &mut S, handle: TextHandle) -> Result<String>
+/// Acquire a text blob and say what came back. Only an acquisition failure is
+/// an error; see [`MessageText`] for why the other two are values.
+async fn observe_text<S>(store: &mut S, handle: TextHandle) -> Result<MessageText>
 where
     S: AsyncBlobStoreAcquire,
 {
-    let bytes = store
+    let Some(bytes) = store
         .acquire(handle.transmute())
         .await
         .with_context(|| format!("acquire Message text blake3:{}", hex::encode(handle.raw)))?
-        .with_context(|| {
-            format!(
-                "Message text is unavailable (blake3:{})",
-                hex::encode(handle.raw)
-            )
-        })?;
-    Ok(std::str::from_utf8(&bytes)
-        .with_context(|| format!("decode Message text blake3:{}", hex::encode(handle.raw)))?
-        .to_owned())
+    else {
+        return Ok(MessageText::Unavailable(handle));
+    };
+    Ok(match std::str::from_utf8(&bytes) {
+        Ok(text) => MessageText::Text(text.to_owned()),
+        Err(_) => MessageText::Undecodable(handle),
+    })
 }
 
 async fn person_label<S, P>(store: &mut S, facts: &P, person: Id) -> Result<String>
@@ -437,9 +459,12 @@ where
     else {
         return Ok(format!("{person:x} [label unavailable]"));
     };
-    Ok(std::str::from_utf8(&bytes)
-        .context("decode Message person label")?
-        .to_owned())
+    // The same convention as absence, one line up: a label that is not text is
+    // a fact about that label, not a reason to show nobody's messages.
+    Ok(match std::str::from_utf8(&bytes) {
+        Ok(label) => label.to_owned(),
+        Err(_) => format!("{person:x} [label undecodable]"),
+    })
 }
 
 async fn recipient_label<S, P>(
@@ -457,11 +482,21 @@ where
         None => person_label(store, facts, to).await,
         Some(snapshot) => {
             let snapshot = relations::group_snapshot(facts, snapshot)?;
-            acquire_text(store, snapshot.name).await.with_context(|| {
+            let name = observe_text(store, snapshot.name).await.with_context(|| {
                 format!(
                     "read name of group snapshot {:x} for Message {:x}",
                     snapshot.id, message
                 )
+            })?;
+            // Degrades the way `person_label` always has.
+            Ok(match name {
+                MessageText::Text(name) => name,
+                MessageText::Unavailable(_) => {
+                    format!("{:x} [group name unavailable]", snapshot.id)
+                }
+                MessageText::Undecodable(_) => {
+                    format!("{:x} [group name undecodable]", snapshot.id)
+                }
             })
         }
     }
@@ -642,7 +677,7 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
         } else {
             MessageStatus::Sent
         };
-        let body = acquire_text(storage.pile, body)
+        let body = observe_text(storage.pile, body)
             .await
             .with_context(|| format!("read body of Message {id:x}"))?;
         entries.push(MessageObservation {
@@ -990,7 +1025,10 @@ mod tests {
             assert_eq!(result.reader, recipient);
             assert_eq!(result.entries.len(), 1);
             assert_eq!(result.entries[0].id, first_id);
-            assert_eq!(result.entries[0].body, "first message");
+            assert_eq!(
+                result.entries[0].body,
+                MessageText::Text("first message".to_owned())
+            );
             assert_eq!(result.entries[0].status, MessageStatus::Unread);
             assert_eq!(
                 pile.snapshot().unwrap().select_records(&selectors).unwrap(),
@@ -1288,7 +1326,7 @@ mod tests {
                 .find(|entry| entry.id == sent.id)
                 .unwrap()
                 .body,
-            "published without index WRITE"
+            MessageText::Text("published without index WRITE".to_owned())
         );
         assert!(pile.health().started_at.is_none());
         pile.close().unwrap();
@@ -1387,7 +1425,10 @@ mod tests {
             .unwrap();
         assert_eq!(listed.entries.len(), 1);
         assert_eq!(listed.entries[0].id, first_id);
-        assert_eq!(listed.entries[0].body, "the resident message");
+        assert_eq!(
+            listed.entries[0].body,
+            MessageText::Text("the resident message".to_owned())
+        );
         let after = pile.snapshot().unwrap();
         assert_eq!(
             after
@@ -1713,8 +1754,8 @@ mod tests {
         );
         assert!(store.requested.is_empty());
         assert_eq!(
-            pollster::block_on(acquire_text(&mut store, body)).unwrap(),
-            "visible inbox body"
+            pollster::block_on(observe_text(&mut store, body)).unwrap(),
+            MessageText::Text("visible inbox body".to_owned())
         );
         // The unobserved sender keeps its exact anchor; delivery equivalence
         // never rewrites attribution.
@@ -1822,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn group_name_acquisition_errors_identify_snapshot_message_and_handle() {
+    fn a_missing_group_name_degrades_and_a_failed_one_identifies_itself() {
         let group = test_id(13);
         let (relations, snapshot) =
             relations::group_create_fragment(group, "unavailable group name").unwrap();
@@ -1841,41 +1882,64 @@ mod tests {
                 .try_to_inline()
                 .unwrap(),
         );
-        for failure in [None, Some(io::ErrorKind::TimedOut)] {
-            let mut store = AcquiringPile::new(MemoryBlobStore::new());
-            store.failure = failure;
-            let error = pollster::block_on(recipient_label(
+        // A missing group name is a fact about that name. It degrades to the
+        // snapshot's id, the way a missing person label always has, and the
+        // message it labels is still listed.
+        let mut store = AcquiringPile::new(MemoryBlobStore::new());
+        assert_eq!(
+            pollster::block_on(recipient_label(
                 &mut store,
                 relations.facts(),
                 id,
                 group,
                 Some(snapshot),
             ))
-            .unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                format!("read name of group snapshot {snapshot:x} for Message {id:x}")
-            );
-            let report = format!("{error:#}");
-            assert!(report.contains(&format!("blake3:{}", hex::encode(name.raw))));
-            assert!(!report.contains("read body of Message"));
-            match failure {
-                None => {
-                    assert!(report.contains("Message text is unavailable"));
-                    assert!(error.downcast_ref::<io::Error>().is_none());
-                }
-                Some(kind) => {
-                    assert!(report.contains("acquire Message text"));
-                    assert!(!report.contains("Message text is unavailable"));
-                    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
-                }
-            }
-            assert_eq!(store.requested, vec![name.transmute()]);
-        }
+            .unwrap(),
+            format!("{snapshot:x} [group name unavailable]")
+        );
+        assert_eq!(store.requested, vec![name.transmute()]);
+
+        // The store FAILING is still an error, and still identifies the
+        // snapshot, the message and the handle, which is what this test was
+        // written to guarantee.
+        let mut store = AcquiringPile::new(MemoryBlobStore::new());
+        store.failure = Some(io::ErrorKind::TimedOut);
+        let error = pollster::block_on(recipient_label(
+            &mut store,
+            relations.facts(),
+            id,
+            group,
+            Some(snapshot),
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("read name of group snapshot {snapshot:x} for Message {id:x}")
+        );
+        let report = format!("{error:#}");
+        assert!(report.contains(&format!("blake3:{}", hex::encode(name.raw))));
+        assert!(report.contains("acquire Message text"));
+        assert!(!report.contains("read body of Message"));
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(store.requested, vec![name.transmute()]);
     }
 
     #[test]
-    fn list_body_decode_error_identifies_message_and_handle() {
+    fn one_unreadable_body_does_not_hide_the_rest_of_the_inbox() {
+        // This was list_body_decode_error_identifies_message_and_handle, and it
+        // pinned the opposite: one body that could not be shown failed the
+        // whole listing. On 2026-09-22 a message record synced to sky ahead of
+        // its text blob, and that refusal made the reader unable to show ANY
+        // message -- including every perfectly readable one behind it.
+        //
+        // The body here is resident but not UTF-8, so the real list path runs
+        // without starting the lazy network host. An ABSENT body takes the same
+        // path through `list` -- observe_text returns it as a value, not an
+        // error -- and that half is proved directly in
+        // acquisition_distinguishes_missing_failed_and_invalid_text.
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -1919,6 +1983,18 @@ mod tests {
         );
         let id = envelope.root().unwrap();
         pile.commit(message_source, &owner, envelope).unwrap();
+        // And a perfectly readable message beside it.
+        let good: TextHandle = pile.put("still readable").unwrap();
+        let readable = message::envelope_fragment(
+            person,
+            person,
+            good,
+            clock::point_now().unwrap(),
+            None,
+            None,
+        );
+        let readable_id = readable.root().unwrap();
+        pile.commit(message_source, &owner, readable).unwrap();
         carry(&mut pile, &runtime, relations_source, &owner);
         carry(&mut pile, &runtime, message_source, &owner);
         let (snapshot, relation_facts, message_facts) = runtime
@@ -1937,18 +2013,24 @@ mod tests {
             messages: &message_facts,
             relations: &relation_facts,
         };
-        let error = runtime
+        let listed = runtime
             .block_on(list(&mut input, &ListOptions::new("reader")))
-            .unwrap_err();
-        assert_eq!(error.to_string(), format!("read body of Message {id:x}"));
-        let report = format!("{error:#}");
-        assert!(report.contains(&format!(
-            "decode Message text blake3:{}",
-            hex::encode(body.raw)
-        )));
-        assert!(!report.contains("Message text is unavailable"));
-        assert!(!report.contains("group snapshot"));
-        assert!(error.downcast_ref::<std::str::Utf8Error>().is_some());
+            .unwrap();
+        let body_of = |wanted: Id| {
+            listed
+                .entries
+                .iter()
+                .find(|entry| entry.id == wanted)
+                .map(|entry| entry.body.clone())
+        };
+        assert_eq!(
+            body_of(readable_id),
+            Some(MessageText::Text("still readable".to_owned())),
+            "the readable message is listed despite its neighbour"
+        );
+        // The unreadable one is listed too, and still identifies its handle --
+        // which is what the old test existed to guarantee.
+        assert_eq!(body_of(id), Some(MessageText::Undecodable(body)));
         assert!(pile.health().started_at.is_none());
         pile.close().unwrap();
     }
@@ -1962,8 +2044,8 @@ mod tests {
         let before = store.snapshot().unwrap();
 
         assert_eq!(
-            pollster::block_on(acquire_text(&mut store, selected)).unwrap(),
-            "selected body"
+            pollster::block_on(observe_text(&mut store, selected)).unwrap(),
+            MessageText::Text("selected body".to_owned())
         );
         assert_eq!(store.requested, vec![selected.transmute()]);
         assert!(!before.contains_blob(selected).unwrap());
@@ -1975,6 +2057,11 @@ mod tests {
 
     #[test]
     fn acquisition_distinguishes_missing_failed_and_invalid_text() {
+        // Three outcomes, still told apart -- that part of this test is
+        // unchanged. What changed is which of them are errors. Absent and
+        // undecodable are facts about the DATA and come back as values the
+        // reader reports; only the store failing is an error, because it is a
+        // fact about the reader.
         let mut remote = MemoryBlobStore::new();
         let invalid = remote.insert(Blob::<blobencodings::UTF8String>::new(Bytes::from_source(
             vec![0xff_u8],
@@ -1982,18 +2069,14 @@ mod tests {
         let absent: TextHandle = "absent".to_blob().get_handle();
         let mut store = AcquiringPile::new(remote);
 
-        let missing = pollster::block_on(acquire_text(&mut store, absent)).unwrap_err();
         assert_eq!(
-            missing.to_string(),
-            format!(
-                "Message text is unavailable (blake3:{})",
-                hex::encode(absent.raw)
-            )
+            pollster::block_on(observe_text(&mut store, absent)).unwrap(),
+            MessageText::Unavailable(absent),
+            "a missing body is named by its handle, so a peer can be asked for it"
         );
-        assert!(missing.downcast_ref::<io::Error>().is_none());
 
         store.failure = Some(io::ErrorKind::PermissionDenied);
-        let failed = pollster::block_on(acquire_text(&mut store, absent)).unwrap_err();
+        let failed = pollster::block_on(observe_text(&mut store, absent)).unwrap_err();
         assert_eq!(
             failed.to_string(),
             format!("acquire Message text blake3:{}", hex::encode(absent.raw))
@@ -2006,27 +2089,25 @@ mod tests {
             failed.root_cause().to_string(),
             "injected Message acquisition failure"
         );
-        assert!(!format!("{failed:#}").contains("Message text is unavailable"));
 
         store.failure = None;
-        let malformed = pollster::block_on(acquire_text(&mut store, invalid)).unwrap_err();
         assert_eq!(
-            malformed.to_string(),
-            format!("decode Message text blake3:{}", hex::encode(invalid.raw))
+            pollster::block_on(observe_text(&mut store, invalid)).unwrap(),
+            MessageText::Undecodable(invalid),
         );
-        assert!(malformed.downcast_ref::<std::str::Utf8Error>().is_some());
 
+        // And a person label that is not text degrades the way an absent one
+        // always has, instead of taking the whole listing down with it.
         let person = test_id(12);
         let profile = entity! {
             metadata::tag: &crate::schemas::relations::KIND_PERSON_PROFILE,
             crate::schemas::relations::profile::of: &person,
             metadata::name: invalid,
         };
-        let malformed =
-            pollster::block_on(person_label(&mut store, profile.facts(), person)).unwrap_err();
-        assert!(malformed
-            .to_string()
-            .contains("decode Message person label"));
+        assert_eq!(
+            pollster::block_on(person_label(&mut store, profile.facts(), person)).unwrap(),
+            format!("{person:x} [label undecodable]")
+        );
     }
 
     #[test]
