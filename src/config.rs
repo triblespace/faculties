@@ -220,6 +220,59 @@ mod tests {
         facts
     }
 
+    /// Saying the same thing twice is ONE state, not two.
+    ///
+    /// A state written without an explicit id takes an intrinsic one derived
+    /// from its content, so two writers stating the same configuration mint the
+    /// same entity and the facts collapse under set union. This is the primary
+    /// defence against a duplicate, and it is why the reader's own de-duplication
+    /// is a backstop rather than the mechanism.
+    #[test]
+    fn writing_the_same_configuration_twice_collapses_to_one_state() {
+        let scope = genid().id;
+        let once = entity! {
+            crate::schemas::config::config::anchor: scope,
+            crate::schemas::config::config::selects: descriptor(0xAB),
+        };
+        let twice = entity! {
+            crate::schemas::config::config::anchor: scope,
+            crate::schemas::config::config::selects: descriptor(0xAB),
+        };
+        assert_eq!(
+            once.root(),
+            twice.root(),
+            "the same statement must mint the same entity"
+        );
+
+        let mut facts = once.facts().clone();
+        facts.union(twice.facts().clone());
+        assert_eq!(
+            facts.len(),
+            once.facts().len(),
+            "the union of one statement with itself adds nothing"
+        );
+        assert_eq!(
+            configured_in(&facts, scope).unwrap(),
+            Some(descriptor(0xAB))
+        );
+    }
+
+    /// And a DIFFERENT statement is a different state, which is what keeps a
+    /// revert from closing a cycle in the supersession DAG.
+    #[test]
+    fn selecting_a_different_collection_mints_a_different_state() {
+        let scope = genid().id;
+        let one = entity! {
+            crate::schemas::config::config::anchor: scope,
+            crate::schemas::config::config::selects: descriptor(0xAB),
+        };
+        let other = entity! {
+            crate::schemas::config::config::anchor: scope,
+            crate::schemas::config::config::selects: descriptor(0xCD),
+        };
+        assert_ne!(one.root(), other.root());
+    }
+
     #[test]
     fn an_unconfigured_faculty_resolves_to_nothing_rather_than_failing() {
         let facts = TribleSet::new();
