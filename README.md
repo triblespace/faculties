@@ -622,7 +622,7 @@ this diagnostic alone does **not** certify conversion semantics, Decide
 clearance equivalence or readiness for activation. Historical source piles
 and collections must remain intact.
 
-Run the already-built example with `--pile /exact/existing.pile --collection
+Run the already-built example with `--pile /exact/offline-copy.pile --collection
 blake3:<descriptor>` (repeat `--collection` for each source and target).
 It emits JSON lines, never payload text. Exit zero means the observations
 were emitted, not that all content is present. Attachment inspection follows
@@ -636,6 +636,12 @@ The audit uses one native snapshot without whole-pile derived-index
 settlement. Although the underlying pile API opens an append-capable file
 descriptor, this example has no append path; temporary-pile tests check that
 the file length is unchanged. It is not a live cutover command.
+Use an isolated, complete copy, **not the live custody pile**: the native
+snapshot replay holds a shared file lock and can delay live writers for
+minutes, especially with an unoptimized binary. Copying an append-only file
+while writers run may catch an incomplete tail; an audit that cannot parse
+that copy has failed inspection, not proved empty or complete content. Never
+truncate or repair the source to make this diagnostic succeed.
 
 ### Secrets: replication, publication, and key delivery
 

@@ -6,6 +6,8 @@
 //! `PileFile::open` requires an existing append-capable file descriptor, but
 //! this path only takes ONE passive snapshot and closes without dirty writes.
 //! It deliberately avoids `Pile`'s whole-pile coverage settlement.
+//! Use an isolated complete copy, never live custody: replay holds a shared
+//! file lock and can delay writers even though the audit appends nothing.
 //!
 //! JSON lines preserve record identity, signature, admission and immediate
 //! archive observations separately. Exit success means the audit ran, NOT that
@@ -40,7 +42,8 @@ use triblespace::core::trible::TribleSet;
 #[derive(Parser)]
 #[command(about = "Audit explicit collection claims and immediate archives without writing")]
 struct Args {
-    /// Existing local pile. No PILE or other environment fallback is consulted.
+    /// Existing offline pile copy, never live custody (replay holds a shared lock).
+    /// No PILE or other environment fallback is consulted.
     #[arg(long)]
     pile: PathBuf,
     /// Exact descriptor handle, repeated for every source or target to inspect.
