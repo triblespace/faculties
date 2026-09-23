@@ -612,6 +612,31 @@ deliberately, not made executable merely by copying their facts. Existing
 pause assertions, including a paused stranded-work check, must survive that
 conversion. The legacy live setup is unchanged while this candidate is built.
 
+The developer example `trigger_migration_audit` inspects explicitly selected
+collection handles from one local pile snapshot. It separates raw signed
+claims, writer admission, canonical data/metafact readability and supported
+attachment references. It does not register descriptors, acquire content,
+maintain indexes, migrate records or resolve live configuration. Unknown
+schemas, absent payloads and unreadable content remain distinct evidence;
+this diagnostic alone does **not** certify conversion semantics, Decide
+clearance equivalence or readiness for activation. Historical source piles
+and collections must remain intact.
+
+Run the already-built example with `--pile /exact/existing.pile --collection
+blake3:<descriptor>` (repeat `--collection` for each source and target).
+It emits JSON lines, never payload text. Exit zero means the observations
+were emitted, not that all content is present. Attachment inspection follows
+schema-described Blake3 handles into UTF-8, opaque bytes and SimpleArchive;
+other formats and missing schema descriptions remain explicitly unsupported.
+Its 100,000-reference / 256 MiB attachment budget is reported if reached.
+That bounds payload processing, not the store's validation I/O or root-archive
+inspection. Supported encoding descriptions come from this binary as well as
+the supplied metafacts; the report does not certify source self-description.
+The audit uses one native snapshot without whole-pile derived-index
+settlement. Although the underlying pile API opens an append-capable file
+descriptor, this example has no append path; temporary-pile tests check that
+the file length is unchanged. It is not a live cutover command.
+
 ### Secrets: replication, publication, and key delivery
 
 Secrets keeps three rights separate: collection READ replicates encrypted

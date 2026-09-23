@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add a passive Trigger migration-audit example with explicit collection
+  selection, exact COMMIT provenance, writer-admission checks and canonical
+  payload/known-attachment diagnostics. Raw pair coverage is not treated as
+  admitted, readable content. The audit neither migrates nor activates anything.
+
 - Stage the Trigger library/CLI candidate: durable bounded check execution,
   completion-independent timers, event-context routing and replay, and one
   destination for existing Posture policy/scans with Decide links preserved.
