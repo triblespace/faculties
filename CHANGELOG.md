@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
   selection, exact COMMIT provenance, writer-admission checks and canonical
   payload/known-attachment diagnostics. Raw pair coverage is not treated as
   admitted, readable content. The audit neither migrates nor activates anything.
+  Absence of positive admission evidence is not reported as denial: missing
+  capability definitions may change that answer without new signed records.
 
 - Stage the Trigger library/CLI candidate: durable bounded check execution,
   completion-independent timers, event-context routing and replay, and one

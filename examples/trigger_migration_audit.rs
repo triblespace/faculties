@@ -179,7 +179,6 @@ fn audit_snapshot(
         let mut raw_pairs = BTreeSet::new();
         let mut valid_pairs = BTreeSet::new();
         let mut admitted_pairs = BTreeSet::new();
-        let mut denied_pairs = BTreeSet::new();
         let mut unresolved_pairs = BTreeSet::new();
         let mut readable_admitted_pairs = BTreeSet::new();
         let mut admitted_facts = TribleSet::new();
@@ -241,7 +240,10 @@ fn audit_snapshot(
                     Ok(false) if policy["status"] != "readable" => json!({
                         "status": "unavailable", "error": "policy is not readable",
                     }),
-                    Ok(false) => json!({ "status": "not_admitted" }),
+                    // Native admission is a positive proof query. A false
+                    // answer also covers absent capability definitions; it is
+                    // not a proof that authority is denied.
+                    Ok(false) => json!({ "status": "not_proved_admitted" }),
                     Err(error) => json!({ "status": "unavailable", "error": error.to_string() }),
                 }
             });
@@ -253,9 +255,7 @@ fn audit_snapshot(
                     Some("admitted") => {
                         admitted_pairs.insert(pair);
                     }
-                    Some("not_admitted") => {
-                        denied_pairs.insert(pair);
-                    }
+                    Some("not_proved_admitted") => {}
                     _ => {
                         unresolved_pairs.insert(pair);
                     }
@@ -338,9 +338,8 @@ fn audit_snapshot(
                 "valid_signed_pairs": valid_pairs.len(),
                 "admitted_pairs": admitted_pairs.len(),
                 "valid_pairs_not_proved_admitted": valid_pairs.difference(&admitted_pairs).count(),
-                "valid_pairs_with_unresolved_admission": unresolved_pairs.difference(&admitted_pairs).count(),
-                "valid_pairs_only_denied": denied_pairs.iter()
-                    .filter(|pair| !admitted_pairs.contains(*pair) && !unresolved_pairs.contains(*pair)).count(),
+                "valid_pairs_with_unavailable_admission_check": unresolved_pairs.difference(&admitted_pairs).count(),
+                "admission_scope": "positive native WRITE evidence in this snapshot; false may include absent definitions and is never negative authority proof",
                 "readable_admitted_pairs": readable_admitted_pairs.len(),
                 "admitted_pairs_with_unreadable_archives": admitted_pairs.difference(&readable_admitted_pairs).count(),
                 "decoded_admitted_data_tribles": admitted_facts.len(),
@@ -473,11 +472,11 @@ mod tests {
         let rows = evidence(&file, handle);
         let commit = rows.iter().find(|row| row["kind"] == "commit").unwrap();
         assert_eq!(commit["signature_valid"], true);
-        assert_eq!(commit["writer_admission"]["status"], "not_admitted");
+        assert_eq!(commit["writer_admission"]["status"], "not_proved_admitted");
         assert_eq!(summary(&rows)["raw_pairs"], 1);
         assert_eq!(summary(&rows)["valid_signed_pairs"], 1);
         assert_eq!(summary(&rows)["admitted_pairs"], 0);
-        assert_eq!(summary(&rows)["valid_pairs_only_denied"], 1);
+        assert_eq!(summary(&rows)["valid_pairs_not_proved_admitted"], 1);
         assert_eq!(summary(&rows)["decoded_admitted_data_tribles"], 0);
     }
 
@@ -559,8 +558,11 @@ mod tests {
         let rows = evidence(&file, absent);
         let commit = rows.iter().find(|row| row["kind"] == "commit").unwrap();
         assert_eq!(commit["writer_admission"]["status"], "unavailable");
-        assert_eq!(summary(&rows)["valid_pairs_only_denied"], 0);
-        assert_eq!(summary(&rows)["valid_pairs_with_unresolved_admission"], 1);
+        assert_eq!(summary(&rows)["admitted_pairs"], 0);
+        assert_eq!(
+            summary(&rows)["valid_pairs_with_unavailable_admission_check"],
+            1
+        );
     }
 
     #[test]
@@ -575,7 +577,7 @@ mod tests {
         assert_eq!(summary(&rows)["known_commits"], 2);
         assert_eq!(summary(&rows)["raw_pairs"], 1);
         assert_eq!(summary(&rows)["admitted_pairs"], 1);
-        assert_eq!(summary(&rows)["valid_pairs_only_denied"], 0);
+        assert_eq!(summary(&rows)["valid_pairs_not_proved_admitted"], 0);
     }
 
     #[test]
@@ -599,5 +601,49 @@ mod tests {
         let replayed = evidence(&file, handle);
         assert_eq!(summary(&replayed)["known_commits"], 1);
         assert_eq!(summary(&first), summary(&replayed));
+    }
+
+    #[test]
+    fn missing_write_definition_is_not_denial_and_can_recover_without_new_records() {
+        use triblespace::core::collection::{read_capability, write_capability};
+
+        let (source_file, handle) = fixture(|_, _, _| {});
+        let mut source = PileFile::open(source_file.path()).unwrap();
+        let snapshot = source.snapshot().unwrap();
+        let descriptor: Blob<SimpleArchive> = snapshot.get(handle).unwrap();
+        let read_definition: Blob<SimpleArchive> = snapshot.get(read_capability()).unwrap();
+        let write_definition: Blob<SimpleArchive> = snapshot.get(write_capability()).unwrap();
+        source.close().unwrap();
+
+        let file = NamedTempFile::new().unwrap();
+        let mut pile = PileFile::open(file.path()).unwrap();
+        pile.put::<SimpleArchive, _>(descriptor).unwrap();
+        pile.put::<SimpleArchive, _>(read_definition).unwrap();
+        let empty = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        let key = SigningKey::from_bytes(&[31; 32]);
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &key,
+            handle,
+            Inline::new(empty.raw),
+            empty,
+        )))
+        .unwrap();
+        pile.close().unwrap();
+
+        let before = evidence(&file, handle);
+        let commit = before.iter().find(|row| row["kind"] == "commit").unwrap();
+        assert_eq!(commit["signature_valid"], true);
+        assert_eq!(commit["writer_admission"]["status"], "not_proved_admitted");
+        assert_eq!(summary(&before)["admitted_pairs"], 0);
+
+        let mut pile = PileFile::open(file.path()).unwrap();
+        pile.put::<SimpleArchive, _>(write_definition).unwrap();
+        pile.close().unwrap();
+        let after = evidence(&file, handle);
+        assert_eq!(summary(&after)["admitted_pairs"], 1);
+        assert_eq!(
+            summary(&before)["known_record_set_blake3"],
+            summary(&after)["known_record_set_blake3"]
+        );
     }
 }
