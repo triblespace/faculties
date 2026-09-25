@@ -1038,21 +1038,29 @@ mod tests {
         let target_merge = CollectionMerge::sign(
             &signer,
             target,
-            target_commit.data(),
-            target_commit.data(),
+            [target_commit.data(), Inline::new([4; 32])],
             Inline::new([5; 32]),
-        );
+        )
+        .unwrap();
         let other_merge = CollectionMerge::sign(
             &signer,
             other,
-            other_commit.data(),
-            other_commit.data(),
+            [other_commit.data(), Inline::new([7; 32])],
             Inline::new([8; 32]),
+        )
+        .unwrap();
+        let derive_to_target = CollectionDerive::sign(
+            &signer,
+            target,
+            triblespace::core::collection::SourceLocator::of(other_commit.data().raw),
+            Inline::new([10; 32]),
         );
-        let derive_to_target =
-            CollectionDerive::sign(&signer, target, other_commit.data(), Inline::new([10; 32]));
-        let derive_from_target =
-            CollectionDerive::sign(&signer, other, target_commit.data(), Inline::new([12; 32]));
+        let derive_from_target = CollectionDerive::sign(
+            &signer,
+            other,
+            triblespace::core::collection::SourceLocator::of(target_commit.data().raw),
+            Inline::new([12; 32]),
+        );
 
         for record in [
             CollectionRecord::Commit(target_commit),
@@ -1152,13 +1160,15 @@ mod tests {
         }
         let joined = store.put::<SimpleArchive, _>(expected.clone()).unwrap();
         store
-            .insert(CollectionRecord::Merge(CollectionMerge::sign(
-                &owner,
-                collection.handle(),
-                commits[0].data(),
-                commits[1].data(),
-                Handle::<SimpleArchive>::to_hash(joined),
-            )))
+            .insert(CollectionRecord::Merge(
+                CollectionMerge::sign(
+                    &owner,
+                    collection.handle(),
+                    [commits[0].data(), commits[1].data()],
+                    Handle::<SimpleArchive>::to_hash(joined),
+                )
+                .unwrap(),
+            ))
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         assert!(collection.admitted(&snapshot).unwrap().is_empty());
