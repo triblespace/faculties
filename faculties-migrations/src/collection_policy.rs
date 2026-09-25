@@ -466,7 +466,7 @@ mod tests {
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::collection::{
         CollectionData, CollectionDerive, CollectionMerge, CollectionRecordSelector,
-        CollectionStore, CollectionStoreExt,
+        CollectionStore, CollectionStoreExt, SourceLocator,
     };
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
@@ -653,18 +653,20 @@ mod tests {
         );
         let source = CollectionCommit::sign(&signer, old, missing_data(1), missing_metadata(2));
         pile.insert(CollectionRecord::Commit(source)).unwrap();
-        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &signer,
-            old,
-            source.data(),
-            source.data(),
-            source.data(),
-        )))
+        pile.insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &signer,
+                old,
+                [source.data(), missing_data(3)],
+                source.data(),
+            )
+            .unwrap(),
+        ))
         .unwrap();
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             old,
-            source.data(),
+            SourceLocator::of(source.data().raw),
             missing_data(5),
         )))
         .unwrap();

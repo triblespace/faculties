@@ -666,10 +666,19 @@ mod tests {
             let snapshot = pile.maintain(rank9, &signer).await.unwrap();
             let fact_collection = snapshot.collection(rank9).unwrap();
             let intent_collection = snapshot.collection(target).unwrap();
-            assert_ne!(
-                fact_collection.support().unwrap(),
-                intent_collection.support().unwrap()
+            // The facts have derived the second intent; the register lags
+            // the source by exactly that commit, and reads as it stands.
+            assert!(
+                crate::storage::FactLag::of(&snapshot, source, succinct, rank9)
+                    .unwrap()
+                    .is_current()
             );
+            let source_view = snapshot.collection(source).unwrap();
+            assert_eq!(
+                intent_collection.missing_from(&source_view).unwrap().len(),
+                1
+            );
+            drop(source_view);
             let facts = fact_collection.view::<FactArchive>().unwrap();
             let lagging = intent_collection
                 .view::<LwwIndex>()

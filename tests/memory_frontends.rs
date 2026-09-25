@@ -153,16 +153,18 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
             let snapshot = pile.snapshot()?;
             assert!(source.admitted(&snapshot)?.contains(cold));
             assert!(!snapshot.contains_blob(cold)?);
-            assert!(snapshot
-                .collection(succinct)?
-                .support()
-                .unwrap()
-                .contains(warm));
+            // Both views derived the resident commit; the cold one is not
+            // readable here, so neither view lags anything this reader sees.
+            let root = snapshot.collection(source)?;
+            assert!(root.support().unwrap().contains(warm));
+            let succinct_view = snapshot.collection(succinct)?;
+            assert!(succinct_view.missing_from(&root).unwrap().is_empty());
             assert!(snapshot
                 .collection(rank9)?
-                .support()
+                .missing_from(&succinct_view)
                 .unwrap()
-                .contains(warm));
+                .is_empty());
+            drop((root, succinct_view));
             assert!(!source.writer_is_admitted(&snapshot, reader.verifying_key())?);
             assert!(!succinct.writer_is_admitted(&snapshot, reader.verifying_key())?);
             assert!(!rank9.writer_is_admitted(&snapshot, reader.verifying_key())?);

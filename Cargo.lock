@@ -11008,6 +11008,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "hex-literal",
  "hifitime",
  "iroh",
  "iroh-base",

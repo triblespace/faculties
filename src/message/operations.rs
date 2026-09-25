@@ -1296,9 +1296,44 @@ mod tests {
             CollectionRecord::Commit(commit) if commit.collection() == message_source.handle()
         )));
 
-        // The worker carries the sender's admitted source writes with the
-        // owner's authority; any reader then sees them.
+        // The owner's worker derives only what the owner wrote: the sender's
+        // two commits are the views' lag, and the owner reads its own
+        // message alone.
         carry(&mut pile, &runtime, message_source, &owner);
+        let lag = {
+            let snapshot = pile.snapshot().unwrap();
+            let policy = message_source.policy(&snapshot).unwrap();
+            let succinct = pile
+                .derive::<SuccinctArchiveBlob>(message_source, (), policy.clone())
+                .unwrap();
+            let rank9 = pile
+                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .unwrap();
+            storage::FactLag::of(&snapshot, message_source, succinct, rank9).unwrap()
+        };
+        assert_eq!(
+            lag,
+            storage::FactLag {
+                succinct: 2,
+                rank9: 0
+            }
+        );
+
+        // Once the sender may write the views, it derives its own writes and
+        // any reader then sees them.
+        let snapshot = pile.snapshot().unwrap();
+        let policy = message_source.policy(&snapshot).unwrap();
+        drop(snapshot);
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(message_source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        for target in [succinct.handle(), rank9.handle()] {
+            grant_collection_write(&mut pile, target, &owner, sender.verifying_key()).unwrap();
+        }
+        carry(&mut pile, &runtime, message_source, &sender);
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,

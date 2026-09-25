@@ -19,7 +19,9 @@ use dryoc::dryocsecretbox::{DryocSecretBox, Key, Nonce};
 use dryoc::types::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
+use triblespace::core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, UnionArchive,
+};
 use triblespace::core::collection::{CollectionHandle, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -65,11 +67,45 @@ pub struct WrapRow {
     pub sealed_dek: BytesHandle,
 }
 
+/// How far the maintained Secrets view is behind its source in one store
+/// snapshot, hop by hop: source commits the Succinct encoding has no leaf for,
+/// and Succinct images the Rank9 encoding has none for.
+///
+/// Each writer derives what it wrote, so a lagging hop is someone's
+/// derivation still to come or still to arrive by sync. There is no globally
+/// consistent state to be current against; a read attaches what is present
+/// and reports this, it never waits or refuses.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SecretsLag {
+    /// Source commits without a Succinct leaf.
+    pub succinct: usize,
+    /// Succinct images without a Rank9 leaf.
+    pub rank9: usize,
+}
+
+impl SecretsLag {
+    /// Whether every source foundation this snapshot sees has reached Rank9.
+    pub const fn is_current(self) -> bool {
+        self.succinct == 0 && self.rank9 == 0
+    }
+}
+
+impl std::fmt::Display for SecretsLag {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} source commit(s) not yet derived into Succinct, {} Succinct image(s) not yet derived into Rank9",
+            self.succinct, self.rank9
+        )
+    }
+}
+
 /// One immutable observation of the configured Secrets collection.
 pub struct SecretsSnapshot<R> {
     store_snapshot: R,
     collection: CollectionHandle,
-    support: Support,
+    support: Support<Rank9AcceleratedSuccinctArchiveBlob>,
+    lag: SecretsLag,
     facts: Option<SecretsFacts>,
 }
 
@@ -77,13 +113,15 @@ impl<R> SecretsSnapshot<R> {
     pub(crate) fn new(
         store_snapshot: R,
         collection: CollectionHandle,
-        support: Support,
+        support: Support<Rank9AcceleratedSuccinctArchiveBlob>,
+        lag: SecretsLag,
         facts: Option<SecretsFacts>,
     ) -> Self {
         Self {
             store_snapshot,
             collection,
             support,
+            lag,
             facts,
         }
     }
@@ -96,8 +134,16 @@ impl<R> SecretsSnapshot<R> {
         self.collection
     }
 
-    pub fn support(&self) -> &Support {
+    /// The Rank9 encoding's own foundations this observation stands on: its
+    /// leaf images, not source commits. Comparable only with another
+    /// observation of the same collection.
+    pub fn support(&self) -> &Support<Rank9AcceleratedSuccinctArchiveBlob> {
         &self.support
+    }
+
+    /// What the view had not derived yet when it was observed.
+    pub const fn lag(&self) -> SecretsLag {
+        self.lag
     }
 
     /// Queryable facts physically realized for this exact support.
@@ -121,10 +167,19 @@ impl<R: BlobStoreGet> SecretsSnapshot<R> {
     /// opens its additive DEK envelope. Every independently decryptable
     /// occurrence must agree on plaintext.
     pub fn open(&self, secret: Id, signing_key: &SigningKey) -> Result<Vec<u8>> {
-        let facts = self
+        let found = self
             .facts
             .as_ref()
-            .ok_or_else(|| anyhow!("secret {secret} not found"))?;
+            .filter(|facts| !secret_rows_for(*facts, secret).is_empty());
+        let Some(facts) = found else {
+            if self.lag.is_current() {
+                bail!("secret {secret} not found");
+            }
+            bail!(
+                "secret {secret} not found in the Secrets view, which lags its source: {}",
+                self.lag
+            );
+        };
         open_version_from_facts(&self.store_snapshot, facts, secret, signing_key)
     }
 }

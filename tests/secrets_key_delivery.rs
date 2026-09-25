@@ -5,8 +5,7 @@ use std::process::{Command, Output};
 use faculties::secrets::{self, storage::SecretsCollection};
 use hifitime::Epoch;
 use triblespace::core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRealizationError,
-    CollectionStoreExt,
+    AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionStoreExt,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::SnapshotSource;
@@ -99,7 +98,8 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
         .unwrap());
 
     // Possessing a delivered envelope does not grant the recipient WRITE on
-    // either derived collection. Explicit production still refuses that key.
+    // either derived collection, and the recipient wrote nothing: explicit
+    // production owes it nothing to derive and publishes nothing.
     let before = pile
         .snapshot()
         .unwrap()
@@ -107,22 +107,16 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let error = pollster::block_on(collection.ensure(&mut pile, &recipient))
-        .err()
-        .expect("recipient cannot publish the missing Secrets cover");
-    assert!(matches!(
-        error.downcast_ref::<CollectionRealizationError>(),
-        Some(CollectionRealizationError::UnauthorizedProducer { collection: target })
-            if *target == collection.succinct().handle()
-    ));
+    drop(pollster::block_on(collection.ensure(&mut pile, &recipient)).unwrap());
 
-    // Ordinary reads tolerate only that lack of production authority. The
-    // target is not realized yet, so its honest read-only view is empty.
+    // The owner has not derived its commit yet, so the honest read-only view
+    // is empty and says it lags the source by that commit.
     let observed = pollster::block_on(secrets::storage::ensure_and_snapshot(
         &mut pile, collection, &recipient,
     ))
     .unwrap();
     assert!(observed.support().is_empty());
+    assert_eq!(observed.lag().succinct, 1);
     drop(observed);
     assert_eq!(
         pile.snapshot()

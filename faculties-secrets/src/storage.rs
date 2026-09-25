@@ -24,7 +24,7 @@ use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, Store, StoreRea
 use triblespace::macros::{find, pattern};
 
 use super::resource::SecretTarget;
-use super::{IntervalValue, SecretsFacts, SecretsSnapshot};
+use super::{IntervalValue, SecretsFacts, SecretsLag, SecretsSnapshot};
 
 /// One logical Secrets policy boundary and its ordinary maintained encodings.
 ///
@@ -97,89 +97,66 @@ impl SecretsCollection {
         self.rank9
     }
 
-    /// Ensure the source root when the derived encodings do not yet stand for
-    /// every admitted commit: a payload the root cannot fetch is then reported
-    /// rather than hidden behind an empty derived view. A commit the derived
-    /// encodings already stand for is never fetched again.
-    async fn ensure_source_if_behind<S>(self, store: &mut S, signer: &SigningKey) -> Result<()>
-    where
-        S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
-    {
-        let before = store
-            .snapshot()
-            .context("freeze Secrets source selection")?;
-        let admitted = self
-            .source
-            .admitted(&before)
-            .context("admit Secrets source support")?;
-        let succinct = before
-            .collection(self.succinct)
-            .context("observe resident Succinct Secrets support")?
-            .support()
-            .context("resolve resident Succinct Secrets support")?
-            .clone();
-        let rank9 = before
-            .collection(self.rank9)
-            .context("observe resident Rank9 Secrets support")?
-            .support()
-            .context("resolve resident Rank9 Secrets support")?
-            .clone();
-        let covered = succinct.union(&rank9)?;
-        drop(before);
-        if !admitted.is_subset(&covered)? {
-            drop(
-                store
-                    .ensure(self.source, signer)
-                    .await
-                    .context("ensure Secrets source collection")?,
-            );
-        }
-        Ok(())
-    }
-
-    /// Make both derived encodings stand for everything the source stands
-    /// on, without carrying them.
+    /// Derive the signer's own missing leaves into both encodings, Succinct
+    /// first, without mirroring any merge. Other writers' commits are theirs
+    /// to derive; what they have not derived yet is the view's lag, reported
+    /// by [`snapshot`], never waited for here.
     pub async fn ensure<S>(self, store: &mut S, signer: &SigningKey) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        self.ensure_source_if_behind(store, signer).await?;
-        drop(
-            store
-                .ensure(self.succinct, signer)
-                .await
-                .context("ensure Succinct Secrets collection")?,
-        );
-        store
+        let lagging = own_lag(
+            store.ensure(self.succinct, signer).await,
+            "ensure Succinct Secrets collection",
+        )?;
+        let rank9 = store
             .ensure(self.rank9, signer)
             .await
-            .context("ensure Rank9 Secrets collection")
+            .context("ensure Rank9 Secrets collection")?;
+        lagging.map_or(Ok(rank9), Err)
     }
 
-    /// Make both derived encodings stand for everything the source stands
-    /// on, then carry each to its LSM fixed point.
+    /// Derive the signer's own leaves into both encodings and mirror its own
+    /// source merges there, Succinct first.
     pub async fn maintain<S>(self, store: &mut S, signer: &SigningKey) -> Result<S::Snapshot>
     where
         S: Store + CollectionStoreExt + AsyncBlobStoreAcquire + Send,
     {
-        self.ensure_source_if_behind(store, signer).await?;
-        drop(
-            store
-                .maintain(self.succinct, signer)
-                .await
-                .context("maintain Succinct Secrets collection")?,
-        );
-        store
+        let lagging = own_lag(
+            store.maintain(self.succinct, signer).await,
+            "maintain Succinct Secrets collection",
+        )?;
+        let rank9 = store
             .maintain(self.rank9, signer)
             .await
-            .context("maintain Rank9 Secrets collection")
+            .context("maintain Rank9 Secrets collection")?;
+        lagging.map_or(Ok(rank9), Err)
+    }
+}
+
+/// Split one Succinct upkeep result: an own commit left without a leaf
+/// (`Unmappable`) comes back to be reported after Rank9 has derived what
+/// Succinct does hold, because everything else in Succinct was done; any
+/// other failure stops here.
+fn own_lag<T>(
+    result: Result<T, CollectionRealizationError>,
+    operation: &'static str,
+) -> Result<Option<anyhow::Error>> {
+    match result {
+        Ok(_) => Ok(None),
+        Err(error @ CollectionRealizationError::Unmappable { .. }) => {
+            Ok(Some(anyhow::Error::new(error).context(operation)))
+        }
+        Err(error) => Err(anyhow::Error::new(error).context(operation)),
     }
 }
 
 /// Attach the configured collection at one immutable store boundary.
 ///
 /// This never performs maintenance. It reports exactly the support physically
-/// realized in `snapshot`, preserving the snapshot/derivation boundary.
+/// realized in `snapshot`, preserving the snapshot/derivation boundary, and
+/// how far each encoding lags the one it derives from there: a commit nobody
+/// has derived yet is read as absent and counted, never waited for.
 pub fn snapshot<R>(store_snapshot: R, collection: SecretsCollection) -> Result<SecretsSnapshot<R>>
 where
     R: StoreRead,
@@ -191,6 +168,23 @@ where
         .support()
         .context("resolve maintained Secrets snapshot support")?
         .clone();
+    let source = store_snapshot
+        .collection(collection.source)
+        .context("observe Secrets source collection")?;
+    let succinct = store_snapshot
+        .collection(collection.succinct)
+        .context("observe Succinct Secrets collection")?;
+    let lag = SecretsLag {
+        succinct: succinct
+            .missing_from(&source)
+            .context("compare Succinct Secrets leaves with the source")?
+            .len(),
+        rank9: observed
+            .missing_from(&succinct)
+            .context("compare Rank9 Secrets leaves with Succinct")?
+            .len(),
+    };
+    drop((source, succinct));
     let facts = if observed.cover().is_empty() {
         None
     } else {
@@ -204,6 +198,7 @@ where
         store_snapshot,
         collection.handle(),
         support,
+        lag,
         facts,
     ))
 }
@@ -221,13 +216,16 @@ where
     snapshot(store_snapshot, collection)
 }
 
-/// Ensure missing support, then read the actual resulting target snapshot.
+/// Derive the signer's own missing leaves, then read the actual resulting
+/// target snapshot.
 ///
-/// Work is selected once from source admission and resident derived support.
-/// It does not constrain the returned view to that old selection or require
-/// ancestral proofs and payloads for already-certified target members. A reader
-/// without authority to publish missing derivations still reads the available
-/// target; other errors propagate. No opportunistic LSM compaction is performed.
+/// A read never refuses for lagging. A signer without WRITE on the encodings
+/// cannot publish its leaves, and an own commit the mapping cannot represent
+/// or whose payload nobody can hand over is left without one; both still read
+/// the available target. The snapshot's [`SecretsSnapshot::lag`] counts the
+/// source commits this reader can see that the view has not derived; a
+/// payload that is not here is named by explicit maintenance instead. Other
+/// errors propagate. No merge is mirrored.
 pub async fn ensure_and_snapshot<S>(
     store: &mut S,
     collection: SecretsCollection,
@@ -241,7 +239,10 @@ where
         Err(error)
             if matches!(
                 error.downcast_ref::<CollectionRealizationError>(),
-                Some(CollectionRealizationError::UnauthorizedProducer { .. })
+                Some(
+                    CollectionRealizationError::UnauthorizedProducer { .. }
+                        | CollectionRealizationError::Unmappable { .. }
+                )
             ) =>
         {
             store
@@ -538,8 +539,15 @@ mod tests {
         (secret, commit, blobs)
     }
 
+    /// A derived encoding stands on its own writers. The writer derives its
+    /// own commit; a replica holding those leaves but none of the writer's
+    /// grants, payloads or metadata reads nothing, owes nothing and fetches
+    /// nothing. Once the writer's grants on the two encodings arrive, the
+    /// leaves are read at once, still without the source grant or the
+    /// payload. A Rank9 leaf the writer has not published yet is lag that no
+    /// other key can fill.
     #[test]
-    fn ordinary_reads_reuse_derived_endorsements_without_ancestral_proof_or_payloads() {
+    fn ordinary_reads_stand_on_the_encodings_own_writers_without_source_proof_or_payloads() {
         pollster::block_on(async {
             for rank9_ready in [false, true] {
                 let authority = SigningKey::generate(&mut OsRng);
@@ -562,33 +570,34 @@ mod tests {
                     staging.put::<UnknownBlob, _>(blob).unwrap();
                 }
                 staging.insert(CollectionRecord::Commit(commit)).unwrap();
-                let proof = CapabilityProof::new(
-                    CapabilityResource::from(collection.handle()),
-                    &authority,
-                    write_capability(),
-                    writer.verifying_key(),
-                );
-                staging.insert_proof(proof.clone()).unwrap();
-                let support = collection
-                    .source()
-                    .cover([Handle::<SimpleArchive>::from_hash(commit.data())]);
+                let grant = |collection: CollectionHandle| {
+                    CapabilityProof::new(
+                        CapabilityResource::from(collection),
+                        &authority,
+                        write_capability(),
+                        writer.verifying_key(),
+                    )
+                };
+                let derived_grants = [
+                    grant(collection.succinct().handle()),
+                    grant(collection.rank9().handle()),
+                ];
+                staging.insert_proof(grant(collection.handle())).unwrap();
+                for proof in &derived_grants {
+                    staging.insert_proof(proof.clone()).unwrap();
+                }
                 drop(
                     staging
-                        .ensure(collection.succinct(), &authority)
+                        .ensure(collection.succinct(), &writer)
                         .await
                         .unwrap(),
                 );
                 if rank9_ready {
-                    drop(
-                        staging
-                            .ensure(collection.rank9(), &authority)
-                            .await
-                            .unwrap(),
-                    );
+                    drop(staging.ensure(collection.rank9(), &writer).await.unwrap());
                 }
 
-                // Replicate an honestly produced witness chain but neither the
-                // original writer's grant nor its data/metadata archive bytes.
+                // Replicate the writer's commit and leaves but none of its
+                // grants, and neither its data nor its metadata archive.
                 let realized = staging.snapshot().unwrap();
                 let mut store = AcquiringStore::default();
                 let metadata = Handle::<SimpleArchive>::to_hash(commit.metadata());
@@ -609,7 +618,7 @@ mod tests {
                 }
                 let before = store.snapshot().unwrap();
                 assert!(!collection
-                    .source()
+                    .succinct()
                     .writer_is_admitted(&before, writer.verifying_key())
                     .unwrap());
                 assert!(!before
@@ -618,11 +627,9 @@ mod tests {
                 assert!(!before
                     .contains_blob(Handle::<UnknownBlob>::from_hash(metadata))
                     .unwrap());
-                // Without the writer's grant the fold admits nothing beneath the
-                // images, so maintenance owes nothing here: nothing is fetched
-                // or published, and a read stands for nothing either, however
-                // resident the rank9 image is. No walk certifies an image from
-                // what its producer named.
+                // Without the writer's grants its leaves stand for nothing,
+                // and the authority owns nothing here: nothing is fetched or
+                // published.
                 assert!(!snapshot(before.clone(), collection)
                     .unwrap()
                     .contains(secret));
@@ -631,27 +638,32 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(!observed.contains(secret));
+                assert!(observed.support().is_empty());
                 assert!(store.acquired.is_empty());
                 assert_eq!(
                     store.snapshot().unwrap().records().unwrap().count(),
                     records_before
                 );
 
-                // The grant arrives: the replicated images stand for the commit
-                // at once, without its payload or metadata bytes, and only the
-                // missing rank9 image is published.
-                store.insert_proof(proof).unwrap();
+                // The grants on the encodings arrive, not the source grant.
+                for proof in derived_grants {
+                    store.insert_proof(proof).unwrap();
+                }
                 let observed = ensure_and_snapshot(&mut store, collection, &authority)
                     .await
                     .unwrap();
-                assert!(observed.contains(secret));
-                assert_eq!(observed.support(), &support);
+                assert_eq!(observed.contains(secret), rank9_ready);
+                assert_eq!(observed.support().len(), usize::from(rank9_ready));
+                assert_eq!(
+                    observed.lag(),
+                    SecretsLag {
+                        succinct: 0,
+                        rank9: usize::from(!rank9_ready),
+                    }
+                );
                 assert!(store.acquired.is_empty());
                 let after = store.snapshot().unwrap();
-                assert_eq!(
-                    after.records().unwrap().count(),
-                    records_before + usize::from(!rank9_ready),
-                );
+                assert_eq!(after.records().unwrap().count(), records_before);
                 assert!(!after
                     .contains_blob(Handle::<UnknownBlob>::from_hash(commit.data()))
                     .unwrap());
@@ -659,18 +671,22 @@ mod tests {
                 let maintained = maintain_and_snapshot(&mut store, collection, &authority)
                     .await
                     .unwrap();
-                assert!(maintained.contains(secret));
-                assert_eq!(maintained.support(), &support);
+                assert_eq!(maintained.contains(secret), rank9_ready);
+                assert_eq!(maintained.support(), observed.support());
                 assert!(store.acquired.is_empty());
             }
         });
     }
 
+    /// A writer admitted to the source but not to the encodings owes the view
+    /// leaves it cannot publish: its read keeps the resident target, reports
+    /// its own commit as lag and publishes nothing, while explicit
+    /// maintenance still reports the missing producer authority.
     #[test]
     fn ordinary_read_without_write_keeps_resident_target_when_source_is_ahead() {
         pollster::block_on(async {
             let owner = SigningKey::generate(&mut OsRng);
-            let reader = SigningKey::generate(&mut OsRng);
+            let writer = SigningKey::generate(&mut OsRng);
             let mut store = AcquiringStore::default();
             let collection = SecretsCollection::register(
                 &mut store,
@@ -683,27 +699,44 @@ mod tests {
                 .await
                 .unwrap();
             let support = warm.support().clone();
-            let new = add_secret(&mut store, &owner, collection, "new", b"new", at(51)).unwrap();
+            assert!(warm.lag().is_current());
+            grant_collection_write(
+                &mut store,
+                collection.handle(),
+                &owner,
+                writer.verifying_key(),
+            )
+            .unwrap();
+            let new = add_secret(&mut store, &writer, collection, "new", b"new", at(51)).unwrap();
             let before = store.snapshot().unwrap();
             let records_before = before.records().unwrap().count();
             assert!(!collection
                 .succinct()
-                .writer_is_admitted(&before, reader.verifying_key())
+                .writer_is_admitted(&before, writer.verifying_key())
                 .unwrap());
 
-            let observed = ensure_and_snapshot(&mut store, collection, &reader)
+            let observed = ensure_and_snapshot(&mut store, collection, &writer)
                 .await
                 .unwrap();
             assert!(observed.contains(old));
             assert!(!observed.contains(new));
             assert_eq!(observed.support(), &support);
             assert_eq!(
+                observed.lag(),
+                SecretsLag {
+                    succinct: 1,
+                    rank9: 0
+                }
+            );
+            let error = observed.open(new, &writer).unwrap_err().to_string();
+            assert!(error.contains("lags its source"), "{error}");
+            assert_eq!(
                 store.snapshot().unwrap().records().unwrap().count(),
                 records_before,
             );
             assert!(store.acquired.is_empty());
 
-            let error = maintain_and_snapshot(&mut store, collection, &reader)
+            let error = maintain_and_snapshot(&mut store, collection, &writer)
                 .await
                 .err()
                 .expect("explicit maintenance still reports missing producer authority");
@@ -714,8 +747,13 @@ mod tests {
         });
     }
 
+    /// An own commit whose payload nobody can hand over has no leaf. The read
+    /// still attaches what is present; the payload was asked for once and no
+    /// WANT was recorded. Lag is measured against the source commits this
+    /// reader can see, which excludes a payload that is not here, so the
+    /// commit is named by explicit maintenance instead.
     #[test]
-    fn ordinary_read_does_not_hide_missing_payload_errors() {
+    fn ordinary_read_attaches_what_is_present_when_an_own_payload_is_nowhere() {
         pollster::block_on(async {
             let owner = SigningKey::generate(&mut OsRng);
             let mut store = AcquiringStore::default();
@@ -725,23 +763,26 @@ mod tests {
                 direct_policy(owner.verifying_key()),
             )
             .unwrap();
-            let (_, commit, _) =
+            let (secret, commit, _) =
                 detached_secret_commit(collection.source(), &owner, "cold", b"unavailable", at(60));
             store.insert(CollectionRecord::Commit(commit)).unwrap();
 
-            let error = ensure_and_snapshot(&mut store, collection, &owner)
+            let observed = ensure_and_snapshot(&mut store, collection, &owner)
                 .await
-                .err()
-                .expect("a missing blob is not an unauthorized-producer fallback");
-            assert!(matches!(
-                error.downcast_ref::<CollectionRealizationError>(),
-                Some(
-                    CollectionRealizationError::MissingDependency { .. }
-                        | CollectionRealizationError::IncompleteCover { .. }
-                ),
-            ));
+                .unwrap();
+            assert!(!observed.contains(secret));
+            assert!(observed.lag().is_current());
             assert!(store.acquired.contains(&commit.data()));
             assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
+
+            let error = maintain_and_snapshot(&mut store, collection, &owner)
+                .await
+                .err()
+                .expect("explicit maintenance names the own commit it could not derive");
+            assert!(matches!(
+                error.downcast_ref::<CollectionRealizationError>(),
+                Some(CollectionRealizationError::Unmappable { .. }),
+            ));
         });
     }
 
@@ -961,6 +1002,15 @@ mod tests {
             writer.verifying_key(),
         )
         .unwrap();
+        // Admitted to the source, the commit is the writer's to derive: the
+        // owner reads it as lag until the writer may write the encodings too.
+        let admitted = observed(&mut store, collection, &owner);
+        assert!(!admitted.contains(secret));
+        assert_eq!(admitted.lag().succinct, 1);
+        for target in [collection.succinct().handle(), collection.rank9().handle()] {
+            grant_collection_write(&mut store, target, &owner, writer.verifying_key()).unwrap();
+        }
+        drop(observed(&mut store, collection, &writer));
         let after = observed(&mut store, collection, &owner);
         assert_eq!(after.open(secret, &writer).unwrap(), b"offline");
         assert!(

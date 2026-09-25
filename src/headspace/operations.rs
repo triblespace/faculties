@@ -207,22 +207,18 @@ impl Storage {
             )?;
             let secrets_collection =
                 open_secrets_collection_read(pile, self.signer.verifying_key())?;
+            // This key's own leaves and merges are carried into the views;
+            // other writers' commits arrive through their own derivations,
+            // and an own commit neither view can derive is lag.
             let secrets = pollster::block_on(async {
-                drop(
-                    pile.ensure(source, &self.signer)
-                        .await
-                        .context("ensure Headspace source collection")?,
-                );
-                drop(
-                    pile.maintain(collection_succinct, &self.signer)
-                        .await
-                        .context("maintain Headspace fact collection")?,
-                );
-                drop(
-                    pile.maintain(collection_rank9, &self.signer)
-                        .await
-                        .context("maintain Headspace fact collection")?,
-                );
+                crate::storage::tolerate_own_lag(
+                    pile.maintain(collection_succinct, &self.signer).await,
+                )
+                .context("maintain Headspace fact collection")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain(collection_rank9, &self.signer).await,
+                )
+                .context("maintain Headspace fact collection")?;
                 let secrets =
                     secret_storage::ensure_and_snapshot(pile, secrets_collection, &self.signer)
                         .await

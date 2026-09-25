@@ -231,6 +231,7 @@ pub struct WikiSnapshot {
     facts: TribleSet,
     store_snapshot: PileSnapshot,
     latest: LatestIndex,
+    latest_lag: usize,
     catalog: WikiCatalog,
 }
 
@@ -245,6 +246,14 @@ impl WikiSnapshot {
 
     pub fn latest(&self) -> &LatestIndex {
         &self.latest
+    }
+
+    /// Source commits the supersession index had not derived yet when this
+    /// snapshot was taken. Each writer derives its own revisions, so another
+    /// writer's revision can be in the facts before it is in the index; the
+    /// index is read as it stands.
+    pub fn latest_lag(&self) -> usize {
+        self.latest_lag
     }
 
     pub fn catalog(&self) -> &WikiCatalog {
@@ -1672,12 +1681,13 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
 /// Strictly project and validate a complete Wiki snapshot.
 ///
 /// This remains an explicit migration/import boundary for callers that need a
-/// closed-world diagnostic oracle. It is deliberately not the ordinary query
-/// path; normal commands use [`query_snapshot`] and query its [`FactArchive`]
-/// directly. Because it is an import's preparation and not a read, it ensures
-/// the Wiki's derived views first, so the supersession index it validates
-/// stands for every admitted revision a signer admitted to it can image; a
-/// signer who cannot is told so by the support check, never guessed around.
+/// closed-world diagnostic oracle over the facts. It is deliberately not the
+/// ordinary query path; normal commands use [`query_snapshot`] and query its
+/// [`FactArchive`] directly. Because it is an import's preparation and not a
+/// read, it first derives the signer's own revisions into the Wiki's views.
+/// Other writers' revisions reach the supersession index when they derive
+/// them; until then the index lags the facts, and the snapshot says by how
+/// much ([`WikiSnapshot::latest_lag`]) instead of refusing.
 pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -1695,14 +1705,18 @@ pub async fn materialize_indexed_collection(
             .context("ensure the Wiki views before materializing")?,
     );
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let (facts, cover) = crate::storage::read_fact_collection(collection, &store_snapshot)
-        .context("read Wiki collection")?;
+    let source = store_snapshot
+        .collection(collection)
+        .context("attach Wiki collection")?;
+    let facts = source.view::<TribleSet>().context("read Wiki collection")?;
     let latest = store_snapshot
         .collection(target)
         .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?;
-    if latest.support().map_err(|error| anyhow!("{error}"))? != &cover {
-        bail!("Wiki supersession index stands on a different support than the facts read");
-    }
+    let latest_lag = latest
+        .missing_from(&source)
+        .map_err(|error| anyhow!("compare the Wiki supersession index with its source: {error}"))?
+        .len();
+    drop(source);
     let latest = latest
         .view::<LatestIndex>()
         .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
@@ -1713,6 +1727,7 @@ pub async fn materialize_indexed_collection(
         facts,
         store_snapshot,
         latest,
+        latest_lag,
         catalog,
     })
 }
@@ -1938,9 +1953,12 @@ mod tests {
                 .view::<TribleSet>()
                 .unwrap();
             let current = snapshot.collection(target).unwrap();
-            assert_ne!(
-                current.support().unwrap(),
-                snapshot.collection(source).unwrap().support().unwrap()
+            assert_eq!(
+                current
+                    .missing_from(&snapshot.collection(source).unwrap())
+                    .unwrap()
+                    .len(),
+                1
             );
             let current = current.view::<LatestIndex>().unwrap();
             assert_eq!(

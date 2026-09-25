@@ -398,13 +398,15 @@ mod tests {
         let second_resource = resource_of(second);
         assert_ne!(first_resource, second_resource);
 
-        grant_collection_write(
-            &mut store,
+        // The attacker may write the source and, so that its commit reaches
+        // the views it derives for itself, their encodings.
+        for target in [
             collection.handle(),
-            &alice,
-            attacker.verifying_key(),
-        )
-        .unwrap();
+            collection.succinct().handle(),
+            collection.rank9().handle(),
+        ] {
+            grant_collection_write(&mut store, target, &alice, attacker.verifying_key()).unwrap();
+        }
         // The attacker knows neither genuine DEK. Their own valid body and
         // envelope bind S1 to R2, exploiting public-key sealing rather than
         // forging an authenticator or substituting an immutable descriptor.
@@ -429,6 +431,12 @@ mod tests {
         store
             .commit(collection.source(), &attacker, attack)
             .unwrap();
+        drop(
+            pollster::block_on(storage::ensure_and_snapshot(
+                &mut store, collection, &attacker,
+            ))
+            .unwrap(),
+        );
         let selected =
             pollster::block_on(storage::ensure_and_snapshot(&mut store, collection, &alice))
                 .unwrap();

@@ -255,14 +255,6 @@ struct CompassStorage<'a> {
     storage: &'a Storage,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Preparation {
-    /// Append an event referring only to entities in the resident view.
-    Resident,
-    /// Preserve complete-source checks for priority-graph changes.
-    Complete,
-}
-
 impl CompassStorage<'_> {
     fn with_pile<T>(
         &self,
@@ -307,7 +299,6 @@ impl CompassStorage<'_> {
     /// be repeated by a missing attachment. `None` is a genuine no-op.
     fn update<P, T>(
         &self,
-        preparation: Preparation,
         persona: Option<&str>,
         mut prepare: impl FnMut(&FactArchive, &PileSnapshot, Option<Id>) -> Result<P>,
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
@@ -331,7 +322,7 @@ impl CompassStorage<'_> {
             let compass_rank9 = pile
                 .derive::<Rank9AcceleratedSuccinctArchiveBlob>(compass_succinct, (), compass_policy)
                 .context("register Compass Rank9 collection")?;
-            let relation_collections = if persona.is_some() {
+            let relations_rank9 = if persona.is_some() {
                 if let Some(handle) = configured_handle(RELATIONS_SCOPE_ID)? {
                     let reader = pile
                         .snapshot()
@@ -354,34 +345,17 @@ impl CompassStorage<'_> {
                 let rank9 = pile
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                     .context("register Relations Rank9 collection")?;
-                Some((source, succinct, rank9))
+                Some(rank9)
             } else {
                 None
             };
 
-            runtime.block_on(async {
-                if preparation == Preparation::Complete {
-                    drop(
-                        pile.ensure(compass_source, signer)
-                            .await
-                            .context("ensure Compass source collection")?,
-                    );
-                    if let Some((source, _, _)) = relation_collections {
-                        drop(
-                            pile.ensure(source, signer).await.context(
-                                "ensure Relations source collection for Compass persona",
-                            )?,
-                        );
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            })?;
-            // Attach every view through one immutable post-maintenance store
-            // boundary, so validation and persona resolution cannot mix
-            // collection watermarks.
+            // Attach every view through one immutable store boundary, so
+            // validation and persona resolution cannot mix collection
+            // watermarks.
             let reader = pile
                 .snapshot()
-                .context("freeze maintained Compass/Relations snapshot")?;
+                .context("freeze resident Compass/Relations snapshot")?;
             // No read refuses for being behind. There is no globally
             // consistent state to be behind of: another node holds commits
             // this one has never seen, so "stands for every admitted commit"
@@ -394,7 +368,7 @@ impl CompassStorage<'_> {
                 .context("observe Compass fact collection")?
                 .view::<FactArchive>()
                 .context("read Compass fact collection")?;
-            let by = if let (Some(persona), Some((_, _, rank9))) = (persona, relation_collections) {
+            let by = if let (Some(persona), Some(rank9)) = (persona, relations_rank9) {
                 let relations = reader
                     .collection(rank9)
                     .context("observe Relations fact collection for Compass persona")?
@@ -841,7 +815,6 @@ fn add_goal(
     let status = compass::canonical_status(status)?;
     let tags = compass::canonical_tags(tags)?;
     storage.update(
-        Preparation::Resident,
         persona,
         |space, _reader, by_id| {
             let parent_id = parent
@@ -911,7 +884,6 @@ fn move_goal(
     let status = compass::canonical_status(status)?;
     let rendered_status = status.clone();
     storage.update(
-        Preparation::Resident,
         persona,
         |space, _reader, by_id| Ok((resolve_task_id(&id, space)?, by_id)),
         |(task_id, by_id)| {
@@ -952,7 +924,6 @@ fn add_note(
     references.dedup();
 
     storage.update(
-        Preparation::Resident,
         persona,
         |space, _reader, by_id| {
             let task_id = resolve_task_id(&id, space)?;
@@ -1153,7 +1124,6 @@ fn prioritize(
     lower_input: String,
 ) -> Result<PriorityChange> {
     storage.update(
-        Preparation::Complete,
         None,
         |space, reader, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;
@@ -1209,7 +1179,6 @@ fn deprioritize(
     lower_input: String,
 ) -> Result<PriorityChange> {
     storage.update(
-        Preparation::Complete,
         None,
         |space, reader, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;

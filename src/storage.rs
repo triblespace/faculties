@@ -14,11 +14,16 @@
 //! - **Publication and discovery.** [`publish_fragment`] / [`publish_fragments`]
 //!   commit whole fragments into one scoped collection; [`discover_target`]
 //!   reports what a scope already holds.
-//! - **Derived upkeep.** A write calls [`ensure_downstream`] after its commit so
-//!   the commit is readable through every view derived from its collection,
-//!   found from the store's own listing rather than a list kept per faculty;
-//!   the maintenance daemon, or [`carry_facts`] standing in for it, calls
-//!   [`maintain_downstream`] to carry those views to their fixed points.
+//! - **Derived upkeep.** Maintenance is "derive what you wrote": a signer
+//!   derives the leaves of its own commits and mirrors its own merges, and
+//!   nobody derives anyone else's. A write calls [`ensure_downstream`] after
+//!   its commit so the commit is readable through every view derived from its
+//!   collection, found from the store's own listing rather than a list kept
+//!   per faculty; the maintenance daemon, or [`carry_facts`] standing in for
+//!   it, calls [`maintain_downstream`] to mirror the signer's own merges too.
+//!   A view that has not caught up with its source lags, and a read reports
+//!   that ([`FactLag`]) instead of refusing: there is no globally consistent
+//!   state to be current against.
 //!
 //! This module was carved out of the storage cutover, which is where these
 //! primitives were first written. The cutover itself now lives in the separate
@@ -535,6 +540,89 @@ where
         .view::<TribleSet>()
         .context("read authorized collection facts")?;
     Ok((facts, support))
+}
+
+/// How far a Succinct and Rank9 fact pair lags its source in one store
+/// snapshot, hop by hop: source commits the Succinct view has no leaf for,
+/// and Succinct images the Rank9 view has none for.
+///
+/// Each writer derives what it wrote, so a lagging hop is someone's
+/// derivation still to come or still to arrive by sync. There is no globally
+/// consistent state to be current against: a read attaches what is present
+/// and reports this, it never waits or refuses. Each hop is measured by
+/// [`missing_from`](triblespace::core::collection::CollectionSnapshot::missing_from)
+/// against what the snapshot can read of the hop below, so a source commit
+/// whose payload is not here is not counted. Two collections' supports are
+/// never compared.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FactLag {
+    /// Source commits without a Succinct leaf.
+    pub succinct: usize,
+    /// Succinct images without a Rank9 leaf.
+    pub rank9: usize,
+}
+
+impl FactLag {
+    /// Measure the pair registered over `source` in `snapshot`.
+    pub fn of<R>(
+        snapshot: &R,
+        source: Collection<SimpleArchive>,
+        succinct: Collection<SuccinctArchiveBlob>,
+        rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    ) -> Result<Self>
+    where
+        R: StoreRead,
+    {
+        let source = snapshot
+            .collection(source)
+            .context("attach the fact source")?;
+        let succinct = snapshot
+            .collection(succinct)
+            .context("attach the Succinct fact view")?;
+        let rank9 = snapshot
+            .collection(rank9)
+            .context("attach the Rank9 fact view")?;
+        Ok(Self {
+            succinct: succinct
+                .missing_from(&source)
+                .context("compare the Succinct leaves with the source")?
+                .len(),
+            rank9: rank9
+                .missing_from(&succinct)
+                .context("compare the Rank9 leaves with the Succinct view")?
+                .len(),
+        })
+    }
+
+    /// Whether every source commit the snapshot can read has reached Rank9.
+    pub const fn is_current(self) -> bool {
+        self.succinct == 0 && self.rank9 == 0
+    }
+}
+
+impl std::fmt::Display for FactLag {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} source commit(s) not yet derived into Succinct, {} Succinct image(s) not yet derived into Rank9",
+            self.succinct, self.rank9
+        )
+    }
+}
+
+/// Settle one read-path upkeep result: a signer's own foundation the mapping
+/// could not derive ([`CollectionRealizationError::Unmappable`]) is lag, not
+/// failure. That error is raised only after everything else was derived and
+/// mirrored, so the view is as current as it can be and a read attaches what
+/// is present; explicit maintenance, the daemon's included, still names the
+/// foundation. Every other error is returned unchanged.
+pub fn tolerate_own_lag<T>(
+    result: std::result::Result<T, CollectionRealizationError>,
+) -> std::result::Result<(), CollectionRealizationError> {
+    match result {
+        Ok(_) | Err(CollectionRealizationError::Unmappable { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Resolve the durable signer path for a pile without touching the filesystem.
@@ -1353,10 +1441,11 @@ pub(crate) fn discovered_records<S: triblespace::core::collection::CollectionRea
     Ok(discovered)
 }
 
-/// What the maintenance worker does between a write and a read: carry every
-/// collection derived from `source` to its fixed point, as the daemon would.
-/// Reads attach what was carried and never maintain, so a test or a tool
-/// that writes and then reads calls this to stand in for the worker.
+/// What the maintenance worker does between a write and a read for the
+/// signer: derive its leaves and mirror its merges into every collection
+/// derived from `source`, as the daemon would. Reads attach what was carried
+/// and never maintain, so a test or a tool that writes and then reads calls
+/// this to stand in for the worker.
 pub fn carry_facts<S>(pile: &mut S, source: Collection<SimpleArchive>, signer: &SigningKey)
 where
     S: Store + AsyncBlobStoreAcquire + Send,
@@ -1370,6 +1459,12 @@ where
 /// know, such as the Files semantic index without its model or the Archive's
 /// own BM25 mapping, is named in the report and left to whoever registered
 /// it; nothing is guessed at.
+///
+/// A target that could derive everything of the signer's except some own
+/// foundations the mapping cannot represent, such as a commit whose payload
+/// is not here, counts as realized: those foundations are its lag
+/// ([`tolerate_own_lag`]), and the pass goes on to every other derived
+/// collection instead of stopping at the first one that lags.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FacultiesRealizer;
 
@@ -1384,15 +1479,20 @@ where
         signer: &SigningKey,
         upkeep: Upkeep,
     ) -> Result<Realized, CollectionRealizationError> {
-        if derived.representation == <PortableBM25Blob as MetaDescribe>::id() {
-            return realize_as::<S, PortableBM25Blob>(store, derived, signer, upkeep).await;
+        let realized = if derived.representation == <PortableBM25Blob as MetaDescribe>::id() {
+            realize_as::<S, PortableBM25Blob>(store, derived, signer, upkeep).await
+        } else {
+            CoreRealizer.realize(store, derived, signer, upkeep).await
+        };
+        match realized {
+            Err(CollectionRealizationError::Unmappable { .. }) => Ok(Realized::Done),
+            realized => realized,
         }
-        CoreRealizer.realize(store, derived, signer, upkeep).await
     }
 }
 
 /// Register the Succinct and Rank9 pair every faculty source is read through.
-fn fact_pair<S>(
+pub fn fact_pair<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
 ) -> Result<(
@@ -1420,8 +1520,10 @@ where
 ///
 /// A derived collection joins a store's listing with its first record, and
 /// until then no pass over what derives from its source can find it. So
-/// whoever registers one realizes it right then, for the commits already
-/// there; from then on every write's [`ensure_downstream`] finds it. `source` is
+/// whoever registers one derives its own leaves right then, for the commits
+/// it already wrote; from then on every write's [`ensure_downstream`] finds
+/// it. A signer that owns nothing in the source publishes nothing, and the
+/// collection stays unlisted until some writer derives into it. `source` is
 /// the collection `target` derives from. Costs one listing when the target
 /// is already listed, which is every time but the first.
 pub async fn seed_derived<S, T>(
@@ -1459,11 +1561,14 @@ where
 
 /// What a write does after its commit into `source`: register the Succinct
 /// and Rank9 pair over it, seed them if the store does not list them yet,
-/// then realize the missing images of every collection derived from
-/// `source`, transitively, so the write is readable through every view. No
-/// merge is published; the maintenance daemon carries the leaves to their
-/// fixed points later. The first call over a source with a backlog pays for
-/// that backlog, and that is the price of the first call.
+/// then derive the signer's own missing leaves into every collection derived
+/// from `source`, transitively, so what the signer wrote is readable through
+/// every view. Other writers' commits are theirs to derive. No merge is
+/// published; the maintenance daemon mirrors the signer's own merges later.
+/// Each call walks every view's source foundations once (an ownership check
+/// each, and a locator lookup for each own one), plus the images of whatever
+/// is still owed. A view that lags on an own foundation the mapping cannot
+/// derive does not stop the pass ([`FacultiesRealizer`]).
 pub async fn ensure_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
@@ -1480,9 +1585,10 @@ where
         .map_err(|error| anyhow!("ensure the collections derived from the source: {error}"))
 }
 
-/// Carry every collection derived from `source` to its fixed point, each
-/// after its own source, as the maintenance daemon does. The pair is
-/// registered and seeded first, like [`ensure_downstream`].
+/// Derive the signer's own leaves into every collection derived from
+/// `source` and mirror its own source merges there, each after its own
+/// source, as the maintenance daemon does. The pair is registered and seeded
+/// first, like [`ensure_downstream`].
 pub async fn maintain_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,

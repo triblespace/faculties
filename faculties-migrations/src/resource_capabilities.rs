@@ -441,7 +441,7 @@ mod tests {
     use faculties::storage::initialize_signer;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::collection::{
-        read_capability, write_capability, CollectionDerive, CollectionMerge,
+        read_capability, write_capability, CollectionDerive, CollectionMerge, SourceLocator,
     };
     use triblespace::core::id::fucid;
     use triblespace::core::repo::{BlobStorePut, CapabilityProofRead};
@@ -524,18 +524,20 @@ mod tests {
         let source = sparse_commit(&signer, old, 0x51);
         let mut pile = open_pile_strict(&path).unwrap();
         pile.insert(CollectionRecord::Commit(source)).unwrap();
-        pile.insert(CollectionRecord::Merge(CollectionMerge::sign(
-            &signer,
-            old,
-            source.data(),
-            source.data(),
-            source.data(),
-        )))
+        pile.insert(CollectionRecord::Merge(
+            CollectionMerge::sign(
+                &signer,
+                old,
+                [source.data(), Inline::new([3; 32])],
+                source.data(),
+            )
+            .unwrap(),
+        ))
         .unwrap();
         pile.insert(CollectionRecord::Derive(CollectionDerive::sign(
             &signer,
             old,
-            source.data(),
+            SourceLocator::of(source.data().raw),
             Inline::new([5; 32]),
         )))
         .unwrap();

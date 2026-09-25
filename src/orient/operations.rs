@@ -256,6 +256,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::observed_store::{DependencyTracker, ObservedStore};
+#[cfg(test)]
 use triblespace::core::collection::Support;
 use triblespace::core::collection::{
     Collection, CollectionEncoding, CollectionRealizationError, CollectionSnapshot,
@@ -660,17 +661,15 @@ impl OrientSource {
         self.maintain_local(pile, signer).await
     }
 
+    /// Derive this key's own leaves and mirror its own merges, Succinct
+    /// first. An own commit neither hop could derive is the view's lag, and
+    /// the observation reads what is present
+    /// ([`crate::storage::tolerate_own_lag`]).
     async fn maintain_local(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
-        drop(
-            pile.maintain(self.succinct, signer)
-                .await
-                .with_context(|| format!("maintain {} Succinct collection", self.label))?,
-        );
-        drop(
-            pile.maintain(self.rank9, signer)
-                .await
-                .with_context(|| format!("maintain {} Rank9 collection", self.label))?,
-        );
+        crate::storage::tolerate_own_lag(pile.maintain(self.succinct, signer).await)
+            .with_context(|| format!("maintain {} Succinct collection", self.label))?;
+        crate::storage::tolerate_own_lag(pile.maintain(self.rank9, signer).await)
+            .with_context(|| format!("maintain {} Rank9 collection", self.label))?;
         Ok(())
     }
 
@@ -751,17 +750,14 @@ impl ReceiptSource {
             return Ok(());
         }
         // Both hops, in order: the Rank9 derives from the Succinct, so
-        // refreshing only the tip leaves it reading a stale intermediate.
-        drop(
-            pile.maintain(self.succinct, signer)
-                .await
-                .context("maintain Orient receipt Succinct collection")?,
-        );
-        drop(
-            pile.maintain(self.rank9, signer)
-                .await
-                .context("maintain Orient receipt Rank9 collection")?,
-        );
+        // refreshing only the tip leaves it reading a stale intermediate. An
+        // own historical receipt whose payload is not here is lag: the new
+        // receipts are derived all the same, and readers take the resident
+        // set.
+        crate::storage::tolerate_own_lag(pile.maintain(self.succinct, signer).await)
+            .context("maintain Orient receipt Succinct collection")?;
+        crate::storage::tolerate_own_lag(pile.maintain(self.rank9, signer).await)
+            .context("maintain Orient receipt Rank9 collection")?;
         Ok(())
     }
 }
@@ -879,7 +875,7 @@ struct OrientFact {
 
 impl OrientFact {
     #[cfg(test)]
-    fn support(&self) -> &Support {
+    fn support(&self) -> &Support<Rank9AcceleratedSuccinctArchiveBlob> {
         self.collection.support().expect("explicit fixture support")
     }
 
@@ -998,11 +994,8 @@ async fn maintain_inputs(
         .writer_is_admitted(&pile.snapshot()?, signer.verifying_key())
         .context("check Compass status WRITE admission")?
     {
-        drop(
-            pile.maintain(sources.compass_status, signer)
-                .await
-                .context("maintain Compass status register")?,
-        );
+        crate::storage::tolerate_own_lag(pile.maintain(sources.compass_status, signer).await)
+            .context("maintain Compass status register")?;
     }
     Ok(())
 }
@@ -1116,6 +1109,10 @@ fn is_payload_pending(error: &anyhow::Error) -> bool {
 
 /// An unavailable observation may be retried; authority, malformed descriptors,
 /// contradictory equations, and other storage failures are not availability.
+/// A blob to wait for (`MissingDependency`, or a root that cannot yet stand
+/// on its admitted commits) is pending. An own foundation left without a leaf
+/// (`Unmappable`) is not: upkeep treats it as lag and never returns it
+/// ([`crate::storage::tolerate_own_lag`]), and waiting would not change it.
 fn is_preparation_pending(error: &anyhow::Error) -> bool {
     error.chain().any(|source| {
         source.downcast_ref::<MissingBlob>().is_some()
@@ -5442,9 +5439,12 @@ mod tests {
             assert!(report.contains("Beliefs (cover):"));
             assert!(report.contains("a resident goal for this wake"));
 
-            // The accepted overview still publishes its shown goal receipt.
-            // Making that new receipt visible does not fetch the historical
-            // gap; all ordinary receipt readers accept the resident set.
+            // The accepted overview still publishes its shown goal receipt,
+            // and making it visible does not depend on the historical gap:
+            // all ordinary receipt readers accept the resident set. The gap is
+            // this signer's own receipt, so under "derive what you wrote" the
+            // projection asks once for its payload; nothing arrives, no WANT
+            // is recorded, and the gap stays lag.
             sources
                 .presentations
                 .maintain(&mut pile, &fixture.signer)
@@ -5463,7 +5463,7 @@ mod tests {
                 .contains(goal_id));
             assert!(!snapshot.contains_blob(cold.get_handle()).unwrap());
             assert!(snapshot.wants().unwrap().next().is_none());
-            assert!(pile.health().started_at.is_none());
+            assert!(pile.health().started_at.is_some());
             pile.close().unwrap();
         });
     }
@@ -5882,6 +5882,12 @@ mod tests {
             CollectionRealizationError::InvalidCover("bad support".to_owned()),
             CollectionRealizationError::Resolution("conflicting equations".to_owned()),
             CollectionRealizationError::Stalled { cover: Vec::new() },
+            CollectionRealizationError::Unmappable {
+                blocked: vec![(member, "capacity".to_owned())],
+            },
+            CollectionRealizationError::UnauthorizedProducer {
+                collection: triblespace::core::inline::Inline::new([74; 32]),
+            },
         ] {
             assert!(!is_preparation_pending(&error.into()));
         }
@@ -7068,11 +7074,12 @@ mod tests {
                 .await
                 .unwrap();
             let lagging = observe_sources(snapshot, &sources).unwrap();
-            let status_support = lagging.snapshot.collection(sources.compass_status).unwrap();
-            assert_ne!(
-                lagging.facts.compass.support(),
-                status_support.support().unwrap()
-            );
+            // The facts derived the new commit; the status register lags the
+            // source by it and is read as it stands.
+            let compass_source = lagging.snapshot.collection(sources.compass.source).unwrap();
+            let status = lagging.snapshot.collection(sources.compass_status).unwrap();
+            assert_eq!(status.missing_from(&compass_source).unwrap().len(), 1);
+            drop((compass_source, status));
             let query = lagging.query(&lagging.snapshot);
             assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
             assert_eq!(latest_goal_status(&query, unseen_goal), None);
@@ -7129,7 +7136,7 @@ mod tests {
             .unwrap();
         let watermark = pile.snapshot().unwrap();
         let expected_support = watermark
-            .collection(sources.messages.source)
+            .collection(sources.messages.rank9)
             .unwrap()
             .support()
             .unwrap()

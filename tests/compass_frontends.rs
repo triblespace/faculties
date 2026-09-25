@@ -371,9 +371,38 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
     let after = after_priority;
     assert_eq!(records(), after);
 
-    // The worker carries the writer's appended actions; only now do the
-    // owner's reads, and the writer's prefix resolution, see them.
+    // The owner's worker derives only what the owner wrote: the writer's
+    // appended actions are the views' lag, and the owner's reads do not see
+    // them yet.
     fixture.carry();
+    let listing = fixture
+        .operations()
+        .list(ListOptions {
+            all: true,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(!listing.contains("appended child"));
+
+    // Once the writer may write the views, a worker running with its key
+    // derives its own actions; only now do the owner's reads, and the
+    // writer's prefix resolution, see them.
+    {
+        let mut pile = Pile::open(&fixture.pile).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        for target in [succinct.handle(), rank9.handle(), status.handle()] {
+            grant_collection_write(&mut pile, target, &owner, writer.verifying_key()).unwrap();
+        }
+        carry_facts(&mut pile, source, &writer);
+        pollster::block_on(async { drop(pile.maintain(status, &writer).await.unwrap()) });
+        pile.close().unwrap();
+    }
     let listing = fixture
         .operations()
         .list(ListOptions {

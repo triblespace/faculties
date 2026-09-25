@@ -1101,7 +1101,14 @@ fn run_search(
     limit: usize,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let (observed, index) = archive_collection::ensure_search_local_with_storage(storage.storage)?;
+    let (observed, index, lag) =
+        archive_collection::ensure_search_local_with_storage(storage.storage)?;
+    if !lag.is_current() {
+        out.line(format!(
+            "note: searching what is present; facts: {}; index: {} source commit(s) not yet derived",
+            lag.facts, lag.index,
+        ))?;
+    }
     let facts = observed.view::<FactArchive>()?;
     let query = index.query().context("prepare Archive BM25 query")?;
     for (document, score) in query
@@ -1129,19 +1136,17 @@ fn run_search(
 }
 
 fn run_index(storage: ArchiveStorage<'_>, out: &mut Out<'_>) -> Result<()> {
-    let observed = archive_collection::ensure_local_with_storage(storage.storage)?;
-    let source_elements = observed
-        .support()
-        .context("resolve indexed Archive support")?
-        .len();
+    let facts = archive_collection::ensure_succinct_index_with_storage(storage.storage)?;
     let bm25 = archive_collection::ensure_bm25_index_with_storage(storage.storage)?;
     out.line(format!(
-        "Archive: {} distinct source element(s) covered by accelerated-Succinct",
-        source_elements,
+        "Archive: {} distinct source element(s); accelerated-Succinct lag: {}",
+        facts.source_elements, facts.lag,
     ))?;
     out.line(format!(
-        "Archive BM25: {} distinct source element(s), {} resident cover segment(s)",
-        bm25.source_elements, bm25.cover_segments,
+        "Archive BM25: {} of {} distinct source element(s) derived, {} resident cover segment(s)",
+        bm25.source_elements.saturating_sub(bm25.lagging),
+        bm25.source_elements,
+        bm25.cover_segments,
     ))?;
     Ok(())
 }
@@ -1367,8 +1372,9 @@ mod tests {
     /// How many root payloads the archive stands on: one per imported
     /// source, none more for a repeated or refused import.
     fn archive_root_payloads(fixture: &Fixture) -> usize {
-        let observed = storage(fixture).load().unwrap();
-        observed.support().unwrap().len()
+        archive_collection::ensure_succinct_index_with_storage(&fixture.storage)
+            .unwrap()
+            .source_elements
     }
 
     fn projection_ids(facts: &FactArchive) -> Vec<Id> {

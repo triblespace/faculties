@@ -341,24 +341,12 @@ impl Storage {
                     pile.derive::<SuccinctArchiveBlob>(relations_collection, (), policy.clone())?;
                 let relations_rank9 =
                     pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
-                // Acquire the sources' commits, then attach the views as they
-                // stand through the same final target snapshot as the
-                // configured Secrets view. A read never maintains; a write
-                // ensures its own images after its commit.
+                // Attach the views as they stand through the same final
+                // target snapshot as the configured Secrets view. A read
+                // never maintains and never waits for a source commit nobody
+                // has derived yet; a write ensures its own leaves after its
+                // commit.
                 let secrets = pollster::block_on(async {
-                    for (label, source) in [
-                        ("Mail", mail_collection),
-                        ("Files", files_collection),
-                        ("Decide", decide_collection),
-                        ("Relations", relations_collection),
-                    ] {
-                        drop(
-                            pile.ensure(source, &self.signer)
-                                .await
-                                .with_context(|| format!("ensure {label} source collection"))?,
-                        );
-                    }
-
                     let secrets = secret_storage::ensure_and_snapshot(
                         pile,
                         secrets_collection,

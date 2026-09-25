@@ -433,29 +433,25 @@ impl MemoryStorage<'_> {
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                     .context("register Rank9 Memory collection")?;
                 // Read the resident target, not a complete historical root.
-                // Each authorized hop may catch up from its resident source;
-                // another producer's already-maintained view needs no WRITE.
+                // Each authorized hop derives this key's own commits; one it
+                // cannot derive, such as a payload that is not here, is lag,
+                // and the read attaches what is present. Another producer's
+                // already-maintained view needs no WRITE.
                 let admission = pile.snapshot().context("freeze Memory WRITE admission")?;
                 let subject = signer.verifying_key();
                 if succinct
                     .writer_is_admitted(&admission, subject)
                     .context("check Succinct Memory WRITE admission")?
                 {
-                    drop(
-                        pile.maintain(succinct, signer)
-                            .await
-                            .context("maintain Succinct Memory collection")?,
-                    );
+                    crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+                        .context("maintain Succinct Memory collection")?;
                 }
                 if collection
                     .writer_is_admitted(&admission, subject)
                     .context("check Rank9 Memory WRITE admission")?
                 {
-                    drop(
-                        pile.maintain(collection, signer)
-                            .await
-                            .context("maintain Rank9 Memory collection")?,
-                    );
+                    crate::storage::tolerate_own_lag(pile.maintain(collection, signer).await)
+                        .context("maintain Rank9 Memory collection")?;
                 }
                 let store_snapshot = pile
                     .snapshot()
@@ -524,21 +520,15 @@ impl MemoryStorage<'_> {
                         .writer_is_admitted(&admission, subject)
                         .with_context(|| format!("check Succinct {label} WRITE admission"))?
                     {
-                        drop(
-                            pile.maintain(succinct, signer)
-                                .await
-                                .with_context(|| format!("maintain Succinct {label} collection"))?,
-                        );
+                        crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+                            .with_context(|| format!("maintain Succinct {label} collection"))?;
                     }
                     if rank9
                         .writer_is_admitted(&admission, subject)
                         .with_context(|| format!("check Rank9 {label} WRITE admission"))?
                     {
-                        drop(
-                            pile.maintain(rank9, signer)
-                                .await
-                                .with_context(|| format!("maintain Rank9 {label} collection"))?,
-                        );
+                        crate::storage::tolerate_own_lag(pile.maintain(rank9, signer).await)
+                            .with_context(|| format!("maintain Rank9 {label} collection"))?;
                     }
                 }
                 let store_snapshot = pile
@@ -589,21 +579,17 @@ impl MemoryStorage<'_> {
                     .writer_is_admitted(&admission, subject)
                     .context("check Succinct Memory WRITE admission")?
                 {
-                    drop(
-                        pile.maintain(memory_succinct, signer)
-                            .await
-                            .context("maintain Succinct Memory collection")?,
-                    );
+                    crate::storage::tolerate_own_lag(pile.maintain(memory_succinct, signer).await)
+                        .context("maintain Succinct Memory collection")?;
                 }
                 if memory_collection
                     .writer_is_admitted(&admission, subject)
                     .context("check Rank9 Memory WRITE admission")?
                 {
-                    drop(
-                        pile.maintain(memory_collection, signer)
-                            .await
-                            .context("maintain Rank9 Memory collection")?,
-                    );
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain(memory_collection, signer).await,
+                    )
+                    .context("maintain Rank9 Memory collection")?;
                 }
                 let store_snapshot = pile
                     .snapshot()
@@ -706,21 +692,15 @@ impl MemoryStorage<'_> {
                         .writer_is_admitted(&admission, subject)
                         .with_context(|| format!("check Succinct {label} WRITE admission"))?
                     {
-                        drop(
-                            pile.maintain(succinct, signer)
-                                .await
-                                .with_context(|| format!("maintain Succinct {label} collection"))?,
-                        );
+                        crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+                            .with_context(|| format!("maintain Succinct {label} collection"))?;
                     }
                     if collection
                         .writer_is_admitted(&admission, subject)
                         .with_context(|| format!("check Rank9 {label} WRITE admission"))?
                     {
-                        drop(
-                            pile.maintain(collection, signer)
-                                .await
-                                .with_context(|| format!("maintain Rank9 {label} collection"))?,
-                        );
+                        crate::storage::tolerate_own_lag(pile.maintain(collection, signer).await)
+                            .with_context(|| format!("maintain Rank9 {label} collection"))?;
                     }
                 }
                 let store_snapshot = pile

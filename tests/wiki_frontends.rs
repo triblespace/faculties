@@ -613,14 +613,33 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
     let after = after_edit;
     assert_eq!(records(), after);
 
-    // The worker carries the writer's source commits; only then does the
-    // owner's read see them, since a read attaches and never maintains.
+    // The owner's worker derives only what the owner wrote, so the writer's
+    // source commits stay the views' lag and the owner's read does not see
+    // them: a read attaches and never maintains.
     faculties::storage::carry_scope(
         &fixture.pile,
         Some(&fixture.key),
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
     )
     .unwrap();
+    let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
+    assert!(!listing.contains("imported by source writer"));
+
+    // Once the writer may write the views, a worker running with its key
+    // derives its own commits, and only then does the owner's read see them.
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+    let succinct = pile
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let rank9 = pile
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .unwrap();
+    for target in [succinct.handle(), rank9.handle(), latest.handle()] {
+        grant_collection_write(&mut pile, target, &owner, writer.verifying_key()).unwrap();
+    }
+    faculties::storage::carry_facts(&mut pile, source, &writer);
+    pile.close().unwrap();
     let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
     assert!(listing.contains("source writer"));
     assert!(listing.contains("imported by source writer"));

@@ -81,14 +81,16 @@ impl HealthSources {
                 if !source.can_maintain(&snapshot, signer)? {
                     continue;
                 }
-                drop(local.maintain(source.succinct, signer).await?);
-                drop(local.maintain(source.rank9, signer).await?);
+                // An own report neither hop could derive is lag; the
+                // report reads what is present.
+                crate::storage::tolerate_own_lag(local.maintain(source.succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(local.maintain(source.rank9, signer).await)?;
             }
             if self
                 .latest
                 .writer_is_admitted(&snapshot, signer.verifying_key())?
             {
-                drop(local.maintain(self.latest, signer).await?);
+                crate::storage::tolerate_own_lag(local.maintain(self.latest, signer).await)?;
             }
             // As on the ordinary Orient path, receipt freshness avoids a
             // repeat but is not a precondition of reporting resident health.
@@ -1958,11 +1960,26 @@ mod tests {
                 );
             });
         }
-        let lagging = f.sources.at(f.store.snapshot().unwrap(), at(11.0)).unwrap();
-        assert_ne!(
-            lagging.facts.collection.support().unwrap(),
-            lagging.latest_collection.support().unwrap(),
+        let snapshot = f.store.snapshot().unwrap();
+        let lagging = f.sources.at(snapshot.clone(), at(11.0)).unwrap();
+        // The facts derived the new report; the winners register lags the
+        // source by it and is read as it stands.
+        let health = snapshot.collection(f.sources.health.source).unwrap();
+        assert!(lagging
+            .facts
+            .collection
+            .missing_from(&snapshot.collection(f.sources.health.succinct).unwrap())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            lagging
+                .latest_collection
+                .missing_from(&health)
+                .unwrap()
+                .len(),
+            1
         );
+        drop(health);
         assert_eq!(lagging.report().attention, first.attention);
         assert!(f
             .observe_at(at(11.0))

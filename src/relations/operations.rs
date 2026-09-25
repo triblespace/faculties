@@ -1211,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn non_writer_reads_resident_relations_without_hiding_pending_updates_from_writers() {
+    fn non_writer_reads_and_prepares_on_resident_relations_while_pending_updates_lag() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = open_store(file.path()).unwrap();
         let runtime = Arc::new(runtime().unwrap());
@@ -1284,21 +1284,25 @@ mod tests {
             before
         );
 
+        // Preparation derives only what the preparer wrote. A non-writer owns
+        // nothing here, so it publishes nothing and prepares on the resident
+        // view, where the owner's pending person is lag, not hidden: the
+        // freshness of the views names it.
         let mut mutation_prepared = false;
-        let error = with_relations_view(&mut pile, &reader, &runtime, source, false, |_| {
+        with_relations_view(&mut pile, &reader, &runtime, source, false, |storage| {
             mutation_prepared = true;
+            assert!(!list_people(storage, 20, false, false)?.contains("Grace"));
             Ok(())
         })
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("requires an admitted WRITE producer"));
-        assert!(
-            !mutation_prepared,
-            "mutation preparation must not use the older view"
-        );
+        .unwrap();
+        assert!(mutation_prepared);
         assert_eq!(
             pile.snapshot().unwrap().select_records(&selectors).unwrap(),
             before
         );
+        let lag = crate::storage::FactLag::of(&pile.snapshot().unwrap(), source, succinct, rank9)
+            .unwrap();
+        assert_eq!(lag.succinct, 1);
 
         // Once the worker has carried the second person, every reader sees it.
         crate::storage::carry_facts(&mut pile, source, &owner);

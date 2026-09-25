@@ -549,9 +549,8 @@ struct CollectionView {
 struct TeamsSession {
     storage: Storage,
     collection: Collection<SimpleArchive>,
-    succinct: Collection<SuccinctArchiveBlob>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    support: Support,
+    support: Support<Rank9AcceleratedSuccinctArchiveBlob>,
     facts: FactArchive,
     reader: PileSnapshot,
     signer: ed25519_dalek::SigningKey,
@@ -646,20 +645,12 @@ impl TeamsSession {
                 .commit(self.collection, &self.signer, fragment)
                 .context("commit Teams fragment")?;
             pollster::block_on(async {
+                // A write derives its own leaves into every view of its
+                // collection, so the commit is readable through them at once.
                 drop(
-                    pile.ensure(self.collection, &self.signer)
+                    crate::storage::ensure_downstream(pile, self.collection, &self.signer)
                         .await
-                        .context("ensure Teams source after commit")?,
-                );
-                drop(
-                    pile.maintain(self.succinct, &self.signer)
-                        .await
-                        .context("maintain Teams succinct fact collection after commit")?,
-                );
-                drop(
-                    pile.maintain(self.rank9, &self.signer)
-                        .await
-                        .context("maintain Teams fact collection after commit")?,
+                        .context("Teams fragment was committed, but ensuring its views failed")?,
                 );
                 self.refresh_secrets_for_async(pile, None).await
             })?;
@@ -680,7 +671,7 @@ impl TeamsSession {
     async fn refresh_secrets_for_async(
         &mut self,
         pile: &mut Pile,
-        support: Option<Support>,
+        support: Option<Support<Rank9AcceleratedSuccinctArchiveBlob>>,
     ) -> Result<()> {
         let secrets =
             secret_storage::ensure_and_snapshot(pile, self.secret_collection, &self.signer)
@@ -753,22 +744,17 @@ impl TeamsStorage {
                     policy,
                 )?;
                 let secret_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
+                // The session derives this key's own leaves and mirrors its
+                // own merges; other writers' commits reach the views through
+                // their own derivations, and until then the views lag, as
+                // they do on an own commit neither view can derive.
                 let secrets = pollster::block_on(async {
-                    drop(
-                        pile.ensure(collection, signer)
-                            .await
-                            .context("ensure Teams source collection")?,
-                    );
-                    drop(
-                        pile.maintain(maintained_succinct, signer)
-                            .await
-                            .context("maintain Teams fact collection")?,
-                    );
-                    drop(
-                        pile.maintain(maintained_rank9, signer)
-                            .await
-                            .context("maintain Teams fact collection")?,
-                    );
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain(maintained_succinct, signer).await,
+                    )
+                    .context("maintain Teams fact collection")?;
+                    crate::storage::tolerate_own_lag(pile.maintain(maintained_rank9, signer).await)
+                        .context("maintain Teams fact collection")?;
                     let secrets =
                         secret_storage::ensure_and_snapshot(pile, secret_collection, signer)
                             .await
@@ -790,7 +776,6 @@ impl TeamsStorage {
                 Ok(TeamsSession {
                     storage: storage.clone(),
                     collection,
-                    succinct: maintained_succinct,
                     rank9: maintained_rank9,
                     support,
                     facts,
@@ -3811,13 +3796,8 @@ mod tests {
                         signer,
                         source_fragment("newer-session-input.example"),
                     )?;
-                    pollster::block_on(async {
-                        drop(pile.ensure(session.collection, signer).await?);
-                        drop(pile.maintain(session.succinct, signer).await?);
-                        pile.maintain(session.rank9, signer)
-                            .await
-                            .map_err(Into::into)
-                    })
+                    crate::storage::carry_facts(pile, session.collection, signer);
+                    pile.snapshot().map_err(Into::into)
                 })?;
                 assert_ne!(later.collection(session.rank9)?.support()?, &support);
                 drop(later);
