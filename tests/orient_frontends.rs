@@ -289,6 +289,15 @@ impl Fixture {
         .collect()
     }
 }
+/// How long an in-process daemon test observes before its timeout closes it.
+///
+/// The daemon has no early exit, so this is also each such test's duration.
+/// It is a load budget, not a latency claim: one ordinary refresh of the
+/// fixture costs about 0.43 s in a debug build on sky run alone (2026-09-25),
+/// a second arrival needs two, and a binary running its tests in parallel
+/// slowed that past a 2 s window.
+const DAEMON_WINDOW: Duration = Duration::from_secs(10);
+
 fn text(parts: &[Part]) -> String {
     parts
         .iter()
@@ -309,7 +318,7 @@ fn daemon_keeps_observing_after_delivery_and_records_only_accepted_reports() {
         .daemon(
             &f.who(),
             &WaitOptions {
-                timeout: Some(Duration::from_secs(2)),
+                timeout: Some(DAEMON_WINDOW),
                 poll_interval: Duration::from_millis(10),
             },
             &mut Out::new(&mut |part| {
@@ -389,7 +398,7 @@ fn daemon_retains_due_habit_baseline_across_other_news_and_own_receipts() {
         .daemon(
             &f.who(),
             &WaitOptions {
-                timeout: Some(Duration::from_secs(2)),
+                timeout: Some(DAEMON_WINDOW),
                 poll_interval: Duration::from_millis(10),
             },
             &mut Out::new(&mut |part| {
@@ -1288,14 +1297,30 @@ fn local_health_episodes_are_peekable_and_cli_mcp_share_the_presentation_ledger(
     f.health(&mut recorder, at + -20.0, State::Stalled, true);
     f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
+    // The recovery is an episode of its own: news once, peekable through the
+    // CLI without being recorded, and recorded in the same ledger by the MCP
+    // poll that accepts it.
     f.health(&mut recorder, at + -10.0, State::Current, false);
     f.maintain();
-    assert!(f
-        .call("orient_poll", json!({"persona":f.who(),"peek":false}))
-        .is_empty());
+    let cli = f.cli(&["--persona", &f.who(), "poll", "--peek"]);
+    assert!(
+        text(&cli).contains("DHT publication: recovered; current"),
+        "{}",
+        text(&cli)
+    );
+    assert_eq!(f.presented(), issues);
+    assert!(
+        text(&f.call("orient_poll", json!({"persona":f.who(),"peek":false})))
+            .contains("DHT publication: recovered; current")
+    );
+    let presented = f.presented();
+    assert!(presented.is_superset(&issues));
+    assert_eq!(presented.len(), issues.len() + 1);
+    // A later report of the same recovered state is not news on either side.
     f.health(&mut recorder, at, State::Current, false);
     f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
+    assert!(f.cli(&["--persona", &f.who(), "poll", "--peek"]).is_empty());
 }
 
 #[test]
