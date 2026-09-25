@@ -117,11 +117,17 @@ impl Habits {
                     (),
                     policy,
                 )?;
-                let snapshot = pollster::block_on(async {
-                    drop(session.pile.ensure(source, session.signer).await?);
-                    drop(session.pile.maintain(succinct, session.signer).await?);
-                    session.pile.maintain(rank9, session.signer).await
+                // Derive this key's own commits into each view; the root is
+                // not acquired, and a persona the views lack is lag.
+                pollster::block_on(async {
+                    crate::storage::tolerate_own_lag(
+                        session.pile.maintain(succinct, session.signer).await,
+                    )?;
+                    crate::storage::tolerate_own_lag(
+                        session.pile.maintain(rank9, session.signer).await,
+                    )
                 })?;
+                let snapshot = session.pile.snapshot()?;
                 let facts = snapshot.collection(rank9)?.view::<FactArchive>()?;
                 for input in personas {
                     let input = input.trim();

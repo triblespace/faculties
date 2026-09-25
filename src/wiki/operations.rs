@@ -202,12 +202,6 @@ struct WikiStorage<'a> {
     storage: &'a Storage,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Preparation {
-    Read,
-    Update,
-}
-
 #[derive(Clone)]
 struct WikiView {
     facts: FactArchive,
@@ -233,7 +227,6 @@ impl WikiStorage<'_> {
     /// after this returns: only the pure preparation may be retried.
     fn views<T>(
         &self,
-        preparation: Preparation,
         scopes: &[(Id, &str)],
         prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
     ) -> Result<T> {
@@ -241,25 +234,22 @@ impl WikiStorage<'_> {
             runtime.block_on(async {
                 let source =
                     open_source(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).await?;
-                views_in(pile, source, signer, preparation, scopes, prepare).await
+                views_in(pile, source, signer, scopes, prepare).await
             })
         })
     }
 
     fn view<T>(&self, mut prepare: impl FnMut(&WikiView) -> Result<T>) -> Result<T> {
-        self.views(Preparation::Read, &[], |wiki, _| prepare(wiki))
+        self.views(&[], |wiki, _| prepare(wiki))
     }
 
     fn view_with_scope<T>(
         &self,
-        preparation: Preparation,
         scope: Id,
         label: &str,
         mut prepare: impl FnMut(&WikiView, &FactArchive) -> Result<T>,
     ) -> Result<T> {
-        self.views(preparation, &[(scope, label)], |wiki, facts| {
-            prepare(wiki, &facts[0])
-        })
+        self.views(&[(scope, label)], |wiki, facts| prepare(wiki, &facts[0]))
     }
 
     #[cfg(feature = "local-embed")]
@@ -317,16 +307,18 @@ impl WikiStorage<'_> {
 }
 
 /// Preparation attaches the views as they stand, whatever the signer may
-/// write: a write ensures its own images after its commit, and the
-/// maintenance worker carries the rest. It never hydrates the whole source
-/// first. Update preparation acquires the sources and then refuses a view
-/// that does not stand for every admitted commit: a stale frontier is not a
-/// substitute for the frontier an edit is about to supersede.
+/// write and whether it reads or is about to edit: a write ensures its own
+/// images after its commit, and each other writer derives its own. It never
+/// acquires the sources first. Their payloads feed no view this key reads,
+/// since nobody derives another key's commits, so acquiring them would only
+/// let a payload nobody can hand over refuse the operation. An edit
+/// supersedes the frontier it can see, and editing from a frontier another
+/// node has already moved branches that entry's history, which is what a
+/// monotone store is for.
 async fn views_in<T>(
     pile: &mut FacultyStore,
     wiki_source: Collection<blobencodings::SimpleArchive>,
     signer: &ed25519_dalek::SigningKey,
-    preparation: Preparation,
     scopes: &[(Id, &str)],
     mut prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
 ) -> Result<T> {
@@ -360,27 +352,8 @@ async fn views_in<T>(
         let rank9 = pile
             .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
             .with_context(|| format!("register {label} Rank9 collection"))?;
-        auxiliaries.push((source, succinct, rank9, label));
+        auxiliaries.push((rank9, label));
     }
-    if preparation == Preparation::Update {
-        // An edit supersedes the frontier it reads, so its sources are
-        // acquired first. The views themselves are attached as they stand
-        // and checked for completeness below; a read never maintains, and a
-        // write ensures its own images after its commit.
-        drop(
-            pile.ensure(wiki_source, signer)
-                .await
-                .context("ensure Wiki source collection")?,
-        );
-        for (source, _, _, label) in &auxiliaries {
-            drop(
-                pile.ensure(*source, signer)
-                    .await
-                    .with_context(|| format!("ensure {label} source collection"))?,
-            );
-        }
-    }
-
     // Positive membership makes latest a normal joined relation. Missing
     // maintenance is an older resident answer, never a demand for equal source
     // support or a new query-time supersession scan.
@@ -405,7 +378,7 @@ async fn views_in<T>(
         .view::<LatestIndex>()
         .context("read Wiki supersession index")?;
     let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
-    for (_, _, rank9, label) in &auxiliaries {
+    for (rank9, label) in &auxiliaries {
         auxiliary_facts.push(
             reader
                 .collection(*rank9)
@@ -857,7 +830,7 @@ fn cmd_create(
 ) -> Result<Id> {
     let raw = content;
     let (content, tags, mut fragment) =
-        storage.view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |view, files| {
+        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
             let content = prepare_content(&raw, &view.facts, Some(files), force)?;
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
@@ -881,35 +854,31 @@ fn cmd_edit(
     } else {
         Vec::new()
     };
-    let (entry, title, content, tags, mut fragment) =
-        storage.views(Preparation::Update, &scopes, |view, files| {
-            let entry = mutation_entry(view, &id)?;
-            if content.is_none()
-                && title.is_none()
-                && tag_names.is_empty()
-                && entry.frontier.len() == 1
-            {
-                bail!("nothing to change");
-            }
-            let title = match &title {
-                Some(value) => value.clone(),
-                None => read_string(&view.reader, agreed(&entry, |head| head.title, "title")?)?,
-            };
-            let content = match &content {
-                Some(raw) => prepare_content(raw, &view.facts, files.first(), force)?,
-                None => read_string(
-                    &view.reader,
-                    agreed(&entry, |head| head.content, "content")?,
-                )?,
-            };
-            let mut fragment = Fragment::empty();
-            let tags = if tag_names.is_empty() {
-                agreed(&entry, |head| head.tags.clone(), "tags")?
-            } else {
-                resolve_tags(&view.facts, &view.reader, &tag_names, &mut fragment)?
-            };
-            Ok((entry, title, content, tags, fragment))
-        })?;
+    let (entry, title, content, tags, mut fragment) = storage.views(&scopes, |view, files| {
+        let entry = mutation_entry(view, &id)?;
+        if content.is_none() && title.is_none() && tag_names.is_empty() && entry.frontier.len() == 1
+        {
+            bail!("nothing to change");
+        }
+        let title = match &title {
+            Some(value) => value.clone(),
+            None => read_string(&view.reader, agreed(&entry, |head| head.title, "title")?)?,
+        };
+        let content = match &content {
+            Some(raw) => prepare_content(raw, &view.facts, files.first(), force)?,
+            None => read_string(
+                &view.reader,
+                agreed(&entry, |head| head.content, "content")?,
+            )?,
+        };
+        let mut fragment = Fragment::empty();
+        let tags = if tag_names.is_empty() {
+            agreed(&entry, |head| head.tags.clone(), "tags")?
+        } else {
+            resolve_tags(&view.facts, &view.reader, &tag_names, &mut fragment)?
+        };
+        Ok((entry, title, content, tags, fragment))
+    })?;
     let revision = stage_revision(storage, &mut fragment, Some(&entry), title, content, tags)?;
     storage.publish(fragment)?;
     Ok(revision)
@@ -1072,7 +1041,7 @@ fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> R
     if normalized.is_empty() {
         bail!("tag name cannot be empty");
     }
-    let prepared = storage.views(Preparation::Update, &[], |view, _| {
+    let prepared = storage.views(&[], |view, _| {
         let entry = mutation_entry(view, &id)?;
         let mut fragment = Fragment::empty();
         let mut tags: BTreeSet<Id> = agreed(&entry, |head| head.tags.clone(), "tags")?
@@ -1122,7 +1091,7 @@ fn mutate_tags(storage: WikiStorage<'_>, id: String, name: &str, add: bool) -> R
 }
 
 fn cmd_revert(storage: WikiStorage<'_>, id: String, to: usize) -> Result<Id> {
-    let (entry, title, content, tags) = storage.views(Preparation::Update, &[], |view, _| {
+    let (entry, title, content, tags) = storage.views(&[], |view, _| {
         let entry = mutation_entry(view, &id)?;
         let rows = wiki_model::entry_history(&view.facts, &entry);
         let Some(chosen) = rows.get(to.saturating_sub(1)) else {
@@ -1628,7 +1597,7 @@ fn cmd_tag_list(storage: WikiStorage<'_>, out: &mut Out<'_>) -> Result<()> {
 }
 
 fn cmd_tag_mint(storage: WikiStorage<'_>, name: String) -> Result<Id> {
-    let ids = storage.views(Preparation::Update, &[], |view, _| {
+    let ids = storage.views(&[], |view, _| {
         tag_ids_named(&view.facts, &view.reader, &name)
     })?;
     if let Some(id) = ids.first() {
@@ -1645,7 +1614,7 @@ fn cmd_import(
     tags: Vec<String>,
 ) -> Result<Vec<Id>> {
     let (view, files_catalog, tags, mut fragment) =
-        storage.view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |view, files| {
+        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
             Ok((view.clone(), files.clone(), tags, fragment))
@@ -1813,10 +1782,9 @@ fn resolve_reference_line(
 }
 
 fn cmd_fix_truncated(storage: WikiStorage<'_>, input: String, out: &mut Out<'_>) -> Result<()> {
-    let (view, files) =
-        storage.view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |view, files| {
-            Ok((view.clone(), files.clone()))
-        })?;
+    let (view, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
+        Ok((view.clone(), files.clone()))
+    })?;
     let resolver = ReferenceResolver {
         wiki: &view.facts,
         files: Some(&files),
@@ -1832,15 +1800,8 @@ fn cmd_fix_truncated(storage: WikiStorage<'_>, input: String, out: &mut Out<'_>)
 }
 
 fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>) -> Result<()> {
-    let (report, changed, revisions) = storage.view_with_scope(
-        if fix {
-            Preparation::Update
-        } else {
-            Preparation::Read
-        },
-        FILES_SCOPE_ID,
-        "Files",
-        |view, files| {
+    let (report, changed, revisions) =
+        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
             let resolver = ReferenceResolver {
                 wiki: &view.facts,
                 files: Some(files),
@@ -1880,8 +1841,7 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>)
                 }
             }
             Ok((report, changed, revisions))
-        },
-    )?;
+        })?;
     let mut fragment = Fragment::empty();
     for (entry, title, content, tags) in revisions {
         stage_revision(storage, &mut fragment, Some(&entry), title, content, tags)?;
@@ -1911,7 +1871,7 @@ fn cmd_batch_export(storage: WikiStorage<'_>) -> Result<Vec<(Id, String)>> {
 }
 
 fn cmd_batch_import(storage: WikiStorage<'_>, imports: Vec<(Id, String)>) -> Result<()> {
-    let revisions = storage.views(Preparation::Update, &[], |view, _| {
+    let revisions = storage.views(&[], |view, _| {
         let mut revisions = Vec::new();
         for (revision_id, content) in &imports {
             let revision_id = *revision_id;
@@ -1957,7 +1917,6 @@ fn l2_normalize(mut values: Vec<f32>) -> Vec<f32> {
 #[cfg(feature = "local-embed")]
 fn cmd_embed(storage: WikiStorage<'_>, out: &mut Out<'_>) -> Result<()> {
     let documents = storage.view_with_scope(
-        Preparation::Update,
         EMBEDDINGS_SCOPE_ID,
         "Embeddings",
         |view, embedding_facts| {
@@ -2013,7 +1972,6 @@ fn cmd_similar(storage: WikiStorage<'_>, query: String) -> Result<String> {
     let embedder = crate::nomic::load_text_embedder()?;
     let query = l2_normalize(embedder.embed_query(&query)?);
     let report = storage.view_with_scope(
-        Preparation::Read,
         EMBEDDINGS_SCOPE_ID,
         "Embeddings",
         |view, embedding_facts| {
@@ -2323,14 +2281,9 @@ mod tests {
         let owner_read = || {
             storage
                 .with_pile(|pile, signer, runtime| {
-                    runtime.block_on(views_in(
-                        pile,
-                        source,
-                        signer,
-                        Preparation::Read,
-                        &[],
-                        |view, _| Ok(view.clone()),
-                    ))
+                    runtime.block_on(views_in(pile, source, signer, &[], |view, _| {
+                        Ok(view.clone())
+                    }))
                 })
                 .unwrap()
         };
@@ -2359,14 +2312,10 @@ mod tests {
         reader
             .with_store(|pile, signer, runtime| {
                 let before = pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?;
-                let resident = runtime.block_on(views_in(
-                    pile,
-                    source,
-                    signer,
-                    Preparation::Read,
-                    &[],
-                    |view, _| Ok(view.clone()),
-                ))?;
+                let resident =
+                    runtime.block_on(views_in(pile, source, signer, &[], |view, _| {
+                        Ok(view.clone())
+                    }))?;
                 let entry = wiki_model::entry(&resident.facts, &resident.latest, root).unwrap();
                 assert_eq!(
                     entry
@@ -2387,24 +2336,6 @@ mod tests {
                     "a reader must not publish maintenance equations",
                 );
 
-                // An edit's preparation reads the same frontier and refuses
-                // nothing for being behind: there is no globally consistent
-                // state to be behind of. It acquires the source's payloads
-                // and publishes no equation of its own.
-                runtime
-                    .block_on(views_in(
-                        pile,
-                        source,
-                        signer,
-                        Preparation::Update,
-                        &[],
-                        |_, _| Ok(()),
-                    ))
-                    .unwrap();
-                assert_eq!(
-                    pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?,
-                    before,
-                );
                 Ok(())
             })
             .unwrap();
@@ -2446,14 +2377,10 @@ mod tests {
         );
         reader
             .with_store(|pile, signer, runtime| {
-                let carried = runtime.block_on(views_in(
-                    pile,
-                    source,
-                    signer,
-                    Preparation::Read,
-                    &[],
-                    |view, _| Ok(view.clone()),
-                ))?;
+                let carried =
+                    runtime.block_on(views_in(pile, source, signer, &[], |view, _| {
+                        Ok(view.clone())
+                    }))?;
                 let entry = wiki_model::entry(&carried.facts, &carried.latest, root).unwrap();
                 assert_eq!(
                     entry
@@ -2518,7 +2445,6 @@ mod tests {
                         pile,
                         source,
                         signer,
-                        Preparation::Read,
                         &[(FILES_SCOPE_ID, "Files")],
                         |view, _| Ok(view.clone()),
                     ))
@@ -2564,7 +2490,6 @@ mod tests {
                         pile,
                         source,
                         signer,
-                        Preparation::Read,
                         &[(FILES_SCOPE_ID, "Files")],
                         |view, auxiliaries| {
                             let entry = wiki_model::entry(&view.facts, &view.latest, root).unwrap();
@@ -3007,9 +2932,7 @@ mod tests {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let files = storage
-            .view_with_scope(Preparation::Read, FILES_SCOPE_ID, "Files", |_, files| {
-                Ok(files.clone())
-            })
+            .view_with_scope(FILES_SCOPE_ID, "Files", |_, files| Ok(files.clone()))
             .unwrap();
         assert!(find!(
             id: Id,

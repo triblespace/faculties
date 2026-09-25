@@ -134,12 +134,9 @@ impl Code {
     pub fn index(&self) -> Result<IndexReport> {
         self.storage().with_pile(|pile, signer| {
             pollster::block_on(async {
+                // Each cover derives this key's own commits; the root is
+                // not acquired, because nobody else's payload feeds them.
                 let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                drop(
-                    pile.ensure(source, signer)
-                        .await
-                        .context("ensure Code source dependencies")?,
-                );
                 let doc_target = register(pile, source, attrs::doc.id(), signer.verifying_key())?;
                 let text_target = register(
                     pile,

@@ -421,8 +421,14 @@ fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
     Server::new(&registered).unwrap();
 }
 
+/// A writer with source WRITE and only READ on the rollups can still create,
+/// import and edit: each revision is committed. Only the key that wrote a
+/// commit derives it into a view, though, so no reader sees those revisions
+/// until that key may write the views, and every command that committed one
+/// says so and exits nonzero instead of succeeding silently. Once the grants
+/// arrive, a pass with the writer's key derives them all.
 #[test]
-fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
+fn source_writer_commits_revisions_and_is_told_no_reader_sees_them_until_granted() {
     use std::collections::BTreeSet;
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -535,13 +541,25 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
             );
         command
     };
+    // Each committed revision is reported as reaching no reader; the count
+    // is every write of this key the views still lack.
+    let unreadable = |output: &std::process::Output, writes: usize| {
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("was committed"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("{writes} of this key's writes reach no reader")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("grant that key WRITE"), "{stderr}");
+    };
     let before = records();
     let body = format!("#link(\"wiki:{first:x}\")[the resident revision]");
     let created = command(&writer_key)
         .args(["create", "source writer", &body])
         .output()
         .unwrap();
-    assert!(created.status.success(), "{created:?}");
+    unreadable(&created, 1);
     let imported_file = fixture.directory.path().join("imported.typ");
     fs::write(
         &imported_file,
@@ -553,7 +571,7 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
         .arg(&imported_file)
         .output()
         .unwrap();
-    assert!(imported.status.success(), "{imported:?}");
+    unreadable(&imported, 2);
     let after = records();
     let added: Vec<_> = after.difference(&before).copied().collect();
     assert_eq!(
@@ -601,7 +619,7 @@ fn source_writer_creates_and_imports_with_lagging_read_only_rollups() {
         ])
         .output()
         .unwrap();
-    assert!(edited.status.success(), "{edited:?}");
+    unreadable(&edited, 3);
     let after_edit = records();
     let edits: Vec<_> = after_edit.difference(&after).copied().collect();
     assert_eq!(edits.len(), 1);

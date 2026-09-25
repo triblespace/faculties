@@ -254,7 +254,6 @@ struct CollectionView {
 struct DiscordSession<'a> {
     pile: &'a mut Pile,
     collection: Collection<SimpleArchive>,
-    succinct: Collection<SuccinctArchiveBlob>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     signer: SigningKey,
     facts: FactArchive,
@@ -275,12 +274,21 @@ impl DiscordSession<'_> {
             .pile
             .commit(self.collection, &self.signer, fragment)
             .context("publish Discord collection fragment")?;
-        self.reader = pollster::block_on(async {
-            drop(self.pile.ensure(self.collection, &self.signer).await?);
-            drop(self.pile.maintain(self.succinct, &self.signer).await?);
-            self.pile.maintain(self.rank9, &self.signer).await
-        })
-        .context("maintain Discord fact collection after commit")?;
+        // Like every other write: derive this key's own leaves into the
+        // views, and refuse to call the commit done if no reader can see it.
+        // Merges are the maintenance daemon's.
+        drop(
+            pollster::block_on(crate::storage::ensure_downstream(
+                self.pile,
+                self.collection,
+                &self.signer,
+            ))
+            .context("Discord fragment was committed, but ensuring its derived views failed")?,
+        );
+        self.reader = self
+            .pile
+            .snapshot()
+            .context("freeze Discord fact collection after commit")?;
         self.facts = self
             .reader
             .collection(self.rank9)
@@ -355,7 +363,6 @@ impl DiscordStorage<'_> {
                 operation(&mut DiscordSession {
                     pile,
                     collection,
-                    succinct: maintained_succinct,
                     rank9: maintained_rank9,
                     signer: signer.clone(),
                     facts,

@@ -39,7 +39,8 @@ use crate::storage::{load_signer, open_pile_strict, FactArchive, FactLag};
 use crate::collection_names::open_configured;
 #[cfg(test)]
 use triblespace::core::collection::{
-    CollectionDerivation, CollectionDerive, CollectionRecord, CollectionStore,
+    CollectionDerivation, CollectionDerive, CollectionRealizationError, CollectionRecord,
+    CollectionStore,
 };
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
@@ -344,8 +345,9 @@ async fn ensure_facts(
 
 /// Accelerated-Succinct derivation summary. Source membership is measured in
 /// distinct commit payloads the snapshot can read, never in the number of
-/// attestations over them; the lag says how many of those each hop of the
-/// fact pair has not derived yet.
+/// attestations over them; the lag says how many admitted commits each hop of
+/// the fact pair has not derived yet, a commit whose payload is not here
+/// included.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SuccinctIndexReport {
     pub source_elements: usize,
@@ -388,8 +390,8 @@ pub fn ensure_succinct_index_with_storage(
 }
 
 /// Archive BM25 derivation summary: the source commits the snapshot can
-/// read, how many of them the index has no leaf for yet, and how many
-/// segments its resident cover has.
+/// read, how many admitted source commits the index has no leaf for yet, and
+/// how many segments its resident cover has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bm25IndexReport {
     pub source_elements: usize,
@@ -442,10 +444,8 @@ async fn ensure_bm25(
     let source_view = maintained
         .collection(source)
         .context("attach Archive source")?;
-    let lagging = attached
-        .missing_from(&source_view)
-        .context("compare Archive BM25 leaves with the source")?
-        .len();
+    let lagging = crate::storage::underived(&maintained, source, target)
+        .context("count Archive commits without a BM25 leaf")?;
     let index = attached
         .view::<archive_bm25::ArchiveBM25View>()
         .context("read Archive BM25 cover")?;
@@ -499,7 +499,7 @@ pub struct ArchiveSearchLag {
 
 impl ArchiveSearchLag {
     /// Whether both views have caught up with every source commit the
-    /// snapshot can read.
+    /// snapshot admits.
     pub const fn is_current(self) -> bool {
         self.facts.is_current() && self.index == 0
     }
@@ -560,13 +560,10 @@ pub fn ensure_search_local_with_storage(
             let search = after
                 .collection(target)
                 .context("attach Archive BM25 cover")?;
-            let source_view = after.collection(source).context("attach Archive source")?;
             let lag = ArchiveSearchLag {
                 facts: FactLag::of(&after, source, succinct, rank9)?,
-                index: search
-                    .missing_from(&source_view)
-                    .context("compare Archive BM25 leaves with the source")?
-                    .len(),
+                index: crate::storage::underived(&after, source, target)
+                    .context("count Archive commits without a BM25 leaf")?,
             };
             let index = search
                 .view::<archive_bm25::ArchiveBM25View>()
@@ -1815,19 +1812,22 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), before);
     }
 
+    /// The collection union is a valid Archive, but the tagged block and its
+    /// part/fact closure live in separate signed elements. Each commit is a
+    /// leaf of its own and a DERIVE names one source foundation, so no leaf
+    /// sees both halves, and mirroring a merge of the two needs both leaves
+    /// first: this law cannot index the block, now or later. That is the
+    /// block's lag and nobody else's. Every other commit is still derived,
+    /// search reads around the block and says it lags, explicit maintenance
+    /// names it with the mapping's reason, and a repeat publishes nothing.
     #[test]
-    fn bm25_rejects_split_source_without_an_admitted_route_before_writing() {
+    fn bm25_leaves_a_split_block_as_lag_and_derives_every_other_commit() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        // The collection union is a valid Archive, but the tagged block and
-        // its part/fact closure live in separate signed elements. Each commit
-        // is a leaf of its own, and a DERIVE names one source foundation, so
-        // no leaf can see both halves: the mapping refuses the block's leaf,
-        // and none is published for it.
         let (block_element, remainder_element) =
             projection_split_across_source_elements("session:split", "closure needle");
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
@@ -1835,29 +1835,180 @@ mod tests {
         let collection =
             open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let block_commit = pile.commit(collection, &signer, block_element).unwrap();
-        pile.commit(collection, &signer, remainder_element).unwrap();
+        let remainder_commit = pile.commit(collection, &signer, remainder_element).unwrap();
         let target = test_target(&mut pile, collection, &pile_path, &key);
         pile.close().unwrap();
+        // A whole commit after the split one: derived like any other.
+        commit_projection(&pile_path, &key, "session:whole", "whole haystack");
 
         let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(archive.support().unwrap().len(), 2);
+        assert_eq!(archive.support().unwrap().len(), 3);
         assert_eq!(
             projection_ids(&archive.view::<FactArchive>().unwrap()).len(),
-            1
+            2
         );
         drop(archive);
 
-        let error = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap_err();
-        let error = format!("{error:#}");
-        assert!(error.contains("references absent part"), "{error}");
+        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        assert_eq!(report.source_elements, 3);
+        assert_eq!(report.lagging, 1, "only the split block lags");
+        let length = std::fs::metadata(&pile_path).unwrap().len();
+        assert_eq!(
+            pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap(),
+            report
+        );
+        assert_eq!(
+            std::fs::metadata(&pile_path).unwrap().len(),
+            length,
+            "a refused leaf publishes nothing on a later pass either"
+        );
+
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let records = discovered_records(&pile.snapshot().unwrap()).unwrap();
-        let block_locator =
-            triblespace::core::collection::SourceLocator::of(block_commit.data().raw);
-        assert!(!records.derives().iter().any(
-            |derive| derive.collection() == target.handle() && derive.input() == block_locator
-        ));
+        let has_leaf = |commit: &CollectionCommit| {
+            let locator = triblespace::core::collection::SourceLocator::of(commit.data().raw);
+            records
+                .derives()
+                .iter()
+                .any(|derive| derive.collection() == target.handle() && derive.input() == locator)
+        };
+        assert!(!has_leaf(&block_commit));
+        assert!(has_leaf(&remainder_commit));
+        assert_eq!(
+            records
+                .derives()
+                .iter()
+                .filter(|derive| derive.collection() == target.handle())
+                .count(),
+            2
+        );
+        let error = pollster::block_on(
+            pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
+        )
+        .err()
+        .expect("explicit maintenance names the block it cannot derive");
+        let CollectionRealizationError::Unmappable { blocked } = error else {
+            panic!("expected Unmappable, got {error}");
+        };
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, block_commit.data());
+        assert!(
+            blocked[0].1.contains("references absent part"),
+            "{}",
+            blocked[0].1
+        );
         pile.close().unwrap();
+
+        let (_, index, lag) =
+            pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert_eq!(lag.index, 1);
+        assert!(lag.facts.is_current());
+        let query = index.query().unwrap();
+        assert_eq!(query.query_multi(&hash_tokens("whole haystack")).len(), 1);
+        assert!(query.query_multi(&hash_tokens("closure needle")).is_empty());
+    }
+
+    /// Eight own commits fill the root's lowest tier, so the root carry joins
+    /// them with one 8-input MERGE. BM25 maintenance derives the eight leaves
+    /// and mirrors that merge exactly once: one target MERGE over the eight
+    /// leaf images, its result the mapping of the merged source node's own
+    /// bytes. The index then reads as one segment that finds every commit,
+    /// and a repeat pass publishes nothing.
+    #[test]
+    fn bm25_mirrors_an_own_root_merge_once_and_reads_it_as_one_segment() {
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        let signer = initialize_archive_fixture(&pile_path, &key);
+        let words = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ];
+        assert_eq!(words.len(), triblespace::core::collection::MERGE_FAN_IN);
+        for word in words {
+            commit_projection(&pile_path, &key, &format!("session:{word}"), word);
+        }
+
+        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let source = test_source(&mut pile, &pile_path, &key);
+        let target = test_target(&mut pile, source, &pile_path, &key);
+        drop(pollster::block_on(pile.maintain(source, &signer)).unwrap());
+        let records = discovered_records(&pile.snapshot().unwrap()).unwrap();
+        let root_merges: Vec<_> = records
+            .merges()
+            .iter()
+            .filter(|merge| merge.collection() == source.handle())
+            .copied()
+            .collect();
+        assert_eq!(root_merges.len(), 1, "one carry of the full tier");
+        assert_eq!(root_merges[0].inputs().len(), words.len());
+
+        let bm25_records = |pile: &mut Pile| {
+            let records = discovered_records(&pile.snapshot().unwrap()).unwrap();
+            let derives = records
+                .derives()
+                .iter()
+                .filter(|derive| derive.collection() == target.handle())
+                .count();
+            let merges: Vec<_> = records
+                .merges()
+                .iter()
+                .filter(|merge| merge.collection() == target.handle())
+                .copied()
+                .collect();
+            (derives, merges)
+        };
+        drop(
+            pollster::block_on(
+                pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
+            )
+            .unwrap(),
+        );
+        let (derives, merges) = bm25_records(&mut pile);
+        assert_eq!(derives, words.len());
+        assert_eq!(merges.len(), 1, "the own root merge is mirrored once");
+        assert_eq!(merges[0].inputs().len(), words.len());
+        let snapshot = pile.snapshot().unwrap();
+        let merged: Blob<SimpleArchive> = snapshot
+            .get(Handle::<SimpleArchive>::from_hash(root_merges[0].result()))
+            .unwrap();
+        let expected = archive_bm25::derive_element(&snapshot, merged).unwrap();
+        assert_eq!(
+            Handle::<PortableBM25Blob>::to_hash(expected.get_handle()),
+            merges[0].result(),
+            "the mirror's image is the merged source node's own image"
+        );
+        let attached = snapshot.collection(target).unwrap();
+        assert_eq!(attached.cover().len(), 1);
+        assert_eq!(
+            crate::storage::underived(&snapshot, source, target).unwrap(),
+            0
+        );
+        drop((attached, snapshot));
+
+        let length = std::fs::metadata(&pile_path).unwrap().len();
+        drop(
+            pollster::block_on(
+                pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
+            )
+            .unwrap(),
+        );
+        assert_eq!(bm25_records(&mut pile), (derives, merges));
+        pile.close().unwrap();
+        assert_eq!(
+            std::fs::metadata(&pile_path).unwrap().len(),
+            length,
+            "a repeat pass publishes no record"
+        );
+
+        let (_, index, lag) =
+            pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert!(lag.is_current(), "{lag:?}");
+        assert_eq!(index.segments().len(), 1);
+        let query = index.query().unwrap();
+        for word in words {
+            assert_eq!(query.query_multi(&hash_tokens(word)).len(), 1, "{word}");
+        }
     }
 
     /// A new commit costs the index exactly one new leaf, the index stands

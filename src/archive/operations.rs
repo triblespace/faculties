@@ -254,21 +254,15 @@ impl ArchiveStorage<'_> {
                 let rank9 = pile
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
                     .context("register Rank9 Comb cursor collection")?;
-                drop(
-                    pile.ensure(source, signer)
-                        .await
-                        .context("ensure Comb source dependencies")?,
-                );
-                drop(
-                    pile.maintain(succinct, signer)
-                        .await
-                        .context("maintain Succinct Comb cursor collection")?,
-                );
-                let after = pile
-                    .maintain(rank9, signer)
-                    .await
+                // Each hop derives this key's own cursors; what it cannot
+                // derive, and what other writers have not derived yet, is
+                // lag, and the read attaches what is here.
+                crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+                    .context("maintain Succinct Comb cursor collection")?;
+                crate::storage::tolerate_own_lag(pile.maintain(rank9, signer).await)
                     .context("maintain Rank9 Comb cursor collection")?;
-                after
+                pile.snapshot()
+                    .context("freeze maintained Comb cursor collection")?
                     .collection(rank9)
                     .context("attach Comb cursor collection")?
                     .view::<FactArchive>()
@@ -319,37 +313,22 @@ impl ArchiveStorage<'_> {
                     .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
                     .context("register Rank9 Comb cursor collection")?;
 
-                // Acquire the roots, maintain each immediate derivation, then
-                // observe both representations through one final snapshot.
-                drop(
-                    pile.ensure(archive_source, signer)
-                        .await
-                        .context("ensure Archive source dependencies")?,
-                );
-                drop(
-                    pile.ensure(comb_source, signer)
-                        .await
-                        .context("ensure Comb cursor dependencies")?,
-                );
-                drop(
-                    pile.maintain(comb_succinct, signer)
-                        .await
-                        .context("maintain Succinct Comb cursor collection")?,
-                );
-                drop(
-                    pile.maintain(comb_rank9, signer)
-                        .await
-                        .context("maintain Rank9 Comb cursor collection")?,
-                );
-                drop(
-                    pile.maintain(archive_succinct, signer)
-                        .await
-                        .context("maintain Succinct Archive replay facts")?,
-                );
-                let after = pile
-                    .maintain(archive_rank9, signer)
-                    .await
+                // Derive this key's own commits into each view, then observe
+                // both representations through one final snapshot. The roots
+                // are not acquired: a view is read as it stands, other
+                // writers' commits reach it through their own derivations,
+                // and what neither has derived yet is lag.
+                crate::storage::tolerate_own_lag(pile.maintain(comb_succinct, signer).await)
+                    .context("maintain Succinct Comb cursor collection")?;
+                crate::storage::tolerate_own_lag(pile.maintain(comb_rank9, signer).await)
+                    .context("maintain Rank9 Comb cursor collection")?;
+                crate::storage::tolerate_own_lag(pile.maintain(archive_succinct, signer).await)
+                    .context("maintain Succinct Archive replay facts")?;
+                crate::storage::tolerate_own_lag(pile.maintain(archive_rank9, signer).await)
                     .context("maintain Rank9 Archive replay facts")?;
+                let after = pile
+                    .snapshot()
+                    .context("freeze maintained Archive replay snapshot")?;
                 let archive = after
                     .collection(archive_rank9)
                     .context("attach Archive replay facts")?;
@@ -1142,11 +1121,12 @@ fn run_index(storage: ArchiveStorage<'_>, out: &mut Out<'_>) -> Result<()> {
         "Archive: {} distinct source element(s); accelerated-Succinct lag: {}",
         facts.source_elements, facts.lag,
     ))?;
+    // The lag counts every admitted source commit, its payload here or not,
+    // so it is reported beside the resident count rather than taken from it.
     out.line(format!(
-        "Archive BM25: {} of {} distinct source element(s) derived, {} resident cover segment(s)",
-        bm25.source_elements.saturating_sub(bm25.lagging),
-        bm25.source_elements,
-        bm25.cover_segments,
+        "Archive BM25: {} distinct source element(s) here, {} source commit(s) not yet derived, \
+         {} resident cover segment(s)",
+        bm25.source_elements, bm25.lagging, bm25.cover_segments,
     ))?;
     Ok(())
 }

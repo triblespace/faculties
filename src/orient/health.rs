@@ -95,30 +95,12 @@ impl HealthSources {
             // As on the ordinary Orient path, receipt freshness avoids a
             // repeat but is not a precondition of reporting resident health.
             // Only this optional projection is best effort; health, Relations
-            // and latest-target failures above still propagate unchanged.
-            let receipt_result: Result<()> = async {
-                if self
-                    .presentations
-                    .rank9
-                    .writer_is_admitted(&snapshot, signer.verifying_key())
-                    .context("check Orient receipt projection WRITE admission")?
-                {
-                    drop(
-                        local
-                            .maintain(self.presentations.succinct, signer)
-                            .await
-                            .context("maintain Orient receipt Succinct collection")?,
-                    );
-                    drop(
-                        local
-                            .maintain(self.presentations.rank9, signer)
-                            .await
-                            .context("maintain Orient receipt Rank9 collection")?,
-                    );
-                }
-                Ok(())
-            }
-            .await;
+            // and latest-target failures above still propagate unchanged. It
+            // is the ordinary path's own upkeep on the resident-only store,
+            // so an own historical receipt neither hop can derive is lag
+            // here too, and the new receipts reach Rank9 all the same.
+            drop(snapshot);
+            let receipt_result = self.presentations.maintain(&mut *local, signer).await;
             Ok(receipt_result.err().map(|error| {
                 format!(
                     "note: Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
@@ -1274,6 +1256,70 @@ mod tests {
                 .0
         );
         assert!(parts.is_empty());
+    }
+
+    /// An own historical receipt whose payload is nowhere is the receipt
+    /// projection's lag on the health path, as on the ordinary path: no poll
+    /// calls the refresh failed, and the receipt a delivered report records
+    /// still reaches Rank9 around it, so a re-armed watcher does not repeat
+    /// the report.
+    #[test]
+    fn own_receipt_payload_that_is_nowhere_is_lag_and_does_not_repeat_a_report() {
+        let mut f = Fixture::new();
+        let persona = *fucid();
+        let mut recorder = Recorder::new(f.signer.verifying_key());
+        f.publish(
+            recorder
+                .record(
+                    clock::now().unwrap(),
+                    [store_condition(State::Stalled, true)],
+                )
+                .unwrap(),
+        );
+        // A receipt of this signer's arrives without its archive.
+        let cold = orient_model::receipt_fragment([*fucid()], clock::point_now().unwrap());
+        let cold = IntoBlob::<SimpleArchive>::to_blob(cold.facts().clone());
+        f.store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &f.signer,
+                f.sources.presentations.source.handle(),
+                inlineencodings::Handle::<SimpleArchive>::to_hash(cold.get_handle()),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+
+        let poll = |sources: &mut HealthSources, store: &mut FacultyStore| {
+            let mut text = String::new();
+            let mut emit = |part| {
+                let crate::out::Part::Text { text: part } = part else {
+                    bail!("expected health text");
+                };
+                text.push_str(&part);
+                Ok(())
+            };
+            let (fired, _) = sources
+                .poll(
+                    store,
+                    &f.signer,
+                    &fmt_id(persona),
+                    false,
+                    &mut Out::new(&mut emit),
+                )
+                .unwrap();
+            (fired, text)
+        };
+        let (fired, text) = poll(&mut f.sources, &mut f.store);
+        assert!(fired);
+        assert!(!text.contains("not refreshed"), "{text}");
+
+        let mut rearmed =
+            HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60)).unwrap();
+        let (fired, text) = poll(&mut rearmed, &mut f.store);
+        assert!(!fired, "a delivered report must not repeat: {text}");
+        assert!(text.is_empty(), "{text}");
+        let after = f.store.snapshot().unwrap();
+        assert!(!after.contains_blob(cold.get_handle()).unwrap());
+        assert!(after.wants().unwrap().next().is_none());
     }
 
     #[test]

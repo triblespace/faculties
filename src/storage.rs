@@ -30,6 +30,7 @@
 //! `faculties-migrations` crate and depends on this module rather than the
 //! other way round.
 
+use std::collections::BTreeSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -43,14 +44,15 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{
     ensure_downstream as core_ensure_downstream, maintain_downstream as core_maintain_downstream,
-    realize_as, Collection, CollectionCommit, CollectionDerivation, CollectionDerive,
-    CollectionHandle, CollectionMerge, CollectionRead, CollectionRealizationError,
-    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt,
-    CoreRealizer, Derived, RealizeDerived, Realized, Support, Upkeep, UpkeepReport,
+    ownership, realize_as, Collection, CollectionCommit, CollectionData, CollectionDerivation,
+    CollectionDerive, CollectionEncoding, CollectionHandle, CollectionMerge, CollectionRead,
+    CollectionRealizationError, CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt,
+    CollectionStoreExt, CoreRealizer, CoverageRead, Derived, RealizeDerived, Realized,
+    SourceLocator, Support, Upkeep, UpkeepReport,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::InlineEncoding;
+use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
@@ -542,6 +544,34 @@ where
     Ok((facts, support))
 }
 
+/// How many foundations `source` stands for in `snapshot` that `view` has no
+/// leaf for: a view's freshness against its immediate source, as a count.
+///
+/// Every admitted foundation counts, whether or not its payload is here. A
+/// commit whose payload this reader never received, because it holds no
+/// source READ or the payload is simply elsewhere, is still missing from the
+/// view until its writer derives it, and a reader that could not count it
+/// would call a view current that is missing it. Each foundation is looked
+/// up by its locator in the view's own leaves; two collections' supports are
+/// never compared.
+pub fn underived<R, S, T>(snapshot: &R, source: Collection<S>, view: Collection<T>) -> Result<usize>
+where
+    R: StoreRead,
+    S: CollectionEncoding,
+    T: CollectionEncoding,
+{
+    let foundations = source
+        .admitted(snapshot)
+        .context("read the foundations a view's source stands for")?;
+    let coverage = snapshot
+        .coverage(&BTreeSet::from([view.handle()]))
+        .context("read a view's leaves")?;
+    Ok(foundations
+        .members()
+        .filter(|foundation| !coverage.has_leaf(view.handle(), SourceLocator::of(foundation.raw)))
+        .count())
+}
+
 /// How far a Succinct and Rank9 fact pair lags its source in one store
 /// snapshot, hop by hop: source commits the Succinct view has no leaf for,
 /// and Succinct images the Rank9 view has none for.
@@ -549,11 +579,9 @@ where
 /// Each writer derives what it wrote, so a lagging hop is someone's
 /// derivation still to come or still to arrive by sync. There is no globally
 /// consistent state to be current against: a read attaches what is present
-/// and reports this, it never waits or refuses. Each hop is measured by
-/// [`missing_from`](triblespace::core::collection::CollectionSnapshot::missing_from)
-/// against what the snapshot can read of the hop below, so a source commit
-/// whose payload is not here is not counted. Two collections' supports are
-/// never compared.
+/// and reports this, it never waits or refuses. Each hop counts every
+/// foundation the hop below stands for ([`underived`]), including one whose
+/// payload is not here.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FactLag {
     /// Source commits without a Succinct leaf.
@@ -573,28 +601,15 @@ impl FactLag {
     where
         R: StoreRead,
     {
-        let source = snapshot
-            .collection(source)
-            .context("attach the fact source")?;
-        let succinct = snapshot
-            .collection(succinct)
-            .context("attach the Succinct fact view")?;
-        let rank9 = snapshot
-            .collection(rank9)
-            .context("attach the Rank9 fact view")?;
         Ok(Self {
-            succinct: succinct
-                .missing_from(&source)
-                .context("compare the Succinct leaves with the source")?
-                .len(),
-            rank9: rank9
-                .missing_from(&succinct)
-                .context("compare the Rank9 leaves with the Succinct view")?
-                .len(),
+            succinct: underived(snapshot, source, succinct)
+                .context("count source commits without a Succinct leaf")?,
+            rank9: underived(snapshot, succinct, rank9)
+                .context("count Succinct images without a Rank9 leaf")?,
         })
     }
 
-    /// Whether every source commit the snapshot can read has reached Rank9.
+    /// Whether every source commit the snapshot knows of has reached Rank9.
     pub const fn is_current(self) -> bool {
         self.succinct == 0 && self.rank9 == 0
     }
@@ -610,17 +625,24 @@ impl std::fmt::Display for FactLag {
     }
 }
 
-/// Settle one read-path upkeep result: a signer's own foundation the mapping
-/// could not derive ([`CollectionRealizationError::Unmappable`]) is lag, not
-/// failure. That error is raised only after everything else was derived and
-/// mirrored, so the view is as current as it can be and a read attaches what
-/// is present; explicit maintenance, the daemon's included, still names the
-/// foundation. Every other error is returned unchanged.
+/// Settle one read-path upkeep result: what the signer could not derive of
+/// its own is the view's lag, not a failure of the read. That is an own
+/// foundation the mapping could not represent
+/// ([`CollectionRealizationError::Unmappable`], raised only after everything
+/// else was derived and mirrored), and own commits owed to a view the signer
+/// may not write ([`CollectionRealizationError::UnauthorizedProducer`]). In
+/// both cases the view is as current as this signer can make it, and a read
+/// attaches what is present and counts the rest ([`underived`]). Explicit
+/// maintenance still names both, and a write refuses to call its commit done
+/// when either leaves it unreadable ([`ensure_downstream`]). Every other
+/// error is returned unchanged.
 pub fn tolerate_own_lag<T>(
     result: std::result::Result<T, CollectionRealizationError>,
 ) -> std::result::Result<(), CollectionRealizationError> {
     match result {
-        Ok(_) | Err(CollectionRealizationError::Unmappable { .. }) => Ok(()),
+        Ok(_)
+        | Err(CollectionRealizationError::Unmappable { .. })
+        | Err(CollectionRealizationError::UnauthorizedProducer { .. }) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -1213,6 +1235,74 @@ mod tests {
         assert_eq!(view.segment_count(), 1);
     }
 
+    /// A write's own commit must reach the fact pair every faculty reads
+    /// through, or the write says so. An unadmitted author's offline commit
+    /// is not yet anybody's to derive, so it is no error. A source writer
+    /// that may not write the views gets an error that counts its unreadable
+    /// writes and names the views, while other keys' writes are unaffected;
+    /// once it may write them, its next pass derives everything it wrote.
+    #[test]
+    fn ensure_downstream_reports_own_writes_that_no_reader_can_see() {
+        use triblespace::core::collection::grant_collection_write;
+
+        let owner = SigningKey::from_bytes(&[11; 32]);
+        let writer = SigningKey::from_bytes(&[12; 32]);
+        let mut store = MemoryRepo::default();
+        let source = crate::collection_names::open(
+            &mut store,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let (succinct, rank9) = fact_pair(&mut store, source).unwrap();
+        let lag = |store: &mut MemoryRepo| {
+            FactLag::of(&store.snapshot().unwrap(), source, succinct, rank9).unwrap()
+        };
+
+        store
+            .commit(source, &writer, entity! { metadata::name: "offline" })
+            .unwrap();
+        drop(pollster::block_on(ensure_downstream(&mut store, source, &writer)).unwrap());
+
+        grant_collection_write(&mut store, source.handle(), &owner, writer.verifying_key())
+            .unwrap();
+        store
+            .commit(
+                source,
+                &writer,
+                entity! { metadata::name: "source grant only" },
+            )
+            .unwrap();
+        let error = pollster::block_on(ensure_downstream(&mut store, source, &writer))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("2 of this key's writes reach no reader"),
+            "{error}"
+        );
+        for view in [succinct.handle(), rank9.handle()] {
+            assert!(error.contains(&hex::encode_upper(view.raw)), "{error}");
+        }
+
+        store
+            .commit(source, &owner, entity! { metadata::name: "owner" })
+            .unwrap();
+        drop(pollster::block_on(ensure_downstream(&mut store, source, &owner)).unwrap());
+        assert_eq!(
+            lag(&mut store),
+            FactLag {
+                succinct: 2,
+                rank9: 0
+            }
+        );
+
+        for view in [succinct.handle(), rank9.handle()] {
+            grant_collection_write(&mut store, view, &owner, writer.verifying_key()).unwrap();
+        }
+        drop(pollster::block_on(ensure_downstream(&mut store, source, &writer)).unwrap());
+        assert!(lag(&mut store).is_current(), "{:?}", lag(&mut store));
+    }
+
     #[test]
     fn fact_read_stands_for_nothing_beneath_unadmitted_commits_and_reads_the_rollup_once_they_are_admitted(
     ) {
@@ -1464,9 +1554,17 @@ where
 /// foundations the mapping cannot represent, such as a commit whose payload
 /// is not here, counts as realized: those foundations are its lag
 /// ([`tolerate_own_lag`]), and the pass goes on to every other derived
-/// collection instead of stopping at the first one that lags.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FacultiesRealizer;
+/// collection instead of stopping at the first one that lags. What each such
+/// target left behind is kept in [`Self::lagging`], so the caller, not the
+/// realizer, decides whether that lag is acceptable: a read attaches around
+/// it, a write refuses to call an unreadable commit done
+/// ([`ensure_downstream`]).
+#[derive(Clone, Debug, Default)]
+pub struct FacultiesRealizer {
+    /// Each target that left own foundations without a leaf, with each
+    /// foundation and the reason, in the order the targets were visited.
+    pub lagging: Vec<(CollectionHandle, Vec<(CollectionData, String)>)>,
+}
 
 impl<S> RealizeDerived<S> for FacultiesRealizer
 where
@@ -1485,7 +1583,10 @@ where
             CoreRealizer.realize(store, derived, signer, upkeep).await
         };
         match realized {
-            Err(CollectionRealizationError::Unmappable { .. }) => Ok(Realized::Done),
+            Err(CollectionRealizationError::Unmappable { blocked }) => {
+                self.lagging.push((derived.handle, blocked));
+                Ok(Realized::Done)
+            }
             realized => realized,
         }
     }
@@ -1525,7 +1626,10 @@ where
 /// it. A signer that owns nothing in the source publishes nothing, and the
 /// collection stays unlisted until some writer derives into it. `source` is
 /// the collection `target` derives from. Costs one listing when the target
-/// is already listed, which is every time but the first.
+/// is already listed, which is every time but the first. An own foundation
+/// the mapping cannot represent is the new view's lag, exactly as in a pass
+/// over a listed one ([`FacultiesRealizer`]), so it does not stop the write
+/// that seeds the view from reaching the others.
 pub async fn seed_derived<S, T>(
     pile: &mut S,
     target: Collection<T>,
@@ -1537,13 +1641,7 @@ where
     T: CollectionDerivation + MetaDescribe,
     Handle<T>: InlineEncoding,
 {
-    let listed = pile
-        .snapshot()
-        .context("freeze the store for its collection listing")?
-        .collections()
-        .map_err(|error| anyhow!("list the store's collections: {error}"))?
-        .contains(&target.handle());
-    if listed {
+    if listed(pile, target.handle())? {
         return Ok(Realized::Done);
     }
     // The realizer reads the mapping from the descriptors; the algorithm
@@ -1554,9 +1652,68 @@ where
         representation: <T as MetaDescribe>::id(),
         algorithm: None,
     };
-    realize_as::<S, T>(pile, &derived, signer, Upkeep::Ensure)
-        .await
-        .map_err(|error| anyhow!("seed a newly registered derived collection: {error}"))
+    match realize_as::<S, T>(pile, &derived, signer, Upkeep::Ensure).await {
+        Err(CollectionRealizationError::Unmappable { .. }) => Ok(Realized::Done),
+        realized => {
+            realized.map_err(|error| anyhow!("seed a newly registered derived collection: {error}"))
+        }
+    }
+}
+
+/// Whether the store lists `collection` yet: it has a record of its own.
+fn listed<S>(pile: &mut S, collection: CollectionHandle) -> Result<bool>
+where
+    S: Store,
+{
+    Ok(pile
+        .snapshot()
+        .context("freeze the store for its collection listing")?
+        .collections()
+        .map_err(|error| anyhow!("list the store's collections: {error}"))?
+        .contains(&collection))
+}
+
+/// [`seed_derived`] for the fact pair, through `realizer`, so what the pair
+/// could not derive is kept with everything else the pass leaves. Returns
+/// the views of the pair the signer may not write.
+async fn seed_fact_pair<S>(
+    pile: &mut S,
+    realizer: &mut FacultiesRealizer,
+    source: Collection<SimpleArchive>,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    signer: &SigningKey,
+) -> Result<Vec<CollectionHandle>>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
+    let mut unadmitted = Vec::new();
+    for derived in [
+        Derived {
+            handle: succinct.handle(),
+            source: source.handle(),
+            representation: <SuccinctArchiveBlob as MetaDescribe>::id(),
+            algorithm: None,
+        },
+        Derived {
+            handle: rank9.handle(),
+            source: succinct.handle(),
+            representation: <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id(),
+            algorithm: None,
+        },
+    ] {
+        if listed(pile, derived.handle)? {
+            continue;
+        }
+        let realized = realizer
+            .realize(pile, &derived, signer, Upkeep::Ensure)
+            .await
+            .map_err(|error| anyhow!("seed a newly registered derived collection: {error}"))?;
+        if realized == Realized::Unadmitted {
+            unadmitted.push(derived.handle);
+        }
+    }
+    Ok(unadmitted)
 }
 
 /// What a write does after its commit into `source`: register the Succinct
@@ -1569,6 +1726,19 @@ where
 /// each, and a locator lookup for each own one), plus the images of whatever
 /// is still owed. A view that lags on an own foundation the mapping cannot
 /// derive does not stop the pass ([`FacultiesRealizer`]).
+///
+/// The pass is not the verdict, though. Only the key that wrote a commit
+/// derives it, so a commit that did not reach the fact pair every faculty
+/// reads through reaches no reader at all, and a write that returned
+/// success then would be the silent write
+/// [`require_command_write_admission`](crate::collection_names::require_command_write_admission)
+/// exists to prevent. When the pair left something of the signer's out, a
+/// view it may not write or an own commit here the mapping refused, this
+/// returns an error naming how many writes are unreadable and why, after
+/// everything else was derived. A commit whose payload is not here, which
+/// nothing on this host could derive, stays lag. The commit itself stays in
+/// the source either way, and the signer derives it on its next write or
+/// maintenance once the cause is resolved.
 pub async fn ensure_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
@@ -1578,17 +1748,128 @@ where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
     let (succinct, rank9) = fact_pair(pile, source)?;
-    seed_derived(pile, succinct, source.handle(), signer).await?;
-    seed_derived(pile, rank9, succinct.handle(), signer).await?;
-    core_ensure_downstream(pile, source.handle(), signer, &mut FacultiesRealizer)
+    let mut realizer = FacultiesRealizer::default();
+    let mut unadmitted =
+        seed_fact_pair(pile, &mut realizer, source, succinct, rank9, signer).await?;
+    let report = core_ensure_downstream(pile, source.handle(), signer, &mut realizer)
         .await
-        .map_err(|error| anyhow!("ensure the collections derived from the source: {error}"))
+        .map_err(|error| anyhow!("ensure the collections derived from the source: {error}"))?;
+    let pair = [succinct.handle(), rank9.handle()];
+    unadmitted.extend(
+        report
+            .unadmitted
+            .iter()
+            .filter(|view| pair.contains(view))
+            .copied(),
+    );
+    // A view seeded in this pass is visited again by it, so it may have left
+    // the same foundations twice; the latest visit is the one to report.
+    let refused: Vec<_> = pair
+        .iter()
+        .filter_map(|view| {
+            realizer
+                .lagging
+                .iter()
+                .rfind(|(lagging, _)| lagging == view)
+        })
+        .collect();
+    if !unadmitted.is_empty() || !refused.is_empty() {
+        require_readable_writes(pile, source, succinct, rank9, signer, &unadmitted, &refused)?;
+    }
+    Ok(report)
+}
+
+/// Refuse a write when own commits whose payloads are here have no leaf in
+/// the fact pair: counted with the freshness API and the ownership rule, so
+/// exactly the writes the pass should have made readable and did not.
+fn require_readable_writes<S>(
+    pile: &mut S,
+    source: Collection<SimpleArchive>,
+    succinct: Collection<SuccinctArchiveBlob>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    signer: &SigningKey,
+    unadmitted: &[CollectionHandle],
+    refused: &[&(CollectionHandle, Vec<(CollectionData, String)>)],
+) -> Result<()>
+where
+    S: Store,
+{
+    let snapshot = pile
+        .snapshot()
+        .context("freeze the store to check this write's readability")?;
+    let key = signer.verifying_key();
+    let coverage = snapshot
+        .coverage(&BTreeSet::from([source.handle(), succinct.handle()]))
+        .context("read the fact pair's ownership")?;
+    let source_view = snapshot
+        .collection(source)
+        .context("attach the source collection")?;
+    let succinct_view = snapshot
+        .collection(succinct)
+        .context("attach the Succinct fact view")?;
+    let rank9_view = snapshot
+        .collection(rank9)
+        .context("attach the Rank9 fact view")?;
+    let own = |collection: CollectionHandle, raw: [u8; 32]| {
+        ownership::owns(&coverage, collection, Inline::new(raw), &key)
+    };
+    let unreadable = succinct_view
+        .missing_from(&source_view)
+        .context("compare the Succinct leaves with the source")?
+        .members()
+        .filter(|commit| own(source.handle(), commit.raw))
+        .count()
+        + rank9_view
+            .missing_from(&succinct_view)
+            .context("compare the Rank9 leaves with the Succinct view")?
+            .members()
+            .filter(|image| own(succinct.handle(), image.raw))
+            .count();
+    if unreadable == 0 {
+        return Ok(());
+    }
+    let mut causes = Vec::new();
+    if !unadmitted.is_empty() {
+        causes.push(format!(
+            "key {key} may not write the view(s) {views} of the source collection {source}, and \
+             only the key that wrote a commit derives it into a view (a WRITE grant on the \
+             source does not cover its views): grant that key WRITE on each of them",
+            key = hex::encode_upper(key.to_bytes()),
+            views = unadmitted
+                .iter()
+                .map(|view| hex::encode_upper(view.raw))
+                .collect::<Vec<_>>()
+                .join(", "),
+            source = hex::encode_upper(source.handle().raw),
+        ));
+    }
+    for (view, blocked) in refused {
+        causes.push(format!(
+            "the view {} cannot derive {} own foundation(s): {}",
+            hex::encode_upper(view.raw),
+            blocked.len(),
+            blocked
+                .iter()
+                .map(|(foundation, reason)| {
+                    format!("{} ({reason})", hex::encode_upper(foundation.raw))
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    Err(anyhow!(
+        "{unreadable} of this key's writes reach no reader: {}. They stay committed in the \
+         source, and this key derives them on its next write or maintenance once that is \
+         resolved",
+        causes.join("; "),
+    ))
 }
 
 /// Derive the signer's own leaves into every collection derived from
 /// `source` and mirror its own source merges there, each after its own
 /// source, as the maintenance daemon does. The pair is registered and seeded
-/// first, like [`ensure_downstream`].
+/// first, like [`ensure_downstream`]. An own foundation a view cannot derive
+/// is that view's lag and the pass goes on, as in [`FacultiesRealizer`].
 pub async fn maintain_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
@@ -1598,9 +1879,9 @@ where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
     let (succinct, rank9) = fact_pair(pile, source)?;
-    seed_derived(pile, succinct, source.handle(), signer).await?;
-    seed_derived(pile, rank9, succinct.handle(), signer).await?;
-    core_maintain_downstream(pile, source.handle(), signer, &mut FacultiesRealizer)
+    let mut realizer = FacultiesRealizer::default();
+    seed_fact_pair(pile, &mut realizer, source, succinct, rank9, signer).await?;
+    core_maintain_downstream(pile, source.handle(), signer, &mut realizer)
         .await
         .map_err(|error| anyhow!("maintain the collections derived from the source: {error}"))
 }

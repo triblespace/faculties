@@ -218,37 +218,18 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
     let relations_rank9 =
         pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
 
+    // Derive this key's own commits into each view. The roots are not
+    // acquired: a view is read as it stands, other windows' statuses reach it
+    // through their own derivations, and what nobody has derived yet is lag.
     pollster::block_on(async {
-        drop(
-            pile.ensure(status_source, signer)
-                .await
-                .context("ensure Status source collection")?,
-        );
-        drop(
-            pile.ensure(relations_source, signer)
-                .await
-                .context("ensure Relations source collection")?,
-        );
-        drop(
-            pile.maintain(status_succinct, signer)
-                .await
-                .context("maintain Status fact collection")?,
-        );
-        drop(
-            pile.maintain(status_rank9, signer)
-                .await
-                .context("maintain Status fact collection")?,
-        );
-        drop(
-            pile.maintain(relations_succinct, signer)
-                .await
-                .context("maintain Relations fact collection")?,
-        );
-        drop(
-            pile.maintain(relations_rank9, signer)
-                .await
-                .context("maintain Relations fact collection")?,
-        );
+        crate::storage::tolerate_own_lag(pile.maintain(status_succinct, signer).await)
+            .context("maintain Status fact collection")?;
+        crate::storage::tolerate_own_lag(pile.maintain(status_rank9, signer).await)
+            .context("maintain Status fact collection")?;
+        crate::storage::tolerate_own_lag(pile.maintain(relations_succinct, signer).await)
+            .context("maintain Relations fact collection")?;
+        crate::storage::tolerate_own_lag(pile.maintain(relations_rank9, signer).await)
+            .context("maintain Relations fact collection")?;
         Ok::<_, anyhow::Error>(())
     })?;
 
@@ -283,12 +264,14 @@ fn maintain_and_observe_relations(
     let collection_succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
     let collection_rank9 =
         pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)?;
-    let snapshot = pollster::block_on(async {
-        drop(pile.ensure(source, signer).await?);
-        drop(pile.maintain(collection_succinct, signer).await?);
-        pile.maintain(collection_rank9, signer).await
+    pollster::block_on(async {
+        crate::storage::tolerate_own_lag(pile.maintain(collection_succinct, signer).await)?;
+        crate::storage::tolerate_own_lag(pile.maintain(collection_rank9, signer).await)
     })
     .context("maintain Relations fact collection")?;
+    let snapshot = pile
+        .snapshot()
+        .context("freeze maintained Relations snapshot")?;
     let relations = snapshot
         .collection(collection_rank9)
         .context("observe Relations Rank9 collection")?

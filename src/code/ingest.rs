@@ -255,21 +255,14 @@ pub async fn ensure_facts(
     let rank9 = pile
         .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
         .context("register Rank9 Code fact collection")?;
-    drop(
-        pile.ensure(source, signer)
-            .await
-            .context("ensure Code source dependencies")?,
-    );
-    drop(
-        pile.maintain(succinct, signer)
-            .await
-            .context("maintain Succinct Code fact collection")?,
-    );
-    let after = pile
-        .maintain(rank9, signer)
-        .await
+    // Each hop derives this key's own commits. The root is not acquired: the
+    // view is read as it stands, and what it has not derived yet is lag.
+    crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+        .context("maintain Succinct Code fact collection")?;
+    crate::storage::tolerate_own_lag(pile.maintain(rank9, signer).await)
         .context("maintain Rank9 Code fact collection")?;
-    after
+    pile.snapshot()
+        .context("freeze maintained Code facts")?
         .collection(rank9)
         .context("attach Code fact collection")
 }

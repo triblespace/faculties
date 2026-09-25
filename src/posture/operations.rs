@@ -2103,7 +2103,6 @@ impl PostureStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = (|| {
                 // Register every descriptor before advancing the fact chains.
-                let mut sources = Vec::with_capacity(scopes.len());
                 let mut succinct = Vec::with_capacity(scopes.len());
                 let mut rank9 = Vec::with_capacity(scopes.len());
                 for (scope, label) in scopes {
@@ -2121,29 +2120,20 @@ impl PostureStorage<'_> {
                             policy,
                         )
                         .with_context(|| format!("register Rank9 Posture {label} collection"))?;
-                    sources.push(collection);
                     succinct.push(succinct_collection);
                     rank9.push(rank9_collection);
                 }
+                // Derive this key's own commits into each view. The roots
+                // are not acquired: a view is read as it stands, and what it
+                // lacks is lag.
                 pollster::block_on(async {
-                    for ((_, label), collection) in scopes.iter().zip(&sources) {
-                        drop(pile.ensure(*collection, signer).await.with_context(|| {
-                            format!("ensure Posture {label} source collection")
-                        })?);
-                    }
                     for (index, (_, label)) in scopes.iter().enumerate() {
-                        drop(
-                            pile.maintain(succinct[index], signer)
-                                .await
-                                .with_context(|| {
-                                    format!("maintain succinct Posture {label} collection")
-                                })?,
-                        );
-                        drop(
-                            pile.maintain(rank9[index], signer)
-                                .await
-                                .with_context(|| format!("maintain Posture {label} collection"))?,
-                        );
+                        crate::storage::tolerate_own_lag(
+                            pile.maintain(succinct[index], signer).await,
+                        )
+                        .with_context(|| format!("maintain succinct Posture {label} collection"))?;
+                        crate::storage::tolerate_own_lag(pile.maintain(rank9[index], signer).await)
+                            .with_context(|| format!("maintain Posture {label} collection"))?;
                     }
                     Ok::<_, anyhow::Error>(())
                 })?;

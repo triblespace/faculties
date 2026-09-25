@@ -397,8 +397,14 @@ fn print_fs_tree(
 
 // ── embedder seam (mary, behind `local-embed`) ────────────────────────────
 /// The compute class the Files semantic index is canonical on: the Sparks.
-/// The descriptor is the same from every machine, so one index exists; a
-/// machine of another class reads the rows that replicate to it.
+/// The descriptor is the same from every machine, so one index exists, and a
+/// machine of another class reads the rows that replicate to it. Rows exist
+/// only for files a key of this class wrote, though: the key that wrote a
+/// commit is the only one that derives it, and only this class computes, so
+/// a file another machine's key saved gets no rows anywhere until some
+/// ownership rule lets a machine of this class embed files it did not write.
+/// `files index` and `files similar` count those files instead of promising
+/// that replication will bring them.
 #[cfg(feature = "local-embed")]
 const SEMANTIC_COMPUTE: &str = "gb10";
 
@@ -424,6 +430,17 @@ fn semantic_index(descriptors: &PileSnapshot) -> Result<SemanticIndex<embeddings
     .map_err(|error| anyhow::anyhow!("describe the Files semantic index: {error}"))
 }
 
+/// What a Files commit without semantic rows means, for a reader: rows come
+/// only from the key that wrote a file, on the canonical compute.
+#[cfg(feature = "local-embed")]
+fn semantic_lag_note(unindexed: usize) -> String {
+    format!(
+        "note: {unindexed} Files commit(s) have no semantic rows. Only the key that wrote a \
+         file embeds it, on a {SEMANTIC_COMPUTE}: `files index` there covers that key's own \
+         files, and files another machine's key saved are not indexed at all"
+    )
+}
+
 /// Register the index descriptor (idempotent) and return its collection.
 #[cfg(feature = "local-embed")]
 fn semantic_target(
@@ -443,9 +460,10 @@ fn semantic_target(
         .context("register the Files semantic index")
 }
 
-/// Maintain the index: embed every Files member that has no rows yet (this
-/// machine must be the canonical compute) and return the snapshot that sees
-/// the result.
+/// Maintain the index: embed every Files commit this key wrote that has no
+/// rows yet (this machine must be the canonical compute) and return the
+/// snapshot that sees the result. Other keys' files are theirs to embed; the
+/// root is not acquired, since none of their payloads feeds a row here.
 #[cfg(feature = "local-embed")]
 fn maintain_semantic(
     store: &mut FacultyStore,
@@ -458,7 +476,10 @@ fn maintain_semantic(
 )> {
     if local_compute() != SEMANTIC_COMPUTE {
         bail!(
-            "the Files semantic index is computed on {SEMANTIC_COMPUTE} and this machine is {}; its rows arrive by replication",
+            "the Files semantic index is computed on {SEMANTIC_COMPUTE} and this machine is {}. \
+             Rows replicate here only for files a {SEMANTIC_COMPUTE} key wrote: the key that \
+             wrote a file is the only one that embeds it, so files this machine's key saved \
+             are not indexed",
             local_compute()
         );
     }
@@ -471,12 +492,6 @@ fn maintain_semantic(
     drop(frozen);
     let target = semantic_target(store, collection)?;
     let snapshot = runtime.block_on(async {
-        drop(
-            store
-                .ensure(collection, signer)
-                .await
-                .context("ensure Files source collection")?,
-        );
         store
             .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
             .await
@@ -1455,7 +1470,9 @@ fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
 /// pile, as rows of a derived NVFP4 cosine set keyed by file entity (see
 /// `triblespace_search::semantic`). Idempotent: members already derived are
 /// reused, only missing DERIVE work is computed. Only a machine of the
-/// canonical compute class computes; the rows replicate to the others.
+/// canonical compute class computes, and only for the files its own key
+/// wrote; the rows replicate to the others, and the report counts the Files
+/// commits that have none (`SEMANTIC_COMPUTE` says why).
 fn cmd_index(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
@@ -1488,6 +1505,11 @@ fn cmd_index(
             rows,
             SEMANTIC_COMPUTE
         ))?;
+        let unindexed = crate::storage::underived(&snapshot, collection, target)
+            .context("count Files commits without semantic rows")?;
+        if unindexed > 0 {
+            out.line(semantic_lag_note(unindexed))?;
+        }
         Ok(())
     }
 }
@@ -1943,10 +1965,13 @@ fn cmd_similar<P: TriblePattern>(
 
         // The index as it stands: a query is a read and never waits on the
         // GPU. `files add` maintains the rows of the file it just saved and
-        // `files index` the rest, on the canonical compute; elsewhere the rows
-        // arrive by replication. (Before 2026-09-13 a query on gb10 maintained
-        // the whole index first, and paid for every member whose bytes had
-        // arrived since the last build: minutes to hours before one answer.)
+        // `files index` the rest of its own key's files, on the canonical
+        // compute; elsewhere those rows arrive by replication, and files
+        // other keys wrote have none (see SEMANTIC_COMPUTE), which the
+        // query counts rather than hides. (Before 2026-09-13 a query on gb10
+        // maintained the whole index first, and paid for every member whose
+        // bytes had arrived since the last build: minutes to hours before
+        // one answer.)
         let target = semantic_target(store, collection)?;
         let snapshot = store
             .snapshot()
@@ -1957,10 +1982,16 @@ fn cmd_similar<P: TriblePattern>(
             .context("observe the Files semantic index")?
             .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
             .context("read the Files semantic index")?;
+        let unindexed = crate::storage::underived(&snapshot, collection, target)
+            .context("count Files commits without semantic rows")?;
         if index.is_empty() {
             bail!(
-                "the Files semantic index has no rows yet: run `files index` on a {SEMANTIC_COMPUTE}, or wait for its rows to replicate"
+                "the Files semantic index has no rows yet. {}",
+                semantic_lag_note(unindexed)
             );
+        }
+        if unindexed > 0 {
+            out.line(semantic_lag_note(unindexed))?;
         }
         if std::env::var_os("SEMANTIC_TRACE").is_some() {
             eprintln!(

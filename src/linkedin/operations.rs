@@ -319,16 +319,15 @@ impl RelationsStorage<'_> {
                     (),
                     policy,
                 )?;
-                drop(pile.ensure(collection, signer).await?);
-                drop(
-                    pile.maintain(maintained_succinct, signer)
-                        .await
-                        .context("maintain Relations fact collection")?,
-                );
-                let store_snapshot = pile
-                    .maintain(maintained_rank9, signer)
-                    .await
+                // Derive this key's own commits into each view; the root is
+                // not acquired, and what the views lack is lag.
+                crate::storage::tolerate_own_lag(pile.maintain(maintained_succinct, signer).await)
                     .context("maintain Relations fact collection")?;
+                crate::storage::tolerate_own_lag(pile.maintain(maintained_rank9, signer).await)
+                    .context("maintain Relations fact collection")?;
+                let store_snapshot = pile
+                    .snapshot()
+                    .context("freeze maintained Relations fact collection")?;
                 let observed = store_snapshot
                     .collection(maintained_rank9)
                     .context("observe Relations Rank9 projection")?;

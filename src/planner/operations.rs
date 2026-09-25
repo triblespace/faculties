@@ -320,12 +320,18 @@ impl PlannerStorage<'_> {
                     (),
                     policy,
                 )?;
-                let store_snapshot = pollster::block_on(async {
-                    drop(pile.ensure(source, signer).await?);
-                    drop(pile.maintain(collection_succinct, signer).await?);
-                    pile.maintain(collection_rank9, signer).await
+                // Derive this key's own commits into each view; the root is
+                // not acquired, and what the views lack is lag.
+                pollster::block_on(async {
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain(collection_succinct, signer).await,
+                    )?;
+                    crate::storage::tolerate_own_lag(pile.maintain(collection_rank9, signer).await)
                 })
                 .context("maintain Planner fact collection")?;
+                let store_snapshot = pile
+                    .snapshot()
+                    .context("freeze maintained Planner fact collection")?;
                 let facts = store_snapshot
                     .collection(collection_rank9)
                     .context("observe maintained Planner fact collection")?

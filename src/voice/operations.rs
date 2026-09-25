@@ -242,12 +242,18 @@ impl VoiceStorage<'_> {
                     (),
                     policy,
                 )?;
-                let store_snapshot = pollster::block_on(async {
-                    drop(pile.ensure(collection, signer).await?);
-                    drop(pile.maintain(maintained_succinct, signer).await?);
-                    pile.maintain(maintained_rank9, signer).await
+                // Derive this key's own commits into each view; the root is
+                // not acquired, and what the views lack is lag.
+                pollster::block_on(async {
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain(maintained_succinct, signer).await,
+                    )?;
+                    crate::storage::tolerate_own_lag(pile.maintain(maintained_rank9, signer).await)
                 })
                 .context("maintain Voice fact collection")?;
+                let store_snapshot = pile
+                    .snapshot()
+                    .context("freeze maintained Voice fact collection")?;
                 let facts = store_snapshot
                     .collection(maintained_rank9)
                     .context("observe maintained Voice fact collection")?

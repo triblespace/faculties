@@ -10,13 +10,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use hifitime::Epoch;
+use std::collections::BTreeSet;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
+
 use triblespace::core::collection::{
-    Collection, CollectionHandle, CollectionPolicy, CollectionRealizationError,
-    CollectionSnapshotExt, CollectionStoreExt,
+    Collection, CollectionEncoding, CollectionHandle, CollectionPolicy, CollectionRealizationError,
+    CollectionSnapshotExt, CollectionStoreExt, SourceLocator,
 };
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::SnapshotSource;
@@ -151,12 +153,36 @@ fn own_lag<T>(
     }
 }
 
+/// How many foundations `source` stands for in `snapshot`, whether or not
+/// their payloads are here, that `view` has no leaf for. A commit this
+/// reader never received is still missing from the view until its writer
+/// derives it, so it counts; each foundation is looked up by its locator in
+/// the view's own leaves.
+fn underived<R, S, T>(snapshot: &R, source: Collection<S>, view: Collection<T>) -> Result<usize>
+where
+    R: StoreRead,
+    S: CollectionEncoding,
+    T: CollectionEncoding,
+{
+    let foundations = source
+        .admitted(snapshot)
+        .context("read the foundations a view's source stands for")?;
+    let coverage = snapshot
+        .coverage(&BTreeSet::from([view.handle()]))
+        .context("read a view's leaves")?;
+    Ok(foundations
+        .members()
+        .filter(|foundation| !coverage.has_leaf(view.handle(), SourceLocator::of(foundation.raw)))
+        .count())
+}
+
 /// Attach the configured collection at one immutable store boundary.
 ///
 /// This never performs maintenance. It reports exactly the support physically
 /// realized in `snapshot`, preserving the snapshot/derivation boundary, and
 /// how far each encoding lags the one it derives from there: a commit nobody
-/// has derived yet is read as absent and counted, never waited for.
+/// has derived yet, its payload here or not, is read as absent and counted,
+/// never waited for.
 pub fn snapshot<R>(store_snapshot: R, collection: SecretsCollection) -> Result<SecretsSnapshot<R>>
 where
     R: StoreRead,
@@ -168,23 +194,12 @@ where
         .support()
         .context("resolve maintained Secrets snapshot support")?
         .clone();
-    let source = store_snapshot
-        .collection(collection.source)
-        .context("observe Secrets source collection")?;
-    let succinct = store_snapshot
-        .collection(collection.succinct)
-        .context("observe Succinct Secrets collection")?;
     let lag = SecretsLag {
-        succinct: succinct
-            .missing_from(&source)
-            .context("compare Succinct Secrets leaves with the source")?
-            .len(),
-        rank9: observed
-            .missing_from(&succinct)
-            .context("compare Rank9 Secrets leaves with Succinct")?
-            .len(),
+        succinct: underived(&store_snapshot, collection.source, collection.succinct)
+            .context("count Secrets source commits without a Succinct leaf")?,
+        rank9: underived(&store_snapshot, collection.succinct, collection.rank9)
+            .context("count Succinct Secrets images without a Rank9 leaf")?,
     };
-    drop((source, succinct));
     let facts = if observed.cover().is_empty() {
         None
     } else {
@@ -223,9 +238,9 @@ where
 /// cannot publish its leaves, and an own commit the mapping cannot represent
 /// or whose payload nobody can hand over is left without one; both still read
 /// the available target. The snapshot's [`SecretsSnapshot::lag`] counts the
-/// source commits this reader can see that the view has not derived; a
-/// payload that is not here is named by explicit maintenance instead. Other
-/// errors propagate. No merge is mirrored.
+/// admitted source commits the view has not derived, a commit whose payload
+/// is not here included, and explicit maintenance names why an own one was
+/// left. Other errors propagate. No merge is mirrored.
 pub async fn ensure_and_snapshot<S>(
     store: &mut S,
     collection: SecretsCollection,
@@ -749,9 +764,9 @@ mod tests {
 
     /// An own commit whose payload nobody can hand over has no leaf. The read
     /// still attaches what is present; the payload was asked for once and no
-    /// WANT was recorded. Lag is measured against the source commits this
-    /// reader can see, which excludes a payload that is not here, so the
-    /// commit is named by explicit maintenance instead.
+    /// WANT was recorded. The commit is admitted all the same, so the read
+    /// counts it as lag and a lookup of its secret says the view lags rather
+    /// than that the secret does not exist; explicit maintenance names why.
     #[test]
     fn ordinary_read_attaches_what_is_present_when_an_own_payload_is_nowhere() {
         pollster::block_on(async {
@@ -771,7 +786,15 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!observed.contains(secret));
-            assert!(observed.lag().is_current());
+            assert_eq!(
+                observed.lag(),
+                SecretsLag {
+                    succinct: 1,
+                    rank9: 0
+                }
+            );
+            let error = observed.open(secret, &owner).unwrap_err().to_string();
+            assert!(error.contains("lags its source"), "{error}");
             assert!(store.acquired.contains(&commit.data()));
             assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
 

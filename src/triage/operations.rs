@@ -135,7 +135,6 @@ impl TriageSnapshot {
         // Loading is deliberately strict: a diagnostic read must never mint a
         // new identity, create a pile, or admit somebody else's COMMITs.
         let mut registered = Vec::new();
-        let mut sources = Vec::new();
         let mut succinct = Vec::new();
         let mut rank9 = Vec::new();
         for (scope, label) in [
@@ -158,31 +157,19 @@ impl TriageSnapshot {
                 .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct_collection, (), policy)
                 .with_context(|| format!("register Rank9 {label} collection"))?;
             registered.push((scope, label));
-            sources.push(source);
             succinct.push(succinct_collection);
             rank9.push(rank9_collection);
         }
 
         let secrets_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
+        // Derive this key's own commits into each view. The roots are not
+        // acquired: a view is read as it stands, and what it lacks is lag.
         let secrets = pollster::block_on(async {
-            for ((_, label), source) in registered.iter().zip(&sources) {
-                drop(
-                    pile.ensure(*source, signer)
-                        .await
-                        .with_context(|| format!("ensure {label} source collection"))?,
-                );
-            }
             for (index, (_, label)) in registered.iter().enumerate() {
-                drop(
-                    pile.maintain(succinct[index], signer)
-                        .await
-                        .with_context(|| format!("maintain {label} succinct fact archive"))?,
-                );
-                drop(
-                    pile.maintain(rank9[index], signer)
-                        .await
-                        .with_context(|| format!("maintain {label} fact archive"))?,
-                );
+                crate::storage::tolerate_own_lag(pile.maintain(succinct[index], signer).await)
+                    .with_context(|| format!("maintain {label} succinct fact archive"))?;
+                crate::storage::tolerate_own_lag(pile.maintain(rank9[index], signer).await)
+                    .with_context(|| format!("maintain {label} fact archive"))?;
             }
             let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                 .await

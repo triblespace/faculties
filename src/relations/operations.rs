@@ -1045,21 +1045,23 @@ fn with_relations_view<T>(
     let facts_succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
     let facts_rank9 =
         pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
-    // Mutation preparation keeps its existing ensure/maintain contract. A
-    // read attaches what the maintenance worker has carried and never
-    // maintains, whoever the signer is.
-    let reader = if !read_only {
+    // Mutation preparation first derives this key's own commits into the
+    // views, so an update reads what this key already wrote. It prepares on
+    // the resident views as they then stand: another writer's pending update
+    // that nobody has derived yet is simply not seen, and nothing here
+    // reports it, because there is no complete state to wait for. A read
+    // attaches what is there and never maintains, whoever the signer is.
+    if !read_only {
         runtime
             .block_on(async {
-                drop(pile.ensure(collection, signer).await?);
-                drop(pile.maintain(facts_succinct, signer).await?);
-                pile.maintain(facts_rank9, signer).await
+                crate::storage::tolerate_own_lag(pile.maintain(facts_succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(pile.maintain(facts_rank9, signer).await)
             })
-            .context("maintain Relations fact collection")?
-    } else {
-        pile.snapshot()
-            .context("freeze resident Relations fact collection")?
-    };
+            .context("maintain Relations fact collection")?;
+    }
+    let reader = pile
+        .snapshot()
+        .context("freeze resident Relations fact collection")?;
     let observed = reader
         .collection(facts_rank9)
         .context("observe Relations Rank9 projection")?;
@@ -1286,8 +1288,9 @@ mod tests {
 
         // Preparation derives only what the preparer wrote. A non-writer owns
         // nothing here, so it publishes nothing and prepares on the resident
-        // view, where the owner's pending person is lag, not hidden: the
-        // freshness of the views names it.
+        // view, where the owner's pending person is simply not seen yet.
+        // Preparation does not report that; the views' freshness counts it
+        // for whoever asks, as this test does below.
         let mut mutation_prepared = false;
         with_relations_view(&mut pile, &reader, &runtime, source, false, |storage| {
             mutation_prepared = true;

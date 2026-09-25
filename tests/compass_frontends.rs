@@ -117,8 +117,14 @@ fn clean_child(command: &mut Command) {
     }
 }
 
+/// A writer with source WRITE and only READ on the rollups can still append:
+/// each action is committed. Only the key that wrote a commit derives it into
+/// a view, though, so no reader sees those actions until that key may write
+/// the views, and every command that appended one says so and exits nonzero
+/// instead of succeeding silently. Once the grants arrive, a pass with the
+/// writer's key derives them all.
 #[test]
-fn source_writer_appends_actions_with_lagging_read_only_rollups() {
+fn source_writer_appends_actions_and_is_told_no_reader_sees_them_until_granted() {
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
@@ -254,6 +260,34 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
             );
         command
     };
+    // Each append is committed and reported as reaching no reader; the
+    // count is every write of this key the views still lack.
+    let unreadable = |output: &std::process::Output, writes: usize| {
+        assert!(!output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("was committed"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("{writes} of this key's writes reach no reader")),
+            "{stderr}"
+        );
+        assert!(stderr.contains("grant that key WRITE"), "{stderr}");
+    };
+    // The goals the root holds, whether or not any view has them yet.
+    let root_goals = || {
+        let mut pile = Pile::open(&fixture.pile).unwrap();
+        let goals = compass::goal_ids(
+            &pile
+                .snapshot()
+                .unwrap()
+                .collection(source)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap(),
+        );
+        pile.close().unwrap();
+        goals
+    };
+    let goals_before = root_goals();
     let before = records();
     let added = command(&writer_key)
         .args([
@@ -266,22 +300,25 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
         ])
         .output()
         .unwrap();
-    assert!(added.status.success(), "{added:?}");
-    let added_text = String::from_utf8(added.stdout).unwrap();
-    let child = added_text
-        .lines()
-        .find_map(|line| line.strip_prefix("Added goal "))
-        .unwrap();
+    unreadable(&added, 1);
+    let child = root_goals()
+        .difference(&goals_before)
+        .map(|goal| format!("{goal:x}"))
+        .collect::<Vec<_>>();
+    let [child] = child.as_slice() else {
+        panic!("one appended goal, got {child:?}");
+    };
+    let child = child.as_str();
     let moved = command(&writer_key)
         .args(["move", &first_id, "doing"])
         .output()
         .unwrap();
-    assert!(moved.status.success(), "{moved:?}");
+    unreadable(&moved, 2);
     let noted = command(&writer_key)
         .args(["note", &first_id, "source-only research note"])
         .output()
         .unwrap();
-    assert!(noted.status.success(), "{noted:?}");
+    unreadable(&noted, 3);
     let after = records();
     let added_records: Vec<_> = after.difference(&before).copied().collect();
     assert_eq!(
@@ -332,7 +369,7 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
         .args(["note", child, "explicit full-ID forward reference"])
         .output()
         .unwrap();
-    assert!(forward_reference.status.success(), "{forward_reference:?}");
+    unreadable(&forward_reference, 4);
     let after_forward_reference = records();
     let forwarded: Vec<_> = after_forward_reference
         .difference(&after)
@@ -359,7 +396,7 @@ fn source_writer_appends_actions_with_lagging_read_only_rollups() {
         ])
         .output()
         .unwrap();
-    assert!(priority.status.success(), "{priority:?}");
+    unreadable(&priority, 5);
     let after_priority = records();
     let prioritized: Vec<_> = after_priority.difference(&after).copied().collect();
     assert_eq!(prioritized.len(), 1);

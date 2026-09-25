@@ -314,21 +314,12 @@ impl WebStorage<'_> {
 
                 let secrets_collection =
                     open_secrets_collection_read(pile, signer.verifying_key())?;
-                drop(
-                    pile.ensure(source, signer)
-                        .await
-                        .context("ensure Headspace source collection")?,
-                );
-                drop(
-                    pile.maintain(headspace_succinct, signer)
-                        .await
-                        .context("maintain Headspace fact collection")?,
-                );
-                drop(
-                    pile.maintain(headspace_rank9, signer)
-                        .await
-                        .context("maintain Headspace fact collection")?,
-                );
+                // Derive this key's own commits into each view; the root is
+                // not acquired, and what the views lack is lag.
+                crate::storage::tolerate_own_lag(pile.maintain(headspace_succinct, signer).await)
+                    .context("maintain Headspace fact collection")?;
+                crate::storage::tolerate_own_lag(pile.maintain(headspace_rank9, signer).await)
+                    .context("maintain Headspace fact collection")?;
 
                 let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                     .await

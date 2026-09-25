@@ -74,7 +74,8 @@ pub struct WrapRow {
 /// Each writer derives what it wrote, so a lagging hop is someone's
 /// derivation still to come or still to arrive by sync. There is no globally
 /// consistent state to be current against; a read attaches what is present
-/// and reports this, it never waits or refuses.
+/// and reports this, it never waits or refuses. Every admitted foundation
+/// counts, whether or not its payload is here.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SecretsLag {
     /// Source commits without a Succinct leaf.
@@ -84,7 +85,7 @@ pub struct SecretsLag {
 }
 
 impl SecretsLag {
-    /// Whether every source foundation this snapshot sees has reached Rank9.
+    /// Whether every source foundation this snapshot admits has reached Rank9.
     pub const fn is_current(self) -> bool {
         self.succinct == 0 && self.rank9 == 0
     }

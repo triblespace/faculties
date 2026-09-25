@@ -60,7 +60,8 @@ pub type ArchiveBM25View = PortableBM25View<GenId, WordHash>;
 #[derive(Debug)]
 enum DeriveValidation {
     Ready(Blob<PortableBM25Blob>),
-    Pending,
+    /// A selected text payload is not resident; the first one, by handle.
+    Pending(Inline<Handle<UTF8String>>),
     Rejected(String),
 }
 
@@ -113,6 +114,16 @@ impl CollectionMapping for ArchiveBlockTextBm25Mapping {
         Ok(Self)
     }
 
+    /// Map one source element, classifying what stops it by what could
+    /// still change the answer. A selected text payload that is not here is a
+    /// dependency the store may fetch, after which the map runs again. An
+    /// element this law cannot index as one member, such as a block whose
+    /// part and fact closure sits in another commit, is refused as that
+    /// element's capacity: every other element is still derived, the refused
+    /// one stays lag, explicit maintenance names it, and a coarser cover
+    /// that holds the whole closure may still represent it. Only a failure
+    /// to read the store is fatal, because that is the one thing no other
+    /// element or cover can get around.
     fn map<R>(
         &self,
         source: &Blob<SimpleArchive>,
@@ -121,8 +132,16 @@ impl CollectionMapping for ArchiveBlockTextBm25Mapping {
     where
         R: BlobStoreGet + BlobStoreMeta,
     {
-        derive_element(reader, source.clone())
-            .map_err(|error| CollectionOperationError::Fatal(format!("{error:#}")))
+        match derive_for_validation(reader, source.clone()) {
+            Ok(DeriveValidation::Ready(blob)) => Ok(blob),
+            Ok(DeriveValidation::Pending(payload)) => Err(
+                CollectionOperationError::MissingDependency(Inline::new(payload.raw)),
+            ),
+            Ok(DeriveValidation::Rejected(reason)) => Err(CollectionOperationError::Capacity(
+                format!("invalid Archive BM25 source: {reason}"),
+            )),
+            Err(error) => Err(CollectionOperationError::Fatal(format!("{error:#}"))),
+        }
     }
 }
 
@@ -143,7 +162,10 @@ where
 {
     match derive_for_validation(reader, source)? {
         DeriveValidation::Ready(blob) => Ok(blob),
-        DeriveValidation::Pending => bail!("Archive BM25 source has a nonresident text payload"),
+        DeriveValidation::Pending(payload) => bail!(
+            "Archive BM25 source has a nonresident text payload {}",
+            hex::encode_upper(payload.raw)
+        ),
         DeriveValidation::Rejected(reason) => bail!("invalid Archive BM25 source: {reason}"),
     }
 }
@@ -166,10 +188,10 @@ where
         .flat_map(|payloads| payloads.iter().copied())
         .collect();
     let mut token_cache = BTreeMap::new();
-    let mut missing = false;
+    let mut missing = None;
     for handle in handles {
         if reader.metadata(handle)?.is_none() {
-            missing = true;
+            missing.get_or_insert(handle);
             continue;
         }
         let blob: Blob<UTF8String> = reader.get(handle)?;
@@ -184,8 +206,8 @@ where
         };
         token_cache.insert(handle.raw, hash_tokens(text.as_ref()));
     }
-    if missing {
-        return Ok(DeriveValidation::Pending);
+    if let Some(payload) = missing {
+        return Ok(DeriveValidation::Pending(payload));
     }
 
     let documents: Vec<Inline<GenId>> = plan.documents.keys().map(IntoInline::to_inline).collect();

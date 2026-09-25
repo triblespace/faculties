@@ -731,8 +731,15 @@ impl ReceiptSource {
     /// report an event it already reported. The background maintainer derives
     /// the same projection; this call only closes the window between the commit
     /// and that maintainer's next pass. A signer without WRITE attaches the
-    /// projection as it stands.
-    async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
+    /// projection as it stands. Both the ordinary path and the resident-only
+    /// health path call this, each with its own store, so the two cannot
+    /// disagree about what counts as lag.
+    async fn maintain<S>(&self, pile: &mut S, signer: &SigningKey) -> Result<()>
+    where
+        S: triblespace::core::repo::Store
+            + triblespace::core::repo::async_store::AsyncBlobStoreAcquire
+            + Send,
+    {
         let snapshot = pile
             .snapshot()
             .context("freeze Orient receipt projection authority")?;
@@ -4582,12 +4589,10 @@ async fn cmd_wake(
             .writer_is_admitted(&storage.snapshot()?, signer.verifying_key())
             .context("check Wiki supersession WRITE admission")?
         {
-            drop(
-                storage
-                    .maintain(wiki_latest, signer)
-                    .await
-                    .context("maintain Wiki supersession index")?,
-            );
+            // An own revision the index cannot derive is its lag, exactly as
+            // it is for the Wiki facts just above; wake reads what is here.
+            crate::storage::tolerate_own_lag(storage.maintain(wiki_latest, signer).await)
+                .context("maintain Wiki supersession index")?;
         }
         let snapshot = storage
             .snapshot()
@@ -5443,8 +5448,12 @@ mod tests {
             // and making it visible does not depend on the historical gap:
             // all ordinary receipt readers accept the resident set. The gap is
             // this signer's own receipt, so under "derive what you wrote" the
-            // projection asks once for its payload; nothing arrives, no WANT
-            // is recorded, and the gap stays lag.
+            // projection asks the network for its payload, which starts the
+            // host; nothing arrives, no WANT is recorded, and the gap stays
+            // lag. Nothing remembers that the payload was unavailable, so
+            // every pass that still owes this leaf asks again: a known cost of
+            // foreground upkeep that this test pins the existence of, not its
+            // frequency.
             sources
                 .presentations
                 .maintain(&mut pile, &fixture.signer)

@@ -1164,8 +1164,14 @@ mod tests {
         pile.close().unwrap();
     }
 
+    /// A writer with source WRITE but none on the views can still append:
+    /// its send and ack are committed. Only the key that wrote a commit
+    /// derives it into a view, though, so no reader sees either until that
+    /// key may write the views, and each command says so instead of
+    /// succeeding silently. Once the grants arrive, the sender's next pass
+    /// derives both and every reader sees them.
     #[test]
-    fn source_only_writer_sends_and_acknowledges_without_derived_write() {
+    fn source_only_writer_is_told_its_sends_and_acks_reach_no_reader_until_granted() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -1266,7 +1272,7 @@ mod tests {
             messages: &message_facts,
             relations: &relation_facts,
         };
-        let sent = runtime
+        let error = runtime
             .block_on(send(
                 &mut input,
                 &SendOptions {
@@ -1275,12 +1281,21 @@ mod tests {
                     text: "published without index WRITE",
                 },
             ))
-            .unwrap();
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("was committed"), "{error}");
         assert!(
-            !runtime
-                .block_on(ack(&mut input, &fmt_id(first_id), "sender"))
-                .unwrap()
-                .already_read
+            error.contains("1 of this key's writes reach no reader"),
+            "{error}"
+        );
+        assert!(error.contains("grant that key WRITE"), "{error}");
+        let error = runtime
+            .block_on(ack(&mut input, &fmt_id(first_id), "sender"))
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("2 of this key's writes reach no reader"),
+            "{error}"
         );
         let after = pile
             .snapshot()
@@ -1297,8 +1312,7 @@ mod tests {
         )));
 
         // The owner's worker derives only what the owner wrote: the sender's
-        // two commits are the views' lag, and the owner reads its own
-        // message alone.
+        // two commits are the views' lag, counted as such.
         carry(&mut pile, &runtime, message_source, &owner);
         let lag = {
             let snapshot = pile.snapshot().unwrap();
@@ -1354,15 +1368,9 @@ mod tests {
             .block_on(list(&mut input, &ListOptions::new("sender")))
             .unwrap();
         assert_eq!(listed.entries.len(), 2);
-        assert_eq!(
-            listed
-                .entries
-                .iter()
-                .find(|entry| entry.id == sent.id)
-                .unwrap()
-                .body,
-            MessageText::Text("published without index WRITE".to_owned())
-        );
+        assert!(listed.entries.iter().any(
+            |entry| entry.body == MessageText::Text("published without index WRITE".to_owned())
+        ));
         assert!(pile.health().started_at.is_none());
         pile.close().unwrap();
     }
