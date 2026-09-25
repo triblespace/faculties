@@ -422,13 +422,13 @@ fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
 }
 
 /// A writer with source WRITE and only READ on the rollups can still create,
-/// import and edit: each revision is committed. Only the key that wrote a
-/// commit derives it into a view, though, so no reader sees those revisions
-/// until that key may write the views, and every command that committed one
-/// says so and exits nonzero instead of succeeding silently. Once the grants
-/// arrive, a pass with the writer's key derives them all.
+/// import and edit: each revision is committed. A write derives only its own
+/// key's commits, so no reader sees those revisions yet, and every command
+/// that committed one says so and exits nonzero instead of succeeding
+/// silently. The owner's next maintenance pass derives them all, without any
+/// grant.
 #[test]
-fn source_writer_commits_revisions_and_is_told_no_reader_sees_them_until_granted() {
+fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
     use std::collections::BTreeSet;
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -631,33 +631,19 @@ fn source_writer_commits_revisions_and_is_told_no_reader_sees_them_until_granted
     let after = after_edit;
     assert_eq!(records(), after);
 
-    // The owner's worker derives only what the owner wrote, so the writer's
-    // source commits stay the views' lag and the owner's read does not see
-    // them: a read attaches and never maintains.
+    // A read attaches and never maintains, so the owner's read does not see
+    // the writer's revisions yet.
+    let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
+    assert!(!listing.contains("imported by source writer"));
+
+    // The owner's worker derives them anyway: a derive is a function, so the
+    // owner's read sees them without any grant.
     faculties::storage::carry_scope(
         &fixture.pile,
         Some(&fixture.key),
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
     )
     .unwrap();
-    let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
-    assert!(!listing.contains("imported by source writer"));
-
-    // Once the writer may write the views, a worker running with its key
-    // derives its own commits, and only then does the owner's read see them.
-    let mut pile = Pile::open(&fixture.pile).unwrap();
-    let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-    let succinct = pile
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
-    let rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-        .unwrap();
-    for target in [succinct.handle(), rank9.handle(), latest.handle()] {
-        grant_collection_write(&mut pile, target, &owner, writer.verifying_key()).unwrap();
-    }
-    faculties::storage::carry_facts(&mut pile, source, &writer);
-    pile.close().unwrap();
     let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
     assert!(listing.contains("source writer"));
     assert!(listing.contains("imported by source writer"));

@@ -1727,18 +1727,19 @@ where
 /// is still owed. A view that lags on an own foundation the mapping cannot
 /// derive does not stop the pass ([`FacultiesRealizer`]).
 ///
-/// The pass is not the verdict, though. Only the key that wrote a commit
-/// derives it, so a commit that did not reach the fact pair every faculty
-/// reads through reaches no reader at all, and a write that returned
-/// success then would be the silent write
+/// The pass is not the verdict, though. A write derives only its own key's
+/// commits, so a commit that did not reach the fact pair every faculty reads
+/// through reaches no reader until a key the views admit maintains them (a
+/// derive is a function, and the maintenance daemon derives what any writer
+/// left), and a write that returned success then would be the silent write
 /// [`require_command_write_admission`](crate::collection_names::require_command_write_admission)
 /// exists to prevent. When the pair left something of the signer's out, a
 /// view it may not write or an own commit here the mapping refused, this
 /// returns an error naming how many writes are unreadable and why, after
 /// everything else was derived. A commit whose payload is not here, which
 /// nothing on this host could derive, stays lag. The commit itself stays in
-/// the source either way, and the signer derives it on its next write or
-/// maintenance once the cause is resolved.
+/// the source either way; the signer derives it on its next write once the
+/// cause is resolved, and any admitted maintainer on its next pass.
 pub async fn ensure_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
@@ -1831,9 +1832,10 @@ where
     let mut causes = Vec::new();
     if !unadmitted.is_empty() {
         causes.push(format!(
-            "key {key} may not write the view(s) {views} of the source collection {source}, and \
-             only the key that wrote a commit derives it into a view (a WRITE grant on the \
-             source does not cover its views): grant that key WRITE on each of them",
+            "key {key} may not write the view(s) {views} of the source collection {source}, so \
+             this write cannot derive its own commits into them (a WRITE grant on the source \
+             does not cover its views): grant that key WRITE on each of them, or leave them \
+             to the next pass of a maintainer the views admit",
             key = hex::encode_upper(key.to_bytes()),
             views = unadmitted
                 .iter()
@@ -1858,9 +1860,9 @@ where
         ));
     }
     Err(anyhow!(
-        "{unreadable} of this key's writes reach no reader: {}. They stay committed in the \
-         source, and this key derives them on its next write or maintenance once that is \
-         resolved",
+        "{unreadable} of this key's writes reach no reader yet: {}. They stay committed in \
+         the source; any maintainer the views admit derives them on its next pass, and this \
+         key does on its next write once that is resolved",
         causes.join("; "),
     ))
 }

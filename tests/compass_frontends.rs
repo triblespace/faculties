@@ -118,13 +118,13 @@ fn clean_child(command: &mut Command) {
 }
 
 /// A writer with source WRITE and only READ on the rollups can still append:
-/// each action is committed. Only the key that wrote a commit derives it into
-/// a view, though, so no reader sees those actions until that key may write
-/// the views, and every command that appended one says so and exits nonzero
-/// instead of succeeding silently. Once the grants arrive, a pass with the
-/// writer's key derives them all.
+/// each action is committed. A write derives only its own key's commits, so
+/// no reader sees those actions yet, and every command that appended one says
+/// so and exits nonzero instead of succeeding silently. The owner's next
+/// maintenance pass derives them without any grant; once the grants arrive,
+/// the writer's own commands succeed.
 #[test]
-fn source_writer_appends_actions_and_is_told_no_reader_sees_them_until_granted() {
+fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
@@ -408,38 +408,9 @@ fn source_writer_appends_actions_and_is_told_no_reader_sees_them_until_granted()
     let after = after_priority;
     assert_eq!(records(), after);
 
-    // The owner's worker derives only what the owner wrote: the writer's
-    // appended actions are the views' lag, and the owner's reads do not see
-    // them yet.
+    // The owner's worker derives the writer's actions too: a derive is a
+    // function, so the owner's reads see them without any grant.
     fixture.carry();
-    let listing = fixture
-        .operations()
-        .list(ListOptions {
-            all: true,
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(!listing.contains("appended child"));
-
-    // Once the writer may write the views, a worker running with its key
-    // derives its own actions; only now do the owner's reads, and the
-    // writer's prefix resolution, see them.
-    {
-        let mut pile = Pile::open(&fixture.pile).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
-        let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-            .unwrap();
-        for target in [succinct.handle(), rank9.handle(), status.handle()] {
-            grant_collection_write(&mut pile, target, &owner, writer.verifying_key()).unwrap();
-        }
-        carry_facts(&mut pile, source, &writer);
-        pollster::block_on(async { drop(pile.maintain(status, &writer).await.unwrap()) });
-        pile.close().unwrap();
-    }
     let listing = fixture
         .operations()
         .list(ListOptions {
@@ -453,6 +424,23 @@ fn source_writer_appends_actions_and_is_told_no_reader_sees_them_until_granted()
         .show(&first_id)
         .unwrap()
         .contains("source-only research note"));
+
+    // Once the writer may write the views, its own writes derive themselves
+    // and its commands succeed.
+    {
+        let mut pile = Pile::open(&fixture.pile).unwrap();
+        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
+        let succinct = pile
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let rank9 = pile
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .unwrap();
+        for target in [succinct.handle(), rank9.handle(), status.handle()] {
+            grant_collection_write(&mut pile, target, &owner, writer.verifying_key()).unwrap();
+        }
+        pile.close().unwrap();
+    }
     let now_visible = command(&writer_key)
         .args(["note", child_prefix, "after remote maintenance"])
         .output()

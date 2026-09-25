@@ -559,8 +559,9 @@ mod tests {
     /// grants, payloads or metadata reads nothing, owes nothing and fetches
     /// nothing. Once the writer's grants on the two encodings arrive, the
     /// leaves are read at once, still without the source grant or the
-    /// payload. A Rank9 leaf the writer has not published yet is lag that no
-    /// other key can fill.
+    /// payload. A Rank9 leaf the writer has not published yet is lag for a
+    /// read, which ensures only its own key's leaves; maintenance by an
+    /// admitted key fills it from the resident Succinct image.
     #[test]
     fn ordinary_reads_stand_on_the_encodings_own_writers_without_source_proof_or_payloads() {
         pollster::block_on(async {
@@ -683,11 +684,14 @@ mod tests {
                     .contains_blob(Handle::<UnknownBlob>::from_hash(commit.data()))
                     .unwrap());
 
+                // Maintenance by an admitted key fills a Rank9 leaf the writer
+                // left, from the Succinct image already here: a derive is a
+                // function, and nothing is fetched to compute it.
                 let maintained = maintain_and_snapshot(&mut store, collection, &authority)
                     .await
                     .unwrap();
-                assert_eq!(maintained.contains(secret), rank9_ready);
-                assert_eq!(maintained.support(), observed.support());
+                assert!(maintained.contains(secret));
+                assert_eq!(maintained.support().len(), 1);
                 assert!(store.acquired.is_empty());
             }
         });

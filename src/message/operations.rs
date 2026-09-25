@@ -1165,13 +1165,13 @@ mod tests {
     }
 
     /// A writer with source WRITE but none on the views can still append:
-    /// its send and ack are committed. Only the key that wrote a commit
-    /// derives it into a view, though, so no reader sees either until that
-    /// key may write the views, and each command says so instead of
-    /// succeeding silently. Once the grants arrive, the sender's next pass
-    /// derives both and every reader sees them.
+    /// its send and ack are committed. A write derives only its own key's
+    /// commits, and this key may not write the views, so no reader sees
+    /// either yet and each command says so instead of succeeding silently.
+    /// The owner's next maintenance pass derives both, without any grant,
+    /// and every reader sees them.
     #[test]
-    fn source_only_writer_is_told_its_sends_and_acks_reach_no_reader_until_granted() {
+    fn source_only_writer_is_told_its_sends_and_acks_wait_for_maintenance() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
@@ -1311,10 +1311,8 @@ mod tests {
             CollectionRecord::Commit(commit) if commit.collection() == message_source.handle()
         )));
 
-        // The owner's worker derives only what the owner wrote: the sender's
-        // two commits are the views' lag, counted as such.
-        carry(&mut pile, &runtime, message_source, &owner);
-        let lag = {
+        // The sender's two commits are the views' lag, counted as such.
+        let lag = |pile: &mut FacultyStore| {
             let snapshot = pile.snapshot().unwrap();
             let policy = message_source.policy(&snapshot).unwrap();
             let succinct = pile
@@ -1326,28 +1324,17 @@ mod tests {
             storage::FactLag::of(&snapshot, message_source, succinct, rank9).unwrap()
         };
         assert_eq!(
-            lag,
+            lag(&mut pile),
             storage::FactLag {
                 succinct: 2,
                 rank9: 0
             }
         );
 
-        // Once the sender may write the views, it derives its own writes and
-        // any reader then sees them.
-        let snapshot = pile.snapshot().unwrap();
-        let policy = message_source.policy(&snapshot).unwrap();
-        drop(snapshot);
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(message_source, (), policy.clone())
-            .unwrap();
-        let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-            .unwrap();
-        for target in [succinct.handle(), rank9.handle()] {
-            grant_collection_write(&mut pile, target, &owner, sender.verifying_key()).unwrap();
-        }
-        carry(&mut pile, &runtime, message_source, &sender);
+        // The owner's worker derives them anyway: a derive is a function, so
+        // no grant is needed for every reader to see them.
+        carry(&mut pile, &runtime, message_source, &owner);
+        assert!(lag(&mut pile).is_current(), "{:?}", lag(&mut pile));
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
