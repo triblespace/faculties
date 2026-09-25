@@ -12,7 +12,8 @@ use clap::Parser;
 use faculties::collection_names::open_configured;
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::message::{
-    cli, mcp, AckAllOptions, ListOptions, Message, MessageStatus, Recipient, SendOptions,
+    cli, mcp, AckAllOptions, ListOptions, Message, MessageStatus, MessageText, Recipient,
+    SendOptions,
 };
 use faculties::out::{Out, Part};
 use faculties::relations::{self, ProfileInput};
@@ -433,7 +434,10 @@ fn settled_identity_shares_receipts_without_rewriting_attribution() {
         (fixture.alice, fixture.bob)
     );
     assert_eq!(observed.entries[0].status, MessageStatus::Read);
-    assert_eq!(observed.entries[0].body, "@- is literal in the library too");
+    assert_eq!(
+        observed.entries[0].body,
+        MessageText::Text("@- is literal in the library too".to_owned())
+    );
 }
 
 #[test]
@@ -452,7 +456,10 @@ fn mcp_text_is_literal_and_sender_and_host_configuration_are_never_implicit() {
     let received = fixture.messages().list(&ListOptions::new("Bob")).unwrap();
     assert_eq!(received.entries.len(), 2);
     for literal in ["@-", literal_path.as_str()] {
-        assert!(received.entries.iter().any(|entry| entry.body == literal));
+        assert!(received
+            .entries
+            .iter()
+            .any(|entry| entry.body == MessageText::Text(literal.to_owned())));
     }
     assert!(received
         .entries
@@ -611,11 +618,13 @@ fn cli_keeps_persona_file_and_stdin_text_conventions() {
     assert!(received
         .entries
         .iter()
-        .any(|entry| entry.from == fixture.alice && entry.body == "from a CLI file\n"));
+        .any(|entry| entry.from == fixture.alice
+            && entry.body == MessageText::Text("from a CLI file\n".to_owned())));
     assert!(received
         .entries
         .iter()
-        .any(|entry| entry.from == fixture.cara && entry.body == "from CLI stdin\n"));
+        .any(|entry| entry.from == fixture.cara
+            && entry.body == MessageText::Text("from CLI stdin\n".to_owned())));
     let output = fixture
         .command()
         .args(["send", "Bob", "no sender"])
@@ -646,5 +655,8 @@ fn emission_failure_does_not_retry_a_completed_send() {
     assert_eq!(fixture.message_commits(), before + 1);
     let received = fixture.messages().list(&ListOptions::new("Bob")).unwrap();
     assert_eq!(received.entries.len(), 1);
-    assert_eq!(received.entries[0].body, "one publication");
+    assert_eq!(
+        received.entries[0].body,
+        MessageText::Text("one publication".to_owned())
+    );
 }
