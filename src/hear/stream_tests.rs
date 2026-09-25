@@ -4,7 +4,7 @@ use anyhow::Result;
 use framed_stream::{EndStatus, FramedReader, FramedWriter, UNIT_BYTES, UNIT_SAMPLES};
 
 use crate::hear::stream::{self, Event, PcmFormat};
-use crate::hear::{process_pcm16k, Backend, Heard, Observation, Options, HEAR_RATE};
+use crate::hear::{process_pcm16k, Backend, Heard, Observation, Options, Outcome, HEAR_RATE};
 
 const F32: &str = "audio/x-pcm;format=f32le;rate=16000;channels=1";
 const S16: &str = "audio/x-pcm;format=s16le;rate=16000;channels=1";
@@ -25,6 +25,7 @@ impl Backend for Fake {
             hidden: 2,
             rows: vec![0.25, -0.5],
             text: None,
+            token_limit_reached: false,
         })
     }
 }
@@ -87,19 +88,17 @@ fn pcm_stream(samples: &[f32], content_type: &str, status: EndStatus) -> Vec<u8>
 }
 
 fn capture(bytes: &[u8]) -> (Result<()>, Fake, Vec<Event>) {
+    capture_with_options(bytes, &Options::default())
+}
+
+fn capture_with_options(bytes: &[u8], options: &Options) -> (Result<()>, Fake, Vec<Event>) {
     let mut backend = Fake::default();
     let mut events = Vec::new();
     let result = FramedReader::open(bytes).and_then(|reader| {
-        stream::process(
-            reader,
-            &mut backend,
-            "speaker",
-            &Options::default(),
-            &mut |event| {
-                events.push(event);
-                Ok(())
-            },
-        )
+        stream::process(reader, &mut backend, "speaker", options, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
     });
     (result, backend, events)
 }
@@ -178,6 +177,89 @@ fn complete_flushes_the_speech_tail_including_pending_samples_once() {
     assert_eq!(events.len(), 2);
     assert!(matches!(events[0], Event::Utterance { .. }));
     assert!(matches!(events[1], Event::Complete));
+}
+
+#[test]
+fn complete_preserves_short_cap_continuation_when_duration_filter_allows_it() {
+    let cap_samples = HEAR_RATE * 28;
+    let mut options = Options::default();
+    options.filter.min_dur_s = 0.0;
+    // The 10 ms tail is smaller than one VAD frame, let alone the three
+    // frames needed to detect a new speech run after a genuine endpoint.
+    for tail_samples in [HEAR_RATE / 100, HEAR_RATE / 5] {
+        let wave = tone(cap_samples + tail_samples, 0.3);
+        let (result, backend, events) =
+            capture_with_options(&pcm_stream(&wave, F32, EndStatus::Complete), &options);
+        result.unwrap();
+        assert_eq!(backend.clips.len(), 2);
+        assert_eq!(backend.clips[0].as_slice(), &wave[..cap_samples]);
+        assert_eq!(backend.clips[1].as_slice(), &wave[cap_samples..]);
+        let actual = observations(&events);
+        assert_eq!(actual.len(), 2);
+        assert!(actual.iter().all(|observation| observation.kept()));
+        assert_eq!(actual[0].start_s, 0.0);
+        assert_eq!(actual[0].end_s, 28.0);
+        assert_eq!(actual[1].start_s, 28.0);
+        assert!((actual[1].end_s - wave.len() as f64 / HEAR_RATE as f64).abs() < 1e-10);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[2], Event::Complete));
+    }
+}
+
+#[test]
+fn default_duration_filter_reports_short_cap_continuation_as_dropped() {
+    let cap_samples = HEAR_RATE * 28;
+    for tail_samples in [HEAR_RATE / 100, HEAR_RATE / 5] {
+        let wave = tone(cap_samples + tail_samples, 0.3);
+        let (result, backend, events) = capture(&pcm_stream(&wave, F32, EndStatus::Complete));
+        result.unwrap();
+        assert_eq!(
+            backend.clips.len(),
+            1,
+            "short tail must not reach the model"
+        );
+        assert_eq!(backend.clips[0].as_slice(), &wave[..cap_samples]);
+        let actual = observations(&events);
+        assert_eq!(actual.len(), 2, "short tail must not disappear silently");
+        assert!(actual[0].kept());
+        assert_eq!(actual[1].start_s, 28.0);
+        assert!((actual[1].end_s - wave.len() as f64 / HEAR_RATE as f64).abs() < 1e-10);
+        assert!(matches!(
+            &actual[1].outcome,
+            Outcome::Dropped { reason, text: None } if reason == "too-short-segment"
+        ));
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[2], Event::Complete));
+    }
+}
+
+#[test]
+fn complete_at_an_exact_cap_boundary_never_emits_an_empty_tail() {
+    let cap_samples = HEAR_RATE * 28;
+    let mut options = Options::default();
+    options.filter.min_dur_s = 0.0;
+    for chunks in [1, 2] {
+        let wave = tone(cap_samples * chunks, 0.3);
+        let (result, backend, events) =
+            capture_with_options(&pcm_stream(&wave, F32, EndStatus::Complete), &options);
+        result.unwrap();
+        assert_eq!(backend.clips.len(), chunks);
+        for (index, clip) in backend.clips.iter().enumerate() {
+            assert_eq!(
+                clip.as_slice(),
+                &wave[index * cap_samples..(index + 1) * cap_samples]
+            );
+        }
+        let actual = observations(&events);
+        assert_eq!(actual.len(), chunks);
+        for (index, observation) in actual.iter().enumerate() {
+            assert!(observation.kept());
+            assert_eq!(observation.start_s, (index * 28) as f64);
+            assert_eq!(observation.end_s, ((index + 1) * 28) as f64);
+        }
+        assert_eq!(events.len(), chunks + 1);
+        assert!(matches!(events.last(), Some(Event::Complete)));
+    }
 }
 
 #[test]

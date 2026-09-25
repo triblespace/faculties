@@ -5,7 +5,6 @@ pub(super) struct VadConfig {
     frame_ms: usize,
     start_frames: usize,
     hangover_ms: usize,
-    min_utt_ms: usize,
     max_utt_s: f32,
     ratio: f32,
     abs_floor: f32,
@@ -18,7 +17,6 @@ impl Default for VadConfig {
             frame_ms: 20,
             start_frames: 3,
             hangover_ms: 700,
-            min_utt_ms: 300,
             // Stay inside the feature extractor's 30 s window.
             max_utt_s: 28.0,
             ratio: 3.5,
@@ -182,29 +180,40 @@ impl Segmenter {
             }
             if self.in_speech && self.current.len() as f32 >= self.cfg.max_utt_s * self.rate as f32
             {
-                self.close(emit);
+                // A model-sized chunk is not a speech endpoint. Keep the VAD
+                // state so even a sub-frame continuation belongs to this run.
+                self.emit_current(emit);
             }
         }
         self.samples_seen += frame.len() as u64;
     }
 
     fn close(&mut self, emit: &mut impl FnMut(Segment)) {
-        let samples = std::mem::take(&mut self.current);
         self.in_speech = false;
         self.speech_run = 0;
         self.silence_run = 0;
         self.preroll.clear();
-        let min_len = self.rate * self.cfg.min_utt_ms / 1000;
-        if samples.len() >= min_len {
-            let start_s = self.utt_start_sample as f64 / self.rate as f64;
-            let end_s = start_s + samples.len() as f64 / self.rate as f64;
-            emit(Segment {
-                samples,
-                rate: self.rate,
-                start_s,
-                end_s,
-            });
+        self.emit_current(emit);
+    }
+
+    fn emit_current(&mut self, emit: &mut impl FnMut(Segment)) {
+        let samples = std::mem::take(&mut self.current);
+        // Complete can arrive immediately after a forced chunk boundary.
+        if samples.is_empty() {
+            return;
         }
+        // Report every detected segment, including short continuations after
+        // the duration cap. The common duration filter owns acceptance and
+        // emits an explicit dropped observation instead of losing audio here.
+        let start_s = self.utt_start_sample as f64 / self.rate as f64;
+        let end_s = start_s + samples.len() as f64 / self.rate as f64;
+        self.utt_start_sample += samples.len() as u64;
+        emit(Segment {
+            samples,
+            rate: self.rate,
+            start_s,
+            end_s,
+        });
     }
 }
 
@@ -263,16 +272,16 @@ mod tests {
         );
     }
 
-    /// Why the filter's `min_dur_s` exists on TOP of the segmenter's
-    /// `min_utt_ms`, and why its default is 0.6 s.
+    /// Why the common filter's `min_dur_s` defaults to 0.6 s.
     ///
-    /// The segmenter's own minimum measures the PADDED segment: 240 ms of
+    /// The filter measures the PADDED segment: 240 ms of
     /// pre-roll (so a soft onset is not clipped) plus the speech plus the
     /// ~200 ms hangover tail it keeps. A 50 ms click therefore comes out as
-    /// roughly half a second of audio and sails past `min_utt_ms = 300`. That
-    /// is the "sub-second blips trigger the VAD; 0.46 s ones observed" note
+    /// roughly half a second of audio. That is the
+    /// "sub-second blips trigger the VAD; 0.46 s ones observed" note
     /// `converse` shipped with -- 0.46 s is padding, not speech. The audio-only
-    /// filter is what actually catches it, before the audio tower is paid for.
+    /// filter catches it before the audio tower is paid for, while preserving
+    /// an explicit dropped observation for the caller.
     #[test]
     fn a_click_survives_the_segmenter_and_is_caught_by_the_filter() {
         let segments = segment_all(&[silence(1.0), tone(0.05, 0.4), silence(1.2)]);
@@ -363,26 +372,9 @@ mod tests {
             .collect();
         let at_model = to_hear_rate(&at_capture, CAPTURE_RATE).unwrap();
         let expected = (HEAR_RATE as f64 * secs) as usize;
-        // MEASURED (2026-08-27, mary's `resample_to_16k`, 1.5 s at 24 kHz ->
-        // 16 kHz): 23828 of an expected 24000, i.e. ~172 samples / ~11 ms
-        // short. That is the resampler's own startup delay, which the helper
-        // skips from the FRONT without extending the tail, so the loss lands
-        // at the END of the utterance -- inside the VAD's ~200 ms hangover
-        // tail, which is why it is harmless here. It is also constant per
-        // CALL, which is the whole reason this runs once per utterance
-        // instead of once per 80 ms frame: per frame it would be ~11 ms lost
-        // out of every 80 ms.
-        assert!(
-            at_model.len() <= expected,
-            "resampling must never invent audio: {} > {expected}",
-            at_model.len()
-        );
-        assert!(
-            expected - at_model.len() < 300,
-            "{} samples, expected ~{expected} (startup-delay loss should stay \
-             under ~20 ms)",
-            at_model.len()
-        );
+        // Drain the delayed real tail before trimming to the source duration.
+        // Complete or a forced chunk boundary need not fall inside silence.
+        assert_eq!(at_model.len(), expected);
         // Already at the model rate: an identity, not a round trip through the
         // resampler.
         let same = to_hear_rate(&at_model, HEAR_RATE).unwrap();

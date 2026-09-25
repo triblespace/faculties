@@ -9,6 +9,8 @@ All notable changes to this project will be documented in this file.
   reject overflowing transport clocks, accept pinned model sidefiles, and
   do not learn initial speech as background noise. Hearing uses CUDA on Linux
   and shares one audio encoding between embeddings and transcription.
+  Preserve ongoing speech across forced chunk boundaries, report short tails
+  through the common duration filter, and expose transcript token exhaustion.
 
 - The exact collection API is gone from core, and with it every place a
   faculty asked for a support: the archive search maintains its fact view

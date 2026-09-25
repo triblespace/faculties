@@ -29,6 +29,7 @@ impl Backend for Fake {
             hidden: if self.wrong_shape { 3 } else { 2 },
             rows: vec![0.25, -0.5],
             text: self.text.clone(),
+            token_limit_reached: false,
         })
     }
 }
@@ -61,6 +62,7 @@ fn sample_observation() -> Observation {
             hidden: 2,
             rows: vec![0.25, -0.5],
             text: Some("literal transcript".into()),
+            token_limit_reached: true,
         }),
     }
 }
@@ -86,6 +88,7 @@ fn native_observation_emits_exact_shape_metadata_then_raw_embedding_resource() {
     assert_eq!(metadata["n_tokens"], 1);
     assert_eq!(metadata["hidden"], 2);
     assert_eq!(metadata["text"], "literal transcript");
+    assert_eq!(metadata["token_limit_reached"], true);
     let Part::Blob {
         bytes,
         mime_type,

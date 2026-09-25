@@ -323,6 +323,8 @@ finished utterances to 16 kHz. Input uses `framed-stream` version 1 with unit
 16/24 kHz are also accepted. Each DATA record contains at most one second.
 Stdout is flushed JSONL (`utterance`, `gap`, `end`); diagnostics go to stderr.
 This is utterance-level transcription, not incremental token-level ASR.
+An utterance with `token_limit_reached: true` exhausted the decode budget
+without a model end token; its text must not be treated as complete.
 
 ```sh
 audio_bridge | hear stream --pile model.pile --source speaker \
@@ -335,6 +337,9 @@ invocation; abort or truncation does not flush. Keep the input stream open
 between utterances to avoid reloading the model. The energy-based endpointing
 accepts speech at startup, but is not a validated speech/noise classifier for
 car interiors. No audio device or Discord connection is opened by this mode.
+Duration rejection is reported as a dropped observation, including short
+continuations after the 28-second chunk limit; it is not silently swallowed
+by a second private endpointing threshold.
 
 #### Perception versus exact exports
 

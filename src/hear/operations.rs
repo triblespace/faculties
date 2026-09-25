@@ -57,6 +57,9 @@ pub struct Heard {
     pub hidden: usize,
     pub rows: Vec<f32>,
     pub text: Option<String>,
+    /// No end token was observed before the transcription budget ran out.
+    /// Consumers must not treat this as a complete transcript.
+    pub token_limit_reached: bool,
 }
 impl Heard {
     pub fn validate(&self) -> Result<()> {
@@ -121,7 +124,7 @@ impl Observation {
             Outcome::Embedded(heard)=>{
                 let bytes=heard.embedding_bytes()?;
                 let uri=format!("hear:embedding/{}",blake3::hash(bytes.as_ref()).to_hex());
-                out.line(serde_json::json!({"utc_ms":self.utc_ms,"source":self.source,"start_s":self.start_s,"end_s":self.end_s,"dur_s":self.duration(),"rate":HEAR_RATE,"n_tokens":heard.n_tokens,"hidden":heard.hidden,"dtype":"f32le","layout":"row-major","emb":uri,"text":heard.text}).to_string())?;
+                out.line(serde_json::json!({"utc_ms":self.utc_ms,"source":self.source,"start_s":self.start_s,"end_s":self.end_s,"dur_s":self.duration(),"rate":HEAR_RATE,"n_tokens":heard.n_tokens,"hidden":heard.hidden,"dtype":"f32le","layout":"row-major","emb":uri,"text":heard.text,"token_limit_reached":heard.token_limit_reached}).to_string())?;
                 out.blob(bytes,"application/octet-stream",uri)
             }
         }
@@ -319,7 +322,7 @@ impl Ears {
 impl Backend for Ears {
     fn hear(&mut self, wave: &[f32], options: &Options) -> Result<Heard> {
         let audio = self.hearing.embed(wave);
-        let text = options.transcribe.then(|| {
+        let transcript = options.transcribe.then(|| {
             self.hearing
                 .understand_embeddings(&audio, &options.prompt, options.tokens, |_| {})
         });
@@ -327,7 +330,8 @@ impl Backend for Ears {
             n_tokens: audio.n_tokens,
             hidden: audio.hidden,
             rows: audio.rows,
-            text,
+            token_limit_reached: transcript.as_ref().is_some_and(|t| t.token_limit_reached),
+            text: transcript.map(|t| t.text),
         })
     }
 }

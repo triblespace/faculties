@@ -341,7 +341,10 @@ fn cmd_stream(args: StreamArgs, out: &mut Out<'_>) -> Result<()> {
             } => {
                 let mut value = serde_json::json!({"event":"utterance","source":observation.source,"utc_ms":observation.utc_ms,"start_s":observation.start_s,"end_s":observation.end_s,"processing_ms":processing_ms});
                 match observation.outcome {
-                    Outcome::Embedded(heard) => value["text"] = serde_json::json!(heard.text),
+                    Outcome::Embedded(heard) => {
+                        value["text"] = serde_json::json!(heard.text);
+                        value["token_limit_reached"] = serde_json::json!(heard.token_limit_reached);
+                    }
                     Outcome::Dropped { reason, text } => {
                         value["dropped"] = serde_json::json!(reason);
                         value["text"] = serde_json::json!(text);
@@ -388,7 +391,7 @@ fn write_observation(shared: &Shared, observation: &Observation, out: &mut Out<'
                     heard.n_tokens, heard.hidden
                 ))?,
             }
-            serde_json::json!({"utc_ms":observation.utc_ms,"source":observation.source,"start_s":observation.start_s,"end_s":observation.end_s,"dur_s":dur,"rate":HEAR_RATE,"n_tokens":heard.n_tokens,"hidden":heard.hidden,"dtype":"f32le","layout":"row-major","emb":path.display().to_string(),"text":heard.text})
+            serde_json::json!({"utc_ms":observation.utc_ms,"source":observation.source,"start_s":observation.start_s,"end_s":observation.end_s,"dur_s":dur,"rate":HEAR_RATE,"n_tokens":heard.n_tokens,"hidden":heard.hidden,"dtype":"f32le","layout":"row-major","emb":path.display().to_string(),"text":heard.text,"token_limit_reached":heard.token_limit_reached})
         }
     };
     append_record(&shared.out, &record)
