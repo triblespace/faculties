@@ -128,21 +128,21 @@ impl Segmenter {
 
     fn frame_in(&mut self, frame: &[f32], emit: &mut impl FnMut(Segment)) {
         let rms = (frame.iter().map(|&x| x * x).sum::<f32>() / frame.len() as f32).sqrt();
-
+        // Classify before learning. A stream may begin with speech; treating
+        // its first 500 ms as known noise suppresses that entire utterance.
+        let threshold = (self.noise_floor * self.cfg.ratio).max(self.cfg.abs_floor);
+        let speech = rms > threshold;
         let warm_frames = 500 / self.cfg.frame_ms;
-        if self.floor_warm < warm_frames {
+        if !self.in_speech && !speech && self.floor_warm < warm_frames {
             self.noise_floor = if self.floor_warm == 0 {
                 rms
             } else {
                 0.7 * self.noise_floor + 0.3 * rms
             };
             self.floor_warm += 1;
-        } else if !self.in_speech && rms < self.noise_floor * 2.0 {
+        } else if !self.in_speech && !speech {
             self.noise_floor = 0.98 * self.noise_floor + 0.02 * rms;
         }
-
-        let threshold = (self.noise_floor * self.cfg.ratio).max(self.cfg.abs_floor);
-        let speech = rms > threshold;
 
         if !self.in_speech {
             for &s in frame {

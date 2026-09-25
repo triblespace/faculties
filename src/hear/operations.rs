@@ -287,19 +287,19 @@ fn decode_clip(_bytes: Bytes, _hint: Option<&str>) -> Result<Vec<f32>> {
 }
 #[cfg(feature = "hear")]
 pub(super) struct Ears {
-    hearing: mary::models::gemma::gemma4::hear::Hearing<mary::nn::backend::B>,
+    hearing: mary::models::gemma::gemma4::hear::Hearing<mary::nn::backend::hear::B>,
 }
 #[cfg(feature = "hear")]
 impl Ears {
     pub(super) fn open(config: &ModelConfig) -> Result<Self> {
         use mary::models::gemma::gemma4::config::Gemma4Config;
         use mary::models::gemma::gemma4::hear::Hearing;
-        use mary::nn::backend::{WgpuDevice, B};
+        use mary::nn::backend::hear::{Device, B};
         let mut model_config = Gemma4Config::load(&config.config_json);
         model_config.vision_config = None;
         let tokenizer = tokenizers::Tokenizer::from_file(&config.tokenizer_json)
             .map_err(|error| anyhow::anyhow!("load hearing tokenizer: {error}"))?;
-        let device = WgpuDevice::default();
+        let device = Device::default();
         let (model, _vision, tower, embedder) = mary::persist::load_gemma4_hearing_from_pile::<B>(
             &config.pile,
             mary::selection::ModelSelector::Source {

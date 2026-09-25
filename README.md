@@ -316,6 +316,26 @@ separate publication after output acceptance. `hear_once` returns ordered
 hearing metadata and raw f32le embedding resources, not a synthetic audio
 playback result.
 
+`hear stream` is the pipe frontend for one speaker's framed PCM. It keeps
+the model loaded across utterances, segments at the input rate, and resamples
+finished utterances to 16 kHz. Input uses `framed-stream` version 1 with unit
+`samples` and `audio/x-pcm;format=f32le;rate=48000;channels=1`; `s16le` and
+16/24 kHz are also accepted. Each DATA record contains at most one second.
+Stdout is flushed JSONL (`utterance`, `gap`, `end`); diagnostics go to stderr.
+This is utterance-level transcription, not incremental token-level ASR.
+
+```sh
+audio_bridge | hear stream --pile model.pile --source speaker \
+  --config-json config.json --tokenizer-json tokenizer.json
+```
+
+A GAP declares lost samples and discards unfinished speech; it is not a
+substitute for known silence. END Complete flushes the tail and ends this
+invocation; abort or truncation does not flush. Keep the input stream open
+between utterances to avoid reloading the model. The energy-based endpointing
+accepts speech at startup, but is not a validated speech/noise classifier for
+car interiors. No audio device or Discord connection is opened by this mode.
+
 #### Perception versus exact exports
 
 Files exports return original bytes as an embedded binary resource with a

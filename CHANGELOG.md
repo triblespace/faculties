@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Add `hear stream`: framed mono PCM to resident utterance-level ASR and
+  explicit gap/end JSONL. Preserve clocks across dropped partial frames,
+  reject overflowing transport clocks, accept pinned model sidefiles, and
+  do not learn initial speech as background noise. Hearing uses CUDA on Linux
+  and shares one audio encoding between embeddings and transcription.
+
 - The exact collection API is gone from core, and with it every place a
   faculty asked for a support: the archive search maintains its fact view
   and its BM25 index, attaches both from one snapshot and compares their

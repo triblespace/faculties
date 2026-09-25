@@ -181,6 +181,30 @@ fn complete_flushes_the_speech_tail_including_pending_samples_once() {
 }
 
 #[test]
+fn speech_at_stream_start_is_not_learned_as_background_noise() {
+    let speech = tone(HEAR_RATE * 6 / 5, 0.3);
+    for wave in [
+        speech.clone(),
+        [speech.clone(), silence(HEAR_RATE)].concat(),
+    ] {
+        let (result, backend, events) = capture(&pcm_stream(&wave, F32, EndStatus::Complete));
+        result.unwrap();
+        assert_eq!(backend.clips.len(), 1);
+        assert_eq!(&backend.clips[0][..speech.len()], speech.as_slice());
+        assert_eq!(observations(&events)[0].start_s, 0.0);
+        assert!(matches!(events.last(), Some(Event::Complete)));
+    }
+    let (result, backend, events) = capture(&pcm_stream(
+        &speech,
+        F32,
+        EndStatus::Aborted("disconnected".into()),
+    ));
+    assert!(result.is_err());
+    assert!(backend.clips.is_empty());
+    assert!(events.is_empty());
+}
+
+#[test]
 fn abort_and_truncation_never_flush_partial_speech_or_claim_complete() {
     let wave = unfinished_utterance();
     let complete = pcm_stream(&wave, F32, EndStatus::Complete);
