@@ -207,13 +207,19 @@ where
         // generation beside ones the other hosts already write to. The private
         // descriptor is only content until something commits to it, so
         // registering it costs nothing; using it here would.
+        //
+        // A private generation that already holds commits is not being
+        // started: it is this host's own collection, reopened. Siblings with
+        // content of their own do not change that -- `cat` of another host's
+        // pile brings in exactly such siblings, and the merge must not stop
+        // this host from opening what it already wrote.
         let snapshot = storage
             .snapshot()
             .context("freeze store to look for other generations of this name")?;
         if let Some(report) = generation::named_generations(&snapshot, collection.handle())
             .map_err(|error| anyhow!("look for other generations: {error}"))?
         {
-            if report.strands_records() {
+            if report.selected().commits() == 0 && report.strands_records() {
                 let variable = override_env_name(scope);
                 let siblings: Vec<String> = report
                     .siblings()
@@ -510,6 +516,27 @@ mod tests {
         // The same host's own generation, reopened, is not "another".
         open_configured(&mut store, scope, mac.verifying_key())
             .expect("reopening the generation that holds the content");
+
+        // Nor is it once a sibling holds content of its own, which is what
+        // `cat` of another host's pile produces: each host keeps opening the
+        // generation it already wrote to.
+        let theirs = open(&mut store, scope, sky.verifying_key()).unwrap();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &sky,
+                theirs.handle(),
+                Inline::new([3; 32]),
+                Inline::new([4; 32]),
+            )))
+            .unwrap();
+        open_configured(&mut store, scope, mac.verifying_key())
+            .expect("a sibling with content does not stop a host reopening its own");
+        open_configured(&mut store, scope, sky.verifying_key())
+            .expect("each host with content reopens its own generation");
+        // A host with nothing of its own is still starting one, and refused.
+        let fresh = SigningKey::from_bytes(&[70; 32]);
+        open_configured(&mut store, scope, fresh.verifying_key())
+            .expect_err("an empty generation beside content is still not started");
     }
 
     /// A configured generation that reads empty while a same-named sibling
