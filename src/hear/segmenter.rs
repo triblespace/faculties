@@ -114,6 +114,9 @@ impl Segmenter {
     /// (no re-warm-up on every reply), and the stream clock still advances so
     /// later timestamps stay stream-relative.
     pub(super) fn pause_skip(&mut self, n: u64) {
+        // Pending samples have arrived but have not reached frame_in yet.
+        // Account for them before discarding a partial frame at a gap.
+        self.samples_seen += self.pending.len() as u64;
         self.pending.clear();
         self.preroll.clear();
         self.current.clear();

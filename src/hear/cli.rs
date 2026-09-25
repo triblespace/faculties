@@ -27,6 +27,8 @@ enum Command {
     /// Run recorded clips through the SAME segmenter and embed path — the
     /// hardware-free gate for everything below the capture seam.
     Once(OnceArgs),
+    /// Read framed mono PCM from stdin; emit utterance/gap/end JSONL on stdout.
+    Stream(StreamArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -45,6 +47,11 @@ struct Shared {
     /// `gemma_hear` spells it this way.
     #[arg(long, default_value = "google/gemma-4-E4B-it")]
     model: String,
+    /// Explicit pinned sidefiles; otherwise use the local HF cache (no download).
+    #[arg(long)]
+    config_json: Option<PathBuf>,
+    #[arg(long)]
+    tokenizer_json: Option<PathBuf>,
     /// Utterance jsonl to append to.
     #[arg(long, default_value = "/tmp/hear.jsonl")]
     out: PathBuf,
@@ -101,6 +108,27 @@ struct OnceArgs {
     wav: Vec<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+struct StreamArgs {
+    #[arg(long, env = "GEMMA_PILE")]
+    pile: Option<PathBuf>,
+    #[arg(long, default_value = "google/gemma-4-E4B-it")]
+    model: String,
+    #[arg(long)]
+    config_json: Option<PathBuf>,
+    #[arg(long)]
+    tokenizer_json: Option<PathBuf>,
+    /// Caller-supplied speaker/channel label; one speaker per input stream.
+    #[arg(long, default_value = "stdin")]
+    source: String,
+    #[arg(long, default_value = DEFAULT_PROMPT)]
+    prompt: String,
+    #[arg(long, default_value_t = 128)]
+    tokens: usize,
+    #[arg(long, default_value_t = 0.6)]
+    min_dur_s: f64,
+}
+
 impl Shared {
     fn options(&self) -> Result<Options> {
         let options = Options {
@@ -117,21 +145,41 @@ impl Shared {
         Ok(options)
     }
 }
-#[cfg(feature = "hear")]
 fn model_config(shared: &Shared) -> Result<ModelConfig> {
-    let pile = shared
-        .pile
-        .clone()
-        .context("no Gemma pile: pass --pile or set GEMMA_PILE")?;
+    configured_model(
+        shared.pile.clone(),
+        &shared.model,
+        shared.config_json.clone(),
+        shared.tokenizer_json.clone(),
+    )
+}
+#[cfg(feature = "hear")]
+fn configured_model(
+    pile: Option<PathBuf>,
+    model: &str,
+    config: Option<PathBuf>,
+    tokenizer: Option<PathBuf>,
+) -> Result<ModelConfig> {
     Ok(ModelConfig {
-        pile,
-        model: shared.model.clone(),
-        config_json: find_hf_file(&shared.model, "config.json")?,
-        tokenizer_json: find_hf_file(&shared.model, "tokenizer.json")?,
+        pile: pile.context("no Gemma pile: pass --pile or set GEMMA_PILE")?,
+        model: model.to_owned(),
+        config_json: match config {
+            Some(path) => path,
+            None => find_hf_file(model, "config.json")?,
+        },
+        tokenizer_json: match tokenizer {
+            Some(path) => path,
+            None => find_hf_file(model, "tokenizer.json")?,
+        },
     })
 }
 #[cfg(not(feature = "hear"))]
-fn model_config(_shared: &Shared) -> Result<ModelConfig> {
+fn configured_model(
+    _pile: Option<PathBuf>,
+    _model: &str,
+    _config: Option<PathBuf>,
+    _tokenizer: Option<PathBuf>,
+) -> Result<ModelConfig> {
     bail!("hear was built without the `hear` feature")
 }
 #[cfg(feature = "hear")]
@@ -259,6 +307,52 @@ fn cmd_listen(args: ListenArgs, out: &mut Out<'_>) -> Result<()> {
         }
     }
 }
+
+fn cmd_stream(args: StreamArgs, out: &mut Out<'_>) -> Result<()> {
+    use super::stream::{self, Event};
+    let mut options = Options {
+        transcribe: true,
+        prompt: crate::text_arg(&args.prompt, "hearing prompt")?,
+        tokens: args.tokens,
+        ..Default::default()
+    };
+    options.filter.min_dur_s = args.min_dur_s;
+    options.validate()?;
+    let stdin = std::io::stdin();
+    let (reader, format) = stream::open(stdin.lock())?;
+    let config = configured_model(
+        args.pile,
+        &args.model,
+        args.config_json,
+        args.tokenizer_json,
+    )?;
+    let mut ears = Ears::open(&config)?;
+    stream::process(reader, &mut ears, &args.source, &options, &mut |event| {
+        let value = match event {
+            Event::Gap(gap) => {
+                serde_json::json!({"event":"gap","source":args.source,"index":gap.index,"offset":gap.offset,"extent":gap.extent,"rate":format.sample_rate(),"reason":gap.reason})
+            }
+            Event::Complete => {
+                serde_json::json!({"event":"end","source":args.source,"status":"complete"})
+            }
+            Event::Utterance {
+                observation,
+                processing_ms,
+            } => {
+                let mut value = serde_json::json!({"event":"utterance","source":observation.source,"utc_ms":observation.utc_ms,"start_s":observation.start_s,"end_s":observation.end_s,"processing_ms":processing_ms});
+                match observation.outcome {
+                    Outcome::Embedded(heard) => value["text"] = serde_json::json!(heard.text),
+                    Outcome::Dropped { reason, text } => {
+                        value["dropped"] = serde_json::json!(reason);
+                        value["text"] = serde_json::json!(text);
+                    }
+                }
+                value
+            }
+        };
+        out.line(value.to_string())
+    })
+}
 fn write_observation(shared: &Shared, observation: &Observation, out: &mut Out<'_>) -> Result<()> {
     let dur = observation.duration();
     let record = match &observation.outcome {
@@ -312,6 +406,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     match cli.command {
         Some(Command::Listen(args)) => cmd_listen(args, out),
         Some(Command::Once(args)) => cmd_once(args, out),
+        Some(Command::Stream(args)) => cmd_stream(args, out),
         None => out.line(Cli::command().render_help().to_string()),
     }
 }
@@ -321,6 +416,24 @@ pub fn run() -> Result<()> {
         Cli::command().print_help()?;
         println!();
         return Ok(());
+    }
+    if matches!(&cli.command, Some(Command::Stream(_))) {
+        // The data-plane contract is stdout, even if a control-plane launcher
+        // inherited DRIVE_ENDPOINT. Never route private PCM results elsewhere.
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        return execute(
+            cli,
+            &mut Out::new(&mut |part| {
+                let crate::out::Part::Text { text } = part else {
+                    bail!("hear stream emitted unexpected non-text output");
+                };
+                stdout.write_all(text.as_bytes())?;
+                stdout.flush()?;
+                Ok(())
+            }),
+        );
     }
     crate::cli::with_output("hear", |out| execute(cli, out))
 }

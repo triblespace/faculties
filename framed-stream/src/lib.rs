@@ -559,7 +559,7 @@ impl<R: Read> FramedReader<R> {
                 );
                 let mut payload = vec![0u8; len];
                 read_exact_or_eof(&mut self.source, &mut payload, "record payload")?;
-                self.advance(extent);
+                self.advance(extent)?;
                 Ok(Frame::Record(Record {
                     index,
                     offset,
@@ -572,7 +572,7 @@ impl<R: Read> FramedReader<R> {
             KIND_GAP => {
                 let (index, offset, extent) = self.read_clocks("gap record")?;
                 let reason = read_string(&mut self.source, "gap reason")?;
-                self.advance(extent);
+                self.advance(extent)?;
                 Ok(Frame::Gap(Gap {
                     index,
                     offset,
@@ -630,9 +630,18 @@ impl<R: Read> FramedReader<R> {
         Ok(())
     }
 
-    fn advance(&mut self, extent: u64) {
-        self.expect_index += 1;
-        self.expect_offset += extent;
+    fn advance(&mut self, extent: u64) -> anyhow::Result<()> {
+        let index = self
+            .expect_index
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("framed stream record index overflow"))?;
+        let offset = self
+            .expect_offset
+            .checked_add(extent)
+            .ok_or_else(|| anyhow::anyhow!("framed stream offset overflow"))?;
+        self.expect_index = index;
+        self.expect_offset = offset;
+        Ok(())
     }
 }
 

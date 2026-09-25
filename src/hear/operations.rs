@@ -295,7 +295,8 @@ impl Ears {
         use mary::models::gemma::gemma4::config::Gemma4Config;
         use mary::models::gemma::gemma4::hear::Hearing;
         use mary::nn::backend::{WgpuDevice, B};
-        let model_config = Gemma4Config::load(&config.config_json);
+        let mut model_config = Gemma4Config::load(&config.config_json);
+        model_config.vision_config = None;
         let tokenizer = tokenizers::Tokenizer::from_file(&config.tokenizer_json)
             .map_err(|error| anyhow::anyhow!("load hearing tokenizer: {error}"))?;
         let device = WgpuDevice::default();
@@ -320,7 +321,7 @@ impl Backend for Ears {
         let audio = self.hearing.embed(wave);
         let text = options.transcribe.then(|| {
             self.hearing
-                .understand(wave, &options.prompt, options.tokens, |_| {})
+                .understand_embeddings(&audio, &options.prompt, options.tokens, |_| {})
         });
         Ok(Heard {
             n_tokens: audio.n_tokens,
