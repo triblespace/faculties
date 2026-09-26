@@ -107,6 +107,12 @@ name = "status-capture"
 path = "src/bin/status-capture.rs"
 required-features = ["widgets"]
 
+# Resident Discord voice line.
+[[bin]]
+name = "call"
+path = "src/bin/call.rs"
+required-features = ["call"]
+
 [features]
 # `local-embed` and `widgets` are default: semantic recall is core to knowledge
 # workflows, and the GORBIE viewer is part of the normal office surface.
@@ -157,6 +163,13 @@ hear = ["dep:mary", "mary/gemma", "dep:tokenizers"]
 # this one binary needs it. NOT YET REALTIME on the measured hardware — see the
 # frame-budget section of the binary's module docs before relying on it.
 duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
+# The `call` faculty: a resident voice line in a Discord voice channel. One
+# process holds a minimal Discord gateway session of its own, songbird's voice
+# driver (DAVE end-to-end encryption, mandatory on Discord since 2026-03-02),
+# and one resident Qwen3-TTS session from `voice`. No serenity: songbird's
+# driver connects from the session and server details the gateway hands out.
+# Off by default: only this binary needs it.
+call = ["voice", "dep:songbird", "dep:tokio-tungstenite", "dep:futures-util"]
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"
@@ -209,6 +222,9 @@ regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
 soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear + duplex capture and voice playback (shared Soma wire/HTTP contracts). Unconditional: this is how the body is reached.
+songbird = { version = "0.6", default-features = false, features = ["driver", "rustls", "tungstenite"], optional = true }  # call
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }  # call: the Discord gateway
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }  # call
 tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
 rrule = "0.14"              # planner
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web

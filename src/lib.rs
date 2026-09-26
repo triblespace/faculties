@@ -51,6 +51,8 @@ pub mod atlas;
 pub mod blockdag;
 pub mod body;
 pub mod bootstrap;
+#[cfg(feature = "call")]
+pub mod call;
 pub mod cli;
 pub mod clock;
 pub mod code;
