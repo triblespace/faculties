@@ -131,4 +131,22 @@ pub mod discord {
     /// `D5CE5556F159FE3F34A67A87DB105281`.
     #[allow(non_upper_case_globals)]
     pub const kind_ingestion_baseline: Id = id_hex!("D5CE5556F159FE3F34A67A87DB105281");
+    /// Tag for the Discord user a bot token of this pile authenticates as,
+    /// linked through [`user`]. What that user writes is the pile's own, so a
+    /// reader looking for news from others passes over it.
+    ///
+    /// Minted with `trible genid` on 2026-09-26:
+    /// `F131FEA2CAF2573F40AEC8F4C68D85DA`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_bot_account: Id = id_hex!("F131FEA2CAF2573F40AEC8F4C68D85DA");
+    /// Tag for a Discord message that is a system notice rather than
+    /// something somebody wrote (a pin, a member joining, a boost, a thread
+    /// starting), linked through [`message`] to its anchor. Discord gives
+    /// such messages an author, so this is how a reader looking for people
+    /// writing passes over them.
+    ///
+    /// Minted with `trible genid` on 2026-09-26:
+    /// `B0D2317A9B8F77AFB906CC35EB5AB516`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_system_notice: Id = id_hex!("B0D2317A9B8F77AFB906CC35EB5AB516");
 }
