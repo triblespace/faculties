@@ -130,10 +130,10 @@ imagine = ["dep:mary", "mary/flux"]
 # is retained by each Voice frontend instance, so a stream or MCP server loads
 # its selected cohort once instead of paying model startup per utterance. There
 # is no separately-built speech binary that can drift stale against the pile
-# format (the staleness class that truncated memory on 2026-06-30). Four explicit
-# roots are selected from one frozen native model-collection pile
-# (`QWEN3TTS_PILE`): exact base, shared codec, filtered f16 talker, and folded
-# f16 talker.
+# format (the staleness class that truncated memory on 2026-06-30). Roots are
+# selected from one frozen native model-collection pile (`QWEN3TTS_PILE`): the
+# exact base and shared codec everywhere, plus the filtered and folded f16
+# talker on macOS, whose zero-copy Metal lane is the only reader of those two.
 # Native audio device enumeration + playback sink (rodio/cpal). Default so
 # stock installs keep `voice devices`/routing; excluded on audio-less servers
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
@@ -157,6 +157,14 @@ hear = ["dep:mary", "mary/gemma", "dep:tokenizers"]
 # this one binary needs it. NOT YET REALTIME on the measured hardware — see the
 # frame-budget section of the binary's module docs before relying on it.
 duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
+# The voice connection of `discord live`: the bot in a voice channel, hanging
+# off the discord faculty's one gateway session, through songbird's voice
+# driver (DAVE end-to-end encryption, mandatory on Discord since 2026-03-02),
+# speaking with one resident Qwen3-TTS synthesizer from `voice`. No serenity:
+# songbird's driver connects from the session and server details the gateway
+# hands out. Without it, `discord live` runs intake alone and `discord say`
+# says voice is not built in. Off by default: the model runtime is heavy.
+discord-voice = ["voice", "dep:songbird", "dep:symphonia", "dep:async-trait"]
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"
@@ -209,8 +217,11 @@ regex = "1"                 # wiki
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
 soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear + duplex capture and voice playback (shared Soma wire/HTTP contracts). Unconditional: this is how the body is reached.
+songbird = { version = "0.6", default-features = false, features = ["driver", "rustls", "tungstenite"], optional = true }  # discord-voice
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }  # discord: the gateway session of `discord live`
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }  # discord: the gateway session of `discord live`
+symphonia = { version = "0.5", default-features = false, features = ["pcm"], optional = true }  # discord-voice: songbird decodes its raw f32 input with the PCM codec, registered only when this feature is on
+async-trait = { version = "0.1", optional = true }  # discord-voice: songbird track event handlers
 tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
 rrule = "0.14"              # planner
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web

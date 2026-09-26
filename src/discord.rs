@@ -7,8 +7,10 @@
 //! explicit numeric intervals.
 //!
 //! `discord live` ([`live`]) is the faculty's resident process: it holds
-//! Discord's one gateway session ([`gateway`]) and stores the messages it
-//! reads in the collection ([`intake`]).
+//! Discord's one gateway session ([`gateway`]), stores the messages it reads
+//! in the collection ([`intake`]), and, with the `discord-voice` feature,
+//! joins a voice channel through the same session to speak what `discord say`
+//! queues.
 
 pub mod cli;
 pub mod gateway;
@@ -17,6 +19,8 @@ pub mod live;
 pub mod mcp;
 pub mod operations;
 pub mod render;
+#[cfg(feature = "discord-voice")]
+pub mod voice;
 
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,

@@ -1,5 +1,5 @@
 //! Discord CLI host input and sync-then-read workflow, and the resident
-//! process (`live`).
+//! process (`live`) with its voice queue (`say`).
 use super::intake::{self, Intake};
 use super::live::{self, Live, StateDir};
 use super::{operations::*, render};
@@ -10,12 +10,26 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use std::num::NonZeroU64;
 use std::{fs, io::Read, path::PathBuf};
 
+/// What `discord say` and `discord live --voice-channel` answer in a build
+/// without voice.
+#[cfg(not(feature = "discord-voice"))]
+const NO_VOICE: &str =
+    "voice is not built into this discord binary; build it with the discord-voice feature";
+
+/// What `discord live` answers when given nothing to run: only what this
+/// build can run.
+#[cfg(feature = "discord-voice")]
+const NOTHING_TO_RUN: &str = "nothing to run: give --guild and --voice-channel to join a voice \
+     channel, or --intake-channel or --intake-dms for intake";
+#[cfg(not(feature = "discord-voice"))]
+const NOTHING_TO_RUN: &str = "nothing to run: give --intake-channel or --intake-dms for intake";
+
 #[derive(Parser)]
 #[command(
     version = crate::GIT_VERSION,
     name = "discord",
     about = "Post to and ingest Discord channels into TribleSpace, and run the bot live on \
-             Discord's gateway (message intake)"
+             Discord's gateway (message intake, and voice with the discord-voice feature)"
 )]
 pub struct Cli {
     /// Path to the pile file to use: send, read and channels need it, and so
@@ -40,15 +54,26 @@ enum Command {
     /// Run the bot live on Discord's gateway until stopped.
     ///
     /// One gateway session stores what the intake channels (and DMs)
-    /// receive in the discord collection as it arrives. Runs in the
-    /// foreground; run it under a user unit so it outlives the shell.
+    /// receive in the discord collection as it arrives and, with
+    /// --voice-channel, joins that voice channel and speaks what `discord
+    /// say` queues. Runs in the foreground; run it under a user unit so it
+    /// outlives the shell.
     Live(LiveArgs),
+    /// Queue text for the resident process to speak in its voice channel.
+    Say {
+        #[command(flatten)]
+        state: StateArg,
+        /// What to say, spoken after everything queued before it.
+        text: String,
+    },
 }
 
 #[derive(Args)]
 struct StateArg {
-    /// State directory of `live`: intake keeps where each channel's intake
-    /// begins in `intake/`. Default: $XDG_DATA_HOME/faculties/discord, or
+    /// State directory shared by `live` and `say`: queued lines wait in
+    /// `say/`, spoken ones are kept in `said/` and unspeakable ones in
+    /// `failed/`; intake keeps where each channel's intake begins in
+    /// `intake/`. Default: $XDG_DATA_HOME/faculties/discord, or
     /// ~/.local/share/faculties/discord without XDG_DATA_HOME.
     #[arg(long, env = "DISCORD_STATE_DIR", value_name = "DIR")]
     state_dir: Option<PathBuf>,
@@ -58,12 +83,27 @@ struct StateArg {
 struct LiveArgs {
     #[command(flatten)]
     state: StateArg,
+    /// Guild (server) of the voice channel (global Discord snowflake).
+    #[arg(long, value_name = "GUILD_ID", requires = "voice_channel")]
+    guild: Option<NonZeroU64>,
+    /// Voice channel to join (global Discord snowflake); needs --guild, and a
+    /// build with the discord-voice feature.
+    #[arg(long, value_name = "CHANNEL_ID", requires = "guild")]
+    voice_channel: Option<NonZeroU64>,
+    /// Text channel to post --greeting in once the voice connection is up
+    /// (global Discord snowflake), so that people know to join.
+    #[arg(long, value_name = "CHANNEL_ID", requires = "voice_channel")]
+    announce: Option<NonZeroU64>,
+    /// What to post in the --announce channel.
+    #[arg(long, default_value = "I'm in voice.")]
+    greeting: String,
     /// Store every message of this text channel (global Discord snowflake)
     /// in the discord collection, where orient finds it (repeatable), from
     /// the first time the process runs with it on; its earlier history stays
     /// out (`discord read` brings it in). Needs the Message Content intent
-    /// enabled for the bot: without it, Discord refuses intake. Intake is off
-    /// unless this or --intake-dms is given.
+    /// enabled for the bot: without it, Discord refuses intake, and a voice
+    /// connection goes on with voice only. Intake is off unless this or
+    /// --intake-dms is given.
     #[arg(long = "intake-channel", value_name = "CHANNEL_ID")]
     intake_channels: Vec<NonZeroU64>,
     /// Also store direct messages to the bot, each DM channel from the first
@@ -127,6 +167,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let command = match command {
         Command::Collection(command) => command,
         Command::Live(args) => return run_live(&cli, args),
+        Command::Say { state, text } => return say(state.state_dir, &text, out),
     };
     let token = require_token(&cli)?;
     let pile = cli
@@ -204,47 +245,104 @@ pub fn run() -> Result<()> {
     }
 }
 
-/// `discord live`: the gateway session with intake.
+/// `discord live`: the gateway session with intake, a voice connection, or
+/// both.
 fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
+    // The voice driver reports its own failures through tracing; RUST_LOG
+    // (e.g. songbird=debug) makes them visible in the process's log.
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let LiveArgs {
         state,
+        guild,
+        voice_channel,
+        announce,
+        greeting,
         intake_channels,
         intake_dms,
     } = args;
-    if intake_channels.is_empty() && !intake_dms {
-        bail!("nothing to run: give --intake-channel or --intake-dms for intake");
+    // clap asks for --guild and --voice-channel together.
+    let voice = guild.zip(voice_channel);
+    #[cfg(not(feature = "discord-voice"))]
+    {
+        if voice.is_some() {
+            bail!(NO_VOICE);
+        }
+        let _ = (announce, greeting);
+    }
+    let wants_intake = !intake_channels.is_empty() || intake_dms;
+    if voice.is_none() && !wants_intake {
+        bail!(NOTHING_TO_RUN);
     }
     let state = StateDir::resolve(state.state_dir)?;
     let token = require_token(cli)?;
-    let pile = cli
-        .pile
-        .clone()
-        .ok_or_else(|| anyhow!("intake cannot run: it needs a pile (--pile or PILE)"))?;
-    // One store for the life of the process, rather than one pile open per
-    // message.
-    let intake = Intake::new(
-        Discord::with_storage(crate::storage::Storage::shared(pile, cli.key.clone())),
-        Box::new(Rest::new(token.clone())),
-        intake_channels,
-        intake_dms,
-        state.intake(),
-        intake::floor_at(std::time::SystemTime::now()),
-    );
-    intake
-        .preflight()
-        .context("intake cannot run: the discord collection cannot be written")?;
+    // Intake that cannot write is off, loudly, and a voice connection runs
+    // either way; without one, nothing is left to run.
+    let off = |reason: String| -> Result<Option<Intake>> {
+        if voice.is_none() {
+            bail!("intake cannot run: {reason}");
+        }
+        eprintln!("[discord] intake is off: {reason}");
+        Ok(None)
+    };
+    let intake = match (wants_intake, cli.pile.clone()) {
+        (false, _) => None,
+        (true, None) => off("it needs a pile (--pile or PILE)".to_owned())?,
+        (true, Some(pile)) => {
+            // One store for the life of the process, rather than one pile
+            // open per message.
+            let intake = Intake::new(
+                Discord::with_storage(crate::storage::Storage::shared(pile, cli.key.clone())),
+                Box::new(Rest::new(token.clone())),
+                intake_channels,
+                intake_dms,
+                state.intake(),
+                intake::floor_at(std::time::SystemTime::now()),
+            );
+            match intake.preflight() {
+                Ok(()) => Some(intake),
+                Err(error) => off(format!(
+                    "the discord collection cannot be written: {error:#}"
+                ))?,
+            }
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("start the async runtime")?;
     let outcome = runtime.block_on(live::run(Live {
         token,
-        intake: Some(intake),
+        intake,
+        #[cfg(feature = "discord-voice")]
+        voice: voice.map(|(guild, channel)| super::voice::Config {
+            guild,
+            channel,
+            announce,
+            greeting,
+            state,
+        }),
     }));
     // Whatever is still running (a download, say) does not hold the process
     // up past its own bounded shutdown.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     outcome
+}
+
+/// `discord say`: queue one line for the voice connection to speak.
+#[cfg(feature = "discord-voice")]
+fn say(state_dir: Option<PathBuf>, text: &str, out: &mut Out<'_>) -> Result<()> {
+    let queued = StateDir::resolve(state_dir)?.enqueue(text)?;
+    out.line(format!("queued {}", queued.display()))
+}
+
+#[cfg(not(feature = "discord-voice"))]
+fn say(_: Option<PathBuf>, _: &str, _: &mut Out<'_>) -> Result<()> {
+    bail!(NO_VOICE)
 }
 
 fn require_token(cli: &Cli) -> Result<String> {
@@ -281,15 +379,17 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
-    fn live_parses_beside_the_collection_commands() {
+    fn live_and_say_parse_beside_the_collection_commands() {
         Cli::command().debug_assert();
         let cli = Cli::try_parse_from([
             "discord",
             "--token",
             "t",
             "live",
-            "--state-dir",
-            "/s",
+            "--guild",
+            "1",
+            "--voice-channel",
+            "2",
             "--intake-channel",
             "3",
             "--intake-channel",
@@ -300,9 +400,24 @@ mod tests {
         let Some(Command::Live(live)) = cli.command else {
             panic!("live parses as live");
         };
-        assert_eq!(live.state.state_dir, Some(PathBuf::from("/s")));
+        assert_eq!(
+            live.guild
+                .zip(live.voice_channel)
+                .map(|(g, c)| (g.get(), c.get())),
+            Some((1, 2))
+        );
         assert_eq!(live.intake_channels.len(), 2);
         assert!(live.intake_dms);
+        // A voice channel is nothing without its guild.
+        assert!(Cli::try_parse_from(["discord", "live", "--voice-channel", "2"]).is_err());
+        let cli = Cli::try_parse_from(["discord", "say", "--state-dir", "/s", "hello"]).unwrap();
+        let Some(Command::Say { state, text }) = cli.command else {
+            panic!("say parses as say");
+        };
+        assert_eq!(
+            (state.state_dir, text),
+            (Some(PathBuf::from("/s")), "hello".to_owned())
+        );
         let cli = Cli::try_parse_from(["discord", "channels", "list"]).unwrap();
         assert!(matches!(
             cli.command,
@@ -335,6 +450,45 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["discord", "read", "--pile", "/p", "--token", "t"]).unwrap();
         assert_eq!(cli.pile, Some(PathBuf::from("/p")));
+    }
+
+    /// `discord live` names only what this build can run, and a build without
+    /// voice says so for `say` and `--voice-channel` before it needs a token
+    /// or touches the state directory.
+    #[test]
+    fn live_and_say_answer_for_what_this_build_can_run() {
+        let live = |args: &[&str]| {
+            let mut cli = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Live(live)) = cli.command.take() else {
+                panic!("live parses as live");
+            };
+            run_live(&cli, live).unwrap_err().to_string()
+        };
+        let nothing = live(&["discord", "live", "--state-dir", "/nonexistent"]);
+        assert!(nothing.starts_with("nothing to run"), "{nothing}");
+        assert!(nothing.contains("--intake-channel"), "{nothing}");
+        assert_eq!(
+            nothing.contains("--voice-channel"),
+            cfg!(feature = "discord-voice"),
+            "{nothing}"
+        );
+        #[cfg(not(feature = "discord-voice"))]
+        {
+            let voice = live(&[
+                "discord",
+                "live",
+                "--state-dir",
+                "/nonexistent",
+                "--guild",
+                "1",
+                "--voice-channel",
+                "2",
+            ]);
+            assert_eq!(voice, NO_VOICE);
+            let state_dir = Some(PathBuf::from("/nonexistent"));
+            let said = say(state_dir, "hello", &mut Out::new(&mut |_| Ok(())));
+            assert_eq!(said.unwrap_err().to_string(), NO_VOICE);
+        }
     }
 
     #[test]

@@ -502,7 +502,7 @@ fn send_with(
     })
 }
 
-fn post_message(token: &str, channel_id: &str, text: &str) -> Result<JsonValue> {
+pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<JsonValue> {
     let client = build_client()?;
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
     let response = client
