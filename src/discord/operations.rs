@@ -9,12 +9,18 @@
 //!
 //! Forward progress is represented by immutable numeric intervals. The first
 //! bounded import establishes an explicit baseline immediately before its
-//! oldest returned message. Later reads backpaginate to the connected frontier
+//! oldest returned message, or at a floor its caller names. Later reads page
+//! forward from the connected frontier, a bounded number of pages per pull,
 //! before publishing one interval in the same signed COMMIT as every message
 //! and attachment it covers. A bounded recent-window fetch also reconciles
 //! edits. The REST API cannot prove deletions or edits outside that window;
 //! future Gateway tombstones can be modeled as another immutable observation
 //! kind.
+//!
+//! An attachment is stored with its bytes, and one Discord declares larger
+//! than [`MAX_ATTACHMENT_BYTES`] by its name and size alone, so a single
+//! large file can never hold a channel's ingestion back. A system notice (a
+//! pin, a member joining) is stored like any message and marked as one.
 //!
 //! Bot credentials are deliberately external input. This faculty neither
 //! claims the historical shared logs branch nor stores mutable secrets in the
@@ -51,6 +57,17 @@ use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+/// Attachments Discord declares larger than this are recorded by name and
+/// size, without their bytes.
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+/// How long one attachment download may take.
+const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Forward pages one pull reads at most; a longer gap is closed by the pulls
+/// after it, each going on from the frontier the one before proved.
+const FORWARD_PAGES: usize = 10;
+/// Message types somebody writes: default, reply, and the two kinds of
+/// application command. Every other type is a system notice.
+const WRITTEN_MESSAGE_TYPES: [u64; 4] = [0, 19, 20, 23];
 
 #[derive(Clone, Debug)]
 pub struct SendReceipt {
@@ -111,6 +128,9 @@ pub struct ChannelReceipt {
     pub observations: usize,
     pub coverage: Option<discord_model::CoverageInterval>,
     pub commit: Option<CollectionCommit>,
+    /// The forward read stopped at its page budget with more to read: pull
+    /// again to go on.
+    pub more: bool,
 }
 #[derive(Clone, Debug)]
 pub struct ChannelPull {
@@ -230,6 +250,65 @@ impl Discord {
     pub fn pull(&self, options: PullOptions) -> Result<PullReport> {
         options.validate()?;
         pull(self.storage(), self.token()?, options)
+    }
+    /// Pull one channel as [`Self::pull`] does, reading Discord through
+    /// `source`. `floor` says where coverage begins when the channel has
+    /// none: the pull then reads forward from just after that message id
+    /// instead of taking the newest page as a bounded baseline, so nothing
+    /// older than the floor is stored.
+    pub fn pull_channel(
+        &self,
+        channel_id: &str,
+        floor: Option<u64>,
+        source: &mut dyn Source,
+    ) -> Result<ChannelReceipt> {
+        let options = PullOptions {
+            channel_id: Some(channel_id.to_owned()),
+            ..PullOptions::default()
+        };
+        options.validate()?;
+        let storage = self.storage();
+        storage.storage.scope(|owner| {
+            let storage = DiscordStorage {
+                storage: owner,
+                collection: storage.collection,
+            };
+            let mut view = storage.with_session(|session| Ok(session.view()))?;
+            pull_channel(
+                storage,
+                &mut view,
+                source,
+                channel_id,
+                floor,
+                options.fetch_limit,
+                options.reconcile_limit,
+            )
+        })
+    }
+    /// Store one message object as Discord delivered it, over the gateway
+    /// (MESSAGE_CREATE, or a complete MESSAGE_UPDATE) or from REST: exactly
+    /// the observation a pull stores for the same message, attachments
+    /// included, so a replayed event or an overlapping pull converges on it.
+    /// Coverage is untouched; only a pull proves an interval complete.
+    pub fn observe(&self, message: JsonValue, source: &mut dyn Source) -> Result<CollectionCommit> {
+        let (fragment, message_id, channel_id) =
+            message_fragment(message, |url, size| source.attachment(url, size))?;
+        self.storage().publish(
+            fragment,
+            format!("discord: observed message {message_id} in channel {channel_id}"),
+        )
+    }
+    /// Record the Discord user a bot token of this pile authenticates as, so
+    /// readers can tell the pile's own messages from everyone else's.
+    pub fn record_bot_account(&self, user_id: &str) -> Result<CollectionCommit> {
+        self.storage().publish(
+            discord_model::bot_account_fragment(user_id)?,
+            format!("discord: bot account is user {user_id}"),
+        )
+    }
+    /// Prove that this process can publish to the Discord collection.
+    pub fn preflight_write(&self) -> Result<()> {
+        self.storage().preflight_write()
     }
     pub fn channels_list(&self, guild: Option<&str>) -> Result<ChannelListing> {
         if let Some(guild) = guild {
@@ -400,11 +479,13 @@ fn send_with(
         .context("preflight Discord collection WRITE admission")?;
     let payload = post(token, channel_id, text)?;
     let messages = parse_messages(vec![payload], channel_id)?;
-    let message_id = messages
+    let message = messages
         .first()
-        .map(|message| message.external_id.as_str())
         .ok_or_else(|| anyhow!("Discord send response contained no message"))?;
-    let fragment = build_ingest_fragment(&messages, None, fetch_attachment_bytes)?;
+    let message_id = message.external_id.as_str();
+    let mut fragment = build_ingest_fragment(&messages, None, None, fetch_attachment_bytes)?;
+    // The bot wrote this message, so its author is the pile's own account.
+    fragment += discord_model::bot_account_fragment(&message.author_external_id)?;
     let commit = storage.publish(
         fragment,
         format!("discord: sent and observed message {message_id} in channel {channel_id}"),
@@ -442,7 +523,65 @@ pub struct ReadOptions {
     pub descending: bool,
 }
 
+/// Where ingestion reads Discord from: the REST API, or a stand-in under test.
+pub trait Source {
+    /// One page of a channel's messages, newest first, as Discord's
+    /// `GET /channels/{id}/messages` returns it: with `after`, the `limit`
+    /// messages right after that id; with `before`, the `limit` right before
+    /// it; with neither, the newest `limit`.
+    fn page(&mut self, channel_id: &str, request: PageRequest) -> Result<Vec<JsonValue>>;
+    /// The bytes of one attachment URL, refused beyond `limit` bytes.
+    fn attachment(&mut self, url: &str, limit: u64) -> Result<Vec<u8>>;
+}
+
+/// Discord's REST API, as the bot a token names.
+pub struct Rest {
+    token: String,
+}
+
+impl Rest {
+    pub fn new(token: String) -> Self {
+        Self { token }
+    }
+}
+
+impl Source for Rest {
+    fn page(&mut self, channel_id: &str, request: PageRequest) -> Result<Vec<JsonValue>> {
+        fetch_message_page(&self.token, channel_id, request)
+    }
+
+    fn attachment(&mut self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        fetch_attachment_bytes(url, limit)
+    }
+}
+
+/// One message object as the fragment ingestion stores for it, with its
+/// message and channel ids.
+fn message_fragment(
+    message: JsonValue,
+    fetch: impl FnMut(&str, u64) -> Result<Vec<u8>>,
+) -> Result<(Fragment, String, String)> {
+    let channel_id = required_snowflake(&message, "channel_id", "message")?;
+    let messages = parse_messages(vec![message], &channel_id)?;
+    let message_id = messages
+        .first()
+        .map(|message| message.external_id.clone())
+        .expect("one parsed message");
+    let fragment = build_ingest_fragment(&messages, None, None, fetch)?;
+    Ok((fragment, message_id, channel_id))
+}
+
+/// The fragment [`Discord::observe`] stores for one message object.
+#[cfg(test)]
+pub(crate) fn observed_fragment(
+    message: JsonValue,
+    fetch: impl FnMut(&str, u64) -> Result<Vec<u8>>,
+) -> Result<Fragment> {
+    message_fragment(message, fetch).map(|(fragment, _, _)| fragment)
+}
+
 fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Result<PullReport> {
+    let source = &mut Rest::new(token.to_owned());
     storage.storage.scope(|owner| {
         let storage = DiscordStorage {
             storage: owner,
@@ -464,8 +603,9 @@ fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Resul
                 let result = pull_channel(
                     storage,
                     &mut view,
-                    token,
+                    source,
                     &channel.id,
+                    None,
                     options.fetch_limit,
                     options.reconcile_limit,
                 )
@@ -481,8 +621,9 @@ fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Resul
         let result = pull_channel(
             storage,
             &mut view,
-            token,
+            source,
             channel_id,
+            None,
             options.fetch_limit,
             options.reconcile_limit,
         )?;
@@ -504,8 +645,9 @@ fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Resul
 fn pull_channel(
     storage: DiscordStorage<'_>,
     view: &mut CollectionView,
-    token: &str,
+    source: &mut dyn Source,
     channel_id: &str,
+    floor: Option<u64>,
     fetch_limit: u32,
     reconcile_limit: u32,
 ) -> Result<ChannelReceipt> {
@@ -514,14 +656,17 @@ fn pull_channel(
         .root()
         .expect("intrinsic channel has one root");
     let prior = discord_model::channel_coverage(&view.facts, channel)?;
-    let forward = fetch_complete_forward(
-        prior.map(|coverage| coverage.through_inclusive),
-        fetch_limit,
-        |request| fetch_message_page(token, channel_id, request),
-    )?;
+    // Coverage goes on from its frontier; a channel without any begins as a
+    // baseline, at the floor when there is one.
+    let (after, baseline) = match prior {
+        Some(coverage) => (Some(coverage.through_inclusive), false),
+        None => (floor, true),
+    };
+    let forward = fetch_complete_forward(after, baseline, fetch_limit, |request| {
+        source.page(channel_id, request)
+    })?;
     let recent_payloads = if prior.is_some() {
-        fetch_message_page(
-            token,
+        source.page(
             channel_id,
             PageRequest {
                 after: None,
@@ -542,10 +687,16 @@ fn pull_channel(
             observations: 0,
             coverage: None,
             commit: None,
+            more: false,
         });
     }
 
-    let fragment = build_ingest_fragment(&messages, forward.coverage, fetch_attachment_bytes)?;
+    let fragment = build_ingest_fragment(
+        &messages,
+        forward.coverage,
+        Some(&view.facts),
+        |url, limit| source.attachment(url, limit),
+    )?;
     let description = match forward.coverage {
         Some(interval) => format!(
             "discord: observed {} payloads in channel {channel_id}, covered ({}, {}]{}",
@@ -575,20 +726,25 @@ fn pull_channel(
         observations: messages.len(),
         coverage: forward.coverage,
         commit: Some(commit),
+        more: forward.more,
     })
 }
 
+/// One page of a channel's messages: at most `limit`, newest first, after
+/// and before the given message ids.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PageRequest {
-    after: Option<u64>,
-    before: Option<u64>,
-    limit: u32,
+pub struct PageRequest {
+    pub after: Option<u64>,
+    pub before: Option<u64>,
+    pub limit: u32,
 }
 
 #[derive(Debug)]
 struct ForwardBatch {
     payloads: Vec<JsonValue>,
     coverage: Option<discord_model::CoverageInterval>,
+    /// The page budget ran out with a full page: there is more to read.
+    more: bool,
 }
 
 fn fetch_message_page(
@@ -621,12 +777,15 @@ fn fetch_message_page(
     response.json().context("parse Discord message page")
 }
 
-/// Discord returns message pages newest first. When a forward page is full we
-/// must walk backwards from its smallest id until crossing the prior frontier;
-/// otherwise a burst larger than `limit` would publish a cursor past messages
-/// it never ingested.
+/// Read forward from `after` (the covered frontier, or the floor where
+/// coverage is to begin): Discord answers `after=X` with the `limit` messages
+/// right after X, newest first, so each page goes on from the newest id of the
+/// one before, until a short page or [`FORWARD_PAGES`] pages. Every id in
+/// `(after, newest read]` has then been read. Without `after`, the newest page
+/// is a bounded baseline: `(oldest - 1, newest]`.
 fn fetch_complete_forward<F>(
-    prior_frontier: Option<u64>,
+    after: Option<u64>,
+    baseline: bool,
     limit: u32,
     mut fetch: F,
 ) -> Result<ForwardBatch>
@@ -634,74 +793,59 @@ where
     F: FnMut(PageRequest) -> Result<Vec<JsonValue>>,
 {
     let limit = limit.clamp(1, 100);
-    let first_request = PageRequest {
-        after: prior_frontier,
-        before: None,
-        limit,
-    };
-    let mut payloads = fetch(first_request)?;
-    let mut ids = checked_page_ids(&payloads, limit)?;
-    if ids.is_empty() {
-        return Ok(ForwardBatch {
-            payloads,
-            coverage: None,
-        });
-    }
-
-    if let Some(frontier) = prior_frontier {
-        if ids.iter().any(|id| *id <= frontier) {
-            bail!("Discord after={frontier} page returned a non-forward message");
-        }
-    }
-    let through = *ids.iter().max().expect("non-empty id page");
-
-    if let Some(frontier) = prior_frontier {
-        let mut before = *ids.iter().min().expect("non-empty id page");
-        while ids.len() == limit as usize {
-            let page = fetch(PageRequest {
-                after: None,
-                before: Some(before),
-                limit,
-            })?;
-            let page_ids = checked_page_ids(&page, limit)?;
-            if page_ids.is_empty() {
-                break;
-            }
-            if page_ids.iter().any(|id| *id >= before) {
-                bail!("Discord before={before} page did not move backwards");
-            }
-            let reached_frontier = page_ids.iter().any(|id| *id <= frontier);
-            let short_page = page_ids.len() < limit as usize;
-            payloads.extend(
-                page.into_iter()
-                    .zip(page_ids.iter().copied())
-                    .filter_map(|(payload, id)| {
-                        (id > frontier && id <= through).then_some(payload)
-                    }),
-            );
-            before = *page_ids.iter().min().expect("non-empty id page");
-            if reached_frontier || short_page {
-                break;
-            }
-            ids = page_ids;
-        }
-        Ok(ForwardBatch {
-            payloads,
-            coverage: Some(discord_model::CoverageInterval::new(
-                frontier, through, false,
-            )?),
-        })
-    } else {
-        let minimum = *ids.iter().min().expect("non-empty baseline page");
-        Ok(ForwardBatch {
-            payloads,
-            coverage: Some(discord_model::CoverageInterval::new(
-                minimum.saturating_sub(1),
-                through,
+    let Some(start) = after else {
+        let payloads = fetch(PageRequest {
+            after: None,
+            before: None,
+            limit,
+        })?;
+        let ids = checked_page_ids(&payloads, limit)?;
+        let coverage = match (ids.iter().min(), ids.iter().max()) {
+            (Some(oldest), Some(newest)) => Some(discord_model::CoverageInterval::new(
+                oldest.saturating_sub(1),
+                *newest,
                 true,
             )?),
-        })
+            _ => None,
+        };
+        return Ok(ForwardBatch {
+            payloads,
+            coverage,
+            more: false,
+        });
+    };
+
+    let mut payloads = Vec::new();
+    let mut through = start;
+    let mut more = false;
+    for page in 1..=FORWARD_PAGES {
+        let payload = fetch(PageRequest {
+            after: Some(through),
+            before: None,
+            limit,
+        })?;
+        let ids = checked_page_ids(&payload, limit)?;
+        if ids.iter().any(|id| *id <= through) {
+            bail!("Discord after={through} page returned a non-forward message");
+        }
+        let Some(newest) = ids.iter().max().copied() else {
+            break;
+        };
+        payloads.extend(payload);
+        through = newest;
+        if ids.len() < limit as usize {
+            break;
+        }
+        more = page == FORWARD_PAGES;
     }
+    let coverage = (through > start)
+        .then(|| discord_model::CoverageInterval::new(start, through, baseline))
+        .transpose()?;
+    Ok(ForwardBatch {
+        payloads,
+        coverage,
+        more,
+    })
 }
 
 fn checked_page_ids(payloads: &[JsonValue], limit: u32) -> Result<Vec<u64>> {
@@ -743,6 +887,9 @@ struct IncomingMessage {
     edited_at: Option<Inline<NsTAIInterval>>,
     reply_to_external_id: Option<String>,
     attachments: Vec<AttachmentSource>,
+    /// A system notice (a pin, a member joining) rather than something
+    /// somebody wrote.
+    system: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +900,8 @@ struct AttachmentSource {
     url: String,
     filename: String,
     content_type: Option<String>,
+    /// The size Discord declares.
+    size: Option<u64>,
 }
 
 fn parse_messages(
@@ -833,16 +982,20 @@ fn parse_messages(
                         .get("content_type")
                         .and_then(JsonValue::as_str)
                         .map(str::to_owned);
+                    let size = attachment.get("size").and_then(JsonValue::as_u64);
                     Ok(AttachmentSource {
                         source_id,
                         url,
                         filename,
                         content_type,
+                        size,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
             Some(_) => bail!("message {external_id} attachments field is not an array"),
         };
+        // A message without a type is a default one.
+        let kind = payload.get("type").and_then(JsonValue::as_u64).unwrap_or(0);
 
         messages.push(IncomingMessage {
             external_id,
@@ -854,6 +1007,7 @@ fn parse_messages(
             edited_at,
             reply_to_external_id,
             attachments,
+            system: !WRITTEN_MESSAGE_TYPES.contains(&kind),
         });
     }
     messages
@@ -875,14 +1029,18 @@ fn required_snowflake(value: &JsonValue, field: &str, subject: &str) -> Result<S
 ///
 /// The fetch callback makes the validation-before-publication boundary
 /// directly testable. Any attachment error aborts construction; callers have
-/// not opened a writer yet and therefore cannot publish a receipt.
+/// not opened a writer yet and therefore cannot publish a receipt. An
+/// attachment `stored` already holds with its bytes is linked, not fetched
+/// again; one declared larger than [`MAX_ATTACHMENT_BYTES`] is recorded by
+/// name and size alone.
 fn build_ingest_fragment<F>(
     messages: &[IncomingMessage],
     coverage: Option<discord_model::CoverageInterval>,
+    stored: Option<&FactArchive>,
     mut fetch: F,
 ) -> Result<Fragment>
 where
-    F: FnMut(&str) -> Result<Vec<u8>>,
+    F: FnMut(&str, u64) -> Result<Vec<u8>>,
 {
     if messages.is_empty() {
         if coverage.is_some() {
@@ -923,6 +1081,7 @@ where
     #[derive(Debug)]
     struct AttachmentTransport {
         urls: BTreeSet<String>,
+        size: Option<u64>,
     }
 
     // Aggregate by stable Discord attachment id. Signed CDN URLs are merely
@@ -939,6 +1098,7 @@ where
             .entry(key)
             .or_insert_with(|| AttachmentTransport {
                 urls: BTreeSet::new(),
+                size: source.size,
             })
             .urls
             .insert(source.url.clone());
@@ -946,10 +1106,44 @@ where
 
     let mut prepared_attachments: BTreeMap<AttachmentKey, (Id, Fragment)> = BTreeMap::new();
     for (key, transport) in transports {
+        if let Some(facts) = stored {
+            // The same Discord attachment, stored with its bytes by an
+            // earlier pull: the very occurrence a download would rebuild.
+            let source: discord_model::TextHandle = key.source_id.clone().to_blob().get_handle();
+            let name: discord_model::TextHandle = key.filename.clone().to_blob().get_handle();
+            let known = find!(
+                attachment: Id,
+                pattern!(facts, [{
+                    ?attachment @
+                    metadata::tag: archive::kind_attachment,
+                    archive::attachment_source_id: &source,
+                    archive::attachment_name: &name,
+                    archive::attachment_file: _?file,
+                }])
+            )
+            .next();
+            if let Some(attachment_id) = known {
+                prepared_attachments.insert(key, (attachment_id, Fragment::empty()));
+                continue;
+            }
+        }
+        if let Some(size) = transport.size.filter(|size| *size > MAX_ATTACHMENT_BYTES) {
+            let attachment = entity! { _ @
+                metadata::tag: archive::kind_attachment,
+                archive::attachment_source_id: key.source_id.clone(),
+                archive::attachment_name: key.filename.clone(),
+                archive::attachment_size_bytes: size,
+            };
+            let attachment_id = attachment
+                .root()
+                .expect("attachment occurrence has one exported root");
+            prepared_attachments.insert(key, (attachment_id, attachment));
+            continue;
+        }
         let mut failures = Vec::new();
         let mut bytes = None;
         for url in &transport.urls {
-            match fetch(url) {
+            match fetch(url, MAX_ATTACHMENT_BYTES) {
                 Ok(value) => {
                     bytes = Some(value);
                     break;
@@ -964,12 +1158,14 @@ where
                 failures.join("; ")
             )
         })?;
-        let media_type = key
-            .content_type
-            .as_deref()
-            .unwrap_or_else(|| file_capability::infer_media_type(Path::new(&key.filename)));
-        let file_fragment =
-            file_capability::stage(bytes, &key.filename, media_type).with_context(|| {
+        // Discord's content type is untrusted protocol input: a malformed one
+        // degrades to the generic binary type instead of blocking the channel.
+        let media_type = match key.content_type.as_deref() {
+            Some(content_type) => file_capability::normalize_media_type_or_default(content_type),
+            None => file_capability::infer_media_type(Path::new(&key.filename)).to_owned(),
+        };
+        let file_fragment = file_capability::stage(bytes, &key.filename, &media_type)
+            .with_context(|| {
                 format!("construct canonical file for attachment {}", key.source_id)
             })?;
         let file_id = file_fragment
@@ -1041,6 +1237,12 @@ where
             archive::reply_to?: reply_to,
             archive::attachment*: attachment_ids,
         };
+        if message.system {
+            fragment += entity! { _ @
+                metadata::tag: discord::kind_system_notice,
+                discord::message: message_anchor_id,
+            };
+        }
     }
 
     // Keep this last: no receipt fragment exists until every semantic payload
@@ -1255,8 +1457,13 @@ fn list_channels(token: &str, guild_filter: Option<&str>) -> Result<ChannelListi
     })
 }
 
-fn fetch_attachment_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = build_client()?
+fn fetch_attachment_bytes(url: &str, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let response = Client::builder()
+        .user_agent("triblespace-discord/0.2")
+        .timeout(ATTACHMENT_TIMEOUT)
+        .build()
+        .context("build reqwest client")?
         .get(url)
         .send()
         .with_context(|| format!("GET {url}"))?;
@@ -1265,8 +1472,15 @@ fn fetch_attachment_bytes(url: &str) -> Result<Vec<u8>> {
         let body = response.text().unwrap_or_default();
         bail!("GET {url} failed: status={status} body={body}");
     }
-    let bytes = response.bytes().context("read attachment body")?;
-    Ok(bytes.to_vec())
+    let mut bytes = Vec::new();
+    response
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .context("read attachment body")?;
+    if bytes.len() as u64 > limit {
+        bail!("attachment at {url} is larger than {limit} bytes");
+    }
+    Ok(bytes)
 }
 
 fn build_client() -> Result<Client> {
@@ -1299,6 +1513,7 @@ mod tests {
     use super::*;
     use crate::schemas::files::KIND_FILE;
     use std::fs::File;
+    use triblespace::prelude::inlineencodings::U256BE;
     fn message_json(
         id: &str,
         channel: &str,
@@ -1416,12 +1631,14 @@ mod tests {
         let interval =
             discord_model::CoverageInterval::new(100000000000000000, 100000000000000001, true)
                 .unwrap();
-        let first =
-            build_ingest_fragment(&first, Some(interval), |_| unreachable!("no attachments"))
-                .unwrap();
-        let second =
-            build_ingest_fragment(&second, Some(interval), |_| unreachable!("no attachments"))
-                .unwrap();
+        let first = build_ingest_fragment(&first, Some(interval), None, |_, _| {
+            unreachable!("no attachments")
+        })
+        .unwrap();
+        let second = build_ingest_fragment(&second, Some(interval), None, |_, _| {
+            unreachable!("no attachments")
+        })
+        .unwrap();
         assert_eq!(first, second);
     }
 
@@ -1446,7 +1663,8 @@ mod tests {
         let messages = parse_messages(vec![first, second], channel).unwrap();
         storage
             .publish(
-                build_ingest_fragment(&messages, None, |_| unreachable!("no attachments")).unwrap(),
+                build_ingest_fragment(&messages, None, None, |_, _| unreachable!("no attachments"))
+                    .unwrap(),
                 "volatile replay".to_owned(),
             )
             .unwrap();
@@ -1528,20 +1746,22 @@ mod tests {
         let old_fragment = build_ingest_fragment(
             &parse_messages(vec![old.clone()], channel).unwrap(),
             None,
-            |_| Ok(b"bytes".to_vec()),
+            None,
+            |_, _| Ok(b"bytes".to_vec()),
         )
         .unwrap();
         let refreshed_fragment = build_ingest_fragment(
             &parse_messages(vec![refreshed.clone()], channel).unwrap(),
             None,
-            |_| Ok(b"bytes".to_vec()),
+            None,
+            |_, _| Ok(b"bytes".to_vec()),
         )
         .unwrap();
         assert_eq!(old_fragment, refreshed_fragment);
 
         let messages = parse_messages(vec![old, refreshed], channel).unwrap();
         let mut attempts = Vec::new();
-        let fragment = build_ingest_fragment(&messages, None, |url| {
+        let fragment = build_ingest_fragment(&messages, None, None, |url, _| {
             attempts.push(url.to_owned());
             if url.contains("expired") {
                 bail!("expired signature");
@@ -1596,11 +1816,20 @@ mod tests {
         let interval =
             discord_model::CoverageInterval::new(100000000000000007, 100000000000000008, true)
                 .unwrap();
-        assert!(build_ingest_fragment(&messages, Some(interval), |_| bail!("offline")).is_err());
+        assert!(
+            build_ingest_fragment(&messages, Some(interval), None, |_, _| bail!("offline"))
+                .is_err()
+        );
         assert!(storage.view().unwrap().facts.iter().next().is_none());
 
         let fragment =
-            build_ingest_fragment(&messages, Some(interval), |_| Ok(b"bytes".to_vec())).unwrap();
+            build_ingest_fragment(
+                &messages,
+                Some(interval),
+                None,
+                |_, _| Ok(b"bytes".to_vec()),
+            )
+            .unwrap();
         storage
             .publish(fragment, "complete test page".to_owned())
             .unwrap();
@@ -1618,52 +1847,95 @@ mod tests {
         );
     }
 
+    /// One channel as Discord pages it: `after` gives the `limit` ids right
+    /// after it, `before` the `limit` right before it, neither the newest
+    /// `limit`; every page newest first.
+    fn discord_page(available: &[u64], request: PageRequest) -> Vec<JsonValue> {
+        let mut ids = available
+            .iter()
+            .copied()
+            .filter(|id| request.after.is_none_or(|after| *id > after))
+            .filter(|id| request.before.is_none_or(|before| *id < before))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let limit = request.limit as usize;
+        let ids = if request.after.is_some() {
+            ids.into_iter().take(limit).collect::<Vec<_>>()
+        } else {
+            ids.split_off(ids.len().saturating_sub(limit))
+        };
+        ids.into_iter()
+            .rev()
+            .map(|id| json!({"id": id.to_string()}))
+            .collect()
+    }
+
     #[test]
-    fn newest_first_pagination_closes_a_150_message_gap_before_advancing() {
+    fn forward_pagination_closes_a_gap_page_by_page() {
         let frontier = 100_000_u64;
-        let available = ((frontier - 100)..=(frontier + 150)).collect::<Vec<_>>();
+        let available = ((frontier - 100)..=(frontier + 250)).collect::<Vec<_>>();
         let mut requests = Vec::new();
-        let batch = fetch_complete_forward(Some(frontier), 100, |request| {
+        let batch = fetch_complete_forward(Some(frontier), false, 100, |request| {
             requests.push(request);
-            let mut ids = available
-                .iter()
-                .copied()
-                .filter(|id| request.after.is_none_or(|after| *id > after))
-                .filter(|id| request.before.is_none_or(|before| *id < before))
-                .collect::<Vec<_>>();
-            ids.sort_unstable_by(|left, right| right.cmp(left));
-            ids.truncate(request.limit as usize);
-            Ok(ids
-                .into_iter()
-                .map(|id| json!({"id": id.to_string()}))
-                .collect())
+            Ok(discord_page(&available, request))
         })
         .unwrap();
         let ingested = payload_ids(&batch.payloads)
             .unwrap()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        assert_eq!(ingested, ((frontier + 1)..=(frontier + 150)).collect());
+        assert_eq!(ingested, ((frontier + 1)..=(frontier + 250)).collect());
         assert_eq!(
             batch.coverage,
-            Some(discord_model::CoverageInterval::new(frontier, frontier + 150, false).unwrap())
+            Some(discord_model::CoverageInterval::new(frontier, frontier + 250, false).unwrap())
         );
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].after, Some(frontier));
-        assert_eq!(requests[1].before, Some(frontier + 51));
+        assert!(!batch.more);
+        let afters = requests
+            .iter()
+            .map(|request| request.after)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            afters,
+            [Some(frontier), Some(frontier + 100), Some(frontier + 200)]
+        );
+
+        // Nothing new: no interval.
+        let batch = fetch_complete_forward(Some(frontier + 250), false, 100, |request| {
+            Ok(discord_page(&available, request))
+        })
+        .unwrap();
+        assert!(batch.payloads.is_empty() && batch.coverage.is_none());
+    }
+
+    #[test]
+    fn a_gap_longer_than_the_page_budget_is_closed_by_the_next_pull() {
+        let frontier = 100_000_u64;
+        let gap = 100 * FORWARD_PAGES as u64 + 30;
+        let available = ((frontier + 1)..=(frontier + gap)).collect::<Vec<_>>();
+        let first = fetch_complete_forward(Some(frontier), false, 100, |request| {
+            Ok(discord_page(&available, request))
+        })
+        .unwrap();
+        let reached = frontier + 100 * FORWARD_PAGES as u64;
+        assert_eq!(first.payloads.len(), 100 * FORWARD_PAGES);
+        assert_eq!(
+            first.coverage,
+            Some(discord_model::CoverageInterval::new(frontier, reached, false).unwrap())
+        );
+        assert!(first.more);
+        let second = fetch_complete_forward(Some(reached), false, 100, |request| {
+            Ok(discord_page(&available, request))
+        })
+        .unwrap();
+        assert_eq!(second.payloads.len(), 30);
+        assert!(!second.more);
     }
 
     #[test]
     fn first_page_is_an_explicit_bounded_baseline() {
         let available = (1_u64..=150).collect::<Vec<_>>();
-        let batch = fetch_complete_forward(None, 100, |request| {
-            let mut ids = available.clone();
-            ids.sort_unstable_by(|left, right| right.cmp(left));
-            ids.truncate(request.limit as usize);
-            Ok(ids
-                .into_iter()
-                .map(|id| json!({"id": id.to_string()}))
-                .collect())
+        let batch = fetch_complete_forward(None, true, 100, |request| {
+            Ok(discord_page(&available, request))
         })
         .unwrap();
         assert_eq!(batch.payloads.len(), 100);
@@ -1671,6 +1943,162 @@ mod tests {
             batch.coverage,
             Some(discord_model::CoverageInterval::new(50, 150, true).unwrap())
         );
+
+        // A floor instead: the baseline begins there, and reads forward.
+        let batch = fetch_complete_forward(Some(120), true, 100, |request| {
+            Ok(discord_page(&available, request))
+        })
+        .unwrap();
+        assert_eq!(batch.payloads.len(), 30);
+        assert_eq!(
+            batch.coverage,
+            Some(discord_model::CoverageInterval::new(120, 150, true).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_large_attachment_is_recorded_without_its_bytes() {
+        let channel = "100000000000000011";
+        let payload = |url: &str| {
+            message_json(
+                "100000000000000012",
+                channel,
+                "a long video",
+                None,
+                json!([{
+                    "id": "100000000000000013", "url": url, "filename": "video.mp4",
+                    "content_type": "video/mp4", "size": MAX_ATTACHMENT_BYTES + 1
+                }]),
+            )
+        };
+        // Never downloaded, and the same whichever URL it came with.
+        let never = |_: &str, _: u64| -> Result<Vec<u8>> { unreachable!("not downloaded") };
+        let first = build_ingest_fragment(
+            &parse_messages(vec![payload("https://cdn.example/a")], channel).unwrap(),
+            None,
+            None,
+            never,
+        )
+        .unwrap();
+        let second = build_ingest_fragment(
+            &parse_messages(vec![payload("https://cdn.example/b")], channel).unwrap(),
+            None,
+            None,
+            never,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        let recorded = find!(
+            (attachment: Id, size: Inline<U256BE>),
+            pattern!(&first, [{
+                ?attachment @
+                metadata::tag: archive::kind_attachment,
+                archive::attachment_size_bytes: ?size,
+            }])
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            u64::try_from_inline(&recorded[0].1).unwrap(),
+            MAX_ATTACHMENT_BYTES + 1
+        );
+        assert!(!exists!(pattern!(&first, [{
+            _?attachment @ archive::attachment_file: _?file
+        }])));
+
+        // A malformed content type does not hold the message back either.
+        let mut odd = payload("https://cdn.example/c");
+        odd["attachments"][0]["size"] = json!(5);
+        odd["attachments"][0]["content_type"] = json!("not a media type");
+        build_ingest_fragment(
+            &parse_messages(vec![odd], channel).unwrap(),
+            None,
+            None,
+            |_, _| Ok(b"bytes".to_vec()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_stored_attachment_is_linked_not_downloaded_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let owner = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let storage = test_storage(&owner);
+        let channel = "100000000000000014";
+        let payload = |url: &str| {
+            message_json(
+                "100000000000000015",
+                channel,
+                "a photo",
+                None,
+                json!([{
+                    "id": "100000000000000016", "url": url, "filename": "photo.png",
+                    "content_type": "image/png", "size": 5
+                }]),
+            )
+        };
+        let downloaded = build_ingest_fragment(
+            &parse_messages(vec![payload("https://cdn.example/a")], channel).unwrap(),
+            None,
+            None,
+            |_, _| Ok(b"image".to_vec()),
+        )
+        .unwrap();
+        storage
+            .publish(downloaded.clone(), "downloaded".to_owned())
+            .unwrap();
+        let view = storage.view().unwrap();
+        let linked = build_ingest_fragment(
+            &parse_messages(vec![payload("https://cdn.example/b")], channel).unwrap(),
+            None,
+            Some(&view.facts),
+            |_, _| unreachable!("already stored"),
+        )
+        .unwrap();
+        // The same message observation, without the bytes again.
+        let observation = |fragment: &Fragment| {
+            find!(
+                observation: Id,
+                pattern!(fragment, [{ ?observation @ metadata::tag: archive::kind_message }])
+            )
+            .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(observation(&linked), observation(&downloaded));
+        assert!(!exists!(pattern!(&linked, [{
+            _?file @ metadata::tag: &KIND_FILE
+        }])));
+    }
+
+    #[test]
+    fn system_notices_are_marked_and_written_messages_are_not() {
+        let channel = "100000000000000017";
+        let mut pinned = message_json("100000000000000018", channel, "", None, json!([]));
+        pinned["type"] = json!(6);
+        let mut reply = message_json("100000000000000019", channel, "yes", None, json!([]));
+        reply["type"] = json!(19);
+        let plain = message_json("100000000000000020", channel, "hi", None, json!([]));
+        let fragment = build_ingest_fragment(
+            &parse_messages(vec![pinned, reply, plain], channel).unwrap(),
+            None,
+            None,
+            |_, _| unreachable!("no attachments"),
+        )
+        .unwrap();
+        let notices = find!(
+            anchor: Id,
+            pattern!(&fragment, [{
+                _?notice @
+                metadata::tag: discord::kind_system_notice,
+                discord::message: ?anchor,
+            }])
+        )
+        .collect::<Vec<_>>();
+        let pinned_anchor = discord_model::message_anchor_fragment("100000000000000018")
+            .unwrap()
+            .root()
+            .unwrap();
+        assert_eq!(notices, [pinned_anchor]);
     }
 
     #[test]
@@ -1691,7 +2119,8 @@ mod tests {
         let messages = parse_messages(vec![original, edited], channel).unwrap();
         storage
             .publish(
-                build_ingest_fragment(&messages, None, |_| unreachable!("no attachments")).unwrap(),
+                build_ingest_fragment(&messages, None, None, |_, _| unreachable!("no attachments"))
+                    .unwrap(),
                 "original and edit".to_owned(),
             )
             .unwrap();
@@ -1717,7 +2146,8 @@ mod tests {
         let messages = parse_messages(vec![divergent], channel).unwrap();
         storage
             .publish(
-                build_ingest_fragment(&messages, None, |_| unreachable!("no attachments")).unwrap(),
+                build_ingest_fragment(&messages, None, None, |_, _| unreachable!("no attachments"))
+                    .unwrap(),
                 "divergent edit".to_owned(),
             )
             .unwrap();

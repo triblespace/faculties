@@ -5,15 +5,22 @@
 //! selects immutable semantic message versions, presents independently
 //! observed user profiles, and computes the connected coverage frontier from
 //! explicit numeric intervals.
+//!
+//! `discord live` ([`live`]) is the faculty's resident process: it holds
+//! Discord's one gateway session ([`gateway`]) and stores the messages it
+//! reads in the collection ([`intake`]).
 
 pub mod cli;
+pub mod gateway;
+pub mod intake;
+pub mod live;
 pub mod mcp;
 pub mod operations;
 pub mod render;
 
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
-    ObservedMessage, PullOptions, PullReport, ReadOptions, SendReceipt,
+    ObservedMessage, PageRequest, PullOptions, PullReport, ReadOptions, Rest, SendReceipt, Source,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +76,18 @@ pub fn user_fragment(external_id: &str) -> Result<Fragment> {
         metadata::tag: discord::kind_user,
         discord::user_id: external_id.to_owned(),
     })
+}
+
+/// The Discord user a bot token of this pile authenticates as: its stable
+/// user anchor, and the fact that marks it as the pile's own account.
+pub fn bot_account_fragment(user_external_id: &str) -> Result<Fragment> {
+    let mut fragment = user_fragment(user_external_id)?;
+    let user = fragment.root().expect("intrinsic user anchor has one root");
+    fragment += entity! { _ @
+        metadata::tag: discord::kind_bot_account,
+        discord::user: user,
+    };
+    Ok(fragment)
 }
 
 pub fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
