@@ -167,7 +167,7 @@ impl HealthSources {
             .poll_view
             .as_ref()
             .expect("poll selected a health view");
-        let report = observation.report();
+        let report = observation.attention();
         if report.attention.is_empty() {
             return Ok((false, report.next_change));
         }
@@ -324,14 +324,42 @@ impl HealthObservation {
             && self.presentations.is_current(snapshot)
     }
 
+    /// The complete dashboard, for `show`.
     pub(super) fn report(&self) -> HealthReport {
-        render_health(
-            self.facts.view(),
-            &self.latest,
-            &self.snapshot,
-            self.evaluated_at,
-            self.max_age,
-        )
+        self.render(Detail::Full)
+    }
+
+    /// What can wake someone, for wait, poll and baseline: the attention set
+    /// and the next deadline, with empty text.
+    pub(super) fn attention(&self) -> HealthReport {
+        let attention = self.render(Detail::Attention);
+        // Every test that reaches wait, poll or baseline also proves the two
+        // renders agree on everything but the text.
+        #[cfg(test)]
+        {
+            let full = self.render(Detail::Full);
+            assert_eq!(attention.attention, full.attention);
+            assert_eq!(attention.next_change, full.next_change);
+        }
+        attention
+    }
+
+    fn render(&self, detail: Detail) -> HealthReport {
+        let stage = match detail {
+            Detail::Full => "render dashboard",
+            Detail::Attention => "render attention",
+        };
+        trace_refresh_call("Swarm health", stage, || {
+            Ok::<_, std::convert::Infallible>(render_health(
+                self.facts.view(),
+                &self.latest,
+                &self.snapshot,
+                self.evaluated_at,
+                self.max_age,
+                detail,
+            ))
+        })
+        .unwrap_or_else(|never| match never {})
     }
 
     pub(super) fn persona(&self, input: &str) -> Result<Id> {
@@ -586,6 +614,21 @@ fn collection_label(
     }
 }
 
+/// How much of a health observation to render.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    /// The complete dashboard, as `show` prints it.
+    Full,
+    /// Only what can wake someone: the attention set and the next deadline,
+    /// with empty text. Wait, poll and baseline are an attention channel, not a
+    /// dashboard, and they used to build the whole dashboard only to discard
+    /// it. The text is most of the cost when a view is wide: on 2026-09-26 it
+    /// was 137 s of a 200 s `show` against a 10372-member health cover, and
+    /// 1010 of its 1150 condition lines belonged to stale reports, whose
+    /// conditions can never wake anyone.
+    Attention,
+}
+
 /// Query the current report and its conditions directly from maintained facts.
 /// Missing/unknown rows do not invalidate other reports or invent a green bit.
 fn render_health(
@@ -594,6 +637,7 @@ fn render_health(
     snapshot: &FacultySnapshot,
     now: Epoch,
     max_age: Duration,
+    detail: Detail,
 ) -> HealthReport {
     use std::fmt::Write as _;
 
@@ -637,6 +681,11 @@ fn render_health(
                 collection_group: None,
             });
         }
+        // A condition wakes someone only while its report is fresh, so an
+        // attention render has nothing to find in a stale report's conditions.
+        if detail == Detail::Attention && !fresh {
+            continue;
+        }
         let mut conditions = BTreeSet::new();
         for (condition, component, state) in find!(
             (condition: Id, component: Id, state: Id),
@@ -650,6 +699,19 @@ fn render_health(
             let Some(component_name) = component_name(component) else {
                 continue;
             };
+            let alert = exists!(pattern!(facts, [{
+                condition @ metadata::tag: &schema::KIND_ALERT
+            }]));
+            let recovered = exists!(pattern!(facts, [{
+                condition @ metadata::tag: &schema::KIND_RECOVERED
+            }]));
+            let wakes = fresh && (alert || recovered) && collection_sync_may_wake(component);
+            // Same rows, same order as the dashboard, so the first-inserted
+            // detail of an event is the same in both renders; only the labels
+            // nobody will read are skipped.
+            if detail == Detail::Attention && !wakes {
+                continue;
+            }
             let mut collections: Vec<String> = find!(
                 collection: Inline<inlineencodings::Handle<SimpleArchive>>,
                 pattern!(facts, [{ condition @ attrs::collection: ?collection }])
@@ -673,15 +735,10 @@ fn render_health(
                 .map(|peer| format!(" via [{peer}]"))
                 .collect::<String>();
             let scope = format!("{collection_scope}{peer_scope}");
-            let detail = format!("{component_name}{scope}: {}", state_name(component, state));
-            conditions.insert(detail.clone());
-            let alert = exists!(pattern!(facts, [{
-                condition @ metadata::tag: &schema::KIND_ALERT
-            }]));
-            let recovered = exists!(pattern!(facts, [{
-                condition @ metadata::tag: &schema::KIND_RECOVERED
-            }]));
-            if fresh && (alert || recovered) && collection_sync_may_wake(component) {
+            let condition_line =
+                format!("{component_name}{scope}: {}", state_name(component, state));
+            conditions.insert(condition_line);
+            if wakes {
                 attention.insert(AttentionEvent::Health {
                     event: condition,
                     detail: format!(
@@ -727,7 +784,11 @@ fn render_health(
         text.push_str("  Scope is the reported observer/peer/collection pairs, not the whole swarm.\n  DHT publication and record convergence do not prove blob availability.\n");
     }
     HealthReport {
-        text,
+        // An attention render never hands out a partial dashboard.
+        text: match detail {
+            Detail::Full => text,
+            Detail::Attention => String::new(),
+        },
         attention,
         next_change,
     }
@@ -780,7 +841,11 @@ mod tests {
                 .maintain(&self.store, &self.signer)
                 .unwrap()
                 .is_none());
-            self.sources.at(self.store.snapshot().unwrap(), at).unwrap()
+            let observation = self.sources.at(self.store.snapshot().unwrap(), at).unwrap();
+            // Every scenario also checks that the attention render agrees
+            // with the dashboard on everything that can wake someone.
+            observation.attention();
+            observation
         }
 
         fn malformed_member(&mut self, source: Collection<SimpleArchive>) -> CollectionCommit {

@@ -2947,7 +2947,7 @@ async fn cmd_baseline(
     };
     async {
         let health = HealthSources::open(pile, signer, health_max_age)?.observe(pile, signer)?;
-        let health_events = health.report().attention;
+        let health_events = health.attention().attention;
         let sources = OrientSources::open(pile, signer, false).await?;
         maintain_inputs(pile, signer, &sources).await?;
         let observation = observe_current_sources(pile, &sources)?;
