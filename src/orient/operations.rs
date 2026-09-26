@@ -661,9 +661,10 @@ impl OrientSource {
         self.maintain_local(pile, signer).await
     }
 
-    /// Derive this key's own leaves and mirror its own merges, Succinct
-    /// first. An own commit neither hop could derive is the view's lag, and
-    /// the observation reads what is present
+    /// Derive this key's own leaves, then any leafless foundation of another
+    /// writer whose payload is already here, and mirror this key's own
+    /// merges, Succinct first. An own commit neither hop could derive is the
+    /// view's lag, and the observation reads what is present
     /// ([`crate::storage::tolerate_own_lag`]).
     async fn maintain_local(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
         crate::storage::tolerate_own_lag(pile.maintain(self.succinct, signer).await)

@@ -324,9 +324,10 @@ fn fact_views(
 }
 
 /// Derive the signer's own Archive commits into the fact pair and mirror its
-/// own merges there, then attach Rank9. Nobody else's commit is derived or
-/// fetched here; what other writers have not derived yet is lag, and so is an
-/// own commit neither view can derive.
+/// own merges there, then attach Rank9. Another writer's commit that has no
+/// leaf yet is derived too when its payload is already here; nothing is
+/// fetched for it, and what cannot be derived here is that writer's lag, as
+/// is an own commit neither view can derive.
 async fn ensure_facts(
     pile: &mut Pile,
     source: Collection<SimpleArchive>,
