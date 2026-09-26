@@ -272,6 +272,7 @@ Some useful capabilities deliberately remain host interfaces:
 | Body robot/daemon/camera actions | Already acquired captures, intent state, raw exports and bounded views |
 | Hear listening; Duplex devices/ear/run loops | One resident audio clip, or finite interaction with a launcher-selected existing Duplex session |
 | Voice device probing/private-public playback | Resident speech audio plus stored routing metadata; synthesis is not evidence anyone heard it |
+| Discord's live gateway session (`discord live`: message intake) | The resident chat archive intake writes, and explicit pulls/sends |
 | GUI startup and filesystem/web notebook exports | Finite resident PNG capture from the shared composition |
 
 Planner's local `today`/`week` convenience commands become explicit time
@@ -535,7 +536,7 @@ schemas describe exact arguments and effects.
 | `cognition` | Validate shared execution/context evidence |
 | `compass` | Goals, status, priority edges and referenceable ledger notes |
 | `decide` | Proposals, factors and fork-visible decision resolutions |
-| `discord` | Resident chat archive, explicit bot pulls/sends and channel discovery |
+| `discord` | Resident chat archive, explicit bot pulls/sends, channel discovery, and a live gateway session (`discord live`: message intake) |
 | `duplex` | Finite session interaction; separate continuous host speech runtime |
 | `files` | Blob import, tags, discovery, perception and exact export |
 | `gauge` | Research-health, link and quality diagnostics |

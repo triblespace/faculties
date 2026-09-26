@@ -22,10 +22,16 @@
 //! a scalar high-water mark. Baseline intervals make the intentionally bounded
 //! first import explicit; ordinary intervals may advance a reader only when
 //! they connect to that baseline cover.
+//!
+//! Coverage says what is stored, not what was heard: `discord read` brings a
+//! channel's history in with the same observations `discord live`'s intake
+//! stores. Where a channel's live intake begins is therefore a fact of its
+//! own ([`discord::kind_intake`]), which is how a reader looking for news
+//! tells what was sent while the channel was heard from its history.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 /// Stable extrinsic scope of the Discord observation collection.
@@ -93,6 +99,15 @@ pub mod discord {
         /// Minted with `trible genid` on 2026-08-07:
         /// `8B9F2C90AB42911696E17F49974CD28B`.
         "8B9F2C90AB42911696E17F49974CD28B" as pub receipt_through_inclusive: U256BE;
+        /// The moment from which a channel's live intake hears it: what is
+        /// sent in the channel at or after it was heard, whoever stored it,
+        /// and what was sent before it is the channel's history. Discord's
+        /// millisecond, as a point interval like a message's
+        /// `metadata::created_at`.
+        ///
+        /// Minted with `trible genid` on 2026-09-26:
+        /// `066E9645CB6045F63AA0E9BFBC064337`.
+        "066E9645CB6045F63AA0E9BFBC064337" as pub heard_from: NsTAIInterval;
     }
 
     /// Root id for describing the Discord protocol in metadata.
@@ -131,4 +146,34 @@ pub mod discord {
     /// `D5CE5556F159FE3F34A67A87DB105281`.
     #[allow(non_upper_case_globals)]
     pub const kind_ingestion_baseline: Id = id_hex!("D5CE5556F159FE3F34A67A87DB105281");
+    /// Tag for the Discord user a bot token of this pile authenticates as,
+    /// linked through [`user`]. What that user writes is the pile's own, so a
+    /// reader looking for news from others passes over it.
+    ///
+    /// Minted with `trible genid` on 2026-09-26:
+    /// `F131FEA2CAF2573F40AEC8F4C68D85DA`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_bot_account: Id = id_hex!("F131FEA2CAF2573F40AEC8F4C68D85DA");
+    /// Tag for a Discord message that is a system notice rather than
+    /// something somebody wrote (a pin, a member joining, a boost, a thread
+    /// starting), linked through [`message`] to its anchor. Discord gives
+    /// such messages an author, so this is how a reader looking for people
+    /// writing passes over them.
+    ///
+    /// Minted with `trible genid` on 2026-09-26:
+    /// `B0D2317A9B8F77AFB906CC35EB5AB516`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_system_notice: Id = id_hex!("B0D2317A9B8F77AFB906CC35EB5AB516");
+    /// Tag for where a channel's live intake begins, linked through
+    /// [`channel`] and dated by [`heard_from`]. `discord live` records it
+    /// with what it stores in the channel, and on its own when a backfill
+    /// stores nothing; a DM channel whose beginning moves earlier has one
+    /// for each, and the earliest is where it begins. A message sent before
+    /// every one of them, or in a channel without one, is history, however
+    /// it came in.
+    ///
+    /// Minted with `trible genid` on 2026-09-26:
+    /// `C6AF15CBF07E7E6537752837DE056917`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_intake: Id = id_hex!("C6AF15CBF07E7E6537752837DE056917");
 }

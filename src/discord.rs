@@ -5,15 +5,22 @@
 //! selects immutable semantic message versions, presents independently
 //! observed user profiles, and computes the connected coverage frontier from
 //! explicit numeric intervals.
+//!
+//! `discord live` ([`live`]) is the faculty's resident process: it holds
+//! Discord's one gateway session ([`gateway`]) and stores the messages it
+//! reads in the collection ([`intake`]).
 
 pub mod cli;
+pub mod gateway;
+pub mod intake;
+pub mod live;
 pub mod mcp;
 pub mod operations;
 pub mod render;
 
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
-    ObservedMessage, PullOptions, PullReport, ReadOptions, SendReceipt,
+    ObservedMessage, PageRequest, PullOptions, PullReport, ReadOptions, Rest, SendReceipt, Source,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +76,51 @@ pub fn user_fragment(external_id: &str) -> Result<Fragment> {
         metadata::tag: discord::kind_user,
         discord::user_id: external_id.to_owned(),
     })
+}
+
+/// The Discord user a bot token of this pile authenticates as: its stable
+/// user anchor, and the fact that marks it as the pile's own account.
+pub fn bot_account_fragment(user_external_id: &str) -> Result<Fragment> {
+    let mut fragment = user_fragment(user_external_id)?;
+    let user = fragment.root().expect("intrinsic user anchor has one root");
+    fragment += entity! { _ @
+        metadata::tag: discord::kind_bot_account,
+        discord::user: user,
+    };
+    Ok(fragment)
+}
+
+/// Discord's epoch, in milliseconds since the Unix epoch.
+pub const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+
+/// Where `discord live`'s intake begins in a channel: `floor` is the message
+/// id nothing at or below which it stores, and the channel is heard from the
+/// first millisecond that lets in ([`heard_from`]). With the channel's
+/// anchor, so the fragment stands on its own.
+pub fn intake_fragment(channel_external_id: &str, floor: u64) -> Result<Fragment> {
+    let mut fragment = channel_fragment(channel_external_id)?;
+    let channel = fragment.root().expect("intrinsic channel has one root");
+    fragment += entity! { _ @
+        metadata::tag: discord::kind_intake,
+        discord::channel: channel,
+        discord::heard_from: heard_from(floor),
+    };
+    Ok(fragment)
+}
+
+/// The moment a channel whose intake begins above `floor` is heard from:
+/// the millisecond of the first message id above it, as the point interval a
+/// message's `metadata::created_at` is. A message is sent at or after it
+/// exactly when its id is above the floor for a floor at the end of a
+/// millisecond, as a configured channel's is; a DM channel's floor is one
+/// below the message that began it, which is sent at that moment.
+pub fn heard_from(floor: u64) -> Inline<NsTAIInterval> {
+    let milliseconds = (floor.saturating_add(1) >> 22) + DISCORD_EPOCH_MS;
+    // In whole milliseconds: a float would miss the timestamp by nanoseconds.
+    let moment = Epoch::from_unix_duration(hifitime::Unit::Millisecond * milliseconds as i64);
+    (moment, moment)
+        .try_to_inline()
+        .expect("point interval encodes")
 }
 
 pub fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
@@ -652,25 +704,42 @@ pub fn connected_frontier(intervals: &[CoverageInterval]) -> Option<CoverageFron
         .filter(|interval| interval.baseline)
         .map(|interval| interval.after_exclusive)
         .min()?;
-    let mut frontier = intervals
+    let frontier = intervals
         .iter()
         .filter(|interval| interval.baseline && interval.after_exclusive == floor)
         .map(|interval| interval.through_inclusive)
         .max()?;
+    Some(CoverageFrontier {
+        floor_exclusive: floor,
+        through_inclusive: reach(intervals, frontier),
+    })
+}
+
+/// How far the intervals cover continuously from `start`: through every
+/// interval that begins at or before where the ones before it reached, or
+/// `start` itself when none does. Intervals entirely below `start` play no
+/// part.
+pub fn reach(intervals: &[CoverageInterval], start: u64) -> u64 {
     let mut ordered = intervals.to_vec();
     ordered.sort_by_key(|interval| (interval.after_exclusive, interval.through_inclusive));
+    let mut frontier = start;
     for interval in ordered {
         if interval.after_exclusive <= frontier && interval.through_inclusive > frontier {
             frontier = interval.through_inclusive;
         }
     }
-    Some(CoverageFrontier {
-        floor_exclusive: floor,
-        through_inclusive: frontier,
-    })
+    frontier
 }
 
 pub fn channel_coverage<P>(facts: &P, channel: Id) -> Result<Option<CoverageFrontier>>
+where
+    P: TriblePattern,
+{
+    Ok(connected_frontier(&channel_intervals(facts, channel)?))
+}
+
+/// Every coverage interval, baseline or forward, recorded for `channel`.
+pub fn channel_intervals<P>(facts: &P, channel: Id) -> Result<Vec<CoverageInterval>>
 where
     P: TriblePattern,
 {
@@ -701,7 +770,7 @@ where
         let (after, through) = endpoints.into_iter().next().expect("one endpoint pair");
         intervals.push(CoverageInterval::new(after, through, baseline)?);
     }
-    Ok(connected_frontier(&intervals))
+    Ok(intervals)
 }
 
 fn collect_intervals<P>(
@@ -760,6 +829,28 @@ pub fn coverage_fragment(channel: Id, interval: CoverageInterval) -> Fragment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel is heard from the very moment a message's own timestamp
+    /// names, so a reader comparing the two needs no message id: the live
+    /// floor of 2026-09-26 (the end of 20:41:13.190) lets in 20:41:13.191 on,
+    /// and a DM channel's floor, one below the message that began it, lets
+    /// that message in and nothing sent before its millisecond.
+    #[test]
+    fn a_channel_is_heard_from_the_millisecond_its_floor_lets_in() {
+        let at = |timestamp: &str| interval_key(operations::parse_iso8601(timestamp).unwrap());
+        let floor = 1553506755164504063;
+        assert_eq!(
+            interval_key(heard_from(floor)),
+            at("2026-09-26T20:41:13.191000+00:00")
+        );
+        assert!(at("2026-09-26T20:41:13.190000+00:00") < interval_key(heard_from(floor)));
+        let first = 1553079976620851252;
+        assert_eq!(
+            interval_key(heard_from(first - 1)),
+            at("2026-09-25T16:25:21.257000+00:00"),
+            "the message's own timestamp"
+        );
+    }
 
     #[test]
     fn disconnected_intervals_do_not_advance_the_frontier() {

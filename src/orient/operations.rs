@@ -209,6 +209,8 @@ use crate::out::Out;
 use crate::schemas::archive::archive;
 use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 use crate::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+use crate::schemas::discord::{discord, DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID};
+use crate::schemas::files::file;
 use crate::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
 use crate::schemas::habit::{
     attrs as habit_attrs, KIND_DONE_ID as KIND_HABIT_DONE_ID, KIND_HABIT_ID,
@@ -240,8 +242,8 @@ use crate::storage::FacultySnapshot;
 use crate::storage::{open_store, runtime};
 use crate::storage::{read, FactArchive, FacultyStore, Storage};
 use crate::{
-    clock, compass, habits, mail as mail_model, message, orient as orient_model, relations, status,
-    teams as teams_model, wiki as wiki_model,
+    clock, compass, discord as discord_model, habits, mail as mail_model, message,
+    orient as orient_model, relations, status, teams as teams_model, wiki as wiki_model,
 };
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
@@ -391,6 +393,11 @@ impl RefreshProbe {
                 "Teams",
                 previous.map(|p| &p.facts.teams),
                 &current.facts.teams,
+            ),
+            (
+                "Discord",
+                previous.map(|p| &p.facts.discord),
+                &current.facts.discord,
             ),
             (
                 "Compass",
@@ -830,6 +837,7 @@ struct OrientSources {
     messages: OrientSource,
     mail: OrientSource,
     teams: OrientSource,
+    discord: OrientSource,
     compass: OrientSource,
     relations: OrientSource,
     status: OrientSource,
@@ -850,6 +858,7 @@ impl OrientSources {
         let messages = OrientSource::open(pile, signer, MESSAGE_SCOPE_ID, "Message").await?;
         let mail = OrientSource::open(pile, signer, MAIL_SCOPE_ID, "Mail").await?;
         let teams = OrientSource::open(pile, signer, TEAMS_SCOPE_ID, "Teams").await?;
+        let discord = OrientSource::open(pile, signer, DISCORD_SCOPE_ID, "Discord").await?;
         let compass = OrientSource::open(pile, signer, COMPASS_SCOPE_ID, "Compass").await?;
         let relations = OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
         let status = OrientSource::open(pile, signer, STATUS_SCOPE_ID, "Status").await?;
@@ -864,6 +873,7 @@ impl OrientSources {
             messages,
             mail,
             teams,
+            discord,
             compass,
             relations,
             status,
@@ -900,6 +910,7 @@ struct OrientFacts {
     messages: OrientFact,
     mail: OrientFact,
     teams: OrientFact,
+    discord: OrientFact,
     compass: OrientFact,
     relations: OrientFact,
     status: OrientFact,
@@ -933,6 +944,7 @@ impl OrientObservation {
             &self.facts.messages,
             &self.facts.mail,
             &self.facts.teams,
+            &self.facts.discord,
             &self.facts.compass,
             &self.facts.relations,
             &self.facts.status,
@@ -961,6 +973,7 @@ impl OrientObservation {
             messages: self.facts.messages.view(),
             mail: self.facts.mail.view(),
             teams: self.facts.teams.view(),
+            discord: self.facts.discord.view(),
             compass: self.facts.compass.view(),
             relations: self.facts.relations.view(),
             status: self.facts.status.view(),
@@ -987,6 +1000,7 @@ async fn maintain_inputs(
         Some(&sources.messages),
         Some(&sources.mail),
         Some(&sources.teams),
+        Some(&sources.discord),
         Some(&sources.compass),
         Some(&sources.relations),
         Some(&sources.status),
@@ -1028,6 +1042,7 @@ fn observe_sources(
     let messages = sources.messages.observe(&snapshot)?;
     let mail = sources.mail.observe(&snapshot)?;
     let teams = sources.teams.observe(&snapshot)?;
+    let discord = sources.discord.observe(&snapshot)?;
     let compass = sources.compass.observe(&snapshot)?;
     let relations = sources.relations.observe(&snapshot)?;
     let status = sources.status.observe(&snapshot)?;
@@ -1056,6 +1071,7 @@ fn observe_sources(
             messages,
             mail,
             teams,
+            discord,
             compass,
             relations,
             status,
@@ -1098,6 +1114,7 @@ struct OrientQuery<'a> {
     messages: &'a FactArchive,
     mail: &'a FactArchive,
     teams: &'a FactArchive,
+    discord: &'a FactArchive,
     compass: &'a FactArchive,
     relations: &'a FactArchive,
     status: &'a FactArchive,
@@ -1821,6 +1838,349 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
         .transpose()?
         .unwrap_or_else(|| "(no content)".to_owned());
     Ok((author, content))
+}
+
+/// Discord messages that are attention items for this pile.
+///
+/// Scoped exactly like Teams: Discord carries no per-reader read state, so
+/// the attention set is every message somebody other than this pile's bot
+/// wrote, and news is that set minus the persona's `Presented` ledger. There
+/// is no persona gating: one bot serves every window sharing this pile. The
+/// bot's messages are recognised by the account facts its intake (from READY)
+/// and `discord send` record; a message edited or observed again is the same
+/// anchor, so it is news once. As with Teams, news is somebody writing: a
+/// system notice (a pin, a member joining) is not, though Discord gives it an
+/// author.
+///
+/// And news is what was heard: a message sent in a channel at or after the
+/// moment `discord live`'s intake hears the channel from, which intake
+/// records in the collection with what it stores. Who stored the message does
+/// not matter: one sent while intake was down is news when `discord read`
+/// brings it in. A channel's history is never news, although `discord read`
+/// stores it just as intake stores what it hears, and neither is a channel
+/// intake never heard: reading history wakes no window, then or when a
+/// window first reads Discord.
+fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
+    let own: BTreeSet<Id> = find!(
+        user: Id,
+        pattern!(query.discord, [{
+            _?account @
+            metadata::tag: discord::kind_bot_account,
+            discord::user: ?user,
+        }])
+    )
+    .collect();
+    let notices: BTreeSet<Id> = find!(
+        anchor: Id,
+        pattern!(query.discord, [{
+            _?notice @
+            metadata::tag: discord::kind_system_notice,
+            discord::message: ?anchor,
+        }])
+    )
+    .collect();
+    find!(
+        (anchor: Id, author: Id, created: IntervalValue, heard: IntervalValue),
+        pattern!(query.discord, [
+            {
+                _?observation @
+                metadata::tag: archive::kind_message,
+                discord::message: ?anchor,
+                discord::channel: _?channel,
+                archive::author: ?author,
+                metadata::created_at: ?created,
+            },
+            {
+                _?intake @
+                metadata::tag: discord::kind_intake,
+                discord::channel: _?channel,
+                discord::heard_from: ?heard,
+            },
+        ])
+    )
+    .filter(|(anchor, author, created, heard)| {
+        interval_key(*created) >= interval_key(*heard)
+            && !own.contains(author)
+            && !notices.contains(anchor)
+    })
+    .map(|(anchor, ..)| anchor)
+    .collect()
+}
+
+/// The newest observation of one Discord message, as worth printing when it
+/// turns up as news: every distinct version at the newest time Discord gave
+/// it, since the message is news once and a version left out of that one
+/// report would never be presented. Ordinarily there is one.
+///
+/// Versions are told apart as `discord read` tells them apart (its
+/// `select_messages`): by the whole semantic state of an observation, whose
+/// attachments are attachment entities, Discord's attachment id and declared
+/// size part of their identity; never by what is printed of them.
+struct DiscordMessageDetail {
+    author: String,
+    channel: String,
+    versions: Vec<DiscordVersion>,
+    /// The distinct attachment entities of those versions.
+    attachments: usize,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DiscordVersion {
+    content: String,
+    attachments: Vec<DiscordAttachment>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DiscordAttachment {
+    name: String,
+    /// Its stored content, unless it was too large to store.
+    stored: Option<crate::files::ContentHandle>,
+    /// The size Discord declared for one too large to store.
+    size: Option<u64>,
+}
+
+/// What `discord read` tells two observations of one message apart by: its
+/// content, author, channel, times, reply and attachment entities.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct DiscordState {
+    content: BTreeSet<discord_model::TextHandle>,
+    author: BTreeSet<Id>,
+    channel: BTreeSet<Id>,
+    created: BTreeSet<IntervalValue>,
+    edited: BTreeSet<IntervalValue>,
+    reply_to: BTreeSet<Id>,
+    attachments: BTreeSet<Id>,
+}
+
+fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<DiscordMessageDetail> {
+    // Newest by Discord's own version time: the edit, else the creation.
+    let observations: Vec<(i128, Id)> = find!(
+        (observation: Id, created: IntervalValue),
+        pattern!(query.discord, [{
+            ?observation @
+            metadata::tag: archive::kind_message,
+            discord::message: anchor,
+            metadata::created_at: ?created,
+        }])
+    )
+    .map(|(observation, created)| {
+        let edited = find!(
+            edited: IntervalValue,
+            pattern!(query.discord, [{ observation @ archive::edited_at: ?edited }])
+        )
+        .map(interval_key)
+        .max();
+        (edited.unwrap_or(interval_key(created)), observation)
+    })
+    .collect();
+    let latest = observations
+        .iter()
+        .map(|(time, _)| *time)
+        .max()
+        .ok_or_else(|| anyhow!("Discord message [{}] has no observation", fmt_id(anchor)))?;
+    let newest: BTreeSet<Id> = observations
+        .into_iter()
+        .filter(|(time, _)| *time == latest)
+        .map(|(_, observation)| observation)
+        .collect();
+    let first = *newest.first().expect("the latest time has an observation");
+
+    let author = find!(
+        author: Id,
+        pattern!(query.discord, [{ first @ archive::author: ?author }])
+    )
+    .next();
+    let author = match author {
+        Some(author) => {
+            let names = find!(
+                handle: discord_model::TextHandle,
+                pattern!(query.discord, [{
+                    _?profile @
+                    metadata::tag: discord::kind_user_profile,
+                    discord::user: author,
+                    archive::author_name: ?handle,
+                }])
+            )
+            .chain(find!(
+                handle: discord_model::TextHandle,
+                pattern!(query.discord, [{ author @ discord::user_id: ?handle }])
+            ))
+            .next();
+            names
+                .map(|handle| read_utf8(&query.payloads, handle, "Discord author name"))
+                .transpose()?
+        }
+        None => None,
+    }
+    .unwrap_or_else(|| "(unknown)".to_owned());
+    let channel = find!(
+        handle: discord_model::TextHandle,
+        pattern!(query.discord, [
+            { first @ discord::channel: _?channel },
+            { _?channel @ discord::channel_id: ?handle },
+        ])
+    )
+    .next()
+    .map(|handle| read_utf8(&query.payloads, handle, "Discord channel id"))
+    .transpose()?
+    .unwrap_or_else(|| "(unknown)".to_owned());
+    let mut versions: BTreeMap<DiscordState, DiscordVersion> = BTreeMap::new();
+    for observation in newest {
+        let state = DiscordState {
+            content: find!(
+                handle: discord_model::TextHandle,
+                pattern!(query.discord, [{ observation @ archive::content: ?handle }])
+            )
+            .collect(),
+            author: find!(
+                author: Id,
+                pattern!(query.discord, [{ observation @ archive::author: ?author }])
+            )
+            .collect(),
+            channel: find!(
+                channel: Id,
+                pattern!(query.discord, [{ observation @ discord::channel: ?channel }])
+            )
+            .collect(),
+            created: find!(
+                created: IntervalValue,
+                pattern!(query.discord, [{ observation @ metadata::created_at: ?created }])
+            )
+            .collect(),
+            edited: find!(
+                edited: IntervalValue,
+                pattern!(query.discord, [{ observation @ archive::edited_at: ?edited }])
+            )
+            .collect(),
+            reply_to: find!(
+                reply: Id,
+                pattern!(query.discord, [{ observation @ archive::reply_to: ?reply }])
+            )
+            .collect(),
+            attachments: find!(
+                attachment: Id,
+                pattern!(query.discord, [{ observation @ archive::attachment: ?attachment }])
+            )
+            .collect(),
+        };
+        if versions.contains_key(&state) {
+            continue;
+        }
+        let content = state
+            .content
+            .first()
+            .map(|handle| read_utf8(&query.payloads, *handle, "Discord message content"))
+            .transpose()?
+            .unwrap_or_default();
+        let mut attachments = Vec::new();
+        for &attachment in &state.attachments {
+            let name = find!(
+                name: discord_model::TextHandle,
+                pattern!(query.discord, [{ attachment @ archive::attachment_name: ?name }])
+            )
+            .next()
+            .map(|name| read_utf8(&query.payloads, name, "Discord attachment name"))
+            .transpose()?
+            .unwrap_or_else(|| "(unnamed)".to_owned());
+            let stored = find!(
+                stored: crate::files::ContentHandle,
+                pattern!(query.discord, [
+                    { attachment @ archive::attachment_file: _?file },
+                    { _?file @ file::content: ?stored },
+                ])
+            )
+            .next();
+            let size = find!(
+                size: Inline<inlineencodings::U256BE>,
+                pattern!(query.discord, [{ attachment @ archive::attachment_size_bytes: ?size }])
+            )
+            .find_map(|size| u64::try_from_inline(&size).ok());
+            attachments.push(DiscordAttachment { name, stored, size });
+        }
+        attachments.sort();
+        versions.insert(
+            state,
+            DiscordVersion {
+                content,
+                attachments,
+            },
+        );
+    }
+    let attachments = versions
+        .keys()
+        .flat_map(|state| &state.attachments)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let mut versions: Vec<DiscordVersion> = versions.into_values().collect();
+    versions.sort();
+    Ok(DiscordMessageDetail {
+        author,
+        channel,
+        versions,
+        attachments,
+    })
+}
+
+/// What `orient` prints of one version of a Discord message: its author,
+/// channel and whole text, which of how many versions at the newest time it
+/// is when there are more, and per attachment the `files get` that writes its
+/// stored bytes out, or the size Discord declared for one too large to store.
+fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion) -> String {
+    let count = detail.versions.len();
+    let of = if count > 1 {
+        format!(" (one of {count} versions with the same time)")
+    } else {
+        String::new()
+    };
+    let mut text = format!(
+        "- {} in channel {}{of}: {}\n",
+        detail.author, detail.channel, version.content
+    );
+    // The bytes are in the pile, stored with the message; `files get` with
+    // `@-` writes them out by content hash.
+    for attachment in &version.attachments {
+        let name = &attachment.name;
+        match (attachment.stored, attachment.size) {
+            (Some(content), _) => text.push_str(&format!(
+                "  attachment {name}: files get files:{} @-\n",
+                crate::files::content_hash_hex(content)
+            )),
+            (None, Some(size)) => text.push_str(&format!(
+                "  attachment {name}: {size} bytes, too large to store\n"
+            )),
+            (None, None) => text.push_str(&format!("  attachment {name}: not stored\n")),
+        }
+    }
+    text
+}
+
+/// `Discord message from <author> in channel <id>: <first line>`, and how
+/// many attachments come with it (and how many versions, when Discord gave
+/// more than one the same time). Best effort, like every News line: a body
+/// not yet here only shortens the line; the detail below waits for it.
+fn discord_news_line(query: &OrientQuery<'_>, anchor: Id) -> Option<String> {
+    let detail = discord_message_detail(query, anchor).ok()?;
+    let mut line = format!(
+        "Discord message from {} in channel {}",
+        detail.author, detail.channel
+    );
+    let first = detail.versions.first()?;
+    if let Some(preview) = clip_line(&first.content, NEWS_PREVIEW_CHARS) {
+        line.push_str(": ");
+        line.push_str(&preview);
+    }
+    match detail.attachments {
+        0 => {}
+        1 => line.push_str(" (1 attachment)"),
+        n => line.push_str(&format!(" ({n} attachments)")),
+    }
+    if detail.versions.len() > 1 {
+        line.push_str(&format!(
+            " ({} versions with the same time)",
+            detail.versions.len()
+        ));
+    }
+    Some(line)
 }
 
 /// Render the same unread native Mail projection that drives `orient wait`.
@@ -2723,6 +3083,8 @@ enum AttentionEvent {
     Message(Id),
     Mail(Id),
     Teams(Id),
+    /// A Discord message, by its stable anchor.
+    Discord(Id),
     Goal {
         event: Id,
         goal: Id,
@@ -2743,7 +3105,11 @@ enum AttentionEvent {
 impl AttentionEvent {
     fn id(&self) -> Id {
         match self {
-            Self::Message(id) | Self::Mail(id) | Self::Teams(id) | Self::StatusWindow(id) => *id,
+            Self::Message(id)
+            | Self::Mail(id)
+            | Self::Teams(id)
+            | Self::Discord(id)
+            | Self::StatusWindow(id) => *id,
             Self::Goal { event, .. } => *event,
             Self::Note { note, .. } => *note,
             Self::Health { event, .. } => *event,
@@ -2755,6 +3121,7 @@ impl AttentionEvent {
             Self::Message(id) => format!("new message [{}]", fmt_id(*id)),
             Self::Mail(id) => format!("new mail [{}]", fmt_id(*id)),
             Self::Teams(id) => format!("new Teams message [{}]", fmt_id(*id)),
+            Self::Discord(id) => format!("new Discord message [{}]", fmt_id(*id)),
             Self::Goal {
                 event,
                 goal,
@@ -2830,6 +3197,9 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
     }
     for message in native_teams_messages(query)? {
         view.insert(AttentionEvent::Teams(message));
+    }
+    for message in native_discord_messages(query) {
+        view.insert(AttentionEvent::Discord(message));
     }
 
     let attention_keys = attention_keys(query, persona_id)?;
@@ -3157,6 +3527,29 @@ fn render_news_detail(
             writeln!(out, "- {author}: {content}").unwrap();
         }
     }
+    let new_discord: Vec<Id> = pending
+        .events
+        .values()
+        .filter_map(|event| match event {
+            AttentionEvent::Discord(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    if !new_discord.is_empty() {
+        writeln!(out, "\nNew Discord messages:").unwrap();
+        for message in &new_discord {
+            let detail = discord_message_detail(query, *message)?;
+            // Distinct versions that print alike (they differ in a Discord
+            // attachment id, say) are counted, and printed once.
+            let mut printed = BTreeSet::new();
+            for version in &detail.versions {
+                let text = discord_version_text(&detail, version);
+                if printed.insert(text.clone()) {
+                    out.push_str(&text);
+                }
+            }
+        }
+    }
     let new_people: Vec<Id> = pending
         .events
         .values()
@@ -3349,6 +3742,10 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
         AttentionEvent::StatusWindow(window) => match read_native_person_label(query, *window) {
             Ok(label) => format!("new status window {label}"),
             Err(_) => event.reason(),
+        },
+        AttentionEvent::Discord(message) => match discord_news_line(query, *message) {
+            Some(line) => line,
+            None => event.reason(),
         },
         AttentionEvent::Mail(_) | AttentionEvent::Teams(_) | AttentionEvent::Health { .. } => {
             event.reason()
@@ -7790,5 +8187,616 @@ mod tests {
             assert!(!text.contains(&goal_hex), "{text}");
             pile.close().unwrap();
         });
+    }
+
+    /// Discord is read like Teams: a message somebody else wrote is news with
+    /// its author, channel, first line and attachments; the bot's own message
+    /// and a system notice are not; and a presented message never repeats,
+    /// not even once edited.
+    #[test]
+    fn discord_messages_from_others_are_news_once_and_the_bots_own_never() {
+        crate::test_support::clear_ambient_environment();
+        runtime().unwrap().block_on(async {
+            use crate::discord::operations::observed_fragment;
+            use serde_json::json;
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let reader_id = id(90);
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, profile)
+                .unwrap();
+
+            let channel = "100000000000000200";
+            let bot = "100000000000000900";
+            let message = |id: &str, author: &str, content: &str, edited: Option<&str>| {
+                let (name, attachments) = if author == bot {
+                    ("Bot", json!([]))
+                } else {
+                    let photo = json!({
+                        "id": "100000000000000509", "url": "https://cdn.example/p.png",
+                        "filename": "photo.png", "content_type": "image/png"
+                    });
+                    ("Ada", json!([photo]))
+                };
+                json!({
+                    "id": id, "channel_id": channel, "guild_id": "100000000000000300",
+                    "type": 0, "content": content,
+                    "author": {"id": author, "username": author, "global_name": name},
+                    "timestamp": "2026-09-26T08:00:00Z", "edited_timestamp": edited,
+                    "attachments": attachments,
+                })
+            };
+            let stored = |message: serde_json::Value| {
+                observed_fragment(message, |_, _| Ok(b"image".to_vec())).unwrap()
+            };
+            let mut facts = crate::discord::bot_account_fragment(bot).unwrap();
+            // Intake hears the channel from before every message here.
+            facts += crate::discord::intake_fragment(channel, 100000000000000000).unwrap();
+            facts += stored(message(
+                "100000000000000501",
+                "100000000000000400",
+                "look at this\nsecond line",
+                None,
+            ));
+            facts += stored(message("100000000000000502", bot, "my own reply", None));
+            // Somebody pinning a message is a system notice, not writing.
+            let mut pin = message("100000000000000503", "100000000000000400", "", None);
+            pin["type"] = json!(6);
+            pin["attachments"] = json!([]);
+            facts += stored(pin);
+            pile.commit(sources.discord.source, &fixture.signer, facts)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let news = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { text, events } = &news else {
+                panic!("a Discord message from somebody else is news");
+            };
+            assert_eq!(events.len(), 1, "{text}");
+            assert!(
+                text.contains(&format!(
+                    "News: Discord message from Ada in channel {channel}: look at this… (1 attachment)"
+                )),
+                "{text}"
+            );
+            // The attachment is named by the handle of its stored bytes.
+            let photo: Blob<blobencodings::RawBytes> = b"image".to_vec().to_blob();
+            let photo = crate::files::content_hash_hex(photo.get_handle());
+            assert!(
+                text.contains(&format!(
+                    "New Discord messages:\n- Ada in channel {channel}: look at this\nsecond line\n  attachment photo.png: files get files:{photo} @-"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("my own reply"), "{text}");
+
+            // Presented, it is not news again, and neither is its edit.
+            let mut output = Vec::new();
+            apply_news_to_writer(
+                &mut pile,
+                &fixture.signer,
+                reader_id,
+                false,
+                &news,
+                "",
+                &mut output,
+            )
+            .unwrap();
+            pile.commit(
+                sources.discord.source,
+                &fixture.signer,
+                stored(message(
+                    "100000000000000501",
+                    "100000000000000400",
+                    "look at this, edited",
+                    Some("2026-09-26T08:05:00Z"),
+                )),
+            )
+            .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let again = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(again, News::Quiet),
+                "a presented Discord message repeated"
+            );
+            pile.close().unwrap();
+        });
+    }
+
+    /// Two versions of one Discord message with the same newest time (as
+    /// `discord read` keeps them both) are both in its one report: once
+    /// presented, neither would be news again.
+    #[test]
+    fn discord_versions_with_the_same_time_are_all_presented() {
+        crate::test_support::clear_ambient_environment();
+        runtime().unwrap().block_on(async {
+            use crate::discord::operations::observed_fragment;
+            use serde_json::json;
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let reader_id = id(91);
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, profile)
+                .unwrap();
+            let channel = "100000000000000200";
+            let version = |content: &str| {
+                observed_fragment(
+                    json!({
+                        "id": "100000000000000501", "channel_id": channel, "type": 0,
+                        "content": content,
+                        "author": {"id": "100000000000000400", "username": "ada",
+                                   "global_name": "Ada"},
+                        "timestamp": "2026-09-26T08:00:00Z",
+                        "edited_timestamp": "2026-09-26T08:05:00Z",
+                        "attachments": [],
+                    }),
+                    |_, _| unreachable!("no attachments"),
+                )
+                .unwrap()
+            };
+            let mut facts = version("one wording");
+            facts += version("another wording");
+            facts += crate::discord::intake_fragment(channel, 100000000000000000).unwrap();
+            pile.commit(sources.discord.source, &fixture.signer, facts)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let news = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { text, events } = &news else {
+                panic!("a Discord message from somebody else is news");
+            };
+            assert_eq!(events.len(), 1, "{text}");
+            assert!(
+                text.contains(&format!(
+                    "News: Discord message from Ada in channel {channel}: another wording \
+                     (2 versions with the same time)"
+                )),
+                "{text}"
+            );
+            for wording in ["another wording", "one wording"] {
+                assert!(
+                    text.contains(&format!(
+                        "- Ada in channel {channel} (one of 2 versions with the same time): \
+                         {wording}"
+                    )),
+                    "{text}"
+                );
+            }
+            pile.close().unwrap();
+        });
+    }
+
+    /// The review's R4: versions with the same time are told apart as
+    /// `discord read` tells them apart, by their attachment entities. Two
+    /// large `report.bin` attachments with different Discord ids and sizes,
+    /// neither stored, are two versions and two attachments, each printed
+    /// with its size; two that differ in the Discord id alone are two
+    /// versions and two attachments as well, and print alike, so once.
+    #[test]
+    fn discord_versions_are_told_apart_by_their_attachments() {
+        crate::test_support::clear_ambient_environment();
+        runtime().unwrap().block_on(async {
+            use crate::discord::operations::observed_fragment;
+            use serde_json::json;
+            let fixture = TestPile::new();
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let reader_id = id(92);
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, profile)
+                .unwrap();
+            let channel = "100000000000000200";
+            let version = |message: &str, attachment: &str, size: u64| {
+                observed_fragment(
+                    json!({
+                        "id": message, "channel_id": channel, "type": 0,
+                        "content": "the report",
+                        "author": {"id": "100000000000000400", "username": "ada",
+                                   "global_name": "Ada"},
+                        "timestamp": "2026-09-26T08:00:00Z",
+                        "edited_timestamp": "2026-09-26T08:05:00Z",
+                        "attachments": [{
+                            "id": attachment, "url": "https://cdn.example/report.bin",
+                            "filename": "report.bin",
+                            "content_type": "application/octet-stream", "size": size
+                        }],
+                    }),
+                    |_, _| unreachable!("too large to fetch"),
+                )
+                .unwrap()
+            };
+            let mut facts = version("100000000000000501", "100000000000000601", 30_000_000);
+            facts += version("100000000000000501", "100000000000000602", 31_000_000);
+            facts += version("100000000000000502", "100000000000000603", 30_000_000);
+            facts += version("100000000000000502", "100000000000000604", 30_000_000);
+            facts += crate::discord::intake_fragment(channel, 100000000000000000).unwrap();
+            pile.commit(sources.discord.source, &fixture.signer, facts)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let news = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { text, events } = &news else {
+                panic!("Discord messages from somebody else are news");
+            };
+            assert_eq!(events.len(), 2, "{text}");
+            let line = format!(
+                "News: Discord message from Ada in channel {channel}: the report \
+                 (2 attachments) (2 versions with the same time)\n"
+            );
+            assert_eq!(text.matches(&line).count(), 2, "{text}");
+            let version = |size: u64| {
+                format!(
+                    "- Ada in channel {channel} (one of 2 versions with the same time): \
+                     the report\n  attachment report.bin: {size} bytes, too large to store\n"
+                )
+            };
+            assert_eq!(text.matches(&version(31_000_000)).count(), 1, "{text}");
+            assert_eq!(
+                text.matches(&version(30_000_000)).count(),
+                2,
+                "one per message: the second message's two versions print alike\n{text}"
+            );
+            pile.close().unwrap();
+        });
+    }
+
+    /// Discord without a network: one channel's message objects, paged as
+    /// Discord pages them (`after` gives the messages right after it, every
+    /// page newest first) and fetched by id.
+    #[derive(Clone, Default)]
+    struct DiscordFake {
+        messages: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    fn discord_fake_id(message: &serde_json::Value) -> u64 {
+        message["id"].as_str().unwrap().parse().unwrap()
+    }
+
+    impl crate::discord::Source for DiscordFake {
+        fn page(
+            &mut self,
+            _channel_id: &str,
+            request: crate::discord::PageRequest,
+        ) -> Result<Vec<serde_json::Value>> {
+            let mut page: Vec<serde_json::Value> = self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|message| {
+                    let id = discord_fake_id(message);
+                    request.after.is_none_or(|after| id > after)
+                        && request.before.is_none_or(|before| id < before)
+                })
+                .cloned()
+                .collect();
+            page.sort_by_key(discord_fake_id);
+            let limit = request.limit as usize;
+            let mut page: Vec<serde_json::Value> = if request.after.is_some() {
+                page.into_iter().take(limit).collect()
+            } else {
+                page.split_off(page.len().saturating_sub(limit))
+            };
+            page.reverse();
+            Ok(page)
+        }
+
+        fn message(
+            &mut self,
+            _channel_id: &str,
+            message_id: u64,
+        ) -> Result<Option<serde_json::Value>> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|message| discord_fake_id(message) == message_id)
+                .cloned())
+        }
+
+        fn attachment(&mut self, url: &str, _limit: u64) -> Result<Vec<u8>> {
+            bail!("no attachment {url}")
+        }
+    }
+
+    /// Orient's news for `reader` from the pile as it stands, taken as a
+    /// watcher takes it: reported, then presented.
+    async fn take_news(path: &Path, signer: &SigningKey, reader: Id) -> News {
+        let mut pile = open_store(path).unwrap();
+        let sources = OrientSources::open(&mut pile, signer, false).await.unwrap();
+        maintain_sources(&mut pile, signer, &sources).await.unwrap();
+        let observation = observe_current_sources(&mut pile, &sources).unwrap();
+        let news = read(&mut pile, &observation.snapshot, |view| {
+            let query = observation.query(view);
+            prepare_news_once(&query, reader)
+        })
+        .await
+        .unwrap();
+        apply_news_to_writer(
+            &mut pile,
+            signer,
+            reader,
+            false,
+            &news,
+            "",
+            &mut Vec::<u8>::new(),
+        )
+        .unwrap();
+        pile.close().unwrap();
+        news
+    }
+
+    /// The live sequence on sky, 2026-09-25/26, with the channel's and the
+    /// messages' own ids and times. A `discord read` pulled the channel before
+    /// intake had ever run: its first pull, a bounded baseline of the bot
+    /// joining, the bot's greeting and the reply to it, all printed to the
+    /// window that read them. The next day `discord live` began intake of the
+    /// channel (its floor the moment it started, the bot's account recorded,
+    /// a backfill with nothing newer to store), and orient, reading Discord
+    /// for the first time, presented the day-old reply as news. It is the
+    /// channel's history, which `discord read` stored: never news. What is
+    /// sent from where intake begins is news whoever stored it: one sent
+    /// while intake was down that `discord read` brings in, although intake
+    /// has stored nothing in the channel yet, and the gateway's next message.
+    #[test]
+    fn discord_history_read_before_intake_began_is_never_news() {
+        use crate::discord::intake::{floor_at, Done, Intake, Work};
+        use serde_json::json;
+        crate::test_support::clear_ambient_environment();
+        // The Discord faculty runs its own runtime, which must not end inside
+        // this one's: only orient's reads run on it.
+        let runtime = runtime().unwrap();
+        let fixture = TestPile::new();
+        let key = fixture.dir.join("discord.key");
+        let signer = crate::storage::initialize_signer(&fixture.path, Some(&key)).unwrap();
+        let discord = crate::discord::Discord::new(fixture.path.clone(), Some(key));
+        let reader_id = id(93);
+        runtime.block_on(async {
+            let mut pile = open_store(&fixture.path).unwrap();
+            let sources = OrientSources::open(&mut pile, &signer, false)
+                .await
+                .unwrap();
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &signer, profile)
+                .unwrap();
+            pile.close().unwrap();
+        });
+
+        let channel = "1553078566332403894";
+        let bot = "100000000000000900";
+        let message = |id: &str, at: &str, author: &str, kind: u64, content: &str| {
+            let name = if author == bot { "Bot" } else { "Ada" };
+            json!({
+                "id": id, "channel_id": channel, "type": kind, "content": content,
+                "author": {"id": author, "username": name, "global_name": name},
+                "timestamp": at, "edited_timestamp": null,
+                "attachments": [], "referenced_message": null,
+            })
+        };
+        let ada = "100000000000000400";
+        let fake = DiscordFake::default();
+        fake.messages.lock().unwrap().extend([
+            // The bot joining the server.
+            message(
+                "1553078807873724499",
+                "2026-09-25T16:20:42.606000+00:00",
+                bot,
+                7,
+                "",
+            ),
+            message(
+                "1553079260489711807",
+                "2026-09-25T16:22:30.518000+00:00",
+                bot,
+                0,
+                "hello, it is the bot",
+            ),
+            message(
+                "1553079976620851252",
+                "2026-09-25T16:25:21.257000+00:00",
+                ada,
+                0,
+                "thank you, the disk is connected",
+            ),
+        ]);
+
+        // 2026-09-25T16:25:38Z: `discord read`, the channel's first pull.
+        let first = discord
+            .pull_channel(channel, None, &mut fake.clone())
+            .unwrap();
+        assert_eq!(first.observations, 3);
+        assert_eq!(
+            first.coverage,
+            Some(
+                crate::discord::CoverageInterval::new(
+                    1553078807873724498,
+                    1553079976620851252,
+                    true
+                )
+                .unwrap()
+            ),
+            "the bounded baseline the live commit covered"
+        );
+
+        // 2026-09-26T20:41:13.191Z: `discord live` begins intake.
+        let floor = floor_at(UNIX_EPOCH + Duration::from_millis(1_790_455_273_191));
+        assert_eq!(floor, 1553506755164504063, "the floor intake kept on sky");
+        let mut intake = Intake::new(
+            discord.clone(),
+            Box::new(fake.clone()),
+            vec![std::num::NonZeroU64::new(channel.parse().unwrap()).unwrap()],
+            false,
+            fixture.dir.join("intake"),
+            floor,
+        );
+        assert_eq!(
+            intake.handle(Work::Account(bot.to_owned())).unwrap(),
+            Done::Recorded
+        );
+        assert_eq!(
+            intake.handle(Work::Backfill).unwrap(),
+            Done::Backfilled {
+                channels: 1,
+                failed: 0,
+                more: false,
+                unstored: 0
+            }
+        );
+        let history = runtime.block_on(take_news(&fixture.path, &signer, reader_id));
+        assert!(
+            matches!(history, News::Quiet),
+            "the channel's history is not news: {:?}",
+            match &history {
+                News::Report { text, .. } => text.as_str(),
+                News::Quiet => "",
+            }
+        );
+
+        // The process exits, as it did five times over; meanwhile a message is
+        // sent, and `discord read` brings it in with the history it
+        // reconciles. Intake stored none of it, and it is news.
+        drop(intake);
+        fake.messages.lock().unwrap().push(message(
+            "1553511481344004096",
+            "2026-09-26T21:00:00.000000+00:00",
+            ada,
+            0,
+            "are you there?",
+        ));
+        let read = discord
+            .pull_channel(channel, None, &mut fake.clone())
+            .unwrap();
+        assert_eq!(
+            read.observations, 5,
+            "the one read forward, and the recent page reconciled"
+        );
+        let News::Report { text, events } =
+            runtime.block_on(take_news(&fixture.path, &signer, reader_id))
+        else {
+            panic!("a message sent while intake was down is news");
+        };
+        assert_eq!(events.len(), 1, "{text}");
+        assert!(
+            text.contains(&format!(
+                "News: Discord message from Ada in channel {channel}: are you there?"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("the disk is connected"), "{text}");
+
+        // Restarted, intake keeps the floor it began with, and the gateway's
+        // next message is news.
+        let mut intake = Intake::new(
+            discord.clone(),
+            Box::new(fake.clone()),
+            vec![std::num::NonZeroU64::new(channel.parse().unwrap()).unwrap()],
+            false,
+            fixture.dir.join("intake"),
+            floor_at(UNIX_EPOCH + Duration::from_millis(1_790_456_700_000)),
+        );
+        assert_eq!(
+            intake.handle(Work::Account(bot.to_owned())).unwrap(),
+            Done::Recorded
+        );
+        assert_eq!(
+            intake.handle(Work::Backfill).unwrap(),
+            Done::Backfilled {
+                channels: 1,
+                failed: 0,
+                more: false,
+                unstored: 0
+            }
+        );
+        let heard = message(
+            "1553512739635204096",
+            "2026-09-26T21:05:00.000000+00:00",
+            ada,
+            0,
+            "never mind",
+        );
+        fake.messages.lock().unwrap().push(heard.clone());
+        let mut gateway = heard;
+        gateway["guild_id"] = json!("1553078565199683675");
+        assert_eq!(intake.handle(Work::Message(gateway)).unwrap(), Done::Stored);
+        let News::Report { text, events } =
+            runtime.block_on(take_news(&fixture.path, &signer, reader_id))
+        else {
+            panic!("a message sent after intake began is news");
+        };
+        assert_eq!(events.len(), 1, "{text}");
+        assert!(
+            text.contains(&format!(
+                "News: Discord message from Ada in channel {channel}: never mind"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("the disk is connected"), "{text}");
     }
 }
