@@ -50,6 +50,14 @@ enum Command {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    // The voice driver reports its own failures through tracing; RUST_LOG
+    // (e.g. songbird=debug) makes them visible in the line's log.
+    if std::env::var_os("RUST_LOG").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let Some(command) = cli.command else {
         Cli::command().print_help()?;
         println!();

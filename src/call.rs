@@ -206,21 +206,46 @@ async fn speak_line(driver: &mut Driver, speech: &SpeechWorker, queued: &Path) -
     let track = driver.play_input(RawAdapter::new(Cursor::new(pcm), sample_rate, 1).into());
     let started = std::time::Instant::now();
     // How the line ended is part of what happened: a track that errored or
-    // was stopped is not a line that was heard.
-    let ended = loop {
-        match track.get_info().await {
-            Ok(state) if !state.playing.is_done() => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Ok(state) => break format!("{:?}", state.playing),
-            Err(error) => break format!("track control ended: {error}"),
-        }
+    // was stopped is not a line that was heard. songbird drops a track the
+    // moment it ends, so the outcome comes from its own End and Error events,
+    // never from polling a handle that is already gone.
+    let (reported, outcome) = oneshot::channel();
+    let reported = Arc::new(std::sync::Mutex::new(Some(reported)));
+    for event in [songbird::TrackEvent::End, songbird::TrackEvent::Error] {
+        track
+            .add_event(
+                songbird::Event::Track(event),
+                TrackOutcome(reported.clone()),
+            )
+            .map_err(|error| anyhow!("watch the spoken line: {error}"))?;
+    }
+    let ended = match tokio::time::timeout(Duration::from_secs(600), outcome).await {
+        Ok(Ok(state)) => state,
+        Ok(Err(_)) => "without reporting an outcome".to_owned(),
+        Err(_) => "still playing after ten minutes".to_owned(),
     };
     eprintln!(
         "[call] played for {:.1} s, ended {ended}",
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// Reports a track's final play state once, from whichever of its End or
+/// Error events fires.
+struct TrackOutcome(Arc<std::sync::Mutex<Option<oneshot::Sender<String>>>>);
+
+#[async_trait::async_trait]
+impl songbird::EventHandler for TrackOutcome {
+    async fn act(&self, context: &songbird::EventContext<'_>) -> Option<songbird::Event> {
+        if let songbird::EventContext::Track([(state, _), ..]) = context {
+            let sender = self.0.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(sender) = sender {
+                let _ = sender.send(format!("{:?}", state.playing));
+            }
+        }
+        None
+    }
 }
 
 /// Tell a text channel the line is open.
