@@ -5,15 +5,22 @@
 //! selects immutable semantic message versions, presents independently
 //! observed user profiles, and computes the connected coverage frontier from
 //! explicit numeric intervals.
+//!
+//! `discord live` ([`live`]) is the faculty's resident process: it holds
+//! Discord's one gateway session ([`gateway`]) and stores the messages it
+//! reads in the collection ([`intake`]).
 
 pub mod cli;
+pub mod gateway;
+pub mod intake;
+pub mod live;
 pub mod mcp;
 pub mod operations;
 pub mod render;
 
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
-    ObservedMessage, PullOptions, PullReport, ReadOptions, SendReceipt,
+    ObservedMessage, PageRequest, PullOptions, PullReport, ReadOptions, Rest, SendReceipt, Source,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +76,18 @@ pub fn user_fragment(external_id: &str) -> Result<Fragment> {
         metadata::tag: discord::kind_user,
         discord::user_id: external_id.to_owned(),
     })
+}
+
+/// The Discord user a bot token of this pile authenticates as: its stable
+/// user anchor, and the fact that marks it as the pile's own account.
+pub fn bot_account_fragment(user_external_id: &str) -> Result<Fragment> {
+    let mut fragment = user_fragment(user_external_id)?;
+    let user = fragment.root().expect("intrinsic user anchor has one root");
+    fragment += entity! { _ @
+        metadata::tag: discord::kind_bot_account,
+        discord::user: user,
+    };
+    Ok(fragment)
 }
 
 pub fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
@@ -652,25 +671,42 @@ pub fn connected_frontier(intervals: &[CoverageInterval]) -> Option<CoverageFron
         .filter(|interval| interval.baseline)
         .map(|interval| interval.after_exclusive)
         .min()?;
-    let mut frontier = intervals
+    let frontier = intervals
         .iter()
         .filter(|interval| interval.baseline && interval.after_exclusive == floor)
         .map(|interval| interval.through_inclusive)
         .max()?;
+    Some(CoverageFrontier {
+        floor_exclusive: floor,
+        through_inclusive: reach(intervals, frontier),
+    })
+}
+
+/// How far the intervals cover continuously from `start`: through every
+/// interval that begins at or before where the ones before it reached, or
+/// `start` itself when none does. Intervals entirely below `start` play no
+/// part.
+pub fn reach(intervals: &[CoverageInterval], start: u64) -> u64 {
     let mut ordered = intervals.to_vec();
     ordered.sort_by_key(|interval| (interval.after_exclusive, interval.through_inclusive));
+    let mut frontier = start;
     for interval in ordered {
         if interval.after_exclusive <= frontier && interval.through_inclusive > frontier {
             frontier = interval.through_inclusive;
         }
     }
-    Some(CoverageFrontier {
-        floor_exclusive: floor,
-        through_inclusive: frontier,
-    })
+    frontier
 }
 
 pub fn channel_coverage<P>(facts: &P, channel: Id) -> Result<Option<CoverageFrontier>>
+where
+    P: TriblePattern,
+{
+    Ok(connected_frontier(&channel_intervals(facts, channel)?))
+}
+
+/// Every coverage interval, baseline or forward, recorded for `channel`.
+pub fn channel_intervals<P>(facts: &P, channel: Id) -> Result<Vec<CoverageInterval>>
 where
     P: TriblePattern,
 {
@@ -701,7 +737,7 @@ where
         let (after, through) = endpoints.into_iter().next().expect("one endpoint pair");
         intervals.push(CoverageInterval::new(after, through, baseline)?);
     }
-    Ok(connected_frontier(&intervals))
+    Ok(intervals)
 }
 
 fn collect_intervals<P>(
