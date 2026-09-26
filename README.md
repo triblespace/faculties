@@ -272,7 +272,7 @@ Some useful capabilities deliberately remain host interfaces:
 | Body robot/daemon/camera actions | Already acquired captures, intent state, raw exports and bounded views |
 | Hear listening; Duplex devices/ear/run loops | One resident audio clip, or finite interaction with a launcher-selected existing Duplex session |
 | Voice device probing/private-public playback | Resident speech audio plus stored routing metadata; synthesis is not evidence anyone heard it |
-| Discord's live gateway session (`discord live`: message intake) | The resident chat archive intake writes, and explicit pulls/sends |
+| Discord's live gateway session (`discord live`: message intake, and with `discord-voice` a voice connection that speaks what `discord say` queues) | The resident chat archive intake writes, and explicit pulls/sends |
 | GUI startup and filesystem/web notebook exports | Finite resident PNG capture from the shared composition |
 
 Planner's local `today`/`week` convenience commands become explicit time
@@ -294,6 +294,7 @@ discovery itself does not load weights, open devices, or start a GPU.
 | `audio` | Host device enumeration/playback plumbing, not speech-model weights |
 | `hear` | Resident audio inference using the explicitly configured model pile, configuration and tokenizer |
 | `voice` (opt-in) | Qwen3-TTS synthesis using a native model pile and voice-reference assets |
+| `discord-voice` (opt-in) | `discord live` joining a voice channel and speaking what `discord say` queues: songbird's voice driver plus the `voice` feature's synthesis |
 | `imagine` (opt-in) | FLUX image generation using native weights and cached model configuration/tokenizer assets |
 | `duplex` (opt-in) | Continuous host speech runtime; finite session read/say/status operations do not load that model |
 
@@ -536,7 +537,7 @@ schemas describe exact arguments and effects.
 | `cognition` | Validate shared execution/context evidence |
 | `compass` | Goals, status, priority edges and referenceable ledger notes |
 | `decide` | Proposals, factors and fork-visible decision resolutions |
-| `discord` | Resident chat archive, explicit bot pulls/sends, channel discovery, and a live gateway session (`discord live`: message intake) |
+| `discord` | Resident chat archive, explicit bot pulls/sends, channel discovery, and a live gateway session (`discord live`: message intake, and voice with `discord-voice`) |
 | `duplex` | Finite session interaction; separate continuous host speech runtime |
 | `files` | Blob import, tags, discovery, perception and exact export |
 | `gauge` | Research-health, link and quality diagnostics |
