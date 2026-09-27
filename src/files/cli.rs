@@ -116,7 +116,9 @@ const VERBS: &[Verb] = &[
                 .positional()
                 .optional(),
             Param::caller("text", "Text query for cross-modal search").optional(),
-            Param::caller("floor", "Minimum cosine similarity, 0..1. Measured 2026-09-14 over 863 indexed files: any text sits 0.60-0.65 from a text query, any image 0.65-0.86 from an image query, and cross-modal pairs 0.02-0.09; relevance is the margin above that band, not the value").default("0"),
+            Param::caller("floor", "Minimum cosine similarity, 0..1, for each kind without its own floor. Measured 2026-09-14 over 863 indexed files: any text sits 0.60-0.65 from a text query, any image 0.65-0.86 from an image query, and cross-modal pairs 0.02-0.09; relevance is the margin above that band, not the value").default("0"),
+            Param::caller("image-floor", "Minimum cosine for the image index; --floor otherwise").optional(),
+            Param::caller("text-floor", "Minimum cosine for the text index; --floor otherwise").optional(),
             Param::caller("limit", "Maximum results")
                 .default("10")
                 .short('n'),
@@ -135,7 +137,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "index",
-        about: "Maintain the semantic index: every stored file's bytes embedded through the nomic-vision root in the working pile, rows keyed by file (requires local-embed and a gb10; elsewhere the rows arrive by replication)",
+        about: "Maintain the semantic indexes: every stored file's content embedded through the model of its kind in the working pile (images through nomic-vision, PDF text layers and UTF-8 through nomic-text), one row per distinct content (requires local-embed and a gb10; elsewhere the rows arrive by replication)",
         params: &[],
     },
     Verb {
@@ -302,6 +304,16 @@ fn execute_with_input(
                     .require("floor")?
                     .parse()
                     .context("invalid --floor")?,
+                image_floor: invocation
+                    .get("image-floor")
+                    .map(str::parse)
+                    .transpose()
+                    .context("invalid --image-floor")?,
+                text_floor: invocation
+                    .get("text-floor")
+                    .map(str::parse)
+                    .transpose()
+                    .context("invalid --text-floor")?,
                 limit: invocation
                     .require("limit")?
                     .parse()

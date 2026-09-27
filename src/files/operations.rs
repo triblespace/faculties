@@ -36,9 +36,11 @@ use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::prelude::*;
 #[cfg(feature = "local-embed")]
-use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet};
+use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet, ReconstructedCosines};
 #[cfg(feature = "local-embed")]
-use triblespace_search::semantic::{classify, local_compute, Content, SemanticIndex};
+use triblespace_search::semantic::{
+    classify, local_compute, Content, SemanticIndex, SemanticModel,
+};
 
 // ── type aliases ─────────────────────────────────────────────────────────
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
@@ -408,44 +410,57 @@ fn print_fs_tree(
 #[cfg(feature = "local-embed")]
 const SEMANTIC_COMPUTE: &str = "gb10";
 
-/// The semantic index over this Files collection, as a function of the
-/// working pile's model roots: file bytes under `file::content` through the
-/// pinned nomic-vision root, rows keyed by attribute and entity. The same
-/// descriptor from every machine, so `files similar` never has to discover
-/// it. Only changing the selected references creates a new descriptor; another
-/// model or observation in the same collection does not.
+/// The semantic index of one kind over this Files collection, as a function
+/// of the working pile's model roots: every `file::content` value whose bytes
+/// that kind's model reads (images through the pinned nomic-vision root, PDF
+/// text layers and UTF-8 through the nomic-text root), one row per distinct
+/// content handle. The same descriptor from every machine, so `files similar`
+/// never has to discover it. Only changing the selected references creates a
+/// new descriptor; another model or observation in the same collection does
+/// not.
 #[cfg(feature = "local-embed")]
-fn semantic_index(descriptors: &PileSnapshot) -> Result<SemanticIndex<embeddings::Embedding768>> {
+fn semantic_index(
+    descriptors: &PileSnapshot,
+    kind: Kind,
+) -> Result<SemanticIndex<embeddings::Embedding768>> {
     let models = crate::nomic::index_models_in(descriptors)?;
+    let model = match kind {
+        Kind::Image => SemanticModel::Vision {
+            root: models.vision_root,
+        },
+        Kind::Text => SemanticModel::Text {
+            root: models.text_root,
+            tokenizer: models.tokenizer_root,
+        },
+    };
     SemanticIndex::new(
-        Some(file::content.id()),
-        [],
+        [file::content.id()],
         models.collection,
-        Some(models.vision_root),
-        Some(models.text_root),
-        Some(models.tokenizer_root),
+        model,
         SEMANTIC_COMPUTE,
         embeddings::DIM,
     )
-    .map_err(|error| anyhow::anyhow!("describe the Files semantic index: {error}"))
+    .map_err(|error| anyhow::anyhow!("describe the Files {kind} index: {error}"))
 }
 
 /// What a Files commit without semantic rows means, for a reader: rows come
 /// only from the key that wrote a file, on the canonical compute.
 #[cfg(feature = "local-embed")]
-fn semantic_lag_note(unindexed: usize) -> String {
+fn semantic_lag_note(kind: Kind, unindexed: usize) -> String {
     format!(
-        "note: {unindexed} Files commit(s) have no semantic rows. Only the key that wrote a \
+        "note: {unindexed} Files commit(s) have no {kind} rows. Only the key that wrote a \
          file embeds it, on a {SEMANTIC_COMPUTE}: `files index` there covers that key's own \
          files, and files another machine's key saved are not indexed at all"
     )
 }
 
-/// Register the index descriptor (idempotent) and return its collection.
+/// Register the index descriptor of one kind (idempotent) and return its
+/// collection.
 #[cfg(feature = "local-embed")]
 fn semantic_target(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
+    kind: Kind,
 ) -> Result<Collection<NvFp4CosineSet<embeddings::Embedding768>>> {
     let descriptors = store
         .snapshot()
@@ -453,15 +468,15 @@ fn semantic_target(
     let policy = collection
         .policy(&descriptors)
         .context("read Files source collection policy")?;
-    let index = semantic_index(&descriptors)?;
+    let index = semantic_index(&descriptors, kind)?;
     drop(descriptors);
     store
         .derive_with(collection, index, policy)
-        .context("register the Files semantic index")
+        .with_context(|| format!("register the Files {kind} index"))
 }
 
-/// Maintain the index: embed every Files commit this key wrote that has no
-/// rows yet (this machine must be the canonical compute) and return the
+/// Maintain both indexes: embed every Files commit this key wrote that has
+/// no rows yet (this machine must be the canonical compute) and return the
 /// snapshot that sees the result. Other keys' files are theirs to embed; the
 /// root is not acquired, since none of their payloads feeds a row here.
 #[cfg(feature = "local-embed")]
@@ -471,7 +486,7 @@ fn maintain_semantic(
     signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<(
-    Collection<NvFp4CosineSet<embeddings::Embedding768>>,
+    Vec<(Kind, Collection<NvFp4CosineSet<embeddings::Embedding768>>)>,
     FacultySnapshot,
 )> {
     if local_compute() != SEMANTIC_COMPUTE {
@@ -490,14 +505,19 @@ fn maintain_semantic(
         .context("freeze the pile for the golden vectors")?;
     crate::nomic::golden_report(&frozen)?.admit()?;
     drop(frozen);
-    let target = semantic_target(store, collection)?;
-    let snapshot = runtime.block_on(async {
-        store
-            .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
-            .await
-            .context("maintain the Files semantic index")
-    })?;
-    Ok((target, snapshot))
+    let mut targets = Vec::with_capacity(Kind::ALL.len());
+    let mut snapshot = None;
+    for kind in Kind::ALL {
+        let target = semantic_target(store, collection, kind)?;
+        snapshot = Some(runtime.block_on(async {
+            store
+                .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
+                .await
+                .with_context(|| format!("maintain the Files {kind} index"))
+        })?);
+        targets.push((kind, target));
+    }
+    Ok((targets, snapshot.expect("Kind::ALL is not empty")))
 }
 
 /// `files golden`: how this device embeds the golden inputs against the
@@ -1465,14 +1485,15 @@ fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
 
 // ── main ─────────────────────────────────────────────────────────────────
 
-/// Maintain the Files semantic index: every stored file's bytes under
-/// `file::content` embedded through the nomic-vision root in the working
-/// pile, as rows of a derived NVFP4 cosine set keyed by file entity (see
-/// `triblespace_search::semantic`). Idempotent: members already derived are
-/// reused, only missing DERIVE work is computed. Only a machine of the
-/// canonical compute class computes, and only for the files its own key
-/// wrote; the rows replicate to the others, and the report counts the Files
-/// commits that have none (`SEMANTIC_COMPUTE` says why).
+/// Maintain the Files semantic indexes: every distinct value under
+/// `file::content` embedded through the model of its kind in the working pile
+/// (images through nomic-vision, PDF text layers and UTF-8 through
+/// nomic-text), as rows of two derived NVFP4 cosine sets keyed by content
+/// handle (see `triblespace_search::semantic`). Idempotent: members already
+/// derived are reused, only missing DERIVE work is computed. Only a machine
+/// of the canonical compute class computes, and only for the files its own
+/// key wrote; the rows replicate to the others, and the report counts the
+/// Files commits that have none (`SEMANTIC_COMPUTE` says why).
 fn cmd_index(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
@@ -1487,28 +1508,25 @@ fn cmd_index(
     }
     #[cfg(feature = "local-embed")]
     {
-        let (target, snapshot) = maintain_semantic(store, collection, signer, runtime)?;
-        let index = snapshot
-            .collection(target)
-            .context("observe the Files semantic index")?
-            .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
-            .context("read the Files semantic index")?;
-        let rows: usize = index
-            .scan_segments()
-            .iter()
-            .map(|segment| segment.rows())
-            .sum();
-        out.line(format!(
-            "Files semantic index {}: {} member(s), {} row(s), computed on {}",
-            collection_hex(target.handle()),
-            index.segment_count(),
-            rows,
-            SEMANTIC_COMPUTE
-        ))?;
-        let unindexed = crate::storage::underived(&snapshot, collection, target)
-            .context("count Files commits without semantic rows")?;
-        if unindexed > 0 {
-            out.line(semantic_lag_note(unindexed))?;
+        let (targets, snapshot) = maintain_semantic(store, collection, signer, runtime)?;
+        for (kind, target) in targets {
+            let index = snapshot
+                .collection(target)
+                .with_context(|| format!("observe the Files {kind} index"))?
+                .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
+                .with_context(|| format!("read the Files {kind} index"))?;
+            out.line(format!(
+                "Files {kind} index {}: {} member(s), {} row(s), computed on {}",
+                collection_hex(target.handle()),
+                index.segment_count(),
+                index.len(),
+                SEMANTIC_COMPUTE
+            ))?;
+            let unindexed = crate::storage::underived(&snapshot, collection, target)
+                .with_context(|| format!("count Files commits without {kind} rows"))?;
+            if unindexed > 0 {
+                out.line(semantic_lag_note(kind, unindexed))?;
+            }
         }
         Ok(())
     }
@@ -1883,21 +1901,25 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
     Ok(())
 }
 
-/// Semantic nearest-neighbour search over the derived Files index.
+/// Semantic nearest-neighbour search over the derived Files indexes.
 ///
-/// The index ([`SemanticIndex`]) holds one NVFP4 row per stored file: images
-/// through the vision model, PDF text layers, UTF-8 and HTML text through the
-/// text model, all in the one nomic space, each row keyed by the root of the
-/// model it went through and the file's entity. A text query goes through the
+/// Two indexes, one per model ([`SemanticModel`]): the image index holds a
+/// row for every distinct content whose bytes are an image, the text index
+/// for every PDF text layer, UTF-8 and HTML text, all in the one nomic space
+/// and every row keyed by its content handle. A text query goes through the
 /// text model's query side; a file query embeds that file's own bytes the way
-/// the index did, image or text by content. Images and texts are ranked
-/// separately, told apart by the row key: text-to-text cosines in this space
-/// sit near 0.7 and text-to-image near 0.07, so one mixed ranking puts every
-/// text above every image. The group whose best hit scores higher is printed
-/// first, and `kind` restricts the answer to one group. The optional `--tag`
-/// filter is the hybrid join that separates real forms from mascots. With
-/// `mm7b`, the query and candidates live in the 3584-d nomic-7b space
-/// (`attr_mm7b::embedding`, populated by `files embed7b`) instead.
+/// the indexes did, image or text by content. Each index's floor is its own
+/// constraint, because text-to-text cosines in this space sit near 0.7 and
+/// text-to-image near 0.07. One `find!` unions the two thresholds and joins
+/// the Files facts on the content handle with a free attribute, so a hit is a
+/// content and every entity that holds it; the optional `--tag` filter, the
+/// hybrid join that separates real forms from mascots, is part of the same
+/// query. A mail attachment saved three times is three entities over one
+/// content and one hit. The ranking and the per-kind limit are presentation
+/// of that answer: the group whose best hit scores higher is printed first,
+/// and `kind` queries one index only. With `mm7b`, the query and candidates
+/// live in the 3584-d nomic-7b space (`attr_mm7b::embedding`, populated by
+/// `files embed7b`) instead.
 fn cmd_similar<P: TriblePattern>(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
@@ -1905,208 +1927,265 @@ fn cmd_similar<P: TriblePattern>(
     runtime: &tokio::runtime::Runtime,
     space: &P,
     reader: &PileSnapshot,
-    id: Option<&str>,
-    text: Option<&str>,
-    floor: f32,
-    limit: usize,
-    filter_tags: &[String],
-    kind: Option<Kind>,
-    mm7b: bool,
+    options: &SimilarityOptions<'_>,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    if mm7b {
-        return cmd_similar_mm7b(space, reader, id, text, floor, limit, filter_tags, out);
+    if options.mm7b {
+        return cmd_similar_mm7b(
+            space,
+            reader,
+            options.id,
+            options.text,
+            options.floor,
+            options.limit,
+            options.tags,
+            out,
+        );
     }
     #[cfg(not(feature = "local-embed"))]
     {
-        let _ = (store, collection, signer, runtime, kind);
+        let _ = (store, collection, signer, runtime);
         bail!("`files similar` needs the embedders — rebuild with --features local-embed");
     }
     #[cfg(feature = "local-embed")]
     {
-        // The query vector + a label, from either a text string (cross-modal,
-        // the text model's query side) or a query file's bytes (image to
-        // image). `query_eid` is Some only for a file query, so it drops
-        // itself from its own results.
-        let (query_vec, query_eid, label): (Vec<f32>, Option<Id>, String) = match (text, id) {
-            (Some(t), _) => (
-                crate::nomic::load_text_embedder_in(reader)?.embed_query(t)?,
-                None,
-                format!("{t:?}"),
-            ),
-            (None, Some(idstr)) => {
-                let eid = file_capability::resolve_selector(space, idstr)?;
-                let h = content_handle_of(space, eid).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "that entity has no content bytes to embed; query with --text instead"
-                    )
-                })?;
-                let bytes: anybytes::Bytes = reader
-                    .get::<anybytes::Bytes, _>(h)
-                    .context("read the query file's bytes")?;
-                let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
-                let vector = match classify(bytes.as_ref()) {
-                    Content::Image => crate::nomic::load_vision_embedder_in(reader)?
-                        .embed_image(bytes.as_ref())
-                        .context("embed the query image")?,
-                    Content::Pdf(text) | Content::Text(text) => {
-                        crate::nomic::load_text_embedder_in(reader)?
-                            .embed_document(&text)
-                            .context("embed the query document")?
-                    }
-                    Content::Other => bail!(
-                        "{name} is neither an image nor text the index embeds; query with --text instead"
-                    ),
-                };
-                (vector, Some(eid), name)
-            }
-            (None, None) => bail!("give a file id/hash, or --text \"a query\""),
-        };
+        let (query_vec, query_contents, label) = similarity_query(space, reader, options)?;
 
-        // The index as it stands: a query is a read and never waits on the
+        // The indexes as they stand: a query is a read and never waits on the
         // GPU. `files add` maintains the rows of the file it just saved and
         // `files index` the rest of its own key's files, on the canonical
         // compute; elsewhere those rows arrive by replication, and files
         // other keys wrote have none (see SEMANTIC_COMPUTE), which the
-        // query counts rather than hides. (Before 2026-09-13 a query on gb10
-        // maintained the whole index first, and paid for every member whose
-        // bytes had arrived since the last build: minutes to hours before
-        // one answer.)
-        let target = semantic_target(store, collection)?;
+        // query counts rather than hides.
+        let _ = (signer, runtime);
+        let kinds: Vec<Kind> = Kind::ALL
+            .into_iter()
+            .filter(|kind| options.kind.is_none_or(|wanted| wanted == *kind))
+            .collect();
+        let mut targets = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            targets.push((kind, semantic_target(store, collection, kind)?));
+        }
         let snapshot = store
             .snapshot()
             .context("freeze the pile for the Files semantic index")?;
-        let _ = (signer, runtime);
-        let index = snapshot
-            .collection(target)
-            .context("observe the Files semantic index")?
-            .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
-            .context("read the Files semantic index")?;
-        let unindexed = crate::storage::underived(&snapshot, collection, target)
-            .context("count Files commits without semantic rows")?;
-        if index.is_empty() {
-            bail!(
-                "the Files semantic index has no rows yet. {}",
-                semantic_lag_note(unindexed)
-            );
-        }
-        if unindexed > 0 {
-            out.line(semantic_lag_note(unindexed))?;
-        }
-        if std::env::var_os("SEMANTIC_TRACE").is_some() {
-            eprintln!(
-                "semantic index {}: {} segment(s), {} row(s) read",
-                collection_hex(target.handle()),
-                index.segment_count(),
-                index.len()
-            );
-            for (handle, rows) in index.segments() {
-                eprintln!("semantic segment {} {rows}", hex::encode(handle));
+        // One reconstruction scan per index; an index not asked about scores
+        // nothing and its branch of the query below is empty.
+        let mut image_cosines = ReconstructedCosines::default();
+        let mut text_cosines = ReconstructedCosines::default();
+        for (kind, target) in &targets {
+            let index = snapshot
+                .collection(*target)
+                .with_context(|| format!("observe the Files {kind} index"))?
+                .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
+                .with_context(|| format!("read the Files {kind} index"))?;
+            let unindexed = crate::storage::underived(&snapshot, collection, *target)
+                .with_context(|| format!("count Files commits without {kind} rows"))?;
+            if unindexed > 0 {
+                out.line(semantic_lag_note(*kind, unindexed))?;
             }
-        }
-        // Every row, ranked: the wanted images may sit below thousands of
-        // texts for a text query, and the scan prices all rows anyway.
-        let ranked = index
-            .reconstructed_top_k(&query_vec, index.len())
-            .map_err(|error| anyhow::anyhow!("search the Files semantic index: {error}"))?;
-
-        // One row per file content, the floor, the hybrid tag filter, per
-        // kind. A mail attachment saved three times is three entities over
-        // one blob and the reader wants it once; the query's own bytes are
-        // left out the same way, whichever entity carries them.
-        let models = crate::nomic::index_models_in(reader)?;
-        let want_images = kind != Some(Kind::Text);
-        let want_texts = kind != Some(Kind::Image);
-        let mut image_hits: Vec<(f32, Id)> = Vec::new();
-        let mut text_hits: Vec<(f32, Id)> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        if let Some(handle) = query_eid.and_then(|query| content_handle_of(space, query)) {
-            seen.insert(handle_hex(handle));
-        }
-        for (key, score) in ranked {
-            let Some((root, eid)) = SemanticIndex::<embeddings::Embedding768>::row_entity(&key)
-            else {
-                continue;
-            };
-            let cos = score as f32;
-            if cos < floor {
-                break;
-            }
-            let (wanted, bucket) = if root == models.vision_root {
-                (want_images, &mut image_hits)
-            } else if root == models.text_root {
-                (want_texts, &mut text_hits)
-            } else {
-                continue;
-            };
-            if !wanted || bucket.len() >= limit || Some(eid) == query_eid {
-                continue;
-            }
-            let Some(content) = content_handle_of(space, eid) else {
-                continue;
-            };
-            if !seen.insert(handle_hex(content)) {
-                continue;
-            }
-            if !filter_tags.is_empty() {
-                let tags = tags_of(space, eid);
-                if !filter_tags.iter().all(|ft| tags.iter().any(|t| t == ft)) {
-                    continue;
+            if std::env::var_os("SEMANTIC_TRACE").is_some() {
+                eprintln!(
+                    "semantic {kind} index {}: {} segment(s), {} row(s) read",
+                    collection_hex(target.handle()),
+                    index.segment_count(),
+                    index.len()
+                );
+                for (handle, rows) in index.segments() {
+                    eprintln!("semantic segment {} {rows}", hex::encode(handle));
                 }
             }
-            bucket.push((cos, eid));
-            let images_done = !want_images || image_hits.len() >= limit;
-            let texts_done = !want_texts || text_hits.len() >= limit;
-            if images_done && texts_done {
-                break;
+            let cosines = index
+                .reconstructed_cosines(&query_vec)
+                .map_err(|error| anyhow::anyhow!("search the Files {kind} index: {error}"))?;
+            match kind {
+                Kind::Image => image_cosines = cosines,
+                Kind::Text => text_cosines = cosines,
             }
         }
+        if image_cosines.is_empty() && text_cosines.is_empty() {
+            bail!("the Files semantic index has no rows yet");
+        }
 
-        let mut groups: Vec<(&str, Vec<(f32, Id)>)> = Vec::new();
-        if !image_hits.is_empty() {
-            groups.push(("Images", image_hits));
+        // A tag longer than a short string is carried by no file.
+        let tags: Vec<Inline<inlineencodings::ShortString>> = options
+            .tags
+            .iter()
+            .map(|tag| {
+                tag.as_str()
+                    .try_to_inline()
+                    .map_err(|_| anyhow::anyhow!("{tag:?} cannot be a Files tag"))
+            })
+            .collect::<Result<_>>()?;
+        let holders = similar_contents(
+            space,
+            (&image_cosines, f64::from(options.floor_for(Kind::Image))),
+            (&text_cosines, f64::from(options.floor_for(Kind::Text))),
+            &tags,
+        );
+
+        // Presentation: each kind ranked by cosine, the query's own contents
+        // left out, at most `limit` per kind. A content is in the index of
+        // the model that read it, so its kind is where its score is.
+        let mut image_hits: Vec<(f64, FileHandle)> = Vec::new();
+        let mut text_hits: Vec<(f64, FileHandle)> = Vec::new();
+        for content in holders.keys() {
+            if query_contents.contains(content) {
+                continue;
+            }
+            if let Some(cos) = image_cosines.cosine(content) {
+                image_hits.push((cos, *content));
+            } else if let Some(cos) = text_cosines.cosine(content) {
+                text_hits.push((cos, *content));
+            }
         }
-        if !text_hits.is_empty() {
-            groups.push(("Texts", text_hits));
+        let mut groups: Vec<(&str, Vec<(f64, FileHandle)>)> = Vec::new();
+        for (group, mut hits) in [("Images", image_hits), ("Texts", text_hits)] {
+            if hits.is_empty() {
+                continue;
+            }
+            hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            hits.truncate(options.limit);
+            groups.push((group, hits));
         }
+        let floors = match options.kind {
+            Some(kind) => format!("cos ≥ {}", options.floor_for(kind)),
+            None => format!(
+                "image cos ≥ {}, text cos ≥ {}",
+                options.floor_for(Kind::Image),
+                options.floor_for(Kind::Text)
+            ),
+        };
         if groups.is_empty() {
-            out.line(format!("no files similar to {label} above cos {floor}"))?;
+            out.line(format!("no files similar to {label} above {floors}"))?;
             return Ok(());
         }
         // The group whose best hit scores higher first: same-modality hits lead.
-        groups.sort_by(|a, b| {
-            b.1[0]
-                .0
-                .partial_cmp(&a.1[0].0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        out.line(format!("Similar to {label} (cos ≥ {floor}):"))?;
+        groups.sort_by(|a, b| b.1[0].0.total_cmp(&a.1[0].0));
+        out.line(format!("Similar to {label} ({floors}):"))?;
         for (group, hits) in &groups {
-            let indent = if kind.is_none() {
+            let indent = if options.kind.is_none() {
                 out.line(format!("  {group}:"))?;
                 "    "
             } else {
                 "  "
             };
-            for (cos, eid) in hits {
-                let name = read_name(space, reader, *eid)?.unwrap_or_else(|| "?".into());
-                let mime = read_mime(space, reader, *eid)?.unwrap_or_else(|| "?".into());
-                let hash = content_handle_of(space, *eid)
-                    .map(handle_hex)
-                    .unwrap_or_default();
-                let tags = tags_of(space, *eid);
+            for (cos, content) in hits {
+                let held = &holders[content];
+                let eid = *held.first().expect("every hit has a holder");
+                let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
+                let mime = read_mime(space, reader, eid)?.unwrap_or_else(|| "?".into());
+                let hash = handle_hex(*content);
+                let tags = tags_of(space, eid);
                 let tagstr = if tags.is_empty() {
                     String::new()
                 } else {
                     format!("  [{}]", tags.join(", "))
                 };
+                let others = if held.len() > 1 {
+                    format!("  (+{} more holding it)", held.len() - 1)
+                } else {
+                    String::new()
+                };
                 out.line(format!(
-                    "{indent}{cos:.3}  {name}  ({mime})  {hash}{tagstr}"
+                    "{indent}{cos:.3}  {name}  ({mime})  {hash}{tagstr}{others}"
                 ))?;
             }
         }
         Ok(())
     }
+}
+
+/// The query vector and a label, from either a text string (cross-modal, the
+/// text model's query side) or a query file's bytes, embedded the way the
+/// indexes embed them (image or text by content). A file query also names its
+/// own contents, which its answer leaves out.
+#[cfg(feature = "local-embed")]
+fn similarity_query<P: TriblePattern>(
+    space: &P,
+    reader: &PileSnapshot,
+    options: &SimilarityOptions<'_>,
+) -> Result<(Vec<f32>, std::collections::BTreeSet<FileHandle>, String)> {
+    let selector = match (options.text, options.id) {
+        (Some(text), _) => {
+            let vector = crate::nomic::load_text_embedder_in(reader)?.embed_query(text)?;
+            return Ok((vector, Default::default(), format!("{text:?}")));
+        }
+        (None, Some(selector)) => selector,
+        (None, None) => bail!("give a file id/hash, or --text \"a query\""),
+    };
+    let eid = file_capability::resolve_selector(space, selector)?;
+    let h = content_handle_of(space, eid).ok_or_else(|| {
+        anyhow::anyhow!("that entity has no content bytes to embed; query with --text instead")
+    })?;
+    let bytes: anybytes::Bytes = reader
+        .get::<anybytes::Bytes, _>(h)
+        .context("read the query file's bytes")?;
+    let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
+    let vector = match classify(bytes.as_ref()) {
+        Content::Image => crate::nomic::load_vision_embedder_in(reader)?
+            .embed_image(bytes.as_ref())
+            .context("embed the query image")?,
+        Content::Pdf(text) | Content::Text(text) => crate::nomic::load_text_embedder_in(reader)?
+            .embed_document(&text)
+            .context("embed the query document")?,
+        Content::Other => {
+            bail!(
+                "{name} is neither an image nor text the indexes embed; query with --text instead"
+            )
+        }
+    };
+    let own = find!(
+        content: FileHandle,
+        pattern!(space, [{ eid @ file::content: ?content }])
+    )
+    .collect();
+    Ok((vector, own, name))
+}
+
+/// Every content whose cosine clears its own index's floor, with every
+/// entity that holds it under any attribute and carries every one of `tags`:
+/// one query over both indexes and the Files facts. The index a content is
+/// in says which model read it, so each index answers with its own floor and
+/// the two thresholds are a union on the content variable. Holders come from
+/// the source through the content handle itself, so a content held by three
+/// entities is one key with three holders.
+#[cfg(feature = "local-embed")]
+fn similar_contents<P: TriblePattern>(
+    space: &P,
+    (images, image_floor): (&ReconstructedCosines, f64),
+    (texts, text_floor): (&ReconstructedCosines, f64),
+    tags: &[Inline<inlineencodings::ShortString>],
+) -> BTreeMap<FileHandle, std::collections::BTreeSet<Id>> {
+    use triblespace::core::query::Constraint;
+
+    type ContentEncoding = inlineencodings::Handle<blobencodings::RawBytes>;
+    let tag_attribute: Inline<inlineencodings::GenId> = file::tag.id().to_inline();
+    let mut holders: BTreeMap<FileHandle, std::collections::BTreeSet<Id>> = BTreeMap::new();
+    for (content, holder) in find!(
+        (content: FileHandle, holder: Id),
+        temp!(
+            (attribute),
+            and!(
+                or!(
+                    images.similar_to::<ContentEncoding>(content, image_floor),
+                    texts.similar_to::<ContentEncoding>(content, text_floor),
+                ),
+                space.pattern(holder, attribute, content),
+                IntersectionConstraint::new(
+                    tags.iter()
+                        .map(|tag| {
+                            Box::new(space.pattern(holder, tag_attribute, *tag))
+                                as Box<dyn Constraint + Send + Sync>
+                        })
+                        .collect()
+                ),
+            )
+        )
+    ) {
+        holders.entry(content).or_default().insert(holder);
+    }
+    holders
 }
 
 /// Nearest-neighbour search in the nomic-embed-multimodal-7b 3584-d space.
@@ -2267,7 +2346,12 @@ pub struct FetchOptions<'a> {
 pub struct SimilarityOptions<'a> {
     pub id: Option<&'a str>,
     pub text: Option<&'a str>,
+    /// The cosine floor of every kind that has no floor of its own.
     pub floor: f32,
+    /// The image index's floor, when it differs from `floor`.
+    pub image_floor: Option<f32>,
+    /// The text index's floor, when it differs from `floor`.
+    pub text_floor: Option<f32>,
     pub limit: usize,
     pub tags: &'a [String],
     /// Rank only this kind; both kinds, as two groups, when absent.
@@ -2275,11 +2359,37 @@ pub struct SimilarityOptions<'a> {
     pub mm7b: bool,
 }
 
-/// One of the two kinds the semantic index ranks separately.
+impl SimilarityOptions<'_> {
+    /// The floor the index of `kind` answers with.
+    pub fn floor_for(&self, kind: Kind) -> f32 {
+        match kind {
+            Kind::Image => self.image_floor,
+            Kind::Text => self.text_floor,
+        }
+        .unwrap_or(self.floor)
+    }
+}
+
+/// One of the two kinds the semantic index ranks separately: each is its own
+/// index, embedded by its own model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Image,
     Text,
+}
+
+impl Kind {
+    /// Both kinds, images first.
+    pub const ALL: [Kind; 2] = [Kind::Image, Kind::Text];
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Kind::Image => "image",
+            Kind::Text => "text",
+        })
+    }
 }
 
 impl std::str::FromStr for Kind {
@@ -2429,34 +2539,26 @@ impl Files {
             options.id.is_some() ^ options.text.is_some(),
             "provide exactly one of id or text"
         );
-        anyhow::ensure!(
-            options.floor.is_finite() && (0.0..=1.0).contains(&options.floor),
-            "floor must be between 0 and 1"
-        );
+        for floor in [Some(options.floor), options.image_floor, options.text_floor]
+            .into_iter()
+            .flatten()
+        {
+            anyhow::ensure!(
+                floor.is_finite() && (0.0..=1.0).contains(&floor),
+                "floor must be between 0 and 1"
+            );
+        }
         with_files_view(
             &self.storage,
             |store, collection, signer, facts, snapshot, runtime| {
                 cmd_similar(
-                    store,
-                    collection,
-                    signer,
-                    runtime,
-                    facts,
-                    snapshot,
-                    options.id,
-                    options.text,
-                    options.floor,
-                    options.limit,
-                    options.tags,
-                    options.kind,
-                    options.mm7b,
-                    out,
+                    store, collection, signer, runtime, facts, snapshot, options, out,
                 )
             },
         )
     }
 
-    /// Maintain the semantic index over every stored file (see [`cmd_index`]).
+    /// Maintain the semantic indexes over every stored file (see [`cmd_index`]).
     pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
         with_files_store(&self.storage, |store, collection, signer, runtime| {
             cmd_index(store, collection, signer, runtime, out)
@@ -3199,6 +3301,141 @@ mod tests {
         fragment
     }
 
+    /// The Files similarity query over two content-keyed indexes: each kind
+    /// answers with its own floor, holders come through the content handle
+    /// under any attribute, a content several entities hold is one key with
+    /// every holder, and the tag filter is part of the same query.
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn similar_contents_joins_both_indexes_to_the_files_facts() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::trible::Trible;
+        use triblespace_search::nvfp4::NvFp4EmbeddingAttribute;
+
+        // Stand-in rows without a model: content blobs that are themselves
+        // 768-d vectors, so the exact NVFP4 mapping over `file::content`
+        // keys its rows by the content handle, as the semantic index does.
+        let vector = |axis: usize, other: Option<(usize, f32)>| {
+            let mut v = vec![0.0f32; embeddings::DIM];
+            v[axis] = 1.0;
+            if let Some((other, weight)) = other {
+                v[other] = weight;
+            }
+            v
+        };
+        let key = SigningKey::from_bytes(&[0x74; 32]);
+        let root = key.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let mut store = MemoryRepo::default();
+        let mut put = |v: Vec<f32>| -> FileHandle {
+            store
+                .put::<embeddings::Embedding768, _>(v)
+                .unwrap()
+                .transmute()
+        };
+        let exact = put(vector(0, None));
+        let close = put(vector(0, Some((1, 0.2))));
+        let far = put(vector(5, None));
+        let text = put(vector(0, Some((2, 0.2))));
+
+        let entity = |byte: u8| Id::new([byte; 16]).unwrap();
+        let mut facts = TribleSet::new();
+        let mut images = TribleSet::new();
+        let mut texts = TribleSet::new();
+        for (holder, content, image) in [
+            (1, exact, true),
+            (2, exact, true),
+            (3, close, true),
+            (4, far, true),
+            (5, text, false),
+        ] {
+            let fact = Trible::force(&entity(holder), &file::content.id(), &content);
+            facts.insert(&fact);
+            if image {
+                images.insert(&fact);
+            } else {
+                texts.insert(&fact);
+            }
+        }
+        // The text content held under another attribute by another entity.
+        facts.insert(&Trible::force(
+            &entity(6),
+            &file::name.id(),
+            &text.transmute::<inlineencodings::Handle<blobencodings::UTF8String>>(),
+        ));
+        let tagged = entity(1);
+        facts += TribleSet::from(entity! { ExclusiveId::force_ref(&tagged) @ file::tag: "form" });
+
+        let mut index = |name: &str, rows: TribleSet| {
+            let source = store.collection(name, policy.clone()).unwrap();
+            let target = store
+                .derive::<NvFp4CosineSet<embeddings::Embedding768>>(
+                    source,
+                    NvFp4EmbeddingAttribute::new(file::content.id(), embeddings::DIM).unwrap(),
+                    policy.clone(),
+                )
+                .unwrap();
+            store.commit(source, &key, Fragment::from(rows)).unwrap();
+            let snapshot = pollster::block_on(store.maintain(target, &key)).unwrap();
+            snapshot
+                .collection(target)
+                .unwrap()
+                .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
+                .unwrap()
+                .reconstructed_cosines(&vector(0, None))
+                .unwrap()
+        };
+        let image_cosines = index("images", images);
+        let text_cosines = index("texts", texts);
+
+        let holders = |image_floor: f64, text_floor: f64, tags: &[&str]| {
+            let tags: Vec<Inline<inlineencodings::ShortString>> = tags
+                .iter()
+                .map(|tag| tag.try_to_inline().unwrap())
+                .collect();
+            similar_contents(
+                &facts,
+                (&image_cosines, image_floor),
+                (&text_cosines, text_floor),
+                &tags,
+            )
+        };
+        let set = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|byte| entity(*byte))
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            holders(0.9, 0.5, &[]),
+            BTreeMap::from([
+                (exact, set(&[1, 2])),
+                (close, set(&[3])),
+                (text, set(&[5, 6]))
+            ])
+        );
+        // Each index has its own floor.
+        assert_eq!(
+            holders(0.99, 0.99, &[]),
+            BTreeMap::from([(exact, set(&[1, 2]))])
+        );
+        assert_eq!(
+            holders(1.1, 0.5, &[]),
+            BTreeMap::from([(text, set(&[5, 6]))])
+        );
+        // The tag is asked of the holder, inside the same query.
+        assert_eq!(
+            holders(0.9, 0.5, &["form"]),
+            BTreeMap::from([(exact, set(&[1]))])
+        );
+        assert!(holders(0.9, 0.5, &["form", "other"]).is_empty());
+        // The score that ranks a hit is the cosine of the index that holds it.
+        assert!(image_cosines.cosine(&exact).unwrap() > 0.999);
+        assert_eq!(text_cosines.cosine(&exact), None);
+    }
+
     #[cfg(feature = "local-embed")]
     #[test]
     fn semantic_descriptor_ignores_observations_extra_models_and_support_packaging() {
@@ -3216,8 +3453,14 @@ mod tests {
                 .unwrap();
         }
         let frozen = split_pile.snapshot().unwrap();
-        let before = semantic_index(&frozen).unwrap();
-        let selected_text = before.text_root.unwrap();
+        let before = semantic_index(&frozen, Kind::Text).unwrap();
+        let SemanticModel::Text {
+            root: selected_text,
+            ..
+        } = before.model
+        else {
+            panic!("a text index names a text model");
+        };
         let other_root = fucid();
         let mut additions = entity! {
             mary::format::attrs::model_root: selected_text,
@@ -3237,7 +3480,7 @@ mod tests {
         mary::model_collection::publish_model_fragment(&mut split_pile, &signer, additions.clone())
             .unwrap();
         let widened = split_pile.snapshot().unwrap();
-        let after = semantic_index(&widened).unwrap();
+        let after = semantic_index(&widened, Kind::Text).unwrap();
         assert_eq!(before, after);
         assert_eq!(before.fragment(), after.fragment());
 
@@ -3251,7 +3494,7 @@ mod tests {
         )
         .unwrap();
         let repackaged = packed_pile.snapshot().unwrap();
-        let repackaged_index = semantic_index(&repackaged).unwrap();
+        let repackaged_index = semantic_index(&repackaged, Kind::Text).unwrap();
         assert_eq!(before, repackaged_index);
         let split_models = mary::model_collection::snapshot_model_collection_in(&widened).unwrap();
         let packed_models =

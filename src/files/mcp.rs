@@ -59,10 +59,10 @@ const TOOLS: &[Tool] = &[
         name: "files_search", description: "Search stored file names, media types, and tags.",
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
     },
-    Tool { name: "files_index", description: "Maintain the semantic index over every stored file through the nomic-vision root in the working pile (gb10 only; the rows replicate elsewhere).", input_schema: EMPTY_SCHEMA },
+    Tool { name: "files_index", description: "Maintain the two semantic indexes over every stored file's content: images through the nomic-vision root, PDF text layers and UTF-8 through the nomic-text root in the working pile, one row per distinct content (gb10 only; the rows replicate elsewhere).", input_schema: EMPTY_SCHEMA },
     Tool {
-        name: "files_similar", description: "Semantic similarity search over the derived index. Supply exactly one of id or text: a text query through the nomic-text model in the working pile, a file id through the model its content asks for (image or text). Images and texts rank as two groups unless kind picks one.",
-        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"kind":{"type":"string","enum":["image","text"]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
+        name: "files_similar", description: "Semantic similarity search over the derived indexes. Supply exactly one of id or text: a text query through the nomic-text model in the working pile, a file id through the model its content asks for (image or text). Images and texts are two indexes with their own floors (image_floor and text_floor, each defaulting to floor) and rank as two groups unless kind picks one. A content held by several files is one hit.",
+        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0},"image_floor":{"type":"number","minimum":0,"maximum":1},"text_floor":{"type":"number","minimum":0,"maximum":1},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"kind":{"type":"string","enum":["image","text"]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
     },
     Tool {
         name: "files_embed7b", description: "Compute stored image/PDF-page embeddings. Requires the local-embed build and a supported model/runtime.",
@@ -162,6 +162,10 @@ struct Similar {
     text: Option<String>,
     #[serde(default = "similarity_floor")]
     floor: f32,
+    #[serde(default)]
+    image_floor: Option<f32>,
+    #[serde(default)]
+    text_floor: Option<f32>,
     #[serde(default = "similarity_limit")]
     limit: usize,
     #[serde(default)]
@@ -271,6 +275,8 @@ impl Faculty for Files {
                         id: args.id.as_deref(),
                         text: args.text.as_deref(),
                         floor: args.floor,
+                        image_floor: args.image_floor,
+                        text_floor: args.text_floor,
                         limit: args.limit,
                         tags: &args.tags,
                         kind: args.kind.as_deref().map(str::parse).transpose()?,
@@ -354,5 +360,6 @@ mod tests {
         assert_eq!(args.floor, similarity_floor());
         assert_eq!(args.limit, similarity_limit());
         assert_eq!(args.kind, None);
+        assert_eq!((args.image_floor, args.text_floor), (None, None));
     }
 }
