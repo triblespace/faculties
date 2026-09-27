@@ -3439,7 +3439,7 @@ mod tests {
     #[cfg(feature = "local-embed")]
     #[test]
     fn semantic_descriptor_ignores_observations_extra_models_and_support_packaging() {
-        use triblespace::core::collection::{AdmissionPolicy, CollectionMapping, CollectionPolicy};
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, DeriveMapping};
 
         let split = TestPile::new();
         let packed = TestPile::new();

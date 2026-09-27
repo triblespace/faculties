@@ -24,7 +24,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace::core::collection::{CollectionMapping, CollectionOperationError};
+use triblespace::core::collection::{CollectionOperationError, DeriveMapping};
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -93,7 +93,7 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveBlockTextBm25Mapping;
 
-impl CollectionMapping for ArchiveBlockTextBm25Mapping {
+impl DeriveMapping for ArchiveBlockTextBm25Mapping {
     type Source = SimpleArchive;
     type Target = PortableBM25Blob;
 

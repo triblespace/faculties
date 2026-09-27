@@ -1,6 +1,6 @@
 //! The lexical tier: two stock BM25 derivations, and the capability question.
 //!
-//! There is deliberately no new `CollectionMapping` here. `triblespace-search`
+//! There is deliberately no new `DeriveMapping` here. `triblespace-search`
 //! already publishes `TextAttributeToBm25`, whose descriptor carries the
 //! selected attribute and the tokenizer as facts, so `trible pile collection
 //! search` can query either of these indexes from the command line with no code
