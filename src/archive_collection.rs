@@ -34,7 +34,9 @@ use triblespace_search::portable_bm25::PortableBM25Blob;
 use crate::archive_bm25;
 use crate::blockdag;
 use crate::schemas::blockdag as schema;
-use crate::storage::{load_signer, open_pile_strict, FactArchive, FactLag};
+#[cfg(test)]
+use crate::storage::open_pile_strict;
+use crate::storage::{load_signer, open_pile_strict_as, FactArchive, FactLag};
 
 use crate::collection_names::open_configured;
 #[cfg(test)]
@@ -65,7 +67,7 @@ impl ArchiveImportWriter {
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
         let signer = load_signer(pile_path, key_path)?;
-        let mut pile = open_pile_strict(pile_path)?;
+        let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
         let result = async {
             let source =
                 open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
@@ -1930,7 +1932,9 @@ mod tests {
             commit_projection(&pile_path, &key, &format!("session:{word}"), word);
         }
 
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        // Opened as the maintaining key, as every faculty opens: the carry's
+        // merge is then believed here and by the reopen below.
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
         let target = test_target(&mut pile, source, &pile_path, &key);
         drop(pollster::block_on(pile.maintain(source, &signer)).unwrap());

@@ -7,9 +7,13 @@
 //!   resolve one durable signing key per pile. Ordinary commands load; only an
 //!   explicit initialization mints. No faculty falls back to an ephemeral
 //!   identity.
-//! - **Opening.** [`open_store`] supplies lazy exact-handle acquisition;
-//!   [`open_pile_strict`] is the local-only boundary used by migrations and
-//!   not-yet-ported callers. Both report a malformed suffix as evidence through
+//! - **Opening.** [`open_store_as`] supplies lazy exact-handle acquisition;
+//!   [`open_pile_strict_as`] is the local-only boundary used by migrations and
+//!   not-yet-ported callers. Both open the pile as the host: the key the
+//!   caller signs with, whose MERGEs the fold believes and no other key's.
+//!   [`open_store`] and [`open_pile_strict`] open with no host and believe no
+//!   MERGE, which is right only for a reader that holds no key and never
+//!   maintains. All of them report a malformed suffix as evidence through
 //!   [`pile_read_error`] rather than silently truncating it.
 //! - **Publication and discovery.** [`publish_fragment`] / [`publish_fragments`]
 //!   commit whole fragments into one scoped collection; [`discover_target`]
@@ -173,7 +177,14 @@ impl Storage {
         storage.finish(result)
     }
 
-    fn with_session<T>(&self, operation: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+    /// Enter the shared session, opening its store as `host` the first time.
+    /// Every entry loads the same signer from the same paths, so the host is
+    /// one key for the session's life.
+    fn with_session<T>(
+        &self,
+        host: VerifyingKey,
+        operation: impl FnOnce(&mut Session) -> Result<T>,
+    ) -> Result<T> {
         let mut session = self
             .shared
             .as_ref()
@@ -182,7 +193,7 @@ impl Storage {
             .map_err(|_| anyhow!("shared faculty store is poisoned"))?;
         if session.is_none() {
             let runtime = Arc::new(runtime()?);
-            let store = open_store(&self.pile)?;
+            let store = open_store_as(&self.pile, host)?;
             *session = Some(Session {
                 store: Some(store),
                 runtime,
@@ -214,7 +225,7 @@ impl Storage {
     ) -> Result<T> {
         let signer = load_signer(&self.pile, self.key.as_deref())?;
         if self.shared.is_some() {
-            return self.with_session(|session| {
+            return self.with_session(signer.verifying_key(), |session| {
                 operation(
                     session.store.as_mut().expect("open store"),
                     &signer,
@@ -223,7 +234,7 @@ impl Storage {
             });
         }
         let runtime = Arc::new(runtime()?);
-        let mut store = open_store(&self.pile)?;
+        let mut store = open_store_as(&self.pile, signer.verifying_key())?;
         let result = operation(&mut store, &signer, &runtime);
         finish_close(result, store.close().context("close faculty store"))
     }
@@ -238,7 +249,7 @@ impl Storage {
     ) -> Result<T> {
         let signer = load_signer(&self.pile, self.key.as_deref())?;
         if self.shared.is_some() {
-            return self.with_session(|session| {
+            return self.with_session(signer.verifying_key(), |session| {
                 let mut pile = session.store.as_ref().expect("open store").store();
                 pile.refresh()
                     .map_err(|error| pile_read_error(&self.pile, error))?;
@@ -250,7 +261,7 @@ impl Storage {
                 }
             });
         }
-        let mut pile = open_pile_strict(&self.pile)?;
+        let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key())?;
         let result = operation(&mut pile, &signer);
         finish_pile(pile, result)
     }
@@ -338,7 +349,10 @@ where
     }
 }
 
-/// Open a pile with lazy, exact-handle network acquisition.
+/// Open a pile with lazy, exact-handle network acquisition, with no host:
+/// the fold believes no MERGE, so every believed foundation is its own
+/// frontier node. Right for a reader that holds no key; anything that signs
+/// or maintains opens with [`open_store_as`].
 ///
 /// `TRIBLESPACE_PEERS` supplies comma-separated bootstrap endpoint tickets or
 /// endpoint ids, not blob providers to probe in order. The DHT finds providers.
@@ -346,6 +360,20 @@ where
 /// providers. Its ephemeral transport identity is deliberately separate from
 /// both the durable author and any already-running replication daemon.
 pub fn open_store(path: &Path) -> Result<FacultyStore> {
+    lazy_store(|| open_pile_strict(path))
+}
+
+/// [`open_store`] as `host`, the durable key the caller signs with: the fold
+/// believes the MERGEs `host` signed and no other key's, so the caller's own
+/// carries are believed and its reads attach its own merges.
+pub fn open_store_as(path: &Path, host: VerifyingKey) -> Result<FacultyStore> {
+    lazy_store(|| open_pile_strict_as(path, host))
+}
+
+/// Wrap the pile `open` returns in the foreground leech. The pile is opened
+/// only once the peer configuration has parsed, so a bad route leaves it
+/// untouched.
+fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
     use iroh_base::{EndpointAddr, EndpointId};
     use iroh_tickets::endpoint::EndpointTicket;
     use rand_core::RngCore;
@@ -377,7 +405,7 @@ pub fn open_store(path: &Path) -> Result<FacultyStore> {
     use zeroize::Zeroize;
     secret.zeroize();
     Ok(FacultyStore::lazy(
-        open_pile_strict(path)?,
+        open()?,
         key,
         PeerConfig {
             peers,
@@ -671,9 +699,30 @@ pub fn initialize_signer(pile: &Path, explicit: Option<&Path>) -> Result<Signing
         .with_context(|| format!("initialize durable signing key {}", path.display()))
 }
 
-/// Open and refresh an existing pile without automatic repair.
+/// Open and refresh an existing pile without automatic repair, with no host:
+/// the fold believes no MERGE, and every believed foundation stays on its
+/// collection's frontier. Correct for any read, only wider; a carry on it
+/// refuses to publish, since nothing would believe its merges. Anything that
+/// signs or maintains opens with [`open_pile_strict_as`].
 pub fn open_pile_strict(path: &Path) -> Result<Pile> {
-    let mut pile = Pile::open(path).with_context(|| format!("open pile {}", path.display()))?;
+    refreshed(
+        path,
+        Pile::open(path).with_context(|| format!("open pile {}", path.display()))?,
+    )
+}
+
+/// [`open_pile_strict`] as `host`, the durable key the caller signs with: the
+/// fold believes the MERGEs `host` signed and no other key's. Every faculty
+/// that loads a signer opens as it, so its own carries are believed and its
+/// reads attach its own merges.
+pub fn open_pile_strict_as(path: &Path, host: VerifyingKey) -> Result<Pile> {
+    refreshed(
+        path,
+        Pile::open_as(path, host).with_context(|| format!("open pile {}", path.display()))?,
+    )
+}
+
+fn refreshed(path: &Path, mut pile: Pile) -> Result<Pile> {
     if let Err(error) = pile.refresh() {
         let close = pile.close();
         let mut failure = pile_read_error(path, error);
@@ -720,7 +769,7 @@ pub fn publish_fragment(
 /// published, exactly as it would after the daemon's next pass.
 pub fn carry_scope(pile_path: &Path, key_path: Option<&Path>, scope: Id) -> Result<()> {
     let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
+    let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
     let collection =
         crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
             .context("open native collection descriptor")?;
@@ -735,7 +784,7 @@ pub fn publish_fragments(
     fragments: impl IntoIterator<Item = Fragment>,
 ) -> Result<Vec<CollectionCommit>> {
     let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict(pile_path)?;
+    let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
     let collection =
         crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
             .context("open native collection descriptor")?;
@@ -1311,7 +1360,8 @@ mod tests {
 
         let owner = SigningKey::from_bytes(&[7; 32]);
         let author = SigningKey::from_bytes(&[8; 32]);
-        let mut store = MemoryRepo::default();
+        // Opened as the owner, whose MERGE below the fold therefore believes.
+        let mut store = MemoryRepo::for_host(owner.verifying_key());
         let collection = crate::collection_names::open(
             &mut store,
             crate::schemas::wiki::DEFAULT_SCOPE_ID,
@@ -1385,6 +1435,61 @@ mod tests {
         let (facts, support) = read_fact_collection(collection, &snapshot).unwrap();
         assert_eq!(facts, expected);
         assert_eq!(support.len(), 2);
+    }
+
+    #[test]
+    fn storage_opens_as_its_signer_so_its_own_merges_are_read_and_a_keyless_open_reads_wider() {
+        use triblespace::core::collection::MERGE_FAN_IN;
+
+        let files = TestFiles::new();
+        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        assert_eq!(names.len(), MERGE_FAN_IN);
+        publish_fragments(
+            &files.pile,
+            Some(&files.key),
+            scope,
+            names.map(|name| entity! { _ @ metadata::name: name }),
+        )
+        .unwrap();
+        // The maintenance pass carries the root as the signer: one merge of
+        // the whole tier.
+        let mut pile = open_pile_strict_as(&files.pile, signer.verifying_key()).unwrap();
+        let collection =
+            crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+                .unwrap();
+        drop(pollster::block_on(pile.maintain(collection, &signer)).unwrap());
+        pile.close().unwrap();
+
+        let observe = |pile: &mut Pile| -> Result<(usize, TribleSet)> {
+            let snapshot = pile.snapshot()?;
+            let observed = snapshot.collection(collection)?;
+            Ok((observed.cover().len(), observed.view::<TribleSet>()?))
+        };
+        // Every faculty opens through Storage, as the key it signs with, so
+        // the fold believes that key's merge and a read attaches it alone.
+        let (width, facts) = Storage::new(files.pile.clone(), Some(files.key.clone()))
+            .with_pile(|pile, _| observe(pile))
+            .unwrap();
+        assert_eq!(width, 1, "a one-shot open reads the signer's merge");
+        let shared = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let (shared_width, shared_facts) = shared.with_pile(|pile, _| observe(pile)).unwrap();
+        shared.close().unwrap();
+        assert_eq!(
+            shared_width, 1,
+            "the shared session store is opened as the signer"
+        );
+        assert_eq!(shared_facts, facts);
+
+        // With no host the fold believes no MERGE: every commit is read on
+        // its own, and the facts are the same.
+        let mut keyless = open_pile_strict(&files.pile).unwrap();
+        let (wide, wide_facts) = observe(&mut keyless).unwrap();
+        keyless.close().unwrap();
+        assert_eq!(wide, MERGE_FAN_IN);
+        assert_eq!(wide_facts, facts);
+        assert!(!facts.is_empty());
     }
 
     #[test]

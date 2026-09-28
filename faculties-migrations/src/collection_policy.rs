@@ -28,7 +28,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict_as};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
@@ -435,7 +435,7 @@ fn finish_pile<T>(pile: Pile, result: Result<T>, operation: &str) -> Result<T> {
 
 pub fn plan_path(pile: &Path, key: Option<&Path>) -> Result<CollectionPolicyPlan> {
     let signer = load_signer(pile, key).context("load durable collection-policy signer")?;
-    let mut store = open_pile_strict(pile)?;
+    let mut store = open_pile_strict_as(pile, signer.verifying_key())?;
     let snapshot = store
         .snapshot()
         .context("freeze collection-policy planning snapshot")?;
@@ -452,7 +452,7 @@ pub fn plan_path(pile: &Path, key: Option<&Path>) -> Result<CollectionPolicyPlan
 /// missing deterministic successor, and another invocation completes it.
 pub fn publish_path(pile: &Path, key: Option<&Path>) -> Result<CollectionPolicyReport> {
     let signer = load_signer(pile, key).context("load durable collection-policy signer")?;
-    let mut store = open_pile_strict(pile)?;
+    let mut store = open_pile_strict_as(pile, signer.verifying_key())?;
     let result = publish_open(&mut store, &signer);
     finish_pile(store, result, "collection-policy publication")
 }
@@ -462,7 +462,7 @@ mod tests {
     use std::fs::{self, File};
 
     use super::*;
-    use faculties::storage::initialize_signer;
+    use faculties::storage::{initialize_signer, open_pile_strict};
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::collection::{
         CollectionData, CollectionDerive, CollectionMerge, CollectionRecordSelector,

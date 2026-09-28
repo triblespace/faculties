@@ -34,7 +34,7 @@ use triblespace::prelude::*;
 
 use crate::collection_names::open_configured;
 use crate::schemas::code::DEFAULT_SCOPE_ID;
-use crate::storage::{load_signer, open_pile_strict, FactArchive};
+use crate::storage::{load_signer, open_pile_strict_as, FactArchive};
 
 /// Stage Code fragments for commit-last publication.
 pub struct CodeImportWriter<P = Pile> {
@@ -51,7 +51,7 @@ impl CodeImportWriter {
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
         let signer = load_signer(pile_path, key_path)?;
-        let mut pile = open_pile_strict(pile_path)?;
+        let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
         let result = async {
             let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let observed = ensure_facts(&mut pile, source, &signer).await?;

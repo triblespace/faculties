@@ -20,7 +20,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 
-use faculties::storage::{load_signer, open_pile_strict};
+use faculties::storage::{load_signer, open_pile_strict_as};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob};
@@ -380,7 +380,7 @@ fn with_pile<T>(
     operation: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
 ) -> Result<T> {
     let signer = load_signer(path, key).context("load resource-capabilities durable signer")?;
-    let mut pile = open_pile_strict(path)?;
+    let mut pile = open_pile_strict_as(path, signer.verifying_key())?;
     let result = operation(&mut pile, &signer);
     let close = pile.close().map_err(anyhow::Error::from);
     match (result, close) {
@@ -438,7 +438,7 @@ mod tests {
     use std::fs::{self, File};
     use std::path::PathBuf;
 
-    use faculties::storage::initialize_signer;
+    use faculties::storage::{initialize_signer, open_pile_strict};
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::collection::{
         read_capability, write_capability, CollectionDerive, CollectionMerge, SourceLocator,
