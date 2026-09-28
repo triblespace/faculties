@@ -137,7 +137,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "index",
-        about: "Maintain the semantic indexes: every stored file's content embedded through the model of its kind in the working pile (images through nomic-vision, PDF text layers and UTF-8 through nomic-text), one row per distinct content (requires local-embed and a gb10; elsewhere the rows arrive by replication)",
+        about: "Maintain the semantic indexes: every stored file's content embedded through the model of its kind in the working pile (images through nomic-vision, PDF text layers and UTF-8 through nomic-text), one row per distinct content, whoever saved the file (requires local-embed; only a gb10 embeds, elsewhere the rows arrive by replication and are carried)",
         params: &[],
     },
     Verb {

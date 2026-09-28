@@ -734,10 +734,10 @@ impl TeamsStorage {
                     maintained_succinct,
                 )?;
                 let secret_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
-                // The session derives this key's own leaves and mirrors its
-                // own merges; other writers' commits reach the views through
-                // their own derivations, and until then the views lag, as
-                // they do on an own commit neither view can derive.
+                // The session carries the source and attaches the frontier
+                // the carry leaves; a commit neither attachment reaches yet
+                // is read from its own bytes, and what this key cannot
+                // attach is lag, not a failure.
                 let secrets = pollster::block_on(async {
                     crate::storage::tolerate_own_lag(
                         pile.maintain_attached(maintained_succinct, signer).await,

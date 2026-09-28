@@ -392,13 +392,12 @@ fn print_fs_tree(
 // ── embedder seam (mary, behind `local-embed`) ────────────────────────────
 /// The compute class the Files semantic index is canonical on: the Sparks.
 /// The descriptor is the same from every machine, so one index exists, and a
-/// machine of another class reads the rows that replicate to it. Rows exist
-/// only for files a key of this class wrote, though: the key that wrote a
-/// commit is the only one that derives it, and only this class computes, so
-/// a file another machine's key saved gets no rows anywhere until some
-/// ownership rule lets a machine of this class embed files it did not write.
-/// `files index` and `files similar` count those files instead of promising
-/// that replication will bring them.
+/// machine of another class reads the rows that replicate to it and derives
+/// none: the mapping is pinned to this class. A machine of this class embeds
+/// every file whose bytes it holds that has no usable row, whoever saved
+/// it, with any key the index admits; a file whose bytes no such machine
+/// holds has no row yet. `files index` and `files similar` count those files
+/// instead of promising that replication will bring them.
 #[cfg(feature = "local-embed")]
 const SEMANTIC_COMPUTE: &str = "gb10";
 
@@ -440,9 +439,9 @@ fn semantic_index(
 #[cfg(feature = "local-embed")]
 fn semantic_lag_note(kind: Kind, unindexed: usize) -> String {
     format!(
-        "note: {unindexed} Files commit(s) have no {kind} rows. Only the key that wrote a \
-         file embeds it, on a {SEMANTIC_COMPUTE}: `files index` there covers that key's own \
-         files, and files another machine's key saved are not indexed at all"
+        "note: {unindexed} Files commit(s) have no {kind} rows yet. `files index` on a \
+         {SEMANTIC_COMPUTE} embeds every file whose bytes it holds, whoever saved it; \
+         elsewhere the rows arrive by replication"
     )
 }
 
@@ -467,45 +466,51 @@ fn semantic_target(
         .with_context(|| format!("register the Files {kind} index"))
 }
 
-/// Maintain both indexes: embed every Files commit this key wrote that has
-/// no rows yet (this machine must be the canonical compute) and return the
-/// snapshot that sees the result. Other keys' files are theirs to embed; the
-/// root is not acquired, since none of their payloads feeds a row here.
+/// Maintain both indexes and return the snapshot that sees the result.
+///
+/// With `every_file` false -- what saving a file does -- embed the Files
+/// commits this key wrote that have no rows yet. With it true -- `files
+/// index` -- embed every Files commit whose bytes are here and that has no
+/// row whose bytes are here or can be fetched, whoever wrote it, then carry
+/// each index's rows into this key's merges. Only a machine of the canonical
+/// compute embeds, and only after its golden vectors agree; on any other the
+/// mapping is pinned elsewhere, nothing is embedded, and `every_file` still
+/// carries the rows that arrived by replication.
 #[cfg(feature = "local-embed")]
 fn maintain_semantic(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
+    every_file: bool,
 ) -> Result<(
     Vec<(Kind, Collection<NvFp4CosineSet<embeddings::Embedding768>>)>,
     FacultySnapshot,
 )> {
-    if local_compute() != SEMANTIC_COMPUTE {
-        bail!(
-            "the Files semantic index is computed on {SEMANTIC_COMPUTE} and this machine is {}. \
-             Rows replicate here only for files a {SEMANTIC_COMPUTE} key wrote: the key that \
-             wrote a file is the only one that embeds it, so files this machine's key saved \
-             are not indexed",
-            local_compute()
-        );
+    if local_compute() == SEMANTIC_COMPUTE {
+        // The golden vectors first: this device must embed the fixed inputs
+        // to what the model collection records before it publishes a row.
+        let frozen = store
+            .snapshot()
+            .context("freeze the pile for the golden vectors")?;
+        crate::nomic::golden_report(&frozen)?.admit()?;
+        drop(frozen);
     }
-    // The golden vectors first: this device must embed the fixed inputs to
-    // what the model collection records before it publishes a row.
-    let frozen = store
-        .snapshot()
-        .context("freeze the pile for the golden vectors")?;
-    crate::nomic::golden_report(&frozen)?.admit()?;
-    drop(frozen);
     let mut targets = Vec::with_capacity(Kind::ALL.len());
     let mut snapshot = None;
     for kind in Kind::ALL {
         let target = semantic_target(store, collection, kind)?;
         snapshot = Some(runtime.block_on(async {
-            store
-                .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
-                .await
-                .with_context(|| format!("maintain the Files {kind} index"))
+            if every_file {
+                store
+                    .maintain_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
+                    .await
+            } else {
+                store
+                    .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
+                    .await
+            }
+            .with_context(|| format!("maintain the Files {kind} index"))
         })?);
         targets.push((kind, target));
     }
@@ -780,7 +785,7 @@ fn cmd_add(
     // path); elsewhere its rows arrive from a machine that can.
     #[cfg(feature = "local-embed")]
     if local_compute() == SEMANTIC_COMPUTE {
-        match maintain_semantic(pile, collection, signer, runtime) {
+        match maintain_semantic(pile, collection, signer, runtime, false) {
             Ok(_) => {}
             Err(error) => out.line(format!("Semantic index not maintained: {error:#}"))?,
         }
@@ -1481,11 +1486,14 @@ fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
 /// `file::content` embedded through the model of its kind in the working pile
 /// (images through nomic-vision, PDF text layers and UTF-8 through
 /// nomic-text), as rows of two derived NVFP4 cosine sets keyed by content
-/// handle (see `triblespace_search::semantic`). Idempotent: members already
-/// derived are reused, only missing DERIVE work is computed. Only a machine
-/// of the canonical compute class computes, and only for the files its own
-/// key wrote; the rows replicate to the others, and the report counts the
-/// Files commits that have none (`SEMANTIC_COMPUTE` says why).
+/// handle (see `triblespace_search::semantic`). Idempotent: a file with a
+/// row whose bytes are here or can be fetched is not embedded again, whoever
+/// derived that row, and only missing DERIVE work is computed. A machine of
+/// the canonical compute class embeds every file whose bytes it holds,
+/// whoever saved it; any other machine embeds nothing and reads the rows
+/// that replicate to it. Either carries each index's rows into its own
+/// merges, and the report counts the Files commits that have no row yet
+/// (`SEMANTIC_COMPUTE` says why).
 fn cmd_index(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
@@ -1500,7 +1508,7 @@ fn cmd_index(
     }
     #[cfg(feature = "local-embed")]
     {
-        let (targets, snapshot) = maintain_semantic(store, collection, signer, runtime)?;
+        let (targets, snapshot) = maintain_semantic(store, collection, signer, runtime, true)?;
         for (kind, target) in targets {
             let index = snapshot
                 .collection(target)
@@ -1944,11 +1952,11 @@ fn cmd_similar<P: TriblePattern>(
         let (query_vec, query_contents, label) = similarity_query(space, reader, options)?;
 
         // The indexes as they stand: a query is a read and never waits on the
-        // GPU. `files add` maintains the rows of the file it just saved and
-        // `files index` the rest of its own key's files, on the canonical
-        // compute; elsewhere those rows arrive by replication, and files
-        // other keys wrote have none (see SEMANTIC_COMPUTE), which the
-        // query counts rather than hides.
+        // GPU. `files add` embeds the file it just saved and `files index`
+        // every file without a usable row, whoever saved it, on the
+        // canonical compute; elsewhere the rows arrive by replication. Files
+        // with no row yet (see SEMANTIC_COMPUTE) are counted rather than
+        // hidden.
         let _ = (signer, runtime);
         let kinds: Vec<Kind> = Kind::ALL
             .into_iter()

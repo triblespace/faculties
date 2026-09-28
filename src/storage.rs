@@ -38,7 +38,7 @@
 //!   their own bytes, so nothing the source holds here is missing from it;
 //!   [`FactLag`] counts those foundations. Derived collections -- the Files
 //!   semantic index -- still derive their leaves, found from the same
-//!   listing.
+//!   listing, and carry their own leaves into the host's merges.
 //!
 //! This module was carved out of the storage cutover, which is where these
 //! primitives were first written. The cutover itself now lives in the separate
@@ -768,8 +768,9 @@ where
 /// view's lag, not a failure of the read. For a derived view that is an own
 /// foundation the mapping could not represent
 /// ([`CollectionRealizationError::Unmappable`], raised only after everything
-/// else was derived and mirrored), or own commits owed to a view the signer
-/// may not write ([`CollectionRealizationError::UnauthorizedProducer`]); for
+/// else was derived and carried), or own commits owed to a view the signer
+/// may not write ([`CollectionRealizationError::UnauthorizedProducer`],
+/// raised after the view was carried); for
 /// an attached one, a key that is not the store's host
 /// ([`CollectionRealizationError::HostMismatch`]), which attaches nothing. In
 /// every case the read attaches what is present and reads or counts the rest
@@ -838,7 +839,7 @@ pub fn open_pile_strict_as(path: &Path, host: VerifyingKey) -> Result<Pile> {
 
 /// Load the durable signer and open the pile as it, in one step: the way a
 /// faculty that publishes or reads through merges opens a local pile. The
-/// store's host is the key its carries and mirrors sign with by
+/// store's host is the key its carries and attachments sign with by
 /// construction, so the two cannot drift apart at a call site.
 pub fn open_pile_signed(pile: &Path, key: Option<&Path>) -> Result<(Pile, SigningKey)> {
     let signer = load_signer(pile, key)?;
@@ -2152,8 +2153,9 @@ where
 }
 
 /// Carry `source`, attach its new frontier into every collection attached to
-/// it, and derive the signer's own leaves into every collection derived from
-/// it, mirroring its own source merges there, as the maintenance daemon does.
+/// it, and derive every foundation left without a usable leaf into every
+/// collection derived from it, carrying each one's own leaves, as the
+/// maintenance daemon does.
 /// The pair is attached and seeded first, like [`ensure_downstream`]. An own
 /// foundation a derived view cannot derive is that view's lag and the pass
 /// goes on, as in [`FacultiesRealizer`].
