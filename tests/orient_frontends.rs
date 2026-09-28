@@ -897,7 +897,8 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     let other = faculties::storage::initialize_signer(&f.pile, Some(&other_key)).unwrap();
     let owner = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
     assert_ne!(owner.verifying_key(), other.verifying_key());
-    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    // Opened as the owner, whose MAPs this store believes.
+    let mut pile = faculties::storage::open_pile_strict_as(&f.pile, owner.verifying_key()).unwrap();
     let mut overrides = Vec::new();
     for scope in [
         faculties::schemas::message::DEFAULT_SCOPE_ID,
@@ -905,13 +906,9 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     ] {
         let source =
             faculties::collection_names::open(&mut pile, scope, owner.verifying_key()).unwrap();
-        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
-        let rank9 = pile
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-            .unwrap();
-        for handle in [source.handle(), succinct.handle(), rank9.handle()] {
-            grant_collection_read(&mut pile, handle, &owner, other.verifying_key()).unwrap();
-        }
+        // The source's READ is the only grant: the fact pair attached to it
+        // names no policy, and every host builds its own attachments.
+        grant_collection_read(&mut pile, source.handle(), &owner, other.verifying_key()).unwrap();
         overrides.push((
             faculties::collection_names::override_env_name(scope),
             hex::encode(source.handle().raw),

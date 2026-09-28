@@ -195,9 +195,25 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
     storage
         .with_pile(|pile, _| {
             let after = pile.snapshot()?;
-            // Compare all native records, not just this collection's COMMITs:
-            // a read must not publish a new MERGE, DERIVE, or unrelated record.
-            assert_eq!(after.records()?.collect::<Result<Vec<_>, _>>()?, before);
+            // Compare all native records, not just this collection's COMMITs.
+            // A key that opens the pile is the host of its own store, so its
+            // read may attach the warm commit under its own key -- MAPs no
+            // other key believes -- and nothing else: no COMMIT, MERGE or
+            // DERIVE, no want, and the cold root is never fetched.
+            let before: BTreeSet<_> = before.into_iter().collect();
+            let added: Vec<CollectionRecord> = after
+                .records()?
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|record| !before.contains(record))
+                .collect();
+            assert!(
+                added.iter().all(|record| matches!(record,
+                    CollectionRecord::Map(map)
+                        if map.public_key().raw == reader.verifying_key().to_bytes()
+                )),
+                "{added:?}"
+            );
             assert_eq!(after.wants()?.count(), 0);
             assert!(!after.contains_blob(cold)?);
             Ok(())

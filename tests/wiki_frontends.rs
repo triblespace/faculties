@@ -421,21 +421,17 @@ fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
     Server::new(&registered).unwrap();
 }
 
-/// A writer with source WRITE and only READ on the rollups can still create,
-/// import and edit: each revision is committed. A write derives only its own
-/// key's commits, so no reader sees those revisions yet, and every command
-/// that committed one says so and exits nonzero instead of succeeding
-/// silently. The owner's next maintenance pass derives them all, without any
-/// grant.
+/// A writer with source WRITE and nothing else creates, imports and edits,
+/// and every command succeeds. The CLI opens the store as the writer's key,
+/// so the writer is the host of that store: its write attaches what it
+/// wrote under its own key -- MAPs no other key believes. The owner's reads
+/// see the writer's revisions from their bytes before its worker attaches
+/// them, and after. The attached fact pairs and the supersession index name
+/// no policy, so there is no grant to give.
 #[test]
-fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
+fn source_writer_commits_revisions_and_every_reader_sees_them() {
     use std::collections::BTreeSet;
-    use triblespace::core::blob::encodings::succinctarchive::{
-        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-    };
-    use triblespace::core::collection::{
-        grant_collection_read, grant_collection_write, CollectionRecord,
-    };
+    use triblespace::core::collection::{grant_collection_write, CollectionRecord};
     use triblespace::prelude::*;
 
     let fixture = Fixture::new();
@@ -470,31 +466,18 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
     .unwrap();
     grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
     for input in [source, files] {
-        let succinct = pile.attach::<SuccinctArchiveBlob>(input, ()).unwrap();
-        let rank9 = pile
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(input, succinct)
-            .unwrap();
-        for target in [succinct.handle(), rank9.handle()] {
-            grant_collection_read(&mut pile, target, &owner, writer.verifying_key()).unwrap();
-        }
+        let (succinct, rank9) = faculties::storage::fact_pair(&mut pile, input).unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert!(!succinct
-            .writer_is_admitted(&snapshot, writer.verifying_key())
-            .unwrap());
-        assert!(!rank9
-            .writer_is_admitted(&snapshot, writer.verifying_key())
-            .unwrap());
+        assert!(succinct.policy(&snapshot).is_err());
+        assert!(rank9.policy(&snapshot).is_err());
         if input == source {
-            // Both of the owner's creates were ensured by the writes themselves.
+            // Both of the owner's creates were attached by the writes themselves.
             assert_eq!(snapshot.attached(rank9).unwrap().support().len(), 2);
             assert_eq!(source.admitted(&snapshot).unwrap().len(), 2);
         }
     }
     let latest = faculties::wiki::latest_collection(&mut pile, owner.verifying_key()).unwrap();
-    grant_collection_read(&mut pile, latest.handle(), &owner, writer.verifying_key()).unwrap();
-    assert!(!latest
-        .writer_is_admitted(&pile.snapshot().unwrap(), writer.verifying_key())
-        .unwrap());
+    assert!(latest.policy(&pile.snapshot().unwrap()).is_err());
     pile.close().unwrap();
 
     let records = || {
@@ -535,17 +518,33 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
             );
         command
     };
-    // Each committed revision is reported as reaching no reader; the count
-    // is every write of this key the views still lack.
-    let unreadable = |output: &std::process::Output, writes: usize| {
-        assert!(!output.status.success(), "{output:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("was committed"), "{stderr}");
-        assert!(
-            stderr.contains(&format!("{writes} of this key's writes reach no reader")),
-            "{stderr}"
+    // Each revision succeeds and adds one COMMIT by the writer into the
+    // source; anything else it adds is an attachment the writer's own store
+    // made.
+    let check = |before: &BTreeSet<CollectionRecord>, output: &std::process::Output| {
+        assert!(output.status.success(), "{output:?}");
+        let after = records();
+        let added: Vec<_> = after.difference(before).copied().collect();
+        assert_eq!(
+            added
+                .iter()
+                .filter(|record| matches!(record, CollectionRecord::Commit(_)))
+                .count(),
+            1,
+            "{added:?}"
         );
-        assert!(stderr.contains("grant that key WRITE"), "{stderr}");
+        assert!(
+            added.iter().all(|record| match record {
+                CollectionRecord::Commit(commit) =>
+                    commit.collection() == source.handle()
+                        && commit.public_key().raw == writer.verifying_key().to_bytes(),
+                CollectionRecord::Map(map) =>
+                    map.public_key().raw == writer.verifying_key().to_bytes(),
+                _ => false,
+            }),
+            "a revision publishes no merge and nothing signed by another key: {added:?}"
+        );
+        after
     };
     let before = records();
     let body = format!("#link(\"wiki:{first:x}\")[the resident revision]");
@@ -553,7 +552,7 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
         .args(["create", "source writer", &body])
         .output()
         .unwrap();
-    unreadable(&created, 1);
+    let before = check(&before, &created);
     let imported_file = fixture.directory.path().join("imported.typ");
     fs::write(
         &imported_file,
@@ -565,19 +564,7 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
         .arg(&imported_file)
         .output()
         .unwrap();
-    unreadable(&imported, 2);
-    let after = records();
-    let added: Vec<_> = after.difference(&before).copied().collect();
-    assert_eq!(
-        added.len(),
-        2,
-        "append preparation must publish no rollup equations"
-    );
-    assert!(added.iter().all(|record| matches!(record,
-        CollectionRecord::Commit(commit)
-            if commit.collection() == source.handle()
-                && commit.public_key().raw == writer.verifying_key().to_bytes()
-    )));
+    let before = check(&before, &imported);
 
     let missing = genid().id;
     let body = format!("#link(\"wiki:{missing:x}\")[unresolved]");
@@ -597,7 +584,7 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
     assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
     assert_eq!(
         records(),
-        after,
+        before,
         "failed append operations must publish no records"
     );
 
@@ -613,32 +600,21 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
         ])
         .output()
         .unwrap();
-    unreadable(&edited, 3);
-    let after_edit = records();
-    let edits: Vec<_> = after_edit.difference(&after).copied().collect();
-    assert_eq!(edits.len(), 1);
-    assert!(edits.iter().all(|record| matches!(record,
-        CollectionRecord::Commit(commit)
-            if commit.collection() == source.handle()
-                && commit.public_key().raw == writer.verifying_key().to_bytes()
-    )));
-    let after = after_edit;
-    assert_eq!(records(), after);
+    check(&before, &edited);
 
-    // A read attaches and never maintains, so the owner's read does not see
-    // the writer's revisions yet.
-    let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
-    assert!(!listing.contains("imported by source writer"));
-
-    // The owner's worker derives them anyway: a derive is a function, so the
-    // owner's read sees them without any grant.
-    faculties::storage::carry_scope(
-        &fixture.pile,
-        Some(&fixture.key),
-        faculties::schemas::wiki::DEFAULT_SCOPE_ID,
-    )
-    .unwrap();
-    let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
-    assert!(listing.contains("source writer"));
-    assert!(listing.contains("imported by source writer"));
+    // The owner's read sees the writer's revisions from their bytes before
+    // its worker attaches them, and after.
+    for carried in [false, true] {
+        if carried {
+            faculties::storage::carry_scope(
+                &fixture.pile,
+                Some(&fixture.key),
+                faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+            )
+            .unwrap();
+        }
+        let listing = fixture.wiki().list(&ListOptions::default()).unwrap();
+        assert!(listing.contains("source writer"), "{listing}");
+        assert!(listing.contains("imported by source writer"), "{listing}");
+    }
 }
