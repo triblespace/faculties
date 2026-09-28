@@ -846,4 +846,223 @@ mod tests {
         assert!(unread_seen > 0);
         assert!(attachments_taken > 0);
     }
+
+    /// One block of several text parts, and each part's fragment.
+    fn parts_block(texts: &[&str]) -> (Fragment, Vec<Fragment>) {
+        let mut parts = Vec::new();
+        let mut occurrences = Fragment::empty();
+        for (ordinal, text) in texts.iter().enumerate() {
+            let fact = archive::text_fact(
+                schema::content_fact::modality::TEXT,
+                schema::content_fact::direction::IN,
+                (*text).to_owned(),
+            )
+            .unwrap();
+            let part = archive::content_part(ordinal as u64, fact, None).unwrap();
+            parts.push(part.clone());
+            occurrences += part;
+        }
+        let block = archive::block(std::iter::empty::<Id>(), None, occurrences).unwrap();
+        (block, parts)
+    }
+
+    /// The facts of `block` a node holds when it has the `contains` fact and
+    /// the whole closure of each of `parts`, and, when `tagged`, every other
+    /// fact of the block itself.
+    fn block_piece(block: &Fragment, parts: &[&Fragment], tagged: bool) -> Fragment {
+        let block_id = block.root().unwrap();
+        let contains = schema::block::contains.id();
+        let mut facts = TribleSet::new();
+        for part in parts {
+            facts += part.facts().clone();
+            let part_id: Inline<GenId> = part.root().unwrap().to_inline();
+            for fact in block.facts().iter() {
+                if fact.e() == &block_id
+                    && fact.a() == &contains
+                    && fact.v::<GenId>().raw == part_id.raw
+                {
+                    facts.insert(fact);
+                }
+            }
+        }
+        if tagged {
+            for fact in block.facts().iter() {
+                if fact.e() == &block_id && fact.a() != &contains {
+                    facts.insert(fact);
+                }
+            }
+        }
+        Fragment::from(facts)
+    }
+
+    /// Commit each node, attach every one of them, and score each query
+    /// through the production read and through the index of the union of
+    /// the nodes. Every node is attached and nothing is unread, so the two
+    /// must agree.
+    fn scores_read_and_of_the_union(
+        nodes: &[Fragment],
+        texts: Vec<Blob<UnknownBlob>>,
+        queries: &[&str],
+    ) -> Vec<(BTreeMap<RawInline, i64>, BTreeMap<RawInline, i64>)> {
+        use ed25519_dalek::SigningKey;
+        use triblespace::core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+            TryFromCover,
+        };
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+
+        let key = SigningKey::from_bytes(&[62; 32]);
+        let host = key.verifying_key();
+        let mut store = MemoryRepo::for_host(host);
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
+        let root = store.collection("archive-parts", policy).unwrap();
+        let target = store
+            .attach_with(root, ArchiveBlockTextBm25Mapping)
+            .unwrap();
+        for blob in texts {
+            store.put::<UnknownBlob, _>(blob).unwrap();
+        }
+        let mut union = TribleSet::new();
+        for node in nodes {
+            union += node.facts().clone();
+            store.commit(root, &key, node.clone()).unwrap();
+        }
+        pollster::block_on(store.ensure_attached_with::<ArchiveBlockTextBm25Mapping>(target, &key))
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let attached = snapshot.attached(target).unwrap();
+        assert!(attached.residual().is_empty(), "every node is attached");
+        let read = attached
+            .read_with::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>()
+            .unwrap();
+        assert!(read.unread().is_empty());
+        let expected = ArchiveBlockTextBm25Mapping
+            .map(&union.to_blob(), &[], &snapshot)
+            .unwrap();
+        drop(attached);
+        let expected = store.put::<PortableBM25Blob, _>(expected).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+        let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
+        let through_union: ArchiveBM25View =
+            TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
+                .unwrap();
+        queries
+            .iter()
+            .map(|query| (scores(read.value(), query), scores(&through_union, query)))
+            .collect()
+    }
+
+    /// Two nodes each hold the block and one of its two parts, each part
+    /// with the same word. Each node maps, to a frequency of one; the union
+    /// holds both parts, a frequency of two. The cover's pointwise maximum
+    /// says one; a sum would say two here, and twice the truth wherever the
+    /// two nodes hold the same part.
+    #[test]
+    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
+                holding some of a block's parts cannot tell; no combination of per-node images \
+                is exact"]
+    fn a_block_whose_parts_sit_in_two_nodes_scores_like_their_union() {
+        let (block, parts) = parts_block(&["echo", "echo"]);
+        let (other, _) = parts_block(&["alpha"]);
+        let (_, mut texts) = source_and_attachments(block.clone());
+        texts.extend(source_and_attachments(other.clone()).1);
+        let mut first = block_piece(&block, &[&parts[0]], true);
+        first += other;
+        let second = block_piece(&block, &[&parts[1]], true);
+        for (read, union) in scores_read_and_of_the_union(&[first, second], texts, &["echo"]) {
+            assert_eq!(read, union);
+        }
+    }
+
+    /// The same block, one node holding it with its first part and another
+    /// holding only its `contains` fact for the second part and that part's
+    /// closure, not the block's tag. The second node has no document, so
+    /// the block is in one image only, and still its union's frequency is
+    /// larger: finding the blocks two images share cannot find every block
+    /// the cover gets wrong.
+    #[test]
+    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
+                holding some of a block's parts cannot tell; no combination of per-node images \
+                is exact"]
+    fn a_block_extended_by_a_node_without_its_tag_scores_like_their_union() {
+        let (block, parts) = parts_block(&["echo", "echo"]);
+        let (other, _) = parts_block(&["alpha"]);
+        let (_, mut texts) = source_and_attachments(block.clone());
+        texts.extend(source_and_attachments(other.clone()).1);
+        let mut first = block_piece(&block, &[&parts[0]], true);
+        first += other;
+        let second = block_piece(&block, &[&parts[1]], false);
+        for (read, union) in scores_read_and_of_the_union(&[first, second], texts, &["echo"]) {
+            assert_eq!(read, union);
+        }
+    }
+
+    /// The cover-query equivalence law over blocks of several parts whose
+    /// facts are spread over nodes: whole, one part per node with the
+    /// block's own facts in each, two overlapping runs of parts, or the
+    /// block's own facts with its first part and each other part's
+    /// `contains` fact and closure elsewhere; the pieces of different
+    /// blocks share nodes at random. Every node maps, so the law must hold
+    /// with nothing unread.
+    #[test]
+    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
+                holding some of a block's parts cannot tell; no combination of per-node images \
+                is exact"]
+    fn archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes() {
+        const WORDS: [&str; 4] = ["alpha", "bravo", "charlie", "echo"];
+        for seed in 0..24u64 {
+            let mut random = Stream(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) + 5);
+            let mut pieces = Vec::new();
+            let mut texts = Vec::new();
+            for _ in 0..1 + random.below(4) {
+                let words: Vec<String> = (0..1 + random.below(3))
+                    .map(|_| {
+                        (0..1 + random.below(2))
+                            .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect();
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                let (block, parts) = parts_block(&words);
+                texts.extend(source_and_attachments(block.clone()).1);
+                let all: Vec<&Fragment> = parts.iter().collect();
+                match random.below(4) {
+                    0 => pieces.push(block),
+                    1 => {
+                        for part in &all {
+                            pieces.push(block_piece(&block, &[*part], true));
+                        }
+                    }
+                    2 => {
+                        let cut = random.below(all.len() as u64) as usize;
+                        pieces.push(block_piece(&block, &all[..=cut], true));
+                        pieces.push(block_piece(&block, &all[cut..], true));
+                    }
+                    _ => {
+                        pieces.push(block_piece(&block, &all[..1], true));
+                        for part in &all[1..] {
+                            pieces.push(block_piece(&block, &[*part], false));
+                        }
+                    }
+                }
+            }
+            let width = 1 + random.below(pieces.len() as u64) as usize;
+            let mut nodes = vec![Fragment::empty(); width];
+            for piece in pieces {
+                let at = random.below(width as u64) as usize;
+                nodes[at] += piece;
+            }
+            nodes.retain(|node| !node.facts().is_empty());
+            for ((read, union), word) in scores_read_and_of_the_union(&nodes, texts, &WORDS)
+                .into_iter()
+                .zip(WORDS)
+            {
+                assert_eq!(read, union, "seed {seed}, query {word}");
+            }
+        }
+    }
 }
