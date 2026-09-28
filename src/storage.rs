@@ -1432,6 +1432,127 @@ mod tests {
         );
     }
 
+    /// A write is done once its commit is, whatever else is attached to its
+    /// source: upkeep passes over a descriptor no attached read here serves
+    /// (one naming a second parent), and goes on past an attached index
+    /// whose mapping fails on a commit, so the fact pair still attaches
+    /// every commit.
+    #[test]
+    fn a_write_is_done_whatever_an_unrelated_attached_collection_does() {
+        use anybytes::Bytes;
+        use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+        use triblespace::core::blob::encodings::UnknownBlob;
+        use triblespace::core::blob::{Blob, IntoBlob};
+        use triblespace::core::collection::records::{
+            collection_mapping, collection_parent, collection_representation,
+            KIND_COLLECTION_DESCRIPTOR,
+        };
+        use triblespace::core::collection::{CollectionAttachment, CollectionCommit};
+        use triblespace::core::metadata::MetaDescribe;
+        use triblespace::core::repo::BlobStorePut;
+        use triblespace::core::trible::Fragment;
+        use triblespace_search::portable_bm25::PortableBM25Blob;
+        use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+
+        let owner = SigningKey::from_bytes(&[13; 32]);
+        let mut store = MemoryRepo::for_host(owner.verifying_key());
+        let source = crate::collection_names::open(
+            &mut store,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let (succinct, rank9) = fact_pair(&mut store, source).unwrap();
+        let described = |store: &mut MemoryRepo, text: Blob<UTF8String>| {
+            let text = store.put::<UTF8String, _>(text).unwrap();
+            let mut fragment = Fragment::empty();
+            fragment += entity! { metadata::description: text };
+            store.commit(source, &owner, fragment).unwrap();
+        };
+        let write = |store: &mut MemoryRepo, name: &'static str| {
+            store
+                .commit(source, &owner, entity! { metadata::name: name })
+                .unwrap();
+            pollster::block_on(ensure_downstream(store, source, &owner))
+        };
+
+        // A descriptor naming the source and a second parent, listed by a
+        // record naming it.
+        let second = crate::collection_names::open(
+            &mut store,
+            crate::schemas::compass::DEFAULT_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let (facts, mut blobs) = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_parent*: [source.handle(), second.handle()],
+            collection_representation*: <SuccinctArchiveBlob as MetaDescribe>::describe(),
+            collection_mapping*: <SuccinctArchiveBlob as CollectionAttachment>::fragment(&()),
+        }
+        .into_facts_and_blobs();
+        for (_, blob) in blobs.snapshot().unwrap() {
+            store.put::<UnknownBlob, _>(blob).unwrap();
+        }
+        let both = store.put::<SimpleArchive, _>(facts).unwrap();
+        let stray = store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &owner,
+                both,
+                Handle::<SimpleArchive>::to_hash(stray),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        assert!(store
+            .snapshot()
+            .unwrap()
+            .collections()
+            .unwrap()
+            .contains(&both));
+        let report = write(&mut store, "beside a second parent").unwrap();
+        assert!(!report.realized.contains(&both));
+        assert!(report.failed_attached.is_empty());
+        assert!(
+            FactLag::of(&store.snapshot().unwrap(), source, succinct, rank9)
+                .unwrap()
+                .is_current()
+        );
+
+        // A text index over descriptions, seeded while every text is well
+        // formed; then a commit whose description is not UTF-8, which its
+        // mapping refuses.
+        let index = store
+            .attach::<PortableBM25Blob>(
+                source,
+                TextAttributeToBm25 {
+                    attribute: metadata::description.id(),
+                    tokenizer: Bm25Tokenizer::Word,
+                },
+            )
+            .unwrap();
+        described(&mut store, "well formed".to_blob());
+        pollster::block_on(seed_attached(&mut store, index, &owner)).unwrap();
+        described(&mut store, Blob::new(Bytes::from(vec![0xFF, 0xFE])));
+        let report = write(&mut store, "beside a failing index").unwrap();
+        assert_eq!(
+            report
+                .failed_attached
+                .iter()
+                .map(|(attached, _)| attached.handle)
+                .collect::<Vec<_>>(),
+            [index.handle()]
+        );
+        assert!(report.realized.contains(&rank9.handle()));
+        assert!(
+            FactLag::of(&store.snapshot().unwrap(), source, succinct, rank9)
+                .unwrap()
+                .is_current()
+        );
+    }
+
     #[test]
     fn fact_read_stands_for_nothing_beneath_unadmitted_commits_and_reads_the_rollup_once_they_are_admitted(
     ) {
@@ -1832,7 +1953,8 @@ where
 /// or a dependency is not here -- is still readable: [`FactRead::read_facts`]
 /// reads it from its own bytes. So is every commit of a writer that is not
 /// the store's host: such a key attaches nothing, and the write is done
-/// once its commit is.
+/// once its commit is. An attached collection whose upkeep fails is named
+/// in the report's `failed_attached`, and the others are still attached.
 pub async fn ensure_downstream<S>(
     pile: &mut S,
     source: Collection<SimpleArchive>,
