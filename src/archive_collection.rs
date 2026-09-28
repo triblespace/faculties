@@ -130,9 +130,11 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
         // known candidate is an idempotent replay and can be skipped. Once it
         // contributes even one new fact, retain its complete closure in this
         // COMMIT element—including facts already present in older elements.
-        // Set union makes that duplication semantically free, while exact
-        // homomorphisms (BM25 and future derivatives) can derive every leaf
-        // without depending on an implicit merge with historical commits.
+        // Set union makes that duplication semantically free, and a mapping
+        // that reads a whole block (the Archive block BM25) then finds it in
+        // one commit, without depending on an implicit merge with historical
+        // commits. The fragment is kept as given: nothing here checks that it
+        // holds whole blocks; the importers hand it whole ones.
         let (_, facts, metafacts, blobs) = fragment.into_parts();
         if facts.iter().all(|fact| {
             self.delta.facts().contains(fact) || fact_archive_contains(&self.current, fact)
@@ -2193,15 +2195,17 @@ mod tests {
     }
 
     /// The Archive BM25 mapping answers like the union only for covers whose
-    /// nodes hold whole source units (see `archive_bm25`); what keeps every
-    /// cover built from this writer's commits whole is the writer, and this
-    /// pins it. Every commit that holds a block's tag holds every part the
-    /// collection says the block contains, with each part's fields and its
-    /// content fact's, and every part a commit holds is contained by a block
-    /// that commit tags. The second transcript repeats the first's opening
-    /// message and answers with a reply that begins with the first reply's
-    /// parts, so a writer that committed only the facts the pile lacked would
-    /// split those blocks across the two commits, and this test would fail.
+    /// nodes hold whole source units (see `archive_bm25`). This pins that
+    /// faculties' own importer commits whole units, which is that premise
+    /// for data we write; it says nothing of another writer's commits or of
+    /// historical input, and the writer itself checks nothing. Every commit
+    /// that holds a block's tag holds every part the collection says the
+    /// block contains, with each part's fields and its content fact's, and
+    /// every part a commit holds is contained by a block that commit tags.
+    /// The second transcript repeats the first's opening message and answers
+    /// with a reply that begins with the first reply's parts, so a writer
+    /// that committed only the facts the pile lacked would split those
+    /// blocks across the two commits, and this test would fail.
     #[test]
     fn every_import_commit_holds_whole_blocks() {
         const FIRST: &str = r#"{"type":"user","sessionId":"whole-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T15:34:01.542Z","message":{"role":"user","content":"hello there"}}

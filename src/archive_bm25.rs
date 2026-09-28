@@ -11,9 +11,12 @@
 //! documents join by pointwise maximum in the portable carrier.
 //!
 //! Importer receipts are deliberately outside the projection. The mapping is
-//! an open-world typed query: unknown facts and undecodable rows are inert,
-//! while a block-selected part/fact closure which is actually needed for this
-//! BM25 value must be present in the same derivable source element.
+//! an open-world typed query: unknown facts and undecodable rows are inert.
+//! A part a node's block references must be present with its content fact in
+//! that node, or the node is refused; but a part the node does not reference
+//! is invisible to it, so a node holding only some of a block's parts is
+//! indexed from those parts, with nothing refused. See
+//! [`ArchiveBlockTextBm25Mapping`] for what that means for a cover.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -91,18 +94,21 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 /// Bound canonical projection from one Archive fact-set member to its
 /// portable BM25 image.
 ///
-/// Its cover-query law holds under a precondition
-/// ([`MapMapping`](triblespace::core::collection::MapMapping) states the law).
-/// A block's term frequency sums over the block's parts, and a node cannot
-/// tell that a block has more parts elsewhere. So this mapping answers like
-/// the union for every cover whose nodes hold whole source units (a block
-/// with all its parts and their facts); a node holding part of a block
-/// scores that block from the part it holds, so a cover that splits a block
-/// undercounts it. The Archive writer commits whole source units
-/// ([`crate::archive_collection::ArchiveImportWriter::stage_fragment`],
-/// pinned by `every_import_commit_holds_whole_blocks`), so every cover the
-/// system builds from its own writes keeps blocks whole. Another writer's
-/// commits, or a hand-made split, need not.
+/// Its cover-query law ([`MapMapping`](triblespace::core::collection::MapMapping))
+/// is a premise about its input, not something it checks. A block's term
+/// frequency sums over the block's parts, and a node cannot tell that a
+/// block has more parts elsewhere. So this mapping answers like the union
+/// for every cover whose nodes hold whole source units (a block with all its
+/// parts and their facts). A node holding part of a block scores that block
+/// from the part it holds, with no refusal and no residual to show it, so a
+/// cover that splits a block undercounts it even when nothing is unread.
+/// Faculties' own Archive importer commits whole source units
+/// ([`crate::archive_collection::ArchiveImportWriter::stage_fragment`] keeps
+/// each fragment it is given whole in one commit, and the importers hand it
+/// whole blocks), which `every_import_commit_holds_whole_blocks` pins. That
+/// is the premise for data we write. It is not a guarantee: the writer does
+/// not check that a fragment holds whole blocks, and another writer's
+/// commits or historical input need not hold them.
 ///
 /// The ignored tests `a_block_whose_parts_sit_in_two_nodes_scores_like_their_union`,
 /// `a_block_extended_by_a_node_without_its_tag_scores_like_their_union` and
@@ -136,12 +142,15 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
     /// Map one parent node, classifying what stops it by what could still
     /// change the answer. A selected text payload that is not here is a
     /// dependency the store may fetch, after which the map runs again. A
-    /// node this law cannot index as one member, such as a block whose part
-    /// and fact closure sits partly in another commit, is refused as that
-    /// node's capacity: maintenance descends to the nodes beneath it, and a
-    /// merged node above that holds the whole closure represents it. Only a
-    /// failure to read the store is fatal, because that is the one thing no
-    /// other node can get around.
+    /// node holding a block that references a part the node does not hold,
+    /// or a part whose content fact is absent or untyped there, is refused
+    /// as that node's capacity: maintenance descends to the nodes beneath
+    /// it, and a merged node above that holds the whole closure represents
+    /// it. Not every split is refused: a node holding a block with only some
+    /// of its `contains` facts, or a `contains` fact without the block's
+    /// tag, is mapped from what it holds (see the type's documentation).
+    /// Only a failure to read the store is fatal, because that is the one
+    /// thing no other node can get around.
     fn map<R: StoreRead>(
         &self,
         node: &Blob<SimpleArchive>,
@@ -662,10 +671,12 @@ mod tests {
             .collect()
     }
 
-    /// The cover-query equivalence law for the archive-block mapping, the
-    /// one attached index whose mapping refuses some nodes: a block whose
-    /// part and fact closure is split across two commits cannot be indexed
-    /// from either commit alone (`Capacity`), only from a node holding both.
+    /// The cover-query equivalence law for the archive-block mapping over
+    /// the one split it refuses: a block's own facts in one commit and its
+    /// parts and facts in another. The commit holding the block references
+    /// parts it lacks and cannot be indexed alone (`Capacity`), only from a
+    /// node holding both. Splits the mapping does not refuse are the ignored
+    /// tests below.
     ///
     /// Over random commits (some blocks split), the host's carry or not,
     /// random host merges over possibly overlapping nodes, and an attachment
