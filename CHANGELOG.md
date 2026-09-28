@@ -10,7 +10,10 @@ All notable changes to this project will be documented in this file.
   file. Only a machine of the canonical compute embeds, after its golden
   vectors agree; `files index` on any other machine embeds nothing and
   carries the rows that arrived by replication instead of refusing. The note
-  on files without rows no longer says that only a file's writer embeds it.
+  on files without rows no longer says that only a file's writer embeds it,
+  and it counts a file whose only row has not arrived here as a file without
+  rows: `storage::underived` counts a foundation only when none of its leaves
+  has its output here, as maintenance does.
 
 - A faculty opens its pile as the key it signs with exactly when what it does
   depends on which MERGEs and MAPs the fold believes: it publishes them (a

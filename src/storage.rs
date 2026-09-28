@@ -57,6 +57,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
+use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::collection::{
     ensure_downstream as core_ensure_downstream, maintain_downstream as core_maintain_downstream,
     realize_attached_as, succinctarchive_union, Attached, AttachedRead, AttachedSnapshot,
@@ -606,15 +607,18 @@ where
 }
 
 /// How many foundations `source` stands for in `snapshot` that `view` has no
-/// leaf for: a view's freshness against its immediate source, as a count.
+/// usable leaf for: a view's freshness against its immediate source, as a
+/// count.
 ///
 /// Every admitted foundation counts, whether or not its payload is here. A
 /// commit whose payload this reader never received, because it holds no
 /// source READ or the payload is simply elsewhere, is still missing from the
 /// view until its writer derives it, and a reader that could not count it
-/// would call a view current that is missing it. Each foundation is looked
-/// up by its locator in the view's own leaves; two collections' supports are
-/// never compared.
+/// would call a view current that is missing it. A leaf counts only when its
+/// output is here: one whose record arrived before its bytes answers for
+/// nothing yet, which is also how maintenance schedules it. Each foundation
+/// is looked up by its locator in the view's own leaves; two collections'
+/// supports are never compared.
 pub fn underived<R, S, T>(snapshot: &R, source: Collection<S>, view: Collection<T>) -> Result<usize>
 where
     R: StoreRead,
@@ -627,10 +631,24 @@ where
     let coverage = snapshot
         .coverage(&BTreeSet::from([view.handle()]))
         .context("read a view's leaves")?;
-    Ok(foundations
-        .members()
-        .filter(|foundation| !coverage.has_leaf(view.handle(), SourceLocator::of(foundation.raw)))
-        .count())
+    let mut underived = 0;
+    for foundation in foundations.members() {
+        let mut usable = false;
+        for output in coverage.leaf_outputs(view.handle(), SourceLocator::of(foundation.raw)) {
+            if snapshot
+                .metadata(Handle::<UnknownBlob>::from_hash(output))
+                .context("inspect a view leaf's output")?
+                .is_some()
+            {
+                usable = true;
+                break;
+            }
+        }
+        if !usable {
+            underived += 1;
+        }
+    }
+    Ok(underived)
 }
 
 /// How far the Succinct and Rank9 pair attached to a source lags it in one
@@ -770,7 +788,8 @@ where
 /// ([`CollectionRealizationError::Unmappable`], raised only after everything
 /// else was derived and carried), or own commits owed to a view the signer
 /// may not write ([`CollectionRealizationError::UnauthorizedProducer`],
-/// raised after the view was carried); for
+/// which only the per-write ensure raises; maintenance carries such a view
+/// and reports nothing); for
 /// an attached one, a key that is not the store's host
 /// ([`CollectionRealizationError::HostMismatch`]), which attaches nothing. In
 /// every case the read attaches what is present and reads or counts the rest
@@ -1910,6 +1929,70 @@ mod tests {
         assert!(format!("{error:#}").contains("load durable signing key"));
         assert!(!missing.exists());
         assert_eq!(fs::metadata(&files.pile).unwrap().len(), before);
+    }
+
+    /// Review finding, 2026-09-28: the lag count took any leaf for a
+    /// foundation as done, so a file whose only row had not arrived here was
+    /// not counted although the index could not answer for it. A leaf counts
+    /// only when its output is here.
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn a_leaf_whose_output_is_not_here_leaves_its_foundation_underived() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::repo::BlobStorePut;
+        use triblespace::core::trible::Trible;
+        use triblespace_search::nvfp4::{NvFp4CosineSet, NvFp4EmbeddingAttribute};
+        use triblespace_search::schemas::Embedding;
+
+        let key = SigningKey::from_bytes(&[0x78; 32]);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(key.verifying_key()),
+            AdmissionPolicy::direct(key.verifying_key()),
+        );
+        let attribute = Id::new([0xA7; 16]).unwrap();
+        let mut store = MemoryRepo::default();
+        let source = store.collection("vectors", policy.clone()).unwrap();
+        let view = store
+            .derive::<NvFp4CosineSet<Embedding>>(
+                source,
+                NvFp4EmbeddingAttribute::new(attribute, 3).unwrap(),
+                policy,
+            )
+            .unwrap();
+        let commit = |store: &mut MemoryRepo, entity: u8, vector: Vec<f32>| {
+            let embedding = store.put::<Embedding, _>(vector).unwrap();
+            let mut facts = TribleSet::new();
+            facts.insert(&Trible::force(
+                &Id::new([entity; 16]).unwrap(),
+                &attribute,
+                &embedding,
+            ));
+            store
+                .commit(source, &key, Fragment::from(facts))
+                .unwrap()
+                .data()
+        };
+        commit(&mut store, 1, vec![1.0, 0.0, 0.0]);
+        commit(&mut store, 2, vec![0.0, 1.0, 0.0]);
+        drop(pollster::block_on(store.ensure(view, &key)).unwrap());
+        let count =
+            |store: &mut MemoryRepo| underived(&store.snapshot().unwrap(), source, view).unwrap();
+        assert_eq!(count(&mut store), 0);
+
+        // A third file whose row record arrived before its row.
+        let waiting = commit(&mut store, 3, vec![0.0, 0.0, 1.0]);
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key,
+                view.handle(),
+                SourceLocator::of(waiting.raw),
+                Inline::new([0x77; 32]),
+            )))
+            .unwrap();
+        assert_eq!(count(&mut store), 1);
+        // And a fourth with no row at all.
+        commit(&mut store, 4, vec![0.6, 0.8, 0.0]);
+        assert_eq!(count(&mut store), 2);
     }
 }
 

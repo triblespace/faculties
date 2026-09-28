@@ -413,6 +413,7 @@ const SEMANTIC_COMPUTE: &str = "gb10";
 fn semantic_index(
     descriptors: &PileSnapshot,
     kind: Kind,
+    compute: &str,
 ) -> Result<SemanticIndex<embeddings::Embedding768>> {
     let models = crate::nomic::index_models_in(descriptors)?;
     let model = match kind {
@@ -428,7 +429,7 @@ fn semantic_index(
         [file::content.id()],
         models.collection,
         model,
-        SEMANTIC_COMPUTE,
+        compute,
         embeddings::DIM,
     )
     .map_err(|error| anyhow::anyhow!("describe the Files {kind} index: {error}"))
@@ -439,7 +440,7 @@ fn semantic_index(
 #[cfg(feature = "local-embed")]
 fn semantic_lag_note(kind: Kind, unindexed: usize) -> String {
     format!(
-        "note: {unindexed} Files commit(s) have no {kind} rows yet. `files index` on a \
+        "note: {unindexed} Files commit(s) have no {kind} rows here yet. `files index` on a \
          {SEMANTIC_COMPUTE} embeds every file whose bytes it holds, whoever saved it; \
          elsewhere the rows arrive by replication"
     )
@@ -452,6 +453,7 @@ fn semantic_target(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     kind: Kind,
+    compute: &str,
 ) -> Result<Collection<NvFp4CosineSet<embeddings::Embedding768>>> {
     let descriptors = store
         .snapshot()
@@ -459,7 +461,7 @@ fn semantic_target(
     let policy = collection
         .policy(&descriptors)
         .context("read Files source collection policy")?;
-    let index = semantic_index(&descriptors, kind)?;
+    let index = semantic_index(&descriptors, kind, compute)?;
     drop(descriptors);
     store
         .derive_with(collection, index, policy)
@@ -487,7 +489,31 @@ fn maintain_semantic(
     Vec<(Kind, Collection<NvFp4CosineSet<embeddings::Embedding768>>)>,
     FacultySnapshot,
 )> {
-    if local_compute() == SEMANTIC_COMPUTE {
+    maintain_semantic_on(
+        store,
+        collection,
+        signer,
+        runtime,
+        every_file,
+        SEMANTIC_COMPUTE,
+    )
+}
+
+/// [`maintain_semantic`] for indexes computed on the class `compute`: the
+/// one place that decides what this machine does with them.
+#[cfg(feature = "local-embed")]
+fn maintain_semantic_on(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
+    every_file: bool,
+    compute: &str,
+) -> Result<(
+    Vec<(Kind, Collection<NvFp4CosineSet<embeddings::Embedding768>>)>,
+    FacultySnapshot,
+)> {
+    if local_compute() == compute {
         // The golden vectors first: this device must embed the fixed inputs
         // to what the model collection records before it publishes a row.
         let frozen = store
@@ -499,7 +525,7 @@ fn maintain_semantic(
     let mut targets = Vec::with_capacity(Kind::ALL.len());
     let mut snapshot = None;
     for kind in Kind::ALL {
-        let target = semantic_target(store, collection, kind)?;
+        let target = semantic_target(store, collection, kind, compute)?;
         snapshot = Some(runtime.block_on(async {
             if every_file {
                 store
@@ -1964,7 +1990,10 @@ fn cmd_similar<P: TriblePattern>(
             .collect();
         let mut targets = Vec::with_capacity(kinds.len());
         for kind in kinds {
-            targets.push((kind, semantic_target(store, collection, kind)?));
+            targets.push((
+                kind,
+                semantic_target(store, collection, kind, SEMANTIC_COMPUTE)?,
+            ));
         }
         let snapshot = store
             .snapshot()
@@ -3452,7 +3481,7 @@ mod tests {
                 .unwrap();
         }
         let frozen = split_pile.snapshot().unwrap();
-        let before = semantic_index(&frozen, Kind::Text).unwrap();
+        let before = semantic_index(&frozen, Kind::Text, SEMANTIC_COMPUTE).unwrap();
         let SemanticModel::Text {
             root: selected_text,
             ..
@@ -3479,7 +3508,7 @@ mod tests {
         mary::model_collection::publish_model_fragment(&mut split_pile, &signer, additions.clone())
             .unwrap();
         let widened = split_pile.snapshot().unwrap();
-        let after = semantic_index(&widened, Kind::Text).unwrap();
+        let after = semantic_index(&widened, Kind::Text, SEMANTIC_COMPUTE).unwrap();
         assert_eq!(before, after);
         assert_eq!(before.fragment(), after.fragment());
 
@@ -3493,7 +3522,7 @@ mod tests {
         )
         .unwrap();
         let repackaged = packed_pile.snapshot().unwrap();
-        let repackaged_index = semantic_index(&repackaged, Kind::Text).unwrap();
+        let repackaged_index = semantic_index(&repackaged, Kind::Text, SEMANTIC_COMPUTE).unwrap();
         assert_eq!(before, repackaged_index);
         let split_models = mary::model_collection::snapshot_model_collection_in(&widened).unwrap();
         let packed_models =
@@ -3856,5 +3885,123 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// Review finding, 2026-09-28 (test gap): on a machine outside the
+    /// compute class of an index, `files index` embeds nothing -- no golden
+    /// check, no model load, no row of its own -- and carries the rows a
+    /// machine of the class derived into this key's own merge. The class
+    /// here is one no machine is in, which is how every machine but the
+    /// canonical one sees the real index; the rows stand in for a model's
+    /// with the exact NVFP4 mapping over contents that are themselves
+    /// vectors.
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn files_index_outside_the_compute_class_carries_rows_and_embeds_nothing() {
+        use triblespace::core::collection::{
+            AdmissionPolicy, CollectionDerive, CollectionHandle, CollectionPolicy, CollectionRead,
+            CollectionRecord, CollectionRecordSelector, CollectionStore,
+        };
+        use triblespace::core::trible::Trible;
+        use triblespace_search::nvfp4::NvFp4EmbeddingAttribute;
+
+        const ELSEWHERE: &str = "a-class-no-machine-is-in";
+        let fixture = TestPile::new();
+        let publisher = SigningKey::from_bytes(&[0x76; 32]);
+        let mut pile = Pile::open(&fixture.path).unwrap();
+        for fragment in [
+            native_model_fragment(crate::nomic::NOMIC_TEXT_MODEL, "text.weight", 1.0),
+            native_model_fragment(crate::nomic::NOMIC_VISION_MODEL, "vision.weight", 2.0),
+            native_tokenizer_fragment(crate::nomic::NOMIC_TEXT_MODEL, WORDPIECE),
+        ] {
+            mary::model_collection::publish_model_fragment(&mut pile, &publisher, fragment)
+                .unwrap();
+        }
+        pile.close().unwrap();
+
+        let deriver = SigningKey::from_bytes(&[0x77; 32]);
+        let storage = Storage::new(fixture.path.clone(), None);
+        storage
+            .with_store(|store, signer, runtime| {
+                let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+                let files = store.collection("files", policy.clone())?;
+                for axis in 0..8u8 {
+                    let mut vector = vec![0.0f32; embeddings::DIM];
+                    vector[usize::from(axis)] = 1.0;
+                    let content: FileHandle = store
+                        .put::<embeddings::Embedding768, _>(vector)?
+                        .transmute();
+                    let mut facts = TribleSet::new();
+                    facts.insert(&Trible::force(
+                        &Id::new([axis + 1; 16]).unwrap(),
+                        &file::content.id(),
+                        &content,
+                    ));
+                    store.commit(files, &deriver, Fragment::from(facts))?;
+                }
+                let exact = store.derive::<NvFp4CosineSet<embeddings::Embedding768>>(
+                    files,
+                    NvFp4EmbeddingAttribute::new(file::content.id(), embeddings::DIM)?,
+                    policy,
+                )?;
+                drop(runtime.block_on(store.ensure(exact, &deriver))?);
+                let text = semantic_target(store, files, Kind::Text, ELSEWHERE)?;
+                let records = |store: &mut FacultyStore, collection: CollectionHandle| {
+                    store
+                        .snapshot()
+                        .unwrap()
+                        .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                            collection,
+                        )]))
+                        .unwrap()
+                };
+                // The rows the deriver computed, as leaves of the index.
+                for record in records(store, exact.handle()) {
+                    if let CollectionRecord::Derive(leaf) = record {
+                        store.insert(CollectionRecord::Derive(CollectionDerive::sign(
+                            &deriver,
+                            text.handle(),
+                            leaf.input(),
+                            leaf.output(),
+                        )))?;
+                    }
+                }
+
+                let (targets, _) =
+                    maintain_semantic_on(store, files, signer, runtime, true, ELSEWHERE)?;
+                let signed_by_signer = |record: &CollectionRecord| match record {
+                    CollectionRecord::Derive(leaf) => {
+                        leaf.public_key().raw == signer.verifying_key().to_bytes()
+                    }
+                    _ => false,
+                };
+                for (kind, target) in targets {
+                    let held = records(store, target.handle());
+                    assert!(
+                        !held.iter().any(signed_by_signer),
+                        "{kind}: nothing embedded"
+                    );
+                    let merges: Vec<_> = held
+                        .iter()
+                        .filter_map(|record| match record {
+                            CollectionRecord::Merge(merge) => Some(*merge),
+                            _ => None,
+                        })
+                        .collect();
+                    if kind == Kind::Text {
+                        assert_eq!(target.handle(), text.handle());
+                        assert_eq!(merges.len(), 1, "the eight rows are carried");
+                        assert_eq!(merges[0].inputs().len(), 8);
+                        assert_eq!(
+                            merges[0].public_key().raw,
+                            signer.verifying_key().to_bytes()
+                        );
+                    } else {
+                        assert!(held.is_empty(), "{kind}: no rows, nothing to carry");
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 }
