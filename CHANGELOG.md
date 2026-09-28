@@ -9,8 +9,12 @@ All notable changes to this project will be documented in this file.
   carry, or attaching after a write) or reads through them. The store's fold
   then believes that key's MERGEs and MAPs and no other key's, so its own
   carries are believed and its reads take its own attachments instead of
-  reading every commit from its bytes. A root carry or an attach on a store
-  opened as no key fails with `HostMismatch`. `Storage` opens this way for
+  reading every commit from its bytes. On a store opened as no key (or as
+  another key) a root carry (`maintain_downstream`, and `carry_facts`, which
+  panics on it) fails with `HostMismatch`, while a write's upkeep
+  (`ensure_downstream`) and the seeding of a newly attached collection
+  (`seed_attached`) attach nothing and succeed: the commit is done, and a
+  reader reads it from its bytes. `Storage` opens this way for
   one-shot and shared operations alike, through the new `open_store_as` and
   `open_pile_strict_as`; the new
   `open_pile_signed` loads the signer and opens as it in one step, and the
