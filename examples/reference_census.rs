@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use faculties::storage::{load_signer, open_pile_strict_as};
+use faculties::storage::open_pile_signed;
 use faculties::wiki as wiki_model;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
@@ -102,8 +102,7 @@ fn read_content(reader: &PileSnapshot, revision: &wiki_model::RevisionRecord) ->
 
 fn main() -> Result<()> {
     let pile: PathBuf = std::env::var("PILE").expect("PILE").into();
-    let signer = load_signer(&pile, None)?;
-    let mut store = open_pile_strict_as(&pile, signer.verifying_key())?;
+    let (mut store, signer) = open_pile_signed(&pile, None)?;
     let collection = faculties::collection_names::open(
         &mut store,
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,

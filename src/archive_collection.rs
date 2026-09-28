@@ -35,8 +35,8 @@ use crate::archive_bm25;
 use crate::blockdag;
 use crate::schemas::blockdag as schema;
 #[cfg(test)]
-use crate::storage::open_pile_strict;
-use crate::storage::{load_signer, open_pile_strict_as, FactArchive, FactLag};
+use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
+use crate::storage::{open_pile_signed, FactArchive, FactLag};
 
 use crate::collection_names::open_configured;
 #[cfg(test)]
@@ -66,8 +66,7 @@ impl ArchiveImportWriter {
         pile_path: &std::path::Path,
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let signer = load_signer(pile_path, key_path)?;
-        let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
+        let (mut pile, signer) = open_pile_signed(pile_path, key_path)?;
         let result = async {
             let source =
                 open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;

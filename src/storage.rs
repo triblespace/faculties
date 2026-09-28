@@ -7,14 +7,21 @@
 //!   resolve one durable signing key per pile. Ordinary commands load; only an
 //!   explicit initialization mints. No faculty falls back to an ephemeral
 //!   identity.
-//! - **Opening.** [`open_store_as`] supplies lazy exact-handle acquisition;
-//!   [`open_pile_strict_as`] is the local-only boundary used by migrations and
-//!   not-yet-ported callers. Both open the pile as the host: the key the
-//!   caller signs with, whose MERGEs the fold believes and no other key's.
+//! - **Opening.** A faculty opens a pile as a host exactly when what it does
+//!   depends on which MERGEs the fold believes: it publishes merges (a carry,
+//!   or a derived view's upkeep after a write) or reads through them (an
+//!   attached read). It then opens as the key it signs with, whose MERGEs the
+//!   fold believes and no other key's: [`Storage`] does so for every
+//!   operation, and [`open_pile_signed`] loads the signer and opens as it in
+//!   one step, so the host is the signing key by construction.
+//!   [`open_store_as`] and [`open_pile_strict_as`] take the host explicitly.
 //!   [`open_store`] and [`open_pile_strict`] open with no host and believe no
-//!   MERGE, which is right only for a reader that holds no key and never
-//!   maintains. All of them report a malformed suffix as evidence through
-//!   [`pile_read_error`] rather than silently truncating it.
+//!   MERGE: right for a reader that holds no key, and for a record writer that
+//!   neither publishes nor reads merges, such as the `faculties-migrations`
+//!   crate. [`open_store`] and [`open_store_as`] supply lazy exact-handle
+//!   acquisition; the `open_pile_*` functions are the local-only boundary. All
+//!   of them report a malformed suffix as evidence through [`pile_read_error`]
+//!   rather than silently truncating it.
 //! - **Publication and discovery.** [`publish_fragment`] / [`publish_fragments`]
 //!   commit whole fragments into one scoped collection; [`discover_target`]
 //!   reports what a scope already holds.
@@ -103,6 +110,9 @@ pub struct Storage {
 struct Session {
     store: Option<FacultyStore>,
     runtime: Arc<tokio::runtime::Runtime>,
+    /// The key the store was opened as. Constant for the session's life: the
+    /// fold's host cannot change under an open store.
+    host: VerifyingKey,
 }
 
 impl Session {
@@ -178,8 +188,13 @@ impl Storage {
     }
 
     /// Enter the shared session, opening its store as `host` the first time.
-    /// Every entry loads the same signer from the same paths, so the host is
-    /// one key for the session's life.
+    ///
+    /// Every entry loads the signer again from the same paths, so the host is
+    /// one key for the session's life unless the key file itself is replaced
+    /// under a running process. That is refused rather than served: the
+    /// store's fold would keep believing the old key's merges while every
+    /// carry signed with the new one failed, reads quietly wide and writes
+    /// loudly broken. Restarting opens the store as the new key.
     fn with_session<T>(
         &self,
         host: VerifyingKey,
@@ -197,7 +212,17 @@ impl Storage {
             *session = Some(Session {
                 store: Some(store),
                 runtime,
+                host,
             });
+        }
+        let opened_as = session.as_ref().expect("initialized above").host;
+        if opened_as != host {
+            anyhow::bail!(
+                "the durable signing key changed while the shared faculty store was open \
+                 (opened as {}, now {}); restart the process to open it as the new key",
+                hex::encode(opened_as.as_bytes()),
+                hex::encode(host.as_bytes())
+            );
         }
         // MCP reports a handler panic and keeps serving. Drop the ownership
         // guard normally before resuming that panic so a failed handler does
@@ -351,8 +376,8 @@ where
 
 /// Open a pile with lazy, exact-handle network acquisition, with no host:
 /// the fold believes no MERGE, so every believed foundation is its own
-/// frontier node. Right for a reader that holds no key; anything that signs
-/// or maintains opens with [`open_store_as`].
+/// frontier node. Right for a reader that holds no key; anything that
+/// publishes or reads through merges opens with [`open_store_as`].
 ///
 /// `TRIBLESPACE_PEERS` supplies comma-separated bootstrap endpoint tickets or
 /// endpoint ids, not blob providers to probe in order. The DHT finds providers.
@@ -701,9 +726,11 @@ pub fn initialize_signer(pile: &Path, explicit: Option<&Path>) -> Result<Signing
 
 /// Open and refresh an existing pile without automatic repair, with no host:
 /// the fold believes no MERGE, and every believed foundation stays on its
-/// collection's frontier. Correct for any read, only wider; a carry on it
-/// refuses to publish, since nothing would believe its merges. Anything that
-/// signs or maintains opens with [`open_pile_strict_as`].
+/// collection's frontier. Correct for any read, only wider, and for a writer
+/// of COMMITs, grants or descriptors, which WRITE admits whatever the host; a
+/// carry on it refuses to publish, since nothing would believe its merges.
+/// Anything that publishes or reads through merges opens as its signer
+/// ([`open_pile_signed`]).
 pub fn open_pile_strict(path: &Path) -> Result<Pile> {
     refreshed(
         path,
@@ -712,14 +739,23 @@ pub fn open_pile_strict(path: &Path) -> Result<Pile> {
 }
 
 /// [`open_pile_strict`] as `host`, the durable key the caller signs with: the
-/// fold believes the MERGEs `host` signed and no other key's. Every faculty
-/// that loads a signer opens as it, so its own carries are believed and its
-/// reads attach its own merges.
+/// fold believes the MERGEs `host` signed and no other key's, so the caller's
+/// own carries are believed and its reads attach its own merges.
 pub fn open_pile_strict_as(path: &Path, host: VerifyingKey) -> Result<Pile> {
     refreshed(
         path,
         Pile::open_as(path, host).with_context(|| format!("open pile {}", path.display()))?,
     )
+}
+
+/// Load the durable signer and open the pile as it, in one step: the way a
+/// faculty that publishes or reads through merges opens a local pile. The
+/// store's host is the key its carries and mirrors sign with by
+/// construction, so the two cannot drift apart at a call site.
+pub fn open_pile_signed(pile: &Path, key: Option<&Path>) -> Result<(Pile, SigningKey)> {
+    let signer = load_signer(pile, key)?;
+    let opened = open_pile_strict_as(pile, signer.verifying_key())?;
+    Ok((opened, signer))
 }
 
 fn refreshed(path: &Path, mut pile: Pile) -> Result<Pile> {
@@ -768,8 +804,7 @@ pub fn publish_fragment(
 /// signer, and close it. A read that follows sees what a write before it
 /// published, exactly as it would after the daemon's next pass.
 pub fn carry_scope(pile_path: &Path, key_path: Option<&Path>, scope: Id) -> Result<()> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
+    let (mut pile, signer) = open_pile_signed(pile_path, key_path)?;
     let collection =
         crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
             .context("open native collection descriptor")?;
@@ -783,8 +818,7 @@ pub fn publish_fragments(
     scope: Id,
     fragments: impl IntoIterator<Item = Fragment>,
 ) -> Result<Vec<CollectionCommit>> {
-    let signer = load_signer(pile_path, key_path)?;
-    let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
+    let (mut pile, signer) = open_pile_signed(pile_path, key_path)?;
     let collection =
         crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
             .context("open native collection descriptor")?;
@@ -1490,6 +1524,93 @@ mod tests {
         assert_eq!(wide, MERGE_FAN_IN);
         assert_eq!(wide_facts, facts);
         assert!(!facts.is_empty());
+    }
+
+    #[test]
+    fn carry_scope_opens_as_the_signer_so_the_fact_views_mirror_its_root_merge() {
+        use triblespace::core::collection::{CoverageRead, MERGE_FAN_IN};
+
+        let files = TestFiles::new();
+        let signer = initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
+        let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        assert_eq!(names.len(), MERGE_FAN_IN);
+        publish_fragments(
+            &files.pile,
+            Some(&files.key),
+            scope,
+            names.map(|name| entity! { _ @ metadata::name: name }),
+        )
+        .unwrap();
+        // A signed open folds as the signer it hands back.
+        let (mut pile, loaded) = open_pile_signed(&files.pile, Some(&files.key)).unwrap();
+        assert_eq!(loaded.verifying_key(), signer.verifying_key());
+        let host = pile
+            .snapshot()
+            .unwrap()
+            .index(&BTreeSet::new())
+            .unwrap()
+            .host();
+        assert_eq!(
+            host.map(|host| host.raw),
+            Some(signer.verifying_key().to_bytes())
+        );
+        let collection =
+            crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+                .unwrap();
+        drop(pollster::block_on(pile.maintain(collection, &signer)).unwrap());
+        pile.close().unwrap();
+
+        // The daemon's stand-in mirrors the signer's root merge through the
+        // fact pair. It can only do so opened as the signer: a store that
+        // believes no merge has none to mirror, and would publish nothing.
+        carry_scope(&files.pile, Some(&files.key), scope).unwrap();
+
+        let rank9_width = |pile: &mut Pile| -> usize {
+            let (_, rank9) = fact_pair(pile, collection).unwrap();
+            pile.snapshot()
+                .unwrap()
+                .collection(rank9)
+                .unwrap()
+                .cover()
+                .len()
+        };
+        let mut pile = open_pile_strict_as(&files.pile, signer.verifying_key()).unwrap();
+        assert_eq!(
+            rank9_width(&mut pile),
+            1,
+            "one mirrored merge over the tier"
+        );
+        pile.close().unwrap();
+        let mut keyless = open_pile_strict(&files.pile).unwrap();
+        assert_eq!(rank9_width(&mut keyless), MERGE_FAN_IN);
+        keyless.close().unwrap();
+    }
+
+    #[test]
+    fn a_shared_store_refuses_a_signing_key_replaced_under_it() {
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let shared = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        shared.with_pile(|_, _| Ok(())).unwrap();
+
+        // Another key file replaces the one the session opened as.
+        let other = files.directory.join("other.key");
+        initialize_signer(&files.pile, Some(&other)).unwrap();
+        fs::copy(&other, &files.key).unwrap();
+        let error = shared.with_pile(|_, _| Ok(())).unwrap_err().to_string();
+        assert!(
+            error.contains("signing key changed while the shared faculty store was open"),
+            "{error}"
+        );
+        let error = shared.with_store(|_, _, _| Ok(())).unwrap_err().to_string();
+        assert!(error.contains("restart the process"), "{error}");
+        shared.close().unwrap();
+
+        // A fresh owner opens as the key the file now holds.
+        Storage::shared(files.pile.clone(), Some(files.key.clone()))
+            .with_pile(|_, _| Ok(()))
+            .unwrap();
     }
 
     #[test]

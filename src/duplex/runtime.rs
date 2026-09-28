@@ -1250,7 +1250,7 @@ fn accept_inject_drain(
 fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<()> {
     use crate::collection_names::open_configured;
     use crate::schemas::voice::{CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
-    use crate::storage::{load_signer, open_pile_strict_as};
+    use crate::storage::open_pile_signed;
     use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::metadata;
     use triblespace::prelude::*;
@@ -1258,8 +1258,7 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     let stamp = clock::point_now()?;
     let mut fragment = crate::voice::utterance_fragment(CHANNEL_SHOUT, text, None, stamp)?;
 
-    let signer = load_signer(pile_path, key)?;
-    let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
+    let (mut pile, signer) = open_pile_signed(pile_path, key)?;
     let collection = open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
     let result = (|| -> Result<()> {
         crate::voice::validate_staged_payloads(&mut fragment)?;

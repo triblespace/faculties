@@ -4,15 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
-- Every faculty opens its pile as the key it signs with, so the store's fold
-  believes that key's MERGEs and no other key's: its own carries are believed
-  (a carry on a store opened as no key fails with `HostMismatch`) and its
-  reads attach its own merges instead of every commit. `Storage` opens this
-  way for one-shot and shared operations alike, through the new
-  `open_pile_strict_as` and `open_store_as`, as do the Archive and Code
-  import writers, the Duplex transcript, `carry_scope`, `publish_fragments`
-  and both migrations. `open_pile_strict` and `open_store` open with no host
-  and believe no MERGE; they remain for readers that hold no key.
+- A faculty opens its pile as the key it signs with exactly when what it does
+  depends on which MERGEs the fold believes: it publishes merges (a carry, or
+  a derived view's upkeep after a write) or reads through them. The store's
+  fold then believes that key's MERGEs and no other key's, so its own carries
+  are believed and its reads attach its own merges instead of every commit. A
+  root carry on a store opened as no key fails with `HostMismatch`; a derived
+  view's upkeep there mirrors nothing, since the store believes no merge to
+  mirror. `Storage` opens this way for one-shot and shared operations alike,
+  through the new `open_store_as` and `open_pile_strict_as`; the new
+  `open_pile_signed` loads the signer and opens as it in one step, and the
+  Archive and Code import writers, the Duplex transcript, `carry_scope` and
+  `publish_fragments` open through it. A shared `Storage` whose key file is
+  replaced while it is open refuses further operations until restarted,
+  instead of folding as the old key. `open_pile_strict` and `open_store` open
+  with no host and believe no MERGE: they remain for readers that hold no key
+  and for record writers such as the two migrations.
 
 - The exact collection API is gone from core, and with it every place a
   faculty asked for a support: the archive search maintains its fact view

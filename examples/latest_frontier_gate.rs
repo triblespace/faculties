@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use faculties::storage::{load_signer, open_pile_strict_as};
+use faculties::storage::open_pile_signed;
 use faculties::wiki as wiki_model;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
@@ -582,8 +582,7 @@ fn gate_relations_track_heads(space: &TribleSet) -> Result<()> {
 
 fn main() -> Result<()> {
     let pile: PathBuf = std::env::var("PILE").expect("PILE").into();
-    let signer = load_signer(&pile, None)?;
-    let mut handle = open_pile_strict_as(&pile, signer.verifying_key())?;
+    let (mut handle, signer) = open_pile_signed(&pile, None)?;
     let wiki = scope(
         &mut handle,
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
