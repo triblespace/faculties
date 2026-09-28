@@ -16,7 +16,6 @@
 //! collection configuration and is attached only when the pile signer is
 //! admitted to READ it.
 
-use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -27,8 +26,8 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::latest::LatestIndex;
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
 use triblespace::core::collection::{
-    Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt,
-    Cover,
+    AttachedSnapshot, Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt,
+    CollectionStoreExt, Cover, Support,
 };
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
@@ -138,11 +137,15 @@ fn source_closure(sources: impl IntoIterator<Item = SourceKey>) -> BTreeSet<Sour
 /// Opaque cache identity for one logical dataset view.
 ///
 /// Widgets compare revisions for equality; the storage backend owns their
-/// construction. The digest includes each attached relation's descriptor and
-/// its already-attached resident cover. It is a widget cache token, not a
-/// durable collection record or an authorization proof. Equivalent physical
-/// compaction may invalidate a cached projection, but computing the token
-/// never resolves the cover's historical support.
+/// construction. The digest includes each attached relation's descriptor,
+/// its already-attached resident cover, and what the read took beside the
+/// cover: the residual foundations and the ones among them it could not
+/// read. Those three sets decide what the read holds, so a commit read from
+/// its own bytes before anything attaches it moves the token as surely as
+/// maintenance does. It is a widget cache token, not a durable collection
+/// record or an authorization proof. Equivalent physical compaction may
+/// invalidate a cached projection, but computing the token never resolves
+/// the cover's historical support.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DatasetRevision([u8; 32]);
 
@@ -159,25 +162,43 @@ impl DatasetRevision {
         hasher.update(&(cover.len() as u128).to_le_bytes());
     }
 
-    fn from_collection<E: CollectionEncoding>(
-        collection: CollectionHandle,
-        cover: &Cover<E>,
-    ) -> Self {
+    /// Hash what one attached read holds: its cover, its residual, and the
+    /// residual foundations it could not read.
+    fn hash_attached<R, E>(
+        hasher: &mut blake3::Hasher,
+        attached: &AttachedSnapshot<R, E>,
+        unread: &Support,
+    ) where
+        R: triblespace::core::repo::StoreSnapshot,
+        E: CollectionEncoding,
+    {
+        let collection = attached.cover().collection().handle();
+        let parent = attached.support().collection().handle();
+        Self::hash_collection_cover(hasher, collection, attached.cover());
+        Self::hash_collection_cover(hasher, parent, attached.residual());
+        Self::hash_collection_cover(hasher, parent, unread);
+    }
+
+    fn from_attached<R, E>(attached: &AttachedSnapshot<R, E>, unread: &Support) -> Self
+    where
+        R: triblespace::core::repo::StoreSnapshot,
+        E: CollectionEncoding,
+    {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"faculties.viewer.dataset-revision.v3");
-        Self::hash_collection_cover(&mut hasher, collection, cover);
+        hasher.update(b"faculties.viewer.dataset-revision.v4");
+        Self::hash_attached(&mut hasher, attached, unread);
         Self(*hasher.finalize().as_bytes())
     }
 
-    fn include_collection<E: CollectionEncoding>(
-        &mut self,
-        collection: CollectionHandle,
-        cover: &Cover<E>,
-    ) {
+    fn include_attached<R, E>(&mut self, attached: &AttachedSnapshot<R, E>, unread: &Support)
+    where
+        R: triblespace::core::repo::StoreSnapshot,
+        E: CollectionEncoding,
+    {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"faculties.viewer.dataset-relation.v1");
+        hasher.update(b"faculties.viewer.dataset-relation.v2");
         hasher.update(&self.0);
-        Self::hash_collection_cover(&mut hasher, collection, cover);
+        Self::hash_attached(&mut hasher, attached, unread);
         self.0 = *hasher.finalize().as_bytes();
     }
 
@@ -674,6 +695,23 @@ fn load_inputs(storage: &Storage, sources: &BTreeSet<SourceKey>) -> Result<Loade
         .map_err(|error| format!("load viewer storage: {error:#}"))
 }
 
+/// One scope's facts, read through its attached Rank9 cover with the
+/// residual read from its bytes, and the revision that identifies exactly
+/// what that read holds.
+fn attached_facts_and_revision<R>(
+    snapshot: &R,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+) -> anyhow::Result<(FactArchive, DatasetRevision)>
+where
+    R: triblespace::core::repo::StoreRead,
+{
+    let attached = snapshot
+        .attached(rank9)
+        .map_err(|error| anyhow::anyhow!("attach the Rank9 fact cover: {error}"))?;
+    let (facts, unread) = crate::storage::attached_facts_read(&attached)?.into_parts();
+    Ok((facts, DatasetRevision::from_attached(&attached, &unread)))
+}
+
 async fn load_inputs_from_pile(
     pile: &mut Pile,
     signer: &ed25519_dalek::SigningKey,
@@ -756,16 +794,9 @@ async fn load_inputs_from_pile(
                 .find(|source| source.scope == *scope)
                 .expect("every maintained viewer scope has a source label")
                 .label;
-            let collection = store_snapshot
-                .attached(*rank9)
-                .map_err(|error| format!("attach maintained {label} collection: {error}"))?;
-            let facts = collection
-                .facts()
-                .map_err(|error| format!("read maintained {label} collection: {error}"))?;
-            revisions_by_scope.insert(
-                *scope,
-                DatasetRevision::from_collection(rank9.handle(), collection.cover()),
-            );
+            let (facts, revision) = attached_facts_and_revision(&store_snapshot, *rank9)
+                .map_err(|error| format!("read maintained {label} collection: {error:#}"))?;
+            revisions_by_scope.insert(*scope, revision);
             facts_by_scope.insert(*scope, facts);
         }
 
@@ -773,15 +804,17 @@ async fn load_inputs_from_pile(
             let collection = store_snapshot
                 .attached(target)
                 .map_err(|error| format!("attach Compass status register: {error}"))?;
-            let index = collection
-                .view::<LwwIndex>()
+            let (index, unread) = collection
+                .read::<LwwIndex>()
                 .map_err(|error| format!("read Compass status register: {error}"))?
+                .into_parts();
+            let index = index
                 .query()
                 .map_err(|error| format!("prepare Compass status register query: {error}"))?;
             revisions_by_scope
                 .get_mut(&COMPASS_SCOPE_ID)
                 .expect("Compass facts were attached")
-                .include_collection(target.handle(), collection.cover());
+                .include_attached(&collection, &unread);
             lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
                 (
                     crate::schemas::compass::board::status_of.id(),
@@ -795,13 +828,14 @@ async fn load_inputs_from_pile(
             let collection = store_snapshot
                 .attached(target)
                 .map_err(|error| format!("attach Wiki supersession index: {error}"))?;
-            let index = collection
-                .view::<LatestIndex>()
-                .map_err(|error| format!("read Wiki supersession index: {error}"))?;
+            let (index, unread) = collection
+                .read::<LatestIndex>()
+                .map_err(|error| format!("read Wiki supersession index: {error}"))?
+                .into_parts();
             revisions_by_scope
                 .get_mut(&WIKI_SCOPE_ID)
                 .expect("Wiki facts were attached")
-                .include_collection(target.handle(), collection.cover());
+                .include_attached(&collection, &unread);
             latest_by_scope
                 .entry(WIKI_SCOPE_ID)
                 .or_default()
@@ -1082,6 +1116,82 @@ mod tests {
         }
     }
 
+    /// The revision names exactly what a fact read holds. A commit that
+    /// arrives and that nothing attaches is read from its bytes, and moves
+    /// the revision; a commit whose payload is not here is left out and
+    /// named, and its bytes arriving moves the revision again.
+    #[test]
+    fn dataset_revision_changes_when_a_commit_is_read_from_its_bytes() {
+        use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace::core::blob::{Blob, IntoBlob};
+        use triblespace::core::collection::{
+            empty_metadata_handle, CollectionCommit, CollectionRecord, CollectionStore,
+        };
+        use triblespace::core::inline::encodings::hash::Handle;
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+        use triblespace::core::repo::BlobStorePut;
+
+        let signer = SigningKey::from_bytes(&[36; 32]);
+        let mut store = MemoryRepo::for_host(signer.verifying_key());
+        let source = store
+            .collection(
+                "residual-cache",
+                crate::collection_names::private_policy(signer.verifying_key()),
+            )
+            .unwrap();
+        let (_, rank9) = crate::storage::fact_pair(&mut store, source).unwrap();
+        let (first, second, third) = (genid(), genid(), genid());
+        store
+            .commit(
+                source,
+                &signer,
+                entity! { &first @ metadata::name: "first" },
+            )
+            .unwrap();
+        crate::storage::carry_facts(&mut store, source, &signer);
+        let (_, attached) = attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+
+        // A commit arrives, as sync would bring it; nothing attaches it.
+        store
+            .commit(
+                source,
+                &signer,
+                entity! { &second @ metadata::name: "second" },
+            )
+            .unwrap();
+        let (facts, read_raw) =
+            attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        let names = |facts: &FactArchive| -> BTreeSet<Id> {
+            find!(id: Id, pattern!(facts, [{ ?id @ metadata::name: _?name }])).collect()
+        };
+        assert_eq!(names(&facts), BTreeSet::from([first.id, second.id]));
+        assert_ne!(attached, read_raw, "the cover alone did not change");
+
+        // A commit whose payload is not here yet.
+        let payload: Blob<SimpleArchive> = entity! { &third @ metadata::name: "third" }
+            .into_facts()
+            .to_blob();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &signer,
+                source.handle(),
+                Handle::<SimpleArchive>::to_hash(payload.get_handle()),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let (facts, gap) = attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        assert_eq!(names(&facts), BTreeSet::from([first.id, second.id]));
+        assert_ne!(read_raw, gap);
+        store.put::<SimpleArchive, _>(payload).unwrap();
+        let (facts, arrived) =
+            attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        assert_eq!(
+            names(&facts),
+            BTreeSet::from([first.id, second.id, third.id])
+        );
+        assert_ne!(gap, arrived, "the payload's arrival moves the revision");
+    }
+
     #[test]
     fn dataset_revision_changes_when_only_latest_cover_advances() {
         pollster::block_on(async {
@@ -1103,8 +1213,7 @@ mod tests {
             store
                 .commit(source, &signer, entity! { &root @ metadata::name: "root" })
                 .unwrap();
-            let ready = store.maintain_attached(target, &signer).await.unwrap();
-            let lagging = ready.attached(target).unwrap();
+            drop(store.maintain_attached(target, &signer).await.unwrap());
             store
                 .commit(
                     source,
@@ -1114,13 +1223,21 @@ mod tests {
                 .unwrap();
             let snapshot = store.snapshot().unwrap();
             let facts = snapshot.collection(source).unwrap();
-            let mut before = DatasetRevision::from_collection(source.handle(), facts.cover());
-            before.include_collection(target.handle(), lagging.cover());
+            let lagging = snapshot.attached(target).unwrap();
+            let (lagging_index, unread) = lagging.read::<LatestIndex>().unwrap().into_parts();
+            let before = DatasetRevision::from_attached(&lagging, &unread);
 
             let ready = store.maintain_attached(target, &signer).await.unwrap();
             let advanced = ready.attached(target).unwrap();
-            let mut after = DatasetRevision::from_collection(source.handle(), facts.cover());
-            after.include_collection(target.handle(), advanced.cover());
+            let (advanced_index, unread) = advanced.read::<LatestIndex>().unwrap().into_parts();
+            let after = DatasetRevision::from_attached(&advanced, &unread);
+            // The index answers alike -- the residual read builds what
+            // maintenance attached -- and the token still moves: it names
+            // what the read took, not what it answered.
+            assert_eq!(
+                lagging_index.states().collect::<BTreeSet<_>>(),
+                advanced_index.states().collect::<BTreeSet<_>>()
+            );
             assert_ne!(
                 before, after,
                 "index-only progress invalidates widget projections"
