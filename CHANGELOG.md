@@ -6,8 +6,9 @@ All notable changes to this project will be documented in this file.
 
 - `files index` derives every Files commit that has no semantic row whose
   bytes are here or can be fetched, whoever saved it, and carries each
-  index's rows into this key's merges; saving a file still embeds only that
-  file. Only a machine of the canonical compute embeds, after its golden
+  index's rows into this key's merges; saving a file still embeds only this
+  key's own files without rows -- the one just saved, and any earlier one
+  still waiting -- never another key's. Only a machine of the canonical compute embeds, after its golden
   vectors agree; `files index` on any other machine embeds nothing and
   carries the rows that arrived by replication instead of refusing. The note
   on files without rows no longer says that only a file's writer embeds it,

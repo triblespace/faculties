@@ -849,7 +849,8 @@ fn cmd_add(
 
     // A saved image is searchable the moment it is saved, where this machine
     // can embed it (JP, 2026-09-12: saving an image should embed it, no skip
-    // path); elsewhere its rows arrive from a machine that can.
+    // path); elsewhere its rows arrive from a machine that can. Saving embeds
+    // every file of this key's still without rows, not only this one.
     #[cfg(feature = "local-embed")]
     if local_compute() == SEMANTIC_COMPUTE {
         match maintain_semantic(pile, collection, signer, runtime, false) {
@@ -2043,9 +2044,10 @@ fn cmd_similar<P: TriblePattern>(
         let (query_vec, query_contents, label) = similarity_query(space, reader, options)?;
 
         // The indexes as they stand: a query is a read and never waits on the
-        // GPU. `files add` embeds the file it just saved and `files index`
-        // every file without a usable row, whoever saved it, on the
-        // canonical compute; elsewhere the rows arrive by replication. Files
+        // GPU. `files add` embeds the file it just saved, and any earlier
+        // file of this key's still without rows, and `files index` every
+        // file without a usable row, whoever saved it, on the canonical
+        // compute; elsewhere the rows arrive by replication. Files
         // with no row yet (see SEMANTIC_COMPUTE) are counted rather than
         // hidden.
         let _ = (signer, runtime);
