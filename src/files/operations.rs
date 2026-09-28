@@ -468,16 +468,34 @@ fn semantic_target(
         .with_context(|| format!("register the Files {kind} index"))
 }
 
-/// Maintain both indexes and return the snapshot that sees the result.
+/// Both semantic indexes as one pass left them: each index maintained, the
+/// snapshot that sees the result, and what failed, one error per index that
+/// did.
+#[cfg(feature = "local-embed")]
+type SemanticUpkeep = (
+    Vec<(Kind, Collection<NvFp4CosineSet<embeddings::Embedding768>>)>,
+    FacultySnapshot,
+    Vec<anyhow::Error>,
+);
+
+/// Maintain both indexes and return them, the snapshot that sees the
+/// result, and what failed.
 ///
 /// With `every_file` false -- what saving a file does -- embed the Files
-/// commits this key wrote that have no rows yet. With it true -- `files
+/// commits this key wrote that have no rows yet: the file just saved, and
+/// any earlier one of this key's still without rows. With it true -- `files
 /// index` -- embed every Files commit whose bytes are here and that has no
 /// row whose bytes are here or can be fetched, whoever wrote it, then carry
 /// each index's rows into this key's merges. Only a machine of the canonical
 /// compute embeds, and only after its golden vectors agree; on any other the
 /// mapping is pinned elsewhere, nothing is embedded, and `every_file` still
 /// carries the rows that arrived by replication.
+///
+/// One index failing -- a file its model refuses, rows its carry cannot
+/// join -- holds back neither the other index nor what the caller reports:
+/// each is maintained as far as it goes, and the failures come back with
+/// both. Only a failed golden check, or a pile that cannot be read at all,
+/// ends the pass as an error.
 #[cfg(feature = "local-embed")]
 fn maintain_semantic(
     store: &mut FacultyStore,
@@ -485,10 +503,7 @@ fn maintain_semantic(
     signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
     every_file: bool,
-) -> Result<(
-    Vec<(Kind, Collection<NvFp4CosineSet<embeddings::Embedding768>>)>,
-    FacultySnapshot,
-)> {
+) -> Result<SemanticUpkeep> {
     maintain_semantic_on(
         store,
         collection,
@@ -509,10 +524,7 @@ fn maintain_semantic_on(
     runtime: &tokio::runtime::Runtime,
     every_file: bool,
     compute: &str,
-) -> Result<(
-    Vec<(Kind, Collection<NvFp4CosineSet<embeddings::Embedding768>>)>,
-    FacultySnapshot,
-)> {
+) -> Result<SemanticUpkeep> {
     if local_compute() == compute {
         // The golden vectors first: this device must embed the fixed inputs
         // to what the model collection records before it publishes a row.
@@ -523,24 +535,53 @@ fn maintain_semantic_on(
         drop(frozen);
     }
     let mut targets = Vec::with_capacity(Kind::ALL.len());
-    let mut snapshot = None;
+    let mut failures = Vec::new();
     for kind in Kind::ALL {
-        let target = semantic_target(store, collection, kind, compute)?;
-        snapshot = Some(runtime.block_on(async {
-            if every_file {
-                store
-                    .maintain_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
-                    .await
-            } else {
-                store
-                    .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
-                    .await
+        let target = match semantic_target(store, collection, kind, compute) {
+            Ok(target) => target,
+            Err(error) => {
+                failures.push(error);
+                continue;
             }
-            .with_context(|| format!("maintain the Files {kind} index"))
-        })?);
+        };
+        let maintained = runtime
+            .block_on(async {
+                if every_file {
+                    store
+                        .maintain_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
+                        .await
+                } else {
+                    store
+                        .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
+                        .await
+                }
+            })
+            .with_context(|| format!("maintain the Files {kind} index"));
+        if let Err(error) = maintained {
+            failures.push(error);
+        }
         targets.push((kind, target));
     }
-    Ok((targets, snapshot.expect("Kind::ALL is not empty")))
+    let snapshot = store
+        .snapshot()
+        .context("freeze the pile after the Files semantic indexes")?;
+    Ok((targets, snapshot, failures))
+}
+
+/// One error naming every index that failed, or none.
+#[cfg(feature = "local-embed")]
+fn semantic_failures(failures: Vec<anyhow::Error>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{}",
+        failures
+            .iter()
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
 }
 
 /// `files golden`: how this device embeds the golden inputs against the
@@ -812,7 +853,11 @@ fn cmd_add(
     #[cfg(feature = "local-embed")]
     if local_compute() == SEMANTIC_COMPUTE {
         match maintain_semantic(pile, collection, signer, runtime, false) {
-            Ok(_) => {}
+            Ok((_, _, failures)) => {
+                for error in failures {
+                    out.line(format!("Semantic index not maintained: {error:#}"))?;
+                }
+            }
             Err(error) => out.line(format!("Semantic index not maintained: {error:#}"))?,
         }
     }
@@ -1519,7 +1564,8 @@ fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
 /// whoever saved it; any other machine embeds nothing and reads the rows
 /// that replicate to it. Either carries each index's rows into its own
 /// merges, and the report counts the Files commits that have no row yet
-/// (`SEMANTIC_COMPUTE` says why).
+/// (`SEMANTIC_COMPUTE` says why). One index failing holds back neither the
+/// other nor either report; every failure is returned after both.
 fn cmd_index(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
@@ -1533,29 +1579,48 @@ fn cmd_index(
         bail!("`files index` needs the embedders — rebuild with --features local-embed");
     }
     #[cfg(feature = "local-embed")]
-    {
-        let (targets, snapshot) = maintain_semantic(store, collection, signer, runtime, true)?;
-        for (kind, target) in targets {
-            let index = snapshot
-                .collection(target)
-                .with_context(|| format!("observe the Files {kind} index"))?
-                .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
-                .with_context(|| format!("read the Files {kind} index"))?;
-            out.line(format!(
-                "Files {kind} index {}: {} member(s), {} row(s), computed on {}",
+    index_on(store, collection, signer, runtime, out, SEMANTIC_COMPUTE)
+}
+
+/// [`cmd_index`] for indexes computed on the class `compute`.
+#[cfg(feature = "local-embed")]
+fn index_on(
+    store: &mut FacultyStore,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    runtime: &tokio::runtime::Runtime,
+    out: &mut Out<'_>,
+    compute: &str,
+) -> Result<()> {
+    let (targets, snapshot, mut failures) =
+        maintain_semantic_on(store, collection, signer, runtime, true, compute)?;
+    for (kind, target) in targets {
+        let index = snapshot
+            .collection(target)
+            .with_context(|| format!("observe the Files {kind} index"))
+            .and_then(|observed| {
+                observed
+                    .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
+                    .with_context(|| format!("read the Files {kind} index"))
+            });
+        match index {
+            Ok(index) => out.line(format!(
+                "Files {kind} index {}: {} member(s), {} row(s), computed on {compute}",
                 collection_hex(target.handle()),
                 index.segment_count(),
                 index.len(),
-                SEMANTIC_COMPUTE
-            ))?;
-            let unindexed = crate::storage::underived(&snapshot, collection, target)
-                .with_context(|| format!("count Files commits without {kind} rows"))?;
-            if unindexed > 0 {
-                out.line(semantic_lag_note(kind, unindexed))?;
+            ))?,
+            Err(error) => failures.push(error),
+        }
+        match crate::storage::underived(&snapshot, collection, target) {
+            Ok(0) => {}
+            Ok(unindexed) => out.line(semantic_lag_note(kind, unindexed))?,
+            Err(error) => {
+                failures.push(error.context(format!("count Files commits without {kind} rows")))
             }
         }
-        Ok(())
     }
+    semantic_failures(failures)
 }
 
 /// Embed every image file with nomic-embed-multimodal-7b and store the 3584-d
@@ -3967,8 +4032,9 @@ mod tests {
                     }
                 }
 
-                let (targets, _) =
+                let (targets, _, failures) =
                     maintain_semantic_on(store, files, signer, runtime, true, ELSEWHERE)?;
+                assert!(failures.is_empty(), "{failures:?}");
                 let signed_by_signer = |record: &CollectionRecord| match record {
                     CollectionRecord::Derive(leaf) => {
                         leaf.public_key().raw == signer.verifying_key().to_bytes()
@@ -3999,6 +4065,146 @@ mod tests {
                     } else {
                         assert!(held.is_empty(), "{kind}: no rows, nothing to carry");
                     }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// Review finding, 2026-09-28: one index failing -- the Image index,
+    /// maintained first -- ended `files index` before the Text index was
+    /// derived or carried, and before either lag note was printed. Now both
+    /// are maintained and reported, and the failure comes after.
+    #[cfg(feature = "local-embed")]
+    #[test]
+    fn a_failing_image_index_holds_back_neither_the_text_index_nor_the_lag_notes() {
+        use triblespace::core::collection::{
+            AdmissionPolicy, CollectionDerive, CollectionHandle, CollectionPolicy, CollectionRead,
+            CollectionRecord, CollectionRecordSelector, CollectionStore,
+        };
+        use triblespace::core::inline::encodings::hash::Handle;
+        use triblespace::core::trible::Trible;
+        use triblespace_search::nvfp4::NvFp4EmbeddingAttribute;
+
+        const ELSEWHERE: &str = "a-class-no-machine-is-in";
+        let fixture = TestPile::new();
+        let publisher = SigningKey::from_bytes(&[0x76; 32]);
+        let mut pile = Pile::open(&fixture.path).unwrap();
+        for fragment in [
+            native_model_fragment(crate::nomic::NOMIC_TEXT_MODEL, "text.weight", 1.0),
+            native_model_fragment(crate::nomic::NOMIC_VISION_MODEL, "vision.weight", 2.0),
+            native_tokenizer_fragment(crate::nomic::NOMIC_TEXT_MODEL, WORDPIECE),
+        ] {
+            mary::model_collection::publish_model_fragment(&mut pile, &publisher, fragment)
+                .unwrap();
+        }
+        pile.close().unwrap();
+
+        let deriver = SigningKey::from_bytes(&[0x77; 32]);
+        let storage = Storage::new(fixture.path.clone(), None);
+        storage
+            .with_store(|store, signer, runtime| {
+                let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+                let files = store.collection("files", policy.clone())?;
+                for axis in 0..9u8 {
+                    let mut vector = vec![0.0f32; embeddings::DIM];
+                    vector[usize::from(axis)] = 1.0;
+                    let content: FileHandle = store
+                        .put::<embeddings::Embedding768, _>(vector)?
+                        .transmute();
+                    let mut facts = TribleSet::new();
+                    facts.insert(&Trible::force(
+                        &Id::new([axis + 1; 16]).unwrap(),
+                        &file::content.id(),
+                        &content,
+                    ));
+                    store.commit(files, &deriver, Fragment::from(facts))?;
+                }
+                let exact = store.derive::<NvFp4CosineSet<embeddings::Embedding768>>(
+                    files,
+                    NvFp4EmbeddingAttribute::new(file::content.id(), embeddings::DIM)?,
+                    policy,
+                )?;
+                drop(runtime.block_on(store.ensure(exact, &deriver))?);
+                let image = semantic_target(store, files, Kind::Image, ELSEWHERE)?;
+                let text = semantic_target(store, files, Kind::Text, ELSEWHERE)?;
+                let records = |store: &mut FacultyStore, collection: CollectionHandle| {
+                    store
+                        .snapshot()
+                        .unwrap()
+                        .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                            collection,
+                        )]))
+                        .unwrap()
+                };
+                // Eight of the nine files have text rows. The image index has
+                // leaves for the same eight whose outputs are no NVFP4 rows,
+                // so its carry cannot join them.
+                let rows: Vec<CollectionDerive> = records(store, exact.handle())
+                    .into_iter()
+                    .filter_map(|record| match record {
+                        CollectionRecord::Derive(leaf) => Some(leaf),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(rows.len(), 9);
+                for (n, row) in rows.iter().take(8).enumerate() {
+                    store.insert(CollectionRecord::Derive(CollectionDerive::sign(
+                        &deriver,
+                        text.handle(),
+                        row.input(),
+                        row.output(),
+                    )))?;
+                    let garbage = store.put::<UnknownBlob, _>(anybytes::Bytes::from_source(
+                        format!("not an NVFP4 row {n}").into_bytes(),
+                    ))?;
+                    store.insert(CollectionRecord::Derive(CollectionDerive::sign(
+                        &deriver,
+                        image.handle(),
+                        row.input(),
+                        Handle::<UnknownBlob>::to_hash(garbage),
+                    )))?;
+                }
+                let merges = |store: &mut FacultyStore, collection: CollectionHandle| {
+                    records(store, collection)
+                        .into_iter()
+                        .filter(|record| matches!(record, CollectionRecord::Merge(_)))
+                        .count()
+                };
+
+                let mut lines = Vec::new();
+                let mut emit = |part: crate::out::Part| {
+                    if let crate::out::Part::Text { text } = part {
+                        lines.push(text);
+                    }
+                    Ok(())
+                };
+                let result = index_on(
+                    store,
+                    files,
+                    signer,
+                    runtime,
+                    &mut Out::new(&mut emit),
+                    ELSEWHERE,
+                );
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("maintain the Files image index"), "{error}");
+                assert!(!error.contains("text index"), "{error}");
+                assert_eq!(merges(store, text.handle()), 1, "the text rows are carried");
+                assert_eq!(merges(store, image.handle()), 0);
+                let printed = lines.concat();
+                assert!(
+                    printed.contains(&format!(
+                        "Files text index {}",
+                        collection_hex(text.handle())
+                    )),
+                    "{printed}"
+                );
+                for kind in Kind::ALL {
+                    assert!(
+                        printed.contains(&format!("no {kind} rows here yet")),
+                        "{kind}: {printed}"
+                    );
                 }
                 Ok(())
             })

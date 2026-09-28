@@ -15,6 +15,13 @@ All notable changes to this project will be documented in this file.
   rows: `storage::underived` counts a foundation only when none of its leaves
   has its output here, as maintenance does.
 
+- `files index` maintains the Image and the Text index whatever the other
+  did: one failing -- a file its model refuses, rows its carry cannot join --
+  no longer ends the command before the other index is derived and carried,
+  or before either lag note. Each index's line and lag note is printed, and
+  every failure is returned after both. `files add` prints one "Semantic
+  index not maintained" line per index that failed.
+
 - A faculty opens its pile as the key it signs with exactly when what it does
   depends on which MERGEs and MAPs the fold believes: it publishes them (a
   carry, or attaching after a write) or reads through them. The store's fold
