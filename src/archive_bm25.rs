@@ -11,9 +11,12 @@
 //! documents join by pointwise maximum in the portable carrier.
 //!
 //! Importer receipts are deliberately outside the projection. The mapping is
-//! an open-world typed query: unknown facts and undecodable rows are inert,
-//! while a block-selected part/fact closure which is actually needed for this
-//! BM25 value must be present in the same derivable source element.
+//! an open-world typed query: unknown facts and undecodable rows are inert.
+//! A part a node's block references must be present with its content fact in
+//! that node, or the node is refused; but a part the node does not reference
+//! is invisible to it, so a node holding only some of a block's parts is
+//! indexed from those parts, with nothing refused. See
+//! [`ArchiveBlockTextBm25Mapping`] for what that means for a cover.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -90,6 +93,29 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 
 /// Bound canonical projection from one Archive fact-set member to its
 /// portable BM25 image.
+///
+/// Its cover-query law ([`MapMapping`](triblespace::core::collection::MapMapping))
+/// is a premise about its input, not something it checks. A block's term
+/// frequency sums over the block's parts, and a node cannot tell that a
+/// block has more parts elsewhere. So this mapping answers like the union
+/// for every cover whose nodes hold whole source units (a block with all its
+/// parts and their facts). A node holding part of a block scores that block
+/// from the part it holds, with no refusal and no residual to show it, so a
+/// cover that splits a block undercounts it even when nothing is unread.
+/// Faculties' own Archive importer commits whole source units
+/// ([`crate::archive_collection::ArchiveImportWriter::stage_fragment`] keeps
+/// each fragment it is given whole in one commit, and the importers hand it
+/// whole blocks), which `every_import_commit_holds_whole_blocks` pins. That
+/// is the premise for data we write. It is not a guarantee: the writer does
+/// not check that a fragment holds whole blocks, and another writer's
+/// commits or historical input need not hold them.
+///
+/// The ignored tests `a_block_whose_parts_sit_in_two_nodes_scores_like_their_union`,
+/// `a_block_extended_by_a_node_without_its_tag_scores_like_their_union` and
+/// `archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes`
+/// are the acceptance tests of the structural fix: a per-fact text BM25 over
+/// the content fact's payload, blocks ranked at query time through the fact
+/// read, which retires this mapping (`4EC6991611EF484A37FBD95F6E108FC6`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveBlockTextBm25Mapping;
 
@@ -116,12 +142,15 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
     /// Map one parent node, classifying what stops it by what could still
     /// change the answer. A selected text payload that is not here is a
     /// dependency the store may fetch, after which the map runs again. A
-    /// node this law cannot index as one member, such as a block whose part
-    /// and fact closure sits partly in another commit, is refused as that
-    /// node's capacity: maintenance descends to the nodes beneath it, and a
-    /// merged node above that holds the whole closure represents it. Only a
-    /// failure to read the store is fatal, because that is the one thing no
-    /// other node can get around.
+    /// node holding a block that references a part the node does not hold,
+    /// or a part whose content fact is absent or untyped there, is refused
+    /// as that node's capacity: maintenance descends to the nodes beneath
+    /// it, and a merged node above that holds the whole closure represents
+    /// it. Not every split is refused: a node holding a block with only some
+    /// of its `contains` facts, or a `contains` fact without the block's
+    /// tag, is mapped from what it holds (see the type's documentation).
+    /// Only a failure to read the store is fatal, because that is the one
+    /// thing no other node can get around.
     fn map<R: StoreRead>(
         &self,
         node: &Blob<SimpleArchive>,
@@ -642,10 +671,12 @@ mod tests {
             .collect()
     }
 
-    /// The cover-query equivalence law for the archive-block mapping, the
-    /// one attached index whose mapping refuses some nodes: a block whose
-    /// part and fact closure is split across two commits cannot be indexed
-    /// from either commit alone (`Capacity`), only from a node holding both.
+    /// The cover-query equivalence law for the archive-block mapping over
+    /// the one split it refuses: a block's own facts in one commit and its
+    /// parts and facts in another. The commit holding the block references
+    /// parts it lacks and cannot be indexed alone (`Capacity`), only from a
+    /// node holding both. Splits the mapping does not refuse are the ignored
+    /// tests below.
     ///
     /// Over random commits (some blocks split), the host's carry or not,
     /// random host merges over possibly overlapping nodes, and an attachment
@@ -845,5 +876,232 @@ mod tests {
         // and attachments taken.
         assert!(unread_seen > 0);
         assert!(attachments_taken > 0);
+    }
+
+    // The three ignored tests below show the cover law failing when a
+    // block's parts span nodes. They are the acceptance tests of the
+    // structural fix: a per-fact text BM25 over the content fact's payload,
+    // with blocks ranked at query time through the fact read, which retires
+    // mapping 4EC6991611EF484A37FBD95F6E108FC6. They stop being ignored with
+    // it; until then this mapping's law holds only for covers of whole source
+    // units (see `ArchiveBlockTextBm25Mapping`).
+
+    /// One block of several text parts, and each part's fragment.
+    fn parts_block(texts: &[&str]) -> (Fragment, Vec<Fragment>) {
+        let mut parts = Vec::new();
+        let mut occurrences = Fragment::empty();
+        for (ordinal, text) in texts.iter().enumerate() {
+            let fact = archive::text_fact(
+                schema::content_fact::modality::TEXT,
+                schema::content_fact::direction::IN,
+                (*text).to_owned(),
+            )
+            .unwrap();
+            let part = archive::content_part(ordinal as u64, fact, None).unwrap();
+            parts.push(part.clone());
+            occurrences += part;
+        }
+        let block = archive::block(std::iter::empty::<Id>(), None, occurrences).unwrap();
+        (block, parts)
+    }
+
+    /// The facts of `block` a node holds when it has the `contains` fact and
+    /// the whole closure of each of `parts`, and, when `tagged`, every other
+    /// fact of the block itself.
+    fn block_piece(block: &Fragment, parts: &[&Fragment], tagged: bool) -> Fragment {
+        let block_id = block.root().unwrap();
+        let contains = schema::block::contains.id();
+        let mut facts = TribleSet::new();
+        for part in parts {
+            facts += part.facts().clone();
+            let part_id: Inline<GenId> = part.root().unwrap().to_inline();
+            for fact in block.facts().iter() {
+                if fact.e() == &block_id
+                    && fact.a() == &contains
+                    && fact.v::<GenId>().raw == part_id.raw
+                {
+                    facts.insert(fact);
+                }
+            }
+        }
+        if tagged {
+            for fact in block.facts().iter() {
+                if fact.e() == &block_id && fact.a() != &contains {
+                    facts.insert(fact);
+                }
+            }
+        }
+        Fragment::from(facts)
+    }
+
+    /// Commit each node, attach every one of them, and score each query
+    /// through the production read and through the index of the union of
+    /// the nodes. Every node is attached and nothing is unread, so the two
+    /// must agree.
+    fn scores_read_and_of_the_union(
+        nodes: &[Fragment],
+        texts: Vec<Blob<UnknownBlob>>,
+        queries: &[&str],
+    ) -> Vec<(BTreeMap<RawInline, i64>, BTreeMap<RawInline, i64>)> {
+        use ed25519_dalek::SigningKey;
+        use triblespace::core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+            TryFromCover,
+        };
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+
+        let key = SigningKey::from_bytes(&[62; 32]);
+        let host = key.verifying_key();
+        let mut store = MemoryRepo::for_host(host);
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
+        let root = store.collection("archive-parts", policy).unwrap();
+        let target = store
+            .attach_with(root, ArchiveBlockTextBm25Mapping)
+            .unwrap();
+        for blob in texts {
+            store.put::<UnknownBlob, _>(blob).unwrap();
+        }
+        let mut union = TribleSet::new();
+        for node in nodes {
+            union += node.facts().clone();
+            store.commit(root, &key, node.clone()).unwrap();
+        }
+        pollster::block_on(store.ensure_attached_with::<ArchiveBlockTextBm25Mapping>(target, &key))
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        let attached = snapshot.attached(target).unwrap();
+        assert!(attached.residual().is_empty(), "every node is attached");
+        let read = attached
+            .read_with::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>()
+            .unwrap();
+        assert!(read.unread().is_empty());
+        let expected = ArchiveBlockTextBm25Mapping
+            .map(&union.to_blob(), &[], &snapshot)
+            .unwrap();
+        drop(attached);
+        let expected = store.put::<PortableBM25Blob, _>(expected).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+        let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
+        let through_union: ArchiveBM25View =
+            TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
+                .unwrap();
+        queries
+            .iter()
+            .map(|query| (scores(read.value(), query), scores(&through_union, query)))
+            .collect()
+    }
+
+    /// Two nodes each hold the block and one of its two parts, each part
+    /// with the same word. Each node maps, to a frequency of one; the union
+    /// holds both parts, a frequency of two. The cover's pointwise maximum
+    /// says one; a sum would say two here, and twice the truth wherever the
+    /// two nodes hold the same part.
+    #[test]
+    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
+                holding some of a block's parts cannot tell; no combination of per-node images \
+                is exact"]
+    fn a_block_whose_parts_sit_in_two_nodes_scores_like_their_union() {
+        let (block, parts) = parts_block(&["echo", "echo"]);
+        let (other, _) = parts_block(&["alpha"]);
+        let (_, mut texts) = source_and_attachments(block.clone());
+        texts.extend(source_and_attachments(other.clone()).1);
+        let mut first = block_piece(&block, &[&parts[0]], true);
+        first += other;
+        let second = block_piece(&block, &[&parts[1]], true);
+        for (read, union) in scores_read_and_of_the_union(&[first, second], texts, &["echo"]) {
+            assert_eq!(read, union);
+        }
+    }
+
+    /// The same block, one node holding it with its first part and another
+    /// holding only its `contains` fact for the second part and that part's
+    /// closure, not the block's tag. The second node has no document, so
+    /// the block is in one image only, and still its union's frequency is
+    /// larger: finding the blocks two images share cannot find every block
+    /// the cover gets wrong.
+    #[test]
+    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
+                holding some of a block's parts cannot tell; no combination of per-node images \
+                is exact"]
+    fn a_block_extended_by_a_node_without_its_tag_scores_like_their_union() {
+        let (block, parts) = parts_block(&["echo", "echo"]);
+        let (other, _) = parts_block(&["alpha"]);
+        let (_, mut texts) = source_and_attachments(block.clone());
+        texts.extend(source_and_attachments(other.clone()).1);
+        let mut first = block_piece(&block, &[&parts[0]], true);
+        first += other;
+        let second = block_piece(&block, &[&parts[1]], false);
+        for (read, union) in scores_read_and_of_the_union(&[first, second], texts, &["echo"]) {
+            assert_eq!(read, union);
+        }
+    }
+
+    /// The cover-query equivalence law over blocks of several parts whose
+    /// facts are spread over nodes: whole, one part per node with the
+    /// block's own facts in each, two overlapping runs of parts, or the
+    /// block's own facts with its first part and each other part's
+    /// `contains` fact and closure elsewhere; the pieces of different
+    /// blocks share nodes at random. Every node maps, so the law must hold
+    /// with nothing unread.
+    #[test]
+    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
+                holding some of a block's parts cannot tell; no combination of per-node images \
+                is exact"]
+    fn archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes() {
+        const WORDS: [&str; 4] = ["alpha", "bravo", "charlie", "echo"];
+        for seed in 0..24u64 {
+            let mut random = Stream(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) + 5);
+            let mut pieces = Vec::new();
+            let mut texts = Vec::new();
+            for _ in 0..1 + random.below(4) {
+                let words: Vec<String> = (0..1 + random.below(3))
+                    .map(|_| {
+                        (0..1 + random.below(2))
+                            .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect();
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                let (block, parts) = parts_block(&words);
+                texts.extend(source_and_attachments(block.clone()).1);
+                let all: Vec<&Fragment> = parts.iter().collect();
+                match random.below(4) {
+                    0 => pieces.push(block),
+                    1 => {
+                        for part in &all {
+                            pieces.push(block_piece(&block, &[*part], true));
+                        }
+                    }
+                    2 => {
+                        let cut = random.below(all.len() as u64) as usize;
+                        pieces.push(block_piece(&block, &all[..=cut], true));
+                        pieces.push(block_piece(&block, &all[cut..], true));
+                    }
+                    _ => {
+                        pieces.push(block_piece(&block, &all[..1], true));
+                        for part in &all[1..] {
+                            pieces.push(block_piece(&block, &[*part], false));
+                        }
+                    }
+                }
+            }
+            let width = 1 + random.below(pieces.len() as u64) as usize;
+            let mut nodes = vec![Fragment::empty(); width];
+            for piece in pieces {
+                let at = random.below(width as u64) as usize;
+                nodes[at] += piece;
+            }
+            nodes.retain(|node| !node.facts().is_empty());
+            for ((read, union), word) in scores_read_and_of_the_union(&nodes, texts, &WORDS)
+                .into_iter()
+                .zip(WORDS)
+            {
+                assert_eq!(read, union, "seed {seed}, query {word}");
+            }
+        }
     }
 }

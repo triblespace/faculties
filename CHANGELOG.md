@@ -34,8 +34,15 @@ All notable changes to this project will be documented in this file.
   attachment yet is still read. `FactLag` counts the foundations each
   collection of the pair does not reach. Stores are opened as the signing key,
   whose MAPs are the only ones believed. The Archive BM25 mapping implements
-  `MapMapping`, so a block whose closure spans commits is represented at the
-  merged node that holds both. Secrets attaches its pair the same way; its
+  `MapMapping`: a node holding a block that references a part it lacks is
+  refused and the block is represented at a merged node that holds both, but
+  a node holding only some of a block's parts is indexed from those parts
+  with nothing refused, so its law holds for covers whose nodes hold whole
+  source units. Faculties' own importer commits whole units, which
+  `every_import_commit_holds_whole_blocks` pins; that is a premise about
+  the input, not something the writer enforces. Three ignored tests are the
+  acceptance tests of the structural fix (a per-fact text index over the
+  content fact's payload, blocks ranked at query time). Secrets attaches its pair the same way; its
   `SecretsLag` counts unattached foundations and its support is the source's.
 
 - The exact collection API is gone from core, and with it every place a

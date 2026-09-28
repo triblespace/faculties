@@ -129,9 +129,11 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
         // known candidate is an idempotent replay and can be skipped. Once it
         // contributes even one new fact, retain its complete closure in this
         // COMMIT element—including facts already present in older elements.
-        // Set union makes that duplication semantically free, while exact
-        // homomorphisms (BM25 and future derivatives) can derive every leaf
-        // without depending on an implicit merge with historical commits.
+        // Set union makes that duplication semantically free, and a mapping
+        // that reads a whole block (the Archive block BM25) then finds it in
+        // one commit, without depending on an implicit merge with historical
+        // commits. The fragment is kept as given: nothing here checks that it
+        // holds whole blocks; the importers hand it whole ones.
         let (_, facts, metafacts, blobs) = fragment.into_parts();
         if facts.iter().all(|fact| {
             self.delta.facts().contains(fact) || fact_archive_contains(&self.current, fact)
@@ -2191,5 +2193,155 @@ mod tests {
                 block: block.id
             }]
         );
+    }
+
+    /// The Archive BM25 mapping answers like the union only for covers whose
+    /// nodes hold whole source units (see `archive_bm25`). This pins that
+    /// faculties' own importer commits whole units, which is that premise
+    /// for data we write; it says nothing of another writer's commits or of
+    /// historical input, and the writer itself checks nothing. Every commit
+    /// that holds a block's tag holds every part the collection says the
+    /// block contains, with each part's fields and its content fact's, and
+    /// every part a commit holds is contained by a block that commit tags.
+    /// The second transcript repeats the first's opening message and answers
+    /// with a reply that begins with the first reply's parts, so a writer
+    /// that committed only the facts the pile lacked would split those
+    /// blocks across the two commits, and this test would fail.
+    #[test]
+    fn every_import_commit_holds_whole_blocks() {
+        const FIRST: &str = r#"{"type":"user","sessionId":"whole-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T15:34:01.542Z","message":{"role":"user","content":"hello there"}}
+{"type":"assistant","sessionId":"whole-1","uuid":"a1","parentUuid":"u1","timestamp":"2026-03-01T15:34:02.000Z","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"thinking","thinking":"consider it","signature":"opaque"},{"type":"text","text":"hi!"},{"type":"tool_use","id":"toolu_1","name":"Screenshot","input":{"display":1}}]}}
+{"type":"user","sessionId":"whole-1","uuid":"u2","parentUuid":"a1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"screenshot below"},{"type":"image","source":{"type":"base64","media_type":"IMAGE/PNG; charset=binary","data":"iVBORw=="}}]}]}}"#;
+        const SECOND: &str = r#"{"type":"user","sessionId":"whole-2","uuid":"v1","parentUuid":null,"message":{"role":"user","content":"hello there"}}
+{"type":"assistant","sessionId":"whole-2","uuid":"b1","parentUuid":"v1","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"thinking","thinking":"consider it","signature":"opaque"},{"type":"text","text":"hi!"},{"type":"text","text":"and something more"}]}}"#;
+
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("archive.pile");
+        std::fs::File::create(&pile_path).unwrap();
+        let key = directory.path().join("archive.key");
+        let signer = initialize_archive_fixture(&pile_path, &key);
+        for (name, transcript) in [("first.jsonl", FIRST), ("second.jsonl", SECOND)] {
+            let mut writer =
+                pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+            let projection = crate::archive_claude_code::project_bytes(
+                name,
+                Bytes::from_source(transcript.as_bytes().to_vec()),
+                |projected| writer.stage_fragment(projected.fragment),
+            );
+            let (_, commit) = writer.finish(projection).unwrap();
+            assert!(commit.is_some(), "{name} commits");
+        }
+
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
+        let source = test_source(&mut pile, &pile_path, &key);
+        let snapshot = pile.snapshot().unwrap();
+        let commits: Vec<TribleSet> = discovered_records(&snapshot)
+            .unwrap()
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == source.handle())
+            .map(|commit| {
+                snapshot
+                    .get::<TribleSet, SimpleArchive>(Handle::<SimpleArchive>::from_hash(
+                        commit.data(),
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        drop(snapshot);
+        pile.close().unwrap();
+        assert_eq!(commits.len(), 2);
+        let mut union = TribleSet::new();
+        for facts in &commits {
+            union += facts.clone();
+        }
+
+        let tagged = |facts: &TribleSet, kind: Id| -> BTreeSet<Id> {
+            find!(
+                entity: Id,
+                pattern!(facts, [{ ?entity @ metadata::tag: &kind }])
+            )
+            .collect()
+        };
+        let parts_of = |block: Id| -> BTreeSet<Id> {
+            find!(
+                part: Id,
+                pattern!(&union, [{ block @ schema::block::contains: ?part }])
+            )
+            .collect()
+        };
+        // What the BM25 mapping reads of one block, as the whole collection
+        // states it: the block's tag and `contains` facts, each part's tag,
+        // ordinal and fact, and each content fact's tag, modality, direction
+        // and payload.
+        let read = [
+            metadata::tag.id(),
+            schema::block::contains.id(),
+            schema::content_part::ordinal.id(),
+            schema::content_part::fact.id(),
+            schema::content_fact::modality.id(),
+            schema::content_fact::direction.id(),
+            schema::content_fact::payload.id(),
+            schema::content_fact::blob.id(),
+            schema::content_fact::asset_pointer.id(),
+        ];
+        let unit = |block: Id| -> TribleSet {
+            let parts = parts_of(block);
+            let mut facts = BTreeSet::new();
+            for part in &parts {
+                let part = *part;
+                facts.extend(find!(
+                    fact: Id,
+                    pattern!(&union, [{ part @ schema::content_part::fact: ?fact }])
+                ));
+            }
+            let mut unit = TribleSet::new();
+            for trible in union.iter() {
+                let entity = trible.e();
+                if (*entity == block || parts.contains(entity) || facts.contains(entity))
+                    && read.contains(trible.a())
+                {
+                    unit.insert(trible);
+                }
+            }
+            unit
+        };
+
+        let mut multi_part_blocks = 0;
+        for (index, facts) in commits.iter().enumerate() {
+            for block in tagged(facts, schema::block::KIND) {
+                let missing = unit(block)
+                    .iter()
+                    .filter(|trible| !facts.contains(trible))
+                    .count();
+                assert_eq!(
+                    missing, 0,
+                    "commit {index} holds block {block:X} without all of its parts"
+                );
+                if parts_of(block).len() > 1 {
+                    multi_part_blocks += 1;
+                }
+            }
+            for part in tagged(facts, schema::content_part::KIND) {
+                let blocks: BTreeSet<Id> = find!(
+                    block: Id,
+                    pattern!(facts, [{
+                        ?block @
+                            metadata::tag: &schema::block::KIND,
+                            schema::block::contains: &part,
+                    }])
+                )
+                .collect();
+                assert!(
+                    !blocks.is_empty(),
+                    "commit {index} holds part {part:X} without a block it tags"
+                );
+            }
+        }
+        assert!(multi_part_blocks >= 3, "{multi_part_blocks}");
+        // The case a splitting writer gets wrong is present: the two commits
+        // share parts.
+        assert!(!tagged(&commits[0], schema::content_part::KIND)
+            .is_disjoint(&tagged(&commits[1], schema::content_part::KIND)));
     }
 }
