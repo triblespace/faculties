@@ -4,8 +4,9 @@ use crate::clock;
 use crate::collection_names::open_configured;
 use crate::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
 #[cfg(test)]
-use crate::storage::open_pile_strict;
+use crate::storage::open_pile_strict_as;
 use crate::storage::FactArchive;
+use crate::storage::FactRead;
 use crate::voice as voice_model;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -13,9 +14,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
-};
+use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 #[cfg(test)]
@@ -232,32 +231,27 @@ impl VoiceStorage<'_> {
             let result = (|| {
                 let collection =
                     open_configured(pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let maintained_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
+                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    collection,
                     maintained_succinct,
-                    (),
-                    policy,
                 )?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
                 pollster::block_on(async {
                     crate::storage::tolerate_own_lag(
-                        pile.maintain(maintained_succinct, signer).await,
+                        pile.maintain_attached(maintained_succinct, signer).await,
                     )?;
-                    crate::storage::tolerate_own_lag(pile.maintain(maintained_rank9, signer).await)
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain_attached(maintained_rank9, signer).await,
+                    )
                 })
                 .context("maintain Voice fact collection")?;
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze maintained Voice fact collection")?;
                 let facts = store_snapshot
-                    .collection(maintained_rank9)
-                    .context("observe maintained Voice fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(maintained_rank9)
                     .context("read maintained Voice fact collection")?;
                 operation(&mut VoiceSession {
                     pile,
@@ -323,6 +317,7 @@ fn store_route(session: &mut VoiceSession<'_>, channel: &str, devices: &[String]
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::FactView;
     use crate::voice::routing::*;
     use crate::voice::synthesis::{estimate_audio_secs, prebuffer_target_secs};
 
@@ -403,8 +398,8 @@ mod tests {
             })
             .unwrap();
 
-        let mut pile_storage = open_pile_strict(&pile).unwrap();
         let signer = crate::storage::load_signer(&pile, Some(&key)).unwrap();
+        let mut pile_storage = open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
         let collection = open_configured(
             &mut pile_storage,
             COLLECTION_SCOPE_ID,
@@ -433,17 +428,15 @@ mod tests {
                 .with_pile(|pile, signer| {
                     let source =
                         open_configured(pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
-                    let policy = source.policy(&pile.snapshot()?)?;
-                    let succinct =
-                        pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                     let rank9 =
-                        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                     let snapshot = pollster::block_on(async {
-                        drop(pile.maintain(succinct, signer).await?);
-                        pile.maintain(rank9, signer).await
+                        drop(pile.maintain_attached(succinct, signer).await?);
+                        pile.maintain_attached(rank9, signer).await
                     })?;
-                    let selected = snapshot.collection(rank9)?;
-                    Ok(selected.view::<FactArchive>()?)
+                    let selected = snapshot.attached(rank9)?;
+                    Ok(selected.facts()?)
                 })
                 .unwrap()
         }

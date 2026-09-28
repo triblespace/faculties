@@ -5,6 +5,7 @@
 //! complete event set. Relations is a separate native collection used only to
 //! resolve human selectors and render labels.
 
+use crate::storage::FactRead;
 use std::path::PathBuf;
 
 use crate::clock;
@@ -21,7 +22,7 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
@@ -203,32 +204,25 @@ impl StatusStorage<'_> {
 fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<StatusObservation> {
     // Register every descriptor before advancing the two fact chains.
     let status_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let descriptor_snapshot = pile.snapshot()?;
-    let policy = status_source.policy(&descriptor_snapshot)?;
-    drop(descriptor_snapshot);
-    let status_succinct = pile.derive::<SuccinctArchiveBlob>(status_source, (), policy.clone())?;
+    let status_succinct = pile.attach::<SuccinctArchiveBlob>(status_source, ())?;
     let status_rank9 =
-        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(status_succinct, (), policy)?;
+        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(status_source, status_succinct)?;
     let relations_source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-    let descriptor_snapshot = pile.snapshot()?;
-    let policy = relations_source.policy(&descriptor_snapshot)?;
-    drop(descriptor_snapshot);
-    let relations_succinct =
-        pile.derive::<SuccinctArchiveBlob>(relations_source, (), policy.clone())?;
+    let relations_succinct = pile.attach::<SuccinctArchiveBlob>(relations_source, ())?;
     let relations_rank9 =
-        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
+        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(relations_source, relations_succinct)?;
 
     // Derive this key's own commits into each view. The roots are not
     // acquired: a view is read as it stands, other windows' statuses reach it
     // through their own derivations, and what nobody has derived yet is lag.
     pollster::block_on(async {
-        crate::storage::tolerate_own_lag(pile.maintain(status_succinct, signer).await)
+        crate::storage::tolerate_own_lag(pile.maintain_attached(status_succinct, signer).await)
             .context("maintain Status fact collection")?;
-        crate::storage::tolerate_own_lag(pile.maintain(status_rank9, signer).await)
+        crate::storage::tolerate_own_lag(pile.maintain_attached(status_rank9, signer).await)
             .context("maintain Status fact collection")?;
-        crate::storage::tolerate_own_lag(pile.maintain(relations_succinct, signer).await)
+        crate::storage::tolerate_own_lag(pile.maintain_attached(relations_succinct, signer).await)
             .context("maintain Relations fact collection")?;
-        crate::storage::tolerate_own_lag(pile.maintain(relations_rank9, signer).await)
+        crate::storage::tolerate_own_lag(pile.maintain_attached(relations_rank9, signer).await)
             .context("maintain Relations fact collection")?;
         Ok::<_, anyhow::Error>(())
     })?;
@@ -237,14 +231,10 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
         .snapshot()
         .context("freeze maintained Status/Relations snapshot")?;
     let status = snapshot
-        .collection(status_rank9)
-        .context("observe Status Rank9 collection")?
-        .view::<FactArchive>()
+        .read_facts(status_rank9)
         .context("read Status Rank9 collection")?;
     let relations = snapshot
-        .collection(relations_rank9)
-        .context("observe Relations Rank9 collection")?
-        .view::<FactArchive>()
+        .read_facts(relations_rank9)
         .context("read Relations Rank9 collection")?;
     Ok(StatusObservation {
         status,
@@ -258,24 +248,21 @@ fn maintain_and_observe_relations(
     signer: &SigningKey,
 ) -> Result<RelationsObservation> {
     let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-    let descriptor_snapshot = pile.snapshot()?;
-    let policy = source.policy(&descriptor_snapshot)?;
-    drop(descriptor_snapshot);
-    let collection_succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+    let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
     let collection_rank9 =
-        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)?;
+        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
     pollster::block_on(async {
-        crate::storage::tolerate_own_lag(pile.maintain(collection_succinct, signer).await)?;
-        crate::storage::tolerate_own_lag(pile.maintain(collection_rank9, signer).await)
+        crate::storage::tolerate_own_lag(
+            pile.maintain_attached(collection_succinct, signer).await,
+        )?;
+        crate::storage::tolerate_own_lag(pile.maintain_attached(collection_rank9, signer).await)
     })
     .context("maintain Relations fact collection")?;
     let snapshot = pile
         .snapshot()
         .context("freeze maintained Relations snapshot")?;
     let relations = snapshot
-        .collection(collection_rank9)
-        .context("observe Relations Rank9 collection")?
-        .view::<FactArchive>()
+        .read_facts(collection_rank9)
         .context("read Relations Rank9 collection")?;
     Ok(RelationsObservation {
         relations,
@@ -455,15 +442,13 @@ mod tests {
         storage(&fixture)
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let prepared = pollster::block_on(async {
-                    drop(pile.maintain(succinct, signer).await?);
-                    pile.maintain(rank9, signer).await
+                    drop(pile.maintain_attached(succinct, signer).await?);
+                    pile.maintain_attached(rank9, signer).await
                 })?;
-                let facts = prepared.collection(rank9)?.view::<FactArchive>()?;
+                let facts = prepared.read_facts(rank9)?;
                 let rows = status::load_status_rows(&facts)?;
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].event, receipt.event);

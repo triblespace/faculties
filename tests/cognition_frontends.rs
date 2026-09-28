@@ -131,7 +131,8 @@ fn check_validates_known_selected_attachments_and_emits_no_false_success() {
     let missing = omitted.put("not included in the published fragment".to_owned());
     let fragment = entity! { faculties::schemas::reason::reason_schema::text: missing };
     let signer = faculties::storage::load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-    let mut pile = faculties::storage::open_pile_strict(&fixture.pile).unwrap();
+    let mut pile =
+        faculties::storage::open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
     let collection = faculties::collection_names::open_configured(
         &mut pile,
         faculties::schemas::cognition::DEFAULT_SCOPE_ID,

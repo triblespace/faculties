@@ -7,6 +7,7 @@ use crate::collection_names::open_configured;
 use crate::files::presentation::{present, ViewOptions};
 use crate::out::Part;
 use crate::schemas::body::{capture, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
+use crate::storage::FactRead;
 use crate::storage::{FactArchive, Storage};
 use anybytes::Bytes;
 use anyhow::{bail, Context, Result};
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
@@ -332,7 +333,7 @@ impl BodyStorage<'_> {
                 .context("publish native Body collection fragment")?;
             pollster::block_on(async {
                 let intents = super::intent_register_collection(pile, signer.verifying_key())?;
-                crate::storage::seed_derived(pile, intents, collection.handle(), signer).await?;
+                crate::storage::seed_attached(pile, intents, signer).await?;
                 crate::storage::ensure_downstream(pile, collection, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
@@ -351,23 +352,14 @@ impl BodyStorage<'_> {
     fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>) -> Result<T> {
         self.with_pile(|pile, signer| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = source.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let collection_succinct =
-                pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let collection_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                collection_succinct,
-                (),
-                policy,
-            )?;
+            let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let collection_rank9 =
+                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze resident Body fact collection")?;
             let facts = store_snapshot
-                .collection(collection_rank9)
-                .context("observe maintained Body fact collection")?
-                .view::<FactArchive>()
+                .read_facts(collection_rank9)
                 .context("read maintained Body fact collection")?;
             f(&facts, &store_snapshot)
         })
@@ -388,7 +380,7 @@ mod tests;
 #[cfg(test)]
 mod projection_tests {
     use super::*;
-    use crate::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, load_signer, open_pile_strict_as};
     use triblespace::core::collection::lww_register::LwwIndex;
 
     #[test]
@@ -410,30 +402,23 @@ mod projection_tests {
         let intent_id = intent.id;
         let capture_id = capture.id;
         let signer = load_signer(&path, Some(&key)).unwrap();
-        let mut pile = open_pile_strict(&path).unwrap();
+        let mut pile = open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let intents =
             crate::body::intent_register_collection(&mut pile, signer.verifying_key()).unwrap();
         // Maintenance is the reader's job: prepare facts and the intent
         // register, then observe what publication committed.
         let snapshot = pollster::block_on(async {
-            drop(pile.maintain(succinct, &signer).await?);
-            drop(pile.maintain(rank9, &signer).await?);
-            pile.maintain(intents, &signer).await
+            drop(pile.maintain_attached(succinct, &signer).await?);
+            drop(pile.maintain_attached(rank9, &signer).await?);
+            pile.maintain_attached(intents, &signer).await
         })
         .unwrap();
-        let facts = snapshot
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let facts = snapshot.read_facts(rank9).unwrap();
         assert!(exists!(
             pattern!(&facts, [{ intent_id @ metadata::tag: &KIND_INTENT }])
         ));
@@ -441,7 +426,7 @@ mod projection_tests {
             pattern!(&facts, [{ capture_id @ metadata::tag: &KIND_CAPTURE }])
         ));
         let winners = snapshot
-            .collection(intents)
+            .attached(intents)
             .unwrap()
             .view::<LwwIndex>()
             .unwrap()

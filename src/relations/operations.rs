@@ -7,6 +7,7 @@
 //! reconciliation is another monotonic child, never deletion, a mutable head,
 //! or clock-based arbitration.
 
+use crate::storage::FactView;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -1039,12 +1040,9 @@ fn with_relations_view<T>(
     read_only: bool,
     execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
 ) -> Result<T> {
-    let descriptor_snapshot = pile.snapshot()?;
-    let policy = collection.policy(&descriptor_snapshot)?;
-    drop(descriptor_snapshot);
-    let facts_succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+    let facts_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
     let facts_rank9 =
-        pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)?;
+        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, facts_succinct)?;
     // Mutation preparation first derives this key's own commits into the
     // views, so an update reads what this key already wrote. It prepares on
     // the resident views as they then stand: another writer's pending update
@@ -1054,8 +1052,10 @@ fn with_relations_view<T>(
     if !read_only {
         runtime
             .block_on(async {
-                crate::storage::tolerate_own_lag(pile.maintain(facts_succinct, signer).await)?;
-                crate::storage::tolerate_own_lag(pile.maintain(facts_rank9, signer).await)
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(facts_succinct, signer).await,
+                )?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(facts_rank9, signer).await)
             })
             .context("maintain Relations fact collection")?;
     }
@@ -1063,10 +1063,10 @@ fn with_relations_view<T>(
         .snapshot()
         .context("freeze resident Relations fact collection")?;
     let observed = reader
-        .collection(facts_rank9)
+        .attached(facts_rank9)
         .context("observe Relations Rank9 projection")?;
     let view = observed
-        .view::<FactArchive>()
+        .facts()
         .context("read Relations Rank9 projection")?;
     // Only exact payload gets may acquire here. Facts, records, proofs,
     // and their interpretation instant remain those of this observation.
@@ -1086,7 +1086,10 @@ fn with_relations_view<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{initialize_signer, load_signer, open_pile_strict, open_store, runtime};
+    use crate::storage::FactRead;
+    use crate::storage::{
+        initialize_signer, load_signer, open_pile_strict_as, open_store_as, runtime,
+    };
     use std::fs;
     use triblespace::core::blob::encodings::UnknownBlob;
     use triblespace::core::blob::Bytes;
@@ -1116,11 +1119,10 @@ mod tests {
         let (succinct, rank9) = storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 Ok((
                     succinct,
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?,
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?,
                 ))
             })
             .unwrap();
@@ -1128,10 +1130,10 @@ mod tests {
             storage
                 .with_pile(|pile, signer| {
                     let snapshot = pollster::block_on(async {
-                        drop(pile.maintain(succinct, signer).await?);
-                        pile.maintain(rank9, signer).await
+                        drop(pile.maintain_attached(succinct, signer).await?);
+                        pile.maintain_attached(rank9, signer).await
                     })?;
-                    Ok(snapshot.collection(rank9)?.view::<FactArchive>()?)
+                    Ok(snapshot.read_facts(rank9)?)
                 })
                 .unwrap()
         };
@@ -1213,21 +1215,18 @@ mod tests {
     }
 
     #[test]
-    fn non_writer_reads_and_prepares_on_resident_relations_while_pending_updates_lag() {
+    fn non_writer_reads_and_prepares_pending_updates_from_their_bytes_without_publishing() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = open_store(file.path()).unwrap();
         let runtime = Arc::new(runtime().unwrap());
         let owner = SigningKey::from_bytes(&[91; 32]);
         let reader = SigningKey::from_bytes(&[92; 32]);
+        let mut pile = open_store_as(file.path(), owner.verifying_key()).unwrap();
         let source =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
                 .unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let selectors = BTreeSet::from([
             CollectionRecordSelector::Collection(source.handle()),
@@ -1269,15 +1268,17 @@ mod tests {
                 .0,
         )
         .unwrap();
+        // The second person is not attached yet: a reader reads its commit
+        // from the bytes, and attaches nothing.
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
         with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
             assert_eq!(
                 relations::person_anchors(storage.facts),
-                BTreeSet::from([first])
+                BTreeSet::from([first, second])
             );
             let list = list_people(storage, 20, false, false)?;
             assert!(list.contains("Ada"));
-            assert!(!list.contains("Grace"));
+            assert!(list.contains("Grace"));
             Ok(())
         })
         .unwrap();
@@ -1286,15 +1287,14 @@ mod tests {
             before
         );
 
-        // Preparation derives only what the preparer wrote. A non-writer owns
-        // nothing here, so it publishes nothing and prepares on the resident
-        // view, where the owner's pending person is simply not seen yet.
-        // Preparation does not report that; the views' freshness counts it
-        // for whoever asks, as this test does below.
+        // Preparation attaches only what the preparer wrote. A non-writer
+        // owns nothing here, so it publishes nothing, and prepares on the same
+        // read. The attachments' lag counts the unattached commit for whoever
+        // asks, as this test does below.
         let mut mutation_prepared = false;
         with_relations_view(&mut pile, &reader, &runtime, source, false, |storage| {
             mutation_prepared = true;
-            assert!(!list_people(storage, 20, false, false)?.contains("Grace"));
+            assert!(list_people(storage, 20, false, false)?.contains("Grace"));
             Ok(())
         })
         .unwrap();
@@ -1307,7 +1307,8 @@ mod tests {
             .unwrap();
         assert_eq!(lag.succinct, 1);
 
-        // Once the worker has carried the second person, every reader sees it.
+        // Once the worker has carried the second person, the read is the
+        // same, now from the attachment.
         crate::storage::carry_facts(&mut pile, source, &owner);
         with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
             assert_eq!(
@@ -1328,17 +1329,12 @@ mod tests {
         fs::File::create(&pile).unwrap();
         initialize_signer(&pile, Some(&key)).unwrap();
         let signer = load_signer(&pile, Some(&key)).unwrap();
-        let mut store = open_pile_strict(&pile).unwrap();
+        let mut store = open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
         let collection =
             open_configured(&mut store, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let descriptor_snapshot = store.snapshot().unwrap();
-        let policy = collection.policy(&descriptor_snapshot).unwrap();
-        drop(descriptor_snapshot);
-        let facts_succinct = store
-            .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
-            .unwrap();
+        let facts_succinct = store.attach::<SuccinctArchiveBlob>(collection, ()).unwrap();
         let facts_rank9 = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(facts_succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, facts_succinct)
             .unwrap();
 
         let person = genid().id;
@@ -1352,12 +1348,12 @@ mod tests {
 
         let reader = pollster::block_on(async {
             drop(store.ensure(collection, &signer).await?);
-            drop(store.maintain(facts_succinct, &signer).await?);
-            store.maintain(facts_rank9, &signer).await
+            drop(store.maintain_attached(facts_succinct, &signer).await?);
+            store.maintain_attached(facts_rank9, &signer).await
         })
         .unwrap();
-        let observed = reader.collection(facts_rank9).unwrap();
-        let view = observed.view::<FactArchive>().unwrap();
+        let observed = reader.attached(facts_rank9).unwrap();
+        let view = observed.facts().unwrap();
         match relations::profile_head(&view, person).unwrap() {
             Head::Forked(heads) => assert_eq!(heads.len(), 2),
             other => panic!("expected visible fork, got {other:?}"),
@@ -1376,16 +1372,13 @@ mod tests {
         fs::File::create(&path).unwrap();
         let signer = initialize_signer(&path, Some(&key)).unwrap();
         let runtime = Arc::new(runtime().unwrap());
-        let mut pile = open_store(&path).unwrap();
+        let mut pile = open_store_as(&path, signer.verifying_key()).unwrap();
         let collection =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let policy = collection.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(collection, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, succinct)
             .unwrap();
 
         let person = genid().id;
@@ -1400,13 +1393,13 @@ mod tests {
         let frozen = runtime
             .block_on(async {
                 drop(pile.ensure(collection, &signer).await?);
-                drop(pile.maintain(succinct, &signer).await?);
-                pile.maintain(rank9, &signer).await
+                drop(pile.maintain_attached(succinct, &signer).await?);
+                pile.maintain_attached(rank9, &signer).await
             })
             .unwrap();
         assert!(!frozen.contains_blob(label).unwrap());
-        let observed = frozen.collection(rank9).unwrap();
-        let view = observed.view::<FactArchive>().unwrap();
+        let observed = frozen.attached(rank9).unwrap();
+        let view = observed.facts().unwrap();
         let reader = Blocking::with_runtime(frozen.clone(), Arc::clone(&runtime));
 
         // Model bytes arriving in shared backing after the semantic snapshot.

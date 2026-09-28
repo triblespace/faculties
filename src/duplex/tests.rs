@@ -194,32 +194,28 @@ fn recorded_utterance_is_observed_by_a_preparing_voice_read() {
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
     use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
-    use triblespace::core::repo::SnapshotSource;
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("voice.pile");
     std::fs::File::create(&path).unwrap();
     let signer = crate::storage::initialize_signer(&path, None).unwrap();
     record_utterance(&path, None, "generated transcript").unwrap();
-    let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+    let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
     let source = crate::collection_names::open_configured(
         &mut pile,
         crate::schemas::voice::COLLECTION_SCOPE_ID,
         signer.verifying_key(),
     )
     .unwrap();
-    let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-    let succinct = pile
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-        .unwrap();
+    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
     let rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
         .unwrap();
     let view = pollster::block_on(async {
-        drop(pile.maintain(succinct, &signer).await.unwrap());
-        pile.maintain(rank9, &signer).await
+        drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+        pile.maintain_attached(rank9, &signer).await
     })
     .unwrap()
-    .collection(rank9)
+    .attached(rank9)
     .unwrap()
     .view::<crate::storage::FactArchive>()
     .unwrap();

@@ -44,11 +44,9 @@ impl HealthSources {
         let health = open(schema::DEFAULT_SCOPE_ID, "Swarm health")?;
         let relations = open(RELATIONS_SCOPE_ID, "Relations")?;
         let presentations = ReceiptSource::register(&mut *local, signer)?;
-        let policy = health.source.policy(&local.snapshot()?)?;
-        let latest = local.derive::<LwwRegisterBlob>(
+        let latest = local.attach::<LwwRegisterBlob>(
             health.source,
             (attrs::node.id(), metadata::created_at.id()),
-            policy,
         )?;
         drop(local);
         Ok(Self {
@@ -76,30 +74,23 @@ impl HealthSources {
         // mapping futures to completion without yielding a Peer store guard
         // across network I/O or re-entering a Peer operation.
         pollster::block_on(async {
-            let snapshot = local.snapshot()?;
             for source in [&self.health, &self.relations] {
-                if !source.can_maintain(&snapshot, signer)? {
-                    continue;
-                }
-                // An own report neither hop could derive is lag; the
-                // report reads what is present.
-                crate::storage::tolerate_own_lag(local.maintain(source.succinct, signer).await)?;
-                crate::storage::tolerate_own_lag(local.maintain(source.rank9, signer).await)?;
+                // A report left unattached is read from its own bytes.
+                crate::storage::tolerate_own_lag(
+                    local.maintain_attached(source.succinct, signer).await,
+                )?;
+                crate::storage::tolerate_own_lag(
+                    local.maintain_attached(source.rank9, signer).await,
+                )?;
             }
-            if self
-                .latest
-                .writer_is_admitted(&snapshot, signer.verifying_key())?
-            {
-                crate::storage::tolerate_own_lag(local.maintain(self.latest, signer).await)?;
-            }
+            crate::storage::tolerate_own_lag(local.maintain_attached(self.latest, signer).await)?;
             // As on the ordinary Orient path, receipt freshness avoids a
             // repeat but is not a precondition of reporting resident health.
             // Only this optional projection is best effort; health, Relations
             // and latest-target failures above still propagate unchanged. It
             // is the ordinary path's own upkeep on the resident-only store,
-            // so an own historical receipt neither hop can derive is lag
-            // here too, and the new receipts reach Rank9 all the same.
-            drop(snapshot);
+            // so a receipt left unattached is read from its own bytes here
+            // too.
             let receipt_result = self.presentations.maintain(&mut *local, signer).await;
             Ok(receipt_result.err().map(|error| {
                 format!(
@@ -259,7 +250,7 @@ impl HealthSources {
     fn at(&self, snapshot: FacultySnapshot, now: Epoch) -> Result<HealthObservation> {
         let facts = self.health.observe(&snapshot)?;
         let latest_collection = trace_refresh_call("Swarm health latest", "attach", || {
-            snapshot.collection(self.latest)
+            snapshot.attached(self.latest)
         })?;
         let latest_index = trace_refresh_call("Swarm health latest", "view", || {
             latest_collection.view::<LwwIndex>()
@@ -304,7 +295,7 @@ pub(super) struct HealthObservation {
     evaluated_at: Epoch,
     facts: OrientFact,
     latest: LwwQuery,
-    latest_collection: CollectionSnapshot<FacultySnapshot, LwwRegisterBlob>,
+    latest_collection: AttachedSnapshot<FacultySnapshot, LwwRegisterBlob>,
     relations: OrientFact,
     presentations: ReceiptObservation,
     max_age: Duration,
@@ -818,7 +809,7 @@ mod tests {
             std::fs::File::create(&path).unwrap();
             // Test-only author, never a live transport or pile identity.
             let signer = SigningKey::from_bytes(&[71; 32]);
-            let mut store = open_store(&path).unwrap();
+            let mut store = open_store_as(&path, signer.verifying_key()).unwrap();
             let sources =
                 HealthSources::open(&mut store, &signer, Duration::from_secs(60)).unwrap();
             Self {
@@ -903,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn health_reader_keeps_resident_input_when_source_grows_without_images() {
+    fn health_reader_reads_input_nothing_has_attached_yet() {
         let mut f = Fixture::new();
         let mut recorder = Recorder::new(f.signer.verifying_key());
         let first = recorder
@@ -915,6 +906,7 @@ mod tests {
         let second = recorder
             .record(at(2.0), [condition(State::Stalled, true)])
             .unwrap();
+        let second_id = second.root().unwrap();
         f.publish(second);
 
         let reader_key = SigningKey::from_bytes(&[73; 32]);
@@ -926,14 +918,14 @@ mod tests {
         };
         let before = f.store.snapshot().unwrap();
         let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
-        assert!(!f.sources.health.can_maintain(&before, &reader_key).unwrap());
         let observed = f.sources.observe(&mut f.store, &reader_key).unwrap();
         let reports = find!(
             report: Id,
             pattern!(observed.facts.view(), [{ ?report @ metadata::tag: &schema::KIND_REPORT }])
         )
         .collect::<BTreeSet<_>>();
-        assert_eq!(reports, BTreeSet::from([first_id]));
+        // The report nothing has attached yet is read from its own bytes.
+        assert_eq!(reports, BTreeSet::from([first_id, second_id]));
         assert_eq!(
             f.store
                 .snapshot()
@@ -960,12 +952,6 @@ mod tests {
         f.publish(first);
 
         let before = f.store.snapshot().unwrap();
-        assert!(f.sources.health.can_maintain(&before, &f.signer).unwrap());
-        assert!(f
-            .sources
-            .latest
-            .writer_is_admitted(&before, f.signer.verifying_key())
-            .unwrap());
         let ready = f.sources.observe(&mut f.store, &f.signer).unwrap();
         assert!(exists!(pattern!(ready.facts.view(), [
             { first_id @ metadata::tag: &schema::KIND_REPORT }
@@ -1047,13 +1033,15 @@ mod tests {
             .unwrap()
             .cover()
             .clone();
+        // The unattached receipt is read from its own bytes, so the events
+        // are presented before any upkeep attaches it.
         let lagging = f.sources.at(before, clock::now().unwrap()).unwrap();
         assert!(events
             .iter()
-            .all(|event| !lagging.presentations.contains(*event)));
+            .all(|event| lagging.presentations.contains(*event)));
         assert!(matches!(
             lagging.news(persona, &lagging.report()),
-            News::Report { .. }
+            News::Quiet
         ));
         let ready = f.sources.observe(&mut f.store, &reader_key).unwrap();
         assert!(events
@@ -1117,7 +1105,7 @@ mod tests {
             // The malformed member is in the SOURCE, so the hop that reads the
             // source is where it surfaces. Maintaining the Rank9 tip alone
             // would derive from the Succinct intermediate and never look.
-            pollster::block_on(local.maintain(f.sources.presentations.succinct, &f.signer))
+            pollster::block_on(local.maintain_attached(f.sources.presentations.succinct, &f.signer))
                 .err()
                 .expect("resident malformed admitted receipt must actually fail upkeep")
         };
@@ -1451,9 +1439,11 @@ mod tests {
         writer
             .commit(f.sources.health.source, &f.signer, second)
             .unwrap();
+        // The raced report is read from its own bytes before any upkeep
+        // attaches it, so the refreshed view already has it.
         let raced = f.store.snapshot().unwrap();
         f.sources.refresh_poll_view(raced, at(3.0)).unwrap();
-        assert!(!exists!(
+        assert!(exists!(
             pattern!(f.sources.poll_view.as_ref().unwrap().1.facts.view(), [
                 { second_id @ metadata::tag: &schema::KIND_REPORT }
             ])
@@ -1629,23 +1619,25 @@ mod tests {
         );
         {
             let mut local = f.store.store();
-            drop(pollster::block_on(local.maintain(f.sources.latest, &f.signer)).unwrap());
+            drop(pollster::block_on(local.maintain_attached(f.sources.latest, &f.signer)).unwrap());
         }
         let sampled = f.store.snapshot().unwrap();
         let prior = &f.sources.poll_view.as_ref().unwrap().1;
-        assert!(prior.facts.is_current(&sampled));
+        // The new report is a new node of the parent both reads stand on.
+        assert!(!prior.facts.is_current(&sampled));
         assert!(!prior.latest_collection.is_current(&sampled));
         f.sources
             .refresh_poll_view(sampled.clone(), at(3.0))
             .unwrap();
         assert_eq!(f.sources.poll_observations, 2);
+        // Nothing attached the new report to the facts; they read it from its
+        // bytes, so the recovery it records is what the refreshed view shows.
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert_eq!(observed.facts.collection.cover(), &original_facts);
-        assert!(observed.report().attention.is_empty());
-        assert!(observed
-            .report()
-            .text
-            .contains("not observed / not configured"));
+        let report = observed.report();
+        assert!(!report.attention.is_empty());
+        assert!(report.text.contains("fresh"));
+        assert!(!report.text.contains("not observed / not configured"));
         assert!(f
             .store
             .snapshot()
@@ -1655,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn health_poll_refreshes_private_membership_only_when_its_target_advances() {
+    fn health_poll_refreshes_private_membership_only_when_its_receipts_move() {
         let mut f = Fixture::new();
         let persona = *fucid();
         let mut recorder = Recorder::new(f.signer.verifying_key());
@@ -1689,45 +1681,19 @@ mod tests {
                 },
             )
             .unwrap();
-        let lagging = f.store.snapshot().unwrap();
-        assert!(f.sources.poll_view.as_ref().unwrap().1.is_current(&lagging));
-        f.sources
-            .refresh_poll_view(lagging.clone(), at(2.0))
-            .unwrap();
-        assert_eq!(f.sources.poll_observations, 1);
-        let observed = &f.sources.poll_view.as_ref().unwrap().1;
-        assert!(matches!(
-            observed.news(persona, &observed.report()),
-            News::Report { .. }
-        ));
-        assert!(f
-            .store
-            .snapshot()
+        // The receipt is read from its own bytes before any upkeep attaches
+        // it: the poll view is no longer current, and the refreshed one
+        // presents the events at once.
+        let committed = f.store.snapshot().unwrap();
+        assert!(!f
+            .sources
+            .poll_view
+            .as_ref()
             .unwrap()
-            .changes_since(&lagging)
-            .is_empty());
-
-        {
-            let mut local = f.store.store();
-            // Both hops, as the live upkeep does: maintaining only the Rank9
-            // tip derives it from a Succinct that has not caught up, so the
-            // projection does not advance and nothing is refreshed.
-            drop(
-                pollster::block_on(local.maintain(f.sources.presentations.succinct, &f.signer))
-                    .unwrap(),
-            );
-            drop(
-                pollster::block_on(local.maintain(f.sources.presentations.rank9, &f.signer))
-                    .unwrap(),
-            );
-        }
-        let caught_up = f.store.snapshot().unwrap();
-        let prior = &f.sources.poll_view.as_ref().unwrap().1;
-        assert!(prior.facts.is_current(&caught_up));
-        assert!(prior.latest_collection.is_current(&caught_up));
-        assert!(!prior.presentations.is_current(&caught_up));
+            .1
+            .is_current(&committed));
         f.sources
-            .refresh_poll_view(caught_up.clone(), at(3.0))
+            .refresh_poll_view(committed.clone(), at(2.0))
             .unwrap();
         assert_eq!(f.sources.poll_observations, 2);
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
@@ -1742,8 +1708,42 @@ mod tests {
             .store
             .snapshot()
             .unwrap()
-            .changes_since(&caught_up)
+            .changes_since(&committed)
             .is_empty());
+
+        // Attaching the receipt moves the receipt read and nothing else.
+        {
+            let mut local = f.store.store();
+            drop(
+                pollster::block_on(
+                    local.maintain_attached(f.sources.presentations.succinct, &f.signer),
+                )
+                .unwrap(),
+            );
+            drop(
+                pollster::block_on(
+                    local.maintain_attached(f.sources.presentations.rank9, &f.signer),
+                )
+                .unwrap(),
+            );
+        }
+        let attached = f.store.snapshot().unwrap();
+        let prior = &f.sources.poll_view.as_ref().unwrap().1;
+        assert!(prior.facts.is_current(&attached));
+        assert!(prior.latest_collection.is_current(&attached));
+        assert!(!prior.presentations.is_current(&attached));
+        f.sources
+            .refresh_poll_view(attached.clone(), at(3.0))
+            .unwrap();
+        assert_eq!(f.sources.poll_observations, 3);
+        let observed = &f.sources.poll_view.as_ref().unwrap().1;
+        assert!(events
+            .iter()
+            .all(|event| observed.presentations.contains(*event)));
+        assert!(matches!(
+            observed.news(persona, &observed.report()),
+            News::Quiet
+        ));
     }
 
     #[test]
@@ -2059,13 +2059,13 @@ mod tests {
             pollster::block_on(async {
                 drop(
                     local
-                        .maintain(f.sources.health.succinct, &f.signer)
+                        .maintain_attached(f.sources.health.succinct, &f.signer)
                         .await
                         .unwrap(),
                 );
                 drop(
                     local
-                        .maintain(f.sources.health.rank9, &f.signer)
+                        .maintain_attached(f.sources.health.rank9, &f.signer)
                         .await
                         .unwrap(),
                 );
@@ -2073,24 +2073,10 @@ mod tests {
         }
         let snapshot = f.store.snapshot().unwrap();
         let lagging = f.sources.at(snapshot.clone(), at(11.0)).unwrap();
-        // The facts derived the new report; the winners register lags the
+        // The facts attached the new report; the winners register lags the
         // source by it and is read as it stands.
-        let health = snapshot.collection(f.sources.health.source).unwrap();
-        assert!(lagging
-            .facts
-            .collection
-            .missing_from(&snapshot.collection(f.sources.health.succinct).unwrap())
-            .unwrap()
-            .is_empty());
-        assert_eq!(
-            lagging
-                .latest_collection
-                .missing_from(&health)
-                .unwrap()
-                .len(),
-            1
-        );
-        drop(health);
+        assert!(lagging.facts.collection.residual().is_empty());
+        assert_eq!(lagging.latest_collection.residual().len(), 1);
         assert_eq!(lagging.report().attention, first.attention);
         assert!(f
             .observe_at(at(11.0))

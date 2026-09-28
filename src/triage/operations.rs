@@ -1,6 +1,7 @@
 //! Finite Triage inspections over one maintained immutable multi-collection view.
 //! Domain observations are shared with the existing Triage model and widgets.
 use crate::out::Out;
+use crate::storage::FactView;
 
 #[derive(Clone, Debug)]
 pub struct Triage {
@@ -101,7 +102,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
@@ -147,14 +148,11 @@ impl TriageSnapshot {
             let source =
                 crate::collection_names::open_configured(pile, scope, signer.verifying_key())
                     .with_context(|| format!("register {label} collection"))?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = source.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
             let succinct_collection = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .attach::<SuccinctArchiveBlob>(source, ())
                 .with_context(|| format!("register succinct {label} collection"))?;
             let rank9_collection = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct_collection, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct_collection)
                 .with_context(|| format!("register Rank9 {label} collection"))?;
             registered.push((scope, label));
             succinct.push(succinct_collection);
@@ -162,14 +160,18 @@ impl TriageSnapshot {
         }
 
         let secrets_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
-        // Derive this key's own commits into each view. The roots are not
-        // acquired: a view is read as it stands, and what it lacks is lag.
+        // Carry each root and attach its frontier; a commit left unattached
+        // is read from its own bytes.
         let secrets = pollster::block_on(async {
             for (index, (_, label)) in registered.iter().enumerate() {
-                crate::storage::tolerate_own_lag(pile.maintain(succinct[index], signer).await)
-                    .with_context(|| format!("maintain {label} succinct fact archive"))?;
-                crate::storage::tolerate_own_lag(pile.maintain(rank9[index], signer).await)
-                    .with_context(|| format!("maintain {label} fact archive"))?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(succinct[index], signer).await,
+                )
+                .with_context(|| format!("maintain {label} succinct fact archive"))?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(rank9[index], signer).await,
+                )
+                .with_context(|| format!("maintain {label} fact archive"))?;
             }
             let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                 .await
@@ -184,9 +186,9 @@ impl TriageSnapshot {
         let mut collections = BTreeMap::new();
         for ((scope, label), collection) in registered.iter().zip(&rank9) {
             let archive = store_snapshot
-                .collection(*collection)
+                .attached(*collection)
                 .with_context(|| format!("attach maintained {label} collection"))?
-                .view::<FactArchive>()
+                .facts()
                 .with_context(|| format!("read maintained {label} collection"))?;
             collections.insert(*scope, archive);
         }

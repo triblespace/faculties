@@ -1,5 +1,6 @@
 //! `mail` — collection-native RFC 5322 evidence, intent, and receipt faculty.
 
+use crate::storage::FactRead;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 #[cfg(test)]
@@ -18,7 +19,7 @@ use crate::schemas::{
 };
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
-use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
 use crate::storage::{open_secrets_collection, open_secrets_collection_read, FactArchive};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -29,11 +30,10 @@ use lettre::{SmtpTransport, Transport};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -313,39 +313,27 @@ impl Storage {
                     open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
                 let secrets_collection =
                     open_secrets_collection_read(pile, self.signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = mail_collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
                 let mail_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(mail_collection, (), policy.clone())?;
+                    pile.attach::<SuccinctArchiveBlob>(mail_collection, ())?;
                 let mail_rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(mail_succinct, (), policy)?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = files_collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(mail_collection, mail_succinct)?;
                 let files_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(files_collection, (), policy.clone())?;
+                    pile.attach::<SuccinctArchiveBlob>(files_collection, ())?;
                 let files_rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(files_succinct, (), policy)?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = decide_collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(files_collection, files_succinct)?;
                 let decide_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(decide_collection, (), policy.clone())?;
+                    pile.attach::<SuccinctArchiveBlob>(decide_collection, ())?;
                 let decide_rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(decide_succinct, (), policy)?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = relations_collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(decide_collection, decide_succinct)?;
                 let relations_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(relations_collection, (), policy.clone())?;
+                    pile.attach::<SuccinctArchiveBlob>(relations_collection, ())?;
                 let relations_rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(relations_succinct, (), policy)?;
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(relations_collection, relations_succinct)?;
                 // Attach the views as they stand through the same final
                 // target snapshot as the configured Secrets view. A read
-                // never maintains and never waits for a source commit nobody
-                // has derived yet; a write ensures its own leaves after its
-                // commit.
+                // never maintains and never waits for a source commit nothing
+                // has attached yet, which it reads from its own bytes; a write
+                // attaches the source's frontier after its commit.
                 let secrets = pollster::block_on(async {
                     let secrets = secret_storage::ensure_and_snapshot(
                         pile,
@@ -362,24 +350,16 @@ impl Storage {
                 // never be assembled from different store prefixes.
                 let store_snapshot = secrets.store_snapshot().clone();
                 let mail_facts = store_snapshot
-                    .collection(mail_rank9)
-                    .context("attach maintained Mail fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(mail_rank9)
                     .context("read maintained Mail fact collection")?;
                 let files_facts = store_snapshot
-                    .collection(files_rank9)
-                    .context("attach maintained Files fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(files_rank9)
                     .context("read maintained Files fact collection")?;
                 let decide_facts = store_snapshot
-                    .collection(decide_rank9)
-                    .context("attach maintained Decide fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(decide_rank9)
                     .context("read maintained Decide fact collection")?;
                 let relations_facts = store_snapshot
-                    .collection(relations_rank9)
-                    .context("attach maintained Relations fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(relations_rank9)
                     .context("read maintained Relations fact collection")?;
                 (
                     mail_facts,
@@ -1346,24 +1326,19 @@ mod tests {
             })
             .unwrap();
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let mut pile = open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
         for scope in [scopes().mail, scopes().files] {
             let source = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
-            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             let facts = pollster::block_on(async {
-                drop(pile.maintain(succinct, &signer).await.unwrap());
-                pile.maintain(rank9, &signer).await
+                drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+                pile.maintain_attached(rank9, &signer).await
             })
             .unwrap()
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
+            .read_facts(rank9)
             .unwrap();
             assert!(exists!(
                 pattern!(&facts, [{ _?event @ metadata::tag: &marker }])
@@ -1391,23 +1366,18 @@ mod tests {
         assert!(text.contains("facts were committed"));
         assert!(text.contains("injected later action failure"));
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
-        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let mut pile = open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
         let source = open_configured(&mut pile, scopes().mail, signer.verifying_key()).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let facts = pollster::block_on(async {
-            drop(pile.maintain(succinct, &signer).await.unwrap());
-            pile.maintain(rank9, &signer).await
+            drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+            pile.maintain_attached(rank9, &signer).await
         })
         .unwrap()
-        .collection(rank9)
-        .unwrap()
-        .view::<FactArchive>()
+        .read_facts(rank9)
         .unwrap();
         assert!(exists!(
             pattern!(&facts, [{ _?event @ metadata::tag: &marker }])

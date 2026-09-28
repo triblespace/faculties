@@ -1,5 +1,6 @@
 //! Work with pull-based standing intentions in one fixed native collection.
 
+use crate::storage::FactRead;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -14,9 +15,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
-};
+use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
@@ -107,28 +106,25 @@ impl Habits {
                     crate::schemas::relations::DEFAULT_SCOPE_ID,
                     session.signer.verifying_key(),
                 )?;
-                let policy = source.policy(&session.pile.snapshot()?)?;
-                let succinct =
-                    session
-                        .pile
-                        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let rank9 = session.pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    succinct,
-                    (),
-                    policy,
-                )?;
+                let succinct = session.pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let rank9 = session
+                    .pile
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and a persona the views lack is lag.
                 pollster::block_on(async {
                     crate::storage::tolerate_own_lag(
-                        session.pile.maintain(succinct, session.signer).await,
+                        session
+                            .pile
+                            .maintain_attached(succinct, session.signer)
+                            .await,
                     )?;
                     crate::storage::tolerate_own_lag(
-                        session.pile.maintain(rank9, session.signer).await,
+                        session.pile.maintain_attached(rank9, session.signer).await,
                     )
                 })?;
                 let snapshot = session.pile.snapshot()?;
-                let facts = snapshot.collection(rank9)?.view::<FactArchive>()?;
+                let facts = snapshot.read_facts(rank9)?;
                 for input in personas {
                     let input = input.trim();
                     targets.push(match Id::from_hex(input) {
@@ -322,20 +318,14 @@ fn with_habits<T>(
 ) -> Result<T> {
     storage.with_pile(|pile, signer| {
         let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        let descriptor_snapshot = pile.snapshot()?;
-        let policy = collection.policy(&descriptor_snapshot)?;
-        drop(descriptor_snapshot);
-        let maintained_succinct =
-            pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
+        let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
         let maintained_rank9 =
-            pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(maintained_succinct, (), policy)?;
+            pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, maintained_succinct)?;
         let reader = pile
             .snapshot()
             .context("freeze resident Habit fact collection")?;
         let facts = reader
-            .collection(maintained_rank9)
-            .context("observe maintained Habit fact collection")?
-            .view::<FactArchive>()
+            .read_facts(maintained_rank9)
             .context("read maintained Habit fact collection")?;
         operation(&mut HabitSession {
             pile,
@@ -528,8 +518,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("habit.pile");
         std::fs::File::create(&path).unwrap();
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         let owner = SigningKey::from_bytes(&[61; 32]);
+        let mut pile = crate::storage::open_pile_strict_as(&path, owner.verifying_key()).unwrap();
         let outsider = SigningKey::from_bytes(&[62; 32]);
         let source =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
@@ -577,8 +567,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("habit.pile");
         std::fs::File::create(&path).unwrap();
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
         let owner = SigningKey::from_bytes(&[61; 32]);
+        let mut pile = crate::storage::open_pile_strict_as(&path, owner.verifying_key()).unwrap();
         let outsider = SigningKey::from_bytes(&[62; 32]);
         let source =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
@@ -586,12 +576,9 @@ mod tests {
         let (definition, owner_habit) =
             habits::habit_fragment("owner habit", "every 1h", "observe", None, &[], &[]).unwrap();
         commit_habit_fragment(&mut pile, source, &owner, definition).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let before = pile.snapshot().unwrap();
         let before_records = before
@@ -639,20 +626,16 @@ mod tests {
         // Preparing the targets as the owner is what a reader now does, and it
         // must still leave the outsider's unadmitted COMMIT out of the view.
         let prepared = pollster::block_on(async {
-            drop(pile.maintain(succinct, &owner).await?);
-            pile.maintain(rank9, &owner).await
+            drop(pile.maintain_attached(succinct, &owner).await?);
+            pile.maintain_attached(rank9, &owner).await
         })
         .unwrap();
         let succinct_facts = prepared
-            .collection(succinct)
+            .attached(succinct)
             .unwrap()
             .view::<FactArchive>()
             .unwrap();
-        let rank9_facts = prepared
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let rank9_facts = prepared.read_facts(rank9).unwrap();
         for facts in [&succinct_facts, &rank9_facts] {
             assert_eq!(habits::definition_ids(facts), BTreeSet::from([owner_habit]));
         }

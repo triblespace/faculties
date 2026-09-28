@@ -14,7 +14,7 @@ use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::schemas::compass::{board, KIND_NOTE_ID, KIND_STATUS_ID};
 use faculties::storage::{
-    carry_facts, initialize_signer, load_signer, open_pile_strict, publish_fragment,
+    carry_facts, initialize_signer, load_signer, open_pile_strict_as, publish_fragment,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -50,7 +50,7 @@ impl Fixture {
 
     fn snapshot(&self) -> (TribleSet, PileSnapshot) {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = Pile::open(&self.pile).unwrap();
+        let mut pile = Pile::open_as(&self.pile, signer.verifying_key()).unwrap();
         let result = compass::materialize_collection(&mut pile, &signer).unwrap();
         pile.close().unwrap();
         result
@@ -62,7 +62,7 @@ impl Fixture {
     /// is the worker here.
     fn carry(&self) {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = open_pile_strict(&self.pile).unwrap();
+        let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         for scope in [
             faculties::schemas::compass::DEFAULT_SCOPE_ID,
             faculties::schemas::relations::DEFAULT_SCOPE_ID,
@@ -72,7 +72,7 @@ impl Fixture {
         }
         let status =
             compass::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
-        pollster::block_on(async { drop(pile.maintain(status, &signer).await.unwrap()) });
+        pollster::block_on(async { drop(pile.maintain_attached(status, &signer).await.unwrap()) });
         pile.close().unwrap();
     }
 
@@ -180,7 +180,7 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
     let writer = load_signer(&fixture.pile, Some(&writer_key)).unwrap();
     let denied_key = fixture.directory.path().join("ungranted.key");
     initialize_signer(&fixture.pile, Some(&denied_key)).unwrap();
-    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let mut pile = Pile::open_as(&fixture.pile, owner.verifying_key()).unwrap();
     let source = faculties::collection_names::open_configured(
         &mut pile,
         faculties::schemas::compass::DEFAULT_SCOPE_ID,
@@ -195,12 +195,9 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
     .unwrap();
     grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
     for input in [source, relations] {
-        let policy = input.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(input, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(input, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(input, succinct)
             .unwrap();
         for target in [succinct.handle(), rank9.handle()] {
             grant_collection_read(&mut pile, target, &owner, writer.verifying_key()).unwrap();
@@ -214,7 +211,7 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
             .unwrap());
         if input == source {
             let facts = snapshot
-                .collection(rank9)
+                .attached(rank9)
                 .unwrap()
                 .view::<faculties::storage::FactArchive>()
                 .unwrap();
@@ -429,12 +426,9 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
     // and its commands succeed.
     {
         let mut pile = Pile::open(&fixture.pile).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         for target in [succinct.handle(), rank9.handle(), status.handle()] {
             grant_collection_write(&mut pile, target, &owner, writer.verifying_key()).unwrap();

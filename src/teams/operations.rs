@@ -34,7 +34,6 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
@@ -550,7 +549,7 @@ struct TeamsSession {
     storage: Storage,
     collection: Collection<SimpleArchive>,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    support: Support<Rank9AcceleratedSuccinctArchiveBlob>,
+    support: Support<SimpleArchive>,
     facts: FactArchive,
     reader: PileSnapshot,
     signer: ed25519_dalek::SigningKey,
@@ -671,7 +670,7 @@ impl TeamsSession {
     async fn refresh_secrets_for_async(
         &mut self,
         pile: &mut Pile,
-        support: Option<Support<Rank9AcceleratedSuccinctArchiveBlob>>,
+        support: Option<Support<SimpleArchive>>,
     ) -> Result<()> {
         let secrets =
             secret_storage::ensure_and_snapshot(pile, self.secret_collection, &self.signer)
@@ -683,14 +682,10 @@ impl TeamsSession {
         // A Teams commit observes the ordinary view at this final snapshot.
         if support.is_none() {
             let observed = reader
-                .collection(self.rank9)
+                .attached(self.rank9)
                 .context("attach Teams through Secrets snapshot")?;
-            let support = observed
-                .support()
-                .context("resolve Teams support through Secrets snapshot")?
-                .clone();
-            let facts = observed
-                .view::<FactArchive>()
+            let support = observed.support().clone();
+            let facts = crate::storage::attached_facts(&observed)
                 .context("read Teams through Secrets snapshot")?;
             drop(observed);
             self.support = support;
@@ -733,15 +728,10 @@ impl TeamsStorage {
         self.storage.scope(|storage| {
             let mut session = storage.with_pile(|pile, signer| {
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let maintained_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
+                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    collection,
                     maintained_succinct,
-                    (),
-                    policy,
                 )?;
                 let secret_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
                 // The session derives this key's own leaves and mirrors its
@@ -750,11 +740,13 @@ impl TeamsStorage {
                 // they do on an own commit neither view can derive.
                 let secrets = pollster::block_on(async {
                     crate::storage::tolerate_own_lag(
-                        pile.maintain(maintained_succinct, signer).await,
+                        pile.maintain_attached(maintained_succinct, signer).await,
                     )
                     .context("maintain Teams fact collection")?;
-                    crate::storage::tolerate_own_lag(pile.maintain(maintained_rank9, signer).await)
-                        .context("maintain Teams fact collection")?;
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain_attached(maintained_rank9, signer).await,
+                    )
+                    .context("maintain Teams fact collection")?;
                     let secrets =
                         secret_storage::ensure_and_snapshot(pile, secret_collection, signer)
                             .await
@@ -763,14 +755,10 @@ impl TeamsStorage {
                 })?;
                 let reader = secrets.store_snapshot().clone();
                 let observed = reader
-                    .collection(maintained_rank9)
+                    .attached(maintained_rank9)
                     .context("observe Teams through Secrets snapshot")?;
-                let support = observed
-                    .support()
-                    .context("resolve Teams session support")?
-                    .clone();
-                let facts = observed
-                    .view::<FactArchive>()
+                let support = observed.support().clone();
+                let facts = crate::storage::attached_facts(&observed)
                     .context("read Teams through Secrets snapshot")?;
                 drop(observed);
                 Ok(TeamsSession {
@@ -3799,7 +3787,7 @@ mod tests {
                     crate::storage::carry_facts(pile, session.collection, signer);
                     pile.snapshot().map_err(Into::into)
                 })?;
-                assert_ne!(later.collection(session.rank9)?.support()?, &support);
+                assert_ne!(later.attached(session.rank9)?.support(), &support);
                 drop(later);
                 let observed_at = clock::point_now()?;
                 let secret =

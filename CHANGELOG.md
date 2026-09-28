@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Every faculty's Succinct and Rank9 pair, and the compass and body
+  registers, the wiki supersession index, the Code and Archive BM25 indexes
+  and the Orient receipt id set, are attached to their source instead of
+  derived under its policy: `storage::fact_pair` attaches the pair, reads go
+  through `FactRead::read_facts` (the attached Rank9 cover plus every source
+  foundation it does not reach, read from its own bytes), and upkeep attaches
+  the source's frontier (`ensure_downstream`) or carries the source first
+  (`maintain_downstream`). The WRITE-admission checks on the views are gone,
+  since an attached collection has no policy, and so are
+  `require_readable_writes` and its own-lag bookkeeping: a commit with no
+  attachment yet is still read. `FactLag` counts the foundations each
+  collection of the pair does not reach. Stores are opened as the signing key,
+  whose MAPs are the only ones believed. The Archive BM25 mapping implements
+  `MapMapping`, so a block whose closure spans commits is represented at the
+  merged node that holds both. Secrets attaches its pair the same way; its
+  `SecretsLag` counts unattached foundations and its support is the source's.
+
 - The exact collection API is gone from core, and with it every place a
   faculty asked for a support: the archive search maintains its fact view
   and its BM25 index, attaches both from one snapshot and compares their

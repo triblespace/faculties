@@ -1,4 +1,7 @@
 //! Planner operations over resident input and frozen authorized collections.
+use crate::storage::FactRead;
+#[cfg(test)]
+use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -310,32 +313,25 @@ impl PlannerStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = (|| {
                 let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = source.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let collection_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let collection_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    collection_succinct,
-                    (),
-                    policy,
-                )?;
+                let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let collection_rank9 = pile
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
                 pollster::block_on(async {
                     crate::storage::tolerate_own_lag(
-                        pile.maintain(collection_succinct, signer).await,
+                        pile.maintain_attached(collection_succinct, signer).await,
                     )?;
-                    crate::storage::tolerate_own_lag(pile.maintain(collection_rank9, signer).await)
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain_attached(collection_rank9, signer).await,
+                    )
                 })
                 .context("maintain Planner fact collection")?;
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze maintained Planner fact collection")?;
                 let facts = store_snapshot
-                    .collection(collection_rank9)
-                    .context("observe maintained Planner fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(collection_rank9)
                     .context("attach maintained Planner fact collection")?;
                 let loaded = LoadedPlanner {
                     facts,
@@ -1075,15 +1071,14 @@ fn event_and_initial_note_are_one_commit_a_preparing_reader_observes() {
         .storage
         .with_pile(|pile, signer| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let policy = source.policy(&pile.snapshot()?)?;
-            let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
             let snapshot = pollster::block_on(async {
-                drop(pile.maintain(succinct, signer).await?);
-                pile.maintain(rank9, signer).await
+                drop(pile.maintain_attached(succinct, signer).await?);
+                pile.maintain_attached(rank9, signer).await
             })?;
-            let selected = snapshot.collection(rank9)?;
-            let facts = selected.view::<FactArchive>()?;
+            let selected = snapshot.attached(rank9)?;
+            let facts = selected.facts()?;
             assert!(planner_model::event(&facts, added.event).is_some());
             assert_eq!(planner_model::notes_for_event(&facts, added.event).len(), 1);
             assert_eq!(

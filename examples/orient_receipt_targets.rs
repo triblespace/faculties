@@ -23,7 +23,7 @@ fn main() -> Result<()> {
     let policy = private_policy(VerifyingKey::from_bytes(&bytes)?);
     let mut store = MemoryRepo::default();
     let source = store.collection(RECEIPT_COLLECTION_NAME, policy.clone())?;
-    let target = store.derive::<EntityIdSetBlob>(source, presentation::event.id(), policy)?;
+    let target = store.attach::<EntityIdSetBlob>(source, presentation::event.id())?;
     println!("source {}", hex::encode(source.handle().raw));
     println!("target {}", hex::encode(target.handle().raw));
     println!("attribute {:x}", presentation::event.id());

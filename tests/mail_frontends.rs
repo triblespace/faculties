@@ -6,9 +6,8 @@ use faculties::mail::{self, AccountOptions, DraftAttachment, DraftRequest, Mail}
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::relations::{ProfileInput, Relations};
-use faculties::storage::{
-    initialize_signer, load_signer, open_pile_strict, publish_fragment, FactArchive,
-};
+use faculties::storage::FactView;
+use faculties::storage::{initialize_signer, load_signer, open_pile_strict_as, publish_fragment};
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -126,7 +125,7 @@ impl Fixture {
     }
     fn materialize(&self, id: Id) -> mail::MaterializedDraft {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = open_pile_strict(&self.pile).unwrap();
+        let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         let mut indexes = Vec::new();
         for scope in [
             faculties::schemas::mail::DEFAULT_SCOPE_ID,
@@ -138,33 +137,20 @@ impl Fixture {
                 signer.verifying_key(),
             )
             .unwrap();
-            let snapshot = pile.snapshot().unwrap();
-            let policy = source.policy(&snapshot).unwrap();
-            drop(snapshot);
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             pollster::block_on(async {
                 drop(pile.ensure(source, &signer).await.unwrap());
-                drop(pile.maintain(succinct, &signer).await.unwrap());
-                drop(pile.maintain(rank9, &signer).await.unwrap());
+                drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+                drop(pile.maintain_attached(rank9, &signer).await.unwrap());
             });
             indexes.push(rank9);
         }
         let reader = pile.snapshot().unwrap();
-        let mail = reader
-            .collection(indexes[0])
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
-        let files = reader
-            .collection(indexes[1])
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let mail = reader.attached(indexes[0]).unwrap().facts().unwrap();
+        let files = reader.attached(indexes[1]).unwrap().facts().unwrap();
         let value = mail::materialize_draft(&reader, &mail, &files, id).unwrap();
         pile.close().unwrap();
         value

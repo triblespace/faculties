@@ -27,6 +27,7 @@
 //! acceleration — only speed does. A collection this size that re-indexed itself
 //! on every read would make `code find` cost what an `orient wake` costs.
 
+use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Context, Result};
@@ -42,7 +43,7 @@ use triblespace_search::tokens::{code_tokens, WordHash};
 use crate::code::operations::{
     hit, keeps, placements_of_item, provenance, select_scans, Code, Filter, Hit, Provenance, Texts,
 };
-use crate::collection_names::{open_configured, private_policy};
+use crate::collection_names::open_configured;
 use crate::schemas::code::{attrs, DEFAULT_SCOPE_ID};
 use crate::storage::FactArchive;
 
@@ -116,17 +117,15 @@ fn register(
     pile: &mut triblespace::core::repo::pile::Pile,
     source: Collection<SimpleArchive>,
     attribute: Id,
-    authority: ed25519_dalek::VerifyingKey,
 ) -> Result<Collection<PortableBM25Blob>> {
-    pile.derive::<PortableBM25Blob>(
+    pile.attach::<PortableBM25Blob>(
         source,
         TextAttributeToBm25 {
             attribute,
             tokenizer: Bm25Tokenizer::Code,
         },
-        private_policy(authority),
     )
-    .context("register Code BM25 derivation")
+    .context("attach the Code BM25 index")
 }
 
 impl Code {
@@ -134,22 +133,17 @@ impl Code {
     pub fn index(&self) -> Result<IndexReport> {
         self.storage().with_pile(|pile, signer| {
             pollster::block_on(async {
-                // Each cover derives this key's own commits; the root is
-                // not acquired, because nobody else's payload feeds them.
+                // Each index is attached to the source's frontier after its
+                // carry.
                 let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let doc_target = register(pile, source, attrs::doc.id(), signer.verifying_key())?;
-                let text_target = register(
-                    pile,
-                    source,
-                    attrs::source_tokens.id(),
-                    signer.verifying_key(),
-                )?;
+                let doc_target = register(pile, source, attrs::doc.id())?;
+                let text_target = register(pile, source, attrs::source_tokens.id())?;
 
                 let after = pile
-                    .maintain(doc_target, signer)
+                    .maintain_attached(doc_target, signer)
                     .await
                     .context("maintain Code prose BM25 cover")?;
-                let doc_documents = match after.collection(doc_target) {
+                let doc_documents = match after.attached(doc_target) {
                     Ok(attached) => attached
                         .view::<CodeBM25View>()
                         .map(|view| view.segments().iter().map(|index| index.doc_count()).sum())
@@ -159,10 +153,10 @@ impl Code {
                 };
 
                 let after = pile
-                    .maintain(text_target, signer)
+                    .maintain_attached(text_target, signer)
                     .await
                     .context("maintain Code token BM25 cover")?;
-                let text_documents = match after.collection(text_target) {
+                let text_documents = match after.attached(text_target) {
                     Ok(attached) => attached
                         .view::<CodeBM25View>()
                         .map(|view| view.segments().iter().map(|index| index.doc_count()).sum())
@@ -201,7 +195,7 @@ impl Code {
     ) -> Result<SearchReport> {
         let scores = self.bm25_scores(query, tier)?;
         let observed = crate::code::ingest::ensure_local_with_storage(self.storage())?;
-        let facts = observed.view::<FactArchive>().context("read Code facts")?;
+        let facts = observed.facts().context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -309,13 +303,8 @@ impl Code {
         let terms = code_tokens(query);
         self.storage().with_pile(|pile, signer| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let doc_target = register(pile, source, attrs::doc.id(), signer.verifying_key())?;
-            let text_target = register(
-                pile,
-                source,
-                attrs::source_tokens.id(),
-                signer.verifying_key(),
-            )?;
+            let doc_target = register(pile, source, attrs::doc.id())?;
+            let text_target = register(pile, source, attrs::source_tokens.id())?;
             let snapshot = pile.snapshot().context("freeze Code search snapshot")?;
 
             let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
@@ -323,7 +312,7 @@ impl Code {
                               weight: f32,
                               scores: &mut BTreeMap<Id, f32>|
              -> Result<()> {
-                let Ok(attached) = snapshot.collection(target) else {
+                let Ok(attached) = snapshot.attached(target) else {
                     // A cover that has never been maintained is not an error; it
                     // is a cover that is behind, and the caller is told so.
                     return Ok(());

@@ -77,7 +77,7 @@ mod tests {
             let path = directory.path().join("receipt-import.pile");
             std::fs::File::create(&path).unwrap();
             let signer = SigningKey::from_bytes(&[79; 32]);
-            let mut store = open_store(&path).unwrap();
+            let mut store = crate::storage::open_store_as(&path, signer.verifying_key()).unwrap();
             let legacy = OrientSource::open(
                 &mut store,
                 &signer,
@@ -211,7 +211,7 @@ mod tests {
             );
             assert!(
                 after
-                    .collection(f.destination.rank9)
+                    .attached(f.destination.rank9)
                     .unwrap()
                     .cover()
                     .is_empty(),
@@ -258,19 +258,29 @@ mod tests {
             let persona = fucid();
             let receipt = fucid();
             let event = fucid();
-            // A source member without its resident legacy projection is not
-            // permission to invent a complete historical import or a baseline.
-            f.store
-                .commit(
-                    f.legacy.source,
-                    &f.signer,
-                    entity! { &receipt @
-                        metadata::tag: &KIND_PRESENTED,
-                        presentation::persona: &persona,
-                        presentation::event: &event,
-                    },
-                )
-                .unwrap();
+            // A source member whose payload is not here is not permission to
+            // invent a complete historical import or a baseline.
+            let payload = entity! { &receipt @
+                metadata::tag: &KIND_PRESENTED,
+                presentation::persona: &persona,
+                presentation::event: &event,
+            };
+            let data: triblespace::core::blob::Blob<SimpleArchive> =
+                triblespace::core::blob::IntoBlob::to_blob(payload.facts().clone());
+            triblespace::core::collection::CollectionStore::insert(
+                &mut f.store,
+                triblespace::core::collection::CollectionRecord::Commit(
+                    triblespace::core::collection::CollectionCommit::sign(
+                        &f.signer,
+                        f.legacy.source.handle(),
+                        triblespace::core::inline::encodings::hash::Handle::<SimpleArchive>::to_hash(
+                            data.get_handle(),
+                        ),
+                        triblespace::core::collection::empty_metadata_handle(),
+                    ),
+                ),
+            )
+            .unwrap();
             let before = f.store.snapshot().unwrap();
             assert_eq!(
                 import(&mut f.store, &f.signer, &fmt_id(*persona))

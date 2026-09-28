@@ -1,6 +1,7 @@
 //! Typed finite Message operations over one frozen Message/Relations observation.
 //! Text is literal; sender selection and output routing belong to the caller.
 
+use crate::storage::FactRead;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -20,7 +21,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::intersectionconstraint::and;
 use triblespace::core::query::sortedsliceconstraint::SortedSlice;
@@ -753,17 +754,11 @@ async fn message_views(
     // Both query views retain their selected support. Later selected-text
     // acquisition may add bytes, but never replaces these frozen facts.
     let reader = pile.snapshot().context("freeze Message observation")?;
-    let relation_collection = reader
-        .collection(relations_rank9)
-        .context("observe Relations Rank9 projection")?;
-    let relation_facts = relation_collection
-        .view::<FactArchive>()
+    let relation_facts = reader
+        .read_facts(relations_rank9)
         .context("read Relations Rank9 projection")?;
-    let message_collection = reader
-        .collection(message_rank9)
-        .context("observe Message Rank9 projection")?;
-    let message_facts = message_collection
-        .view::<FactArchive>()
+    let message_facts = reader
+        .read_facts(message_rank9)
         .context("read Message Rank9 projection")?;
     let attached_at = started.elapsed();
     if trace {
@@ -783,18 +778,11 @@ fn register_fact_chain(
     source: Collection<SimpleArchive>,
     name: &'static str,
 ) -> Result<Collection<Rank9AcceleratedSuccinctArchiveBlob>> {
-    let descriptors = pile
-        .snapshot()
-        .with_context(|| format!("freeze {name} source policy"))?;
-    let policy = source
-        .policy(&descriptors)
-        .with_context(|| format!("read {name} source policy"))?;
-    drop(descriptors);
     let succinct = pile
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .attach::<SuccinctArchiveBlob>(source, ())
         .with_context(|| format!("register {name} Succinct collection"))?;
     let rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
         .with_context(|| format!("register {name} Rank9 collection"))?;
     Ok(rank9)
 }
@@ -802,6 +790,7 @@ fn register_fact_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::FactView;
 
     use std::collections::BTreeSet;
     use std::future::{ready, Future};
@@ -829,10 +818,24 @@ mod tests {
     }
 
     impl AcquiringPile {
-        fn new(mut remote: MemoryBlobStore) -> Self {
+        fn new(remote: MemoryBlobStore) -> Self {
+            Self::open(remote, None)
+        }
+
+        /// A store whose MAPs are signed by `host`, so its attachments are
+        /// believed.
+        fn hosted(remote: MemoryBlobStore, host: ed25519_dalek::VerifyingKey) -> Self {
+            Self::open(remote, Some(host))
+        }
+
+        fn open(mut remote: MemoryBlobStore, host: Option<ed25519_dalek::VerifyingKey>) -> Self {
             let file = tempfile::NamedTempFile::new().unwrap();
+            let pile = match host {
+                Some(host) => Pile::open_as(file.path(), host),
+                None => Pile::open(file.path()),
+            };
             Self {
-                pile: Pile::open(file.path()).unwrap(),
+                pile: pile.unwrap(),
                 remote: remote.snapshot().unwrap(),
                 requested: Vec::new(),
                 failure: None,
@@ -907,23 +910,28 @@ mod tests {
         source: Collection<SimpleArchive>,
         signer: &SigningKey,
     ) {
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
-        drop(runtime.block_on(pile.maintain(succinct, signer)).unwrap());
-        drop(runtime.block_on(pile.maintain(rank9, signer)).unwrap());
+        drop(
+            runtime
+                .block_on(pile.maintain_attached(succinct, signer))
+                .unwrap(),
+        );
+        drop(
+            runtime
+                .block_on(pile.maintain_attached(rank9, signer))
+                .unwrap(),
+        );
     }
 
     #[test]
     fn non_writer_lists_resident_messages_but_cannot_publish() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[91; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
         let observer = SigningKey::from_bytes(&[92; 32]);
         let relations_source = crate::collection_names::open(
             &mut pile,
@@ -936,12 +944,9 @@ mod tests {
                 .unwrap();
         let mut selectors = BTreeSet::new();
         for source in [relations_source, message_source] {
-            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             for handle in [source.handle(), succinct.handle(), rank9.handle()] {
                 selectors.insert(CollectionRecordSelector::Collection(handle));
@@ -997,13 +1002,14 @@ mod tests {
         .0;
         let options = ListOptions::new("reader");
         for growth in [None, Some((later, second))] {
+            let grown = growth.is_some();
             if let Some((person, message)) = growth {
                 pile.commit(relations_source, &owner, person).unwrap();
                 pile.commit(message_source, &owner, message).unwrap();
             }
             let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-            // The observer lacks derived WRITE, so it sees resident views,
-            // not the newer raw records it is not authorized to carry.
+            // The observer attaches nothing; it reads the attached views and
+            // the newer commits from their own bytes, and publishes nothing.
             let (snapshot, relation_facts, message_facts) = runtime
                 .block_on(message_views(
                     &mut pile,
@@ -1012,7 +1018,10 @@ mod tests {
                     message_source,
                 ))
                 .unwrap();
-            assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
+            assert_eq!(
+                relations::person_anchors(&relation_facts).contains(&later_person),
+                grown
+            );
             let mut input = MessageStorage {
                 pile: &mut pile,
                 signer: &observer,
@@ -1023,13 +1032,25 @@ mod tests {
             };
             let result = runtime.block_on(list(&mut input, &options)).unwrap();
             assert_eq!(result.reader, recipient);
-            assert_eq!(result.entries.len(), 1);
-            assert_eq!(result.entries[0].id, first_id);
             assert_eq!(
-                result.entries[0].body,
-                MessageText::Text("first message".to_owned())
+                result
+                    .entries
+                    .iter()
+                    .map(|entry| entry.id)
+                    .collect::<BTreeSet<_>>(),
+                if grown {
+                    BTreeSet::from([first_id, second_id])
+                } else {
+                    BTreeSet::from([first_id])
+                }
             );
-            assert_eq!(result.entries[0].status, MessageStatus::Unread);
+            let first = result
+                .entries
+                .iter()
+                .find(|entry| entry.id == first_id)
+                .unwrap();
+            assert_eq!(first.body, MessageText::Text("first message".to_owned()));
+            assert_eq!(first.status, MessageStatus::Unread);
             assert_eq!(
                 pile.snapshot().unwrap().select_records(&selectors).unwrap(),
                 before
@@ -1171,11 +1192,11 @@ mod tests {
     /// The owner's next maintenance pass derives both, without any grant,
     /// and every reader sees them.
     #[test]
-    fn source_only_writer_is_told_its_sends_and_acks_wait_for_maintenance() {
+    fn source_only_writer_sends_and_acks_readably_before_maintenance_attaches_them() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[95; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
         let sender = SigningKey::from_bytes(&[96; 32]);
         let relations_source = crate::collection_names::open(
             &mut pile,
@@ -1231,12 +1252,9 @@ mod tests {
         )
         .unwrap();
         for source in [relations_source, message_source] {
-            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             let snapshot = pile.snapshot().unwrap();
             assert!(!succinct
@@ -1272,7 +1290,9 @@ mod tests {
             messages: &message_facts,
             relations: &relation_facts,
         };
-        let error = runtime
+        // The sender is not the host, so its writes attach nothing; every
+        // reader reads them from their bytes until the host's worker does.
+        runtime
             .block_on(send(
                 &mut input,
                 &SendOptions {
@@ -1281,22 +1301,10 @@ mod tests {
                     text: "published without index WRITE",
                 },
             ))
-            .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(error.contains("was committed"), "{error}");
-        assert!(
-            error.contains("1 of this key's writes reach no reader"),
-            "{error}"
-        );
-        assert!(error.contains("grant that key WRITE"), "{error}");
-        let error = runtime
+            .unwrap();
+        runtime
             .block_on(ack(&mut input, &fmt_id(first_id), "sender"))
-            .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(
-            error.contains("2 of this key's writes reach no reader"),
-            "{error}"
-        );
+            .unwrap();
         let after = pile
             .snapshot()
             .unwrap()
@@ -1311,15 +1319,15 @@ mod tests {
             CollectionRecord::Commit(commit) if commit.collection() == message_source.handle()
         )));
 
-        // The sender's two commits are the views' lag, counted as such.
+        // The sender's two commits are the attachments' lag, counted as such,
+        // and already readable.
         let lag = |pile: &mut FacultyStore| {
             let snapshot = pile.snapshot().unwrap();
-            let policy = message_source.policy(&snapshot).unwrap();
             let succinct = pile
-                .derive::<SuccinctArchiveBlob>(message_source, (), policy.clone())
+                .attach::<SuccinctArchiveBlob>(message_source, ())
                 .unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(message_source, succinct)
                 .unwrap();
             storage::FactLag::of(&snapshot, message_source, succinct, rank9).unwrap()
         };
@@ -1327,12 +1335,32 @@ mod tests {
             lag(&mut pile),
             storage::FactLag {
                 succinct: 2,
-                rank9: 0
+                rank9: 2
             }
         );
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let listed = runtime
+            .block_on(list(&mut input, &ListOptions::new("sender")))
+            .unwrap();
+        assert_eq!(listed.entries.len(), 2);
 
-        // The owner's worker derives them anyway: a derive is a function, so
-        // no grant is needed for every reader to see them.
+        // The host's worker attaches them: a MAP is a function of the node,
+        // so no grant is needed, and the read is the same.
         carry(&mut pile, &runtime, message_source, &owner);
         assert!(lag(&mut pile).is_current(), "{:?}", lag(&mut pile));
         let (snapshot, relation_facts, message_facts) = runtime
@@ -1365,9 +1393,9 @@ mod tests {
     #[test]
     fn owner_reads_warm_targets_without_acquiring_cold_root_members() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[97; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
         let relations_source = crate::collection_names::open(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
@@ -1477,12 +1505,13 @@ mod tests {
     }
 
     #[test]
-    fn reads_attach_each_chain_as_its_own_worker_carried_it() {
+    fn reads_see_every_commit_whether_its_chain_was_carried_or_not() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let relations_owner = SigningKey::from_bytes(&[93; 32]);
         let message_owner = SigningKey::from_bytes(&[94; 32]);
+        // The store's host maintains every chain, whoever writes into it.
+        let mut pile = storage::open_store_as(file.path(), message_owner.verifying_key()).unwrap();
         let relations_source = crate::collection_names::open(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
@@ -1518,8 +1547,8 @@ mod tests {
             clock::point_now().unwrap(),
         );
         pile.commit(message_source, &message_owner, first).unwrap();
-        // Each chain's own maintainer carries it, as the worker would.
-        carry(&mut pile, &runtime, relations_source, &relations_owner);
+        // The host's worker carries both chains.
+        carry(&mut pile, &runtime, relations_source, &message_owner);
         carry(&mut pile, &runtime, message_source, &message_owner);
         // Fresh raw records in both chains that nobody has carried yet.
         pile.commit(
@@ -1553,9 +1582,8 @@ mod tests {
         };
         let before = records(&mut pile);
 
-        // A read attaches what each chain's worker carried and publishes
-        // nothing, whatever authority the reader holds: the fresh commits in
-        // both chains wait for their carries.
+        // A read takes what the worker attached and reads the fresh commits
+        // in both chains from their own bytes; it publishes nothing.
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -1566,33 +1594,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             relations::person_anchors(&relation_facts),
-            BTreeSet::from([first_person])
-        );
-        assert_eq!(visible(&message_facts), BTreeSet::from([first_message]));
-        assert_eq!(records(&mut pile), before, "a read publishes nothing");
-
-        // Once the Message worker carries the fresh message, the same read
-        // sees it; Relations still waits for its own worker.
-        carry(&mut pile, &runtime, message_source, &message_owner);
-        let (_, relation_facts, message_facts) = runtime
-            .block_on(message_views(
-                &mut pile,
-                &message_owner,
-                relations_source,
-                message_source,
-            ))
-            .unwrap();
-        assert_eq!(
-            relations::person_anchors(&relation_facts),
-            BTreeSet::from([first_person])
+            BTreeSet::from([first_person, second_person])
         );
         assert_eq!(
             visible(&message_facts),
             BTreeSet::from([first_message, second_message])
         );
-        // Once the Relations worker carries the fresh person, the same read
-        // sees it.
-        carry(&mut pile, &runtime, relations_source, &relations_owner);
+        assert_eq!(records(&mut pile), before, "a read publishes nothing");
+
+        // Once the worker carries both chains again, the same read sees the
+        // same facts, now through attachments alone.
+        carry(&mut pile, &runtime, relations_source, &message_owner);
+        carry(&mut pile, &runtime, message_source, &message_owner);
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
                 &mut pile,
@@ -1971,9 +1984,9 @@ mod tests {
         // error -- and that half is proved directly in
         // acquisition_distinguishes_missing_failed_and_invalid_text.
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[98; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
         let relations_source = crate::collection_names::open(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
@@ -2151,9 +2164,9 @@ mod tests {
             },
         )
         .unwrap();
-        let mut store = AcquiringPile::new(fragment.blobs().clone());
-        fragment.blobs_mut().keep([]);
         let signer = SigningKey::from_bytes(&[7; 32]);
+        let mut store = AcquiringPile::hosted(fragment.blobs().clone(), signer.verifying_key());
+        fragment.blobs_mut().keep([]);
         let source = crate::collection_names::open(
             &mut store.pile,
             DEFAULT_RELATIONS_SCOPE_ID,
@@ -2161,23 +2174,28 @@ mod tests {
         )
         .unwrap();
         store.pile.commit(source, &signer, fragment).unwrap();
-        let policy = source.policy(&store.pile.snapshot().unwrap()).unwrap();
         let succinct = store
             .pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .attach::<SuccinctArchiveBlob>(source, ())
             .unwrap();
         let rank9 = store
             .pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let before = pollster::block_on(async {
             drop(store.pile.ensure(source, &signer).await.unwrap());
-            drop(store.pile.maintain(succinct, &signer).await.unwrap());
-            store.pile.maintain(rank9, &signer).await.unwrap()
+            drop(
+                store
+                    .pile
+                    .maintain_attached(succinct, &signer)
+                    .await
+                    .unwrap(),
+            );
+            store.pile.maintain_attached(rank9, &signer).await.unwrap()
         });
-        let observed = before.collection(rank9).unwrap();
-        let facts = observed.view::<FactArchive>().unwrap();
-        let original_support = observed.support().unwrap().clone();
+        let observed = before.attached(rank9).unwrap();
+        let facts = observed.facts().unwrap();
+        let original_support = observed.support().clone();
         let successor = relations::profile_fragment(
             person,
             relations::ProfileInput {
@@ -2196,7 +2214,7 @@ mod tests {
 
         assert_eq!(outcome, relations::SelectorOutcome::Unique(person));
         assert_eq!(store.requested.len(), 1);
-        assert_eq!(observed.support().unwrap(), &original_support);
+        assert_eq!(observed.support(), &original_support);
         assert_eq!(original_support.len(), 1);
         let after = store.snapshot().unwrap();
         assert_eq!(source.admitted(&after).unwrap().len(), 2);
@@ -2204,11 +2222,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_attach_what_the_worker_carried_and_publish_nothing() {
+    fn reads_see_fresh_commits_and_publish_nothing() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[93; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
         let relations_source = crate::collection_names::open(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
@@ -2220,12 +2238,9 @@ mod tests {
                 .unwrap();
         let mut selectors = BTreeSet::new();
         for source in [relations_source, message_source] {
-            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             for handle in [source.handle(), succinct.handle(), rank9.handle()] {
                 selectors.insert(CollectionRecordSelector::Collection(handle));
@@ -2318,8 +2333,13 @@ mod tests {
             before, after,
             "a read publishes nothing, even for the owner"
         );
-        assert_eq!(visible(&message_facts), BTreeSet::from([first_id]));
-        assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
+        // The fresh commits are read from their own bytes before any
+        // worker attaches them; the earlier read stays as it was taken.
+        assert_eq!(
+            visible(&message_facts),
+            BTreeSet::from([first_id, second_id])
+        );
+        assert!(relations::person_anchors(&relation_facts).contains(&later_person));
         assert_eq!(visible(&old_messages), BTreeSet::from([first_id]));
         assert!(!relations::person_anchors(&old_relations).contains(&later_person));
         assert_eq!(pile.snapshot().unwrap().wants().unwrap().count(), 0);
@@ -2338,7 +2358,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(after.difference(&before).all(|record| matches!(
             record,
-            CollectionRecord::Derive(_) | CollectionRecord::Merge(_)
+            CollectionRecord::Map(_) | CollectionRecord::Merge(_)
         )));
         let bytes_after = std::fs::metadata(file.path()).unwrap().len();
         let (_, relation_facts, message_facts) = runtime
@@ -2370,9 +2390,9 @@ mod tests {
     #[test]
     fn sends_and_acknowledgements_finish_their_views_before_returning() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[98; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
         let relations_source = crate::collection_names::open(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
@@ -2382,12 +2402,11 @@ mod tests {
         let message_source =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
                 .unwrap();
-        let policy = message_source.policy(&pile.snapshot().unwrap()).unwrap();
         let succinct = pile
-            .derive::<SuccinctArchiveBlob>(message_source, (), policy.clone())
+            .attach::<SuccinctArchiveBlob>(message_source, ())
             .unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(message_source, succinct)
             .unwrap();
         let sender = test_id(81);
         let recipient = test_id(82);
@@ -2442,8 +2461,8 @@ mod tests {
             // This is a passive target query, not another faculty call that
             // could repair an incomplete send before the assertion.
             let after = input.pile.snapshot().unwrap();
-            let selected = after.collection(rank9).unwrap();
-            let facts = selected.view::<FactArchive>().unwrap();
+            let selected = after.attached(rank9).unwrap();
+            let facts = selected.facts().unwrap();
             assert_eq!(visible(&facts), sent.iter().copied().collect());
             assert_eq!(message_source.admitted(&after).unwrap().len(), sent.len());
         }
@@ -2473,8 +2492,8 @@ mod tests {
             .unwrap();
         assert!(!acknowledged.already_read);
         let after = input.pile.snapshot().unwrap();
-        let selected = after.collection(rank9).unwrap();
-        let facts = selected.view::<FactArchive>().unwrap();
+        let selected = after.attached(rank9).unwrap();
+        let facts = selected.facts().unwrap();
         assert!(read_by(&facts, sent[0], &[recipient]));
         assert!(!read_by(&facts, sent[1], &[recipient]));
         assert!(!read_by(&message_facts, sent[0], &[recipient]));
@@ -2506,8 +2525,8 @@ mod tests {
             .unwrap();
         assert_eq!(acknowledged.message_ids, vec![sent[1]]);
         let after = input.pile.snapshot().unwrap();
-        let selected = after.collection(rank9).unwrap();
-        let facts = selected.view::<FactArchive>().unwrap();
+        let selected = after.attached(rank9).unwrap();
+        let facts = selected.facts().unwrap();
         assert!(sent.iter().all(|id| read_by(&facts, *id, &[recipient])));
         assert!(!read_by(&message_facts, sent[1], &[recipient]));
         assert_eq!(after.wants().unwrap().count(), 0);
@@ -2518,9 +2537,9 @@ mod tests {
     #[test]
     fn post_commit_ensure_failure_names_the_already_published_fragment() {
         let file = tempfile::NamedTempFile::new().unwrap();
-        let mut pile = storage::open_store(file.path()).unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[99; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
         let relations_source = crate::collection_names::open(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,

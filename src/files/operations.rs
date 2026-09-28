@@ -10,6 +10,7 @@ use crate::schemas::embeddings;
 use crate::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
+use crate::storage::FactRead;
 use crate::storage::{read, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
@@ -308,26 +309,17 @@ fn files_view_in<T>(
     ) -> Result<T>,
 ) -> Result<T> {
     {
-        let descriptors = store
-            .snapshot()
-            .context("freeze Files source policy snapshot")?;
-        let policy = collection
-            .policy(&descriptors)
-            .context("read Files source collection policy")?;
-        drop(descriptors);
         let succinct = store
-            .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
+            .attach::<SuccinctArchiveBlob>(collection, ())
             .context("register Files Succinct collection")?;
         let rank9 = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, succinct)
             .context("register Files Rank9 collection")?;
         let reader = store
             .snapshot()
             .context("freeze the Files views as they stand")?;
         let space = reader
-            .collection(rank9)
-            .context("observe Files fact collection")?
-            .view::<FactArchive>()
+            .read_facts(rank9)
             .context("read Files fact collection")?;
         f(store, collection, signer, &space, &reader, runtime)
     }
@@ -2834,11 +2826,10 @@ mod tests {
         let (succinct, rank9) = storage
             .with_pile(|pile, signer| {
                 let source = open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 Ok((
                     succinct,
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?,
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?,
                 ))
             })
             .unwrap();
@@ -2846,10 +2837,10 @@ mod tests {
             storage
                 .with_pile(|pile, signer| {
                     let snapshot = pollster::block_on(async {
-                        drop(pile.maintain(succinct, signer).await?);
-                        pile.maintain(rank9, signer).await
+                        drop(pile.maintain_attached(succinct, signer).await?);
+                        pile.maintain_attached(rank9, signer).await
                     })?;
-                    Ok(snapshot.collection(rank9)?.view::<FactArchive>()?)
+                    Ok(snapshot.read_facts(rank9)?)
                 })
                 .unwrap()
         };
@@ -3660,7 +3651,7 @@ mod tests {
     }
 
     #[test]
-    fn every_reader_attaches_the_files_views_as_they_stand() {
+    fn every_reader_sees_every_files_commit_attached_or_not() {
         let test_pile = TestPile::new();
         let owner = Storage::new(test_pile.path.clone(), None);
         let first = file_capability::stage(b"first".to_vec(), "first.txt", "text/plain").unwrap();
@@ -3691,17 +3682,17 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        // The owner holds WRITE on the derived targets and still attaches the
-        // views exactly as they stand: a read maintains nothing.
+        // A read maintains nothing: it takes the attachment of the carried
+        // commit and reads the uncarried one from its own bytes.
         with_files_view(&owner, |_, _, _, space, _, _| {
-            assert_eq!(file_ids(space), BTreeSet::from([first_id]));
+            assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
             Ok(())
         })
         .unwrap();
 
-        // A second key without WRITE reads the owner's collection: it must
-        // neither fail for want of rights nor publish maintenance it may not,
-        // and it sees exactly what the owner saw.
+        // A second key reads the owner's collection: it must neither fail
+        // for want of rights nor publish anything, and it sees what the owner
+        // saw, from the bytes, since it believes none of the owner's MAPs.
         let reader_key = test_pile.dir.join("reader.key");
         initialize_signer(&test_pile.path, Some(&reader_key)).unwrap();
         let reader = Storage::new(test_pile.path.clone(), Some(reader_key));
@@ -3716,19 +3707,15 @@ mod tests {
                     signer,
                     runtime,
                     |_, _, _, space, _, _| {
-                        let ids = file_ids(space);
-                        assert!(ids.contains(&first_id), "the maintained view is readable");
-                        assert!(
-                            !ids.contains(&second_id),
-                            "a reader without WRITE attaches the views as they stand"
-                        );
+                        assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
                         Ok(())
                     },
                 )
             })
             .unwrap();
 
-        // Once the worker carries the second commit, both readers see it.
+        // Once the worker carries the second commit, both readers still see
+        // both.
         with_files_store(&owner, |store, collection, signer, _| {
             crate::storage::carry_facts(store, collection, signer);
             Ok(())

@@ -136,11 +136,10 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
             })?;
             let warm = pile.commit(source, owner, fragment)?;
             let warm = Handle::<blobencodings::SimpleArchive>::from_hash(warm.data());
-            let policy = source.policy(&pile.snapshot()?)?;
-            let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
-            drop(pollster::block_on(pile.maintain(succinct, owner))?);
-            drop(pollster::block_on(pile.maintain(rank9, owner))?);
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+            drop(pollster::block_on(pile.maintain_attached(succinct, owner))?);
+            drop(pollster::block_on(pile.maintain_attached(rank9, owner))?);
 
             let mut remote = MemoryRepo::default();
             let cold_record = remote.commit(
@@ -153,21 +152,19 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
             let snapshot = pile.snapshot()?;
             assert!(source.admitted(&snapshot)?.contains(cold));
             assert!(!snapshot.contains_blob(cold)?);
-            // Both views derived the resident commit; the cold one is not
-            // readable here, so neither view lags anything this reader sees.
+            // Both collections attached the resident commit; the cold one
+            // is their residual, its bytes not here.
             let root = snapshot.collection(source)?;
             assert!(root.support().unwrap().contains(warm));
-            let succinct_view = snapshot.collection(succinct)?;
-            assert!(succinct_view.missing_from(&root).unwrap().is_empty());
-            assert!(snapshot
-                .collection(rank9)?
-                .missing_from(&succinct_view)
-                .unwrap()
-                .is_empty());
-            drop((root, succinct_view));
+            for residual in [
+                snapshot.attached(succinct)?.residual().clone(),
+                snapshot.attached(rank9)?.residual().clone(),
+            ] {
+                assert_eq!(residual.len(), 1);
+                assert!(residual.contains(cold));
+            }
+            drop(root);
             assert!(!source.writer_is_admitted(&snapshot, reader.verifying_key())?);
-            assert!(!succinct.writer_is_admitted(&snapshot, reader.verifying_key())?);
-            assert!(!rank9.writer_is_admitted(&snapshot, reader.verifying_key())?);
             assert_eq!(snapshot.wants()?.count(), 0);
             let before = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
             Ok((source, cold, before, warm_id))

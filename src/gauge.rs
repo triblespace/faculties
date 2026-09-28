@@ -4,7 +4,7 @@ pub mod mcp;
 pub mod presentation;
 
 #[cfg(test)]
-use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{load_signer, open_pile_strict_as};
 use crate::wiki::{self as wiki_model, FrontierModel, LinkResolution};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -364,7 +364,7 @@ mod tests {
 
         fn publish(&self, fragment: Fragment) {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
             let collection = crate::collection_names::open(
                 &mut pile,
                 crate::schemas::wiki::DEFAULT_SCOPE_ID,

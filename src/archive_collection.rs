@@ -7,8 +7,10 @@
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
+use crate::storage::FactView;
 use std::borrow::BorrowMut;
 use std::collections::{BTreeMap, BTreeSet};
+use triblespace::core::collection::AttachedSnapshot;
 
 use anybytes::Bytes;
 use anyhow::{anyhow, bail, Context, Result};
@@ -19,7 +21,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
+    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
@@ -34,13 +36,14 @@ use triblespace_search::portable_bm25::PortableBM25Blob;
 use crate::archive_bm25;
 use crate::blockdag;
 use crate::schemas::blockdag as schema;
-use crate::storage::{load_signer, open_pile_strict, FactArchive, FactLag};
+#[cfg(test)]
+use crate::storage::open_pile_strict;
+use crate::storage::{load_signer, open_pile_strict_as, FactArchive, FactLag};
 
 use crate::collection_names::open_configured;
 #[cfg(test)]
 use triblespace::core::collection::{
-    CollectionDerivation, CollectionDerive, CollectionRealizationError, CollectionRecord,
-    CollectionStore,
+    CollectionAttachment, CollectionMap, CollectionRecord, CollectionStore,
 };
 #[cfg(test)]
 use triblespace::core::repo::BlobStoreMeta;
@@ -65,14 +68,12 @@ impl ArchiveImportWriter {
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
         let signer = load_signer(pile_path, key_path)?;
-        let mut pile = open_pile_strict(pile_path)?;
+        let mut pile = open_pile_strict_as(pile_path, signer.verifying_key())?;
         let result = async {
             let source =
                 open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let observed = ensure_facts(&mut pile, source, &signer).await?;
-            let current = observed
-                .view::<FactArchive>()
-                .context("read Archive facts")?;
+            let current = observed.facts().context("read Archive facts")?;
             Ok((source, current))
         }
         .await;
@@ -112,9 +113,7 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
             signer.verifying_key(),
         )?;
         let observed = ensure_facts(pile.borrow_mut(), source, signer).await?;
-        let current = observed
-            .view::<FactArchive>()
-            .context("read Archive facts")?;
+        let current = observed.facts().context("read Archive facts")?;
         let mut writer = Self {
             pile,
             collection: source,
@@ -296,7 +295,7 @@ fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result
 pub async fn ensure_local(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
-) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
+) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     ensure_local_with_storage(&crate::storage::Storage::new(
         pile_path.to_owned(),
         key_path.map(std::path::Path::to_owned),
@@ -305,7 +304,7 @@ pub async fn ensure_local(
 
 pub fn ensure_local_with_storage(
     storage: &crate::storage::Storage,
-) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
+) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     storage.with_pile(|pile, signer| {
         let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
         pollster::block_on(ensure_facts(pile, source, signer))
@@ -323,32 +322,30 @@ fn fact_views(
     crate::storage::fact_pair(pile, source).context("register Archive fact collections")
 }
 
-/// Derive the signer's own Archive commits into the fact pair and mirror its
-/// own merges there, then attach Rank9. Another writer's commit that has no
-/// leaf yet is derived too when its payload is already here; nothing is
-/// fetched for it, and what cannot be derived here is that writer's lag, as
-/// is an own commit neither view can derive.
+/// Carry the Archive source and attach what the carry leaves into the fact
+/// pair, then read Rank9. A commit whose bytes are not here is not fetched;
+/// it is the pair's residual and is counted as its lag.
 async fn ensure_facts(
     pile: &mut Pile,
     source: Collection<SimpleArchive>,
     signer: &SigningKey,
-) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
+) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     let (succinct, rank9) = fact_views(pile, source)?;
-    crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+    crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
         .context("maintain Succinct Archive fact collection")?;
-    crate::storage::tolerate_own_lag(pile.maintain(rank9, signer).await)
+    crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
         .context("maintain Rank9 Archive fact collection")?;
     pile.snapshot()
         .context("freeze maintained Archive facts")?
-        .collection(rank9)
+        .attached(rank9)
         .context("attach Archive fact collection")
 }
 
-/// Accelerated-Succinct derivation summary. Source membership is measured in
+/// Accelerated-Succinct index summary. Source membership is measured in
 /// distinct commit payloads the snapshot can read, never in the number of
-/// attestations over them; the lag says how many admitted commits each hop of
-/// the fact pair has not derived yet, a commit whose payload is not here
-/// included.
+/// attestations over them; the lag says how many source foundations no
+/// attachment of each collection of the fact pair reaches yet, a commit whose
+/// payload is not here included.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SuccinctIndexReport {
     pub source_elements: usize,
@@ -390,9 +387,9 @@ pub fn ensure_succinct_index_with_storage(
     })
 }
 
-/// Archive BM25 derivation summary: the source commits the snapshot can
-/// read, how many admitted source commits the index has no leaf for yet, and
-/// how many segments its resident cover has.
+/// Archive BM25 index summary: the source commits the snapshot can read, how
+/// many source foundations no BM25 attachment reaches yet, and how many
+/// segments its attached cover has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Bm25IndexReport {
     pub source_elements: usize,
@@ -407,32 +404,27 @@ struct EnsuredBm25 {
     index: archive_bm25::ArchiveBM25View,
 }
 
-/// Register the BM25 derivation over the Archive source.
+/// Attach the BM25 index to the Archive source.
 fn bm25_target(
     pile: &mut Pile,
     source: Collection<SimpleArchive>,
-    signer: &SigningKey,
 ) -> Result<Collection<PortableBM25Blob>> {
-    pile.derive_with(
-        source,
-        archive_bm25::ArchiveBlockTextBm25Mapping,
-        crate::collection_names::private_policy(signer.verifying_key()),
-    )
-    .context("register Archive BM25 derivation")
+    pile.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)
+        .context("attach the Archive BM25 index")
 }
 
-/// Derive the signer's own Archive commits into the BM25 index and mirror
-/// its own merges there, then read it back from the maintained snapshot
-/// together with how far it lags the source there.
+/// Carry the Archive source and attach what the carry leaves into the BM25
+/// index, then read it back from the maintained snapshot together with how
+/// many source foundations no attachment reaches there.
 /// Provenance records are neither part of this value nor required to replay it.
 async fn ensure_bm25(
     pile: &mut Pile,
     source: Collection<SimpleArchive>,
     signer: &SigningKey,
 ) -> Result<EnsuredBm25> {
-    let target = bm25_target(pile, source, signer)?;
+    let target = bm25_target(pile, source)?;
     crate::storage::tolerate_own_lag(
-        pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer)
+        pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer)
             .await,
     )
     .context("maintain Archive BM25 cover")?;
@@ -440,13 +432,12 @@ async fn ensure_bm25(
         .snapshot()
         .context("freeze maintained Archive BM25 cover")?;
     let attached = maintained
-        .collection(target)
+        .attached(target)
         .context("attach Archive BM25 cover")?;
     let source_view = maintained
         .collection(source)
         .context("attach Archive source")?;
-    let lagging = crate::storage::underived(&maintained, source, target)
-        .context("count Archive commits without a BM25 leaf")?;
+    let lagging = attached.residual().len();
     let index = attached
         .view::<archive_bm25::ArchiveBM25View>()
         .context("read Archive BM25 cover")?;
@@ -488,13 +479,13 @@ pub fn ensure_bm25_index_with_storage(
 }
 
 /// How far the two Archive search views lag the source in the one snapshot
-/// both were attached from. Each view is derived by each writer for its own
-/// commits, so the two may lag differently; a search reads what is present.
+/// both were attached from. Each view is attached on its own, so the two may
+/// lag differently; a search reads what is present.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArchiveSearchLag {
     /// The fact pair the results are joined against.
     pub facts: FactLag,
-    /// Source commits the BM25 index has no leaf for yet.
+    /// Source foundations no BM25 attachment reaches yet.
     pub index: usize,
 }
 
@@ -506,11 +497,11 @@ impl ArchiveSearchLag {
     }
 }
 
-/// Prepare the fact and search views from one snapshot. Both are derived
-/// from the one Archive source and both are maintained here for the signer,
-/// then attached from one snapshot. They need not stand for the same source
-/// commits: another writer's commit reaches each view when that writer
-/// derives it, and a commit landing between the two passes reaches one view
+/// Prepare the fact and search views from one snapshot. Both are attached
+/// to the one Archive source and both are maintained here, then read from
+/// one snapshot. They need not stand for the same source foundations: a node
+/// one mapping cannot represent is left to finer nodes there and not in the
+/// other, and a commit landing between the two passes reaches one view
 /// first. The returned lag says how far each is behind; nothing waits for
 /// them to agree. The returned collection snapshot exposes the usual fact
 /// view and blob reader; callers explicitly prepare a BM25 query and join
@@ -521,7 +512,7 @@ pub async fn ensure_search_local(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<(
-    CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     archive_bm25::ArchiveBM25View,
     ArchiveSearchLag,
 )> {
@@ -534,19 +525,21 @@ pub async fn ensure_search_local(
 pub fn ensure_search_local_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<(
-    CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     archive_bm25::ArchiveBM25View,
     ArchiveSearchLag,
 )> {
     storage.with_pile(|pile, signer| {
         pollster::block_on(async {
             let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let target = bm25_target(pile, source, signer)?;
+            let target = bm25_target(pile, source)?;
             let (succinct, rank9) = fact_views(pile, source)?;
             drop(ensure_facts(pile, source, signer).await?);
             crate::storage::tolerate_own_lag(
-                pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer)
-                    .await,
+                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                    target, signer,
+                )
+                .await,
             )
             .context("maintain Archive BM25 cover")?;
             // One snapshot for both views: search maintenance may have
@@ -556,15 +549,14 @@ pub fn ensure_search_local_with_storage(
                 .snapshot()
                 .context("freeze prepared Archive search snapshot")?;
             let facts = after
-                .collection(rank9)
+                .attached(rank9)
                 .context("attach Archive search facts")?;
             let search = after
-                .collection(target)
+                .attached(target)
                 .context("attach Archive BM25 cover")?;
             let lag = ArchiveSearchLag {
                 facts: FactLag::of(&after, source, succinct, rank9)?,
-                index: crate::storage::underived(&after, source, target)
-                    .context("count Archive commits without a BM25 leaf")?,
+                index: search.residual().len(),
             };
             let index = search
                 .view::<archive_bm25::ArchiveBM25View>()
@@ -789,6 +781,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::FactRead;
     use std::convert::Infallible;
 
     /// Descriptor-local authority of the Archive fixture.
@@ -809,19 +802,13 @@ mod tests {
             .unwrap()
     }
 
-    /// The derived BM25 collection over that root.
+    /// The BM25 collection attached to that root.
     fn test_target(
         store: &mut Pile,
         source: Collection<SimpleArchive>,
-        pile: &std::path::Path,
-        key: &std::path::Path,
     ) -> Collection<PortableBM25Blob> {
         store
-            .derive_with(
-                source,
-                archive_bm25::ArchiveBlockTextBm25Mapping,
-                crate::collection_names::private_policy(test_authority(pile, key)),
-            )
+            .attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)
             .unwrap()
     }
 
@@ -987,30 +974,15 @@ mod tests {
     /// Whether the observed fact view stands on `commit`: the source reads it
     /// and neither hop of the fact pair still lacks a leaf for anything the
     /// source reads. The observation's own store snapshot answers both.
+    /// Whether the attached read stands on `commit` with nothing residual.
     fn facts_stand_on(
-        observed: &CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+        observed: &AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
         commit: &CollectionCommit,
     ) -> bool {
-        let snapshot = observed.snapshot();
-        let source = Collection::<SimpleArchive>::open(snapshot, commit.collection()).unwrap();
-        let rank9 = observed.cover().collection();
-        // Rank9's descriptor names its source, the pair's Succinct view.
-        let succinct = triblespace::core::collection::derived_from(snapshot, source.handle())
-            .unwrap()
-            .into_iter()
-            .find(|derived| derived.handle == rank9.handle())
-            .map(|derived| Collection::<SuccinctArchiveBlob>::open(snapshot, derived.source))
-            .expect("the fact pair is listed")
-            .unwrap();
-        snapshot
-            .collection(source)
-            .unwrap()
+        observed
             .support()
-            .unwrap()
             .contains(Handle::<SimpleArchive>::from_hash(commit.data()))
-            && FactLag::of(snapshot, source, succinct, rank9)
-                .unwrap()
-                .is_current()
+            && observed.residual().is_empty()
     }
 
     #[test]
@@ -1040,23 +1012,15 @@ mod tests {
         drop(reader);
         physical.close().unwrap();
         let before = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert!(before.support().unwrap().is_empty());
-        assert!(before
-            .view::<FactArchive>()
-            .unwrap()
-            .iter()
-            .next()
-            .is_none());
+        assert!(before.support().is_empty());
+        assert!(before.facts().unwrap().iter().next().is_none());
         drop(before);
 
         let commit = writer.finish(Ok(())).unwrap().1.unwrap();
         let after = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(after.support().unwrap().len(), 1);
+        assert_eq!(after.support().len(), 1);
         assert!(facts_stand_on(&after, &commit));
-        assert_eq!(
-            projection_ids(&after.view::<FactArchive>().unwrap()).len(),
-            1
-        );
+        assert_eq!(projection_ids(&after.facts().unwrap()).len(), 1);
     }
 
     #[test]
@@ -1081,13 +1045,8 @@ mod tests {
         // sound, no semantic edge escaped, and the dependency is merely an
         // unreachable content-addressed record available for later GC.
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert!(snapshot.support().unwrap().is_empty());
-        assert!(snapshot
-            .view::<FactArchive>()
-            .unwrap()
-            .iter()
-            .next()
-            .is_none());
+        assert!(snapshot.support().is_empty());
+        assert!(snapshot.facts().unwrap().iter().next().is_none());
         drop(snapshot);
         let mut physical = open_pile_strict(&pile).unwrap();
         let reader = physical.snapshot().unwrap();
@@ -1121,32 +1080,24 @@ mod tests {
         writer.stage_fragment(fragment.clone()).unwrap();
         assert!(writer.commit_unit().unwrap().is_some());
         // The reader prepares the projection; the writer only commits.
-        let policy = writer
-            .collection
-            .policy(&writer.pile.snapshot().unwrap())
-            .unwrap();
         let succinct = writer
             .pile
-            .derive::<SuccinctArchiveBlob>(writer.collection, (), policy.clone())
+            .attach::<SuccinctArchiveBlob>(writer.collection, ())
             .unwrap();
         let rank9 = writer
             .pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(writer.collection, succinct)
             .unwrap();
         let prepared = {
             let signer = writer.signer.clone();
             let pile = &mut writer.pile;
             pollster::block_on(async {
-                drop(pile.maintain(succinct, &signer).await.unwrap());
-                pile.maintain(rank9, &signer).await
+                drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+                pile.maintain_attached(rank9, &signer).await
             })
             .unwrap()
         };
-        let prepared_facts = prepared
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let prepared_facts = prepared.read_facts(rank9).unwrap();
         assert!(fragment
             .facts()
             .iter()
@@ -1158,8 +1109,8 @@ mod tests {
         assert!(writer.finish(Ok(())).unwrap().1.is_some());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().unwrap().len(), 2);
-        let facts = snapshot.view::<FactArchive>().unwrap();
+        assert_eq!(snapshot.support().len(), 2);
+        let facts = snapshot.facts().unwrap();
         let tags: BTreeSet<_> = find!(
             tag: Id,
             pattern!(&facts, [{ fact.id @ metadata::tag: ?tag }])
@@ -1272,12 +1223,9 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().unwrap().len(), 1);
+        assert_eq!(snapshot.support().len(), 1);
         assert!(facts_stand_on(&snapshot, &first));
-        assert_eq!(
-            projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
-            1
-        );
+        assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 1);
     }
 
     #[test]
@@ -1299,12 +1247,9 @@ mod tests {
         pile.close().unwrap();
 
         let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key_path))).unwrap();
-        assert_eq!(snapshot.support().unwrap().len(), 1);
+        assert_eq!(snapshot.support().len(), 1);
         assert!(facts_stand_on(&snapshot, &admitted));
-        assert_eq!(
-            projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
-            1
-        );
+        assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 1);
     }
 
     #[test]
@@ -1331,7 +1276,7 @@ mod tests {
         writer.finish(Ok(())).unwrap();
 
         let archive = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        let facts = archive.view::<FactArchive>().unwrap();
+        let facts = archive.facts().unwrap();
         let snapshots: BTreeSet<_> = find!(
             snapshot: Id,
             pattern!(&facts, [{ ?snapshot @ metadata::tag: &schema::source_snapshot::KIND }])
@@ -1408,12 +1353,9 @@ mod tests {
         assert_ne!(first.data(), second.data());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().unwrap().len(), 2);
-        assert_eq!(
-            projection_ids(&snapshot.view::<FactArchive>().unwrap()).len(),
-            2
-        );
-        assert!(snapshot.view::<FactArchive>().unwrap().iter().count() > first_len);
+        assert_eq!(snapshot.support().len(), 2);
+        assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 2);
+        assert!(snapshot.facts().unwrap().iter().count() > first_len);
     }
 
     #[test]
@@ -1428,7 +1370,7 @@ mod tests {
         assert_eq!((report.source_elements, report.cover_segments), (0, 0));
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert!(search.0.support().unwrap().is_empty());
+        assert!(search.0.support().is_empty());
         assert!(search
             .1
             .query()
@@ -1438,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_commit_receives_exact_empty_derives_and_keeps_reads_empty() {
+    fn empty_commit_receives_exact_empty_attachments_and_keeps_reads_empty() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -1462,24 +1404,21 @@ mod tests {
             let store_snapshot = pile.snapshot().unwrap();
             discovered_records(&store_snapshot).unwrap()
         };
-        let derives: Vec<_> = records
-            .derives()
+        let maps = records
+            .maps()
             .iter()
-            .filter(|claim| {
-                claim.input() == triblespace::core::collection::SourceLocator::of(commit.data().raw)
-            })
-            .collect();
+            .filter(|map| map.node() == commit.data())
+            .count();
         assert_eq!(
-            derives.len(),
-            2,
-            "one empty leaf per mapping over the source"
+            maps, 3,
+            "one empty attachment per collection attached to the source"
         );
         pile.close().unwrap();
 
         let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().unwrap().len(), 1);
+        assert_eq!(snapshot.support().len(), 1);
         assert!(facts_stand_on(&snapshot, &commit));
-        assert!(projection_ids(&snapshot.view::<FactArchive>().unwrap()).is_empty());
+        assert!(projection_ids(&snapshot.facts().unwrap()).is_empty());
         drop(snapshot);
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         assert!(search
@@ -1519,7 +1458,7 @@ mod tests {
         writer.finish(Ok(())).unwrap();
 
         let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        let facts = snapshot.view::<FactArchive>().unwrap();
+        let facts = snapshot.facts().unwrap();
         let complete = timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
         assert_eq!(complete.len(), 2);
         assert!(complete[0].position < complete[1].position);
@@ -1568,7 +1507,7 @@ mod tests {
         writer.finish(Ok(())).unwrap();
 
         let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        let facts = snapshot.view::<FactArchive>().unwrap();
+        let facts = snapshot.facts().unwrap();
         let timeline = timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
         assert_eq!(timeline.len(), 3, "the untimed conduit stays invisible");
         assert_eq!(timeline[0].block, independent_id);
@@ -1617,54 +1556,41 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let authority = load_signer(&pile_path, Some(&key)).unwrap().verifying_key();
         let source = test_source(&mut pile, &pile_path, &key);
-        let raw_target = pile
-            .derive::<SuccinctArchiveBlob>(
-                source,
-                (),
-                crate::collection_names::private_policy(authority),
-            )
-            .unwrap();
+        let raw_target = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let records = {
             let store_snapshot = pile.snapshot().unwrap();
             discovered_records(&store_snapshot).unwrap()
         };
-        let derive = records
-            .derives()
+        let map = records
+            .maps()
             .iter()
-            .find(|derive| derive.collection() == raw_target.handle())
+            .find(|map| map.attached() == raw_target.handle())
             .copied()
-            .expect("stored Archive raw-Succinct DERIVE");
-        // The leaf names its source commit by locator, which is not a
-        // fetchable handle: the commit it stands for is the one whose
-        // payload has that locator.
+            .expect("stored Archive raw-Succinct MAP");
+        // The MAP names its parent node by handle: the commit it stands for.
         let commit = records
             .commits()
             .iter()
-            .find(|commit| {
-                triblespace::core::collection::SourceLocator::of(commit.data().raw)
-                    == derive.input()
-            })
+            .find(|commit| commit.data() == map.node())
             .copied()
-            .expect("the leaf names an Archive commit");
+            .expect("the MAP names an Archive commit");
         let reader = pile.snapshot().unwrap();
-        let output = derive.output();
         let input: Blob<SimpleArchive> = reader
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
             .unwrap();
         let output: Blob<SuccinctArchiveBlob> = reader
-            .get(Handle::<SuccinctArchiveBlob>::from_hash(output))
+            .get(Handle::<SuccinctArchiveBlob>::from_hash(map.attachment()))
             .unwrap();
         let expected =
-            <SuccinctArchiveBlob as CollectionDerivation>::map(&(), &input, &reader).unwrap();
+            <SuccinctArchiveBlob as CollectionAttachment>::map(&(), &input, &[], &reader).unwrap();
         assert_eq!(expected.get_handle(), output.get_handle());
         pile.close().unwrap();
     }
 
-    /// Each own commit gets one BM25 leaf. With no source merge to mirror,
-    /// the index reads its two leaves as two segments, stands for both
-    /// commits, and a repeat publishes nothing.
+    /// Each commit gets one BM25 attachment. With no source merge, the index
+    /// reads its two attachments as two segments, stands for both commits,
+    /// and a repeat publishes nothing.
     #[test]
     fn bm25_uses_per_commit_leaves_and_reads_them_unmerged() {
         let directory = TempDir::new().unwrap();
@@ -1692,33 +1618,26 @@ mod tests {
         );
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
 
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let signer = load_signer(&pile_path, Some(&key)).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
-        let target = test_target(&mut pile, source, &pile_path, &key);
+        let target = test_target(&mut pile, source);
         let records = {
             let store_snapshot = pile.snapshot().unwrap();
             discovered_records(&store_snapshot).unwrap()
         };
-        let derives: Vec<_> = records
-            .derives()
+        let maps = records
+            .maps()
             .iter()
-            .filter(|claim| claim.collection() == target.handle())
-            .copied()
-            .collect();
-        let merges: Vec<_> = records
-            .merges()
-            .iter()
-            .filter(|claim| claim.collection() == target.handle())
-            .copied()
-            .collect();
-        assert_eq!(derives.len(), 2);
-        assert!(merges.is_empty());
+            .filter(|map| map.attached() == target.handle())
+            .count();
+        assert_eq!(maps, 2);
+        assert!(records.derives().is_empty());
         let store_snapshot = pile.snapshot().unwrap();
-        let source_view = store_snapshot.collection(source).unwrap();
-        let attached = store_snapshot.collection(target).unwrap();
-        assert!(attached.missing_from(&source_view).unwrap().is_empty());
+        let attached = store_snapshot.attached(target).unwrap();
+        assert!(attached.residual().is_empty());
         assert_eq!(attached.cover().len(), 2);
-        drop((source_view, attached));
+        drop(attached);
         pile.close().unwrap();
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
@@ -1815,14 +1734,13 @@ mod tests {
 
     /// The collection union is a valid Archive, but the tagged block and its
     /// part/fact closure live in separate signed elements. Each commit is a
-    /// leaf of its own and a DERIVE names one source foundation, so no leaf
-    /// sees both halves, and mirroring a merge of the two needs both leaves
-    /// first: this law cannot index the block, now or later. That is the
-    /// block's lag and nobody else's. Every other commit is still derived,
-    /// search reads around the block and says it lags, explicit maintenance
-    /// names it with the mapping's reason, and a repeat publishes nothing.
+    /// node of its own, and the BM25 mapping refuses the node that holds the
+    /// block without its closure: maintenance leaves that node as the
+    /// residual, attaches every other one, and a repeat publishes nothing.
+    /// Once the carry joins the two halves into one merged node, that node
+    /// holds the whole closure, and its attachment represents the block.
     #[test]
-    fn bm25_leaves_a_split_block_as_lag_and_derives_every_other_commit() {
+    fn bm25_leaves_a_split_block_residual_until_a_merged_node_holds_it() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -1832,27 +1750,24 @@ mod tests {
         let (block_element, remainder_element) =
             projection_split_across_source_elements("session:split", "closure needle");
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let collection =
             open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let block_commit = pile.commit(collection, &signer, block_element).unwrap();
         let remainder_commit = pile.commit(collection, &signer, remainder_element).unwrap();
-        let target = test_target(&mut pile, collection, &pile_path, &key);
+        let target = test_target(&mut pile, collection);
         pile.close().unwrap();
-        // A whole commit after the split one: derived like any other.
+        // A whole commit after the split one: attached like any other.
         commit_projection(&pile_path, &key, "session:whole", "whole haystack");
 
         let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(archive.support().unwrap().len(), 3);
-        assert_eq!(
-            projection_ids(&archive.view::<FactArchive>().unwrap()).len(),
-            2
-        );
+        assert_eq!(archive.support().len(), 3);
+        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
         drop(archive);
 
         let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
         assert_eq!(report.source_elements, 3);
-        assert_eq!(report.lagging, 1, "only the split block lags");
+        assert_eq!(report.lagging, 1, "only the split block's node is residual");
         let length = std::fs::metadata(&pile_path).unwrap().len();
         assert_eq!(
             pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap(),
@@ -1861,43 +1776,20 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&pile_path).unwrap().len(),
             length,
-            "a refused leaf publishes nothing on a later pass either"
+            "a refused node publishes nothing on a later pass either"
         );
 
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let records = discovered_records(&pile.snapshot().unwrap()).unwrap();
-        let has_leaf = |commit: &CollectionCommit| {
-            let locator = triblespace::core::collection::SourceLocator::of(commit.data().raw);
-            records
-                .derives()
-                .iter()
-                .any(|derive| derive.collection() == target.handle() && derive.input() == locator)
-        };
-        assert!(!has_leaf(&block_commit));
-        assert!(has_leaf(&remainder_commit));
-        assert_eq!(
-            records
-                .derives()
-                .iter()
-                .filter(|derive| derive.collection() == target.handle())
-                .count(),
-            2
-        );
-        let error = pollster::block_on(
-            pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
-        )
-        .err()
-        .expect("explicit maintenance names the block it cannot derive");
-        let CollectionRealizationError::Unmappable { blocked } = error else {
-            panic!("expected Unmappable, got {error}");
-        };
-        assert_eq!(blocked.len(), 1);
-        assert_eq!(blocked[0].0, block_commit.data());
-        assert!(
-            blocked[0].1.contains("references absent part"),
-            "{}",
-            blocked[0].1
-        );
+        let attached_nodes: BTreeSet<_> = records
+            .maps()
+            .iter()
+            .filter(|map| map.attached() == target.handle())
+            .map(|map| map.node())
+            .collect();
+        assert!(!attached_nodes.contains(&block_commit.data()));
+        assert!(attached_nodes.contains(&remainder_commit.data()));
+        assert_eq!(attached_nodes.len(), 2);
         pile.close().unwrap();
 
         let (_, index, lag) =
@@ -1907,16 +1799,31 @@ mod tests {
         let query = index.query().unwrap();
         assert_eq!(query.query_multi(&hash_tokens("whole haystack")).len(), 1);
         assert!(query.query_multi(&hash_tokens("closure needle")).is_empty());
+        drop(query);
+        drop(index);
+
+        // Five more commits fill the lowest tier; the carry joins all eight
+        // into one node, which holds the block with its closure.
+        for word in ["one", "two", "three", "four", "five"] {
+            commit_projection(&pile_path, &key, &format!("session:{word}"), word);
+        }
+        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        assert_eq!(report.lagging, 0);
+        assert_eq!(report.cover_segments, 1);
+        let (_, index, lag) =
+            pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
+        assert!(lag.is_current(), "{lag:?}");
+        let query = index.query().unwrap();
+        assert_eq!(query.query_multi(&hash_tokens("closure needle")).len(), 1);
     }
 
-    /// Eight own commits fill the root's lowest tier, so the root carry joins
-    /// them with one 8-input MERGE. BM25 maintenance derives the eight leaves
-    /// and mirrors that merge exactly once: one target MERGE over the eight
-    /// leaf images, its result the mapping of the merged source node's own
-    /// bytes. The index then reads as one segment that finds every commit,
-    /// and a repeat pass publishes nothing.
+    /// Eight commits fill the root's lowest tier, so the carry joins them
+    /// with one 8-input MERGE, and BM25 maintenance attaches the merged node
+    /// once, mapped from the merged node's own bytes; nothing is attached to
+    /// the eight nodes the carry consumed. The index then reads as one
+    /// segment that finds every commit, and a repeat publishes nothing.
     #[test]
-    fn bm25_mirrors_an_own_root_merge_once_and_reads_it_as_one_segment() {
+    fn bm25_attaches_the_merged_node_once_and_reads_it_as_one_segment() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -1930,10 +1837,26 @@ mod tests {
             commit_projection(&pile_path, &key, &format!("session:{word}"), word);
         }
 
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
-        let target = test_target(&mut pile, source, &pile_path, &key);
-        drop(pollster::block_on(pile.maintain(source, &signer)).unwrap());
+        let target = test_target(&mut pile, source);
+        let bm25_maps = |pile: &mut Pile| {
+            let records = discovered_records(&pile.snapshot().unwrap()).unwrap();
+            records
+                .maps()
+                .iter()
+                .filter(|map| map.attached() == target.handle())
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        drop(
+            pollster::block_on(
+                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                    target, &signer,
+                ),
+            )
+            .unwrap(),
+        );
         let records = discovered_records(&pile.snapshot().unwrap()).unwrap();
         let root_merges: Vec<_> = records
             .merges()
@@ -1943,32 +1866,9 @@ mod tests {
             .collect();
         assert_eq!(root_merges.len(), 1, "one carry of the full tier");
         assert_eq!(root_merges[0].inputs().len(), words.len());
-
-        let bm25_records = |pile: &mut Pile| {
-            let records = discovered_records(&pile.snapshot().unwrap()).unwrap();
-            let derives = records
-                .derives()
-                .iter()
-                .filter(|derive| derive.collection() == target.handle())
-                .count();
-            let merges: Vec<_> = records
-                .merges()
-                .iter()
-                .filter(|merge| merge.collection() == target.handle())
-                .copied()
-                .collect();
-            (derives, merges)
-        };
-        drop(
-            pollster::block_on(
-                pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
-            )
-            .unwrap(),
-        );
-        let (derives, merges) = bm25_records(&mut pile);
-        assert_eq!(derives, words.len());
-        assert_eq!(merges.len(), 1, "the own root merge is mirrored once");
-        assert_eq!(merges[0].inputs().len(), words.len());
+        let maps = bm25_maps(&mut pile);
+        assert_eq!(maps.len(), 1, "only the merged node is attached");
+        assert_eq!(maps[0].node(), root_merges[0].result());
         let snapshot = pile.snapshot().unwrap();
         let merged: Blob<SimpleArchive> = snapshot
             .get(Handle::<SimpleArchive>::from_hash(root_merges[0].result()))
@@ -1976,25 +1876,24 @@ mod tests {
         let expected = archive_bm25::derive_element(&snapshot, merged).unwrap();
         assert_eq!(
             Handle::<PortableBM25Blob>::to_hash(expected.get_handle()),
-            merges[0].result(),
-            "the mirror's image is the merged source node's own image"
+            maps[0].attachment(),
+            "the attachment is the merged node's own image"
         );
-        let attached = snapshot.collection(target).unwrap();
+        let attached = snapshot.attached(target).unwrap();
         assert_eq!(attached.cover().len(), 1);
-        assert_eq!(
-            crate::storage::underived(&snapshot, source, target).unwrap(),
-            0
-        );
+        assert!(attached.residual().is_empty());
         drop((attached, snapshot));
 
         let length = std::fs::metadata(&pile_path).unwrap().len();
         drop(
             pollster::block_on(
-                pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
+                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                    target, &signer,
+                ),
             )
             .unwrap(),
         );
-        assert_eq!(bm25_records(&mut pile), (derives, merges));
+        assert_eq!(bm25_maps(&mut pile), maps);
         pile.close().unwrap();
         assert_eq!(
             std::fs::metadata(&pile_path).unwrap().len(),
@@ -2012,75 +1911,73 @@ mod tests {
         }
     }
 
-    /// A new commit costs the index exactly one new leaf, the index stands
-    /// for every commit after each pass, and a complete repeat publishes no
-    /// record. With no source merge to mirror, each leaf is its own segment.
+    /// A new commit costs the index exactly one new attachment, the index
+    /// stands for every commit after each pass, and a complete repeat
+    /// publishes no record. With no source merge, each attachment is its own
+    /// segment.
     #[test]
-    fn bm25_maintenance_derives_only_the_new_leaf_and_repeats_without_work() {
+    fn bm25_maintenance_attaches_only_the_new_node_and_repeats_without_work() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
         let key = directory.path().join("archive.key");
         let signer = initialize_archive_fixture(&pile_path, &key);
-        let bm25_derives = |pile: &mut Pile, target: Collection<PortableBM25Blob>| {
+        let bm25_maps = |pile: &mut Pile, target: Collection<PortableBM25Blob>| {
             let store_snapshot = pile.snapshot().unwrap();
             discovered_records(&store_snapshot)
                 .unwrap()
-                .derives()
+                .maps()
                 .iter()
-                .filter(|claim| claim.collection() == target.handle())
+                .filter(|map| map.attached() == target.handle())
                 .count()
         };
-        let maintain_fresh = |pile: &mut Pile, source, target, segments: usize| {
+        let maintain_fresh = |pile: &mut Pile, target, segments: usize| {
             let maintained = pollster::block_on(
-                pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
+                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                    target, &signer,
+                ),
             )
             .unwrap();
-            let source_view = maintained.collection(source).unwrap();
-            let index = maintained.collection(target).unwrap();
-            assert!(index.missing_from(&source_view).unwrap().is_empty());
+            let index = maintained.attached(target).unwrap();
+            assert!(index.residual().is_empty());
             assert_eq!(index.cover().len(), segments);
         };
 
         commit_projection(&pile_path, &key, "session:first", "first residual");
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
-        let target = test_target(&mut pile, source, &pile_path, &key);
-        maintain_fresh(&mut pile, source, target, 1);
-        assert_eq!(bm25_derives(&mut pile, target), 1);
+        let target = test_target(&mut pile, source);
+        maintain_fresh(&mut pile, target, 1);
+        assert_eq!(bm25_maps(&mut pile, target), 1);
         pile.close().unwrap();
 
         commit_projection(&pile_path, &key, "session:second", "second residual");
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        maintain_fresh(&mut pile, source, target, 2);
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
+        maintain_fresh(&mut pile, target, 2);
         assert_eq!(
-            bm25_derives(&mut pile, target),
+            bm25_maps(&mut pile, target),
             2,
-            "only the new commit is derived"
+            "only the new commit is attached"
         );
-        let records_before = {
+        let count = |pile: &mut Pile| {
             let store_snapshot = pile.snapshot().unwrap();
-            discovered_records(&store_snapshot).unwrap()
+            store_snapshot.records().unwrap().count()
         };
-        let counts_before = (
-            records_before.derives().len(),
-            records_before.merges().len(),
-        );
-        maintain_fresh(&mut pile, source, target, 2);
-        let records_after = {
-            let store_snapshot = pile.snapshot().unwrap();
-            discovered_records(&store_snapshot).unwrap()
-        };
+        let before = count(&mut pile);
+        maintain_fresh(&mut pile, target, 2);
         assert_eq!(
-            (records_after.derives().len(), records_after.merges().len()),
-            counts_before,
+            count(&mut pile),
+            before,
             "a complete retry publishes no collection records"
         );
         pile.close().unwrap();
     }
 
+    /// A believed MAP whose attachment bytes are not here is not usable: the
+    /// read descends past it, and maintenance builds the same attachment
+    /// again, after which the read takes it.
     #[test]
-    fn maintenance_recovers_a_pending_derive_with_a_missing_output() {
+    fn maintenance_rebuilds_an_attachment_whose_bytes_are_missing() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2088,39 +1985,37 @@ mod tests {
         let signer = initialize_archive_fixture(&pile_path, &key);
         let commit = commit_projection(&pile_path, &key, "session:pending", "recover output");
 
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
-        let target = test_target(&mut pile, source, &pile_path, &key);
+        let target = test_target(&mut pile, source);
         let store_snapshot = pile.snapshot().unwrap();
         let input: Blob<SimpleArchive> = store_snapshot
             .get(Handle::<SimpleArchive>::from_hash(commit.data()))
             .unwrap();
         let output = archive_bm25::derive_element(&store_snapshot, input).unwrap();
         let output_data = Handle::<PortableBM25Blob>::to_hash(output.get_handle());
-        let pending = CollectionDerive::sign(
-            &signer,
-            target.handle(),
-            triblespace::core::collection::SourceLocator::of(commit.data().raw),
-            output_data,
-        );
+        let pending = CollectionMap::sign(&signer, target.handle(), commit.data(), output_data);
         drop(output);
         drop(store_snapshot);
-        CollectionStore::insert(&mut pile, CollectionRecord::Derive(pending)).unwrap();
-        assert!(pile
-            .snapshot()
-            .unwrap()
+        CollectionStore::insert(&mut pile, CollectionRecord::Map(pending)).unwrap();
+        let before = pile.snapshot().unwrap();
+        assert!(before
             .metadata(Handle::<PortableBM25Blob>::from_hash(output_data))
             .unwrap()
             .is_none());
+        let unusable = before.attached(target).unwrap();
+        assert!(unusable.cover().is_empty());
+        assert_eq!(unusable.residual().len(), 1);
+        drop((unusable, before));
 
         let ready_snapshot = pollster::block_on(
-            pile.maintain_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, &signer),
+            pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                target, &signer,
+            ),
         )
         .unwrap();
-        let ready = ready_snapshot.collection(target).unwrap();
-        let source_view = ready_snapshot.collection(source).unwrap();
-        assert!(ready.missing_from(&source_view).unwrap().is_empty());
-        drop(source_view);
+        let ready = ready_snapshot.attached(target).unwrap();
+        assert!(ready.residual().is_empty());
         assert_eq!(
             ready
                 .cover()
@@ -2134,20 +2029,20 @@ mod tests {
             let store_snapshot = pile.snapshot().unwrap();
             discovered_records(&store_snapshot).unwrap()
         };
-        assert_eq!(
+        assert!(
             records
-                .derives()
+                .maps()
                 .iter()
-                .filter(|claim| **claim == pending)
-                .count(),
-            1,
-            "the recovered deterministic equation remains one record"
+                .filter(|map| map.attached() == target.handle())
+                .all(|map| *map == pending),
+            "the rebuilt attachment is the same deterministic MAP"
         );
         pile.close().unwrap();
     }
+
     #[test]
     fn exact_fact_cover_and_raw_export_need_no_outer_commits() {
-        use triblespace::core::collection::CollectionDerivation;
+        use triblespace::core::collection::CollectionAttachment;
 
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
@@ -2186,12 +2081,9 @@ mod tests {
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let source = test_source(&mut pile, &pile_path, &key);
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let (_, facts, _metadata, blobs) = fragment.into_parts();
         stage_embedded_blobs(&mut pile, embedded_blobs(blobs)).unwrap();
@@ -2200,16 +2092,22 @@ mod tests {
         // however, manufacture admitted support or signed collection records.
         let before = pile.snapshot().unwrap();
         let raw: Blob<SimpleArchive> = before.get(data).unwrap();
-        let compact = SuccinctArchiveBlob::map(&(), &raw, &before).unwrap();
-        pile.put::<SuccinctArchiveBlob, _>(compact.clone()).unwrap();
-        let accelerated =
-            Rank9AcceleratedSuccinctArchiveBlob::map(&(), &compact, &pile.snapshot().unwrap())
-                .unwrap();
+        let compact = SuccinctArchiveBlob::map(&(), &raw, &[], &before).unwrap();
+        let compact = Handle::<SuccinctArchiveBlob>::to_hash(
+            pile.put::<SuccinctArchiveBlob, _>(compact).unwrap(),
+        );
+        let accelerated = Rank9AcceleratedSuccinctArchiveBlob::map(
+            &succinct,
+            &raw,
+            &[compact],
+            &pile.snapshot().unwrap(),
+        )
+        .unwrap();
         let member = pile
             .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(accelerated)
             .unwrap();
         let after = pile.snapshot().unwrap();
-        assert!(after.collection(rank9).unwrap().cover().is_empty());
+        assert!(after.attached(rank9).unwrap().cover().is_empty());
         assert!(source.admitted(&after).unwrap().is_empty());
         // The view is built straight from the resident member through the
         // collection's own descriptor, as an attached snapshot would build it.

@@ -455,7 +455,7 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
     let denied_key = fixture.directory.path().join("ungranted.key");
     initialize_signer(&fixture.pile, Some(&denied_key)).unwrap();
 
-    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let mut pile = Pile::open_as(&fixture.pile, owner.verifying_key()).unwrap();
     let source = faculties::collection_names::open_configured(
         &mut pile,
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
@@ -470,12 +470,9 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
     .unwrap();
     grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
     for input in [source, files] {
-        let policy = input.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(input, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(input, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(input, succinct)
             .unwrap();
         for target in [succinct.handle(), rank9.handle()] {
             grant_collection_read(&mut pile, target, &owner, writer.verifying_key()).unwrap();
@@ -489,10 +486,7 @@ fn source_writer_commits_revisions_and_is_told_they_wait_for_maintenance() {
             .unwrap());
         if input == source {
             // Both of the owner's creates were ensured by the writes themselves.
-            assert_eq!(
-                snapshot.collection(rank9).unwrap().support().unwrap().len(),
-                2
-            );
+            assert_eq!(snapshot.attached(rank9).unwrap().support().len(), 2);
             assert_eq!(source.admitted(&snapshot).unwrap().len(), 2);
         }
     }

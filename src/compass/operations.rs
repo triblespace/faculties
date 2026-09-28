@@ -9,6 +9,7 @@ use crate::schemas::compass::{
     KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use crate::storage::FactRead;
 use crate::storage::{self, FactArchive, FacultyStore, Storage};
 use crate::{clock, compass, relations};
 use anyhow::{bail, Context, Result};
@@ -306,21 +307,14 @@ impl CompassStorage<'_> {
         self.with_pile(|pile, signer, runtime| {
             // Register every representation and attach the resident views
             // through one query snapshot for this action; the write authors,
-            // commits, then ensures the derived views it must be readable
-            // through. Reads never maintain.
+            // commits, then attaches the source's frontier so the write is
+            // readable through the attached views. Reads never maintain.
             let compass_source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
-            let descriptors = pile
-                .snapshot()
-                .context("freeze Compass source policy snapshot")?;
-            let compass_policy = compass_source
-                .policy(&descriptors)
-                .context("read Compass source policy")?;
-            drop(descriptors);
             let compass_succinct = pile
-                .derive::<SuccinctArchiveBlob>(compass_source, (), compass_policy.clone())
+                .attach::<SuccinctArchiveBlob>(compass_source, ())
                 .context("register Compass Succinct collection")?;
             let compass_rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(compass_succinct, (), compass_policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(compass_source, compass_succinct)
                 .context("register Compass Rank9 collection")?;
             let relations_rank9 = if persona.is_some() {
                 if let Some(handle) = configured_handle(RELATIONS_SCOPE_ID)? {
@@ -332,18 +326,11 @@ impl CompassStorage<'_> {
                     }))?;
                 }
                 let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
-                let descriptors = pile
-                    .snapshot()
-                    .context("freeze Relations source policy snapshot")?;
-                let policy = source
-                    .policy(&descriptors)
-                    .context("read Relations source policy")?;
-                drop(descriptors);
                 let succinct = pile
-                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .attach::<SuccinctArchiveBlob>(source, ())
                     .context("register Relations Succinct collection")?;
                 let rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                     .context("register Relations Rank9 collection")?;
                 Some(rank9)
             } else {
@@ -364,15 +351,11 @@ impl CompassStorage<'_> {
             // change reads what it can see, like everything else, and
             // ensures its own images after it commits.
             let facts = reader
-                .collection(compass_rank9)
-                .context("observe Compass fact collection")?
-                .view::<FactArchive>()
+                .read_facts(compass_rank9)
                 .context("read Compass fact collection")?;
             let by = if let (Some(persona), Some(rank9)) = (persona, relations_rank9) {
                 let relations = reader
-                    .collection(rank9)
-                    .context("observe Relations fact collection for Compass persona")?
-                    .view::<FactArchive>()
+                    .read_facts(rank9)
                     .context("read Relations fact collection for Compass persona")?;
                 Some(
                     runtime.block_on(storage::read(pile, &reader, |blob_reader| {
@@ -401,8 +384,7 @@ impl CompassStorage<'_> {
                 let status = compass::status_register_collection(pile, signer.verifying_key())?;
                 runtime
                     .block_on(async {
-                        storage::seed_derived(pile, status, compass_source.handle(), signer)
-                            .await?;
+                        storage::seed_attached(pile, status, signer).await?;
                         storage::ensure_downstream(pile, compass_source, signer).await?;
                         Ok::<_, anyhow::Error>(())
                     })
@@ -1248,10 +1230,10 @@ mod tests {
     }
 
     impl AcquiringPile {
-        fn new(mut remote: MemoryBlobStore) -> Self {
+        fn new(mut remote: MemoryBlobStore, host: ed25519_dalek::VerifyingKey) -> Self {
             let file = tempfile::NamedTempFile::new().unwrap();
             Self {
-                pile: Pile::open(file.path()).unwrap(),
+                pile: Pile::open_as(file.path(), host).unwrap(),
                 remote: remote.snapshot().unwrap(),
                 requested: Vec::new(),
                 arriving: None,
@@ -1298,18 +1280,15 @@ mod tests {
     /// the source's commits through the chain and the status register. Reads
     /// attach what was carried and never maintain.
     fn carry(pile: &mut Pile, source: Collection<SimpleArchive>, signer: &SigningKey) {
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let status = compass::status_register_collection(pile, signer.verifying_key()).unwrap();
         pollster::block_on(async {
-            drop(pile.maintain(succinct, signer).await.unwrap());
-            drop(pile.maintain(rank9, signer).await.unwrap());
-            drop(pile.maintain(status, signer).await.unwrap());
+            drop(pile.maintain_attached(succinct, signer).await.unwrap());
+            drop(pile.maintain_attached(rank9, signer).await.unwrap());
+            drop(pile.maintain_attached(status, signer).await.unwrap());
         });
     }
 
@@ -1332,9 +1311,9 @@ mod tests {
         Collection<SimpleArchive>,
         SigningKey,
     ) {
-        let mut store = AcquiringPile::new(fragment.blobs().clone());
-        fragment.blobs_mut().keep([]);
         let signer = SigningKey::from_bytes(&[7; 32]);
+        let mut store = AcquiringPile::new(fragment.blobs().clone(), signer.verifying_key());
+        fragment.blobs_mut().keep([]);
         let source = crate::collection_names::open(
             &mut store.pile,
             COMPASS_SCOPE_ID,
@@ -1362,7 +1341,7 @@ mod tests {
         let name = triblespace::core::collection::descriptor::name(&descriptor)
             .unwrap()
             .unwrap();
-        let mut store = AcquiringPile::new(remote.into_inner().blobs);
+        let mut store = AcquiringPile::new(remote.into_inner().blobs, signer.verifying_key());
         let before = store.snapshot().unwrap();
 
         let opened = pollster::block_on(storage::read(&mut store, &before, |reader| {
@@ -1688,10 +1667,8 @@ mod tests {
         let (succinct, rank9, status) = storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let status = compass::status_register_collection(pile, signer.verifying_key())?;
                 Ok((succinct, rank9, status))
             })
@@ -1701,14 +1678,14 @@ mod tests {
             storage
                 .with_pile(|pile, signer| {
                     let snapshot = pollster::block_on(async {
-                        drop(pile.maintain(succinct, signer).await?);
-                        drop(pile.maintain(rank9, signer).await?);
-                        pile.maintain(status, signer).await
+                        drop(pile.maintain_attached(succinct, signer).await?);
+                        drop(pile.maintain_attached(rank9, signer).await?);
+                        pile.maintain_attached(status, signer).await
                     })?;
                     Ok((
-                        snapshot.collection(rank9)?.view::<FactArchive>()?,
+                        snapshot.read_facts(rank9)?,
                         snapshot
-                            .collection(status)?
+                            .attached(status)?
                             .view::<triblespace::core::collection::lww_register::LwwIndex>()?
                             .query()?,
                     ))

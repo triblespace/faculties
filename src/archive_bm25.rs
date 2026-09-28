@@ -1,8 +1,8 @@
 //! Portable exact-term-frequency BM25 over canonical Archive blocks.
 //!
-//! This module is one concrete V4 collection mapping, not a registry. Its
-//! source is Archive's canonical `SimpleArchive` union and its target is the
-//! portable BM25 carrier. Every canonical semantic block is a document,
+//! This module is one concrete attached-collection mapping, not a registry.
+//! Its parent is Archive's canonical `SimpleArchive` union and its attached
+//! representation is the portable BM25 carrier. Every canonical semantic block is a document,
 //! including a genuine textless block. The unique content-free canonical
 //! bottom used only by raw source receipts is excluded so provenance volume
 //! cannot perturb corpus statistics. Content parts are occurrences, so the
@@ -24,13 +24,13 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace::core::collection::{CollectionOperationError, DeriveMapping};
+use triblespace::core::collection::{CollectionData, CollectionOperationError, MapMapping};
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, IntoInline, RawInline};
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, StoreRead};
 use triblespace::core::trible::Fragment;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::entity;
@@ -93,16 +93,15 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveBlockTextBm25Mapping;
 
-impl DeriveMapping for ArchiveBlockTextBm25Mapping {
-    type Source = SimpleArchive;
+impl MapMapping for ArchiveBlockTextBm25Mapping {
     type Target = PortableBM25Blob;
 
     fn fragment(&self) -> Fragment {
         mapping_fragment()
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
-        let actual = triblespace::core::collection::descriptor::mapping_algorithm(target.facts())
+    fn bind(_parent: &Fragment, attached: &Fragment) -> Result<Self, CollectionOperationError> {
+        let actual = triblespace::core::collection::descriptor::mapping_algorithm(attached.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         if actual != Some(ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1) {
             return Err(CollectionOperationError::Fatal(format!(
@@ -114,25 +113,22 @@ impl DeriveMapping for ArchiveBlockTextBm25Mapping {
         Ok(Self)
     }
 
-    /// Map one source element, classifying what stops it by what could
-    /// still change the answer. A selected text payload that is not here is a
-    /// dependency the store may fetch, after which the map runs again. An
-    /// element this law cannot index as one member, such as a block whose
-    /// part and fact closure sits in another commit, is refused as that
-    /// element's capacity: every other element is still derived, the refused
-    /// one stays lag, explicit maintenance names it, and a coarser cover
-    /// that holds the whole closure may still represent it. Only a failure
-    /// to read the store is fatal, because that is the one thing no other
-    /// element or cover can get around.
-    fn map<R>(
+    /// Map one parent node, classifying what stops it by what could still
+    /// change the answer. A selected text payload that is not here is a
+    /// dependency the store may fetch, after which the map runs again. A
+    /// node this law cannot index as one member, such as a block whose part
+    /// and fact closure sits partly in another commit, is refused as that
+    /// node's capacity: maintenance descends to the nodes beneath it, and a
+    /// merged node above that holds the whole closure represents it. Only a
+    /// failure to read the store is fatal, because that is the one thing no
+    /// other node can get around.
+    fn map<R: StoreRead>(
         &self,
-        source: &Blob<SimpleArchive>,
+        node: &Blob<SimpleArchive>,
+        _siblings: &[CollectionData],
         reader: &R,
-    ) -> Result<Blob<PortableBM25Blob>, CollectionOperationError>
-    where
-        R: BlobStoreGet + BlobStoreMeta,
-    {
-        match derive_for_validation(reader, source.clone()) {
+    ) -> Result<Blob<PortableBM25Blob>, CollectionOperationError> {
+        match derive_for_validation(reader, node.clone()) {
             Ok(DeriveValidation::Ready(blob)) => Ok(blob),
             Ok(DeriveValidation::Pending(payload)) => Err(
                 CollectionOperationError::MissingDependency(Inline::new(payload.raw)),

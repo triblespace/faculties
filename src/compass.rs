@@ -16,6 +16,7 @@ pub use operations::{
     AddOptions, AddedGoal, AddedNote, Compass, ListOptions, MovedGoal, NoteOptions, PriorityChange,
 };
 
+use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
@@ -100,18 +101,8 @@ where
     S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
-    let snapshot = store
-        .snapshot()
-        .context("freeze Compass source policy snapshot")?;
-    let policy = source
-        .policy(&snapshot)
-        .context("read Compass source collection policy")?;
-    let target = store.derive::<LwwRegisterBlob>(
-        source,
-        (board::status_of.id(), metadata::created_at.id()),
-        policy,
-    )?;
-    Ok(target)
+    Ok(store
+        .attach::<LwwRegisterBlob>(source, (board::status_of.id(), metadata::created_at.id()))?)
 }
 
 fn validate_short(label: &str, value: &str) -> Result<()> {
@@ -1106,18 +1097,15 @@ async fn materialize_indexed_source<S>(
 where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
-    let policy = source.policy(&pile.snapshot()?)?;
-    let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-    let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
     let status_target = status_register_for_source(pile, source)?;
     let store_snapshot = pile.snapshot().context("freeze resident Compass targets")?;
     let fact_archive = store_snapshot
-        .collection(rank9)
-        .context("observe Compass fact collection")?
-        .view::<FactArchive>()
+        .read_facts(rank9)
         .context("read Compass fact collection")?;
     let status = store_snapshot
-        .collection(status_target)
+        .attached(status_target)
         .context("observe Compass status register")?
         .view::<LwwIndex>()
         .context("read Compass status register")?
@@ -1170,17 +1158,14 @@ mod tests {
         source: Collection<blobencodings::SimpleArchive>,
         signer: &SigningKey,
     ) {
-        let policy = source.policy(&store.snapshot().unwrap()).unwrap();
-        let succinct = store
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = store.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = store
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let status = status_register_for_source(store, source).unwrap();
-        drop(store.maintain(succinct, signer).await.unwrap());
-        drop(store.maintain(rank9, signer).await.unwrap());
-        drop(store.maintain(status, signer).await.unwrap());
+        drop(store.maintain_attached(succinct, signer).await.unwrap());
+        drop(store.maintain_attached(rank9, signer).await.unwrap());
+        drop(store.maintain_attached(status, signer).await.unwrap());
     }
 
     #[test]
@@ -1188,7 +1173,7 @@ mod tests {
         pollster::block_on(async {
             let owner = SigningKey::from_bytes(&[23; 32]);
             let reader = SigningKey::from_bytes(&[24; 32]);
-            let mut store = MemoryRepo::default();
+            let mut store = MemoryRepo::for_host(owner.verifying_key());
             let source =
                 crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, owner.verifying_key())
                     .unwrap();
@@ -1223,7 +1208,9 @@ mod tests {
                 .unwrap();
 
             // Neither an unadmitted reader nor the owner advances the chain on
-            // a read; both see what was carried, and publish nothing.
+            // a read, and neither publishes anything. The facts read the new
+            // commit from its own bytes; the status register answers from what
+            // was carried until the worker attaches the commit.
             for _signer in [&reader, &owner] {
                 let resident = materialize_indexed_source(&mut store, source)
                     .await
@@ -1231,7 +1218,7 @@ mod tests {
                 assert_eq!(
                     find!(id: Id, pattern!(resident.facts(), [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
                         .collect::<BTreeSet<_>>(),
-                    BTreeSet::from([goal]),
+                    BTreeSet::from([goal, new_goal]),
                 );
                 assert_eq!(
                     crate::schemas::compass::latest_status_event(
@@ -1281,7 +1268,7 @@ mod tests {
     fn indexed_read_keeps_carried_targets_with_a_cold_new_source_member() {
         pollster::block_on(async {
             let owner = SigningKey::from_bytes(&[25; 32]);
-            let mut store = MemoryRepo::default();
+            let mut store = MemoryRepo::for_host(owner.verifying_key());
             let source =
                 crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, owner.verifying_key())
                     .unwrap();
@@ -1358,17 +1345,22 @@ mod tests {
     }
 
     #[test]
-    fn status_register_inherits_the_source_collection_policy() {
+    fn status_register_is_attached_to_its_source_and_carries_no_policy() {
         let mut store = MemoryRepo::default();
         let authority = SigningKey::from_bytes(&[13; 32]).verifying_key();
         let policy =
             CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::delegable(authority));
-        let source = store.collection("shared-compass", policy.clone()).unwrap();
+        let source = store.collection("shared-compass", policy).unwrap();
 
         let register = status_register_for_source(&mut store, source).unwrap();
         let snapshot = store.snapshot().unwrap();
+        let descriptor: TribleSet = snapshot.get(register.handle()).unwrap();
 
-        assert_eq!(register.policy(&snapshot).unwrap(), policy,);
+        assert_eq!(
+            triblespace::core::collection::descriptor::parent(&descriptor).unwrap(),
+            Some(source.handle())
+        );
+        assert!(register.policy(&snapshot).is_err());
     }
 
     #[test]
@@ -1383,7 +1375,7 @@ mod tests {
             let next_id = next.root().unwrap();
             let unseen = status_fragment(unseen_goal, "doing", None, at(3)).unwrap();
             let unseen_id = unseen.root().unwrap();
-            let mut store = MemoryRepo::default();
+            let mut store = MemoryRepo::for_host(signer.verifying_key());
             let source = store
                 .collection(
                     "status-lag",
@@ -1392,9 +1384,9 @@ mod tests {
                 .unwrap();
             let target = status_register_for_source(&mut store, source).unwrap();
             store.commit(source, &signer, initial).unwrap();
-            let ready = store.maintain(target, &signer).await.unwrap();
+            let ready = store.maintain_attached(target, &signer).await.unwrap();
             let lagging = ready
-                .collection(target)
+                .attached(target)
                 .unwrap()
                 .view::<LwwIndex>()
                 .unwrap()
@@ -1418,9 +1410,9 @@ mod tests {
                 None
             );
 
-            let ready = store.maintain(target, &signer).await.unwrap();
+            let ready = store.maintain_attached(target, &signer).await.unwrap();
             let advanced = ready
-                .collection(target)
+                .attached(target)
                 .unwrap()
                 .view::<LwwIndex>()
                 .unwrap()

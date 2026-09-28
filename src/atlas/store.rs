@@ -1,6 +1,7 @@
 //! Callable Atlas operations over the configured collection, without output
 //! routing, CLI invocations, or MCP values.
 
+use crate::storage::FactRead;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -8,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -86,23 +87,14 @@ impl Store {
     ) -> Result<T> {
         self.storage.with_pile(|pile, signer| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = source.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let collection_succinct =
-                pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let collection_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                collection_succinct,
-                (),
-                policy,
-            )?;
+            let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let collection_rank9 =
+                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
             let store_snapshot = pile
                 .snapshot()
                 .context("freeze resident Atlas fact collection")?;
             let facts = store_snapshot
-                .collection(collection_rank9)
-                .context("observe maintained Atlas fact collection")?
-                .view::<FactArchive>()
+                .read_facts(collection_rank9)
                 .context("read maintained Atlas fact collection")?;
             operation(&facts, &store_snapshot)
         })

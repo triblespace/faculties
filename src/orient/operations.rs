@@ -239,8 +239,8 @@ use crate::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::storage::FacultySnapshot;
 #[cfg(test)]
-use crate::storage::{open_store, runtime};
-use crate::storage::{read, FactArchive, FacultyStore, Storage};
+use crate::storage::{open_store, open_store_as, runtime};
+use crate::storage::{read, FactArchive, FactRead, FacultyStore, Storage};
 use crate::{
     clock, compass, discord as discord_model, habits, mail as mail_model, message,
     orient as orient_model, relations, status, teams as teams_model, wiki as wiki_model,
@@ -261,7 +261,7 @@ use triblespace::core::collection::observed_store::{DependencyTracker, ObservedS
 #[cfg(test)]
 use triblespace::core::collection::Support;
 use triblespace::core::collection::{
-    Collection, CollectionEncoding, CollectionRealizationError, CollectionSnapshot,
+    AttachedSnapshot, Collection, CollectionEncoding, CollectionRealizationError,
     CollectionSnapshotExt, CollectionStoreExt, Cover,
 };
 use triblespace::core::metadata;
@@ -623,18 +623,11 @@ impl OrientSource {
         S: CollectionStoreExt + SnapshotSource,
         S::Snapshot: BlobStoreGet + CapabilityProofRead,
     {
-        let descriptors = pile
-            .snapshot()
-            .with_context(|| format!("freeze {label} source policy snapshot"))?;
-        let policy = source
-            .policy(&descriptors)
-            .with_context(|| format!("read {label} source policy"))?;
-        drop(descriptors);
         let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .attach::<SuccinctArchiveBlob>(source, ())
             .with_context(|| format!("register {label} Succinct collection"))?;
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .with_context(|| format!("register {label} Rank9 collection"))?;
         Ok(Self {
             source,
@@ -644,49 +637,25 @@ impl OrientSource {
         })
     }
 
-    fn can_maintain<S>(&self, snapshot: &S, signer: &SigningKey) -> Result<bool>
-    where
-        S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
-    {
-        let subject = signer.verifying_key();
-        Ok(self
-            .succinct
-            .writer_is_admitted(snapshot, subject)
-            .with_context(|| format!("check {} Succinct WRITE admission", self.label))?
-            && self
-                .rank9
-                .writer_is_admitted(snapshot, subject)
-                .with_context(|| format!("check {} Rank9 WRITE admission", self.label))?)
-    }
-
-    /// Refresh authorized inputs before selecting their immutable query views.
-    /// Readers without derived WRITE keep using the resident projection.
+    /// Carry the source and attach what the carry leaves, Succinct first,
+    /// before selecting the immutable query views. Attached collections need
+    /// no WRITE: the store is opened as this signer, whose MAPs are the ones
+    /// believed. A foundation left unattached is read from its own bytes.
     async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
-        if !self.can_maintain(&pile.snapshot()?, signer)? {
-            return Ok(());
-        }
-        self.maintain_local(pile, signer).await
-    }
-
-    /// Derive this key's own leaves, then any leafless foundation of another
-    /// writer whose payload is already here, and mirror this key's own
-    /// merges, Succinct first. An own commit neither hop could derive is the
-    /// view's lag, and the observation reads what is present
-    /// ([`crate::storage::tolerate_own_lag`]).
-    async fn maintain_local(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
-        crate::storage::tolerate_own_lag(pile.maintain(self.succinct, signer).await)
+        crate::storage::tolerate_own_lag(pile.maintain_attached(self.succinct, signer).await)
             .with_context(|| format!("maintain {} Succinct collection", self.label))?;
-        crate::storage::tolerate_own_lag(pile.maintain(self.rank9, signer).await)
+        crate::storage::tolerate_own_lag(pile.maintain_attached(self.rank9, signer).await)
             .with_context(|| format!("maintain {} Rank9 collection", self.label))?;
         Ok(())
     }
 
     fn observe(&self, snapshot: &FacultySnapshot) -> Result<OrientFact> {
-        let collection =
-            trace_refresh_call(self.label, "attach", || snapshot.collection(self.rank9))
-                .with_context(|| format!("observe resident {} Rank9 projection", self.label))?;
-        let view = trace_refresh_call(self.label, "view", || collection.view::<FactArchive>())
-            .with_context(|| format!("read resident {} Rank9 projection", self.label))?;
+        let collection = trace_refresh_call(self.label, "attach", || snapshot.attached(self.rank9))
+            .with_context(|| format!("observe resident {} Rank9 projection", self.label))?;
+        let view = trace_refresh_call(self.label, "view", || {
+            crate::storage::attached_facts(&collection)
+        })
+        .with_context(|| format!("read resident {} Rank9 projection", self.label))?;
         Ok(OrientFact { collection, view })
     }
 }
@@ -715,8 +684,8 @@ impl ReceiptSource {
             crate::schemas::orient::RECEIPT_COLLECTION_NAME,
             policy.clone(),
         )?;
-        let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-        let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+        let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
         Ok(Self {
             source,
             succinct,
@@ -726,52 +695,33 @@ impl ReceiptSource {
 
     fn observe(&self, snapshot: &FacultySnapshot) -> Result<ReceiptObservation> {
         let collection = trace_refresh_call("Orient receipts", "attach", || {
-            snapshot.collection(self.rank9)
+            snapshot.attached(self.rank9)
         })?;
         let view = trace_refresh_call("Orient receipts", "view", || {
-            collection.view::<FactArchive>()
+            crate::storage::attached_facts(&collection)
         })?;
         Ok(ReceiptObservation { collection, view })
     }
 
-    /// Carry this run's own receipts into the queryable projection. A run that is
-    /// about to report does this before observing, so a re-armed run does not
-    /// report an event it already reported. The background maintainer derives
-    /// the same projection; this call only closes the window between the commit
-    /// and that maintainer's next pass. A signer without WRITE attaches the
-    /// projection as it stands. Both the ordinary path and the resident-only
-    /// health path call this, each with its own store, so the two cannot
-    /// disagree about what counts as lag.
+    /// Attach this run's own receipts into the queryable projection. A run that
+    /// is about to report does this before observing, so a re-armed run reads
+    /// its receipts through the projection rather than from their bytes. The
+    /// background maintainer attaches the same projection; this call only
+    /// closes the window between the commit and that maintainer's next pass.
+    /// Both the ordinary path and the resident-only health path call this,
+    /// each with its own store, so the two cannot disagree about what counts
+    /// as lag.
     async fn maintain<S>(&self, pile: &mut S, signer: &SigningKey) -> Result<()>
     where
         S: triblespace::core::repo::Store
             + triblespace::core::repo::async_store::AsyncBlobStoreAcquire
             + Send,
     {
-        let snapshot = pile
-            .snapshot()
-            .context("freeze Orient receipt projection authority")?;
-        let subject = signer.verifying_key();
-        let admitted = self
-            .succinct
-            .writer_is_admitted(&snapshot, subject)
-            .map_err(|error| anyhow!("check Orient receipt Succinct WRITE admission: {error}"))?
-            && self
-                .rank9
-                .writer_is_admitted(&snapshot, subject)
-                .map_err(|error| anyhow!("check Orient receipt Rank9 WRITE admission: {error}"))?;
-        drop(snapshot);
-        if !admitted {
-            return Ok(());
-        }
-        // Both hops, in order: the Rank9 derives from the Succinct, so
-        // refreshing only the tip leaves it reading a stale intermediate. An
-        // own historical receipt whose payload is not here is lag: the new
-        // receipts are derived all the same, and readers take the resident
-        // set.
-        crate::storage::tolerate_own_lag(pile.maintain(self.succinct, signer).await)
+        // Both, in order: Rank9 is built from the Succinct attachment of the
+        // same node, so the Succinct one comes first.
+        crate::storage::tolerate_own_lag(pile.maintain_attached(self.succinct, signer).await)
             .context("maintain Orient receipt Succinct collection")?;
-        crate::storage::tolerate_own_lag(pile.maintain(self.rank9, signer).await)
+        crate::storage::tolerate_own_lag(pile.maintain_attached(self.rank9, signer).await)
             .context("maintain Orient receipt Rank9 collection")?;
         Ok(())
     }
@@ -797,7 +747,7 @@ async fn refresh_receipts_before_observation(
 }
 
 struct ReceiptObservation {
-    collection: CollectionSnapshot<FacultySnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    collection: AttachedSnapshot<FacultySnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     view: FactArchive,
 }
 
@@ -887,14 +837,14 @@ impl OrientSources {
 }
 
 struct OrientFact {
-    collection: CollectionSnapshot<FacultySnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    collection: AttachedSnapshot<FacultySnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
     view: FactArchive,
 }
 
 impl OrientFact {
     #[cfg(test)]
-    fn support(&self) -> &Support<Rank9AcceleratedSuccinctArchiveBlob> {
-        self.collection.support().expect("explicit fixture support")
+    fn support(&self) -> &Support<SimpleArchive> {
+        self.collection.support()
     }
 
     fn is_current(&self, snapshot: &FacultySnapshot) -> bool {
@@ -935,7 +885,7 @@ struct OrientObservation {
     payloads: DependencyTracker,
     facts: OrientFacts,
     compass_status: LwwQuery,
-    compass_status_collection: CollectionSnapshot<FacultySnapshot, LwwRegisterBlob>,
+    compass_status_collection: AttachedSnapshot<FacultySnapshot, LwwRegisterBlob>,
 }
 
 impl OrientObservation {
@@ -1011,14 +961,8 @@ async fn maintain_inputs(
     {
         source.maintain(pile, signer).await?;
     }
-    if sources
-        .compass_status
-        .writer_is_admitted(&pile.snapshot()?, signer.verifying_key())
-        .context("check Compass status WRITE admission")?
-    {
-        crate::storage::tolerate_own_lag(pile.maintain(sources.compass_status, signer).await)
-            .context("maintain Compass status register")?;
-    }
+    crate::storage::tolerate_own_lag(pile.maintain_attached(sources.compass_status, signer).await)
+        .context("maintain Compass status register")?;
     Ok(())
 }
 
@@ -1055,7 +999,7 @@ fn observe_sources(
     // Positive known-winner membership is an ordinary relation: it does not
     // require the fact and register collections to have identical support.
     let status_collection = trace_refresh_call("Compass status", "attach", || {
-        snapshot.collection(sources.compass_status)
+        snapshot.attached(sources.compass_status)
     })
     .map_err(|error| anyhow!("observe Compass status register: {error}"))?;
     let status_index = trace_refresh_call("Compass status", "view", || {
@@ -4983,15 +4927,10 @@ async fn cmd_wake(
         maintain_inputs(storage, signer, &sources).await?;
         memory_collection.maintain(storage, signer).await?;
         wiki_collection.maintain(storage, signer).await?;
-        if wiki_latest
-            .writer_is_admitted(&storage.snapshot()?, signer.verifying_key())
-            .context("check Wiki supersession WRITE admission")?
-        {
-            // An own revision the index cannot derive is its lag, exactly as
-            // it is for the Wiki facts just above; wake reads what is here.
-            crate::storage::tolerate_own_lag(storage.maintain(wiki_latest, signer).await)
-                .context("maintain Wiki supersession index")?;
-        }
+        // A revision the index cannot attach is its lag, exactly as it is for
+        // the Wiki facts just above; wake reads what is here.
+        crate::storage::tolerate_own_lag(storage.maintain_attached(wiki_latest, signer).await)
+            .context("maintain Wiki supersession index")?;
         let snapshot = storage
             .snapshot()
             .map_err(|error| anyhow!("freeze shared wake observation: {error}"))?;
@@ -5001,19 +4940,15 @@ async fn cmd_wake(
         let observation = observe_snapshot(snapshot, &sources)?;
         let memory_facts = observation
             .snapshot
-            .collection(memory_collection.rank9)
-            .context("observe resident Memory collection")?
-            .view::<FactArchive>()
+            .read_facts(memory_collection.rank9)
             .context("attach resident Memory collection")?;
         let wiki_facts = observation
             .snapshot
-            .collection(wiki_collection.rank9)
-            .context("observe resident Wiki collection")?
-            .view::<FactArchive>()
+            .read_facts(wiki_collection.rank9)
             .context("attach resident Wiki collection")?;
         let wiki_order = observation
             .snapshot
-            .collection(wiki_latest)
+            .attached(wiki_latest)
             .context("observe resident Wiki supersession index")?
             .view::<triblespace::core::collection::latest::LatestIndex>()
             .context("attach resident Wiki supersession index")?;
@@ -5333,7 +5268,7 @@ mod tests {
     fn attention_excludes_every_self_attribution_but_keeps_unknown_and_other_actors() {
         pollster::block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -5469,7 +5404,7 @@ mod tests {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let reader_key = SigningKey::from_bytes(&[73; 32]);
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             // External Relations are owned elsewhere; notification receipts
             // remain this local writer's collection.
             let mut sources = OrientSources::open(&mut pile, &reader_key, false)
@@ -5511,10 +5446,11 @@ mod tests {
             .unwrap();
             let before = pile.snapshot().unwrap();
             let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
+            // The unattached input is read from its own bytes.
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
             assert_eq!(
                 person_anchors(observation.facts.relations.view()),
-                BTreeSet::from([known]),
+                BTreeSet::from([known, pending]),
             );
             assert_eq!(
                 pile.snapshot()
@@ -5524,7 +5460,7 @@ mod tests {
                     .map(Result::unwrap)
                     .collect::<Vec<_>>(),
                 records,
-                "a nonwriter read must not publish equations for lagging external input",
+                "a nonwriter read must not publish records for lagging external input",
             );
 
             let event = id(74);
@@ -5538,10 +5474,10 @@ mod tests {
             assert!(next.facts.presentations.contains(event));
             assert_eq!(
                 person_anchors(next.facts.relations.view()),
-                BTreeSet::from([known])
+                BTreeSet::from([known, pending])
             );
 
-            // External upkeep makes the new input visible to the next read.
+            // External upkeep attaches the new input; the read is unchanged.
             sources
                 .relations
                 .maintain(&mut pile, &fixture.signer)
@@ -5561,7 +5497,7 @@ mod tests {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let reader_key = SigningKey::from_bytes(&[73; 32]);
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let mut sources = OrientSources::open(&mut pile, &reader_key, false)
                 .await
                 .unwrap();
@@ -5574,8 +5510,10 @@ mod tests {
             .unwrap();
             let before = pile.snapshot().unwrap();
             let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
+            // An unattached receipt is read from its own bytes, without
+            // upkeep and without blocking.
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(observation.facts.presentations.is_empty());
+            assert!(observation.facts.presentations.contains(id(76)));
             assert_eq!(
                 pile.snapshot()
                     .unwrap()
@@ -5584,7 +5522,7 @@ mod tests {
                     .map(Result::unwrap)
                     .collect::<Vec<_>>(),
                 records,
-                "reading an unprojected receipt never performs upkeep or blocks",
+                "reading an unattached receipt never performs upkeep or blocks",
             );
             assert!(observation.snapshot.wants().unwrap().next().is_none());
             sources
@@ -5594,17 +5532,16 @@ mod tests {
                 .unwrap();
             let ready = observe_current_sources(&mut pile, &sources).unwrap();
             assert!(ready.facts.presentations.contains(id(76)));
-            assert!(observation.facts.presentations.is_empty());
             pile.close().unwrap();
         });
     }
 
     #[test]
-    fn one_shot_receipt_projection_lag_allows_repeats_until_maintenance() {
+    fn a_fresh_one_shot_sees_its_receipts_before_any_upkeep() {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let reader = SigningKey::from_bytes(&[73; 32]);
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &reader, false)
                 .await
                 .unwrap();
@@ -5619,32 +5556,22 @@ mod tests {
                 .unwrap();
             assert_eq!(output, b"News: one delivery\n");
 
-            // A fresh one-shot sees the same signer-owned receipt descriptors.
-            // Its passive view may repeat an event until background upkeep
-            // publishes the projection; there is no whole-ledger barrier.
+            // A fresh one-shot sees the same signer-owned receipt descriptors,
+            // and reads the receipt from its bytes before any upkeep attaches
+            // it: nothing repeats, and observing publishes nothing.
             let restarted = OrientSources::open(&mut pile, &reader, false)
                 .await
                 .unwrap();
             assert_eq!(restarted.presentations.source, sources.presentations.source);
             assert_eq!(restarted.presentations.rank9, sources.presentations.rank9);
-            assert!(restarted
-                .presentations
-                .rank9
-                .writer_is_admitted(&pile.snapshot().unwrap(), reader.verifying_key())
-                .unwrap());
             let before = pile.snapshot().unwrap();
             let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
-            let lagging = observe_current_sources(&mut pile, &restarted).unwrap();
+            let unattached = observe_current_sources(&mut pile, &restarted).unwrap();
             let mut attention = AttentionView::default();
             attention.insert(AttentionEvent::Message(event));
-            assert_eq!(
-                attention
-                    .pending(lagging.facts.presentations.view())
-                    .ids()
-                    .collect::<Vec<_>>(),
-                vec![event],
-                "a repeat is accepted while the receipt projection is behind",
-            );
+            assert!(attention
+                .pending(unattached.facts.presentations.view())
+                .is_empty());
             assert_eq!(
                 pile.snapshot()
                     .unwrap()
@@ -5653,33 +5580,14 @@ mod tests {
                     .map(Result::unwrap)
                     .collect::<Vec<_>>(),
                 records,
-                "observation cannot publish the missing projection",
+                "observation publishes nothing",
             );
-
-            restarted
-                .presentations
-                .maintain(&mut pile, &reader)
-                .await
-                .unwrap();
-            let ready = observe_current_sources(&mut pile, &restarted).unwrap();
-            assert!(attention
-                .pending(ready.facts.presentations.view())
-                .is_empty());
-            assert!(!attention
-                .pending(lagging.facts.presentations.view())
-                .is_empty());
 
             // Routing aliases do not split one zooid's receipt authority.
             save_presentations(&mut pile, &reader, [id(80)]).unwrap();
             let aliases = ReceiptSource::register(&mut pile, &reader).unwrap();
             assert_eq!(aliases.source, restarted.presentations.source);
             assert_eq!(aliases.rank9, restarted.presentations.rank9);
-            assert!(!observe_current_sources(&mut pile, &restarted)
-                .unwrap()
-                .facts
-                .presentations
-                .contains(id(80)));
-            aliases.maintain(&mut pile, &reader).await.unwrap();
             let refreshed = observe_current_sources(&mut pile, &restarted).unwrap();
             assert_eq!(
                 refreshed.facts.presentations.presented_events(),
@@ -5689,21 +5597,15 @@ mod tests {
         });
     }
 
-    /// The lag the previous test accepts is exactly what a re-armed run
-    /// repeats. A run that is about to report closes that window itself, so
-    /// the next arm does not print the same event again.
-    ///
-    /// This drives the production helper rather than a fixture's explicit
-    /// upkeep. The distinction is the whole point: the fixture proves the
-    /// projection CAN catch up, and only the helper proves a reporting run
-    /// makes it. Nothing else in this suite exercises that helper, which is
-    /// why sixty green tests said nothing about it.
+    /// A run that is about to report refreshes the receipt projection itself,
+    /// through the production helper, and says nothing when that succeeds;
+    /// the event it presented does not repeat either before or after.
     #[test]
     fn a_reporting_run_refreshes_the_receipt_set_so_it_does_not_repeat_itself() {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let reader = SigningKey::from_bytes(&[73; 32]);
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &reader, false)
                 .await
                 .unwrap();
@@ -5719,13 +5621,10 @@ mod tests {
 
             let mut attention = AttentionView::default();
             attention.insert(AttentionEvent::Message(event));
-            let lagging = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(
-                !attention
-                    .pending(lagging.facts.presentations.view())
-                    .is_empty(),
-                "the window this closes must be open, or the control is vacuous",
-            );
+            let unattached = observe_current_sources(&mut pile, &sources).unwrap();
+            assert!(attention
+                .pending(unattached.facts.presentations.view())
+                .is_empty());
 
             let mut text = String::new();
             let mut emit = |part| {
@@ -5760,7 +5659,7 @@ mod tests {
     fn persona_wake_ignores_unrelated_historical_receipt_projection_lag() {
         runtime().unwrap().block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -5844,14 +5743,10 @@ mod tests {
 
             // The accepted overview still publishes its shown goal receipt,
             // and making it visible does not depend on the historical gap:
-            // all ordinary receipt readers accept the resident set. The gap is
-            // this signer's own receipt, so under "derive what you wrote" the
-            // projection asks the network for its payload, which starts the
-            // host; nothing arrives, no WANT is recorded, and the gap stays
-            // lag. Nothing remembers that the payload was unavailable, so
-            // every pass that still owes this leaf asks again: a known cost of
-            // foreground upkeep that this test pins the existence of, not its
-            // frequency.
+            // all ordinary receipt readers accept the resident set. Upkeep
+            // attaches what is resident and fetches nothing, so the gap stays
+            // residual, no WANT is recorded, and the network host is never
+            // started.
             sources
                 .presentations
                 .maintain(&mut pile, &fixture.signer)
@@ -5870,7 +5765,7 @@ mod tests {
                 .contains(goal_id));
             assert!(!snapshot.contains_blob(cold.get_handle()).unwrap());
             assert!(snapshot.wants().unwrap().next().is_none());
-            assert!(pile.health().started_at.is_some());
+            assert!(pile.health().started_at.is_none());
             pile.close().unwrap();
         });
     }
@@ -5880,7 +5775,7 @@ mod tests {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let copy = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -5902,7 +5797,7 @@ mod tests {
                 .await
                 .unwrap();
             let before = pile.snapshot().unwrap();
-            let mut copied = open_store(&copy.path).unwrap();
+            let mut copied = open_store_as(&copy.path, fixture.signer.verifying_key()).unwrap();
             for info in before.blobs() {
                 let info = info.unwrap();
                 if !omitted.contains(&info.handle.raw) {
@@ -5949,7 +5844,7 @@ mod tests {
     fn receipt_write_denial_is_not_pending_availability() {
         let fixture = TestPile::new();
         let stranger = SigningKey::from_bytes(&[73; 32]);
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let source = ReceiptSource::register(&mut pile, &fixture.signer)
             .unwrap()
             .source;
@@ -5964,7 +5859,7 @@ mod tests {
     #[test]
     fn cold_receipts_do_not_fetch_history_while_persona_is_pending() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let source = ReceiptSource::register(&mut pile, &fixture.signer)
             .unwrap()
             .source;
@@ -6027,7 +5922,7 @@ mod tests {
     fn receipt_refresh_is_scoped_to_target_progress() {
         pollster::block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
@@ -6043,10 +5938,14 @@ mod tests {
             pile.insert(CollectionRecord::Commit(commit)).unwrap();
             let cold = pile.snapshot().unwrap();
             assert!(!cold.contains_blob(bytes.get_handle()).unwrap());
-            assert!(
-                observation.is_current(&cold),
-                "an unprojected source record does not change the selected receipt set"
-            );
+            // A new receipt commit is a new node of the receipts' parent, so
+            // the receipt read moves, even before the commit's bytes arrive;
+            // until they do, it is residual and presents nothing.
+            assert!(!observation.is_current(&cold));
+            assert!(!observation.facts.presentations.is_current(&cold));
+            let observation = observe_snapshot(cold, &sources).unwrap();
+            assert!(!observation.facts.presentations.contains(id(87)));
+            assert!(observation.snapshot.wants().unwrap().next().is_none());
 
             let unrelated = pile
                 .collection(
@@ -6065,8 +5964,16 @@ mod tests {
                 "unrelated records do not invalidate the selected attention inputs"
             );
 
-            // Explicit fixture arrival/upkeep changes only the receipt target.
+            // The bytes arriving moves the receipt read, and only it: the
+            // receipt is read from them, and upkeep then attaches it.
             pile.put::<SimpleArchive, _>(bytes).unwrap();
+            let arrived = pile.snapshot().unwrap();
+            assert!(!observation.facts.presentations.is_current(&arrived));
+            assert!(observe_snapshot(arrived, &sources)
+                .unwrap()
+                .facts
+                .presentations
+                .contains(id(87)));
             sources
                 .presentations
                 .maintain(&mut pile, &fixture.signer)
@@ -6099,7 +6006,7 @@ mod tests {
     fn acquired_preparation_descriptor_is_used_by_the_same_retry() {
         runtime().unwrap().block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             // A preparation boundary can predate the descriptor's arrival.
             // Register the real sources afterward; no network mock is needed
             // because exact acquisition also handles newly resident bytes.
@@ -6184,7 +6091,7 @@ mod tests {
     fn unchanged_pending_persona_reuses_the_scoped_observation() {
         runtime().unwrap().block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
@@ -6303,7 +6210,7 @@ mod tests {
     #[test]
     fn habit_targets_select_before_loading_payloads() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let habit = id(11); // An opaque, not intrinsically derived entity id.
         let owner = id(12);
@@ -6333,7 +6240,7 @@ mod tests {
     #[test]
     fn habit_targets_are_exact_sets_and_omission_is_global() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let collection = open_configured(
             &mut pile,
             crate::schemas::habit::DEFAULT_SCOPE_ID,
@@ -6378,7 +6285,7 @@ mod tests {
     fn wait_initial_and_timer_paths_do_not_execute_other_personas_predicates() {
         pollster::block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
@@ -6517,7 +6424,7 @@ mod tests {
     #[test]
     fn poll_carries_raw_inputs_and_rearmed_receipts_without_a_daemon() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let sources =
             pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, false)).unwrap();
         let reader = id(91);
@@ -6544,7 +6451,7 @@ mod tests {
             .unwrap();
         let before = pile.snapshot().unwrap();
         assert!(before
-            .collection(sources.messages.rank9)
+            .attached(sources.messages.rank9)
             .unwrap()
             .cover()
             .is_empty());
@@ -6561,7 +6468,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(before
-            .collection(sources.messages.rank9)
+            .attached(sources.messages.rank9)
             .unwrap()
             .cover()
             .is_empty());
@@ -6663,7 +6570,7 @@ mod tests {
     #[test]
     fn an_owned_clock_falls_due_while_a_message_body_is_still_missing() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let sources =
             pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
         let cc = id(22);
@@ -6768,7 +6675,7 @@ mod tests {
     #[test]
     fn a_persona_clock_already_due_at_arm_is_reported_until_completed() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let sources =
             pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
         let cc = id(21);
@@ -6840,7 +6747,7 @@ mod tests {
     #[test]
     fn an_owned_clock_already_due_is_reported_while_a_message_body_is_still_missing() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let sources =
             pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
         let cc = id(24);
@@ -7097,7 +7004,7 @@ mod tests {
         }
 
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         pollster::block_on(async {
             let sources = OrientSources::open(&mut pile, &fixture.signer, true)
                 .await
@@ -7299,7 +7206,7 @@ mod tests {
     fn a_shared_intention_due_at_arm_is_presented_once_and_the_body_still_carries_the_frame_into_ready(
     ) {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let sources =
             pollster::block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
         let cc = id(22);
@@ -7431,7 +7338,7 @@ mod tests {
     fn resident_fact_and_status_views_do_not_require_equal_support() {
         pollster::block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -7472,27 +7379,26 @@ mod tests {
             pile.commit(sources.compass.source, &fixture.signer, next + unseen)
                 .unwrap();
             drop(
-                pile.maintain(sources.compass.succinct, &fixture.signer)
+                pile.maintain_attached(sources.compass.succinct, &fixture.signer)
                     .await
                     .unwrap(),
             );
             let snapshot = pile
-                .maintain(sources.compass.rank9, &fixture.signer)
+                .maintain_attached(sources.compass.rank9, &fixture.signer)
                 .await
                 .unwrap();
             let lagging = observe_sources(snapshot, &sources).unwrap();
-            // The facts derived the new commit; the status register lags the
+            // The facts attached the new commit; the status register lags the
             // source by it and is read as it stands.
-            let compass_source = lagging.snapshot.collection(sources.compass.source).unwrap();
-            let status = lagging.snapshot.collection(sources.compass_status).unwrap();
-            assert_eq!(status.missing_from(&compass_source).unwrap().len(), 1);
-            drop((compass_source, status));
+            let status = lagging.snapshot.attached(sources.compass_status).unwrap();
+            assert_eq!(status.residual().len(), 1);
+            drop(status);
             let query = lagging.query(&lagging.snapshot);
             assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
             assert_eq!(latest_goal_status(&query, unseen_goal), None);
 
             let ready = pile
-                .maintain(sources.compass_status, &fixture.signer)
+                .maintain_attached(sources.compass_status, &fixture.signer)
                 .await
                 .unwrap();
             let advanced = observe_sources(ready, &sources).unwrap();
@@ -7524,7 +7430,7 @@ mod tests {
         use triblespace::core::repo::WantRead;
 
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let sources = OrientSources::open(&mut pile, &fixture.signer, true)
             .await
             .unwrap();
@@ -7543,10 +7449,9 @@ mod tests {
             .unwrap();
         let watermark = pile.snapshot().unwrap();
         let expected_support = watermark
-            .collection(sources.messages.rank9)
+            .attached(sources.messages.rank9)
             .unwrap()
             .support()
-            .unwrap()
             .clone();
 
         // This commit arrives after the wait watermark was frozen. Another
@@ -7561,12 +7466,12 @@ mod tests {
         )
         .unwrap();
         drop(
-            pile.maintain(sources.messages.succinct, &fixture.signer)
+            pile.maintain_attached(sources.messages.succinct, &fixture.signer)
                 .await
                 .unwrap(),
         );
         drop(
-            pile.maintain(sources.messages.rank9, &fixture.signer)
+            pile.maintain_attached(sources.messages.rank9, &fixture.signer)
                 .await
                 .unwrap(),
         );
@@ -7588,7 +7493,7 @@ mod tests {
         let resident_after = frame
             .observation
             .snapshot
-            .collection(sources.messages.rank9)
+            .attached(sources.messages.rank9)
             .unwrap();
         assert_eq!(
             frame.observation.facts.messages.support(),
@@ -7597,7 +7502,7 @@ mod tests {
         );
         assert_eq!(
             frame.observation.facts.messages.support(),
-            resident_after.support().unwrap(),
+            resident_after.support(),
             "the selected view must be the resident target at the observation snapshot",
         );
         assert_eq!(frame.observation.facts.messages.view().iter().count(), 0);
@@ -7674,7 +7579,7 @@ mod tests {
     #[test]
     fn a_missing_selected_payload_is_pending() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let handle = Inline::<inlineencodings::Handle<blobencodings::UTF8String>>::new([42; 32]);
 
@@ -7743,18 +7648,23 @@ mod tests {
                     .unwrap();
                 drop(
                     self.store
-                        .maintain(self.succinct, &self.signer)
+                        .maintain_attached(self.succinct, &self.signer)
                         .await
                         .unwrap(),
                 );
-                drop(self.store.maintain(self.rank9, &self.signer).await.unwrap());
+                drop(
+                    self.store
+                        .maintain_attached(self.rank9, &self.signer)
+                        .await
+                        .unwrap(),
+                );
                 Ok(Some(self.bytes.clone()))
             }
         }
 
         pollster::block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
@@ -7872,10 +7782,7 @@ mod tests {
             assert!(!frozen.contains_blob(handle).unwrap());
             assert!(!reader.contains_blob(unrelated).unwrap());
             assert_eq!(frame.observation.facts.messages.support(), &support);
-            assert_ne!(
-                reader.collection(supply.rank9).unwrap().support().unwrap(),
-                &support
-            );
+            assert_ne!(reader.attached(supply.rank9).unwrap().support(), &support);
             assert!(reader.wants().unwrap().next().is_none());
             let News::Report { text, events } = &news else {
                 panic!("the acquired body must make the selected message readable")
@@ -7913,7 +7820,7 @@ mod tests {
 
     async fn a_missing_persona_preserves_the_wait_watermark_async() {
         let fixture = TestPile::new();
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let sources = OrientSources::open(&mut pile, &fixture.signer, true)
             .await
             .unwrap();
@@ -7991,7 +7898,7 @@ mod tests {
             text: "News: retry me\n".to_owned(),
             events: vec![event],
         };
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let error = apply_news_to_writer(
             &mut pile,
             &fixture.signer,
@@ -8033,7 +7940,7 @@ mod tests {
             text: "News: peek\n".to_owned(),
             events: vec![event],
         };
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         let mut output = Vec::new();
         apply_news_to_writer(
             &mut pile,
@@ -8060,7 +7967,7 @@ mod tests {
         let mut view = AttentionView::default();
         view.insert(AttentionEvent::Message(first));
         view.insert(AttentionEvent::Mail(second));
-        let mut pile = open_store(&fixture.path).unwrap();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
 
         save_presentations(&mut pile, &fixture.signer, view.ids()).unwrap();
         let presented = stored_presentations(&mut pile, &fixture.signer, persona);
@@ -8094,7 +8001,7 @@ mod tests {
     fn news_names_goals_authors_and_both_lanes_instead_of_bare_ids() {
         runtime().unwrap().block_on(async {
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -8200,7 +8107,7 @@ mod tests {
             use crate::discord::operations::observed_fragment;
             use serde_json::json;
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -8339,7 +8246,7 @@ mod tests {
             use crate::discord::operations::observed_fragment;
             use serde_json::json;
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -8422,7 +8329,7 @@ mod tests {
             use crate::discord::operations::observed_fragment;
             use serde_json::json;
             let fixture = TestPile::new();
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
@@ -8562,7 +8469,7 @@ mod tests {
     /// Orient's news for `reader` from the pile as it stands, taken as a
     /// watcher takes it: reported, then presented.
     async fn take_news(path: &Path, signer: &SigningKey, reader: Id) -> News {
-        let mut pile = open_store(path).unwrap();
+        let mut pile = open_store_as(path, signer.verifying_key()).unwrap();
         let sources = OrientSources::open(&mut pile, signer, false).await.unwrap();
         maintain_sources(&mut pile, signer, &sources).await.unwrap();
         let observation = observe_current_sources(&mut pile, &sources).unwrap();
@@ -8612,7 +8519,7 @@ mod tests {
         let discord = crate::discord::Discord::new(fixture.path.clone(), Some(key));
         let reader_id = id(93);
         runtime.block_on(async {
-            let mut pile = open_store(&fixture.path).unwrap();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let sources = OrientSources::open(&mut pile, &signer, false)
                 .await
                 .unwrap();

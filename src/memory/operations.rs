@@ -6,6 +6,7 @@ use crate::memory_cover::CoverReport;
 #[cfg(test)]
 use crate::memory_cover::DEFAULT_SIM_THRESHOLD;
 use crate::out::Out;
+use crate::storage::FactRead;
 
 #[derive(Clone, Debug)]
 pub struct Memory {
@@ -396,9 +397,7 @@ impl MemoryStorage<'_> {
         label: &str,
     ) -> Result<CollectionView> {
         let facts = store_snapshot
-            .collection(collection)
-            .with_context(|| format!("observe maintained {label} collection"))?
-            .view::<FactArchive>()
+            .read_facts(collection)
             .with_context(|| format!("attach maintained {label} collection"))?;
         Ok(CollectionView {
             facts,
@@ -419,40 +418,19 @@ impl MemoryStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = pollster::block_on(async {
                 let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let policy = source
-                    .policy(
-                        &pile
-                            .snapshot()
-                            .context("freeze Memory descriptor snapshot")?,
-                    )
-                    .context("read Memory collection policy")?;
                 let succinct = pile
-                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .attach::<SuccinctArchiveBlob>(source, ())
                     .context("register Succinct Memory collection")?;
                 let collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                     .context("register Rank9 Memory collection")?;
                 // Read the resident target, not a complete historical root.
-                // Each authorized hop derives this key's own commits; one it
-                // cannot derive, such as a payload that is not here, is lag,
-                // and the read attaches what is present. Another producer's
-                // already-maintained view needs no WRITE.
-                let admission = pile.snapshot().context("freeze Memory WRITE admission")?;
-                let subject = signer.verifying_key();
-                if succinct
-                    .writer_is_admitted(&admission, subject)
-                    .context("check Succinct Memory WRITE admission")?
-                {
-                    crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
-                        .context("maintain Succinct Memory collection")?;
-                }
-                if collection
-                    .writer_is_admitted(&admission, subject)
-                    .context("check Rank9 Memory WRITE admission")?
-                {
-                    crate::storage::tolerate_own_lag(pile.maintain(collection, signer).await)
-                        .context("maintain Rank9 Memory collection")?;
-                }
+                // Carry the source and attach its frontier; a commit left
+                // unattached is read from its own bytes.
+                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
+                    .context("maintain Succinct Memory collection")?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(collection, signer).await)
+                    .context("maintain Rank9 Memory collection")?;
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze maintained Memory snapshot")?;
@@ -468,47 +446,25 @@ impl MemoryStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = pollster::block_on(async {
                 let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let memory_policy = memory_source
-                    .policy(
-                        &pile
-                            .snapshot()
-                            .context("freeze Memory descriptor snapshot")?,
-                    )
-                    .context("read Memory collection policy")?;
                 let memory_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                    .attach::<SuccinctArchiveBlob>(memory_source, ())
                     .context("register Succinct Memory collection")?;
                 let memory_collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                        memory_succinct,
-                        (),
-                        memory_policy,
-                    )
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(memory_source, memory_succinct)
                     .context("register Rank9 Memory collection")?;
                 let embeddings_collections = if with_embeddings {
                     let source =
                         open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
-                    let policy = source
-                        .policy(
-                            &pile
-                                .snapshot()
-                                .context("freeze shared Embeddings descriptor snapshot")?,
-                        )
-                        .context("read shared Embeddings collection policy")?;
                     let succinct = pile
-                        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                        .attach::<SuccinctArchiveBlob>(source, ())
                         .context("register Succinct shared Embeddings collection")?;
                     let rank9 = pile
-                        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                         .context("register Rank9 shared Embeddings collection")?;
                     Some((succinct, rank9))
                 } else {
                     None
                 };
-                let admission = pile
-                    .snapshot()
-                    .context("freeze Memory/Embeddings WRITE admission")?;
-                let subject = signer.verifying_key();
                 for (succinct, rank9, label) in [(memory_succinct, memory_collection, "Memory")]
                     .into_iter()
                     .chain(
@@ -516,20 +472,12 @@ impl MemoryStorage<'_> {
                             .map(|(succinct, rank9)| (succinct, rank9, "shared Embeddings")),
                     )
                 {
-                    if succinct
-                        .writer_is_admitted(&admission, subject)
-                        .with_context(|| format!("check Succinct {label} WRITE admission"))?
-                    {
-                        crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
-                            .with_context(|| format!("maintain Succinct {label} collection"))?;
-                    }
-                    if rank9
-                        .writer_is_admitted(&admission, subject)
-                        .with_context(|| format!("check Rank9 {label} WRITE admission"))?
-                    {
-                        crate::storage::tolerate_own_lag(pile.maintain(rank9, signer).await)
-                            .with_context(|| format!("maintain Rank9 {label} collection"))?;
-                    }
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain_attached(succinct, signer).await,
+                    )
+                    .with_context(|| format!("maintain Succinct {label} collection"))?;
+                    crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+                        .with_context(|| format!("maintain Rank9 {label} collection"))?;
                 }
                 let store_snapshot = pile
                     .snapshot()
@@ -554,43 +502,22 @@ impl MemoryStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = pollster::block_on(async {
                 let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let memory_policy = memory_source
-                    .policy(
-                        &pile
-                            .snapshot()
-                            .context("freeze Memory descriptor snapshot")?,
-                    )
-                    .context("read Memory collection policy")?;
                 let memory_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                    .attach::<SuccinctArchiveBlob>(memory_source, ())
                     .context("register Succinct Memory collection")?;
                 let memory_collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                        memory_succinct,
-                        (),
-                        memory_policy,
-                    )
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(memory_source, memory_succinct)
                     .context("register Rank9 Memory collection")?;
                 let comb_source =
                     open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-                let admission = pile.snapshot().context("freeze Memory WRITE admission")?;
-                let subject = signer.verifying_key();
-                if memory_succinct
-                    .writer_is_admitted(&admission, subject)
-                    .context("check Succinct Memory WRITE admission")?
-                {
-                    crate::storage::tolerate_own_lag(pile.maintain(memory_succinct, signer).await)
-                        .context("maintain Succinct Memory collection")?;
-                }
-                if memory_collection
-                    .writer_is_admitted(&admission, subject)
-                    .context("check Rank9 Memory WRITE admission")?
-                {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain(memory_collection, signer).await,
-                    )
-                    .context("maintain Rank9 Memory collection")?;
-                }
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(memory_succinct, signer).await,
+                )
+                .context("maintain Succinct Memory collection")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(memory_collection, signer).await,
+                )
+                .context("maintain Rank9 Memory collection")?;
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze maintained Memory and Comb snapshot")?;
@@ -628,80 +555,40 @@ impl MemoryStorage<'_> {
                     archive_schema::DEFAULT_SCOPE_ID,
                     signer.verifying_key(),
                 )?;
-                let memory_policy = memory_source
-                    .policy(
-                        &pile
-                            .snapshot()
-                            .context("freeze Memory descriptor snapshot")?,
-                    )
-                    .context("read Memory collection policy")?;
                 let memory_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(memory_source, (), memory_policy.clone())
+                    .attach::<SuccinctArchiveBlob>(memory_source, ())
                     .context("register Succinct Memory collection")?;
                 let memory_collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                        memory_succinct,
-                        (),
-                        memory_policy,
-                    )
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(memory_source, memory_succinct)
                     .context("register Rank9 Memory collection")?;
-                let cognition_policy = cognition_source
-                    .policy(
-                        &pile
-                            .snapshot()
-                            .context("freeze Cognition descriptor snapshot")?,
-                    )
-                    .context("read Cognition collection policy")?;
                 let cognition_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(cognition_source, (), cognition_policy.clone())
+                    .attach::<SuccinctArchiveBlob>(cognition_source, ())
                     .context("register Succinct Cognition collection")?;
                 let cognition_collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        cognition_source,
                         cognition_succinct,
-                        (),
-                        cognition_policy,
                     )
                     .context("register Rank9 Cognition collection")?;
-                let archive_policy = archive_source
-                    .policy(
-                        &pile
-                            .snapshot()
-                            .context("freeze Archive descriptor snapshot")?,
-                    )
-                    .context("read Archive collection policy")?;
                 let archive_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
+                    .attach::<SuccinctArchiveBlob>(archive_source, ())
                     .context("register Succinct Archive collection")?;
                 let archive_collection = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                        archive_succinct,
-                        (),
-                        archive_policy,
-                    )
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(archive_source, archive_succinct)
                     .context("register Rank9 Archive collection")?;
-                let admission = pile
-                    .snapshot()
-                    .context("freeze Memory/Cognition/Archive WRITE admission")?;
-                let subject = signer.verifying_key();
                 for (succinct, collection, label) in [
                     (memory_succinct, memory_collection, "Memory"),
                     (cognition_succinct, cognition_collection, "Cognition"),
                     (archive_succinct, archive_collection, "Archive"),
                 ] {
-                    if succinct
-                        .writer_is_admitted(&admission, subject)
-                        .with_context(|| format!("check Succinct {label} WRITE admission"))?
-                    {
-                        crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
-                            .with_context(|| format!("maintain Succinct {label} collection"))?;
-                    }
-                    if collection
-                        .writer_is_admitted(&admission, subject)
-                        .with_context(|| format!("check Rank9 {label} WRITE admission"))?
-                    {
-                        crate::storage::tolerate_own_lag(pile.maintain(collection, signer).await)
-                            .with_context(|| format!("maintain Rank9 {label} collection"))?;
-                    }
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain_attached(succinct, signer).await,
+                    )
+                    .with_context(|| format!("maintain Succinct {label} collection"))?;
+                    crate::storage::tolerate_own_lag(
+                        pile.maintain_attached(collection, signer).await,
+                    )
+                    .with_context(|| format!("maintain Rank9 {label} collection"))?;
                 }
                 let store_snapshot = pile
                     .snapshot()
@@ -2883,11 +2770,10 @@ mod tests {
             .storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 Ok((
                     succinct,
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?,
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?,
                 ))
             })
             .unwrap();
@@ -2896,10 +2782,10 @@ mod tests {
                 .storage
                 .with_pile(|pile, signer| {
                     let snapshot = pollster::block_on(async {
-                        drop(pile.maintain(succinct, signer).await?);
-                        pile.maintain(rank9, signer).await
+                        drop(pile.maintain_attached(succinct, signer).await?);
+                        pile.maintain_attached(rank9, signer).await
                     })?;
-                    Ok(snapshot.collection(rank9)?.view::<FactArchive>()?)
+                    Ok(snapshot.read_facts(rank9)?)
                 })
                 .unwrap()
         };

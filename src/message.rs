@@ -316,6 +316,7 @@ pub fn read_body(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::FactView;
     use std::collections::BTreeSet;
     use std::fs::{self, File};
     use std::path::PathBuf;
@@ -324,7 +325,7 @@ mod tests {
     use crate::collection_names::open_configured;
     use crate::schemas::message::DEFAULT_SCOPE_ID;
     use crate::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
-    use crate::storage::{discover_target, open_pile_strict, FactArchive};
+    use crate::storage::{discover_target, open_pile_strict_as};
     use crate::test_support::initialize_open_collection_fixture;
     use hifitime::Epoch;
     use triblespace::core::blob::encodings::succinctarchive::{
@@ -632,7 +633,7 @@ mod tests {
         .unwrap()
         .0;
 
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let relations_collection = open_configured(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
@@ -645,12 +646,9 @@ mod tests {
         let team = signer.verifying_key();
         let messages =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let policy = messages.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(messages, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(messages, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(messages, succinct)
             .unwrap();
         let (fragment, message_id) = message_fragment(
             sender,
@@ -671,11 +669,11 @@ mod tests {
         );
         let store_snapshot = pollster::block_on(async {
             drop(pile.ensure(messages, &signer).await.unwrap());
-            drop(pile.maintain(succinct, &signer).await.unwrap());
-            pile.maintain(rank9, &signer).await.unwrap()
+            drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+            pile.maintain_attached(rank9, &signer).await.unwrap()
         });
-        let observed = store_snapshot.collection(rank9).unwrap();
-        let message_facts = observed.view::<FactArchive>().unwrap();
+        let observed = store_snapshot.attached(rank9).unwrap();
+        let message_facts = observed.facts().unwrap();
         let published: BTreeSet<Id> = find!(
             id: Id,
             pattern!(&message_facts, [{ ?id @ metadata::tag: &KIND_MESSAGE_ID }])

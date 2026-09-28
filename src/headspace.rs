@@ -1544,6 +1544,7 @@ fn format_ids(ids: impl IntoIterator<Item = Id>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::FactRead;
 
     use std::fs::File;
     use std::path::Path;
@@ -1552,7 +1553,6 @@ mod tests {
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
-    use triblespace::core::collection::CollectionSnapshotExt;
     use triblespace::core::repo::pile::Pile;
 
     use crate::collection_names::open_configured;
@@ -1568,32 +1568,25 @@ mod tests {
         (epoch, epoch).try_to_inline().unwrap()
     }
 
-    fn test_pile(path: &Path) -> Pile {
+    fn test_pile(path: &Path, signer: &SigningKey) -> Pile {
         File::create(path).unwrap();
-        let mut pile = Pile::open(path).unwrap();
+        let mut pile = Pile::open_as(path, signer.verifying_key()).unwrap();
         pile.refresh().unwrap();
         pile
     }
 
     fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (FactArchive, PileSnapshot) {
         let source = open_configured(pile, scope, signer.verifying_key()).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let reader = pollster::block_on(async {
             drop(pile.ensure(source, signer).await.unwrap());
-            drop(pile.maintain(succinct, signer).await.unwrap());
-            pile.maintain(rank9, signer).await.unwrap()
+            drop(pile.maintain_attached(succinct, signer).await.unwrap());
+            pile.maintain_attached(rank9, signer).await.unwrap()
         });
-        let facts = reader
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let facts = reader.read_facts(rank9).unwrap();
         (facts, reader)
     }
 
@@ -1617,8 +1610,8 @@ mod tests {
     fn fork_visible_resolution_keeps_divergent_and_agreed_heads() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("headspace.pile");
-        let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x21; 32]);
+        let mut pile = test_pile(&path, &signer);
         let anchor = test_id(0x11);
         let profile = default_profile(anchor, "default");
         let config = default_config(anchor);
@@ -1662,8 +1655,8 @@ mod tests {
     fn missing_and_ambiguous_config_are_visible_failures() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("headspace.pile");
-        let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x22; 32]);
+        let mut pile = test_pile(&path, &signer);
         let anchor = test_id(0x23);
         let profile = default_profile(anchor, "only-profile");
         let mut profile_only = profile_anchor_fragment(anchor);
@@ -1736,8 +1729,8 @@ mod tests {
     fn exact_secret_opening_ignores_a_newer_same_label_version() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("headspace.pile");
-        let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x41; 32]);
+        let mut pile = test_pile(&path, &signer);
         let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
         let first_id = secrets::storage::add_secret(
             &mut pile,
@@ -1785,8 +1778,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("headspace.pile");
-        let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x53; 32]);
+        let mut pile = test_pile(&path, &signer);
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, fragment);
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
@@ -1814,8 +1807,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("headspace.pile");
-        let mut pile = test_pile(&path);
         let signer = SigningKey::from_bytes(&[0x62; 32]);
+        let mut pile = test_pile(&path, &signer);
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, legacy.clone());
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let materialized = facts.iter().collect::<TribleSet>();

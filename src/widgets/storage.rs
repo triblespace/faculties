@@ -16,6 +16,7 @@
 //! collection configuration and is attached only when the pile signer is
 //! admitted to READ it.
 
+use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -687,18 +688,11 @@ async fn load_inputs_from_pile(
         for (scope, label) in collection_scopes(sources) {
             let source = open_configured(pile, scope, signer.verifying_key())
                 .map_err(|error| format!("register {label} collection: {error:#}"))?;
-            let descriptor_snapshot = pile
-                .snapshot()
-                .map_err(|error| format!("freeze {label} descriptor snapshot: {error}"))?;
-            let policy = source
-                .policy(&descriptor_snapshot)
-                .map_err(|error| format!("read {label} collection policy: {error:#}"))?;
-            drop(descriptor_snapshot);
             let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                .attach::<SuccinctArchiveBlob>(source, ())
                 .map_err(|error| format!("register Succinct {label} collection: {error:#}"))?;
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .map_err(|error| format!("register Rank9 {label} collection: {error:#}"))?;
             collections.push((scope, label, source, succinct, rank9));
         }
@@ -763,10 +757,10 @@ async fn load_inputs_from_pile(
                 .expect("every maintained viewer scope has a source label")
                 .label;
             let collection = store_snapshot
-                .collection(*rank9)
+                .attached(*rank9)
                 .map_err(|error| format!("attach maintained {label} collection: {error}"))?;
             let facts = collection
-                .view::<FactArchive>()
+                .facts()
                 .map_err(|error| format!("read maintained {label} collection: {error}"))?;
             revisions_by_scope.insert(
                 *scope,
@@ -777,7 +771,7 @@ async fn load_inputs_from_pile(
 
         if let Some(target) = compass_register {
             let collection = store_snapshot
-                .collection(target)
+                .attached(target)
                 .map_err(|error| format!("attach Compass status register: {error}"))?;
             let index = collection
                 .view::<LwwIndex>()
@@ -799,7 +793,7 @@ async fn load_inputs_from_pile(
 
         if let Some(target) = wiki_latest {
             let collection = store_snapshot
-                .collection(target)
+                .attached(target)
                 .map_err(|error| format!("attach Wiki supersession index: {error}"))?;
             let index = collection
                 .view::<LatestIndex>()
@@ -890,7 +884,7 @@ mod tests {
     use triblespace::macros::{entity, find, pattern};
     use triblespace::prelude::*;
 
-    use crate::storage::{load_signer, open_pile_strict};
+    use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
     use crate::test_support::initialize_open_collection_fixture;
 
     fn create_pile(path: &Path) {
@@ -1094,7 +1088,7 @@ mod tests {
             use triblespace::core::collection::latest::LatestBlob;
 
             let signer = SigningKey::from_bytes(&[35; 32]);
-            let mut store = MemoryRepo::default();
+            let mut store = MemoryRepo::for_host(signer.verifying_key());
             let source = store
                 .collection(
                     "latest-cache",
@@ -1102,19 +1096,15 @@ mod tests {
                 )
                 .unwrap();
             let target = store
-                .derive::<LatestBlob>(
-                    source,
-                    metadata::supersedes.id(),
-                    crate::collection_names::private_policy(signer.verifying_key()),
-                )
+                .attach::<LatestBlob>(source, metadata::supersedes.id())
                 .unwrap();
             let root = genid();
             let next = genid();
             store
                 .commit(source, &signer, entity! { &root @ metadata::name: "root" })
                 .unwrap();
-            let ready = store.maintain(target, &signer).await.unwrap();
-            let lagging = ready.collection(target).unwrap();
+            let ready = store.maintain_attached(target, &signer).await.unwrap();
+            let lagging = ready.attached(target).unwrap();
             store
                 .commit(
                     source,
@@ -1127,8 +1117,8 @@ mod tests {
             let mut before = DatasetRevision::from_collection(source.handle(), facts.cover());
             before.include_collection(target.handle(), lagging.cover());
 
-            let ready = store.maintain(target, &signer).await.unwrap();
-            let advanced = ready.collection(target).unwrap();
+            let ready = store.maintain_attached(target, &signer).await.unwrap();
+            let advanced = ready.attached(target).unwrap();
             let mut after = DatasetRevision::from_collection(source.handle(), facts.cover());
             after.include_collection(target.handle(), advanced.cover());
             assert_ne!(
@@ -1166,7 +1156,7 @@ mod tests {
                 authored_at: (instant, instant).try_to_inline().unwrap(),
             })
             .unwrap();
-        let mut pile = open_pile_strict(&path).unwrap();
+        let mut pile = open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         crate::wiki::commit_collection(
             &mut pile,
             &signer,

@@ -350,7 +350,7 @@ mod tests {
         let alice = SigningKey::from_bytes(&[1; 32]);
         let bob = SigningKey::from_bytes(&[2; 32]);
         let attacker = SigningKey::from_bytes(&[3; 32]);
-        let mut store = MemoryRepo::default();
+        let mut store = MemoryRepo::for_host(alice.verifying_key());
         let collection = storage::SecretsCollection::register(
             &mut store,
             "binding",
@@ -398,15 +398,15 @@ mod tests {
         let second_resource = resource_of(second);
         assert_ne!(first_resource, second_resource);
 
-        // The attacker may write the source and, so that its commit reaches
-        // the views it derives for itself, their encodings.
-        for target in [
+        // The attacker may write the source; its commit then reaches the
+        // attached encodings like any other.
+        grant_collection_write(
+            &mut store,
             collection.handle(),
-            collection.succinct().handle(),
-            collection.rank9().handle(),
-        ] {
-            grant_collection_write(&mut store, target, &alice, attacker.verifying_key()).unwrap();
-        }
+            &alice,
+            attacker.verifying_key(),
+        )
+        .unwrap();
         // The attacker knows neither genuine DEK. Their own valid body and
         // envelope bind S1 to R2, exploiting public-key sealing rather than
         // forging an authenticator or substituting an immutable descriptor.
