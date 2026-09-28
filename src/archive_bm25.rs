@@ -90,6 +90,26 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 
 /// Bound canonical projection from one Archive fact-set member to its
 /// portable BM25 image.
+///
+/// Its cover-query law holds under a precondition
+/// ([`MapMapping`](triblespace::core::collection::MapMapping) states the law).
+/// A block's term frequency sums over the block's parts, and a node cannot
+/// tell that a block has more parts elsewhere. So this mapping answers like
+/// the union for every cover whose nodes hold whole source units (a block
+/// with all its parts and their facts); a node holding part of a block
+/// scores that block from the part it holds, so a cover that splits a block
+/// undercounts it. The Archive writer commits whole source units
+/// ([`crate::archive_collection::ArchiveImportWriter::stage_fragment`],
+/// pinned by `every_import_commit_holds_whole_blocks`), so every cover the
+/// system builds from its own writes keeps blocks whole. Another writer's
+/// commits, or a hand-made split, need not.
+///
+/// The ignored tests `a_block_whose_parts_sit_in_two_nodes_scores_like_their_union`,
+/// `a_block_extended_by_a_node_without_its_tag_scores_like_their_union` and
+/// `archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes`
+/// are the acceptance tests of the structural fix: a per-fact text BM25 over
+/// the content fact's payload, blocks ranked at query time through the fact
+/// read, which retires this mapping (`4EC6991611EF484A37FBD95F6E108FC6`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveBlockTextBm25Mapping;
 
@@ -846,6 +866,14 @@ mod tests {
         assert!(unread_seen > 0);
         assert!(attachments_taken > 0);
     }
+
+    // The three ignored tests below show the cover law failing when a
+    // block's parts span nodes. They are the acceptance tests of the
+    // structural fix: a per-fact text BM25 over the content fact's payload,
+    // with blocks ranked at query time through the fact read, which retires
+    // mapping 4EC6991611EF484A37FBD95F6E108FC6. They stop being ignored with
+    // it; until then this mapping's law holds only for covers of whole source
+    // units (see `ArchiveBlockTextBm25Mapping`).
 
     /// One block of several text parts, and each part's fragment.
     fn parts_block(texts: &[&str]) -> (Fragment, Vec<Fragment>) {
