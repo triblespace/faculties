@@ -443,6 +443,7 @@ fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
                 direction: ReconcileDirection::ReadOnly,
             },
             provider_publication_budget: Some(0),
+            bind: None,
         },
     ))
 }

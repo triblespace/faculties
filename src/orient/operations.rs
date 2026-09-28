@@ -6833,6 +6833,7 @@ mod tests {
                     direction: ReconcileDirection::ReadOnly,
                 },
                 provider_publication_budget: Some(0),
+                bind: None,
             },
         );
         let sources =
