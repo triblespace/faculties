@@ -1,4 +1,7 @@
 //! Configured operations over one frozen authorized Decide observation.
+use crate::storage::FactRead;
+#[cfg(test)]
+use crate::storage::FactView;
 use std::path::PathBuf;
 
 use crate::clock;
@@ -339,23 +342,16 @@ impl DecideStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = (|| {
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let maintained_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
+                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    collection,
                     maintained_succinct,
-                    (),
-                    policy,
                 )?;
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze resident Decide fact collection")?;
                 let facts = store_snapshot
-                    .collection(maintained_rank9)
-                    .context("observe maintained Decide fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(maintained_rank9)
                     .context("read maintained Decide fact collection")?;
                 operation(
                     pile,
@@ -538,17 +534,16 @@ fn proposed_decision_is_one_commit_a_preparing_reader_observes() {
         .storage
         .with_pile(|pile, signer| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let policy = source.policy(&pile.snapshot()?)?;
-            let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
             // Maintenance is the reader's job now: prepare the projection here,
             // then observe exactly what the action published.
             let snapshot = pollster::block_on(async {
-                drop(pile.maintain(succinct, signer).await?);
-                pile.maintain(rank9, signer).await
+                drop(pile.maintain_attached(succinct, signer).await?);
+                pile.maintain_attached(rank9, signer).await
             })?;
-            let selected = snapshot.collection(rank9)?;
-            let facts = selected.view::<FactArchive>()?;
+            let selected = snapshot.attached(rank9)?;
+            let facts = selected.facts()?;
             assert!(decide::decision_anchors(&facts).contains(&proposed.decision));
             assert_eq!(source.admitted(&snapshot)?.len(), 1);
             Ok(())

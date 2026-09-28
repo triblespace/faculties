@@ -5,21 +5,38 @@ All notable changes to this project will be documented in this file.
 ## Unreleased
 
 - A faculty opens its pile as the key it signs with exactly when what it does
-  depends on which MERGEs the fold believes: it publishes merges (a carry, or
-  a derived view's upkeep after a write) or reads through them. The store's
-  fold then believes that key's MERGEs and no other key's, so its own carries
-  are believed and its reads attach its own merges instead of every commit. A
-  root carry on a store opened as no key fails with `HostMismatch`; a derived
-  view's upkeep there mirrors nothing, since the store believes no merge to
-  mirror. `Storage` opens this way for one-shot and shared operations alike,
-  through the new `open_store_as` and `open_pile_strict_as`; the new
+  depends on which MERGEs and MAPs the fold believes: it publishes them (a
+  carry, or attaching after a write) or reads through them. The store's fold
+  then believes that key's MERGEs and MAPs and no other key's, so its own
+  carries are believed and its reads take its own attachments instead of
+  reading every commit from its bytes. A root carry or an attach on a store
+  opened as no key fails with `HostMismatch`. `Storage` opens this way for
+  one-shot and shared operations alike, through the new `open_store_as` and
+  `open_pile_strict_as`; the new
   `open_pile_signed` loads the signer and opens as it in one step, and the
   Archive and Code import writers, the Duplex transcript, `carry_scope` and
   `publish_fragments` open through it. A shared `Storage` whose key file is
   replaced while it is open refuses further operations until restarted,
   instead of folding as the old key. `open_pile_strict` and `open_store` open
-  with no host and believe no MERGE: they remain for readers that hold no key
-  and for record writers such as the two migrations.
+  with no host and believe no MERGE or MAP: they remain for readers that hold
+  no key and for record writers such as the two migrations.
+
+- Every faculty's Succinct and Rank9 pair, and the compass and body
+  registers, the wiki supersession index, the Code and Archive BM25 indexes
+  and the Orient receipt id set, are attached to their source instead of
+  derived under its policy: `storage::fact_pair` attaches the pair, reads go
+  through `FactRead::read_facts` (the attached Rank9 cover plus every source
+  foundation it does not reach, read from its own bytes), and upkeep attaches
+  the source's frontier (`ensure_downstream`) or carries the source first
+  (`maintain_downstream`). The WRITE-admission checks on the views are gone,
+  since an attached collection has no policy, and so are
+  `require_readable_writes` and its own-lag bookkeeping: a commit with no
+  attachment yet is still read. `FactLag` counts the foundations each
+  collection of the pair does not reach. Stores are opened as the signing key,
+  whose MAPs are the only ones believed. The Archive BM25 mapping implements
+  `MapMapping`, so a block whose closure spans commits is represented at the
+  merged node that holds both. Secrets attaches its pair the same way; its
+  `SecretsLag` counts unattached foundations and its support is the source's.
 
 - The exact collection API is gone from core, and with it every place a
   faculty asked for a support: the archive search maintains its fact view

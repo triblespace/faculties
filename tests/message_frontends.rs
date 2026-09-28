@@ -1,6 +1,7 @@
 //! Real local collections exercising typed operations and their two frontends.
 //! No process-global environment mutation, model execution, or network fixture.
 
+use faculties::storage::FactView;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,7 +21,8 @@ use faculties::relations::{self, ProfileInput};
 use faculties::schemas::message::{local, DEFAULT_SCOPE_ID, KIND_MESSAGE_ID, KIND_READ_ID};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE;
 use faculties::storage::{
-    initialize_signer, load_signer, open_pile_strict, publish_fragment, FactArchive,
+    initialize_signer, load_signer, open_pile_strict, open_pile_strict_as, publish_fragment,
+    FactArchive,
 };
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -98,18 +100,15 @@ impl Fixture {
     fn message_facts(&self) -> FactArchive {
         let before = fs::metadata(&self.pile).unwrap().len();
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = open_pile_strict(&self.pile).unwrap();
+        let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let snapshot = pile.snapshot().unwrap();
-        let selected = snapshot.collection(rank9).unwrap();
-        let facts = selected.view::<FactArchive>().unwrap();
+        let selected = snapshot.attached(rank9).unwrap();
+        let facts = selected.facts().unwrap();
         pile.close().unwrap();
         assert_eq!(fs::metadata(&self.pile).unwrap().len(), before);
         facts

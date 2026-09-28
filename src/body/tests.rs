@@ -30,7 +30,7 @@ where
 use std::fs::{self, File};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::storage::{initialize_signer, load_signer, open_pile_strict};
+use crate::storage::{initialize_signer, load_signer, open_pile_strict_as};
 
 use super::*;
 
@@ -138,7 +138,7 @@ fn indexed_snapshots_are_attached_to_their_exact_cover() {
     File::create(&pile_path).unwrap();
     initialize_signer(&pile_path, Some(&key)).unwrap();
     let signer = load_signer(&pile_path, Some(&key)).unwrap();
-    let mut pile = open_pile_strict(&pile_path).unwrap();
+    let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
 
     let first = intent_fragment("first", at_unix(1_750_000_000.0));
     let first_id = first.root().unwrap();

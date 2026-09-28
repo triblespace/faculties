@@ -5,7 +5,7 @@ use faculties::archive::{cli, mcp, Archive, ImportSource};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::schemas::blockdag as schema;
-use faculties::storage::FactArchive;
+use faculties::storage::FactView;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -78,7 +78,7 @@ impl Fixture {
             Some(&self.key),
         ))
         .unwrap();
-        let facts = observed.view::<FactArchive>().unwrap();
+        let facts = observed.facts().unwrap();
         find!(projection:Id,pattern!(&facts,[{?projection @ metadata::tag:&schema::source_projection::KIND}])).collect()
     }
     fn roots(&self) -> usize {
@@ -87,7 +87,7 @@ impl Fixture {
             Some(&self.key),
         ))
         .unwrap();
-        observed.support().unwrap().len()
+        observed.support().len()
     }
 }
 fn text(parts: &[Part]) -> String {

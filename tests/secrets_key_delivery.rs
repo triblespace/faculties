@@ -97,9 +97,9 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
         .reader_is_admitted(&pile.snapshot().unwrap(), recipient.verifying_key(),)
         .unwrap());
 
-    // Possessing a delivered envelope does not grant the recipient WRITE on
-    // either derived collection, and the recipient wrote nothing: explicit
-    // production owes it nothing to derive and publishes nothing.
+    // This store has no host, so no key may attach into it: the
+    // recipient's explicit production names the mismatch and publishes
+    // nothing.
     let before = pile
         .snapshot()
         .unwrap()
@@ -107,15 +107,17 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    drop(pollster::block_on(collection.ensure(&mut pile, &recipient)).unwrap());
+    assert!(pollster::block_on(collection.ensure(&mut pile, &recipient)).is_err());
 
-    // The owner has not derived its commit yet, so the honest read-only view
-    // is empty and says it lags the source by that commit.
+    // Nothing is attached yet, and the read-only view reads the owner's
+    // commit from its own bytes all the same, saying how far the
+    // attachments lag.
     let observed = pollster::block_on(secrets::storage::ensure_and_snapshot(
         &mut pile, collection, &recipient,
     ))
     .unwrap();
-    assert!(observed.support().is_empty());
+    assert_eq!(observed.support().len(), 1);
+    assert!(observed.contains(secret));
     assert_eq!(observed.lag().succinct, 1);
     drop(observed);
     assert_eq!(
@@ -129,8 +131,12 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
         "read-only fallback publishes no derivations",
     );
 
-    // The actual owner publishes the encodings. Subsequent local readers
-    // reuse that complete cover without new WRITE or current READ/delivery.
+    // The owner, opening the store as its host, publishes the encodings.
+    // A local reader with its own key is the host of the store it opens: it
+    // reads without WRITE or current READ/delivery, and at most attaches for
+    // itself, publishing MAPs no other key believes.
+    pile.close().unwrap();
+    let mut pile = Pile::open_as(&path, owner.verifying_key()).unwrap();
     drop(
         pollster::block_on(secrets::storage::ensure_and_snapshot(
             &mut pile, collection, &owner,
@@ -169,15 +175,23 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
     assert!(successful(command().arg("list").output().unwrap()).contains("already delivered"));
 
     let mut pile = Pile::open(&path).unwrap();
-    assert_eq!(
-        pile.snapshot()
-            .unwrap()
-            .records()
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap(),
-        produced_records,
-        "foreign get/list reuse the owner's equations without publishing records",
+    let after = pile
+        .snapshot()
+        .unwrap()
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(produced_records.iter().all(|record| after.contains(record)));
+    assert!(
+        after
+            .iter()
+            .filter(|record| !produced_records.contains(record))
+            .all(|record| matches!(record,
+                triblespace::core::collection::CollectionRecord::Map(map)
+                    if map.public_key().raw == recipient.verifying_key().to_bytes()
+            )),
+        "foreign get/list publish nothing but their own attachments",
     );
     pile.close().unwrap();
 }

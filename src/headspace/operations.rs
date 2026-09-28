@@ -2,6 +2,7 @@
 //! Storage acquisition and each publication retain the existing shared snapshot
 //! boundaries. Plaintext is exposed only by an explicit show_secrets request.
 use crate::out::Out;
+use crate::storage::FactRead;
 
 #[derive(Clone, Debug)]
 pub struct Headspace {
@@ -156,10 +157,9 @@ use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
@@ -195,28 +195,21 @@ impl Storage {
     fn views(&self) -> Result<Views> {
         self.storage.with_pile(|pile, _| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = source.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let collection_succinct =
-                pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let collection_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                collection_succinct,
-                (),
-                policy,
-            )?;
+            let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let collection_rank9 =
+                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
             let secrets_collection =
                 open_secrets_collection_read(pile, self.signer.verifying_key())?;
-            // This key's own leaves and merges are carried into the views;
-            // other writers' commits arrive through their own derivations,
-            // and an own commit neither view can derive is lag.
+            // The source is carried and its frontier attached; a commit left
+            // unattached is read from its own bytes.
             let secrets = pollster::block_on(async {
                 crate::storage::tolerate_own_lag(
-                    pile.maintain(collection_succinct, &self.signer).await,
+                    pile.maintain_attached(collection_succinct, &self.signer)
+                        .await,
                 )
                 .context("maintain Headspace fact collection")?;
                 crate::storage::tolerate_own_lag(
-                    pile.maintain(collection_rank9, &self.signer).await,
+                    pile.maintain_attached(collection_rank9, &self.signer).await,
                 )
                 .context("maintain Headspace fact collection")?;
                 let secrets =
@@ -229,9 +222,7 @@ impl Storage {
             // that backs every Secrets lookup in this view.
             let reader = secrets.store_snapshot().clone();
             let facts = reader
-                .collection(collection_rank9)
-                .context("attach maintained Headspace collection")?
-                .view::<FactArchive>()
+                .read_facts(collection_rank9)
                 .context("read maintained Headspace collection")?;
             let headspace = CollectionView { facts, reader };
             Ok(Views { headspace, secrets })
@@ -983,15 +974,13 @@ mod tests {
             .storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let snapshot = pollster::block_on(async {
-                    drop(pile.maintain(succinct, signer).await?);
-                    pile.maintain(rank9, signer).await
+                    drop(pile.maintain_attached(succinct, signer).await?);
+                    pile.maintain_attached(rank9, signer).await
                 })?;
-                let facts = snapshot.collection(rank9)?.view::<FactArchive>()?;
+                let facts = snapshot.read_facts(rank9)?;
                 assert!(exists!(
                     pattern!(&facts, [{ profile_id @ metadata::tag: &headspace::KIND_LIVE_RECORD }])
                 ));

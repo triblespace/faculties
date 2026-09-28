@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::CollectionCommit;
 use triblespace::core::id::Id;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::trible::Fragment;
@@ -536,7 +536,7 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                     signer.verifying_key(),
                 )?;
                 let latest = wiki_model::latest_for_source(pile, source)?;
-                crate::storage::seed_derived(pile, latest, source.handle(), signer).await?;
+                crate::storage::seed_attached(pile, latest, signer).await?;
                 crate::storage::ensure_downstream(pile, source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             }
@@ -551,7 +551,7 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                     signer.verifying_key(),
                 )?;
                 let status = compass::status_register_collection(pile, signer.verifying_key())?;
-                crate::storage::seed_derived(pile, status, source.handle(), signer).await?;
+                crate::storage::seed_attached(pile, status, signer).await?;
                 crate::storage::ensure_downstream(pile, source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             }
@@ -584,12 +584,13 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
 #[cfg(test)]
 mod tests {
     use std::fs::File;
+    use triblespace::core::collection::CollectionStoreExt;
 
     use crate::storage::discovered_records;
     use triblespace::prelude::SnapshotSource;
 
     use super::*;
-    use crate::storage::{initialize_signer, load_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, load_signer, open_pile_strict, open_pile_strict_as};
 
     struct Imported {
         _directory: tempfile::TempDir,
@@ -620,7 +621,7 @@ mod tests {
         triblespace::prelude::TribleSet,
     ) {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
-        let mut pile = open_pile_strict(&imported.pile).unwrap();
+        let mut pile = open_pile_strict_as(&imported.pile, signer.verifying_key()).unwrap();
         let (wiki, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
         let (compass, _) = compass::materialize_collection(&mut pile, &signer).unwrap();
         pile.close().unwrap();
@@ -653,7 +654,7 @@ mod tests {
         let imported = imported("eager-projections");
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let seed = build(&signer.verifying_key()).unwrap();
-        let mut pile = open_pile_strict(&imported.pile).unwrap();
+        let mut pile = open_pile_strict_as(&imported.pile, signer.verifying_key()).unwrap();
         for (scope, expected) in [
             (crate::schemas::wiki::DEFAULT_SCOPE_ID, seed.wiki.facts()),
             (
@@ -664,19 +665,16 @@ mod tests {
             let source =
                 crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
                     .unwrap();
-            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             let view = pollster::block_on(async {
-                drop(pile.maintain(succinct, &signer).await.unwrap());
-                pile.maintain(rank9, &signer).await
+                drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+                pile.maintain_attached(rank9, &signer).await
             })
             .unwrap()
-            .collection(rank9)
+            .attached(rank9)
             .unwrap()
             .view::<crate::storage::FactArchive>()
             .unwrap();
@@ -685,9 +683,9 @@ mod tests {
         }
         let status =
             compass::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
-        assert!(!pollster::block_on(pile.maintain(status, &signer))
+        assert!(!pollster::block_on(pile.maintain_attached(status, &signer))
             .unwrap()
-            .collection(status)
+            .attached(status)
             .unwrap()
             .cover()
             .is_empty());

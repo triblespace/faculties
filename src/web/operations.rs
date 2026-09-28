@@ -1,3 +1,4 @@
+use crate::storage::FactRead;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ use crate::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::load_signer;
-use crate::storage::{open_secrets_collection_read, FactArchive};
+use crate::storage::open_secrets_collection_read;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use reqwest::blocking::Client;
@@ -20,10 +21,9 @@ use serde_json::json;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::SnapshotSource;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
@@ -301,25 +301,22 @@ impl WebStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = pollster::block_on(async {
                 let source = open_configured(pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = source.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let headspace_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let headspace_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    headspace_succinct,
-                    (),
-                    policy,
-                )?;
+                let headspace_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let headspace_rank9 =
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, headspace_succinct)?;
 
                 let secrets_collection =
                     open_secrets_collection_read(pile, signer.verifying_key())?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
-                crate::storage::tolerate_own_lag(pile.maintain(headspace_succinct, signer).await)
-                    .context("maintain Headspace fact collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain(headspace_rank9, signer).await)
-                    .context("maintain Headspace fact collection")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(headspace_succinct, signer).await,
+                )
+                .context("maintain Headspace fact collection")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(headspace_rank9, signer).await,
+                )
+                .context("maintain Headspace fact collection")?;
 
                 let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                     .await
@@ -329,9 +326,7 @@ impl WebStorage<'_> {
                 // snapshot, then project only the facts Web actually consumes.
                 let reader = secrets.store_snapshot();
                 let facts = reader
-                    .collection(headspace_rank9)
-                    .context("attach maintained Headspace collection")?
-                    .view::<FactArchive>()
+                    .read_facts(headspace_rank9)
                     .context("read maintained Headspace collection")?;
                 let versions = web_secret_versions(&facts)?;
 
@@ -723,7 +718,7 @@ mod tests {
     use hifitime::Epoch;
 
     use super::*;
-    use crate::storage::{initialize_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, open_pile_strict_as};
     use crate::web::cli::Cli;
     use clap::CommandFactory;
 
@@ -885,31 +880,26 @@ mod tests {
         .unwrap();
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
-        let descriptor_snapshot = pile.snapshot().unwrap();
-        let policy = source.policy(&descriptor_snapshot).unwrap();
-        drop(descriptor_snapshot);
-        let collection_succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let collection_rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(collection_succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)
             .unwrap();
         // Maintenance moved to the reader, so prepare the projection here and
         // then observe exactly what publication wrote.
         let store_snapshot = pollster::block_on(async {
-            drop(pile.maintain(collection_succinct, &signer).await.unwrap());
-            pile.maintain(collection_rank9, &signer).await
+            drop(
+                pile.maintain_attached(collection_succinct, &signer)
+                    .await
+                    .unwrap(),
+            );
+            pile.maintain_attached(collection_rank9, &signer).await
         })
         .unwrap();
-        let facts = store_snapshot
-            .collection(collection_rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let facts = store_snapshot.read_facts(collection_rank9).unwrap();
         assert_eq!(
             find!(
                 (entity: Id),

@@ -1,18 +1,19 @@
 //! Whole-collection Cognition validation as a direct library operation.
 //! Event authoring remains in the existing shared publication API.
 
+use crate::storage::FactRead;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::repo::SnapshotSource;
 
 use crate::collection_names::open_configured;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
-use crate::storage::{FactArchive, Storage};
+use crate::storage::Storage;
 
 #[derive(Clone, Debug)]
 pub struct Cognition {
@@ -46,18 +47,13 @@ impl Cognition {
     pub fn check(&self) -> Result<CheckReport> {
         self.storage.with_pile(|pile, signer| {
             let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let descriptor_snapshot = pile.snapshot()?;
-            let policy = source.policy(&descriptor_snapshot)?;
-            drop(descriptor_snapshot);
-            let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-            let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
             let snapshot = pile
                 .snapshot()
                 .context("freeze resident Cognition fact collection")?;
             let facts = snapshot
-                .collection(rank9)
-                .context("observe Cognition Rank9 collection")?
-                .view::<FactArchive>()
+                .read_facts(rank9)
                 .context("read Cognition Rank9 collection")?;
             super::validate_archive(&snapshot, &facts)?;
             Ok(CheckReport {

@@ -14,6 +14,7 @@ pub mod operations;
 
 pub use operations::{Export, ImportDocument, ListOptions, Wiki};
 
+use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
@@ -248,10 +249,11 @@ impl WikiSnapshot {
         &self.latest
     }
 
-    /// Source commits the supersession index had not derived yet when this
-    /// snapshot was taken. Each writer derives its own revisions, so another
-    /// writer's revision can be in the facts before it is in the index; the
-    /// index is read as it stands.
+    /// Source foundations the supersession index does not answer for in
+    /// this snapshot: none it has an attachment for, and none whose bytes are
+    /// here to build one from in memory. A revision can be in the facts
+    /// before the index is attached to it; the index then reads it from its
+    /// bytes, and only a revision whose bytes are not here is lag.
     pub fn latest_lag(&self) -> usize {
         self.latest_lag
     }
@@ -286,14 +288,7 @@ where
     S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
-    let snapshot = store
-        .snapshot()
-        .context("freeze Wiki source policy snapshot")?;
-    let policy = source
-        .policy(&snapshot)
-        .context("read Wiki source collection policy")?;
-    let target = store.derive::<LatestBlob>(source, metadata::supersedes.id(), policy)?;
-    Ok(target)
+    Ok(store.attach::<LatestBlob>(source, metadata::supersedes.id())?)
 }
 
 // TODO: Shadowmodel, this should just be `entity!` calls.
@@ -1656,21 +1651,21 @@ pub fn materialize_collection(
 /// their actual query.
 pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let policy = collection.policy(&pile.snapshot()?)?;
-    let succinct = pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-    let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+    let succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
+    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, succinct)?;
     let target = latest_collection(pile, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze resident Wiki targets")?;
     let facts = store_snapshot
-        .collection(rank9)
-        .context("observe Wiki fact collection")?
-        .view::<FactArchive>()
+        .read_facts(rank9)
         .context("read Wiki fact collection")?;
+    // The index over the same foundations the facts read: revisions no
+    // attachment reaches yet are built in memory.
     let latest = store_snapshot
-        .collection(target)
+        .attached(target)
         .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
-        .view::<LatestIndex>()
-        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
+        .read::<LatestIndex>()
+        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
+        .into_value();
     Ok(WikiQuerySnapshot {
         facts,
         store_snapshot,
@@ -1684,21 +1679,18 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
 /// closed-world diagnostic oracle over the facts. It is deliberately not the
 /// ordinary query path; normal commands use [`query_snapshot`] and query its
 /// [`FactArchive`] directly. Because it is an import's preparation and not a
-/// read, it first derives the signer's own revisions into the Wiki's views.
-/// Other writers' revisions reach the supersession index when they derive
-/// them; until then the index lags the facts, and the snapshot says by how
-/// much ([`WikiSnapshot::latest_lag`]) instead of refusing.
+/// read, it first attaches the Wiki's current frontier into its views. A
+/// revision the index cannot answer for is its lag, and the snapshot says
+/// how much ([`WikiSnapshot::latest_lag`]) instead of refusing.
 pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<WikiSnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let target = latest_collection(pile, signer.verifying_key())?;
-    drop(
-        crate::storage::seed_derived(pile, target, collection.handle(), signer)
-            .await
-            .context("seed the Wiki supersession index")?,
-    );
+    crate::storage::seed_attached(pile, target, signer)
+        .await
+        .context("seed the Wiki supersession index")?;
     drop(
         crate::storage::ensure_downstream(pile, collection, signer)
             .await
@@ -1709,17 +1701,14 @@ pub async fn materialize_indexed_collection(
         .collection(collection)
         .context("attach Wiki collection")?;
     let facts = source.view::<TribleSet>().context("read Wiki collection")?;
-    let latest = store_snapshot
-        .collection(target)
-        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?;
-    let latest_lag = latest
-        .missing_from(&source)
-        .map_err(|error| anyhow!("compare the Wiki supersession index with its source: {error}"))?
-        .len();
+    let (latest, unread) = store_snapshot
+        .attached(target)
+        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
+        .read::<LatestIndex>()
+        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
+        .into_parts();
+    let latest_lag = unread.len();
     drop(source);
-    let latest = latest
-        .view::<LatestIndex>()
-        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
     // This explicit migration/import projection retains the complete-facts
     // reference oracle; ordinary readers join the positive index directly.
     let catalog = validate_catalog(&store_snapshot, &facts)?;
@@ -1751,7 +1740,7 @@ pub(crate) fn carry_for_tests(pile: &mut Pile, signer: &SigningKey) {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
     crate::storage::carry_facts(pile, collection, signer);
     let target = latest_collection(pile, signer.verifying_key()).unwrap();
-    drop(pollster::block_on(pile.maintain(target, signer)).unwrap());
+    drop(pollster::block_on(pile.maintain_attached(target, signer)).unwrap());
 }
 
 #[cfg(test)]
@@ -1765,17 +1754,22 @@ mod tests {
     use triblespace::core::repo::memoryrepo::MemoryRepo;
 
     #[test]
-    fn latest_inherits_the_source_collection_policy() {
+    fn latest_is_attached_to_its_source_and_carries_no_policy() {
         let mut store = MemoryRepo::default();
         let authority = SigningKey::from_bytes(&[25; 32]).verifying_key();
         let policy =
             CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::delegable(authority));
-        let source = store.collection("shared-wiki", policy.clone()).unwrap();
+        let source = store.collection("shared-wiki", policy).unwrap();
 
         let latest = latest_for_source(&mut store, source).unwrap();
         let snapshot = store.snapshot().unwrap();
+        let descriptor: TribleSet = snapshot.get(latest.handle()).unwrap();
 
-        assert_eq!(latest.policy(&snapshot).unwrap(), policy);
+        assert_eq!(
+            triblespace::core::collection::descriptor::parents(&descriptor).unwrap(),
+            vec![source.handle()]
+        );
+        assert!(latest.policy(&snapshot).is_err());
     }
 
     fn at(seconds: f64) -> IntervalValue {
@@ -1920,7 +1914,7 @@ mod tests {
             let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
             let (next_fragment, next) = revision_record(draft(author, "next", [root])).unwrap();
             let (new_fragment, new) = revision_record(draft(author, "new entry", [])).unwrap();
-            let mut store = MemoryRepo::default();
+            let mut store = MemoryRepo::for_host(signer.verifying_key());
             let source = store
                 .collection(
                     "latest-lag",
@@ -1928,18 +1922,14 @@ mod tests {
                 )
                 .unwrap();
             let target = store
-                .derive::<LatestBlob>(
-                    source,
-                    metadata::supersedes.id(),
-                    crate::collection_names::private_policy(signer.verifying_key()),
-                )
+                .attach::<LatestBlob>(source, metadata::supersedes.id())
                 .unwrap();
             store
                 .commit(source, &signer, author_fragment + root_fragment)
                 .unwrap();
-            let ready = store.maintain(target, &signer).await.unwrap();
+            let ready = store.maintain_attached(target, &signer).await.unwrap();
             let lagging = ready
-                .collection(target)
+                .attached(target)
                 .unwrap()
                 .view::<LatestIndex>()
                 .unwrap();
@@ -1952,14 +1942,8 @@ mod tests {
                 .unwrap()
                 .view::<TribleSet>()
                 .unwrap();
-            let current = snapshot.collection(target).unwrap();
-            assert_eq!(
-                current
-                    .missing_from(&snapshot.collection(source).unwrap())
-                    .unwrap()
-                    .len(),
-                1
-            );
+            let current = snapshot.attached(target).unwrap();
+            assert_eq!(current.residual().len(), 1);
             let current = current.view::<LatestIndex>().unwrap();
             assert_eq!(
                 entry(&facts, &current, root)
@@ -1976,9 +1960,9 @@ mod tests {
                 and!(current.has(state), state.is(next.to_inline()))
             ));
 
-            let ready = store.maintain(target, &signer).await.unwrap();
+            let ready = store.maintain_attached(target, &signer).await.unwrap();
             let advanced = ready
-                .collection(target)
+                .attached(target)
                 .unwrap()
                 .view::<LatestIndex>()
                 .unwrap();
@@ -2082,7 +2066,7 @@ mod tests {
         let (author_fragment, author) = author_record(&signer.verifying_key());
         let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
 
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         commit_collection(&mut pile, &signer, author_fragment + root_fragment).unwrap();
         let collection =
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
@@ -2125,7 +2109,7 @@ mod tests {
         fragment += right_fragment;
         fragment += untagged_fragment;
 
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         let collection =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
@@ -2170,7 +2154,8 @@ mod tests {
         let (author_fragment, author) = author_record(&author_key.verifying_key());
         let (revision_fragment, revision) = revision_record(draft(author, "shared", [])).unwrap();
 
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile =
+            crate::storage::open_pile_strict_as(&path, curator_key.verifying_key()).unwrap();
         commit_collection(&mut pile, &curator_key, author_fragment + revision_fragment).unwrap();
         let snapshot =
             pollster::block_on(materialize_indexed_collection(&mut pile, &curator_key)).unwrap();
@@ -2208,7 +2193,7 @@ mod tests {
         let (revision, _) = revision_record(tagged).unwrap();
         bad_tag += author_record(&signer.verifying_key()).0;
         bad_tag += revision;
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         commit_collection(&mut pile, &signer, bad_tag).unwrap();
         let error = match pollster::block_on(materialize_indexed_collection(&mut pile, &signer)) {
             Ok(_) => panic!("unnormalized tag unexpectedly materialized"),
@@ -2231,7 +2216,7 @@ mod tests {
         let missing =
             Fragment::from_facts_and_blobs(complete.facts().clone(), MemoryBlobStore::new());
 
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         commit_collection(&mut pile, &signer, missing).unwrap();
         let error = match pollster::block_on(materialize_indexed_collection(&mut pile, &signer)) {
             Ok(_) => panic!("missing revision payload unexpectedly materialized"),
@@ -2494,7 +2479,7 @@ mod tests {
         fragment += legacy_fragment;
         fragment += citer_fragment;
 
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         let collection =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
@@ -2575,7 +2560,7 @@ mod tests {
         })
         .unwrap();
 
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         let collection =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
@@ -2618,7 +2603,7 @@ mod tests {
             authored_at: at(2.0),
         })
         .unwrap();
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         let collection =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
@@ -2632,7 +2617,7 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
 
         // Exactly what `wiki links` and `wiki check` do, and nothing else.
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
         let order = latest_index(&facts);
         let model = FrontierModel::load(&reader, &facts, &order).unwrap();

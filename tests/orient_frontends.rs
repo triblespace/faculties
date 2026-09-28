@@ -104,7 +104,8 @@ impl Fixture {
     }
     fn publish(&self, scope: Id, fragment: Fragment) {
         let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
+        let mut pile =
+            faculties::storage::open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         let collection =
             faculties::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
                 .unwrap();
@@ -115,7 +116,8 @@ impl Fixture {
     /// Model the independent maintenance worker, never an Orient call.
     fn maintain(&self) {
         let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
+        let mut pile =
+            faculties::storage::open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         pollster::block_on(async {
             for scope in [
                 faculties::schemas::message::DEFAULT_SCOPE_ID,
@@ -135,36 +137,32 @@ impl Fixture {
                     signer.verifying_key(),
                 )
                 .unwrap();
-                let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-                let succinct = pile
-                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                    .unwrap();
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
                 let rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy.clone())
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                     .unwrap();
-                drop(pile.maintain(succinct, &signer).await.unwrap());
-                drop(pile.maintain(rank9, &signer).await.unwrap());
+                drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+                drop(pile.maintain_attached(rank9, &signer).await.unwrap());
                 if scope == health::DEFAULT_SCOPE_ID {
                     let latest = pile
-                        .derive::<LwwRegisterBlob>(
+                        .attach::<LwwRegisterBlob>(
                             source,
                             (
                                 health::attrs::node.id(),
                                 triblespace::core::metadata::created_at.id(),
                             ),
-                            policy,
                         )
                         .unwrap();
-                    drop(pile.maintain(latest, &signer).await.unwrap());
+                    drop(pile.maintain_attached(latest, &signer).await.unwrap());
                 }
             }
             let status =
                 faculties::compass::status_register_collection(&mut pile, signer.verifying_key())
                     .unwrap();
-            drop(pile.maintain(status, &signer).await.unwrap());
+            drop(pile.maintain_attached(status, &signer).await.unwrap());
             let latest =
                 faculties::wiki::latest_collection(&mut pile, signer.verifying_key()).unwrap();
-            drop(pile.maintain(latest, &signer).await.unwrap());
+            drop(pile.maintain_attached(latest, &signer).await.unwrap());
         });
         pile.close().unwrap();
         self.maintain_receipts(&self.key);
@@ -175,7 +173,8 @@ impl Fixture {
     /// collection is the worker's to carry.
     fn maintain_receipts(&self, key: &Path) {
         let signer = faculties::storage::load_signer(&self.pile, Some(key)).unwrap();
-        let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
+        let mut pile =
+            faculties::storage::open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         let source = pile
             .collection(
                 faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
@@ -745,8 +744,8 @@ fn authorized_reporting_frontends_maintain_lagging_targets_without_a_daemon() {
         assert!(
             appended
                 .iter()
-                .any(|record| matches!(record, CollectionRecord::Derive(_))),
-            "{frontend} must carry the raw input before reporting"
+                .any(|record| matches!(record, CollectionRecord::Map(_))),
+            "{frontend} must attach the raw input before reporting"
         );
         assert!(before.iter().all(|record| after.contains(record)));
         if matches!(frontend, "show" | "wait") {
@@ -763,7 +762,7 @@ fn authorized_reporting_frontends_maintain_lagging_targets_without_a_daemon() {
             );
             assert!(appended.iter().all(|record| matches!(
                 record,
-                CollectionRecord::Merge(_) | CollectionRecord::Derive(_)
+                CollectionRecord::Merge(_) | CollectionRecord::Map(_)
             )));
         }
     }
@@ -898,7 +897,8 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     let other = faculties::storage::initialize_signer(&f.pile, Some(&other_key)).unwrap();
     let owner = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
     assert_ne!(owner.verifying_key(), other.verifying_key());
-    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    // Opened as the owner, whose MAPs this store believes.
+    let mut pile = faculties::storage::open_pile_strict_as(&f.pile, owner.verifying_key()).unwrap();
     let mut overrides = Vec::new();
     for scope in [
         faculties::schemas::message::DEFAULT_SCOPE_ID,
@@ -906,16 +906,9 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     ] {
         let source =
             faculties::collection_names::open(&mut pile, scope, owner.verifying_key()).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
-        let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-            .unwrap();
-        for handle in [source.handle(), succinct.handle(), rank9.handle()] {
-            grant_collection_read(&mut pile, handle, &owner, other.verifying_key()).unwrap();
-        }
+        // The source's READ is the only grant: the fact pair attached to it
+        // names no policy, and every host builds its own attachments.
+        grant_collection_read(&mut pile, source.handle(), &owner, other.verifying_key()).unwrap();
         overrides.push((
             faculties::collection_names::override_env_name(scope),
             hex::encode(source.handle().raw),
@@ -957,16 +950,13 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
         faculties::orient::presented_fragment(f.persona, [event]),
     )
     .unwrap();
-    let policy = legacy.policy(&pile.snapshot().unwrap()).unwrap();
-    let succinct = pile
-        .derive::<SuccinctArchiveBlob>(legacy, (), policy.clone())
-        .unwrap();
+    let succinct = pile.attach::<SuccinctArchiveBlob>(legacy, ()).unwrap();
     let rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(legacy, succinct)
         .unwrap();
     pollster::block_on(async {
-        drop(pile.maintain(succinct, &owner).await.unwrap());
-        drop(pile.maintain(rank9, &owner).await.unwrap());
+        drop(pile.maintain_attached(succinct, &owner).await.unwrap());
+        drop(pile.maintain_attached(rank9, &owner).await.unwrap());
     });
     overrides.push((
         faculties::collection_names::override_env_name(
@@ -1016,7 +1006,8 @@ fn missing_historical_receipt_payload_does_not_block_accepted_news() {
     let f = Fixture::new();
     let event = f.message("history is not a receipt barrier", f.persona);
     let signer = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
-    let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
+    let mut pile =
+        faculties::storage::open_pile_strict_as(&f.pile, signer.verifying_key()).unwrap();
     let receipts = pile
         .collection(
             faculties::schemas::orient::RECEIPT_COLLECTION_NAME,

@@ -14,7 +14,7 @@ use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::schemas::compass::{board, KIND_NOTE_ID, KIND_STATUS_ID};
 use faculties::storage::{
-    carry_facts, initialize_signer, load_signer, open_pile_strict, publish_fragment,
+    carry_facts, initialize_signer, load_signer, open_pile_strict_as, publish_fragment,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -50,7 +50,7 @@ impl Fixture {
 
     fn snapshot(&self) -> (TribleSet, PileSnapshot) {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = Pile::open(&self.pile).unwrap();
+        let mut pile = Pile::open_as(&self.pile, signer.verifying_key()).unwrap();
         let result = compass::materialize_collection(&mut pile, &signer).unwrap();
         pile.close().unwrap();
         result
@@ -62,7 +62,7 @@ impl Fixture {
     /// is the worker here.
     fn carry(&self) {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-        let mut pile = open_pile_strict(&self.pile).unwrap();
+        let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         for scope in [
             faculties::schemas::compass::DEFAULT_SCOPE_ID,
             faculties::schemas::relations::DEFAULT_SCOPE_ID,
@@ -72,7 +72,7 @@ impl Fixture {
         }
         let status =
             compass::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
-        pollster::block_on(async { drop(pile.maintain(status, &signer).await.unwrap()) });
+        pollster::block_on(async { drop(pile.maintain_attached(status, &signer).await.unwrap()) });
         pile.close().unwrap();
     }
 
@@ -117,20 +117,17 @@ fn clean_child(command: &mut Command) {
     }
 }
 
-/// A writer with source WRITE and only READ on the rollups can still append:
-/// each action is committed. A write derives only its own key's commits, so
-/// no reader sees those actions yet, and every command that appended one says
-/// so and exits nonzero instead of succeeding silently. The owner's next
-/// maintenance pass derives them without any grant; once the grants arrive,
-/// the writer's own commands succeed.
+/// A writer with source WRITE and nothing else appends, and every command
+/// succeeds. The CLI opens the store as the writer's key, so the writer is
+/// the host of that store: its write attaches what it wrote under its own
+/// key -- MAPs no other key believes -- and its own reads see it at once,
+/// prefixes included. The owner's reads see the same actions from their
+/// bytes before its worker attaches them, and after. The attached fact pair
+/// and status register name no policy, so there is no grant to give.
 #[test]
-fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
-    use triblespace::core::blob::encodings::succinctarchive::{
-        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-    };
-    use triblespace::core::collection::{
-        grant_collection_read, grant_collection_write, CollectionRecord,
-    };
+fn source_writer_appends_actions_and_reads_them_without_view_grants() {
+    use faculties::storage::FactRead;
+    use triblespace::core::collection::{grant_collection_write, CollectionRecord};
 
     let fixture = Fixture::new();
     let first = fixture
@@ -180,7 +177,7 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
     let writer = load_signer(&fixture.pile, Some(&writer_key)).unwrap();
     let denied_key = fixture.directory.path().join("ungranted.key");
     initialize_signer(&fixture.pile, Some(&denied_key)).unwrap();
-    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let mut pile = Pile::open_as(&fixture.pile, owner.verifying_key()).unwrap();
     let source = faculties::collection_names::open_configured(
         &mut pile,
         faculties::schemas::compass::DEFAULT_SCOPE_ID,
@@ -194,39 +191,16 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
     )
     .unwrap();
     grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
-    for input in [source, relations] {
-        let policy = input.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(input, (), policy.clone())
-            .unwrap();
-        let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-            .unwrap();
-        for target in [succinct.handle(), rank9.handle()] {
-            grant_collection_read(&mut pile, target, &owner, writer.verifying_key()).unwrap();
-        }
-        let snapshot = pile.snapshot().unwrap();
-        assert!(!succinct
-            .writer_is_admitted(&snapshot, writer.verifying_key())
-            .unwrap());
-        assert!(!rank9
-            .writer_is_admitted(&snapshot, writer.verifying_key())
-            .unwrap());
-        if input == source {
-            let facts = snapshot
-                .collection(rank9)
-                .unwrap()
-                .view::<faculties::storage::FactArchive>()
-                .unwrap();
-            assert!(compass::goal_ids(&facts).contains(&first.goal));
-            assert!(compass::goal_ids(&facts).contains(&pending.goal));
-        }
-    }
+    let (succinct, rank9) = faculties::storage::fact_pair(&mut pile, source).unwrap();
     let status = compass::status_register_collection(&mut pile, owner.verifying_key()).unwrap();
-    grant_collection_read(&mut pile, status.handle(), &owner, writer.verifying_key()).unwrap();
-    assert!(!status
-        .writer_is_admitted(&pile.snapshot().unwrap(), writer.verifying_key())
-        .unwrap());
+    let snapshot = pile.snapshot().unwrap();
+    assert!(succinct.policy(&snapshot).is_err());
+    assert!(rank9.policy(&snapshot).is_err());
+    assert!(status.policy(&snapshot).is_err());
+    let facts = snapshot.read_facts(rank9).unwrap();
+    assert!(compass::goal_ids(&facts).contains(&first.goal));
+    assert!(compass::goal_ids(&facts).contains(&pending.goal));
+    drop(snapshot);
     pile.close().unwrap();
 
     let records = || {
@@ -260,19 +234,34 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
             );
         command
     };
-    // Each append is committed and reported as reaching no reader; the
-    // count is every write of this key the views still lack.
-    let unreadable = |output: &std::process::Output, writes: usize| {
-        assert!(!output.status.success(), "{output:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("was committed"), "{stderr}");
-        assert!(
-            stderr.contains(&format!("{writes} of this key's writes reach no reader")),
-            "{stderr}"
+    // Each append succeeds and adds one COMMIT by the writer into the source;
+    // anything else it adds is an attachment the writer's own store made.
+    let check = |before: &BTreeSet<CollectionRecord>, output: &std::process::Output| {
+        assert!(output.status.success(), "{output:?}");
+        let after = records();
+        let added: Vec<_> = after.difference(before).copied().collect();
+        assert_eq!(
+            added
+                .iter()
+                .filter(|record| matches!(record, CollectionRecord::Commit(_)))
+                .count(),
+            1,
+            "{added:?}"
         );
-        assert!(stderr.contains("grant that key WRITE"), "{stderr}");
+        assert!(
+            added.iter().all(|record| match record {
+                CollectionRecord::Commit(commit) =>
+                    commit.collection() == source.handle()
+                        && commit.public_key().raw == writer.verifying_key().to_bytes(),
+                CollectionRecord::Map(map) =>
+                    map.public_key().raw == writer.verifying_key().to_bytes(),
+                _ => false,
+            }),
+            "an append publishes no merge and nothing signed by another key: {added:?}"
+        );
+        after
     };
-    // The goals the root holds, whether or not any view has them yet.
+    // The goals the root holds.
     let root_goals = || {
         let mut pile = Pile::open(&fixture.pile).unwrap();
         let goals = compass::goal_ids(
@@ -300,7 +289,7 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
         ])
         .output()
         .unwrap();
-    unreadable(&added, 1);
+    let before = check(&before, &added);
     let child = root_goals()
         .difference(&goals_before)
         .map(|goal| format!("{goal:x}"))
@@ -313,24 +302,12 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
         .args(["move", &first_id, "doing"])
         .output()
         .unwrap();
-    unreadable(&moved, 2);
+    let before = check(&before, &moved);
     let noted = command(&writer_key)
         .args(["note", &first_id, "source-only research note"])
         .output()
         .unwrap();
-    unreadable(&noted, 3);
-    let after = records();
-    let added_records: Vec<_> = after.difference(&before).copied().collect();
-    assert_eq!(
-        added_records.len(),
-        3,
-        "append preparation must publish no rollup equations"
-    );
-    assert!(added_records.iter().all(|record| matches!(record,
-        CollectionRecord::Commit(commit)
-            if commit.collection() == source.handle()
-                && commit.public_key().raw == writer.verifying_key().to_bytes()
-    )));
+    let before = check(&before, &noted);
 
     let unknown = format!("{:x}", genid().id);
     let missing_goal = command(&writer_key)
@@ -355,38 +332,25 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
         .unwrap();
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
-    // Prefixes resolve against resident rows, unlike complete IDs, which
-    // deliberately support forward references without proving membership.
-    let child_prefix = &child[..16];
-    let not_yet_visible = command(&writer_key)
-        .args(["note", child_prefix, "wait for the projection"])
-        .output()
-        .unwrap();
-    assert!(!not_yet_visible.status.success());
-    assert_eq!(records(), after);
+    assert_eq!(records(), before, "a refused command publishes nothing");
 
-    let forward_reference = command(&writer_key)
-        .args(["note", child, "explicit full-ID forward reference"])
+    // A prefix resolves against what the writer's store reads, which holds
+    // its own writes already; so does a complete id.
+    let child_prefix = &child[..16];
+    let prefixed = command(&writer_key)
+        .args(["note", child_prefix, "found by its prefix"])
         .output()
         .unwrap();
-    unreadable(&forward_reference, 4);
-    let after_forward_reference = records();
-    let forwarded: Vec<_> = after_forward_reference
-        .difference(&after)
-        .copied()
-        .collect();
-    assert_eq!(forwarded.len(), 1);
-    assert!(matches!(forwarded[0],
-        CollectionRecord::Commit(commit)
-            if commit.collection() == source.handle()
-                && commit.public_key().raw == writer.verifying_key().to_bytes()
-    ));
-    let after = after_forward_reference;
+    let before = check(&before, &prefixed);
+    let forward_reference = command(&writer_key)
+        .args(["note", child, "explicit full-ID reference"])
+        .output()
+        .unwrap();
+    let before = check(&before, &forward_reference);
 
     // A priority change reads the frontier this node can see and publishes
     // over it. No read refuses for being behind: there is no globally
-    // consistent state to be behind of, and a source-only writer is as
-    // entitled to that frontier as anyone.
+    // consistent state to be behind of.
     let priority = command(&writer_key)
         .args([
             "prioritize",
@@ -396,56 +360,29 @@ fn source_writer_appends_actions_and_is_told_they_wait_for_maintenance() {
         ])
         .output()
         .unwrap();
-    unreadable(&priority, 5);
-    let after_priority = records();
-    let prioritized: Vec<_> = after_priority.difference(&after).copied().collect();
-    assert_eq!(prioritized.len(), 1);
-    assert!(matches!(prioritized[0],
-        CollectionRecord::Commit(commit)
-            if commit.collection() == source.handle()
-                && commit.public_key().raw == writer.verifying_key().to_bytes()
-    ));
-    let after = after_priority;
-    assert_eq!(records(), after);
+    check(&before, &priority);
 
-    // The owner's worker derives the writer's actions too: a derive is a
-    // function, so the owner's reads see them without any grant.
-    fixture.carry();
-    let listing = fixture
-        .operations()
-        .list(ListOptions {
-            all: true,
-            ..Default::default()
-        })
-        .unwrap();
-    assert!(listing.contains("appended child"));
-    assert!(fixture
-        .operations()
-        .show(&first_id)
-        .unwrap()
-        .contains("source-only research note"));
-
-    // Once the writer may write the views, its own writes derive themselves
-    // and its commands succeed.
-    {
-        let mut pile = Pile::open(&fixture.pile).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
-        let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
-            .unwrap();
-        for target in [succinct.handle(), rank9.handle(), status.handle()] {
-            grant_collection_write(&mut pile, target, &owner, writer.verifying_key()).unwrap();
+    // The owner reads the writer's actions from their bytes before its
+    // worker attaches them, and after: its reads answer for every commit
+    // its store holds, whoever signed it.
+    for carried in [false, true] {
+        if carried {
+            fixture.carry();
         }
-        pile.close().unwrap();
+        let listing = fixture
+            .operations()
+            .list(ListOptions {
+                all: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(listing.contains("appended child"), "{listing}");
+        assert!(fixture
+            .operations()
+            .show(&first_id)
+            .unwrap()
+            .contains("source-only research note"));
     }
-    let now_visible = command(&writer_key)
-        .args(["note", child_prefix, "after remote maintenance"])
-        .output()
-        .unwrap();
-    assert!(now_visible.status.success(), "{now_visible:?}");
 }
 
 fn collect(operation: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<String> {

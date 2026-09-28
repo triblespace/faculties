@@ -43,6 +43,7 @@ use crate::schemas::relations::DEFAULT_SCOPE_ID;
 #[cfg(test)]
 use crate::storage;
 use crate::storage::FactArchive;
+use crate::storage::FactView;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -309,30 +310,29 @@ impl RelationsStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let (collection, view) = pollster::block_on(async {
                 let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let maintained_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
+                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    collection,
                     maintained_succinct,
-                    (),
-                    policy,
                 )?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
-                crate::storage::tolerate_own_lag(pile.maintain(maintained_succinct, signer).await)
-                    .context("maintain Relations fact collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain(maintained_rank9, signer).await)
-                    .context("maintain Relations fact collection")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(maintained_succinct, signer).await,
+                )
+                .context("maintain Relations fact collection")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(maintained_rank9, signer).await,
+                )
+                .context("maintain Relations fact collection")?;
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze maintained Relations fact collection")?;
                 let observed = store_snapshot
-                    .collection(maintained_rank9)
+                    .attached(maintained_rank9)
                     .context("observe Relations Rank9 projection")?;
                 let facts = observed
-                    .view::<FactArchive>()
+                    .facts()
                     .context("read Relations Rank9 projection")?;
                 Ok::<_, anyhow::Error>((
                     collection,
@@ -1376,16 +1376,14 @@ mod tests {
             .storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let snapshot = pollster::block_on(async {
-                    drop(pile.maintain(succinct, signer).await?);
-                    pile.maintain(rank9, signer).await
+                    drop(pile.maintain_attached(succinct, signer).await?);
+                    pile.maintain_attached(rank9, signer).await
                 })?;
-                let selected = snapshot.collection(rank9)?;
-                let facts = selected.view::<FactArchive>()?;
+                let selected = snapshot.attached(rank9)?;
+                let facts = selected.facts()?;
                 let people = relations::person_anchors(&facts);
                 assert!(report
                     .profiles

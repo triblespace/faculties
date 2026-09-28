@@ -14,7 +14,9 @@
 //! against ~1 s of projection put a 3,161-file backfill at 8.2 hours of pure
 //! opening when the open was paid per unit. Pay it once.
 
+use crate::storage::FactView;
 use std::borrow::BorrowMut;
+use triblespace::core::collection::AttachedSnapshot;
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;
@@ -24,7 +26,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
+    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::query::TriblePattern;
@@ -54,7 +56,7 @@ impl CodeImportWriter {
         let result = async {
             let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let observed = ensure_facts(&mut pile, source, &signer).await?;
-            let current = observed.view::<FactArchive>().context("read Code facts")?;
+            let current = observed.facts().context("read Code facts")?;
             Ok((source, current))
         }
         .await;
@@ -90,7 +92,7 @@ impl<P: BorrowMut<Pile>> CodeImportWriter<P> {
     pub async fn from_pile(mut pile: P, signer: &SigningKey) -> Result<Self> {
         let source = open_configured(pile.borrow_mut(), DEFAULT_SCOPE_ID, signer.verifying_key())?;
         let observed = ensure_facts(pile.borrow_mut(), source, signer).await?;
-        let current = observed.view::<FactArchive>().context("read Code facts")?;
+        let current = observed.facts().context("read Code facts")?;
         let mut writer = Self {
             pile,
             collection: source,
@@ -237,32 +239,29 @@ fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result
     }
 }
 
-/// Ensure the Code collection's maintained fact representation and return the
-/// ordinary observation. Storage work, not domain decoding: consumers choose
-/// their own typed queries over `view::<FactArchive>()`.
+/// Maintain the Code collection's attached fact pair and return the attached
+/// read. Storage work, not domain decoding: consumers choose their own typed
+/// queries over [`crate::storage::FactView::facts`].
 pub async fn ensure_facts(
     pile: &mut Pile,
     source: Collection<SimpleArchive>,
     signer: &SigningKey,
-) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
-    let policy = source
-        .policy(&pile.snapshot().context("freeze Code descriptor snapshot")?)
-        .context("read Code collection policy")?;
+) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     let succinct = pile
-        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .attach::<SuccinctArchiveBlob>(source, ())
         .context("register Succinct Code fact collection")?;
     let rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
         .context("register Rank9 Code fact collection")?;
-    // Each hop derives this key's own commits. The root is not acquired: the
-    // view is read as it stands, and what it has not derived yet is lag.
-    crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+    // The source is carried and its frontier attached, Succinct first; a
+    // commit left unattached is read from its own bytes.
+    crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
         .context("maintain Succinct Code fact collection")?;
-    crate::storage::tolerate_own_lag(pile.maintain(rank9, signer).await)
+    crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
         .context("maintain Rank9 Code fact collection")?;
     pile.snapshot()
         .context("freeze maintained Code facts")?
-        .collection(rank9)
+        .attached(rank9)
         .context("attach Code fact collection")
 }
 
@@ -277,7 +276,7 @@ pub async fn ensure_facts(
 /// wake` costs.
 pub fn ensure_local_with_storage(
     storage: &crate::storage::Storage,
-) -> Result<CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
+) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     storage.with_pile(|pile, signer| {
         let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
         pollster::block_on(ensure_facts(pile, source, signer))

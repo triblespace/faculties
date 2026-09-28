@@ -425,7 +425,7 @@ mod tests {
     use std::fs::File;
 
     use crate::schemas::wiki::TAG_SPECS;
-    use crate::storage::open_pile_strict;
+    use crate::storage::open_pile_strict_as;
     use crate::test_support::initialize_open_collection_fixture;
     use crate::widgets::storage::{SourceKey, StorageState};
     use crate::wiki::{self, RevisionDraft};
@@ -488,7 +488,7 @@ mod tests {
         );
         assert_ne!(linked, unlinked);
 
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         wiki::commit_collection(&mut pile, &signer, fragment).unwrap();
         wiki::carry_for_tests(&mut pile, &signer);
         pile.close().unwrap();

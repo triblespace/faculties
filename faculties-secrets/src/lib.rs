@@ -19,9 +19,8 @@ use dryoc::dryocsecretbox::{DryocSecretBox, Key, Nonce};
 use dryoc::types::*;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
-use triblespace::core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, UnionArchive,
-};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::collection::{CollectionHandle, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -67,20 +66,21 @@ pub struct WrapRow {
     pub sealed_dek: BytesHandle,
 }
 
-/// How far the maintained Secrets view is behind its source in one store
-/// snapshot, hop by hop: source commits the Succinct encoding has no leaf for,
-/// and Succinct images the Rank9 encoding has none for.
+/// How far the attached Secrets encodings are behind their source in one
+/// store snapshot: the source foundations no Succinct attachment reaches,
+/// and those no Rank9 attachment reaches.
 ///
-/// Each writer derives what it wrote, so a lagging hop is someone's
-/// derivation still to come or still to arrive by sync. There is no globally
-/// consistent state to be current against; a read attaches what is present
-/// and reports this, it never waits or refuses. Every admitted foundation
-/// counts, whether or not its payload is here.
+/// A foundation without an attachment is read from its own bytes when they
+/// are here, so lag is a cost, not missing facts, unless the bytes are not
+/// here either. There is no globally consistent state to be current
+/// against; a read attaches what is present and reports this, it never
+/// waits or refuses. Every admitted foundation counts, whether or not its
+/// payload is here.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SecretsLag {
-    /// Source commits without a Succinct leaf.
+    /// Source foundations no Succinct attachment reaches.
     pub succinct: usize,
-    /// Succinct images without a Rank9 leaf.
+    /// Source foundations no Rank9 attachment reaches.
     pub rank9: usize,
 }
 
@@ -95,7 +95,7 @@ impl std::fmt::Display for SecretsLag {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "{} source commit(s) not yet derived into Succinct, {} Succinct image(s) not yet derived into Rank9",
+            "{} source foundation(s) not yet attached to Succinct, {} not yet attached to Rank9",
             self.succinct, self.rank9
         )
     }
@@ -105,7 +105,7 @@ impl std::fmt::Display for SecretsLag {
 pub struct SecretsSnapshot<R> {
     store_snapshot: R,
     collection: CollectionHandle,
-    support: Support<Rank9AcceleratedSuccinctArchiveBlob>,
+    support: Support<SimpleArchive>,
     lag: SecretsLag,
     facts: Option<SecretsFacts>,
 }
@@ -114,7 +114,7 @@ impl<R> SecretsSnapshot<R> {
     pub(crate) fn new(
         store_snapshot: R,
         collection: CollectionHandle,
-        support: Support<Rank9AcceleratedSuccinctArchiveBlob>,
+        support: Support<SimpleArchive>,
         lag: SecretsLag,
         facts: Option<SecretsFacts>,
     ) -> Self {
@@ -135,14 +135,15 @@ impl<R> SecretsSnapshot<R> {
         self.collection
     }
 
-    /// The Rank9 encoding's own foundations this observation stands on: its
-    /// leaf images, not source commits. Comparable only with another
-    /// observation of the same collection.
-    pub fn support(&self) -> &Support<Rank9AcceleratedSuccinctArchiveBlob> {
+    /// The source foundations [`Self::facts`] stand for: those the Rank9
+    /// attachments taken stand for, and every residual one read from its
+    /// bytes. A residual foundation whose bytes are not here, or cannot
+    /// form one archive, is in neither.
+    pub fn support(&self) -> &Support<SimpleArchive> {
         &self.support
     }
 
-    /// What the view had not derived yet when it was observed.
+    /// What no attachment reached when the view was observed.
     pub const fn lag(&self) -> SecretsLag {
         self.lag
     }

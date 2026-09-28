@@ -175,11 +175,14 @@ fn validate_persona(persona: &str) -> Result<()> {
     Ok(())
 }
 
+use crate::storage::FactRead;
+use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
+use triblespace::core::collection::AttachedSnapshot;
 
 use crate::archive_agy::{self, ProjectionSummary as AgyProjectionSummary};
 use crate::archive_chatgpt::{self, ProjectionSummary as ChatGptProjectionSummary};
@@ -200,9 +203,7 @@ use crate::storage::FactArchive;
 use crate::storage::{load_signer, open_pile_strict};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::collection::{
-    CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt,
-};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::id::Id;
 use triblespace::core::inline::{Inline, TryFromInline, TryToInline};
 use triblespace::core::repo::pile::PileSnapshot;
@@ -219,7 +220,7 @@ use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::{exists, find, pattern};
 use triblespace_search::tokens::hash_tokens;
 
-type FactSnapshot = CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>;
+type FactSnapshot = AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>;
 type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
 
@@ -245,27 +246,21 @@ impl ArchiveStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = pollster::block_on(async {
                 let source = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-                let policy = source
-                    .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
-                    .context("read Comb collection policy")?;
                 let succinct = pile
-                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+                    .attach::<SuccinctArchiveBlob>(source, ())
                     .context("register Succinct Comb cursor collection")?;
                 let rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                     .context("register Rank9 Comb cursor collection")?;
-                // Each hop derives this key's own cursors; what it cannot
-                // derive, and what other writers have not derived yet, is
-                // lag, and the read attaches what is here.
-                crate::storage::tolerate_own_lag(pile.maintain(succinct, signer).await)
+                // The source is carried and its frontier attached; a cursor
+                // left unattached is read from its own bytes.
+                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
                     .context("maintain Succinct Comb cursor collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain(rank9, signer).await)
+                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
                     .context("maintain Rank9 Comb cursor collection")?;
                 pile.snapshot()
                     .context("freeze maintained Comb cursor collection")?
-                    .collection(rank9)
-                    .context("attach Comb cursor collection")?
-                    .view::<FactArchive>()
+                    .read_facts(rank9)
                     .context("read Comb cursor collection")
             });
             result
@@ -284,33 +279,19 @@ impl ArchiveStorage<'_> {
                     archive_schema::DEFAULT_SCOPE_ID,
                     signer.verifying_key(),
                 )?;
-                let archive_policy = archive_source
-                    .policy(
-                        &pile
-                            .snapshot()
-                            .context("freeze Archive descriptor snapshot")?,
-                    )
-                    .context("read Archive collection policy")?;
                 let archive_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(archive_source, (), archive_policy.clone())
+                    .attach::<SuccinctArchiveBlob>(archive_source, ())
                     .context("register Succinct Archive fact collection")?;
                 let archive_rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
-                        archive_succinct,
-                        (),
-                        archive_policy,
-                    )
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(archive_source, archive_succinct)
                     .context("register Rank9 Archive fact collection")?;
                 let comb_source =
                     open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-                let comb_policy = comb_source
-                    .policy(&pile.snapshot().context("freeze Comb descriptor snapshot")?)
-                    .context("read Comb collection policy")?;
                 let comb_succinct = pile
-                    .derive::<SuccinctArchiveBlob>(comb_source, (), comb_policy.clone())
+                    .attach::<SuccinctArchiveBlob>(comb_source, ())
                     .context("register Succinct Comb cursor collection")?;
                 let comb_rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(comb_succinct, (), comb_policy)
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(comb_source, comb_succinct)
                     .context("register Rank9 Comb cursor collection")?;
 
                 // Derive this key's own commits into each view, then observe
@@ -318,24 +299,28 @@ impl ArchiveStorage<'_> {
                 // are not acquired: a view is read as it stands, other
                 // writers' commits reach it through their own derivations,
                 // and what neither has derived yet is lag.
-                crate::storage::tolerate_own_lag(pile.maintain(comb_succinct, signer).await)
-                    .context("maintain Succinct Comb cursor collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain(comb_rank9, signer).await)
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(comb_succinct, signer).await,
+                )
+                .context("maintain Succinct Comb cursor collection")?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(comb_rank9, signer).await)
                     .context("maintain Rank9 Comb cursor collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain(archive_succinct, signer).await)
-                    .context("maintain Succinct Archive replay facts")?;
-                crate::storage::tolerate_own_lag(pile.maintain(archive_rank9, signer).await)
-                    .context("maintain Rank9 Archive replay facts")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(archive_succinct, signer).await,
+                )
+                .context("maintain Succinct Archive replay facts")?;
+                crate::storage::tolerate_own_lag(
+                    pile.maintain_attached(archive_rank9, signer).await,
+                )
+                .context("maintain Rank9 Archive replay facts")?;
                 let after = pile
                     .snapshot()
                     .context("freeze maintained Archive replay snapshot")?;
                 let archive = after
-                    .collection(archive_rank9)
+                    .attached(archive_rank9)
                     .context("attach Archive replay facts")?;
                 let comb_facts = after
-                    .collection(comb_rank9)
-                    .context("attach Comb cursor collection")?
-                    .view::<FactArchive>()
+                    .read_facts(comb_rank9)
                     .context("read Comb cursor collection")?;
                 Ok(ReplayView {
                     archive,
@@ -879,7 +864,7 @@ fn resolve_prefix(ids: impl IntoIterator<Item = Id>, prefix: &str) -> Result<Id>
 
 fn run_list(storage: ArchiveStorage<'_>, limit: usize, out: &mut Out<'_>) -> Result<()> {
     let observed = storage.load()?;
-    let facts = observed.view::<FactArchive>()?;
+    let facts = observed.facts()?;
     let mut rows = Vec::new();
     for projection in find!(
         projection: Id,
@@ -920,7 +905,7 @@ fn run_list(storage: ArchiveStorage<'_>, limit: usize, out: &mut Out<'_>) -> Res
 
 fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Result<()> {
     let observed = storage.load()?;
-    let facts = observed.view::<FactArchive>()?;
+    let facts = observed.facts()?;
     let id = resolve_prefix(
         find!(
             projection: Id,
@@ -1061,7 +1046,7 @@ fn run_thread(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let observed = storage.load()?;
-    let facts = observed.view::<FactArchive>()?;
+    let facts = observed.facts()?;
     for (index, block) in load_thread(&facts, prefix, limit)?.into_iter().enumerate() {
         if index != 0 {
             out.line(format!("---"))?;
@@ -1088,7 +1073,7 @@ fn run_search(
             lag.facts, lag.index,
         ))?;
     }
-    let facts = observed.view::<FactArchive>()?;
+    let facts = observed.facts()?;
     let query = index.query().context("prepare Archive BM25 query")?;
     for (document, score) in query
         .query_multi(&hash_tokens(&text))
@@ -1255,7 +1240,7 @@ fn run_replay(
     validate_persona(persona)?;
     let replay = storage.load_replay()?;
     let cursor = active_archive_cursor(&replay.comb_facts, REPLAY_STREAM, persona)?;
-    let facts = replay.archive.view::<FactArchive>()?;
+    let facts = replay.archive.facts()?;
     let timeline = archive_collection::timeline_after(&facts, cursor)?
         .into_iter()
         .filter(|item| {
@@ -1467,7 +1452,7 @@ mod tests {
             .unwrap();
         assert!(receipt.commit.is_some());
         let before = archive.storage().load().unwrap();
-        assert_eq!(before.support().unwrap().len(), 1);
+        assert_eq!(before.support().len(), 1);
 
         // A later operation cannot reopen this pathname, but it can borrow the
         // retained owner. Its explicit key remains at the configured location.
@@ -1491,10 +1476,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .is_err());
-        assert_eq!(
-            archive.storage().load().unwrap().support().unwrap().len(),
-            1
-        );
+        assert_eq!(archive.storage().load().unwrap().support().len(), 1);
 
         let second = archive.import(
             ImportSource::ClaudeWeb,
@@ -1503,12 +1485,9 @@ mod tests {
             &BTreeMap::new(),
         ).unwrap();
         assert!(second.commit.is_some());
+        assert_eq!(archive.storage().load().unwrap().support().len(), 2);
         assert_eq!(
-            archive.storage().load().unwrap().support().unwrap().len(),
-            2
-        );
-        assert_eq!(
-            before.support().unwrap().len(),
+            before.support().len(),
             1,
             "the earlier observation stays frozen"
         );
@@ -1577,14 +1556,7 @@ mod tests {
         assert_eq!(archive_root_payloads(&fixture), 5);
 
         assert_eq!(
-            projection_ids(
-                &storage(&fixture)
-                    .load()
-                    .unwrap()
-                    .view::<FactArchive>()
-                    .unwrap()
-            )
-            .len(),
+            projection_ids(&storage(&fixture).load().unwrap().facts().unwrap()).len(),
             10
         );
     }
@@ -1608,10 +1580,7 @@ mod tests {
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
         assert_eq!(archive_root_payloads(&fixture), 1);
         let archive = storage(&fixture).load().unwrap();
-        assert_eq!(
-            projection_ids(&archive.view::<FactArchive>().unwrap()).len(),
-            2
-        );
+        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
         drop(archive);
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
 
@@ -1650,7 +1619,7 @@ mod tests {
         run_import(storage(&fixture), &second, CliImportSource::Codex).unwrap();
 
         let archive = storage(&fixture).load().unwrap();
-        let facts = archive.view::<FactArchive>().unwrap();
+        let facts = archive.facts().unwrap();
         let ids = projection_ids(&facts);
         assert_eq!(ids.len(), 2);
         let blocks: BTreeSet<_> = find!(
@@ -1734,7 +1703,7 @@ mod tests {
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
         let archive = storage(&fixture).load().unwrap();
-        let facts = archive.view::<FactArchive>().unwrap();
+        let facts = archive.facts().unwrap();
         let id = projection_ids(&facts)[0];
         assert!(render_projection(&facts, archive.snapshot(), id)
             .unwrap()
@@ -1821,7 +1790,7 @@ mod tests {
         .unwrap();
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
         let archive = storage(&fixture).load().unwrap();
-        let facts = archive.view::<FactArchive>().unwrap();
+        let facts = archive.facts().unwrap();
         let joined = projection_ids(&facts)
             .into_iter()
             .find(|id| {
@@ -1867,7 +1836,7 @@ mod tests {
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
 
         let archive = storage(&fixture).load().unwrap();
-        let facts = archive.view::<FactArchive>().unwrap();
+        let facts = archive.facts().unwrap();
         let timeline =
             archive_collection::timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN))
                 .unwrap();
@@ -1942,7 +1911,7 @@ mod tests {
         pile.close().unwrap();
 
         let observed = storage(&fixture).load().unwrap();
-        let facts = observed.view::<FactArchive>().unwrap();
+        let facts = observed.facts().unwrap();
         let rendered = render_projection(&facts, observed.snapshot(), projection).unwrap();
         assert!(rendered.contains("one author"));
         assert!(rendered.contains("another author"));

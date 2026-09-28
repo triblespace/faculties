@@ -6,6 +6,7 @@
 //! stricter whole-fragment validators below remain explicit migration and test
 //! tools rather than a gate in front of every read.
 
+use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod cli;
@@ -116,18 +117,8 @@ where
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
-    let snapshot = store
-        .snapshot()
-        .context("freeze Body source policy snapshot")?;
-    let policy = source
-        .policy(&snapshot)
-        .context("read Body source collection policy")?;
-    drop(snapshot);
-    let target = store.derive::<LwwRegisterBlob>(
-        source,
-        (metadata::tag.id(), metadata::created_at.id()),
-        policy,
-    )?;
+    let target =
+        store.attach::<LwwRegisterBlob>(source, (metadata::tag.id(), metadata::created_at.id()))?;
     Ok(target)
 }
 
@@ -551,21 +542,21 @@ pub async fn materialize_indexed_collection(
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let policy = source.policy(&pile.snapshot()?)?;
-    let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-    let rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
     let target = intent_register_collection(pile, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze resident Body targets")?;
     let facts = store_snapshot
-        .collection(rank9)
-        .context("observe maintained Body fact collection")?
-        .view::<FactArchive>()
+        .read_facts(rank9)
         .context("read maintained Body fact collection")?;
+    // The register over the same foundations the facts read, the commits
+    // no attachment reaches built in memory.
     let intents = store_snapshot
-        .collection(target)
+        .attached(target)
         .map_err(|error| anyhow!("observe Body intent register: {error}"))?
-        .view::<LwwIndex>()
+        .read::<LwwIndex>()
         .map_err(|error| anyhow!("read Body intent register: {error}"))?
+        .into_value()
         .query()
         .map_err(|error| anyhow!("prepare Body intent register query: {error}"))?;
     Ok(BodySnapshot {
@@ -581,11 +572,12 @@ pub(crate) fn carry_for_tests(pile: &mut Pile, signer: &SigningKey) {
     let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
     crate::storage::carry_facts(pile, source, signer);
     let target = intent_register_collection(pile, signer.verifying_key()).unwrap();
-    drop(pollster::block_on(pile.maintain(target, signer)).unwrap());
+    drop(pollster::block_on(pile.maintain_attached(target, signer)).unwrap());
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::FactView;
     use hifitime::Epoch;
     use triblespace::core::id::ExclusiveId;
     use triblespace::core::inline::TryToInline;
@@ -628,15 +620,13 @@ mod tests {
             let path = directory.path().join("body.pile");
             std::fs::File::create(&path).unwrap();
             let signer = SigningKey::from_bytes(&[32; 32]);
-            let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+            let mut pile =
+                crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
             let source =
                 open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             let target = intent_register_collection(&mut pile, signer.verifying_key()).unwrap();
             let first = intent_record(&IntentRow {
@@ -662,24 +652,21 @@ mod tests {
             });
             let second_id = second.root().unwrap();
             pile.commit(source, &signer, second).unwrap();
-            drop(pile.maintain(succinct, &signer).await.unwrap());
-            let snapshot = pile.maintain(rank9, &signer).await.unwrap();
-            let fact_collection = snapshot.collection(rank9).unwrap();
-            let intent_collection = snapshot.collection(target).unwrap();
-            // The facts have derived the second intent; the register lags
-            // the source by exactly that commit, and reads as it stands.
+            drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+            let snapshot = pile.maintain_attached(rank9, &signer).await.unwrap();
+            let fact_collection = snapshot.attached(rank9).unwrap();
+            let intent_collection = snapshot.attached(target).unwrap();
+            // The facts have attached the second intent; the register's
+            // attachments lag the source by exactly that commit. Its cover
+            // alone answers as it stands; the whole read builds the commit in
+            // memory and answers like the facts.
             assert!(
                 crate::storage::FactLag::of(&snapshot, source, succinct, rank9)
                     .unwrap()
                     .is_current()
             );
-            let source_view = snapshot.collection(source).unwrap();
-            assert_eq!(
-                intent_collection.missing_from(&source_view).unwrap().len(),
-                1
-            );
-            drop(source_view);
-            let facts = fact_collection.view::<FactArchive>().unwrap();
+            assert_eq!(intent_collection.residual().len(), 1);
+            let facts = fact_collection.facts().unwrap();
             let lagging = intent_collection
                 .view::<LwwIndex>()
                 .unwrap()
@@ -689,10 +676,19 @@ mod tests {
                 latest_intent(&facts, &lagging).unwrap().unwrap().id,
                 first_id
             );
+            let whole = intent_collection.read::<LwwIndex>().unwrap();
+            assert!(whole.unread().is_empty());
+            assert_eq!(
+                latest_intent(&facts, &whole.into_value().query().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                second_id
+            );
 
-            let snapshot = pile.maintain(target, &signer).await.unwrap();
+            let snapshot = pile.maintain_attached(target, &signer).await.unwrap();
             let advanced = snapshot
-                .collection(target)
+                .attached(target)
                 .unwrap()
                 .view::<LwwIndex>()
                 .unwrap()

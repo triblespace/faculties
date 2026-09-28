@@ -515,14 +515,14 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::FactRead;
     use std::fs::File;
 
-    use crate::storage::{load_signer, open_pile_strict};
+    use crate::storage::{load_signer, open_pile_strict_as};
     use crate::test_support::initialize_open_collection_fixture;
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
-    use triblespace::core::collection::CollectionSnapshotExt;
 
     use super::*;
 
@@ -558,26 +558,19 @@ mod tests {
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), after_first);
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         // The reader prepares its own query target; publication only commits.
         let snapshot = pollster::block_on(async {
-            drop(pile.maintain(succinct, &signer).await.unwrap());
-            pile.maintain(rank9, &signer).await
+            drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+            pile.maintain_attached(rank9, &signer).await
         })
         .unwrap();
-        let facts = snapshot
-            .collection(rank9)
-            .unwrap()
-            .view::<FactArchive>()
-            .unwrap();
+        let facts = snapshot.read_facts(rank9).unwrap();
         validate_archive(&snapshot, &facts).unwrap();
         assert_eq!(facts.iter().collect::<TribleSet>(), event.into_facts());
         assert!(facts.iter().all(|fact| fact.e() == &root));
@@ -604,23 +597,18 @@ mod tests {
         );
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
         let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-        let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-            .unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .unwrap();
         let facts = pollster::block_on(async {
-            drop(pile.maintain(succinct, &signer).await.unwrap());
-            pile.maintain(rank9, &signer).await
+            drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+            pile.maintain_attached(rank9, &signer).await
         })
         .unwrap()
-        .collection(rank9)
-        .unwrap()
-        .view::<FactArchive>()
+        .read_facts(rank9)
         .unwrap();
         assert_eq!(facts.iter().collect::<TribleSet>(), expected);
         pile.close().unwrap();

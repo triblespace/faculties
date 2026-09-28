@@ -4,6 +4,7 @@
 //! meaningful with its denominator, and a tool that says "absent" without
 //! saying absent *from what* is how the fourth wrong absence claim gets made.
 
+use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -11,7 +12,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
-use triblespace::core::collection::CollectionSnapshot;
+use triblespace::core::collection::AttachedSnapshot;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
@@ -224,7 +225,7 @@ pub struct IngestOptions {
 
 // ── reading ─────────────────────────────────────────────────────────────
 
-type Observed = CollectionSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>;
+type Observed = AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>;
 
 /// A per-invocation memo of blob text.
 ///
@@ -340,7 +341,7 @@ impl Code {
     /// Where is `name` defined — and if nowhere, say so with a denominator.
     pub fn find(&self, name: &str, filter: &Filter) -> Result<Answer> {
         let observed = self.observe()?;
-        let facts = observed.view::<FactArchive>().context("read Code facts")?;
+        let facts = observed.facts().context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -389,7 +390,7 @@ impl Code {
     /// itself.
     pub fn uses(&self, identifier: &str, filter: &Filter) -> Result<Answer> {
         let observed = self.observe()?;
-        let facts = observed.view::<FactArchive>().context("read Code facts")?;
+        let facts = observed.facts().context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -423,7 +424,7 @@ impl Code {
     /// Which `use` roots appear in the catalogued corpus, and how often.
     pub fn imports(&self, root: &str, filter: &Filter) -> Result<(usize, Provenance)> {
         let observed = self.observe()?;
-        let facts = observed.view::<FactArchive>().context("read Code facts")?;
+        let facts = observed.facts().context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -435,7 +436,7 @@ impl Code {
     /// Everything the catalogue holds about one item.
     pub fn show(&self, selector: &str, with_source: bool) -> Result<ItemDetail> {
         let observed = self.observe()?;
-        let facts = observed.view::<FactArchive>().context("read Code facts")?;
+        let facts = observed.facts().context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let filter = Filter::default();
@@ -485,7 +486,7 @@ impl Code {
         filter: &Filter,
     ) -> Result<DuplicateReport> {
         let observed = self.observe()?;
-        let facts = observed.view::<FactArchive>().context("read Code facts")?;
+        let facts = observed.facts().context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -568,7 +569,7 @@ impl Code {
     /// What the catalogue holds, per revision.
     pub fn stats(&self, filter: &Filter) -> Result<StatsReport> {
         let observed = self.observe()?;
-        let facts = observed.view::<FactArchive>().context("read Code facts")?;
+        let facts = observed.facts().context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;

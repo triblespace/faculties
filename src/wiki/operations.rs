@@ -6,6 +6,8 @@
 //! still compiler execution: a hosted untrusted deployment needs independent
 //! CPU/memory limits. Embedding methods use the configured local model runtime.
 
+use crate::storage::FactRead;
+use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 #[cfg(test)]
@@ -291,7 +293,7 @@ impl WikiStorage<'_> {
             runtime
                 .block_on(async {
                     let latest = wiki_model::latest_for_source(pile, collection)?;
-                    crate::storage::seed_derived(pile, latest, collection.handle(), signer).await?;
+                    crate::storage::seed_attached(pile, latest, signer).await?;
                     crate::storage::ensure_downstream(pile, collection, signer).await?;
                     Ok::<_, anyhow::Error>(())
                 })
@@ -322,35 +324,21 @@ async fn views_in<T>(
     scopes: &[(Id, &str)],
     mut prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
 ) -> Result<T> {
-    let descriptors = pile
-        .snapshot()
-        .context("freeze Wiki source policy snapshot")?;
-    let policy = wiki_source
-        .policy(&descriptors)
-        .context("read Wiki source policy")?;
-    drop(descriptors);
     let wiki_succinct = pile
-        .derive::<SuccinctArchiveBlob>(wiki_source, (), policy.clone())
+        .attach::<SuccinctArchiveBlob>(wiki_source, ())
         .context("register Wiki Succinct collection")?;
     let wiki_rank9 = pile
-        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(wiki_succinct, (), policy)
+        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(wiki_source, wiki_succinct)
         .context("register Wiki Rank9 collection")?;
     let latest = wiki_model::latest_for_source(pile, wiki_source)?;
     let mut auxiliaries = Vec::with_capacity(scopes.len());
     for &(scope, label) in scopes {
         let source = open_source(pile, scope, signer.verifying_key()).await?;
-        let descriptors = pile
-            .snapshot()
-            .with_context(|| format!("freeze {label} source policy snapshot"))?;
-        let policy = source
-            .policy(&descriptors)
-            .with_context(|| format!("read {label} source policy"))?;
-        drop(descriptors);
         let succinct = pile
-            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .attach::<SuccinctArchiveBlob>(source, ())
             .with_context(|| format!("register {label} Succinct collection"))?;
         let rank9 = pile
-            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
             .with_context(|| format!("register {label} Rank9 collection"))?;
         auxiliaries.push((rank9, label));
     }
@@ -361,10 +349,10 @@ async fn views_in<T>(
         .snapshot()
         .context("freeze Wiki and auxiliary snapshot")?;
     let observed_facts = reader
-        .collection(wiki_rank9)
+        .attached(wiki_rank9)
         .context("observe Wiki fact collection")?;
     let observed_latest = reader
-        .collection(latest)
+        .attached(latest)
         .context("observe Wiki supersession index")?;
     // No read refuses for being behind. There is no globally consistent
     // state to be behind of, so "stands for every admitted commit" is a
@@ -372,18 +360,19 @@ async fn views_in<T>(
     // branches that entity's history a little, which is what a monotone
     // store is for. The edit ensures its own images after it commits.
     let facts = observed_facts
-        .view::<FactArchive>()
+        .facts()
         .context("read Wiki fact collection")?;
+    // The index over the same foundations the facts read: a revision no
+    // attachment reaches yet is built in memory.
     let latest = observed_latest
-        .view::<LatestIndex>()
-        .context("read Wiki supersession index")?;
+        .read::<LatestIndex>()
+        .context("read Wiki supersession index")?
+        .into_value();
     let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
     for (rank9, label) in &auxiliaries {
         auxiliary_facts.push(
             reader
-                .collection(*rank9)
-                .with_context(|| format!("observe {label} fact collection"))?
-                .view::<FactArchive>()
+                .read_facts(*rank9)
                 .with_context(|| format!("read {label} fact collection"))?,
         );
     }
@@ -2173,10 +2162,8 @@ mod tests {
             .with_pile(|pile, signer| {
                 let source =
                     open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 Ok((
                     succinct,
                     rank9,
@@ -2189,13 +2176,16 @@ mod tests {
                 .storage
                 .with_pile(|pile, signer| {
                     let snapshot = pollster::block_on(async {
-                        drop(pile.maintain(succinct, signer).await?);
-                        drop(pile.maintain(rank9, signer).await?);
-                        pile.maintain(latest, signer).await
+                        drop(pile.maintain_attached(succinct, signer).await?);
+                        drop(pile.maintain_attached(rank9, signer).await?);
+                        pile.maintain_attached(latest, signer).await
                     })?;
                     Ok((
-                        snapshot.collection(rank9)?.view::<FactArchive>()?,
-                        snapshot.collection(latest)?.view::<LatestIndex>()?,
+                        snapshot.read_facts(rank9)?,
+                        snapshot
+                            .attached(latest)?
+                            .read::<LatestIndex>()?
+                            .into_value(),
                     ))
                 })
                 .unwrap()
@@ -2248,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_keep_the_resident_frontier_until_the_worker_carries() {
+    fn reads_answer_for_every_revision_the_facts_hold_before_the_worker_carries() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let source = storage
@@ -2306,42 +2296,17 @@ mod tests {
             })
             .unwrap();
 
-        let reader_key = fixture._directory.path().join("reader.key");
-        crate::storage::initialize_signer(&fixture.pile, Some(&reader_key)).unwrap();
-        let reader = Storage::new(fixture.pile.clone(), Some(reader_key));
-        reader
-            .with_store(|pile, signer, runtime| {
-                let before = pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?;
-                let resident =
-                    runtime.block_on(views_in(pile, source, signer, &[], |view, _| {
-                        Ok(view.clone())
-                    }))?;
-                let entry = wiki_model::entry(&resident.facts, &resident.latest, root).unwrap();
-                assert_eq!(
-                    entry
-                        .frontier
-                        .iter()
-                        .map(|head| head.id)
-                        .collect::<Vec<_>>(),
-                    [root]
-                );
-                assert_eq!(
-                    revision_content(&resident.reader, &entry.frontier[0])?,
-                    "old body"
-                );
-                assert!(!wiki_model::revision_ids(&resident.facts).contains(&next));
-                assert_eq!(
-                    pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?,
-                    before,
-                    "a reader must not publish maintenance equations",
-                );
-
-                Ok(())
+        // The worker has not attached the new revision yet. The read takes
+        // the supersession index as the worker last attached it and builds
+        // the new revision's image in memory, as it reads its facts from
+        // their own bytes, so the index and the facts answer for the same
+        // revisions: the frontier is already the successor. A read
+        // publishes nothing.
+        let before = storage
+            .with_pile(|pile, _, _| {
+                Ok(pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?)
             })
             .unwrap();
-
-        // The owner's read attaches the views exactly as the non-writer's
-        // does: the frontier the worker last carried, and nothing advanced.
         let resident = owner_read();
         let entry = wiki_model::entry(&resident.facts, &resident.latest, root).unwrap();
         assert_eq!(
@@ -2350,16 +2315,25 @@ mod tests {
                 .iter()
                 .map(|head| head.id)
                 .collect::<Vec<_>>(),
-            [root]
+            [next]
         );
         assert_eq!(
             revision_content(&resident.reader, &entry.frontier[0]).unwrap(),
-            "old body"
+            "new body"
         );
-        assert!(!wiki_model::revision_ids(&resident.facts).contains(&next));
+        assert!(wiki_model::revision_ids(&resident.facts).contains(&next));
+        assert_eq!(
+            storage
+                .with_pile(|pile, _, _| Ok(pile
+                    .snapshot()?
+                    .records()?
+                    .collect::<Result<Vec<_>, _>>()?))
+                .unwrap(),
+            before,
+            "a read publishes nothing",
+        );
 
-        // The worker's carry is what advances them; then both readers see
-        // the new revision.
+        // The worker's carry attaches the revision; the answer stays.
         fixture.carry(&[]);
         let current = owner_read();
         let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();
@@ -2375,28 +2349,6 @@ mod tests {
             revision_content(&current.reader, &entry.frontier[0]).unwrap(),
             "new body"
         );
-        reader
-            .with_store(|pile, signer, runtime| {
-                let carried =
-                    runtime.block_on(views_in(pile, source, signer, &[], |view, _| {
-                        Ok(view.clone())
-                    }))?;
-                let entry = wiki_model::entry(&carried.facts, &carried.latest, root).unwrap();
-                assert_eq!(
-                    entry
-                        .frontier
-                        .iter()
-                        .map(|head| head.id)
-                        .collect::<Vec<_>>(),
-                    [next]
-                );
-                assert_eq!(
-                    revision_content(&carried.reader, &entry.frontier[0])?,
-                    "new body"
-                );
-                Ok(())
-            })
-            .unwrap();
     }
 
     #[test]
@@ -3304,7 +3256,8 @@ mod tests {
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let (author_fragment, _) = wiki_model::author_record(&signer.verifying_key());
         let (legacy, anchor, _v1, _v2) = legacy_anchor_pair();
-        let mut pile = crate::storage::open_pile_strict(&fixture.pile).unwrap();
+        let mut pile =
+            crate::storage::open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
         let collection = crate::collection_names::open(
             &mut pile,
             schema::DEFAULT_SCOPE_ID,

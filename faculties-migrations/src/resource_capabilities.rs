@@ -237,6 +237,8 @@ fn prepare(
                 }
                 CollectionRecord::Merge(_) => root.skipped_merges += 1,
                 CollectionRecord::Derive(_) => root.skipped_derives += 1,
+                // A root holds no MAP; one aimed at it is inert here too.
+                CollectionRecord::Map(_) => {}
             }
         }
         root.target_commits = snapshot

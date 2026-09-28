@@ -1,8 +1,8 @@
 //! Portable exact-term-frequency BM25 over canonical Archive blocks.
 //!
-//! This module is one concrete V4 collection mapping, not a registry. Its
-//! source is Archive's canonical `SimpleArchive` union and its target is the
-//! portable BM25 carrier. Every canonical semantic block is a document,
+//! This module is one concrete attached-collection mapping, not a registry.
+//! Its parent is Archive's canonical `SimpleArchive` union and its attached
+//! representation is the portable BM25 carrier. Every canonical semantic block is a document,
 //! including a genuine textless block. The unique content-free canonical
 //! bottom used only by raw source receipts is excluded so provenance volume
 //! cannot perturb corpus statistics. Content parts are occurrences, so the
@@ -24,13 +24,13 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace::core::collection::{CollectionOperationError, DeriveMapping};
+use triblespace::core::collection::{CollectionData, CollectionOperationError, MapMapping};
 use triblespace::core::id::{id_hex, Id};
 use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, IntoInline, RawInline};
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, StoreRead};
 use triblespace::core::trible::Fragment;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::entity;
@@ -93,16 +93,15 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveBlockTextBm25Mapping;
 
-impl DeriveMapping for ArchiveBlockTextBm25Mapping {
-    type Source = SimpleArchive;
+impl MapMapping for ArchiveBlockTextBm25Mapping {
     type Target = PortableBM25Blob;
 
     fn fragment(&self) -> Fragment {
         mapping_fragment()
     }
 
-    fn bind(_source: &Fragment, target: &Fragment) -> Result<Self, CollectionOperationError> {
-        let actual = triblespace::core::collection::descriptor::mapping_algorithm(target.facts())
+    fn bind(_parent: &Fragment, attached: &Fragment) -> Result<Self, CollectionOperationError> {
+        let actual = triblespace::core::collection::descriptor::mapping_algorithm(attached.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
         if actual != Some(ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1) {
             return Err(CollectionOperationError::Fatal(format!(
@@ -114,25 +113,22 @@ impl DeriveMapping for ArchiveBlockTextBm25Mapping {
         Ok(Self)
     }
 
-    /// Map one source element, classifying what stops it by what could
-    /// still change the answer. A selected text payload that is not here is a
-    /// dependency the store may fetch, after which the map runs again. An
-    /// element this law cannot index as one member, such as a block whose
-    /// part and fact closure sits in another commit, is refused as that
-    /// element's capacity: every other element is still derived, the refused
-    /// one stays lag, explicit maintenance names it, and a coarser cover
-    /// that holds the whole closure may still represent it. Only a failure
-    /// to read the store is fatal, because that is the one thing no other
-    /// element or cover can get around.
-    fn map<R>(
+    /// Map one parent node, classifying what stops it by what could still
+    /// change the answer. A selected text payload that is not here is a
+    /// dependency the store may fetch, after which the map runs again. A
+    /// node this law cannot index as one member, such as a block whose part
+    /// and fact closure sits partly in another commit, is refused as that
+    /// node's capacity: maintenance descends to the nodes beneath it, and a
+    /// merged node above that holds the whole closure represents it. Only a
+    /// failure to read the store is fatal, because that is the one thing no
+    /// other node can get around.
+    fn map<R: StoreRead>(
         &self,
-        source: &Blob<SimpleArchive>,
+        node: &Blob<SimpleArchive>,
+        _siblings: &[CollectionData],
         reader: &R,
-    ) -> Result<Blob<PortableBM25Blob>, CollectionOperationError>
-    where
-        R: BlobStoreGet + BlobStoreMeta,
-    {
-        match derive_for_validation(reader, source.clone()) {
+    ) -> Result<Blob<PortableBM25Blob>, CollectionOperationError> {
+        match derive_for_validation(reader, node.clone()) {
             Ok(DeriveValidation::Ready(blob)) => Ok(blob),
             Ok(DeriveValidation::Pending(payload)) => Err(
                 CollectionOperationError::MissingDependency(Inline::new(payload.raw)),
@@ -596,5 +592,258 @@ mod tests {
         let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0xFF]));
         let error = derive_element(&open_world_store.reader, malformed).unwrap_err();
         assert!(format!("{error:#}").contains("canonical SimpleArchive"));
+    }
+
+    /// A seeded splitmix64 stream, for reproducible random lattices.
+    struct Stream(u64);
+
+    impl Stream {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+    }
+
+    /// One block cut in two: its own facts, and its parts and facts with
+    /// every text payload.
+    fn split(block: Fragment) -> (Fragment, Fragment) {
+        let block_id = block.root().unwrap();
+        let (_, facts, metafacts, blobs) = block.into_parts();
+        let mut own = TribleSet::new();
+        let mut rest = TribleSet::new();
+        for fact in facts.iter() {
+            if fact.e() == &block_id {
+                own.insert(fact);
+            } else {
+                rest.insert(fact);
+            }
+        }
+        (
+            Fragment::from(own),
+            Fragment::from_parts(rest, metafacts, blobs),
+        )
+    }
+
+    /// Scores per document for one query, rounded to compare across two
+    /// summation orders.
+    fn scores(view: &ArchiveBM25View, query: &str) -> BTreeMap<RawInline, i64> {
+        view.query()
+            .unwrap()
+            .query_multi(&hash_tokens(query))
+            .into_iter()
+            .map(|(document, score)| (document.raw, (f64::from(score) * 1e4).round() as i64))
+            .collect()
+    }
+
+    /// The cover-query equivalence law for the archive-block mapping, the
+    /// one attached index whose mapping refuses some nodes: a block whose
+    /// part and fact closure is split across two commits cannot be indexed
+    /// from either commit alone (`Capacity`), only from a node holding both.
+    ///
+    /// Over random commits (some blocks split), the host's carry or not,
+    /// random host merges over possibly overlapping nodes, and an attachment
+    /// at random nodes wherever the mapping can build one, the production
+    /// read -- the attached cover and the residual built in memory -- scores
+    /// every query exactly as the index of the union of every foundation it
+    /// reads. What it cannot read it names, and only a node that cannot be
+    /// indexed alone is ever unread.
+    #[test]
+    fn archive_block_covers_answer_like_the_index_of_what_they_read() {
+        use ed25519_dalek::SigningKey;
+        use triblespace::core::collection::{
+            simplearchive_union, AdmissionPolicy, CollectionMap, CollectionMerge, CollectionPolicy,
+            CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+            CoverageRead, TryFromCover,
+        };
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+
+        const WORDS: [&str; 5] = ["alpha", "bravo", "charlie", "delta", "echo"];
+        let key = SigningKey::from_bytes(&[61; 32]);
+        let host = key.verifying_key();
+        let mut unread_seen = 0;
+        let mut attachments_taken = 0;
+        for seed in 0..24u64 {
+            let mut random = Stream(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) + 7);
+            let mut store = MemoryRepo::for_host(host);
+            let policy =
+                CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
+            let root = store
+                .collection(&format!("archive-law-{seed}"), policy)
+                .unwrap();
+            let target = store
+                .attach_with(root, ArchiveBlockTextBm25Mapping)
+                .unwrap();
+            for _ in 0..2 + random.below(8) {
+                let words: Vec<&str> = (0..1 + random.below(3))
+                    .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
+                    .collect();
+                let block = text_block(&[(schema::content_fact::modality::TEXT, &words.join(" "))]);
+                let pieces = if random.below(3) == 0 {
+                    let (own, rest) = split(block);
+                    vec![own, rest]
+                } else {
+                    vec![block]
+                };
+                for piece in pieces {
+                    let (_, attachments) = source_and_attachments(piece.clone());
+                    for blob in attachments {
+                        store.put::<UnknownBlob, _>(blob).unwrap();
+                    }
+                    store.commit(root, &key, piece).unwrap();
+                }
+            }
+            if random.below(2) == 0 {
+                pollster::block_on(store.maintain(root, &key)).unwrap();
+            }
+            let nodes = |store: &mut MemoryRepo| {
+                let snapshot = store.snapshot().unwrap();
+                let coverage =
+                    CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()])).unwrap();
+                let mut seen = BTreeSet::new();
+                let mut pending: Vec<CollectionData> = coverage.frontier(root.handle()).collect();
+                while let Some(node) = pending.pop() {
+                    if seen.insert(node) {
+                        for inputs in coverage.producers(root.handle(), node) {
+                            pending.extend(inputs.iter());
+                        }
+                    }
+                }
+                seen.into_iter().collect::<Vec<_>>()
+            };
+            // Host merges over random, possibly overlapping, nodes: some hold
+            // both halves of a split block, some only one.
+            for _ in 0..random.below(5) {
+                let lattice = nodes(&mut store);
+                if lattice.len() < 2 {
+                    break;
+                }
+                let picked: BTreeSet<CollectionData> = (0..2 + random.below(3))
+                    .map(|_| lattice[random.below(lattice.len() as u64) as usize])
+                    .collect();
+                if picked.len() < 2 {
+                    continue;
+                }
+                let snapshot = store.snapshot().unwrap();
+                let blobs: Vec<Blob<SimpleArchive>> = picked
+                    .iter()
+                    .map(|node| {
+                        snapshot
+                            .get(Handle::<SimpleArchive>::from_hash(*node))
+                            .unwrap()
+                    })
+                    .collect();
+                drop(snapshot);
+                let joined = blobs.iter().skip(1).fold(blobs[0].clone(), |joined, blob| {
+                    simplearchive_union::join(&joined, blob).unwrap()
+                });
+                let result = store.put::<SimpleArchive, _>(joined).unwrap();
+                store
+                    .insert(CollectionRecord::Merge(
+                        CollectionMerge::sign(
+                            &key,
+                            root.handle(),
+                            picked.iter().copied(),
+                            Handle::<SimpleArchive>::to_hash(result),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap();
+            }
+            // An attachment at random nodes, wherever one can be built.
+            for node in nodes(&mut store) {
+                if random.below(2) == 0 {
+                    continue;
+                }
+                let snapshot = store.snapshot().unwrap();
+                let bytes: Blob<SimpleArchive> = snapshot
+                    .get(Handle::<SimpleArchive>::from_hash(node))
+                    .unwrap();
+                let image = ArchiveBlockTextBm25Mapping.map(&bytes, &[], &snapshot);
+                drop(snapshot);
+                let Ok(image) = image else {
+                    continue;
+                };
+                let attachment = store.put::<PortableBM25Blob, _>(image).unwrap();
+                store
+                    .insert(CollectionRecord::Map(CollectionMap::sign(
+                        &key,
+                        target.handle(),
+                        node,
+                        Handle::<PortableBM25Blob>::to_hash(attachment),
+                    )))
+                    .unwrap();
+            }
+
+            let snapshot = store.snapshot().unwrap();
+            let attached = snapshot.attached(target).unwrap();
+            let read = attached
+                .read_with::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>()
+                .unwrap();
+            // What is unread is only ever a node no mapping can index alone.
+            for member in read.unread().members() {
+                let bytes: Blob<SimpleArchive> = snapshot.get(member).unwrap();
+                assert!(
+                    matches!(
+                        ArchiveBlockTextBm25Mapping.map(&bytes, &[], &snapshot),
+                        Err(CollectionOperationError::Capacity(_))
+                    ),
+                    "seed {seed}"
+                );
+                unread_seen += 1;
+            }
+            // The index of the union of every foundation the read includes.
+            let mut union = TribleSet::new();
+            for member in attached
+                .support()
+                .members()
+                .chain(attached.residual().members())
+            {
+                if read.unread().contains(member) {
+                    continue;
+                }
+                let bytes: Blob<SimpleArchive> = snapshot.get(member).unwrap();
+                union += TribleSet::try_from_blob(bytes).unwrap();
+            }
+            let expected = ArchiveBlockTextBm25Mapping
+                .map(&union.to_blob(), &[], &snapshot)
+                .unwrap();
+            attachments_taken += attached.cover().len();
+            drop(attached);
+            let expected = store.put::<PortableBM25Blob, _>(expected).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+            let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
+            let through_union: ArchiveBM25View =
+                TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
+                    .unwrap();
+            assert_eq!(
+                read.value().query().unwrap().doc_count(),
+                through_union.query().unwrap().doc_count(),
+                "seed {seed}"
+            );
+            for word in WORDS {
+                assert_eq!(
+                    scores(read.value(), word),
+                    scores(&through_union, word),
+                    "seed {seed}, query {word}"
+                );
+            }
+            assert_eq!(
+                scores(read.value(), "alpha charlie echo"),
+                scores(&through_union, "alpha charlie echo"),
+                "seed {seed}"
+            );
+        }
+        // The seeds exercise both sides of the law: split blocks left unread,
+        // and attachments taken.
+        assert!(unread_seen > 0);
+        assert!(attachments_taken > 0);
     }
 }

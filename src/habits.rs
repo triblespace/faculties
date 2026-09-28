@@ -1834,6 +1834,7 @@ pub fn evaluation_dir(pile: &Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::FactRead;
     use std::fs::File;
     use std::path::PathBuf;
 
@@ -1841,9 +1842,9 @@ mod tests {
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
-    use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+    use triblespace::core::collection::{Collection, CollectionStoreExt};
 
-    use crate::storage::{load_signer, open_pile_strict, FactArchive};
+    use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as, FactArchive};
     use crate::test_support::initialize_open_collection_fixture;
 
     use super::*;
@@ -1890,15 +1891,12 @@ mod tests {
             Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         ) {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
             let source =
                 open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-            let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-            let succinct = pile
-                .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
-                .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .unwrap();
             pile.close().unwrap();
             (succinct, rank9)
@@ -1912,22 +1910,18 @@ mod tests {
             rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         ) -> (PileSnapshot, FactArchive, FactArchive) {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
             let snapshot = pollster::block_on(async {
-                drop(pile.maintain(succinct, &signer).await?);
-                pile.maintain(rank9, &signer).await
+                drop(pile.maintain_attached(succinct, &signer).await?);
+                pile.maintain_attached(rank9, &signer).await
             })
             .unwrap();
             let succinct_facts = snapshot
-                .collection(succinct)
+                .attached(succinct)
                 .unwrap()
                 .view::<FactArchive>()
                 .unwrap();
-            let rank9_facts = snapshot
-                .collection(rank9)
-                .unwrap()
-                .view::<FactArchive>()
-                .unwrap();
+            let rank9_facts = snapshot.read_facts(rank9).unwrap();
             pile.close().unwrap();
             (snapshot, succinct_facts, rank9_facts)
         }

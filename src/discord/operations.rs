@@ -26,6 +26,7 @@
 //! claims the historical shared logs branch nor stores mutable secrets in the
 //! logical Discord dataset.
 
+use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -49,8 +50,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{
-    records::CollectionHandle, Collection, CollectionCommit, CollectionSnapshotExt,
-    CollectionStoreExt,
+    records::CollectionHandle, Collection, CollectionCommit, CollectionStoreExt,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -396,9 +396,7 @@ impl DiscordSession<'_> {
             .context("freeze Discord fact collection after commit")?;
         self.facts = self
             .reader
-            .collection(self.rank9)
-            .context("observe maintained Discord fact collection after commit")?
-            .view::<FactArchive>()
+            .read_facts(self.rank9)
             .context("read maintained Discord fact collection after commit")?;
         Ok(commit)
     }
@@ -447,23 +445,16 @@ impl DiscordStorage<'_> {
         self.storage.with_pile(|pile, signer| {
             let result = (|| {
                 let collection = self.open_collection(pile, signer.verifying_key())?;
-                let descriptor_snapshot = pile.snapshot()?;
-                let policy = collection.policy(&descriptor_snapshot)?;
-                drop(descriptor_snapshot);
-                let maintained_succinct =
-                    pile.derive::<SuccinctArchiveBlob>(collection, (), policy.clone())?;
-                let maintained_rank9 = pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
+                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    collection,
                     maintained_succinct,
-                    (),
-                    policy,
                 )?;
                 let store_snapshot = pile
                     .snapshot()
                     .context("freeze resident Discord fact collection")?;
                 let facts = store_snapshot
-                    .collection(maintained_rank9)
-                    .context("observe maintained Discord fact collection")?
-                    .view::<FactArchive>()
+                    .read_facts(maintained_rank9)
                     .context("read maintained Discord fact collection")?;
                 operation(&mut DiscordSession {
                     pile,

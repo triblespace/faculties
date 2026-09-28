@@ -8,7 +8,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::CollectionStoreExt;
-use triblespace::prelude::*;
 
 static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
 
@@ -45,7 +44,8 @@ impl TestPile {
     /// Model the independent projection worker, never an Orient read.
     fn maintain_attention(&self) {
         let signer = faculties::storage::load_signer(&self.path, None).unwrap();
-        let mut pile = faculties::storage::open_pile_strict(&self.path).unwrap();
+        let mut pile =
+            faculties::storage::open_pile_strict_as(&self.path, signer.verifying_key()).unwrap();
         pollster::block_on(async {
             for scope in [
                 faculties::schemas::relations::DEFAULT_SCOPE_ID,
@@ -57,20 +57,17 @@ impl TestPile {
                     signer.verifying_key(),
                 )
                 .unwrap();
-                let policy = source.policy(&pile.snapshot().unwrap()).unwrap();
-                let succinct = pile
-                    .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
-                    .unwrap();
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
                 let rank9 = pile
-                    .derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)
+                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                     .unwrap();
-                drop(pile.maintain(succinct, &signer).await.unwrap());
-                drop(pile.maintain(rank9, &signer).await.unwrap());
+                drop(pile.maintain_attached(succinct, &signer).await.unwrap());
+                drop(pile.maintain_attached(rank9, &signer).await.unwrap());
             }
             let status =
                 faculties::compass::status_register_collection(&mut pile, signer.verifying_key())
                     .unwrap();
-            drop(pile.maintain(status, &signer).await.unwrap());
+            drop(pile.maintain_attached(status, &signer).await.unwrap());
 
             let policy = faculties::collection_names::private_policy(signer.verifying_key());
             let receipts = pile
@@ -80,13 +77,12 @@ impl TestPile {
                 )
                 .unwrap();
             let ids = pile
-                .derive::<EntityIdSetBlob>(
+                .attach::<EntityIdSetBlob>(
                     receipts,
                     faculties::schemas::orient::presentation::event.id(),
-                    policy,
                 )
                 .unwrap();
-            drop(pile.maintain(ids, &signer).await.unwrap());
+            drop(pile.maintain_attached(ids, &signer).await.unwrap());
         });
         pile.close().unwrap();
     }

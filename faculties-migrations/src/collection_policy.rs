@@ -199,6 +199,7 @@ fn records_by_collection(
             CollectionRecord::Commit(commit) => commit.collection(),
             CollectionRecord::Merge(merge) => merge.collection(),
             CollectionRecord::Derive(derive) => derive.collection(),
+            CollectionRecord::Map(map) => map.collection(),
         };
         grouped
             .entry(collection)
@@ -304,6 +305,8 @@ fn prepare(snapshot: &PileSnapshot, signer: &SigningKey) -> Result<PreparedMigra
                 }
                 CollectionRecord::Merge(_) => skipped_merges += 1,
                 CollectionRecord::Derive(_) => skipped_derives += 1,
+                // A root holds no MAP; one aimed at it is inert here too.
+                CollectionRecord::Map(_) => {}
             }
         }
 

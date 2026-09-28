@@ -25,6 +25,7 @@ use crate::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
 #[cfg(test)]
 use crate::storage::open_pile_strict;
 use crate::storage::FactArchive;
+use crate::storage::FactView;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use lopdf::{Dictionary, Document, Object};
@@ -2107,33 +2108,30 @@ impl PostureStorage<'_> {
                 let mut rank9 = Vec::with_capacity(scopes.len());
                 for (scope, label) in scopes {
                     let collection = open_configured(pile, *scope, signer.verifying_key())?;
-                    let descriptor_snapshot = pile.snapshot()?;
-                    let policy = collection.policy(&descriptor_snapshot)?;
-                    drop(descriptor_snapshot);
                     let succinct_collection = pile
-                        .derive::<SuccinctArchiveBlob>(collection, (), policy.clone())
+                        .attach::<SuccinctArchiveBlob>(collection, ())
                         .with_context(|| format!("register succinct Posture {label} collection"))?;
                     let rank9_collection = pile
-                        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(
+                        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                            collection,
                             succinct_collection,
-                            (),
-                            policy,
                         )
                         .with_context(|| format!("register Rank9 Posture {label} collection"))?;
                     succinct.push(succinct_collection);
                     rank9.push(rank9_collection);
                 }
-                // Derive this key's own commits into each view. The roots
-                // are not acquired: a view is read as it stands, and what it
-                // lacks is lag.
+                // Carry each root and attach its frontier; a commit left
+                // unattached is read from its own bytes.
                 pollster::block_on(async {
                     for (index, (_, label)) in scopes.iter().enumerate() {
                         crate::storage::tolerate_own_lag(
-                            pile.maintain(succinct[index], signer).await,
+                            pile.maintain_attached(succinct[index], signer).await,
                         )
                         .with_context(|| format!("maintain succinct Posture {label} collection"))?;
-                        crate::storage::tolerate_own_lag(pile.maintain(rank9[index], signer).await)
-                            .with_context(|| format!("maintain Posture {label} collection"))?;
+                        crate::storage::tolerate_own_lag(
+                            pile.maintain_attached(rank9[index], signer).await,
+                        )
+                        .with_context(|| format!("maintain Posture {label} collection"))?;
                     }
                     Ok::<_, anyhow::Error>(())
                 })?;
@@ -2148,11 +2146,11 @@ impl PostureStorage<'_> {
                     .zip(rank9)
                     .map(|((_, label), collection)| {
                         let facts = reader
-                            .collection(collection)
+                            .attached(collection)
                             .with_context(|| {
                                 format!("observe maintained Posture {label} collection")
                             })?
-                            .view::<FactArchive>()
+                            .facts()
                             .with_context(|| {
                                 format!("read maintained Posture {label} collection")
                             })?;
@@ -5755,16 +5753,14 @@ fn policy_and_scan_actions_are_one_commit_a_preparing_reader_observes() {
             .storage
             .with_pile(|pile, signer| {
                 let source = open_configured(pile, scope, signer.verifying_key())?;
-                let policy = source.policy(&pile.snapshot()?)?;
-                let succinct = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
-                let rank9 =
-                    pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(succinct, (), policy)?;
+                let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let snapshot = pollster::block_on(async {
-                    drop(pile.maintain(succinct, signer).await?);
-                    pile.maintain(rank9, signer).await
+                    drop(pile.maintain_attached(succinct, signer).await?);
+                    pile.maintain_attached(rank9, signer).await
                 })?;
-                let selected = snapshot.collection(rank9)?;
-                let facts = selected.view::<FactArchive>()?;
+                let selected = snapshot.attached(rank9)?;
+                let facts = selected.facts()?;
                 assert!(find!(
                     id: Id,
                     pattern!(&facts, [{ ?id @ metadata::tag: &kind }])
