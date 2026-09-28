@@ -135,8 +135,10 @@ impl<R> SecretsSnapshot<R> {
         self.collection
     }
 
-    /// The source foundations the Rank9 attachments taken stand for; the
-    /// residual read from its bytes is not part of it.
+    /// The source foundations [`Self::facts`] stand for: those the Rank9
+    /// attachments taken stand for, and every residual one read from its
+    /// bytes. A residual foundation whose bytes are not here, or cannot
+    /// form one archive, is in neither.
     pub fn support(&self) -> &Support<SimpleArchive> {
         &self.support
     }

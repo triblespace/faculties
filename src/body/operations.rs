@@ -428,8 +428,9 @@ mod projection_tests {
         let winners = snapshot
             .attached(intents)
             .unwrap()
-            .view::<LwwIndex>()
+            .read::<LwwIndex>()
             .unwrap()
+            .into_value()
             .query()
             .unwrap();
         assert_eq!(winners.winner(KIND_INTENT), Some(intent.id));

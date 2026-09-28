@@ -249,9 +249,11 @@ impl WikiSnapshot {
         &self.latest
     }
 
-    /// Source foundations no supersession attachment reached when this
-    /// snapshot was taken: a revision can be in the facts before the index
-    /// is attached to it, and the index is read as it stands.
+    /// Source foundations the supersession index does not answer for in
+    /// this snapshot: none it has an attachment for, and none whose bytes are
+    /// here to build one from in memory. A revision can be in the facts
+    /// before the index is attached to it; the index then reads it from its
+    /// bytes, and only a revision whose bytes are not here is lag.
     pub fn latest_lag(&self) -> usize {
         self.latest_lag
     }
@@ -1656,11 +1658,14 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
     let facts = store_snapshot
         .read_facts(rank9)
         .context("read Wiki fact collection")?;
+    // The index over the same foundations the facts read: revisions no
+    // attachment reaches yet are built in memory.
     let latest = store_snapshot
         .attached(target)
         .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
-        .view::<LatestIndex>()
-        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
+        .read::<LatestIndex>()
+        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
+        .into_value();
     Ok(WikiQuerySnapshot {
         facts,
         store_snapshot,
@@ -1675,7 +1680,7 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
 /// ordinary query path; normal commands use [`query_snapshot`] and query its
 /// [`FactArchive`] directly. Because it is an import's preparation and not a
 /// read, it first attaches the Wiki's current frontier into its views. A
-/// revision no attachment reaches is the index's lag, and the snapshot says
+/// revision the index cannot answer for is its lag, and the snapshot says
 /// how much ([`WikiSnapshot::latest_lag`]) instead of refusing.
 pub async fn materialize_indexed_collection(
     pile: &mut Pile,
@@ -1696,14 +1701,14 @@ pub async fn materialize_indexed_collection(
         .collection(collection)
         .context("attach Wiki collection")?;
     let facts = source.view::<TribleSet>().context("read Wiki collection")?;
-    let latest = store_snapshot
+    let (latest, unread) = store_snapshot
         .attached(target)
-        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?;
-    let latest_lag = latest.residual().len();
+        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
+        .read::<LatestIndex>()
+        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
+        .into_parts();
+    let latest_lag = unread.len();
     drop(source);
-    let latest = latest
-        .view::<LatestIndex>()
-        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?;
     // This explicit migration/import projection retains the complete-facts
     // reference oracle; ordinary readers join the positive index directly.
     let catalog = validate_catalog(&store_snapshot, &facts)?;
@@ -1761,8 +1766,8 @@ mod tests {
         let descriptor: TribleSet = snapshot.get(latest.handle()).unwrap();
 
         assert_eq!(
-            triblespace::core::collection::descriptor::parent(&descriptor).unwrap(),
-            Some(source.handle())
+            triblespace::core::collection::descriptor::parents(&descriptor).unwrap(),
+            vec![source.handle()]
         );
         assert!(latest.policy(&snapshot).is_err());
     }

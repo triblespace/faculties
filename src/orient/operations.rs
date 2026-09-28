@@ -996,14 +996,17 @@ fn observe_sources(
         .map(|source| source.observe(&snapshot))
         .transpose()?;
     let presentations = sources.presentations.observe(&snapshot)?;
-    // Positive known-winner membership is an ordinary relation: it does not
-    // require the fact and register collections to have identical support.
+    // Positive known-winner membership is an ordinary relation over the
+    // same foundations the facts read: a status no attachment reaches yet is
+    // built in memory, so the register never answers for less than the facts.
     let status_collection = trace_refresh_call("Compass status", "attach", || {
         snapshot.attached(sources.compass_status)
     })
     .map_err(|error| anyhow!("observe Compass status register: {error}"))?;
     let status_index = trace_refresh_call("Compass status", "view", || {
-        status_collection.view::<LwwIndex>()
+        status_collection
+            .read::<LwwIndex>()
+            .map(|read| read.into_value())
     })
     .map_err(|error| anyhow!("read Compass status register: {error}"))?;
     let compass_status = trace_refresh_call("Compass status", "query", || status_index.query())
@@ -4950,8 +4953,9 @@ async fn cmd_wake(
             .snapshot
             .attached(wiki_latest)
             .context("observe resident Wiki supersession index")?
-            .view::<triblespace::core::collection::latest::LatestIndex>()
-            .context("attach resident Wiki supersession index")?;
+            .read::<triblespace::core::collection::latest::LatestIndex>()
+            .context("attach resident Wiki supersession index")?
+            .into_value();
         let persona_id = read(storage, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             persona
@@ -7334,8 +7338,12 @@ mod tests {
         assert!(person_anchors(&relations_source).is_empty());
     }
 
+    /// The status register's attachments may lag the facts' -- the facts
+    /// attached a commit the register has not -- and a read still answers
+    /// for every status the facts hold: the register's residual is built in
+    /// memory. An observation taken earlier keeps its own answer.
     #[test]
-    fn resident_fact_and_status_views_do_not_require_equal_support() {
+    fn a_status_register_whose_attachments_lag_still_answers_for_the_facts() {
         pollster::block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
@@ -7388,14 +7396,17 @@ mod tests {
                 .await
                 .unwrap();
             let lagging = observe_sources(snapshot, &sources).unwrap();
-            // The facts attached the new commit; the status register lags the
-            // source by it and is read as it stands.
+            // The facts attached the new commit and the status register has
+            // not; its read builds that commit in memory and answers for it.
             let status = lagging.snapshot.attached(sources.compass_status).unwrap();
             assert_eq!(status.residual().len(), 1);
             drop(status);
             let query = lagging.query(&lagging.snapshot);
-            assert_eq!(latest_goal_status(&query, goal).unwrap().0, initial_id);
-            assert_eq!(latest_goal_status(&query, unseen_goal), None);
+            assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
+            assert_eq!(
+                latest_goal_status(&query, unseen_goal).unwrap().0,
+                unseen_id
+            );
 
             let ready = pile
                 .maintain_attached(sources.compass_status, &fixture.signer)
@@ -7409,8 +7420,11 @@ mod tests {
                 unseen_id
             );
             let frozen = lagging.query(&lagging.snapshot);
-            assert_eq!(latest_goal_status(&frozen, goal).unwrap().0, initial_id);
-            assert_eq!(latest_goal_status(&frozen, unseen_goal), None);
+            assert_eq!(latest_goal_status(&frozen, goal).unwrap().0, next_id);
+            assert_eq!(
+                latest_goal_status(&frozen, unseen_goal).unwrap().0,
+                unseen_id
+            );
             assert_eq!(
                 latest_goal_status(&observation.query(&observation.snapshot), goal)
                     .unwrap()

@@ -252,8 +252,12 @@ impl HealthSources {
         let latest_collection = trace_refresh_call("Swarm health latest", "attach", || {
             snapshot.attached(self.latest)
         })?;
+        // The register over the same foundations the health facts read: a
+        // report no attachment reaches yet is built in memory.
         let latest_index = trace_refresh_call("Swarm health latest", "view", || {
-            latest_collection.view::<LwwIndex>()
+            latest_collection
+                .read::<LwwIndex>()
+                .map(|read| read.into_value())
         })?;
         let latest = trace_refresh_call("Swarm health latest", "query", || latest_index.query())?;
         let relations = self.relations.observe(&snapshot)?;

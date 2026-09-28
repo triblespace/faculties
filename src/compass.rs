@@ -1104,11 +1104,15 @@ where
     let fact_archive = store_snapshot
         .read_facts(rank9)
         .context("read Compass fact collection")?;
+    // The register over the same foundations the facts read: its cover, and
+    // every commit no attachment reaches built in memory, so a status the
+    // facts hold is never missing from its winners.
     let status = store_snapshot
         .attached(status_target)
         .context("observe Compass status register")?
-        .view::<LwwIndex>()
+        .read::<LwwIndex>()
         .context("read Compass status register")?
+        .into_value()
         .query()
         .context("prepare Compass status register query")?;
     Ok(CompassSnapshot {
@@ -1168,6 +1172,44 @@ mod tests {
         drop(store.maintain_attached(status, signer).await.unwrap());
     }
 
+    /// A host where nothing ever attached the status register -- no MAP
+    /// names it, so no maintenance pass finds it -- reads every goal's
+    /// status all the same, from the commits' own bytes.
+    #[test]
+    fn a_status_register_nothing_attached_reads_every_status() {
+        pollster::block_on(async {
+            let owner = SigningKey::from_bytes(&[25; 32]);
+            let mut store = MemoryRepo::for_host(owner.verifying_key());
+            let source =
+                crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, owner.verifying_key())
+                    .unwrap();
+            let (mut first, goal) = goal_fragment("first", vec![], None, at(1)).unwrap();
+            first += status_fragment(goal, "doing", None, at(1)).unwrap();
+            store.commit(source, &owner, first).unwrap();
+            let resident = materialize_indexed_source(&mut store, source)
+                .await
+                .unwrap();
+            let register = status_register_for_source(&mut store, source).unwrap();
+            assert!(store
+                .snapshot()
+                .unwrap()
+                .attached(register)
+                .unwrap()
+                .cover()
+                .is_empty());
+            assert_eq!(
+                crate::schemas::compass::latest_status_event(
+                    resident.facts(),
+                    resident.status_register(),
+                    goal,
+                )
+                .unwrap()
+                .1,
+                "doing",
+            );
+        });
+    }
+
     #[test]
     fn indexed_reads_attach_what_the_worker_carried_and_never_publish() {
         pollster::block_on(async {
@@ -1209,8 +1251,10 @@ mod tests {
 
             // Neither an unadmitted reader nor the owner advances the chain on
             // a read, and neither publishes anything. The facts read the new
-            // commit from its own bytes; the status register answers from what
-            // was carried until the worker attaches the commit.
+            // commit from its own bytes, and so does the status register: the
+            // two answer for the same foundations, so the goal's newer status
+            // and the new goal's status are winners before the worker
+            // attaches the commit.
             for _signer in [&reader, &owner] {
                 let resident = materialize_indexed_source(&mut store, source)
                     .await
@@ -1225,6 +1269,16 @@ mod tests {
                         resident.facts(),
                         resident.status_register(),
                         goal,
+                    )
+                    .unwrap()
+                    .1,
+                    "done",
+                );
+                assert_eq!(
+                    crate::schemas::compass::latest_status_event(
+                        resident.facts(),
+                        resident.status_register(),
+                        new_goal,
                     )
                     .unwrap()
                     .1,
@@ -1357,8 +1411,8 @@ mod tests {
         let descriptor: TribleSet = snapshot.get(register.handle()).unwrap();
 
         assert_eq!(
-            triblespace::core::collection::descriptor::parent(&descriptor).unwrap(),
-            Some(source.handle())
+            triblespace::core::collection::descriptor::parents(&descriptor).unwrap(),
+            vec![source.handle()]
         );
         assert!(register.policy(&snapshot).is_err());
     }

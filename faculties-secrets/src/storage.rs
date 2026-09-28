@@ -148,18 +148,24 @@ where
     let succinct = store_snapshot
         .attached(collection.succinct)
         .context("observe maintained Succinct Secrets collection")?;
-    let support = observed.support().clone();
     let lag = SecretsLag {
         succinct: succinct.residual().len(),
         rank9: observed.residual().len(),
     };
-    let facts = if observed.cover().is_empty() && observed.residual().is_empty() {
-        None
+    let (support, facts) = if observed.cover().is_empty() && observed.residual().is_empty() {
+        (observed.support().clone(), None)
     } else {
-        Some(
-            succinctarchive_union::read_attached(&observed)
-                .context("read maintained Secrets collection")?,
-        )
+        let (facts, unread) = succinctarchive_union::read_attached(&observed)
+            .context("read maintained Secrets collection")?
+            .into_parts();
+        // What the facts stand for: the attachments' foundations and every
+        // residual one read from its bytes.
+        let read = observed
+            .residual()
+            .difference(&unread)
+            .and_then(|read| observed.support().union(&read))
+            .map_err(|error| anyhow!("combine the Secrets read's support: {error}"))?;
+        (read, Some(facts))
     };
     Ok(SecretsSnapshot::new(
         store_snapshot,
@@ -624,7 +630,10 @@ mod tests {
                 .unwrap();
             assert!(observed.contains(old));
             assert!(observed.contains(new), "read from its own bytes");
-            assert_eq!(observed.support(), &support);
+            // The support is what the facts stand for: the attached commit
+            // and the one read from its bytes.
+            assert!(support.is_subset(observed.support()).unwrap());
+            assert_eq!(observed.support().len(), support.len() + 1);
             assert_eq!(
                 observed.lag(),
                 SecretsLag {

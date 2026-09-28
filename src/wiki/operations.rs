@@ -362,9 +362,12 @@ async fn views_in<T>(
     let facts = observed_facts
         .facts()
         .context("read Wiki fact collection")?;
+    // The index over the same foundations the facts read: a revision no
+    // attachment reaches yet is built in memory.
     let latest = observed_latest
-        .view::<LatestIndex>()
-        .context("read Wiki supersession index")?;
+        .read::<LatestIndex>()
+        .context("read Wiki supersession index")?
+        .into_value();
     let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
     for (rank9, label) in &auxiliaries {
         auxiliary_facts.push(
@@ -2179,7 +2182,10 @@ mod tests {
                     })?;
                     Ok((
                         snapshot.read_facts(rank9)?,
-                        snapshot.attached(latest)?.view::<LatestIndex>()?,
+                        snapshot
+                            .attached(latest)?
+                            .read::<LatestIndex>()?
+                            .into_value(),
                     ))
                 })
                 .unwrap()
@@ -2232,7 +2238,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_keep_the_attached_frontier_until_the_worker_carries() {
+    fn reads_answer_for_every_revision_the_facts_hold_before_the_worker_carries() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
         let source = storage
@@ -2290,9 +2296,12 @@ mod tests {
             })
             .unwrap();
 
-        // The read takes the supersession index as the worker last attached
-        // it, so the frontier stays at the root; the new revision's facts are
-        // read from their own bytes all the same. A read publishes nothing.
+        // The worker has not attached the new revision yet. The read takes
+        // the supersession index as the worker last attached it and builds
+        // the new revision's image in memory, as it reads its facts from
+        // their own bytes, so the index and the facts answer for the same
+        // revisions: the frontier is already the successor. A read
+        // publishes nothing.
         let before = storage
             .with_pile(|pile, _, _| {
                 Ok(pile.snapshot()?.records()?.collect::<Result<Vec<_>, _>>()?)
@@ -2306,11 +2315,11 @@ mod tests {
                 .iter()
                 .map(|head| head.id)
                 .collect::<Vec<_>>(),
-            [root]
+            [next]
         );
         assert_eq!(
             revision_content(&resident.reader, &entry.frontier[0]).unwrap(),
-            "old body"
+            "new body"
         );
         assert!(wiki_model::revision_ids(&resident.facts).contains(&next));
         assert_eq!(
@@ -2324,7 +2333,7 @@ mod tests {
             "a read publishes nothing",
         );
 
-        // The worker's carry is what advances the index.
+        // The worker's carry attaches the revision; the answer stays.
         fixture.carry(&[]);
         let current = owner_read();
         let entry = wiki_model::entry(&current.facts, &current.latest, root).unwrap();

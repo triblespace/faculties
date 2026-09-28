@@ -549,11 +549,14 @@ pub async fn materialize_indexed_collection(
     let facts = store_snapshot
         .read_facts(rank9)
         .context("read maintained Body fact collection")?;
+    // The register over the same foundations the facts read, the commits
+    // no attachment reaches built in memory.
     let intents = store_snapshot
         .attached(target)
         .map_err(|error| anyhow!("observe Body intent register: {error}"))?
-        .view::<LwwIndex>()
+        .read::<LwwIndex>()
         .map_err(|error| anyhow!("read Body intent register: {error}"))?
+        .into_value()
         .query()
         .map_err(|error| anyhow!("prepare Body intent register query: {error}"))?;
     Ok(BodySnapshot {
@@ -653,8 +656,10 @@ mod tests {
             let snapshot = pile.maintain_attached(rank9, &signer).await.unwrap();
             let fact_collection = snapshot.attached(rank9).unwrap();
             let intent_collection = snapshot.attached(target).unwrap();
-            // The facts have attached the second intent; the register lags
-            // the source by exactly that commit, and reads as it stands.
+            // The facts have attached the second intent; the register's
+            // attachments lag the source by exactly that commit. Its cover
+            // alone answers as it stands; the whole read builds the commit in
+            // memory and answers like the facts.
             assert!(
                 crate::storage::FactLag::of(&snapshot, source, succinct, rank9)
                     .unwrap()
@@ -670,6 +675,15 @@ mod tests {
             assert_eq!(
                 latest_intent(&facts, &lagging).unwrap().unwrap().id,
                 first_id
+            );
+            let whole = intent_collection.read::<LwwIndex>().unwrap();
+            assert!(whole.unread().is_empty());
+            assert_eq!(
+                latest_intent(&facts, &whole.into_value().query().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                second_id
             );
 
             let snapshot = pile.maintain_attached(target, &signer).await.unwrap();

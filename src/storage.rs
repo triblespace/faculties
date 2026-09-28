@@ -51,11 +51,12 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{
     ensure_downstream as core_ensure_downstream, maintain_downstream as core_maintain_downstream,
-    realize_attached_as, succinctarchive_union, Attached, AttachedSnapshot, Collection,
-    CollectionAttachment, CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding,
-    CollectionHandle, CollectionMerge, CollectionRead, CollectionRealizationError,
-    CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt,
-    CoreRealizer, Derived, RealizeDerived, Realized, SourceLocator, Support, Upkeep, UpkeepReport,
+    realize_attached_as, succinctarchive_union, Attached, AttachedRead, AttachedSnapshot,
+    Collection, CollectionAttachment, CollectionCommit, CollectionData, CollectionDerive,
+    CollectionEncoding, CollectionHandle, CollectionMerge, CollectionRead,
+    CollectionRealizationError, CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt,
+    CollectionStoreExt, CoreRealizer, Derived, RealizeDerived, Realized, SourceLocator, Support,
+    Upkeep, UpkeepReport,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
@@ -611,9 +612,11 @@ where
 ///
 /// A foundation without an attachment is read from its own bytes by
 /// [`FactRead::read_facts`], so this is a cost, not missing facts, unless the
-/// foundation's bytes are not here either. There is no globally consistent
-/// state to be current against: a read attaches what is present and reports
-/// this, it never waits or refuses.
+/// read cannot read it: its bytes are not here, or they cannot form one
+/// archive (malformed, or too wide for one segment). Those are the read's
+/// own gap, named by [`attached_facts_read`]. There is no globally
+/// consistent state to be current against: a read attaches what is present
+/// and reports this, it never waits or refuses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FactLag {
     /// Source foundations no Succinct attachment reaches.
@@ -713,6 +716,20 @@ impl<R: StoreRead> FactView for AttachedSnapshot<R, Rank9AcceleratedSuccinctArch
 pub fn attached_facts<R>(
     attached: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
 ) -> Result<FactArchive>
+where
+    R: StoreRead,
+{
+    attached_facts_read(attached).map(AttachedRead::into_value)
+}
+
+/// [`attached_facts`], with the residual foundations the read could not
+/// include named beside the facts: those whose bytes are not here, and
+/// those whose bytes cannot form one archive. A caller that must tell a
+/// complete read from a partial one -- a cache key, a lag report -- reads
+/// this.
+pub fn attached_facts_read<R>(
+    attached: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<AttachedRead<FactArchive>>
 where
     R: StoreRead,
 {

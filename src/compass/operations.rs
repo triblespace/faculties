@@ -1686,7 +1686,8 @@ mod tests {
                         snapshot.read_facts(rank9)?,
                         snapshot
                             .attached(status)?
-                            .view::<triblespace::core::collection::lww_register::LwwIndex>()?
+                            .read::<triblespace::core::collection::lww_register::LwwIndex>()?
+                            .into_value()
                             .query()?,
                     ))
                 })
