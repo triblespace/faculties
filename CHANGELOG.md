@@ -7,20 +7,25 @@ All notable changes to this project will be documented in this file.
 - `files index` derives every Files commit that has no semantic row whose
   bytes are here or can be fetched, whoever saved it, and carries each
   index's rows into this key's merges; saving a file still embeds only this
-  key's own files without rows -- the one just saved, and any earlier one
-  still waiting -- never another key's. Only a machine of the canonical compute embeds, after its golden
-  vectors agree; `files index` on any other machine embeds nothing and
-  carries the rows that arrived by replication instead of refusing. The note
-  on files without rows no longer says that only a file's writer embeds it,
-  and it counts a file whose only row has not arrived here as a file without
-  rows: `storage::underived` counts a foundation only when none of its leaves
-  has its output here, as maintenance does.
+  key's own files that have no row at all -- the one just saved, and any
+  earlier one still waiting -- never another key's; a file whose row's bytes
+  are not here is left to `files index`. Only a machine of the canonical
+  compute embeds, after its golden vectors agree; `files index` on any other
+  machine embeds nothing and carries the rows that arrived by replication
+  instead of refusing. The note on files without rows no longer says that
+  only a file's writer embeds it, and it counts a file whose only row has not
+  arrived here as a file without rows: `storage::underived` counts a
+  foundation only when none of its leaves has its output here, as
+  maintenance does.
 
 - `files index` maintains the Image and the Text index whatever the other
   did: one failing -- a file its model refuses, rows its carry cannot join --
   no longer ends the command before the other index is derived and carried,
-  or before either lag note. Each index's line and lag note is printed, and
-  every failure is returned after both. `files add` prints one "Semantic
+  or before either lag note. Each index whose rows can be read gets its
+  line, and each whose lag can be counted its lag note; every failure is
+  returned after both -- for one broken index that can be its maintenance
+  and the read of its rows, each named -- as are the indexes' failures when
+  the pile cannot be read after them. `files add` prints one "Semantic
   index not maintained" line per index that failed.
 
 - A faculty opens its pile as the key it signs with exactly when what it does

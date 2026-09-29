@@ -482,8 +482,9 @@ type SemanticUpkeep = (
 /// result, and what failed.
 ///
 /// With `every_file` false -- what saving a file does -- embed the Files
-/// commits this key wrote that have no rows yet: the file just saved, and
-/// any earlier one of this key's still without rows. With it true -- `files
+/// commits this key wrote that have no row at all yet: the file just saved,
+/// and any earlier one of this key's still without one. A commit whose row's
+/// bytes are not here is left to `files index`. With it true -- `files
 /// index` -- embed every Files commit whose bytes are here and that has no
 /// row whose bytes are here or can be fetched, whoever wrote it, then carry
 /// each index's rows into this key's merges. Only a machine of the canonical
@@ -858,7 +859,7 @@ fn cmd_add(
     // A saved image is searchable the moment it is saved, where this machine
     // can embed it (JP, 2026-09-12: saving an image should embed it, no skip
     // path); elsewhere its rows arrive from a machine that can. Saving embeds
-    // every file of this key's still without rows, not only this one.
+    // every file of this key's that has no row at all, not only this one.
     #[cfg(feature = "local-embed")]
     if local_compute() == SEMANTIC_COMPUTE {
         match maintain_semantic(pile, collection, signer, runtime, false) {
@@ -2053,7 +2054,7 @@ fn cmd_similar<P: TriblePattern>(
 
         // The indexes as they stand: a query is a read and never waits on the
         // GPU. `files add` embeds the file it just saved, and any earlier
-        // file of this key's still without rows, and `files index` every
+        // file of this key's with no row at all, and `files index` every
         // file without a usable row, whoever saved it, on the canonical
         // compute; elsewhere the rows arrive by replication. Files
         // with no row yet (see SEMANTIC_COMPUTE) are counted rather than
