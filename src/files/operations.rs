@@ -495,7 +495,8 @@ type SemanticUpkeep = (
 /// join -- holds back neither the other index nor what the caller reports:
 /// each is maintained as far as it goes, and the failures come back with
 /// both. Only a failed golden check, or a pile that cannot be read at all,
-/// ends the pass as an error.
+/// ends the pass as an error; a pile that cannot be read once the indexes
+/// were maintained ends it with what they reported as well.
 #[cfg(feature = "local-embed")]
 fn maintain_semantic(
     store: &mut FacultyStore,
@@ -562,9 +563,16 @@ fn maintain_semantic_on(
         }
         targets.push((kind, target));
     }
-    let snapshot = store
+    let snapshot = match store
         .snapshot()
-        .context("freeze the pile after the Files semantic indexes")?;
+        .context("freeze the pile after the Files semantic indexes")
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            failures.push(error);
+            return Err(semantic_failures(failures).expect_err("a failure was just recorded"));
+        }
+    };
     Ok((targets, snapshot, failures))
 }
 
