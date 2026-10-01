@@ -2334,7 +2334,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_reads_keep_warm_views_with_cold_source_or_auxiliary_members() {
+    fn owner_reads_report_cold_selected_source_or_auxiliary_members() {
         for cold_auxiliary in [false, true] {
             let fixture = Fixture::new();
             let storage = fixture.storage();
@@ -2381,7 +2381,23 @@ mod tests {
                         signer,
                         &[(auxiliary, "Files")],
                         runtime,
-                        |view, _| Ok(view.clone()),
+                        |view, auxiliaries| {
+                            let entry = wiki_model::entry(&view.facts, &view.latest, root).unwrap();
+                            assert_eq!(
+                                entry.frontier.iter().map(|head| head.id).collect::<Vec<_>>(),
+                                [root],
+                            );
+                            assert_eq!(
+                                revision_content(&view.reader, &entry.frontier[0])?,
+                                "resident body",
+                            );
+                            assert_eq!(
+                                find!(id: Id, pattern!(&auxiliaries[0], [{ ?id @ metadata::tag: &auxiliary_marker }]))
+                                    .collect::<Vec<_>>(),
+                                [*auxiliary_marker],
+                            );
+                            Ok(view.clone())
+                        },
                     )
                 })
                 .unwrap();
@@ -2416,43 +2432,35 @@ mod tests {
                         arriving.data(),
                     );
                     let before = pile.snapshot()?;
+                    let selected_source = if cold_auxiliary { auxiliary } else { source };
+                    assert!(selected_source.admitted(&before)?.contains(cold));
                     assert!(!before.contains_blob(cold)?);
                     let records = before.records()?.collect::<Result<Vec<_>, _>>()?;
                     assert!(pile.health().started_at.is_none());
                     assert!(!pile.health().store.serving_snapshot);
 
-                    views_in(
+                    let error = views_in(
                         pile,
                         source,
                         signer,
                         &[(auxiliary, "Files")],
                         runtime,
-                        |view, auxiliaries| {
-                            let entry = wiki_model::entry(&view.facts, &view.latest, root).unwrap();
-                            assert_eq!(
-                                entry.frontier.iter().map(|head| head.id).collect::<Vec<_>>(),
-                                [root],
-                            );
-                            assert_eq!(
-                                revision_content(&view.reader, &entry.frontier[0])?,
-                                "resident body",
-                            );
-                            assert_eq!(
-                                find!(id: Id, pattern!(&auxiliaries[0], [{ ?id @ metadata::tag: &auxiliary_marker }]))
-                                    .collect::<Vec<_>>(),
-                                [*auxiliary_marker],
-                            );
-                            Ok(())
+                        |_, _| -> Result<()> {
+                            panic!("an incomplete observation must not reach the reader")
                         },
-                    )?;
+                    )
+                    .unwrap_err();
+                    let incomplete = error
+                        .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                        .unwrap();
+                    assert_eq!(incomplete.unread.collection(), selected_source);
+                    assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
                     let after = pile.snapshot()?;
                     assert!(!after.contains_blob(cold)?);
                     assert_eq!(after.records()?.collect::<Result<Vec<_>, _>>()?, records);
                     assert_eq!(after.wants()?.count(), 0);
-                    // Health is corroborating evidence: started_at is written
-                    // at host-loop entry, not at the startup handshake. The
-                    // Core Leech fixture checks its dormant state directly.
-                    assert!(pile.health().started_at.is_none(), "no host activity should be observed for an unrelated source miss");
+                    // Exact acquisition may start the demand-side host, but
+                    // cannot publish this foreground observation for serving.
                     let health = pile.health();
                     assert!(!health.store.serving_snapshot);
                     assert!(health.store.last_snapshot_published_at.is_none());

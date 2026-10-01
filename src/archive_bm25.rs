@@ -461,14 +461,22 @@ mod tests {
             AdmissionPolicy::direct(signer.verifying_key()),
         )).unwrap();
         let target = store.attach_with(root, ArchiveBlockTextBm25Mapping).unwrap();
+        let text: Blob<UTF8String> = "late comet comet".to_blob();
+        let text_handle = text.get_handle();
         let (node, attachments) = source_and_attachments(text_block(&[
             (schema::content_fact::modality::TEXT, "late comet comet"),
         ]));
+        assert!(attachments.iter().any(|blob| blob.get_handle().raw == text_handle.raw));
         let facts = TribleSet::try_from_blob(node.clone()).unwrap();
         store.commit(root, &signer, facts.into()).unwrap();
         let frozen = store.snapshot().unwrap();
-        assert!(derive_element(&frozen, node.clone()).is_err());
-        assert!(attachments.iter().all(|blob| !frozen.contains_blob(blob.get_handle()).unwrap()));
+        assert!(matches!(
+            derive_for_validation(&frozen, node.clone()).unwrap(),
+            DeriveValidation::Pending(handle) if handle == text_handle
+        ));
+        // Descriptor registration may already have stored schema attachments.
+        // The selected document text itself must be genuinely cold.
+        assert!(!frozen.contains_blob(text_handle).unwrap());
 
         // Exact lookup can now find the bytes in the owning Leech, but the
         // selected node and residency observation remain the older ones.
@@ -483,7 +491,7 @@ mod tests {
             selected.read_with_acquiring::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>().unwrap(),
         ).unwrap();
         assert_eq!(index.segments().iter().map(|segment| segment.doc_count()).sum::<usize>(), 1);
-        assert!(attachments.iter().all(|blob| !reader.contains_blob(blob.get_handle()).unwrap()));
+        assert!(!reader.contains_blob(text_handle).unwrap());
         assert!(store.health().started_at.is_none());
         store.close().unwrap();
     }

@@ -150,7 +150,11 @@ impl HealthSources {
                 // Do not fetch historical receipt bytes it never consults.
                 presentations: ReceiptObservation {
                     collection: presentations.into_frozen(),
-                    view: FactArchive::new(Vec::new()),
+                    view: FactArchive::new(vec![
+                        triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(
+                            TribleSet::new(),
+                        ),
+                    ]),
                 },
                 max_age,
             })
@@ -1149,6 +1153,17 @@ mod tests {
             "catching up a receipt projection must not author another receipt",
         );
         assert!(after.wants().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn foreground_dashboard_needs_no_historical_receipt_shards() {
+        let mut f = Fixture::new();
+        test_block_on(async {
+            let observation = f.sources.observe_acquiring(&mut f.store, &f.signer).await.unwrap();
+            let report = observation.report_acquiring().await.unwrap();
+            assert!(report.text.contains("not observed / not configured"));
+            assert!(report.attention.is_empty());
+        });
     }
 
     #[test]

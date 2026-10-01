@@ -1143,8 +1143,8 @@ mod tests {
 
     /// The revision names exactly what a fact read holds. A commit that
     /// arrives and that nothing attaches is read from its bytes, and moves
-    /// the revision; a commit whose payload is not here is left out and
-    /// named, and its bytes arriving moves the revision again.
+    /// the revision; a commit whose payload is not here refuses the dataset
+    /// as incomplete, and its bytes arriving moves the revision again.
     #[test]
     fn dataset_revision_changes_when_a_commit_is_read_from_its_bytes() {
         use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -1204,8 +1204,18 @@ mod tests {
                 empty_metadata_handle(),
             )))
             .unwrap();
-        let (facts, gap) = attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
-        assert_eq!(names(&facts), BTreeSet::from([first.id, second.id]));
+        let missing_snapshot = store.snapshot().unwrap();
+        let error = attached_facts_and_revision(&missing_snapshot, rank9)
+            .err().expect("a foreground dataset must not silently omit the missing commit");
+        let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>()
+            .expect("the failure names incomplete selected support");
+        assert_eq!(incomplete.unread.len(), 1);
+        assert_eq!(incomplete.unread.members().next(), Some(payload.get_handle()));
+        // The revision law still distinguishes this failed observation from
+        // the later complete one; no partial dataset is exposed or cached.
+        let gap = DatasetRevision::from_attached(
+            &missing_snapshot.attached_acquiring(rank9).unwrap(), &incomplete.unread,
+        );
         assert_ne!(read_raw, gap);
         store.put::<SimpleArchive, _>(payload).unwrap();
         let (facts, arrived) =

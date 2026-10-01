@@ -1094,7 +1094,11 @@ async fn observe_snapshot_acquiring(
         } else {
             // Wake presents an overview, not unseen-news membership. Do not
             // demand historical receipt payloads it will never consult.
-            FactArchive::new(Vec::new())
+            FactArchive::new(vec![
+                triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(
+                    TribleSet::new(),
+                ),
+            ])
         };
         let status_collection = reader.attached_acquiring(status_target)?;
         let status_index = crate::storage::require_complete_attached_read(
@@ -6806,11 +6810,14 @@ mod tests {
         pile.put::<blobencodings::UTF8String, _>("still on its way".to_owned())
             .unwrap();
         test_block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
+        // These are semantic delivery assertions, not 25 ms latency gates.
+        // Frozen selection now yields while its blocking task runs, so the
+        // command can enforce its timeout during otherwise resident work.
         let delivered = run_wait_for(
             &mut pile,
             &fixture,
             "cc",
-            Duration::from_millis(25),
+            Duration::from_secs(1),
             Duration::from_secs(1),
         );
         assert!(delivered.contains("News: new message"), "{delivered}");
@@ -6826,7 +6833,7 @@ mod tests {
             &mut pile,
             &fixture,
             "cc",
-            Duration::from_millis(25),
+            Duration::from_secs(1),
             Duration::from_secs(1),
         );
         assert!(!quiet.contains("News:"), "{quiet}");
@@ -6874,11 +6881,13 @@ mod tests {
         // watcher observed either transition, so leaving the shared one to
         // "whoever saw it" leaves it to nobody. Reporting is what writes the
         // receipt, which is what makes the rearm below quiet.
+        // Leave room for the asynchronous frozen-selection boundary; this
+        // fixture tests due/receipt semantics, not sub-25 ms preparation.
         let armed = run_wait_for(
             &mut pile,
             &fixture,
             "cc",
-            Duration::from_millis(25),
+            Duration::from_secs(1),
             Duration::from_secs(1),
         );
         assert!(
@@ -6897,7 +6906,7 @@ mod tests {
             &mut pile,
             &fixture,
             "cc",
-            Duration::from_millis(25),
+            Duration::from_secs(1),
             Duration::from_secs(1),
         );
         assert!(!rearmed.contains("became due"), "{rearmed}");

@@ -2849,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_memory_reads_and_creates_ignore_an_unavailable_root_member() {
+    fn memory_reads_and_creates_report_an_unavailable_selected_root_member() {
         let fixture = TestPile::new();
         let storage = fixture.storage();
         let memory = Memory::with_storage(fixture.storage.clone());
@@ -2866,28 +2866,6 @@ mod tests {
             resolve_chunk_id(&loaded, &format!("{warm:x}")).unwrap(),
             warm
         );
-        let (source, cold) = fixture
-            .storage
-            .with_pile(|pile, signer| {
-                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let (fragment, _) = memory_model::chunk_fragment(text_draft(
-                    "unavailable historical member",
-                    "2026-08-01T00:00:00",
-                    "2026-08-01T01:00:00",
-                ))?;
-                let mut remote = MemoryRepo::default();
-                let arriving = remote.commit(source, signer, fragment)?;
-                let cold = Handle::<blobencodings::SimpleArchive>::from_hash(arriving.data());
-                // Only the genuine signed record arrives, not its archive or
-                // attachments. The warm target is still a complete local view.
-                pile.insert(CollectionRecord::Commit(arriving))?;
-                let snapshot = pile.snapshot()?;
-                assert!(source.admitted(&snapshot)?.contains(cold));
-                assert!(!snapshot.contains_blob(cold)?);
-                Ok((source, cold))
-            })
-            .unwrap();
-
         let mut shown = String::new();
         memory
             .show(
@@ -2914,16 +2892,7 @@ mod tests {
             resolve_chunk_id(&loaded, &format!("{:x}", plain.id)).unwrap(),
             plain.id
         );
-        assert_eq!(
-            chunk_references(&loaded.memory.facts, linked.id),
-            vec![warm]
-        );
-
-        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(source.handle())]);
-        let before = fixture
-            .storage
-            .with_pile(|pile, _| Ok(pile.snapshot()?.select_records(&selectors)?))
-            .unwrap();
+        assert_eq!(chunk_references(&loaded.memory.facts, linked.id), vec![warm]);
         let unknown = ufoid();
         let error = memory
             .create(
@@ -2934,6 +2903,58 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("hard reference"));
         assert!(format!("{error:#}").contains("no chunk id matches"));
+
+        let (source, cold) = fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let (fragment, _) = memory_model::chunk_fragment(text_draft(
+                    "unavailable historical member",
+                    "2026-08-01T00:00:00",
+                    "2026-08-01T01:00:00",
+                ))?;
+                let mut remote = MemoryRepo::default();
+                let arriving = remote.commit(source, signer, fragment)?;
+                let cold = Handle::<blobencodings::SimpleArchive>::from_hash(arriving.data());
+                // Only the genuine signed record arrives, not its archive or
+                // attachments. A warm view no longer covers this observation.
+                pile.insert(CollectionRecord::Commit(arriving))?;
+                let snapshot = pile.snapshot()?;
+                assert!(source.admitted(&snapshot)?.contains(cold));
+                assert!(!snapshot.contains_blob(cold)?);
+                Ok((source, cold))
+            })
+            .unwrap();
+
+        shown.clear();
+        let error = memory
+            .show(
+                &format!("{warm:x}"),
+                &mut Out::new(&mut |part| {
+                    match part {
+                        crate::out::Part::Text { text } => shown.push_str(&text),
+                        other => panic!("expected journal text, got {other:?}"),
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap_err();
+        assert!(shown.is_empty(), "an incomplete observation must not be presented");
+        let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>().unwrap();
+        assert_eq!(incomplete.unread.collection(), source);
+        assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
+
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(source.handle())]);
+        let before = fixture
+            .storage
+            .with_pile(|pile, _| Ok(pile.snapshot()?.select_records(&selectors)?))
+            .unwrap();
+        for summary in ["a later journal entry".to_owned(), format!("[earlier](memory:{warm:x})")] {
+            let error = memory.create(&summary, Some(range), None).unwrap_err();
+            let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>().unwrap();
+            assert_eq!(incomplete.unread.collection(), source);
+            assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
+        }
         fixture
             .storage
             .with_pile(|pile, _| {
@@ -2947,7 +2968,7 @@ mod tests {
     }
 
     #[test]
-    fn resident_memory_auxiliary_views_ignore_unavailable_root_members() {
+    fn memory_auxiliary_views_report_unavailable_selected_root_members() {
         let fixture = TestPile::new();
         let storage = fixture.storage();
         let warm = publish_chunk(
@@ -2979,9 +3000,28 @@ mod tests {
                     .collect::<Result<Vec<_>>>()
             })
             .unwrap();
-        drop(storage.load_context(true).unwrap());
-        drop(storage.load_comb().unwrap());
-        drop(storage.load_provenance().unwrap());
+        let context = storage.load_context(true).unwrap();
+        let comb = storage.load_comb().unwrap();
+        let provenance = storage.load_provenance().unwrap();
+        for loaded in [&context.memory, &comb.memory, &provenance.memory] {
+            assert_eq!(resolve_chunk_id(loaded, &format!("{warm:x}")).unwrap(), warm);
+        }
+        assert_eq!(
+            find!(id: Id, pattern!(&comb.comb.facts, [{ ?id @ metadata::tag: &marker }]))
+                .collect::<Vec<_>>(),
+            vec![*marker],
+        );
+        for facts in [
+            &context.embeddings.as_ref().unwrap().facts,
+            &provenance.cognition.facts,
+            &provenance.archive.facts,
+        ] {
+            assert_eq!(
+                find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &marker }]))
+                    .collect::<Vec<_>>(),
+                vec![*marker],
+            );
+        }
 
         let (cold, before) = fixture
             .storage
@@ -3001,37 +3041,24 @@ mod tests {
                     ));
                 }
                 let snapshot = pile.snapshot()?;
-                for handle in &cold {
+                for (source, handle) in sources.iter().zip(&cold) {
+                    assert!(source.admitted(&snapshot)?.contains(*handle));
                     assert!(!snapshot.contains_blob(*handle)?);
                 }
                 let records = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
                 Ok((cold, records))
             })
             .unwrap();
-        let context = storage.load_context(true).unwrap();
-        let comb = storage.load_comb().unwrap();
-        let provenance = storage.load_provenance().unwrap();
-        for loaded in [&context.memory, &comb.memory, &provenance.memory] {
-            assert_eq!(
-                resolve_chunk_id(loaded, &format!("{warm:x}")).unwrap(),
-                warm
-            );
-        }
-        assert_eq!(
-            find!(id: Id, pattern!(&comb.comb.facts, [{ ?id @ metadata::tag: &marker }]))
-                .collect::<Vec<_>>(),
-            vec![*marker],
-        );
-        for facts in [
-            &context.embeddings.as_ref().unwrap().facts,
-            &provenance.cognition.facts,
-            &provenance.archive.facts,
+        for error in [
+            storage.load_context(true).err().expect("incomplete context"),
+            storage.load_comb().err().expect("incomplete comb view"),
+            storage.load_provenance().err().expect("incomplete provenance"),
         ] {
-            assert_eq!(
-                find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &marker }]))
-                    .collect::<Vec<_>>(),
-                vec![*marker],
-            );
+            let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>().unwrap();
+            // Every operation first needs the Memory facts, so its missing
+            // selected foundation must be reported, not a partial warm view.
+            assert_eq!(incomplete.unread.collection(), sources[0]);
+            assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold[0]]);
         }
         fixture
             .storage

@@ -1400,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_reads_warm_targets_without_acquiring_cold_root_members() {
+    fn owner_reads_name_unavailable_selected_foundations_instead_of_hiding_them() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[97; 32]);
@@ -1441,6 +1441,32 @@ mod tests {
         carry(&mut pile, &runtime, message_source, &owner);
         assert!(pile.health().started_at.is_none());
 
+        let (snapshot, relation_facts, message_facts) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+            ))
+            .unwrap();
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+        };
+        let listed = runtime
+            .block_on(list(&mut input, &ListOptions::new("reader")))
+            .unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].id, first_id);
+        assert_eq!(
+            listed.entries[0].body,
+            MessageText::Text("the resident message".to_owned())
+        );
+
         let mut missing = Vec::new();
         for (source, name) in [
             (relations_source, "cold Relations member"),
@@ -1471,31 +1497,21 @@ mod tests {
             .unwrap()
             .map(|record| record.unwrap())
             .collect::<Vec<_>>();
-        let (snapshot, relation_facts, message_facts) = runtime
+        let error = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
             ))
-            .unwrap();
-        let mut input = MessageStorage {
-            pile: &mut pile,
-            signer: &owner,
-            collection: message_source,
-            reader: &snapshot,
-            messages: &message_facts,
-            relations: &relation_facts,
-        };
-        let listed = runtime
-            .block_on(list(&mut input, &ListOptions::new("reader")))
-            .unwrap();
-        assert_eq!(listed.entries.len(), 1);
-        assert_eq!(listed.entries[0].id, first_id);
-        assert_eq!(
-            listed.entries[0].body,
-            MessageText::Text("the resident message".to_owned())
-        );
+            .err()
+            .expect("an unavailable selected member must not become a partial success");
+        let unread = &error
+            .downcast_ref::<storage::IncompleteAttachedRead>()
+            .expect("preserve the typed incomplete observation")
+            .unread;
+        assert_eq!(unread.collection(), relations_source);
+        assert_eq!(unread.members().collect::<Vec<_>>(), vec![missing[0]]);
         let after = pile.snapshot().unwrap();
         assert_eq!(
             after
