@@ -1524,8 +1524,9 @@ mod tests {
         for handle in missing {
             assert!(!after.contains_blob(handle).unwrap());
         }
-        // A foreground Peer starts only when an unavailable blob is acquired.
-        assert!(pile.health().started_at.is_none());
+        // Unlike the resident read above, demanding the missing selected
+        // foundation starts the foreground Peer even when no provider has it.
+        assert!(pile.health().started_at.is_some());
         pile.close().unwrap();
     }
 
