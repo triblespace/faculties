@@ -6,13 +6,13 @@ resolver = "2"
 
 [package]
 name = "faculties"
-version = "0.20.2"
+version = "0.21.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "An office suite for AI agents: kanban, wiki, files, messaging, and a GORBIE-backed viewer — all persisted in a TribleSpace pile."
+description = "An office suite for AI agents: kanban, wiki, files, messaging, and a Lissajous-backed viewer — all persisted in a TribleSpace pile."
 authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
-homepage = "https://github.com/erlkonig-ai/faculties"
-repository = "https://github.com/erlkonig-ai/faculties"
+homepage = "https://github.com/triblespace/faculties"
+repository = "https://github.com/triblespace/faculties"
 readme = "README.md"
 keywords = ["triblespace", "ai-agent", "kanban", "wiki", "notebook"]
 categories = ["command-line-utilities", "data-structures"]
@@ -123,6 +123,9 @@ web-export = []
 # Semantic similarity in `files` + `wiki similar` / `memory similar` (image+text
 # embeddings via mary's embedder). Default (see above).
 local-embed = ["dep:mary", "mary/embed", "mary/gemma", "triblespace-search/semantic"]
+# Explicit bounded single-model WeMM path; never a Nomic fallback. Descriptor
+# and join portability live in search's separate semantic-wemm feature.
+wemm = ["dep:mary", "mary/wemm-input", "triblespace-search/semantic-wemm-cuda"]
 # Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux"]
 # In-process Qwen3-TTS in the `voice` faculty (`voice say`/`voice shout`/`voice
@@ -172,20 +175,20 @@ clap = { version = "4.5.4", features = ["derive", "env"] }
 ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
 rand_core = "0.6.4"
-triblespace = { version = "0.47", path = "../triblespace-rs" }
+triblespace = { version = "0.47.0", path = "../triblespace-rs" }
 triblespace-paths = { version = "0.47.0", path = "../triblespace-rs/triblespace-paths" }
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
-triblespace-net = { path = "../triblespace-rs/triblespace-net" }
+triblespace-net = { version = "0.47.0", path = "../triblespace-rs/triblespace-net" }
 iroh-base = "1.0"
 iroh-tickets = "1.0"
 iroh = "1.0"  # CLI output to Drive's existing organ endpoint
-framed-stream = { path = "framed-stream" }  # native ordered media framing
+framed-stream = { package = "faculties-framed-stream", version = "0.1.0", path = "framed-stream" }  # native ordered media framing
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net", "sync", "signal", "macros"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }  # native MCP HTTP transport
 faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets faculty logic
 
 # Per-faculty dependencies shared by library operations and explicit frontends.
-anybytes = "0.20"           # files
+anybytes = { version = "0.20.3", path = "../anybytes" }
 base64 = "0.22"             # teams
 blake3 = "1"                # mail (deterministic entity id from Message-Id)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
@@ -234,7 +237,7 @@ typst-syntax = "0.14"       # wiki
 zip = { version = "2", default-features = false, features = ["deflate"] }  # posture (OOXML is a zip of XML)
 
 # Widgets-only (optional): GORBIE viewer stack.
-GORBIE = { version = "0.18.1", default-features = false, features = ["typst", "markdown"], optional = true }
+GORBIE = { package = "lissajous", version = "0.19.0", default-features = false, features = ["typst", "markdown"], optional = true, path = "../GORBIE" }
 egui = { version = "0.34", optional = true }
 
 # Optional, heavy: mary's Burn/Metal model ports. Activated as a bare optional
@@ -244,59 +247,18 @@ egui = { version = "0.34", optional = true }
 #                 image+text shared space) + nomic-embed-multimodal-7b (3584-d
 #                 dense image/text space; Qwen2.5-VL port + Metal/wgpu backend).
 #   imagine     → mary[flux]: the ported FLUX.2 text→image pipeline.
-mary = { path = "../mary", default-features = false, optional = true }
+mary = { package = "maryml", version = "0.1.0", path = "../mary", default-features = false, optional = true }
 # Files presentation codecs; also matches the image type returned by Mary FLUX.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] } # files view; imagine
 
 [dev-dependencies]
 tempfile = "3"
 
-# ── patches ────────────────────────────────────────────────────────────────
-# `[patch]` only takes effect from the *root* crate of a build, so mary's own
-# patch section is ignored when mary is consumed as a path dep here. We mirror
-# it: the nomic-mm7b zero-copy aliasing path (`local-embed`) and resident CUDA
-# speech need the CubeCL graph fork (external aliases plus captured/replayed
-# launches), while V3 uses the 256-byte-aligned local triblespace-core. The
-# whole suite is on one CubeCL lineage (0.10): widgets, Mary's model ports, and
-# these fork patches all resolve together — widgets, local-embed, imagine, and
-# voice are co-buildable in one release cohort.
+# SOURCE-BUILD-ONLY: retain the tested network readiness repair.
+# Registry consumers intentionally use upstream netwatch without these fixes.
+# Root patches are not inherited; this source/registry difference is deliberate.
 [patch.crates-io]
-# Section freezes are immutable views, not durability barriers. Keep the same
-# AnyBytes lineage at every build root; dependency patch tables are ignored.
-anybytes = { git = "https://github.com/triblespace/anybytes.git", rev = "066c32a7cfcc470a6750c849499c1e88a0e0c50a" }
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
-# The pinned GORBIE source cohort provides resident PNG capture.
-GORBIE = { path = "../GORBIE" }
-# Match Mary's deterministic macro expansion and mixed-dtype matmul fixes.
-# Cargo ignores a dependency's patch table, and Burn's workspace crates must
-# stay on one source lineage to avoid resolving duplicate burn-tensor types.
-cubecl-macros = { git = "https://github.com/erlkonig-ai/cubecl", rev = "8b2aa74e2514e39562df6e384a271c2ef9e53b06" }
-burn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-autodiff = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-backend = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-core = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cubecl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cubecl-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-cuda = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-dataset = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-derive = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-dispatch = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-flex = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-fusion = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-ir = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-ndarray = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-nn = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-optim = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-rl = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-std = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-tensor = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-train = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-vision = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-burn-wgpu = { git = "https://github.com/erlkonig-ai/burn", rev = "21adb25bb5277a1ff65179fa61442d8330d494d9" }
-cubecl-runtime = { path = "../cubecl-graph/cubecl-runtime" }
-cubecl-cuda = { path = "../cubecl-graph/cubecl-cuda" }
-cubecl-wgpu = { path = "../cubecl-graph/cubecl-wgpu" }
-triblespace-core = { path = "../triblespace-rs/triblespace-core" }
 
 # Debug info was 94.7% of a debug binary here: the `trible` test binary
 # measured 1.97 GB, of which only 110 MB was code. Cargo never collects old

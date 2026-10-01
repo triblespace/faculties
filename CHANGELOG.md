@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## 0.21.0 - 2026-10-01
+
+- Update the source cohort to TribleSpace 0.47.0, GORBIE 0.19.0 and
+  `maryml` 0.1.0; the Rust library and dependency alias remain `mary`.
+  This does not switch Files' semantic model to WeMM.
+- Name the standalone media-framing package `faculties-framed-stream`
+  0.1.0 for publication; its library remains `framed_stream` and the
+  workspace directory remains `framed-stream`.
+
+- Add explicit native `files index --wemm` / `files similar --wemm` and reusable
+  Files APIs sharing one prebound native CUDA model for text and PNG/JPEG.
+  Model loading uses a read-only frozen pile observation with explicit unsafe
+  immutable-prefix custody; writable Files/model inode aliases are refused.
+  Descriptors pin the actual root/assets, GB10 compute and bounded input/kernel
+  profile. Query ranking uses the GPU NVFP4 scorer and the ordinary Files
+  relational content join. Unsupported or overlength input refuses its entire
+  source foundation; no Nomic fallback, truncation or empty-success leaf.
+  Legacy defaults remain separate, and no live index migration is performed.
+  The bounded GB10 scratch gate passed: library/Files compile, three metadata
+  tests, and a real Files fixture publishing three native DERIVEs whose NVFP4
+  row handles match retained native embeddings exactly. Text and image queries,
+  whole-foundation overlength refusal, and reuse of all 759 bindings passed.
+  Its debug fixture took 50.51 s, including 37.85 s binding and 4.34 s indexing;
+  this is scoped evidence, not general retrieval quality or throughput. Earlier
+  compile and scratch-setup failures are retained; no production arithmetic or
+  assertion was relaxed. Evidence: `files-native-wemm-20261001/gate-3`.
+
 - Foreground faculty readers acquire exact descriptor, name, admission-definition,
   selected fact and body bytes through their retained Leech owner. Core's shared
   acquisition adapter keeps the original record/proof evidence and residency;

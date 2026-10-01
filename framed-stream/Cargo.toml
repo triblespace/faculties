@@ -1,10 +1,13 @@
 [package]
-name = "framed-stream"
+name = "faculties-framed-stream"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-publish = false
 description = "The framed-stream convention: content-typed, continuity-checked records carrying a modality over an ordinary pipe, in either direction."
+
+[lib]
+name = "framed_stream"
+path = "src/lib.rs"
 
 # std + anyhow, deliberately. A faculty that speaks the convention must be able
 # to link it without pulling in a pile, a sandbox client, or a cognition loop —

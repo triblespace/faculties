@@ -4,7 +4,7 @@ use super::operations::{EmbeddingOptions, FetchOptions, Files, SimilarityOptions
 use super::presentation::ViewOptions;
 use crate::out::Out;
 use crate::spec::{Invocation, Param, Spec, Verb};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 const SHARED: &[Param] = &[
@@ -20,6 +20,14 @@ const SHARED: &[Param] = &[
     .ambient()
     .optional()
     .env("TRIBLESPACE_KEY"),
+    Param::caller("wemm-pile", "Dedicated finished WeMM BF16 model pile; operator must keep its mapped prefix immutable through CUDA teardown")
+        .path().ambient().optional().env("WEMM_PILE"),
+    Param::caller("wemm-assets", "Directory containing the exact pinned config.json, tokenizer.json and chat_template.jinja")
+        .path().ambient().optional().env("WEMM_ASSETS"),
+    Param::caller("wemm-root", "Opaque selected WeMM model root (32 hex digits)")
+        .ambient().optional().env("WEMM_ROOT"),
+    Param::caller("wemm-collection", "Contributing model collection descriptor (64 hex digits)")
+        .ambient().optional().env("WEMM_COLLECTION"),
 ];
 
 const VERBS: &[Verb] = &[
@@ -116,7 +124,9 @@ const VERBS: &[Verb] = &[
                 .positional()
                 .optional(),
             Param::caller("text", "Text query for cross-modal search").optional(),
-            Param::caller("floor", "Minimum cosine similarity, 0..1, for each kind without its own floor. Measured 2026-09-14 over 863 indexed files: any text sits 0.60-0.65 from a text query, any image 0.65-0.86 from an image query, and cross-modal pairs 0.02-0.09; relevance is the margin above that band, not the value").default("0"),
+            Param::caller("wemm", "Use the explicit native 4096-D single-model GB10 WeMM index, never Nomic fallback").flag(),
+            Param::caller("wemm-floor", "Optional reconstructed WeMM cosine floor [-1,1]; omitted ranks top-k without a calibrated relevance cutoff").optional(),
+            Param::caller("floor", "Legacy Nomic cosine floor, 0..1 (default 0); use --wemm-floor with WeMM. Nomic modality calibration does not apply to WeMM").optional(),
             Param::caller("image-floor", "Minimum cosine for the image index; --floor otherwise").optional(),
             Param::caller("text-floor", "Minimum cosine for the text index; --floor otherwise").optional(),
             Param::caller("limit", "Maximum results")
@@ -138,7 +148,7 @@ const VERBS: &[Verb] = &[
     Verb {
         name: "index",
         about: "Maintain the semantic indexes: every stored file's content embedded through the model of its kind in the working pile (images through nomic-vision, PDF text layers and UTF-8 through nomic-text), one row per distinct content, whoever saved the file (requires local-embed; only a gb10 embeds, elsewhere the rows arrive by replication and are carried)",
-        params: &[],
+        params: &[Param::caller("wemm", "Use one native WeMM model for bounded UTF-8 and PNG/JPEG (requires wemm); unsupported content fails its foundation without a partial/empty success").flag()],
     },
     Verb {
         name: "golden",
@@ -219,6 +229,10 @@ fn execute_with_input(
     out: &mut Out<'_>,
     input: &mut impl std::io::Read,
 ) -> Result<()> {
+    anyhow::ensure!(
+        invocation.flag("wemm") || invocation.get("wemm-floor").is_none(),
+        "--wemm-floor requires --wemm; no legacy threshold substitution was made"
+    );
     let files = Files::new(
         invocation.require_path("pile")?.to_owned(),
         invocation.path("key").map(Path::to_owned),
@@ -296,12 +310,14 @@ fn execute_with_input(
             out,
         ),
         "search" => out.text(files.search(invocation.require("query")?)?),
+        "similar" if invocation.flag("wemm") => execute_wemm(&files, invocation, out),
         "similar" => files.similar(
             &SimilarityOptions {
                 id: invocation.get("id"),
                 text: invocation.get("text"),
                 floor: invocation
-                    .require("floor")?
+                    .get("floor")
+                    .unwrap_or("0")
                     .parse()
                     .context("invalid --floor")?,
                 image_floor: invocation
@@ -328,6 +344,7 @@ fn execute_with_input(
             },
             out,
         ),
+        "index" if invocation.flag("wemm") => execute_wemm(&files, invocation, out),
         "index" => files.index(out),
         "golden" => files.golden(invocation.flag("publish"), out),
         "embed7b" => files.embed7b(
@@ -404,10 +421,195 @@ fn execute_with_input(
     }
 }
 
+#[cfg(not(feature = "wemm"))]
+fn execute_wemm(_files: &Files, _invocation: &Invocation, _out: &mut Out<'_>) -> Result<()> {
+    bail!(
+        "native WeMM selected but unavailable: rebuild with --features wemm; no fallback was used"
+    )
+}
+
+#[cfg(feature = "wemm")]
+fn execute_wemm(files: &Files, invocation: &Invocation, out: &mut Out<'_>) -> Result<()> {
+    use super::operations::wemm::{ModelOptions, ModelSource, Query, QueryOptions};
+    use mary::models::qwen3_5::native::device_identity;
+    use mary::nn::cuda_bf16_alias::CudaBf16Aliases;
+    use triblespace::prelude::{Id, Inline};
+    anyhow::ensure!(
+        !invocation.flag("mm7b")
+            && invocation.get("kind").is_none()
+            && invocation.get("floor").is_none()
+            && invocation.get("image-floor").is_none()
+            && invocation.get("text-floor").is_none(),
+        "WeMM uses one unified index; legacy model/kind/floor options cannot be combined with --wemm"
+    );
+    let query = if invocation.verb().name == "similar" {
+        Some(match (invocation.get("id"), invocation.get("text")) {
+            (Some(id), None) => Query::File(id),
+            (None, Some(text)) => Query::Text(text),
+            _ => bail!("provide exactly one file id or --text"),
+        })
+    } else {
+        None
+    };
+    let floor = invocation
+        .get("wemm-floor")
+        .map(str::parse::<f64>)
+        .transpose()
+        .context("invalid --wemm-floor")?;
+    if let Some(floor) = floor {
+        anyhow::ensure!(
+            floor.is_finite() && (-1.0..=1.0).contains(&floor),
+            "--wemm-floor must be finite in [-1,1]"
+        );
+    }
+    let limit = invocation
+        .get("limit")
+        .map(str::parse::<usize>)
+        .transpose()
+        .context("invalid --limit")?
+        .unwrap_or(10);
+    let collection: [u8; 32] = hex::decode(
+        invocation
+            .require("wemm-collection")?
+            .strip_prefix("blake3:")
+            .unwrap_or(invocation.require("wemm-collection")?),
+    )?
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("--wemm-collection requires 64 hex digits"))?;
+    let root = Id::from_hex(invocation.require("wemm-root")?)
+        .context("--wemm-root requires a valid opaque model id")?;
+    let source = ModelSource::open(
+        ModelOptions {
+            pile: invocation.require_path("wemm-pile")?.to_owned(),
+            collection: Inline::new(collection),
+            root,
+            assets: invocation.require_path("wemm-assets")?.to_owned(),
+        },
+        invocation.require_path("pile")?,
+    )?;
+    let device = Default::default();
+    let identity = device_identity(&device).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        identity == ("NVIDIA GB10".into(), 12, 1),
+        "native WeMM requires actual NVIDIA GB10 / compute 12.1; observed {identity:?}"
+    );
+    let mut aliases = CudaBf16Aliases::new(device, 759).map_err(anyhow::Error::msg)?;
+    // SAFETY: this explicit CLI mode accepts a dedicated finished model
+    // artifact under the documented operator immutable-prefix custody. It
+    // exposes no mutation/compaction; read-only open is not claimed as proof.
+    // aliases is allocated once for the command, including failure paths.
+    let mut session = unsafe { source.bind(&mut aliases) }?;
+    eprintln!(
+        "WeMM model backing {:?}, {} roles, selection blake3:{}; same native text/image session",
+        session.backing_identity(),
+        session.role_count,
+        session.selection_blake3
+    );
+    if let Some(query) = query {
+        let hits = files.similar_wemm(
+            &mut session,
+            &QueryOptions {
+                query,
+                floor,
+                limit,
+                tags: invocation.values("tag"),
+            },
+        )?;
+        out.line("Native WeMM: ranked reconstructed NVFP4 cosines (not a calibrated relevance probability)")?;
+        for hit in hits {
+            out.line(format!(
+                "{:.6}  {}  {}  {}",
+                hit.cosine,
+                hit.name,
+                hex::encode(hit.content.raw),
+                hit.entity
+            ))?;
+        }
+        Ok(())
+    } else {
+        let report = files.index_wemm(&mut session)?;
+        out.line(format!(
+            "Native WeMM index {}: {} rows, {} underived foundations",
+            hex::encode(report.collection.handle().raw),
+            report.rows,
+            report.underived_foundations
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spec::CliRequest;
+
+    #[test]
+    fn wemm_floor_requires_explicit_model_before_opening_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let pile = dir.path().join("absent.pile");
+        let CliRequest::Invoke(invocation) = SPEC
+            .lower_cli_from([
+                "files",
+                "--pile",
+                pile.to_str().unwrap(),
+                "similar",
+                "--text",
+                "query",
+                "--wemm-floor",
+                "0.9",
+            ])
+            .unwrap()
+        else {
+            panic!("invoke");
+        };
+        let error = execute(
+            &invocation,
+            &mut Out::new(&mut |_| panic!("unexpected output")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--wemm-floor requires --wemm"));
+        assert!(!pile.exists());
+    }
+
+    #[test]
+    fn explicit_wemm_selection_has_no_legacy_or_calibrated_floor_default() {
+        let CliRequest::Invoke(invocation) = SPEC
+            .lower_cli_from([
+                "files",
+                "--pile",
+                "/absent/files.pile",
+                "similar",
+                "--wemm",
+                "--text",
+                "query",
+            ])
+            .unwrap()
+        else {
+            panic!("invoke");
+        };
+        assert!(invocation.flag("wemm"));
+        assert!(invocation.get("floor").is_none());
+        assert!(invocation.get("wemm-floor").is_none());
+    }
+
+    #[cfg(not(feature = "wemm"))]
+    #[test]
+    fn unavailable_wemm_never_enters_legacy_or_opens_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let pile = dir.path().join("absent.pile");
+        let CliRequest::Invoke(invocation) = SPEC
+            .lower_cli_from(["files", "--pile", pile.to_str().unwrap(), "index", "--wemm"])
+            .unwrap()
+        else {
+            panic!("invoke");
+        };
+        let error = execute(
+            &invocation,
+            &mut Out::new(&mut |_| panic!("unexpected output")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no fallback"));
+        assert!(!pile.exists());
+    }
 
     #[test]
     fn invalid_options_fail_before_opening_storage() {

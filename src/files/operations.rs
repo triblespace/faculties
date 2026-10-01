@@ -2,6 +2,10 @@
 //!
 //! Callers use typed operations directly; no CLI invocation or MCP value enters here.
 
+#[cfg(feature = "wemm")]
+#[path = "wemm.rs"]
+pub mod wemm;
+
 use crate::clock;
 use crate::collection_names::{configured_handle, open, open_configured_acquiring};
 #[cfg(test)]

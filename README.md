@@ -133,6 +133,32 @@ tools cannot substitute those paths. Additional launcher configuration is:
 | Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
 | Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
 
+The opt-in `wemm` feature adds `files index --wemm` and
+`files similar --wemm --text 'query'` (or a Files selector in place of `--text`).
+It uses **one** resident native WeMM model for both modalities and a new 4096-D
+content-keyed NVFP4 set index; it never falls back to the historical Nomic paths.
+Supply `WEMM_PILE`, `WEMM_COLLECTION` (descriptor handle), `WEMM_ROOT` (opaque
+root), and `WEMM_ASSETS` (the pinned config/tokenizer/template directory), or
+their `--wemm-*` options. This bounded CUDA profile requires actual NVIDIA GB10
+compute 12.1 and one contributing native model collection in the selected pile.
+The model pile must be a dedicated finished artifact, different from the writable
+Files pile even through hard links. The operator must prevent mutation,
+compaction and truncation of its mapped prefix through CUDA runtime teardown;
+read-only opening and inode/size checks do not prove that external guarantee.
+
+Supported content is UTF-8 text of at most 256 **framed** token IDs (no
+truncation), and one complete PNG/JPEG image (fixed 256-patch GPU aspect-fit/
+white-pad preparation, at most 4096×4096 pixels and 64 MiB encoded). There is no
+PDF, crop, caption, video, long-document chunking or batch policy in this Files
+profile. A foundation containing unsupported content reports failure and gets
+no successful partial or empty leaf; other foundations may have progressed.
+Queries reuse the same selected runtime as indexing in the library API. Scores
+are reconstructed NVFP4 cosines, not exact reranks or relevance probabilities;
+default output is ranked top-k with no relevance floor. `--wemm-floor` is an
+explicit optional [-1,1] threshold; historical modality floors are not reused.
+This opt-in does not replace the global legacy defaults, automatic background
+indexing, or MCP's historical selector. No live index migration is implicit.
+
 Prefer the token environment variables to visible argv; help hides their
 values. Discovery needs neither tokens nor model assets. Resident Discord and
 LinkedIn operations work without their network tokens. Teams and Mail use
@@ -661,35 +687,33 @@ The older `migrations collection-policy` verb consumes the mandatory-authority
 epoch, not this transition. Neither verb is the historical branch-to-collection
 cutover.
 
-Reads use maintained Succinct/Rank9 collections through immutable store
-snapshots. The snapshot freezes both the stored prefix and its authorization
-instant; reading it never fetches or derives missing data. A live store's
-`ensure` fetches root dependencies, while `maintain` advances each explicitly
-selected derivation hop from what its immediate source provides. Readers attach
-their query views to one final snapshot; facts and a maintained latest/status
-relation need not have identical support to participate in a positive join.
-Use `maintain_exact` only when the operation actually requests a particular
-support, not as ordinary read bookkeeping. Archive
-uses this same generic collection snapshot rather than a separate decoded
-catalog or COMMIT-list facade.
+Foreground reads use attached Succinct/Rank9 indexes through one immutable
+record/proof observation. Their retained Leech owner may acquire exact
+descriptor, name, capability-definition, selected fact and body bytes. Acquiring
+bytes does not refresh the selected records, discover a later grant, or replace
+an already-selected attached cover and its residual foundations. Ordinary fact
+and register reads report unavailable selected support rather than presenting
+it as a complete collection; backend faults remain errors. Passive health,
+discovery and explicitly resident-only APIs remain local. Archive uses this
+same generic collection snapshot rather than a separate decoded catalog or
+COMMIT-list facade.
 
 Maintenance receives the same existing durable signing key as COMMIT
-publication. Newly published MERGE and DERIVE equations require WRITE on their
-target collection; reusing an already realised cover does not. Native target
-discovery trusts local record signatures, while snapshot admission still checks
-each producer's WRITE authority. Audit unfamiliar piles explicitly before
-accepting them as trusted local storage.
+publication, and opens the store as that host. COMMIT and DERIVE foundations
+require WRITE admission. MERGE and MAP are host-local choices: the fold drives
+only its host's records over believed inputs, without a separate WRITE check;
+foreign MERGE and MAP records remain inert. Attached indexes have no independent
+policy. Audit unfamiliar piles explicitly before accepting them as trusted
+local storage, whose record signatures are not reverified during replay.
 
-Relations, Message, Compass, and Wiki do not require a reader to be a
-producer. At their read boundaries, a signer admitted to the needed targets
-still performs inline upkeep; other readers attach the resident rollups,
-including a partial view while newer source commits await derivation or
-replication. This preserves local read-your-writes without making WRITE a
-prerequisite for reading shared data. Transport READ must independently cover
-the exact derived collections being replicated, not just their foundation.
+Relations, Message, Compass, and Wiki do not require a reader to be a producer.
+Acquiring a selected read is distinct from maintenance or derivation, and WRITE
+is not a prerequisite for reading shared data. Transport READ must cover each
+collection through which records or exact blobs are requested; a derived
+collection may have a different policy from its source.
 
-Orient performs eager upkeep of its configured inputs when its signer has the
-required target WRITE authority. `wake`, `show`, `poll`, and `wait` carry those
+Orient performs eager host-local upkeep of its configured inputs.
+`wake`, `show`, `poll`, and `wait` carry those
 inputs before selecting their immutable query views; a daemon is not the
 foreground freshness boundary. The local health path remains resident-only.
 Selected attachment bodies may still be fetched lazily, without replacing the
@@ -700,9 +724,10 @@ request, not an extra read-side certification pass.
 
 Receipt history belongs to the signing zooid, not its routing alias or host.
 Ordinary `orient-receipts` facts retain event IDs and `created_at` annotations;
-a derived EntityIdSet on `presentation::event` supplies fast membership tests.
-Both descriptors have READ and WRITE rooted only at that key, independently of
-the old `TRIBLESPACE_COLLECTION_ORIENT` override. Two selectors using the same
+a host-local attached EntityIdSet on `presentation::event` supplies fast
+membership tests. The receipt source has READ and WRITE rooted only at that
+key; its attached index has no separate policy. This is independent of the old
+`TRIBLESPACE_COLLECTION_ORIENT` override. Two selectors using the same
 key share receipt history; separate zooids need separate keys. Reporting runs
 refresh that membership projection before observing it. Failed receipt upkeep
 is reported and may permit a repeat; it does not hold the waiter behind a

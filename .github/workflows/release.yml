@@ -1,9 +1,7 @@
 name: release
 
-# Build precompiled faculty binaries on tag push and attach them to
-# the GitHub release. Restricted sandboxes can grab a tarball; dev
-# environments can still install from the documented sibling source cohort.
-
+# Publish the registry packages first, then push the corresponding Faculties tag.
+# Registry compilation has no sibling checkouts or source-only root patches.
 on:
   push:
     tags:
@@ -13,10 +11,18 @@ on:
 permissions:
   contents: write
 
+env:
+  FACULTIES_VERSION: '0.21.0'
+  MIGRATIONS_VERSION: '0.1.0'
+  TRIBLE_VERSION: '0.47.0'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+
 jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -25,123 +31,98 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # Intel macOS dropped: Apple stopped shipping Intel Macs
-          # in late 2023 and the macos-13 free runner queue
-          # frequently times out before the build slot opens. Add
-          # back if a downstream user actually asks for it.
           - target: aarch64-apple-darwin
             os: macos-14
-
     steps:
-      # Faculties is intentionally developed as one source cohort with
-      # TribleSpace, Mary, Soma, GORBIE, and the CubeCL graph fork. Keep the repositories
-      # as siblings: their paths are part of the local Cargo manifests.
-      - name: Check out Faculties
+      - name: Refuse non-tag or mismatched dispatch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "refs/tags/v$FACULTIES_VERSION"
+
+      - name: Check out release tag for source and notices
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.ref }}
           path: faculties
+          persist-credentials: false
 
-      - name: Check out TribleSpace cohort
-        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          repository: triblespace/triblespace-rs
-          ref: d4164a9ddab775e0749259fac4fff2e93ee29052
-          path: triblespace-rs
+          python-version: '3.12'
 
-      - name: Check out Mary cohort
-        uses: actions/checkout@v4
-        with:
-          repository: erlkonig-ai/mary
-          ref: c08c7fa1ca76f83180125de326b2c7dd70e0a18b
-          path: mary
+      - name: Check tag versions and current default features
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C faculties rev-parse HEAD)" = "$(git -C faculties rev-parse "$GITHUB_REF^{commit}")"
+          python - <<'PY'
+          import os, pathlib, tomllib
+          root = pathlib.Path('faculties')
+          fac = tomllib.loads((root / 'Cargo.toml').read_text())
+          mig = tomllib.loads((root / 'faculties-migrations/Cargo.toml').read_text())
+          assert fac['package']['name'] == 'faculties'
+          assert fac['package']['version'] == os.environ['FACULTIES_VERSION']
+          assert mig['package']['version'] == os.environ['MIGRATIONS_VERSION']
+          assert set(fac['features']['default']) == {'local-embed', 'widgets', 'audio', 'hear'}
+          PY
 
-      - name: Check out GORBIE cohort
-        uses: actions/checkout@v4
-        with:
-          repository: erlkonig-ai/GORBIE
-          ref: 09a82ff3a729093ea6941bd677f589b0e123c0cb
-          path: GORBIE
+      - name: Install native audio build headers on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev libudev-dev
 
-      - name: Check out Soma cohort
-        uses: actions/checkout@v4
+      - name: Install pinned compiler
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
-          repository: erlkonig-ai/soma
-          ref: 6cdb487c93b10bb183d62f9d547dc1627782c228
-          path: soma
-
-      - name: Check out CubeCL runtime cohort
-        uses: actions/checkout@v4
-        with:
-          repository: erlkonig-ai/cubecl
-          ref: 0c0972c1eb1da5e2d17cc6cc61b3f5e698e73793
-          path: cubecl-fork
-
-      - name: Check out CubeCL graph cohort
-        uses: actions/checkout@v4
-        with:
-          repository: erlkonig-ai/cubecl
-          ref: 1fc64da1fba7f9609d19a569000bdd6a6eaea2cd
-          path: cubecl-graph
-
-      - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          # `wasm32-unknown-unknown` is needed because `wasmi`'s build
-          # script (pulled transitively via triblespace-core)
-          # invokes rustc against it.
           targets: ${{ matrix.target }}, wasm32-unknown-unknown
 
-      - name: Build all binaries
-        # Release builds don't deny warnings — that's a lint concern,
-        # and the CLI faculties carry pre-existing unused-import
-        # noise from their rust-script origins. Add a separate lint
-        # workflow if/when we want to enforce.
-        working-directory: faculties
-        # `migrations` lives in a workspace member rather than the root package.
-        run: cargo build --locked --release --workspace --bins --target ${{ matrix.target }}
-
-      - name: Build bundled trible CLI
-        # Ship the `trible` CLI alongside the faculty bins so users
-        # who grab a tarball get the whole pile-management toolkit
-        # in one drop. Keep it on the exact TribleSpace release cohort
-        # compiled into Faculties so pile formats and management APIs agree.
-        working-directory: faculties
+      - name: Install exact registry binaries into temporary roots
+        shell: bash
+        env:
+          CARGO_HOME: ${{ runner.temp }}/release-cargo-home
+          CARGO_TARGET_DIR: ${{ runner.temp }}/release-target
         run: |
-          cargo install \
-            --path ../triblespace-rs/trible \
-            --target ${{ matrix.target }} \
-            --root "$RUNNER_TEMP/trible-staged" \
-            --locked
+          set -euo pipefail
+          # Explicitly spell today's defaults; no native WeMM/voice claim.
+          cargo +1.98.0 install faculties --version "=$FACULTIES_VERSION" \
+            --registry crates-io --locked --bins --no-default-features \
+            --features local-embed,widgets,audio,hear --jobs "$CARGO_BUILD_JOBS" \
+            --target '${{ matrix.target }}' --root "$RUNNER_TEMP/faculties-installed"
+          cargo +1.98.0 install faculties-migrations --version "=$MIGRATIONS_VERSION" \
+            --registry crates-io --locked --bin migrations --jobs "$CARGO_BUILD_JOBS" \
+            --target '${{ matrix.target }}' --root "$RUNNER_TEMP/migrations-installed"
+          cargo +1.98.0 install trible --version "=$TRIBLE_VERSION" \
+            --registry crates-io --locked --bin trible --no-default-features \
+            --features search,dashboard-gui --jobs "$CARGO_BUILD_JOBS" \
+            --target '${{ matrix.target }}' --root "$RUNNER_TEMP/trible-installed"
 
-      - name: Stage binaries
-        working-directory: faculties
+      - name: Verify published source and lockfiles, then stage binaries
+        shell: bash
+        env:
+          CARGO_HOME: ${{ runner.temp }}/release-cargo-home
         run: |
-          set -eu
+          set -euo pipefail
+          python faculties/scripts/check-registry-release.py faculties "$CARGO_HOME"
           stage="faculties-${GITHUB_REF_NAME}-${{ matrix.target }}"
-          mkdir -p "$stage"
-          cp LICENSE-MIT LICENSE-APACHE README.md "$stage/" || true
-          migration="target/${{ matrix.target }}/release/migrations"
-          if [ ! -x "$migration" ]; then
-            echo "::error::$migration is absent; build the full workspace binary cohort"
-            exit 1
-          fi
-          # All faculty binaries, including the default-enabled viewer and
-          # capture tools (extension-less; .exe suffix on windows if we ever
-          # add it).
-          for bin in target/${{ matrix.target }}/release/*; do
-            [ -f "$bin" ] || continue
-            [ -x "$bin" ] || continue
-            case "$(basename "$bin")" in
-              *.d|*.rlib|*.so|*.dylib|deps|build|examples|incremental) continue ;;
-            esac
+          mkdir "$stage"
+          # cargo install installs executables, not these distribution notices.
+          # The preceding check binds them to the exact downloaded archive.
+          cp faculties/LICENSE-MIT faculties/LICENSE-APACHE faculties/README.md "$stage/"
+          for bin in "$RUNNER_TEMP/faculties-installed/bin/"*; do
+            test -f "$bin" && test -x "$bin"
             cp "$bin" "$stage/"
           done
-          # Bundled trible CLI from the previous step.
-          cp "$RUNNER_TEMP/trible-staged/bin/trible" "$stage/"
+          test -x "$RUNNER_TEMP/migrations-installed/bin/migrations"
+          test -x "$RUNNER_TEMP/trible-installed/bin/trible"
+          cp "$RUNNER_TEMP/migrations-installed/bin/migrations" "$stage/"
+          cp "$RUNNER_TEMP/trible-installed/bin/trible" "$stage/"
+          test -x "$stage/viewer"
+          test -x "$stage/faculties"
           tar -czf "$stage.tar.gz" "$stage"
           shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
-          echo "STAGE_TARBALL=faculties/$stage.tar.gz" >> "$GITHUB_ENV"
-          echo "STAGE_SHA256=faculties/$stage.tar.gz.sha256" >> "$GITHUB_ENV"
+          echo "STAGE_TARBALL=$stage.tar.gz" >> "$GITHUB_ENV"
+          echo "STAGE_SHA256=$stage.tar.gz.sha256" >> "$GITHUB_ENV"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
@@ -149,25 +130,34 @@ jobs:
           files: |
             ${{ env.STAGE_TARBALL }}
             ${{ env.STAGE_SHA256 }}
+          fail_on_unmatched_files: true
 
   publish-meta:
     name: release notes
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - name: Generate notes
+        shell: bash
         run: |
-          echo "## Install" > notes.md
-          echo "" >> notes.md
-          echo "### Precompiled (sandboxed environments)" >> notes.md
-          echo '```sh' >> notes.md
-          echo 'curl -L https://github.com/erlkonig-ai/faculties/releases/download/'"${GITHUB_REF_NAME}"'/faculties-'"${GITHUB_REF_NAME}"'-aarch64-apple-darwin.tar.gz | tar -xz' >> notes.md
-          echo 'export PATH="$PWD/faculties-'"${GITHUB_REF_NAME}"'-aarch64-apple-darwin:$PATH"' >> notes.md
-          echo '```' >> notes.md
-          echo "" >> notes.md
-          echo "### From source (dev environments)" >> notes.md
-          echo "Faculties uses a sibling source cohort; see the tagged README for the exact layout." >> notes.md
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = tag
+          test "$GITHUB_REF" = "refs/tags/v$FACULTIES_VERSION"
+          {
+            echo '## Install'
+            echo
+            echo '### Precompiled (sandboxed environments)'
+            echo '```sh'
+            echo "curl -L https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/faculties-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz | tar -xz"
+            echo 'export PATH="$PWD/faculties-'"${GITHUB_REF_NAME}"'-aarch64-apple-darwin:$PATH"'
+            echo '```'
+            echo
+            echo '### Registry source builds'
+            echo 'This archive was built from faculties 0.21.0, faculties-migrations 0.1.0, and trible 0.47.0 on crates.io, using their packaged lockfiles.'
+            echo 'Faculties features: local-embed, widgets, audio, hear (the release defaults). Trible features: search, dashboard-gui. No source-cohort Git patches apply.'
+            echo 'Native WeMM is NOT enabled in these portable binaries. It remains an opt-in `wemm` source build for the bounded CUDA/GB10 profile and its runtime/toolkit requirements; a full native macOS WeMM path is not released. `voice` and `discord-voice` are also not enabled.'
+            echo 'See the tagged README for optional source-build features and deployment prerequisites.'
+          } > notes.md
       - uses: softprops/action-gh-release@v2
         with:
           body_path: notes.md
