@@ -59,6 +59,12 @@ impl Archive {
             storage: &self.storage,
         }
     }
+    fn with_operation<T>(
+        &self,
+        operation: impl FnOnce(ArchiveStorage<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.storage.scope(|storage| operation(ArchiveStorage { storage }))
+    }
     /// Publish one resident source atomically after complete successful scanning.
     /// Attachments are resident export filenames for ChatGPT and exact pointer
     /// keys for Gemini; other formats consume embedded assets and reject a map.
@@ -77,8 +83,8 @@ impl Archive {
         {
             bail!("this Archive format accepts embedded assets, not an external attachment map");
         }
-        self.storage.with_pile(|pile, signer| {
-            let mut writer = pollster::block_on(ArchiveImportWriter::from_pile(pile, signer))?;
+        self.storage.with_store(|store, signer, runtime| {
+            let mut writer = ArchiveImportWriter::from_store(store, signer, runtime.clone())?;
             let projection = match source {
                 ImportSource::Agy => archive_agy::project_bytes(source_name, bytes, |p| {
                     writer.stage_fragment(p.fragment)
@@ -123,19 +129,19 @@ impl Archive {
         })
     }
     pub fn list(&self, limit: usize, out: &mut Out<'_>) -> Result<()> {
-        run_list(self.storage(), limit, out)
+        self.with_operation(|storage| run_list(storage, limit, out))
     }
     pub fn show(&self, prefix: &str, out: &mut Out<'_>) -> Result<()> {
-        run_show(self.storage(), prefix, out)
+        self.with_operation(|storage| run_show(storage, prefix, out))
     }
     pub fn thread(&self, prefix: &str, limit: usize, out: &mut Out<'_>) -> Result<()> {
-        run_thread(self.storage(), prefix, limit, out)
+        self.with_operation(|storage| run_thread(storage, prefix, limit, out))
     }
     pub fn search(&self, text: &str, limit: usize, out: &mut Out<'_>) -> Result<()> {
-        run_search(self.storage(), text, limit, out)
+        self.with_operation(|storage| run_search(storage, text, limit, out))
     }
     pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
-        run_index(self.storage(), out)
+        self.with_operation(|storage| run_index(storage, out))
     }
     pub fn replay_start(&self, persona: &str, from: Epoch) -> Result<()> {
         validate_persona(persona)?;
@@ -165,7 +171,7 @@ impl Archive {
         with_tools: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
-        run_replay(self.storage(), limit, with_tools, persona, out)
+        self.with_operation(|storage| run_replay(storage, limit, with_tools, persona, out))
     }
 }
 fn validate_persona(persona: &str) -> Result<()> {
@@ -175,8 +181,9 @@ fn validate_persona(persona: &str) -> Result<()> {
     Ok(())
 }
 
-use crate::storage::FactRead;
+#[cfg(test)]
 use crate::storage::FactView;
+use crate::storage::{AcquiringReader, FacultySnapshot};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 #[cfg(test)]
@@ -194,6 +201,7 @@ use crate::archive_collection::{
 };
 use crate::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use crate::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::comb::{self as comb_model, CursorDraft, CursorResolution, CursorState};
 use crate::schemas::blockdag as archive_schema;
@@ -206,7 +214,6 @@ use hifitime::Epoch;
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::id::Id;
 use triblespace::core::inline::{Inline, TryFromInline, TryToInline};
-use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::Fragment;
 
@@ -220,6 +227,7 @@ use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::{exists, find, pattern};
 use triblespace_search::tokens::hash_tokens;
 
+type PileSnapshot = AcquiringReader<FacultySnapshot>;
 type FactSnapshot = AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>;
 type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
@@ -239,13 +247,16 @@ struct ReplayView {
 
 impl ArchiveStorage<'_> {
     fn load(&self) -> Result<FactSnapshot> {
-        archive_collection::ensure_local_with_storage(self.storage)
+        archive_collection::ensure_acquiring_with_storage(self.storage)
     }
 
     fn load_comb(&self) -> Result<FactArchive> {
-        self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
-                let source = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
+        self.storage.with_store(|store, signer, runtime| {
+            let source = crate::collection_names::open_configured_acquiring(
+                store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
+            let rank9 = runtime.block_on(async {
                 let succinct = pile
                     .attach::<SuccinctArchiveBlob>(source, ())
                     .context("register Succinct Comb cursor collection")?;
@@ -258,12 +269,11 @@ impl ArchiveStorage<'_> {
                     .context("maintain Succinct Comb cursor collection")?;
                 crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
                     .context("maintain Rank9 Comb cursor collection")?;
-                pile.snapshot()
-                    .context("freeze maintained Comb cursor collection")?
-                    .read_facts(rank9)
-                    .context("read Comb cursor collection")
-            });
-            result
+                Ok::<_, anyhow::Error>(rank9)
+            })?;
+            let reader = AcquiringReader::new(pile.snapshot()?, runtime.clone());
+            crate::storage::acquire_facts(&reader, rank9)
+                .context("read Comb cursor collection")
         })
     }
 
@@ -272,21 +282,21 @@ impl ArchiveStorage<'_> {
     /// Both maintained views are observed through Archive's final immutable
     /// store snapshot. Later payload reads keep that same boundary.
     fn load_replay(&self) -> Result<ReplayView> {
-        self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
-                let archive_source = open_configured(
-                    pile,
-                    archive_schema::DEFAULT_SCOPE_ID,
-                    signer.verifying_key(),
-                )?;
+        self.storage.with_store(|store, signer, runtime| {
+            let archive_source = crate::collection_names::open_configured_acquiring(
+                store, archive_schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let comb_source = crate::collection_names::open_configured_acquiring(
+                store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
+            let (archive_rank9, comb_rank9) = runtime.block_on(async {
                 let archive_succinct = pile
                     .attach::<SuccinctArchiveBlob>(archive_source, ())
                     .context("register Succinct Archive fact collection")?;
                 let archive_rank9 = pile
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(archive_source, archive_succinct)
                     .context("register Rank9 Archive fact collection")?;
-                let comb_source =
-                    open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
                 let comb_succinct = pile
                     .attach::<SuccinctArchiveBlob>(comb_source, ())
                     .context("register Succinct Comb cursor collection")?;
@@ -294,11 +304,9 @@ impl ArchiveStorage<'_> {
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(comb_source, comb_succinct)
                     .context("register Rank9 Comb cursor collection")?;
 
-                // Derive this key's own commits into each view, then observe
-                // both representations through one final snapshot. The roots
-                // are not acquired: a view is read as it stands, other
-                // writers' commits reach it through their own derivations,
-                // and what neither has derived yet is lag.
+                // Maintain locally, then freeze both views once. Foreground
+                // acquisition below fills only that snapshot's residual and
+                // queried bodies; it never advances the cursor boundary.
                 crate::storage::tolerate_own_lag(
                     pile.maintain_attached(comb_succinct, signer).await,
                 )
@@ -313,21 +321,16 @@ impl ArchiveStorage<'_> {
                     pile.maintain_attached(archive_rank9, signer).await,
                 )
                 .context("maintain Rank9 Archive replay facts")?;
-                let after = pile
-                    .snapshot()
-                    .context("freeze maintained Archive replay snapshot")?;
-                let archive = after
-                    .attached(archive_rank9)
-                    .context("attach Archive replay facts")?;
-                let comb_facts = after
-                    .read_facts(comb_rank9)
-                    .context("read Comb cursor collection")?;
-                Ok(ReplayView {
-                    archive,
-                    comb_facts,
-                })
-            });
-            result
+                Ok::<_, anyhow::Error>((archive_rank9, comb_rank9))
+            })?;
+            let after = AcquiringReader::new(
+                pile.snapshot().context("freeze maintained Archive replay snapshot")?,
+                runtime.clone(),
+            );
+            let archive = after.attached_acquiring(archive_rank9).context("attach Archive replay facts")?;
+            let comb_facts = crate::storage::acquire_facts(&after, comb_rank9)
+                .context("read Comb cursor collection")?;
+            Ok(ReplayView { archive, comb_facts })
         })
     }
 }
@@ -864,7 +867,7 @@ fn resolve_prefix(ids: impl IntoIterator<Item = Id>, prefix: &str) -> Result<Id>
 
 fn run_list(storage: ArchiveStorage<'_>, limit: usize, out: &mut Out<'_>) -> Result<()> {
     let observed = storage.load()?;
-    let facts = observed.facts()?;
+    let facts = crate::storage::acquire_attached_facts(&observed)?;
     let mut rows = Vec::new();
     for projection in find!(
         projection: Id,
@@ -905,7 +908,7 @@ fn run_list(storage: ArchiveStorage<'_>, limit: usize, out: &mut Out<'_>) -> Res
 
 fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Result<()> {
     let observed = storage.load()?;
-    let facts = observed.facts()?;
+    let facts = crate::storage::acquire_attached_facts(&observed)?;
     let id = resolve_prefix(
         find!(
             projection: Id,
@@ -1046,7 +1049,7 @@ fn run_thread(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let observed = storage.load()?;
-    let facts = observed.facts()?;
+    let facts = crate::storage::acquire_attached_facts(&observed)?;
     for (index, block) in load_thread(&facts, prefix, limit)?.into_iter().enumerate() {
         if index != 0 {
             out.line(format!("---"))?;
@@ -1066,14 +1069,14 @@ fn run_search(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let (observed, index, lag) =
-        archive_collection::ensure_search_local_with_storage(storage.storage)?;
+        archive_collection::ensure_search_acquiring_with_storage(storage.storage)?;
     if !lag.is_current() {
         out.line(format!(
             "note: searching what is present; facts: {}; index: {} source commit(s) not yet derived",
             lag.facts, lag.index,
         ))?;
     }
-    let facts = observed.facts()?;
+    let facts = crate::storage::acquire_attached_facts(&observed)?;
     let query = index.query().context("prepare Archive BM25 query")?;
     for (document, score) in query
         .query_multi(&hash_tokens(&text))
@@ -1200,12 +1203,15 @@ fn active_archive_cursor(
 }
 
 fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
-    storage.storage.with_pile(|pile, signer| {
+    storage.storage.with_store(|store, signer, runtime| {
+        let collection = crate::collection_names::open_configured_acquiring(
+            store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let pile = store;
         let result = (|| {
-            let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("publish archive replay cursor")?;
-            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context(
                     "Archive replay cursor was committed, but ensuring its derived views failed",
                 )
@@ -1240,7 +1246,7 @@ fn run_replay(
     validate_persona(persona)?;
     let replay = storage.load_replay()?;
     let cursor = active_archive_cursor(&replay.comb_facts, REPLAY_STREAM, persona)?;
-    let facts = replay.archive.facts()?;
+    let facts = crate::storage::acquire_attached_facts(&replay.archive)?;
     let timeline = archive_collection::timeline_after(&facts, cursor)?
         .into_iter()
         .filter(|item| {
@@ -1692,10 +1698,10 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        let first = pollster::block_on(archive_collection::ensure_succinct_index(
+        let first = archive_collection::ensure_succinct_index(
             &fixture.pile,
             Some(&fixture.key),
-        ))
+        )
         .unwrap();
 
         assert_eq!(first.source_elements, 1);
@@ -1713,29 +1719,29 @@ mod tests {
             1
         );
         drop(archive);
-        let repeated = pollster::block_on(archive_collection::ensure_succinct_index(
+        let repeated = archive_collection::ensure_succinct_index(
             &fixture.pile,
             Some(&fixture.key),
-        ))
+        )
         .unwrap();
         assert_eq!(repeated, first);
 
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
 
-        let first_bm25 = pollster::block_on(archive_collection::ensure_bm25_index(
+        let first_bm25 = archive_collection::ensure_bm25_index(
             &fixture.pile,
             Some(&fixture.key),
-        ))
+        )
         .unwrap();
 
         assert_eq!(first_bm25.source_elements, 1);
         assert_eq!(first_bm25.cover_segments, 1);
         let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(
-            pollster::block_on(archive_collection::ensure_bm25_index(
+            archive_collection::ensure_bm25_index(
                 &fixture.pile,
                 Some(&fixture.key),
-            ))
+            )
             .unwrap(),
             first_bm25
         );

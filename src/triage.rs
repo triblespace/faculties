@@ -41,30 +41,30 @@ pub type Interval = Inline<inlineencodings::NsTAIInterval>;
 
 /// One immutable collection value from a single frozen pile prefix.
 #[derive(Debug)]
-pub struct SourceView<'a, P: TriblePattern = TribleSet> {
+pub struct SourceView<'a, P: TriblePattern = TribleSet, R = PileSnapshot> {
     pub facts: &'a P,
-    pub reader: &'a PileSnapshot,
+    pub reader: &'a R,
 }
 
-impl<P: TriblePattern> Copy for SourceView<'_, P> {}
+impl<P: TriblePattern, R> Copy for SourceView<'_, P, R> {}
 
-impl<P: TriblePattern> Clone for SourceView<'_, P> {
+impl<P: TriblePattern, R> Clone for SourceView<'_, P, R> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-pub struct ScanSources<'a, P: TriblePattern = TribleSet> {
-    pub cognition: SourceView<'a, P>,
-    pub headspace: SourceView<'a, P>,
-    pub secrets: &'a SecretsSnapshot<PileSnapshot>,
-    pub relations: SourceView<'a, P>,
-    pub messages: SourceView<'a, P>,
+pub struct ScanSources<'a, P: TriblePattern = TribleSet, R = PileSnapshot> {
+    pub cognition: SourceView<'a, P, R>,
+    pub headspace: SourceView<'a, P, R>,
+    pub secrets: &'a SecretsSnapshot<R>,
+    pub relations: SourceView<'a, P, R>,
+    pub messages: SourceView<'a, P, R>,
 }
 
-impl<P: TriblePattern> Copy for ScanSources<'_, P> {}
+impl<P: TriblePattern, R> Copy for ScanSources<'_, P, R> {}
 
-impl<P: TriblePattern> Clone for ScanSources<'_, P> {
+impl<P: TriblePattern, R> Clone for ScanSources<'_, P, R> {
     fn clone(&self) -> Self {
         *self
     }
@@ -1057,9 +1057,9 @@ fn budget_info(
     }
 }
 
-pub fn project_headspace<P: TriblePattern>(
-    headspace_view: SourceView<'_, P>,
-    secrets: &SecretsSnapshot<PileSnapshot>,
+pub fn project_headspace<P: TriblePattern, R: BlobStoreGet>(
+    headspace_view: SourceView<'_, P, R>,
+    secrets: &SecretsSnapshot<R>,
 ) -> Result<TriageHeadspace> {
     let config = headspace::current_config(headspace_view.reader, headspace_view.facts)?;
     let active_profile = config
@@ -1111,7 +1111,7 @@ pub fn project_headspace<P: TriblePattern>(
     })
 }
 
-pub fn relation_state<P: TriblePattern>(view: SourceView<'_, P>) -> Result<RelationState> {
+pub fn relation_state<P: TriblePattern, R: BlobStoreGet>(view: SourceView<'_, P, R>) -> Result<RelationState> {
     let mut terms = BTreeSet::new();
     let mut forked_profiles = Vec::new();
     for (person, profile) in relations_model::person_profile_views(view.reader, view.facts) {
@@ -1142,9 +1142,9 @@ pub fn relation_state<P: TriblePattern>(view: SourceView<'_, P>) -> Result<Relat
     })
 }
 
-pub fn count_unread_messages<P: TriblePattern>(
-    messages: SourceView<'_, P>,
-    relations: SourceView<'_, P>,
+pub fn count_unread_messages<P: TriblePattern, R>(
+    messages: SourceView<'_, P, R>,
+    relations: SourceView<'_, P, R>,
     reader: Id,
 ) -> Result<usize> {
     let identities = IdentityComponents::from_facts(relations.facts)?;
@@ -1273,8 +1273,8 @@ impl ScanReport {
 }
 
 /// Project the complete native `triage scan` semantic state.
-pub fn project_scan<P: TriblePattern>(
-    sources: ScanSources<'_, P>,
+pub fn project_scan<P: TriblePattern, R: BlobStoreGet>(
+    sources: ScanSources<'_, P, R>,
     options: ScanOptions,
 ) -> Result<ScanReport> {
     let exec_state = collect_exec_state(sources.cognition.reader, sources.cognition.facts)?;

@@ -94,6 +94,8 @@ pub type FacultyStore = triblespace_net::peer::Leech<Pile>;
 /// The live store's frozen observation with an async exact-blob reader.
 pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
 
+pub use triblespace::core::repo::async_store::AcquiringReader;
+
 /// Explicit storage ownership for native faculty operations.
 ///
 /// A one-shot caller uses [`Self::new`]: each operation opens and closes its
@@ -152,6 +154,16 @@ impl std::fmt::Debug for Storage {
 }
 
 impl Storage {
+    /// Keep a network owner alive for readers retained beyond one callback.
+    /// Existing shared ownership is preserved; a one-shot configuration gains
+    /// one lazy shared owner without opening it yet.
+    pub fn retained(&self) -> Self {
+        if self.shared.is_some() {
+            self.clone()
+        } else {
+            Self::shared(self.pile.clone(), self.key.clone())
+        }
+    }
     /// Configure operation-scoped storage, suitable for a short-lived CLI.
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
         Self {
@@ -505,6 +517,32 @@ where
     open_secrets_collection(store, subject)
 }
 
+/// Open Secrets at a synchronous acquisition boundary. This preserves its
+/// explicit private key-delivery policy and local-wrap possession semantics:
+/// acquiring exact descriptor/name bytes adds no READ or expiry check.
+pub fn open_secrets_collection_acquiring<S>(
+    store: &mut S,
+    subject: VerifyingKey,
+    runtime: &Arc<tokio::runtime::Runtime>,
+) -> Result<crate::secrets::storage::SecretsCollection>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+{
+    let scope = crate::secrets::DEFAULT_SCOPE_ID;
+    let Some(handle) = crate::collection_names::configured_handle(scope)? else {
+        return open_secrets_collection(store, subject);
+    };
+    let snapshot = store
+        .snapshot()
+        .context("freeze configured Secrets descriptor")?;
+    let reader = AcquiringReader::new(snapshot, Arc::clone(runtime));
+    let source = crate::collection_names::open_exact_in(&reader, scope, handle)
+        .context("open configured Secrets source collection")?;
+    crate::secrets::storage::SecretsCollection::from_source(store, source)
+        .context("register maintained Secrets collection descriptors")
+}
+
 /// Canonical records currently known for one scoped target collection.
 ///
 /// Discovery classifies trusted local records without repeating signature
@@ -740,6 +778,113 @@ pub trait FactRead: StoreRead + Sized {
 }
 
 impl<R: StoreRead> FactRead for R {}
+
+/// Select once and read facts through an exact-byte acquiring reader. The
+/// support/cover never changes while its residual payloads are acquired.
+pub fn acquire_facts<R: StoreRead>(
+    reader: &R,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<FactArchive> {
+    acquire_attached_facts(
+        &reader
+            .attached_acquiring(rank9)
+            .context("select Rank9 fact cover")?,
+    )
+}
+
+/// Acquire residual bytes of an already-selected fact observation, without
+/// selecting again after a cache fill. Refuse a partial operational value;
+/// core's `read_attached_acquiring` retains structured unread support for
+/// callers deliberately reporting partial observations.
+pub fn acquire_attached_facts<R: StoreRead>(
+    attached: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<FactArchive> {
+    require_complete_attached_read(
+        succinctarchive_union::read_attached_acquiring(attached)
+            .context("acquire the selected Rank9 facts")?,
+    )
+}
+
+/// Extract an operational value only when every selected foundation was read.
+/// This is completeness of this frozen observation, not network synchronization
+/// or knowledge of records a peer has not supplied.
+pub fn require_complete_attached_read<V>(read: AttachedRead<V>) -> Result<V> {
+    let (value, unread) = read.into_parts();
+    if unread.is_empty() {
+        Ok(value)
+    } else {
+        Err(IncompleteAttachedRead { unread }.into())
+    }
+}
+
+/// A selected operational value omits these foundations. Bytes or mapping
+/// dependencies may be unavailable, or the mapping may not represent them.
+/// This is not `MissingBlob`: actual read/validation failures stay separate.
+#[derive(Debug)]
+pub struct IncompleteAttachedRead {
+    pub unread: Support<SimpleArchive>,
+}
+
+impl std::fmt::Display for IncompleteAttachedRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let named = self
+            .unread
+            .members()
+            .take(8)
+            .map(|handle| hex::encode(handle.raw))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "cannot read {} selected foundation(s) of collection {}: {}{}",
+            self.unread.len(),
+            hex::encode(self.unread.collection().handle().raw),
+            named,
+            if self.unread.len() > 8 { ", ..." } else { "" },
+        )
+    }
+}
+
+impl std::error::Error for IncompleteAttachedRead {}
+
+/// Async boundary for an already-selected observation. The storage owner
+/// remains with the caller; only the exact byte reads run on a blocking task.
+pub async fn acquire_attached_facts_async<R>(
+    attached: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<FactArchive>
+where
+    R: StoreRead + triblespace::core::repo::async_store::AsyncBlobStoreGet + 'static,
+{
+    let attached = attached.clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || acquire_attached_facts(&attached.acquiring(runtime)))
+        .await
+        .context("join selected fact acquisition")?
+}
+
+/// Async counterpart of the core fixed-observation attached read. This never
+/// obtains another store snapshot or silently advances an attention watermark.
+pub async fn acquire_attached_read_async<E, V>(
+    attached: &AttachedSnapshot<
+        impl StoreRead + triblespace::core::repo::async_store::AsyncBlobStoreGet + 'static,
+        E,
+    >,
+) -> Result<AttachedRead<V>>
+where
+    E: CollectionAttachment + Send,
+    V: triblespace::core::collection::TryFromCover<E> + Send + 'static,
+{
+    let attached = attached.clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        attached
+            .acquiring(runtime)
+            .read_acquiring::<V>()
+            .map_err(anyhow::Error::new)
+    })
+    .await
+    .context("join selected attached acquisition")?
+}
 
 /// The facts of an attached Rank9 read already taken, as
 /// [`attached_facts`] reads them: the method form, so a caller holding the
@@ -1382,6 +1527,49 @@ mod tests {
             !store.blobs.is_empty(),
             "registration retains the descriptor attachment closure"
         );
+    }
+
+    #[test]
+    fn operational_fact_read_names_unread_selected_foundations() {
+        use triblespace::core::repo::BlobStorePut;
+
+        let signer = SigningKey::from_bytes(&[7; 32]);
+        let mut source = MemoryRepo::for_host(signer.verifying_key());
+        let root = crate::collection_names::open(
+            &mut source,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        let (_, rank9) = fact_pair(&mut source, root).unwrap();
+        let committed = source
+            .commit(root, &signer, entity! { metadata::tag: &id(9) })
+            .unwrap();
+        let selected_payload = committed.data();
+        let full = source.snapshot().unwrap();
+        let mut local = MemoryRepo::for_host(signer.verifying_key());
+        for blob in full.blobs() {
+            let handle = blob.unwrap().handle;
+            if handle.raw != selected_payload.raw {
+                local
+                    .put::<UnknownBlob, _>(full.get::<anybytes::Bytes, _>(handle).unwrap())
+                    .unwrap();
+            }
+        }
+        for record in full.records().unwrap() {
+            local.insert(record.unwrap()).unwrap();
+        }
+        let frozen = local.snapshot().unwrap();
+        let selected = frozen.attached(rank9).unwrap();
+        let partial = attached_facts_read(&selected).unwrap();
+        assert_eq!(partial.unread().len(), 1);
+        let error = acquire_attached_facts(&selected).err().unwrap();
+        assert!(error.downcast_ref::<IncompleteAttachedRead>().is_some());
+        assert!(error
+            .to_string()
+            .contains(&hex::encode(selected_payload.raw)));
+        assert!(selected.support().is_empty());
+        assert_eq!(selected.residual().len(), 1);
     }
 
     #[test]

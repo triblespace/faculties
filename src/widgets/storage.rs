@@ -29,7 +29,8 @@ use triblespace::core::collection::{
     AttachedSnapshot, Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt,
     CollectionStoreExt, Cover, Support,
 };
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+#[cfg(test)]
+use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
@@ -52,7 +53,11 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
-use crate::storage::{open_secrets_collection_read, FactArchive, Storage};
+use crate::storage::{open_secrets_collection_read, AcquiringReader, FacultySnapshot, FacultyStore, FactArchive, Storage};
+
+/// Frozen widget data with exact-body acquisition through its owning state.
+pub type WidgetReader = AcquiringReader<FacultySnapshot>;
+type PileSnapshot = WidgetReader;
 
 /// Stable logical input requested by a widget.
 ///
@@ -485,6 +490,7 @@ impl StorageState {
     /// Share an explicit store while retaining operation-local dataset views.
     /// Construction and source dependency selection perform no storage I/O.
     pub fn with_storage(storage: Storage, sources: impl IntoIterator<Item = SourceKey>) -> Self {
+        let storage = storage.retained();
         let pile_path_text = storage.path().to_string_lossy().into_owned();
         Self {
             datasets: None,
@@ -503,7 +509,7 @@ impl StorageState {
     /// explicitly configured key.
     pub fn with_key_path(mut self, key_path: Option<PathBuf>) -> Self {
         if self.storage.key_path() != key_path.as_deref() {
-            self.storage = Storage::new(self.storage.path().to_owned(), key_path);
+            self.storage = Storage::shared(self.storage.path().to_owned(), key_path);
             self.datasets = None;
             self.secrets = None;
             self.stamp = None;
@@ -533,7 +539,7 @@ impl StorageState {
         self.pile_path_text = path.to_string_lossy().into_owned();
         self.error = None;
         if changed {
-            self.storage = Storage::new(path, self.storage.key_path().map(Path::to_owned));
+            self.storage = Storage::shared(path, self.storage.key_path().map(Path::to_owned));
             self.datasets = None;
             self.secrets = None;
             self.stamp = None;
@@ -671,25 +677,29 @@ fn load_consistent_inputs(
     storage: &Storage,
     sources: &BTreeSet<SourceKey>,
 ) -> Result<(LoadedInputs, FileStamp), String> {
-    let path = storage.path();
-    for _ in 0..2 {
-        let before = file_stamp(path)?;
-        let inputs = load_inputs(storage, sources)?;
-        let after = file_stamp(path)?;
-        if before == after {
-            return Ok((inputs, after));
-        }
-    }
-    Err(format!(
-        "pile {} changed repeatedly while loading viewer datasets; retry OPEN",
-        path.display()
-    ))
+    // All datasets select one store snapshot. Exact body fetches append cache
+    // bytes and may change the file stamp, but cannot make that observation
+    // incoherent. Keep the pre-read stamp conservatively: any append during
+    // the load prompts a later refresh, never a retry/reselection inside it.
+    let before = file_stamp(storage.path())?;
+    let inputs = load_inputs(storage, sources)?;
+    Ok((inputs, before))
 }
 
 fn load_inputs(storage: &Storage, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
     storage
-        .with_pile(|pile, signer| {
-            pollster::block_on(load_inputs_from_pile(pile, signer, sources))
+        .with_store(|store, signer, runtime| {
+            for (scope, _) in collection_scopes(sources) {
+                crate::collection_names::open_configured_acquiring(
+                    store, scope, signer.verifying_key(), runtime,
+                )?;
+            }
+            if sources.contains(&SourceKey::Secrets) {
+                crate::storage::open_secrets_collection_acquiring(
+                    store, signer.verifying_key(), runtime,
+                )?;
+            }
+            load_inputs_from_store(store, signer, sources, runtime)
                 .map_err(anyhow::Error::msg)
         })
         .map_err(|error| format!("load viewer storage: {error:#}"))
@@ -706,18 +716,23 @@ where
     R: triblespace::core::repo::StoreRead,
 {
     let attached = snapshot
-        .attached(rank9)
+        .attached_acquiring(rank9)
         .map_err(|error| anyhow::anyhow!("attach the Rank9 fact cover: {error}"))?;
-    let (facts, unread) = crate::storage::attached_facts_read(&attached)?.into_parts();
-    Ok((facts, DatasetRevision::from_attached(&attached, &unread)))
+    let read = triblespace::core::collection::succinctarchive_union::read_attached_acquiring(
+        &attached,
+    )?;
+    let revision = DatasetRevision::from_attached(&attached, read.unread());
+    let facts = crate::storage::require_complete_attached_read(read)?;
+    Ok((facts, revision))
 }
 
-async fn load_inputs_from_pile(
-    pile: &mut Pile,
+fn load_inputs_from_store(
+    pile: &mut FacultyStore,
     signer: &ed25519_dalek::SigningKey,
     sources: &BTreeSet<SourceKey>,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
 ) -> Result<LoadedInputs, String> {
-    let loaded = async {
+    let loaded = (|| {
         let mut by_scope = BTreeMap::<Id, Collection<Rank9AcceleratedSuccinctArchiveBlob>>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwQuery>>::new();
         let mut latest_by_scope = BTreeMap::<Id, BTreeMap<Id, LatestIndex>>::new();
@@ -767,10 +782,9 @@ async fn load_inputs_from_pile(
         }
 
         let secrets = if let Some(collection) = secrets_collection {
-            let snapshot = secret_storage::ensure_and_snapshot(pile, collection, signer)
-                .await
+            let snapshot = runtime.block_on(secret_storage::ensure_and_snapshot(pile, collection, signer))
                 .map_err(|error| format!("observe configured Secrets collection: {error:#}"))?;
-            Some(LoadedSecrets::new(snapshot))
+            Some(snapshot)
         } else {
             None
         };
@@ -780,11 +794,17 @@ async fn load_inputs_from_pile(
         // inhabit literally one known-prefix observation. A viewer without
         // Secrets freezes the same boundary itself.
         let store_snapshot = match secrets.as_ref() {
-            Some(secrets) => secrets.snapshot.store_snapshot().clone(),
+            Some(secrets) => secrets.store_snapshot().clone(),
             None => pile
                 .snapshot()
                 .map_err(|error| format!("freeze maintained viewer snapshot: {error}"))?,
         };
+        let store_snapshot = AcquiringReader::new(store_snapshot, runtime.clone());
+        let secrets = secrets_collection
+            .map(|collection| secret_storage::snapshot_acquiring(store_snapshot.clone(), collection)
+                .map(LoadedSecrets::new)
+                .map_err(|error| format!("read configured Secrets collection: {error:#}")))
+            .transpose()?;
 
         let mut facts_by_scope = BTreeMap::new();
         let mut revisions_by_scope = BTreeMap::new();
@@ -802,12 +822,15 @@ async fn load_inputs_from_pile(
 
         if let Some(target) = compass_register {
             let collection = store_snapshot
-                .attached(target)
+                .attached_acquiring(target)
                 .map_err(|error| format!("attach Compass status register: {error}"))?;
             let (index, unread) = collection
-                .read::<LwwIndex>()
+                .read_acquiring::<LwwIndex>()
                 .map_err(|error| format!("read Compass status register: {error}"))?
                 .into_parts();
+            if !unread.is_empty() {
+                return Err(format!("Compass status register has {} unread foundations", unread.len()));
+            }
             let index = index
                 .query()
                 .map_err(|error| format!("prepare Compass status register query: {error}"))?;
@@ -826,12 +849,15 @@ async fn load_inputs_from_pile(
 
         if let Some(target) = wiki_latest {
             let collection = store_snapshot
-                .attached(target)
+                .attached_acquiring(target)
                 .map_err(|error| format!("attach Wiki supersession index: {error}"))?;
             let (index, unread) = collection
-                .read::<LatestIndex>()
+                .read_acquiring::<LatestIndex>()
                 .map_err(|error| format!("read Wiki supersession index: {error}"))?
                 .into_parts();
+            if !unread.is_empty() {
+                return Err(format!("Wiki latest index has {} unread foundations", unread.len()));
+            }
             revisions_by_scope
                 .get_mut(&WIKI_SCOPE_ID)
                 .expect("Wiki facts were attached")
@@ -870,8 +896,7 @@ async fn load_inputs_from_pile(
             })
             .collect();
         Ok(LoadedInputs { datasets, secrets })
-    }
-    .await;
+    })();
 
     loaded
 }

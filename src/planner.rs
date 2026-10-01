@@ -939,7 +939,7 @@ where
 }
 
 /// Strictly read a UTF8String attachment.
-pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let text: anybytes::View<str> = reader.get(handle).context("read Planner text")?;
     Ok(text.to_string())
 }

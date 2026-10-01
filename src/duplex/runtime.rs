@@ -1248,9 +1248,7 @@ fn accept_inject_drain(
 /// One utterance, one commit — the exact record shape `voice shout` writes, so
 /// nothing that reads the collection has to learn a new one.
 fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<()> {
-    use crate::collection_names::open_configured;
     use crate::schemas::voice::{CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
-    use crate::storage::open_pile_signed;
     use triblespace::core::collection::CollectionStoreExt;
     use triblespace::core::metadata;
     use triblespace::prelude::*;
@@ -1258,34 +1256,31 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     let stamp = clock::point_now()?;
     let mut fragment = crate::voice::utterance_fragment(CHANNEL_SHOUT, text, None, stamp)?;
 
-    let (mut pile, signer) = open_pile_signed(pile_path, key)?;
-    let collection = open_configured(&mut pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
-    let result = (|| -> Result<()> {
+    crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned))
+        .with_store(|pile, signer, runtime| {
+        let collection = crate::collection_names::open_configured_acquiring(
+            pile, COLLECTION_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
         crate::voice::validate_staged_payloads(&mut fragment)?;
         fragment.describe_with(entity! { metadata::description: "duplex spoke" });
-        crate::collection_names::require_command_write_admission(
-            &mut pile,
+        crate::collection_names::require_command_write_admission_acquiring(
+            pile,
             collection,
-            &signer,
+            signer,
             "Duplex",
             "voice route show",
+            runtime,
         )?;
-        pile.commit(collection, &signer, fragment)
+        pile.commit(collection, signer, fragment)
             .context("commit the utterance")?;
         drop(
-            pollster::block_on(crate::storage::ensure_downstream(
-                &mut pile, collection, &signer,
+            runtime.block_on(crate::storage::ensure_downstream(
+                pile, collection, signer,
             ))
             .context("Duplex utterance was committed, but ensuring its derived views failed")?,
         );
         Ok(())
-    })();
-    let close = pile.close().map_err(anyhow::Error::from);
-    match (result, close) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Ok(()), Err(error)) => Err(error.context("close the transcript pile")),
-        (Err(error), _) => Err(error),
-    }
+    })
 }
 
 // ── the loop ───────────────────────────────────────────────────────────────

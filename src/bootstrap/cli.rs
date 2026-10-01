@@ -37,7 +37,7 @@ pub fn run() -> Result<()> {
     };
 
     crate::cli::with_output("bootstrap", |out| {
-        let report = pollster::block_on(super::import(&cli.pile, cli.key.as_deref()))?;
+        let report = super::import(&cli.pile, cli.key.as_deref())?;
         super::render_import(&report, out)
     })
 }

@@ -14,8 +14,7 @@
 //! against ~1 s of projection put a 3,161-file backfill at 8.2 hours of pure
 //! opening when the open was paid per unit. Pay it once.
 
-use crate::storage::FactView;
-use std::borrow::BorrowMut;
+use std::sync::Arc;
 use triblespace::core::collection::AttachedSnapshot;
 
 use anyhow::{anyhow, Context, Result};
@@ -31,35 +30,34 @@ use triblespace::core::collection::{
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStorePut, SnapshotSource};
+use triblespace::core::repo::{BlobStorePut, SnapshotSource, StorageClose, Store};
+use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::prelude::*;
 
-use crate::collection_names::open_configured;
 use crate::schemas::code::DEFAULT_SCOPE_ID;
-use crate::storage::{open_pile_signed, FactArchive};
+use crate::storage::{FactArchive, FacultyStore};
 
 /// Stage Code fragments for commit-last publication.
-pub struct CodeImportWriter<P = Pile> {
+pub struct CodeImportWriter<P = FacultyStore> {
     pile: P,
     collection: Collection<SimpleArchive>,
     signer: SigningKey,
     current: FactArchive,
     delta: Fragment,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl CodeImportWriter {
-    pub async fn open(
+    /// Open a synchronous import session. Async callers run the complete
+    /// open/stage/close lifetime on a blocking worker, not inside their runtime.
+    pub fn open(
         pile_path: &std::path::Path,
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let (mut pile, signer) = open_pile_signed(pile_path, key_path)?;
-        let result = async {
-            let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let observed = ensure_facts(&mut pile, source, &signer).await?;
-            let current = observed.facts().context("read Code facts")?;
-            Ok((source, current))
-        }
-        .await;
+        let signer = crate::storage::load_signer(pile_path, key_path)?;
+        let runtime = Arc::new(crate::storage::runtime()?);
+        let mut pile = crate::storage::open_store_as(pile_path, signer.verifying_key())?;
+        let result = Self::prepare(&mut pile, &signer, &runtime);
         match result {
             Ok((collection, current)) => {
                 let mut writer = Self {
@@ -68,6 +66,7 @@ impl CodeImportWriter {
                     signer,
                     current,
                     delta: Fragment::empty(),
+                    runtime,
                 };
                 if let Err(error) = writer.stage_fragment(crate::code::law_fragment()) {
                     return close_pile(
@@ -87,21 +86,47 @@ impl CodeImportWriter {
     }
 }
 
-impl<P: BorrowMut<Pile>> CodeImportWriter<P> {
-    /// Stage against a caller-owned pile. The caller controls its lifetime.
-    pub async fn from_pile(mut pile: P, signer: &SigningKey) -> Result<Self> {
-        let source = open_configured(pile.borrow_mut(), DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        let observed = ensure_facts(pile.borrow_mut(), source, signer).await?;
-        let current = observed.facts().context("read Code facts")?;
+impl<P> CodeImportWriter<P>
+where
+    P: Store + AsyncBlobStoreAcquire + Send,
+    P::Snapshot: AsyncBlobStoreGet,
+{
+    /// Borrow the full caller-owned store; no local-backend guard spans I/O.
+    pub fn from_store(
+        mut pile: P,
+        signer: &SigningKey,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self> {
+        let (source, current) = Self::prepare(&mut pile, signer, &runtime)?;
         let mut writer = Self {
             pile,
             collection: source,
             signer: signer.clone(),
             current,
             delta: Fragment::empty(),
+            runtime,
         };
         writer.stage_fragment(crate::code::law_fragment())?;
         Ok(writer)
+    }
+
+    fn prepare(
+        pile: &mut P,
+        signer: &SigningKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+    ) -> Result<(Collection<SimpleArchive>, FactArchive)> {
+        let source = crate::collection_names::open_configured_acquiring(
+            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let (succinct, rank9) = crate::storage::fact_pair(pile, source)?;
+        runtime.block_on(async {
+            crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
+            crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+        }).context("maintain Code import facts")?;
+        let reader = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
+        let current = crate::storage::acquire_facts(&reader, rank9)
+            .context("read Code import facts")?;
+        Ok((source, current))
     }
 
     /// Whether this exact entity is already catalogued.
@@ -136,7 +161,7 @@ impl<P: BorrowMut<Pile>> CodeImportWriter<P> {
         // stay semantically unreachable until a signed COMMIT names the facts
         // referencing them.
         let embedded = embedded_blobs(blobs);
-        stage_embedded_blobs(self.pile.borrow_mut(), embedded)?;
+        stage_embedded_blobs(&mut self.pile, embedded)?;
 
         self.delta += Fragment::from_parts(facts, metafacts, Default::default());
         Ok(())
@@ -156,16 +181,16 @@ impl<P: BorrowMut<Pile>> CodeImportWriter<P> {
         }
         let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
         let published = fragment.facts().clone();
-        crate::collection_names::require_command_write_admission(
-            &mut *self.pile.borrow_mut(),
+        crate::collection_names::require_command_write_admission_acquiring(
+            &mut self.pile,
             self.collection,
             &self.signer,
             "Code",
             "code find",
+            &self.runtime,
         )?;
         let commit = self
             .pile
-            .borrow_mut()
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Code projection unit")?;
         self.current = extend_archive(&self.current, &published);
@@ -228,7 +253,7 @@ fn extend_archive(current: &FactArchive, additions: &TribleSet) -> FactArchive {
     ])
 }
 
-fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result<T> {
+fn close_pile<T>(pile: impl StorageClose, result: Result<T>, failure_context: &str) -> Result<T> {
     match (result, pile.close()) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -277,8 +302,12 @@ pub async fn ensure_facts(
 pub fn ensure_local_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
-    storage.with_pile(|pile, signer| {
-        let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    storage.with_store(|store, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let mut local = store.store();
+        let pile = &mut *local;
         pollster::block_on(ensure_facts(pile, source, signer))
     })
 }

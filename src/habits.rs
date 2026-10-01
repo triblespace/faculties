@@ -22,7 +22,7 @@ use std::path::Path;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::collection::CollectionCommit;
+use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -63,8 +63,10 @@ pub fn collection_handle(
 pub fn collection_handle_with_storage(
     storage: &Storage,
 ) -> Result<triblespace::core::collection::records::CollectionHandle> {
-    storage.with_pile(|pile, signer| {
-        open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+    storage.with_store(|pile, signer, runtime| {
+        crate::collection_names::open_configured_acquiring(
+            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )
             .map(|collection| collection.handle())
             .context("open Habit collection")
     })
@@ -1291,13 +1293,14 @@ where
     Ok(rows)
 }
 
-fn load_text_overlay<Overlay>(
-    reader: &PileSnapshot,
+fn load_text_overlay<Reader, Overlay>(
+    reader: &Reader,
     overlay: Option<&Overlay>,
     handle: TextHandle,
     field: &str,
 ) -> Result<String>
 where
+    Reader: BlobStoreGet,
     Overlay: BlobStoreGet + BlobStoreMeta,
 {
     if let Some(overlay) = overlay {
@@ -1325,13 +1328,14 @@ where
 /// missing blob. It is deliberately not degraded into "this habit is not due":
 /// a standing intention that quietly stops firing is worse than one that
 /// refuses to be read at all, because nobody notices the first.
-fn load_script_overlay<Overlay>(
-    reader: &PileSnapshot,
+fn load_script_overlay<Reader, Overlay>(
+    reader: &Reader,
     overlay: Option<&Overlay>,
     handle: ScriptHandle,
     habit: Id,
 ) -> Result<Script>
 where
+    Reader: BlobStoreGet,
     Overlay: BlobStoreGet + BlobStoreMeta,
 {
     let missing = || {
@@ -1360,12 +1364,13 @@ where
     })
 }
 
-fn decode_catalog<Overlay>(
-    reader: &PileSnapshot,
+fn decode_catalog<Reader, Overlay>(
+    reader: &Reader,
     overlay: Option<&Overlay>,
     raw: RawCatalog,
 ) -> Result<Catalog>
 where
+    Reader: BlobStoreGet,
     Overlay: BlobStoreGet + BlobStoreMeta,
 {
     let mut texts = HashMap::<[u8; 32], String>::new();
@@ -1429,7 +1434,7 @@ where
 }
 
 /// Strictly validate and decode one complete materialized Habit collection.
-pub fn load_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<Catalog> {
+pub fn load_catalog<Reader: BlobStoreGet>(reader: &Reader, facts: &TribleSet) -> Result<Catalog> {
     let raw = validate_structure(facts)?;
     decode_catalog(reader, None::<&PileSnapshot>, raw)
 }
@@ -1619,9 +1624,14 @@ pub fn publish(
 /// returned. If that upkeep fails, the error identifies the already-committed
 /// fragment; it does not imply that publication was rolled back.
 pub fn publish_with_storage(storage: &Storage, fragment: Fragment) -> Result<CollectionCommit> {
-    storage.with_pile(|pile, signer| {
-        let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        operations::commit_habit_fragment(pile, collection, signer, fragment)
+    storage.with_store(|pile, signer, runtime| {
+        let collection = crate::collection_names::open_configured_acquiring(
+            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let commit = pile.commit(collection, signer, fragment).context("commit Habit fragment")?;
+        runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            .context("Habit facts were committed, but ensuring their derived views failed")?;
+        Ok(commit)
     })
 }
 
@@ -1639,13 +1649,22 @@ pub fn read_catalog_strict(pile_path: &Path, key_path: Option<&Path>) -> Result<
 
 /// Run the explicit whole-collection audit without reopening a shared store.
 pub fn read_catalog_strict_with_storage(storage: &Storage) -> Result<Catalog> {
-    storage.with_pile(|pile, signer| {
-        let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        let store_snapshot = pile
-            .snapshot()
-            .context("freeze native Habit store snapshot")?;
-        let (facts, _) = crate::storage::read_fact_collection(collection, &store_snapshot)
-            .context("read native Habit collection")?;
+    storage.with_store(|pile, signer, runtime| {
+        let collection = crate::collection_names::open_configured_acquiring(
+            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let store_snapshot = crate::storage::AcquiringReader::new(
+            pile.snapshot().context("freeze Habit audit snapshot")?, runtime.clone(),
+        );
+        // Strict check includes every admitted foundation, not only the
+        // resident realized cover. Bytes may arrive, but the admitted set and
+        // its authorization evidence stay at this one audit observation.
+        let admitted = collection.admitted(&store_snapshot)?;
+        let mut facts = TribleSet::new();
+        for payload in admitted.members() {
+            facts += store_snapshot.get::<TribleSet, _>(payload)
+                .context("read admitted Habit audit foundation")?;
+        }
         load_catalog(&store_snapshot, &facts).context("strictly validate native Habit catalog")
     })
 }

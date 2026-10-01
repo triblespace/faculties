@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Foreground faculty readers acquire exact descriptor, name, admission-definition,
+  selected fact and body bytes through their retained Leech owner. Core's shared
+  acquisition adapter keeps the original record/proof evidence and residency;
+  obtaining bytes cannot advance an already-selected view or discover a later
+  grant. Operational fact and register reads refuse unread selected support,
+  naming its foundations rather than silently rendering a partial collection.
+  Secrets retains its distinct local key-wrap policy. Import sessions and
+  widgets keep their reader's acquisition owner alive; model discovery uses
+  acquiring known-foundation selection without changing GPU computation.
+  Passive health, discovery and explicitly resident-only APIs remain local.
+  Reader usability is not bulk-sync completion.
+
 - `files index` derives every Files commit that has no semantic row whose
   bytes are here or can be fetched, whoever saved it, and carries each
   index's rows into this key's merges; saving a file still embeds only this

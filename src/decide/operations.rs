@@ -1,16 +1,17 @@
 //! Configured operations over one frozen authorized Decide observation.
-use crate::storage::FactRead;
 #[cfg(test)]
 use crate::storage::FactView;
 use std::path::PathBuf;
 
 use crate::clock;
+use crate::collection_names::open_configured_acquiring;
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
 use crate::schemas::decide::DEFAULT_SCOPE_ID;
-use crate::storage::FactArchive;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -19,7 +20,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -326,32 +326,34 @@ struct DecideStorage<'a> {
 
 struct CollectionView {
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: AcquiringReader<FacultySnapshot>,
 }
 
 impl DecideStorage<'_> {
     fn with_store<T>(
         &self,
         operation: impl FnOnce(
-            &mut Pile,
+            &mut FacultyStore,
             Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &CollectionView,
+            &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_pile(|pile, signer| {
+        self.storage.with_store(|pile, signer, runtime| {
             let result = (|| {
-                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let collection = open_configured_acquiring(
+                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+                )?;
                 let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
                 let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
                     collection,
                     maintained_succinct,
                 )?;
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze resident Decide fact collection")?;
-                let facts = store_snapshot
-                    .read_facts(maintained_rank9)
+                let store_snapshot = AcquiringReader::new(
+                    pile.snapshot().context("freeze Decide fact collection")?, runtime.clone(),
+                );
+                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
                     .context("read maintained Decide fact collection")?;
                 operation(
                     pile,
@@ -361,6 +363,7 @@ impl DecideStorage<'_> {
                         facts,
                         reader: store_snapshot,
                     },
+                    runtime,
                 )
             })();
             result
@@ -368,7 +371,7 @@ impl DecideStorage<'_> {
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&CollectionView) -> Result<T>) -> Result<T> {
-        self.with_store(|_, _, _, view| operation(view))
+        self.with_store(|_, _, _, view, _| operation(view))
     }
 
     fn update<T>(
@@ -376,20 +379,21 @@ impl DecideStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&CollectionView) -> Result<(Fragment, T)>,
     ) -> Result<T> {
-        self.with_store(|pile, collection, signer, view| {
+        self.with_store(|pile, collection, signer, view, runtime| {
             let (mut fragment, value) = operation(view)?;
             fragment.describe_with(entity! { metadata::description: description });
-            crate::collection_names::require_command_write_admission(
+            crate::collection_names::require_command_write_admission_acquiring(
                 pile,
                 collection,
                 signer,
                 "Decide",
                 "decide show",
+                runtime,
             )?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored Decide fragment")?;
             drop(
-                pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context(
                         "Decide facts were committed, but ensuring their derived views failed",
                     )?,

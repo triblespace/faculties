@@ -6,6 +6,7 @@ use crate::memory_cover::CoverReport;
 #[cfg(test)]
 use crate::memory_cover::DEFAULT_SIM_THRESHOLD;
 use crate::out::Out;
+#[cfg(test)]
 use crate::storage::FactRead;
 
 #[derive(Clone, Debug)]
@@ -69,10 +70,11 @@ impl Memory {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self { storage }
     }
-    fn storage(&self) -> MemoryStorage<'_> {
-        MemoryStorage {
-            storage: &self.storage,
-        }
+    fn with_operation<T>(
+        &self,
+        operation: impl FnOnce(MemoryStorage<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.storage.scope(|storage| operation(MemoryStorage { storage }))
     }
 
     /// An id/alias prefix or a temporal range is a domain selector, not argv.
@@ -81,53 +83,57 @@ impl Memory {
     }
     /// All selectors resolve against one frozen Memory view; retain input order.
     pub fn show_many(&self, selectors: &[String], out: &mut Out<'_>) -> Result<()> {
-        let loaded = self.storage().load()?;
-        for (index, raw) in selectors.iter().enumerate() {
-            let id = if raw.contains("..") {
-                let (start, end) = parse_time_range(raw)?;
-                find_chunk_by_time_range(&loaded.memory.facts, start, end)
-                    .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
-            } else {
-                resolve_chunk_id(&loaded, raw)
-                    .map_err(|error| invalid_memory_id_error(raw, error))?
-            };
-            if index != 0 {
-                out.line("")?;
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            for (index, raw) in selectors.iter().enumerate() {
+                let id = if raw.contains("..") {
+                    let (start, end) = parse_time_range(raw)?;
+                    find_chunk_by_time_range(&loaded.memory.facts, start, end)
+                        .ok_or_else(|| anyhow!("no memory covers range {raw}"))?
+                } else {
+                    resolve_chunk_id(&loaded, raw)
+                        .map_err(|error| invalid_memory_id_error(raw, error))?
+                };
+                if index != 0 {
+                    out.line("")?;
+                }
+                print_chunk(&loaded.memory.reader, &loaded.memory.facts, id, out)?;
             }
-            print_chunk(&loaded.memory.reader, &loaded.memory.facts, id, out)?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
     pub fn turn(&self, turn: &str, out: &mut Out<'_>) -> Result<()> {
-        let loaded = self.storage().load()?;
-        print_turn_facets(&loaded.memory.reader, &loaded.memory.facts, turn, out)
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            print_turn_facets(&loaded.memory.reader, &loaded.memory.facts, turn, out)
+        })
     }
     pub fn meta(&self, selector: &str, out: &mut Out<'_>) -> Result<()> {
-        meta(self.storage(), selector, out)
+        self.with_operation(|storage| meta(storage, selector, out))
     }
     pub fn provenance(&self, id: &str, out: &mut Out<'_>) -> Result<()> {
-        provenance(self.storage(), id, out)
+        self.with_operation(|storage| provenance(storage, id, out))
     }
     pub fn search(&self, query: &str, out: &mut Out<'_>) -> Result<()> {
-        search(self.storage(), query, out)
+        self.with_operation(|storage| search(storage, query, out))
     }
     pub fn similar(&self, query: &str, out: &mut Out<'_>) -> Result<()> {
-        similar(self.storage(), query, out)
+        self.with_operation(|storage| similar(storage, query, out))
     }
     pub fn embed(&self, out: &mut Out<'_>) -> Result<()> {
-        embed(self.storage(), out)
+        self.with_operation(|storage| embed(storage, out))
     }
     pub fn lens(&self, theme: Option<&str>, out: &mut Out<'_>) -> Result<()> {
-        lens(self.storage(), theme, out)
+        self.with_operation(|storage| lens(storage, theme, out))
     }
     pub fn list(&self, grain: Option<&str>, out: &mut Out<'_>) -> Result<()> {
-        list(self.storage(), grain, out)
+        self.with_operation(|storage| list(storage, grain, out))
     }
     pub fn check(&self, grain: &str, out: &mut Out<'_>) -> Result<()> {
-        check(self.storage(), grain, out)
+        self.with_operation(|storage| check(storage, grain, out))
     }
     pub fn density(&self, grain: Option<&str>, out: &mut Out<'_>) -> Result<()> {
-        density(self.storage(), grain, out)
+        self.with_operation(|storage| density(storage, grain, out))
     }
     pub fn churn(&self, options: &ChurnOptions, out: &mut Out<'_>) -> Result<()> {
         if options.step_units <= 0 {
@@ -139,13 +145,13 @@ impl Memory {
             .and_then(|step| step.checked_mul(options.steps as i128))
             .filter(|duration| *duration <= i128::MAX / 2)
             .ok_or_else(|| anyhow!("churn diagnostic time span is too large"))?;
-        churn(self.storage(), options, out)
+        self.with_operation(|storage| churn(storage, options, out))
     }
     pub fn respan_instants(&self, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
-        respan_instants(self.storage(), dry_run, out)
+        self.with_operation(|storage| respan_instants(storage, dry_run, out))
     }
     pub fn respan_seams(&self, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
-        respan_seams(self.storage(), dry_run, out)
+        self.with_operation(|storage| respan_seams(storage, dry_run, out))
     }
 
     /// Summary/lens strings are literal resident data, including @ prefixes.
@@ -166,19 +172,20 @@ impl Memory {
             }
         };
         require_duration(range)?;
-        let storage = self.storage();
-        let loaded = storage.load()?;
-        let id = create_chunk(storage, &loaded, summary, range, lens, range.1)?;
-        Ok(CreatedMemory {
-            id,
-            start: range.0,
-            end: range.1,
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            let id = create_chunk(storage, &loaded, summary, range, lens, range.1)?;
+            Ok(CreatedMemory {
+                id,
+                start: range.0,
+                end: range.1,
+            })
         })
     }
     /// Store exact resident bytes. Presentation validates/derives a view later;
     /// storage does not decode, convert, or relabel the image.
     pub fn image(&self, bytes: &[u8], range: (Epoch, Epoch)) -> Result<CreatedMemory> {
-        let id = create_image_chunk(self.storage(), bytes, range)?;
+        let id = self.with_operation(|storage| create_image_chunk(storage, bytes, range))?;
         Ok(CreatedMemory {
             id,
             start: range.0,
@@ -187,19 +194,20 @@ impl Memory {
     }
     pub fn respan(&self, previous: &str, range: (Epoch, Epoch)) -> Result<RespanReceipt> {
         require_duration(range)?;
-        let storage = self.storage();
-        let loaded = storage.load()?;
-        let previous = resolve_chunk_id(&loaded, previous)?;
-        let (fragment, id) = respan_fragment(&loaded, previous, range, clock::now()?)?;
-        storage.publish_memory(fragment)?;
-        Ok(RespanReceipt {
-            memory: CreatedMemory {
-                id,
-                start: range.0,
-                end: range.1,
-            },
-            previous,
-            previous_range: chunk_span_str(&loaded.memory.facts, previous),
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            let previous = resolve_chunk_id(&loaded, previous)?;
+            let (fragment, id) = respan_fragment(&loaded, previous, range, clock::now()?)?;
+            storage.publish_memory(fragment)?;
+            Ok(RespanReceipt {
+                memory: CreatedMemory {
+                    id,
+                    start: range.0,
+                    end: range.1,
+                },
+                previous,
+                previous_range: chunk_span_str(&loaded.memory.facts, previous),
+            })
         })
     }
     /// Exact charged text is separate from diagnostics, including fail-open
@@ -210,8 +218,10 @@ impl Memory {
         }
         let needs_embeddings = cfg!(feature = "local-embed")
             && (options.about.is_some() || options.filter.is_some() || options.remove.is_some());
-        let loaded = self.storage().load_context(needs_embeddings)?;
-        render_context(&loaded, options)
+        self.with_operation(|storage| {
+            let loaded = storage.load_context(needs_embeddings)?;
+            render_context(&loaded, options)
+        })
     }
     pub fn consolidate_start(&self, persona: &str, edge: Epoch) -> Result<()> {
         self.set_cursor(CONSOLIDATE_STREAM, persona, Some(edge), None)
@@ -240,9 +250,10 @@ impl Memory {
         grain: Option<&str>,
     ) -> Result<()> {
         require_persona(persona)?;
-        let storage = self.storage();
-        let loaded = storage.load_comb()?;
-        comb_advance(storage, &loaded, stream, persona, position, grain)
+        self.with_operation(|storage| {
+            let loaded = storage.load_comb()?;
+            comb_advance(storage, &loaded, stream, persona, position, grain)
+        })
     }
 }
 
@@ -323,10 +334,10 @@ use crate::schemas::memory::{
     DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
 };
 use crate::schemas::{blockdag as archive_schema, cognition as cognition_schema};
-use crate::storage::FactArchive;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 // The shared recollection renderer and accessors also serve Orient in-process.
-use crate::collection_names::open_configured;
+use crate::collection_names::{open_configured, open_configured_acquiring};
 use crate::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
     chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_observed_at, chunk_references,
@@ -345,12 +356,13 @@ use triblespace::core::blob::Bytes;
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
+
+type PileSnapshot = AcquiringReader<FacultySnapshot>;
 
 #[derive(Clone, Copy)]
 struct MemoryStorage<'a> {
@@ -391,13 +403,31 @@ struct LoadedProvenance {
 }
 
 impl MemoryStorage<'_> {
+    /// Keep exact-byte acquisition outside a local-backend guard. Public
+    /// operations keep this shared store alive through their final rendering.
+    fn with_store<T>(
+        &self,
+        scopes: &[Id],
+        operation: impl FnOnce(
+            &mut FacultyStore,
+            &ed25519_dalek::SigningKey,
+            &std::sync::Arc<tokio::runtime::Runtime>,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        self.storage.with_store(|store, signer, runtime| {
+            for &scope in scopes {
+                open_configured_acquiring(store, scope, signer.verifying_key(), runtime)?;
+            }
+            operation(store, signer, runtime)
+        })
+    }
+
     fn attach_collection(
         collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         store_snapshot: &PileSnapshot,
         label: &str,
     ) -> Result<CollectionView> {
-        let facts = store_snapshot
-            .read_facts(collection)
+        let facts = crate::storage::acquire_facts(store_snapshot, collection)
             .with_context(|| format!("attach maintained {label} collection"))?;
         Ok(CollectionView {
             facts,
@@ -415,8 +445,8 @@ impl MemoryStorage<'_> {
 
     /// Freeze maintained Memory alone for ordinary commands.
     fn load(&self) -> Result<LoadedMemory> {
-        self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
+        self.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
+            let collection = runtime.block_on(async {
                 let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile
                     .attach::<SuccinctArchiveBlob>(source, ())
@@ -431,20 +461,26 @@ impl MemoryStorage<'_> {
                     .context("maintain Succinct Memory collection")?;
                 crate::storage::tolerate_own_lag(pile.maintain_attached(collection, signer).await)
                     .context("maintain Rank9 Memory collection")?;
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze maintained Memory snapshot")?;
-                Self::load_memory_from_snapshot(collection, &store_snapshot)
-            });
-            result
+                Ok::<_, anyhow::Error>(collection)
+            })?;
+            let store_snapshot = AcquiringReader::new(
+                pile.snapshot().context("freeze maintained Memory snapshot")?,
+                runtime.clone(),
+            );
+            Self::load_memory_from_snapshot(collection, &store_snapshot)
         })
     }
 
     /// Freeze Memory and shared Embeddings from one snapshot for semantic or
     /// context-cover reads.
     fn load_context(&self, with_embeddings: bool) -> Result<LoadedContext> {
-        self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
+        let scopes = if with_embeddings {
+            &[MEMORY_SCOPE_ID, EMBEDDINGS_SCOPE_ID][..]
+        } else {
+            &[MEMORY_SCOPE_ID][..]
+        };
+        self.with_store(scopes, |pile, signer, runtime| {
+            let (memory_collection, embeddings_collections) = runtime.block_on(async {
                 let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
                 let memory_succinct = pile
                     .attach::<SuccinctArchiveBlob>(memory_source, ())
@@ -479,28 +515,27 @@ impl MemoryStorage<'_> {
                     crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
                         .with_context(|| format!("maintain Rank9 {label} collection"))?;
                 }
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze maintained Memory/Embeddings snapshot")?;
-                let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-                let embeddings = match embeddings_collections {
-                    Some((_, collection)) => Some(Self::attach_collection(
-                        collection,
-                        &store_snapshot,
-                        "shared Embeddings",
-                    )?),
-                    None => None,
-                };
-                Ok(LoadedContext { memory, embeddings })
-            });
-            result
+                Ok::<_, anyhow::Error>((memory_collection, embeddings_collections))
+            })?;
+            let store_snapshot = AcquiringReader::new(
+                pile.snapshot().context("freeze maintained Memory/Embeddings snapshot")?,
+                runtime.clone(),
+            );
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let embeddings = match embeddings_collections {
+                Some((_, collection)) => Some(Self::attach_collection(
+                    collection, &store_snapshot, "shared Embeddings",
+                )?),
+                None => None,
+            };
+            Ok(LoadedContext { memory, embeddings })
         })
     }
 
     /// Freeze Memory and Comb together for cursor transitions.
     fn load_comb(&self) -> Result<LoadedComb> {
-        self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
+        self.with_store(&[MEMORY_SCOPE_ID, DEFAULT_COMB_SCOPE_ID], |pile, signer, runtime| {
+            let (memory_collection, comb_source) = runtime.block_on(async {
                 let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
                 let memory_succinct = pile
                     .attach::<SuccinctArchiveBlob>(memory_source, ())
@@ -518,32 +553,34 @@ impl MemoryStorage<'_> {
                     pile.maintain_attached(memory_collection, signer).await,
                 )
                 .context("maintain Rank9 Memory collection")?;
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze maintained Memory and Comb snapshot")?;
-                let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-                // The Comb is read from its source: a cursor committed a
-                // moment ago is in this snapshot, whoever may maintain the
-                // derived images.
-                let facts = store_snapshot
-                    .collection(comb_source)
-                    .context("observe Comb source collection")?
-                    .view::<TribleSet>()
-                    .context("read Comb source collection")?;
-                Ok(LoadedComb {
-                    memory,
-                    comb: CombView { facts },
-                })
-            });
-            result
+                Ok::<_, anyhow::Error>((memory_collection, comb_source))
+            })?;
+            let store_snapshot = AcquiringReader::new(
+                pile.snapshot().context("freeze maintained Memory and Comb snapshot")?,
+                runtime.clone(),
+            );
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            // The Comb is read from its selected source; acquiring a payload
+            // never replaces its captured foundations with a newer frontier.
+            let facts = store_snapshot
+                .collection_acquiring(comb_source)
+                .context("observe Comb source collection")?
+                .view::<TribleSet>()
+                .context("read Comb source collection")?;
+            Ok(LoadedComb { memory, comb: CombView { facts } })
         })
     }
 
     /// Freeze Memory, Cognition, and Archive from exactly one pile snapshot
     /// for a coherent cross-scope provenance read.
     fn load_provenance(&self) -> Result<LoadedProvenance> {
-        self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
+        let scopes = [
+            MEMORY_SCOPE_ID,
+            cognition_schema::DEFAULT_SCOPE_ID,
+            archive_schema::DEFAULT_SCOPE_ID,
+        ];
+        self.with_store(&scopes, |pile, signer, runtime| {
+            let (memory_collection, cognition_collection, archive_collection) = runtime.block_on(async {
                 let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
                 let cognition_source = open_configured(
                     pile,
@@ -590,34 +627,27 @@ impl MemoryStorage<'_> {
                     )
                     .with_context(|| format!("maintain Rank9 {label} collection"))?;
                 }
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze maintained Memory/Cognition/Archive snapshot")?;
-                let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-                Ok(LoadedProvenance {
-                    memory,
-                    cognition: Self::attach_collection(
-                        cognition_collection,
-                        &store_snapshot,
-                        "Cognition",
-                    )?,
-                    archive: Self::attach_collection(
-                        archive_collection,
-                        &store_snapshot,
-                        "Archive",
-                    )?,
-                })
-            });
-            result
+                Ok::<_, anyhow::Error>((memory_collection, cognition_collection, archive_collection))
+            })?;
+            let store_snapshot = AcquiringReader::new(
+                pile.snapshot().context("freeze maintained Memory/Cognition/Archive snapshot")?,
+                runtime.clone(),
+            );
+            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            Ok(LoadedProvenance {
+                memory,
+                cognition: Self::attach_collection(cognition_collection, &store_snapshot, "Cognition")?,
+                archive: Self::attach_collection(archive_collection, &store_snapshot, "Archive")?,
+            })
         })
     }
 
     fn publish_memory(&self, fragment: Fragment) -> Result<()> {
-        self.storage.with_pile(|pile, signer| {
+        self.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
             let collection = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored Memory fragment")?;
-            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context("Memory fragment was committed, but ensuring its derived views failed")
                 .map(drop)
         })
@@ -625,22 +655,22 @@ impl MemoryStorage<'_> {
 
     #[cfg(feature = "local-embed")]
     fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
-        self.storage.with_pile(|pile, signer| {
+        self.with_store(&[EMBEDDINGS_SCOPE_ID], |pile, signer, runtime| {
             let collection = open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored embedding observations")?;
-            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context("Embedding observations were committed, but ensuring derived views failed")
                 .map(drop)
         })
     }
 
     fn publish_comb(&self, fragment: Fragment) -> Result<()> {
-        self.storage.with_pile(|pile, signer| {
+        self.with_store(&[DEFAULT_COMB_SCOPE_ID], |pile, signer, runtime| {
             let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit authored Comb cursor")?;
-            pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context("Comb cursor was committed, but ensuring its derived views failed")
                 .map(drop)
         })
@@ -2540,49 +2570,51 @@ impl Memory {
         if summary.is_empty() {
             bail!("consolidation summary must not be empty");
         }
-        let storage = self.storage();
-        let loaded = storage.load_comb()?;
-        let Some(resolution) =
-            comb_model::resolution(&loaded.comb.facts, CONSOLIDATE_STREAM, persona)?
-        else {
-            bail!(
-                "no open consolidation edge for persona {persona}: \
+        self.with_operation(|storage| {
+            let loaded = storage.load_comb()?;
+            let Some(resolution) =
+                comb_model::resolution(&loaded.comb.facts, CONSOLIDATE_STREAM, persona)?
+            else {
+                bail!(
+                    "no open consolidation edge for persona {persona}: \
                          use `memory consolidate start <ts>`"
-            );
-        };
-        let state = resolution.settled_state()?;
-        let Some(position) = state.position else {
-            bail!(
-                "no open consolidation edge for persona {persona}: \
+                );
+            };
+            let state = resolution.settled_state()?;
+            let Some(position) = state.position else {
+                bail!(
+                    "no open consolidation edge for persona {persona}: \
                          use `memory consolidate start <ts>`"
-            );
-        };
-        let edge_key = interval_key(position);
-        let edge = key_to_epoch(edge_key);
-        if until.to_tai_duration().total_nanoseconds() <= edge_key {
-            bail!(
-                "consolidate target {} is not after the open edge {}",
-                fmt_epoch(until),
-                fmt_epoch(edge)
-            );
-        }
-        // The boundary timestamp is a deterministic observation for
-        // this automatic write, so retrying a half-completed
-        // Memory-then-Comb publication yields the same Memory data.
-        let chunk_id = create_chunk(storage, &loaded.memory, summary, (edge, until), None, until)?;
-        comb_advance(
-            storage,
-            &loaded,
-            CONSOLIDATE_STREAM,
-            persona,
-            Some(until),
-            None,
-        )?;
+                );
+            };
+            let edge_key = interval_key(position);
+            let edge = key_to_epoch(edge_key);
+            if until.to_tai_duration().total_nanoseconds() <= edge_key {
+                bail!(
+                    "consolidate target {} is not after the open edge {}",
+                    fmt_epoch(until),
+                    fmt_epoch(edge)
+                );
+            }
+            // The boundary timestamp is a deterministic observation for
+            // this automatic write, so retrying a half-completed
+            // Memory-then-Comb publication yields the same Memory data.
+            let chunk_id =
+                create_chunk(storage, &loaded.memory, summary, (edge, until), None, until)?;
+            comb_advance(
+                storage,
+                &loaded,
+                CONSOLIDATE_STREAM,
+                persona,
+                Some(until),
+                None,
+            )?;
 
-        Ok(CreatedMemory {
-            id: chunk_id,
-            start: edge,
-            end: until,
+            Ok(CreatedMemory {
+                id: chunk_id,
+                start: edge,
+                end: until,
+            })
         })
     }
     /// Deliver one coordinate-complete batch before advancing the cursor.
@@ -2593,102 +2625,103 @@ impl Memory {
         if count == 0 {
             bail!("memory replay batch count must be greater than zero");
         }
-        let storage = self.storage();
-        let loaded = storage.load_comb()?;
-        let Some(resolution) =
-            comb_model::resolution(&loaded.comb.facts, MEMORY_REPLAY_STREAM, persona)?
-        else {
-            bail!(
-                "no active memory replay for persona {persona}: \
+        self.with_operation(|storage| {
+            let loaded = storage.load_comb()?;
+            let Some(resolution) =
+                comb_model::resolution(&loaded.comb.facts, MEMORY_REPLAY_STREAM, persona)?
+            else {
+                bail!(
+                    "no active memory replay for persona {persona}: \
                          use `memory replay start <grain> [<from>]`"
-            );
-        };
-        let state = resolution.settled_state()?;
-        let (Some(position), Some(grain_raw)) = (state.position, state.grain.as_deref()) else {
-            bail!(
-                "no active memory replay for persona {persona}: \
-                         use `memory replay start <grain> [<from>]`"
-            );
-        };
-        let position_key = interval_key(position);
-        let grain_ns = parse_grain(grain_raw)?;
-        let space = &loaded.memory.memory.facts;
-
-        // Chunks at this zoom: width fits the grain and is maximal among
-        // grain-fitting chunks (not contained in a
-        // wider one that also fits — that one IS this zoom's voice).
-        let mut fitting: Vec<(i128, i128, Id)> = Vec::new();
-        for chunk_id in all_chunk_ids(space) {
-            let (Some(s), Some(e)) = (
-                chunk_start_at(space, chunk_id),
-                chunk_end_at(space, chunk_id),
-            ) else {
-                continue;
+                );
             };
-            let (sk, ek) = (interval_key(s), interval_key(e));
-            if ek - sk <= grain_ns {
-                fitting.push((sk, ek, chunk_id));
-            }
-        }
-        let maximal: Vec<(i128, i128, Id)> = fitting
-            .iter()
-            .filter(|(sk, ek, id)| {
-                !fitting.iter().any(|(osk, oek, oid)| {
-                    oid != id && osk <= sk && oek >= ek && (oek - osk) > (ek - sk)
-                })
-            })
-            .copied()
-            .collect();
+            let state = resolution.settled_state()?;
+            let (Some(position), Some(grain_raw)) = (state.position, state.grain.as_deref()) else {
+                bail!(
+                    "no active memory replay for persona {persona}: \
+                         use `memory replay start <grain> [<from>]`"
+                );
+            };
+            let position_key = interval_key(position);
+            let grain_ns = parse_grain(grain_raw)?;
+            let space = &loaded.memory.memory.facts;
 
-        let mut batch: Vec<(i128, i128, Id)> = maximal
-            .into_iter()
-            .filter(|(sk, _, _)| *sk > position_key)
-            .collect();
-        batch.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
-        let total = batch.len();
-        if total == 0 {
-            out.line(format!(
-                "memory replay complete at grain {grain_raw}: nothing after the cursor."
-            ))?;
-            return Ok(());
-        }
-        let take = replay_take_count(&batch, count);
-        let mut last_start = position_key;
-        for (sk, ek, chunk_id) in batch.iter().take(take) {
-            let summary = match chunk_summary_handle(space, *chunk_id) {
-                Some(handle) => {
-                    let view: View<str> = loaded
-                        .memory
-                        .memory
-                        .reader
-                        .get(handle)
-                        .context("read chunk summary")?;
-                    view.trim_end().to_string()
+            // Chunks at this zoom: width fits the grain and is maximal among
+            // grain-fitting chunks (not contained in a
+            // wider one that also fits — that one IS this zoom's voice).
+            let mut fitting: Vec<(i128, i128, Id)> = Vec::new();
+            for chunk_id in all_chunk_ids(space) {
+                let (Some(s), Some(e)) = (
+                    chunk_start_at(space, chunk_id),
+                    chunk_end_at(space, chunk_id),
+                ) else {
+                    continue;
+                };
+                let (sk, ek) = (interval_key(s), interval_key(e));
+                if ek - sk <= grain_ns {
+                    fitting.push((sk, ek, chunk_id));
                 }
-                None => String::new(),
-            };
+            }
+            let maximal: Vec<(i128, i128, Id)> = fitting
+                .iter()
+                .filter(|(sk, ek, id)| {
+                    !fitting.iter().any(|(osk, oek, oid)| {
+                        oid != id && osk <= sk && oek >= ek && (oek - osk) > (ek - sk)
+                    })
+                })
+                .copied()
+                .collect();
+
+            let mut batch: Vec<(i128, i128, Id)> = maximal
+                .into_iter()
+                .filter(|(sk, _, _)| *sk > position_key)
+                .collect();
+            batch.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+            let total = batch.len();
+            if total == 0 {
+                out.line(format!(
+                    "memory replay complete at grain {grain_raw}: nothing after the cursor."
+                ))?;
+                return Ok(());
+            }
+            let take = replay_take_count(&batch, count);
+            let mut last_start = position_key;
+            for (sk, ek, chunk_id) in batch.iter().take(take) {
+                let summary = match chunk_summary_handle(space, *chunk_id) {
+                    Some(handle) => {
+                        let view: View<str> = loaded
+                            .memory
+                            .memory
+                            .reader
+                            .get(handle)
+                            .context("read chunk summary")?;
+                        view.trim_end().to_string()
+                    }
+                    None => String::new(),
+                };
+                out.line(format!(
+                    "── {} ({:x})",
+                    format_time_range(key_to_epoch(*sk), key_to_epoch(*ek)),
+                    chunk_id
+                ))?;
+                out.line(format!("{summary}"))?;
+                out.line("")?;
+                last_start = *sk;
+            }
+            comb_advance(
+                storage,
+                &loaded,
+                MEMORY_REPLAY_STREAM,
+                persona,
+                Some(key_to_epoch(last_start)),
+                Some(grain_raw),
+            )?;
             out.line(format!(
-                "── {} ({:x})",
-                format_time_range(key_to_epoch(*sk), key_to_epoch(*ek)),
-                chunk_id
+                "— batch: {take} chunk(s) at grain {grain_raw}; {} remaining",
+                total - take
             ))?;
-            out.line(format!("{summary}"))?;
-            out.line("")?;
-            last_start = *sk;
-        }
-        comb_advance(
-            storage,
-            &loaded,
-            MEMORY_REPLAY_STREAM,
-            persona,
-            Some(key_to_epoch(last_start)),
-            Some(grain_raw),
-        )?;
-        out.line(format!(
-            "— batch: {take} chunk(s) at grain {grain_raw}; {} remaining",
-            total - take
-        ))?;
-        Ok(())
+            Ok(())
+        })
     }
 }
 #[cfg(test)]

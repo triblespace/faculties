@@ -1,12 +1,13 @@
 //! Typed finite Message operations over one frozen Message/Relations observation.
 //! Text is literal; sender selection and output routing belong to the caller.
 
-use crate::storage::FactRead;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::{configured_handle, open_configured, open_exact_in};
+use crate::collection_names::open_configured_acquiring;
+#[cfg(test)]
+use crate::collection_names::open_exact_in;
 use crate::message::{self, IntervalValue};
 use crate::relations::{self, IdentityComponents, TextHandle};
 use crate::schemas::message::{local, DEFAULT_SCOPE_ID, KIND_MESSAGE_ID, KIND_READ_ID};
@@ -223,15 +224,21 @@ impl MessageStorage<'_> {
                 .pile
                 .snapshot()
                 .context("freeze Message publication authority")?;
+            let collection = self.collection;
+            let subject = self.signer.verifying_key();
+            let runtime = tokio::runtime::Handle::current();
+            let admitted = tokio::task::spawn_blocking(move || {
+                let reader = storage::AcquiringReader::with_handle(snapshot, runtime);
+                collection
+                    .writer_is_admitted_acquiring(&reader, subject)
+                    .context("check Message source WRITE admission")
+            })
+            .await
+            .context("join Message WRITE admission")??;
             anyhow::ensure!(
-                self.collection
-                    .writer_is_admitted(&snapshot, self.signer.verifying_key())
-                    .map_err(|error| {
-                        anyhow::anyhow!("check Message source WRITE admission: {error}")
-                    })?,
+                admitted,
                 "publishing a Message fragment requires source collection WRITE"
             );
-            drop(snapshot);
             fragment.describe_with(entity! { metadata::description: description });
             self.pile
                 .commit(self.collection, self.signer, fragment)
@@ -706,26 +713,20 @@ fn with_storage<T>(
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     capability.storage.with_store(|pile, signer, runtime| {
-        let (message_source, reader, relation_facts, message_facts) = runtime.block_on(async {
-            // An explicit descriptor may itself have arrived as only an exact
-            // handle. Acquire it and the name needed by open_configured, not its
-            // arbitrary attachment closure.
-            for scope in [DEFAULT_RELATIONS_SCOPE_ID, DEFAULT_SCOPE_ID] {
-                if let Some(handle) = configured_handle(scope)? {
-                    let reader = pile
-                        .snapshot()
-                        .context("freeze configured Message collection descriptor")?;
-                    storage::read(pile, &reader, |reader| open_exact_in(reader, scope, handle))
-                        .await?;
-                }
-            }
-            let relations_source =
-                open_configured(pile, DEFAULT_RELATIONS_SCOPE_ID, signer.verifying_key())?;
-            let message_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let (reader, relation_facts, message_facts) =
-                message_views(pile, signer, relations_source, message_source).await?;
-            Ok::<_, anyhow::Error>((message_source, reader, relation_facts, message_facts))
-        })?;
+        let relations_source = open_configured_acquiring(
+            pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
+        )?;
+        let message_source =
+            open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+        let (reader, relation_facts, message_facts) = runtime.block_on(message_views(
+            pile,
+            signer,
+            relations_source,
+            message_source,
+        ))?;
         let mut storage = MessageStorage {
             pile,
             signer,
@@ -754,12 +755,20 @@ async fn message_views(
     // Both query views retain their selected support. Later selected-text
     // acquisition may add bytes, but never replaces these frozen facts.
     let reader = pile.snapshot().context("freeze Message observation")?;
-    let relation_facts = reader
-        .read_facts(relations_rank9)
-        .context("read Relations Rank9 projection")?;
-    let message_facts = reader
-        .read_facts(message_rank9)
-        .context("read Message Rank9 projection")?;
+    let acquiring_snapshot = reader.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let (relation_facts, message_facts) = tokio::task::spawn_blocking(move || {
+        // Select only once, after resolving definitions against this frozen
+        // proof/record evidence. No cache fill advances the observation.
+        let acquiring = storage::AcquiringReader::with_handle(acquiring_snapshot, runtime);
+        let relations = storage::acquire_facts(&acquiring, relations_rank9)
+            .context("read Relations Rank9 projection")?;
+        let messages = storage::acquire_facts(&acquiring, message_rank9)
+            .context("read Message Rank9 projection")?;
+        Ok::<_, anyhow::Error>((relations, messages))
+    })
+    .await
+    .context("join Message observation acquisition")??;
     let attached_at = started.elapsed();
     if trace {
         eprintln!(

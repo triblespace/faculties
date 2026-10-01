@@ -25,7 +25,7 @@ use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
 use triblespace::core::id::Id;
-use triblespace::core::repo::pile::PileSnapshot;
+use super::storage::WidgetReader as PileSnapshot;
 
 use crate::relations::{self as native_relations, Head};
 use crate::status as native_status;

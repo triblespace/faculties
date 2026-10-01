@@ -3,14 +3,17 @@
 //! Inputs are literal native values. CLI paths/pipes and MCP argument decoding
 //! belong to their explicit frontends, never to these operations.
 
-use crate::collection_names::{configured_handle, open_configured, open_exact_in};
+use crate::collection_names::open_configured_acquiring;
+#[cfg(test)]
+use crate::collection_names::{open_configured, open_exact_in};
 use crate::schemas::compass::{
     board, latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, DEFAULT_STATUSES,
     KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+#[cfg(test)]
 use crate::storage::FactRead;
-use crate::storage::{self, FactArchive, FacultyStore, Storage};
+use crate::storage::{self, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use crate::{clock, compass, relations};
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
@@ -20,8 +23,9 @@ use std::path::PathBuf;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::lww_register::LwwQuery;
+use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
 use triblespace::core::metadata;
+#[cfg(test)]
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
@@ -262,36 +266,33 @@ impl CompassStorage<'_> {
         f: impl FnOnce(
             &mut FacultyStore,
             &ed25519_dalek::SigningKey,
-            &tokio::runtime::Runtime,
+            &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_store(|pile, signer, runtime| {
-            if let Some(handle) = configured_handle(COMPASS_SCOPE_ID)? {
-                let reader = pile
-                    .snapshot()
-                    .context("freeze configured Compass descriptor")?;
-                runtime.block_on(storage::read(pile, &reader, |reader| {
-                    open_exact_in(reader, COMPASS_SCOPE_ID, handle)
-                }))?;
-            }
-            f(pile, signer, runtime)
-        })
+        self.storage.with_store(|pile, signer, runtime| f(pile, signer, runtime))
     }
 
     /// Prepare a pure read against fixed facts/status and an acquiring blob
     /// reader. Printing and other effects belong after this returns.
     fn with_view<T>(
         &self,
-        mut f: impl FnMut(&FactArchive, &PileSnapshot, &LwwQuery) -> Result<T>,
+        mut f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            runtime.block_on(async {
-                let view = compass::materialize_indexed_collection(pile, signer).await?;
-                storage::read(pile, view.store_snapshot(), |reader| {
-                    f(view.facts(), reader, view.status_register())
-                })
-                .await
-            })
+            let source = open_configured_acquiring(
+                pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+            let status_target = compass::status_register_for_source(pile, source)?;
+            let reader = AcquiringReader::new(
+                pile.snapshot().context("freeze Compass facts and status")?, runtime.clone(),
+            );
+            let facts = storage::acquire_facts(&reader, rank9)?;
+            let status = storage::require_complete_attached_read(
+                reader.attached_acquiring(status_target)?.read_acquiring::<LwwIndex>()?,
+            )?.query()?;
+            f(&facts, &reader, &status)
         })
     }
 
@@ -301,7 +302,7 @@ impl CompassStorage<'_> {
     fn update<P, T>(
         &self,
         persona: Option<&str>,
-        mut prepare: impl FnMut(&FactArchive, &PileSnapshot, Option<Id>) -> Result<P>,
+        mut prepare: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, Option<Id>) -> Result<P>,
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
@@ -309,7 +310,9 @@ impl CompassStorage<'_> {
             // through one query snapshot for this action; the write authors,
             // commits, then attaches the source's frontier so the write is
             // readable through the attached views. Reads never maintain.
-            let compass_source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+            let compass_source = open_configured_acquiring(
+                pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
             let compass_succinct = pile
                 .attach::<SuccinctArchiveBlob>(compass_source, ())
                 .context("register Compass Succinct collection")?;
@@ -317,15 +320,9 @@ impl CompassStorage<'_> {
                 .attach::<Rank9AcceleratedSuccinctArchiveBlob>(compass_source, compass_succinct)
                 .context("register Compass Rank9 collection")?;
             let relations_rank9 = if persona.is_some() {
-                if let Some(handle) = configured_handle(RELATIONS_SCOPE_ID)? {
-                    let reader = pile
-                        .snapshot()
-                        .context("freeze configured Relations descriptor for Compass")?;
-                    runtime.block_on(storage::read(pile, &reader, |reader| {
-                        open_exact_in(reader, RELATIONS_SCOPE_ID, handle)
-                    }))?;
-                }
-                let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+                let source = open_configured_acquiring(
+                    pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime,
+                )?;
                 let succinct = pile
                     .attach::<SuccinctArchiveBlob>(source, ())
                     .context("register Relations Succinct collection")?;
@@ -340,9 +337,9 @@ impl CompassStorage<'_> {
             // Attach every view through one immutable store boundary, so
             // validation and persona resolution cannot mix collection
             // watermarks.
-            let reader = pile
-                .snapshot()
-                .context("freeze resident Compass/Relations snapshot")?;
+            let reader = AcquiringReader::new(
+                pile.snapshot().context("freeze Compass/Relations snapshot")?, runtime.clone(),
+            );
             // No read refuses for being behind. There is no globally
             // consistent state to be behind of: another node holds commits
             // this one has never seen, so "stands for every admitted commit"
@@ -350,38 +347,24 @@ impl CompassStorage<'_> {
             // the branching of one entity's history a little. A priority
             // change reads what it can see, like everything else, and
             // ensures its own images after it commits.
-            let facts = reader
-                .read_facts(compass_rank9)
+            let facts = storage::acquire_facts(&reader, compass_rank9)
                 .context("read Compass fact collection")?;
             let by = if let (Some(persona), Some(rank9)) = (persona, relations_rank9) {
-                let relations = reader
-                    .read_facts(rank9)
+                let relations = storage::acquire_facts(&reader, rank9)
                     .context("read Relations fact collection for Compass persona")?;
-                Some(
-                    runtime.block_on(storage::read(pile, &reader, |blob_reader| {
-                        resolve_persona_id(&relations, blob_reader, persona)
-                    }))?,
-                )
+                Some(resolve_persona_id(&relations, &reader, persona)?)
             } else {
                 None
             };
-            let prepared = runtime.block_on(storage::read(pile, &reader, |blob_reader| {
-                prepare(&facts, blob_reader, by)
-            }))?;
+            let prepared = prepare(&facts, &reader, by)?;
             let (fragment, value) = author(prepared)?;
             if let Some(fragment) = fragment {
-                let snapshot = pile
-                    .snapshot()
-                    .context("freeze Compass publication authority")?;
-                anyhow::ensure!(
-                    compass_source
-                        .writer_is_admitted(&snapshot, signer.verifying_key())
-                        .context("check Compass source WRITE admission")?,
-                    "publishing a Compass fragment requires source collection WRITE"
-                );
-                drop(snapshot);
-                compass::commit_collection(pile, signer, fragment)?;
-                let status = compass::status_register_collection(pile, signer.verifying_key())?;
+                crate::collection_names::require_command_write_admission_acquiring(
+                    pile, compass_source, signer, "Compass", "compass list", runtime,
+                )?;
+                pile.commit(compass_source, signer, fragment)
+                    .context("commit Compass collection fragment")?;
+                let status = compass::status_register_for_source(pile, compass_source)?;
                 runtime
                     .block_on(async {
                         storage::seed_attached(pile, status, signer).await?;
@@ -397,7 +380,7 @@ impl CompassStorage<'_> {
     }
 }
 
-fn task_title<P: TriblePattern>(reader: &PileSnapshot, space: &P, task_id: Id) -> Result<String> {
+fn task_title<P: TriblePattern>(reader: &impl BlobStoreGet, space: &P, task_id: Id) -> Result<String> {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
         .map(|handle| read_text(reader, handle))
@@ -455,7 +438,7 @@ fn all_note_ids<P: TriblePattern>(space: &P) -> Vec<Id> {
     .collect()
 }
 
-fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     compass::read_text(reader, handle)
 }
 
@@ -525,7 +508,7 @@ fn note_tags<P: TriblePattern>(space: &P, note_id: Id) -> Vec<String> {
 }
 
 fn note_references<P: TriblePattern>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     space: &P,
     note_id: Id,
 ) -> Result<Vec<String>> {
@@ -552,7 +535,7 @@ fn note_supersedes<P: TriblePattern>(space: &P, note_id: Id) -> Vec<Id> {
 }
 
 fn render_board<P: TriblePattern>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     space: &P,
     status_register: &LwwQuery,
     status_filter: &[String],
@@ -779,7 +762,7 @@ fn order_rows(rows: Vec<TaskRow>, ranks: &BTreeMap<Id, usize>) -> Vec<(TaskRow, 
 /// anchor.
 fn resolve_persona_id<P: TriblePattern>(
     space: &P,
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     input: &str,
 ) -> Result<Id> {
     relations::resolve_person(reader, space, input, false)?.require_unique("persona", input)
@@ -940,7 +923,7 @@ fn add_note(
 }
 
 fn render_goal<P: TriblePattern>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     space: &P,
     status_register: &LwwQuery,
     task_id: Id,

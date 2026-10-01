@@ -7,8 +7,9 @@
 //! there is no Repository branch, CAS head, sidecar registry, or fallback
 //! identity.
 
+#[cfg(test)]
 use crate::storage::FactView;
-use std::borrow::BorrowMut;
+use std::sync::Arc;
 use std::collections::{BTreeMap, BTreeSet};
 use triblespace::core::collection::AttachedSnapshot;
 
@@ -27,7 +28,8 @@ use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store};
+use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -38,8 +40,9 @@ use crate::blockdag;
 use crate::schemas::blockdag as schema;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
-use crate::storage::{open_pile_signed, FactArchive, FactLag};
+use crate::storage::{FactArchive, FactLag, FacultyStore};
 
+#[cfg(test)]
 use crate::collection_names::open_configured;
 #[cfg(test)]
 use triblespace::core::collection::{
@@ -54,28 +57,26 @@ type RawHandle = Inline<Handle<RawBytes>>;
 ///
 /// Supplied facts remain open-world relations, including opaque ids and further
 /// annotations. Publication does not require a closed-world catalog decode.
-pub struct ArchiveImportWriter<P = Pile> {
+pub struct ArchiveImportWriter<P = FacultyStore> {
     pile: P,
     collection: Collection<SimpleArchive>,
     signer: SigningKey,
     current: FactArchive,
     delta: Fragment,
+    runtime: Arc<tokio::runtime::Runtime>,
 }
 
 impl ArchiveImportWriter {
-    pub async fn open(
+    /// Open a synchronous import session. Async callers run the complete
+    /// open/stage/finish lifetime on a blocking worker, not inside their runtime.
+    pub fn open(
         pile_path: &std::path::Path,
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
-        let (mut pile, signer) = open_pile_signed(pile_path, key_path)?;
-        let result = async {
-            let source =
-                open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let observed = ensure_facts(&mut pile, source, &signer).await?;
-            let current = observed.facts().context("read Archive facts")?;
-            Ok((source, current))
-        }
-        .await;
+        let signer = crate::storage::load_signer(pile_path, key_path)?;
+        let runtime = Arc::new(crate::storage::runtime()?);
+        let mut pile = crate::storage::open_store_as(pile_path, signer.verifying_key())?;
+        let result = Self::prepare(&mut pile, &signer, &runtime);
         match result {
             Ok((collection, current)) => {
                 let mut writer = Self {
@@ -84,6 +85,7 @@ impl ArchiveImportWriter {
                     signer,
                     current,
                     delta: Fragment::empty(),
+                    runtime,
                 };
                 if let Err(error) = writer.stage_fragment(blockdag::vocabulary_fragment()) {
                     return close_pile(
@@ -103,25 +105,51 @@ impl ArchiveImportWriter {
     }
 }
 
-impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
-    /// Stage against a caller-owned pile. The caller controls its lifetime and close.
-    pub async fn from_pile(mut pile: P, signer: &SigningKey) -> Result<Self> {
-        let source = open_configured(
-            pile.borrow_mut(),
-            schema::DEFAULT_SCOPE_ID,
-            signer.verifying_key(),
-        )?;
-        let observed = ensure_facts(pile.borrow_mut(), source, signer).await?;
-        let current = observed.facts().context("read Archive facts")?;
+impl<P> ArchiveImportWriter<P>
+where
+    P: Store + AsyncBlobStoreAcquire + Send,
+    P::Snapshot: AsyncBlobStoreGet,
+{
+    /// Borrow a caller-owned store without taking its local-backend guard.
+    /// The caller keeps the transport alive until the last commit completes.
+    pub fn from_store(
+        mut pile: P,
+        signer: &SigningKey,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self> {
+        let (source, current) = Self::prepare(&mut pile, signer, &runtime)?;
         let mut writer = Self {
             pile,
             collection: source,
             signer: signer.clone(),
             current,
             delta: Fragment::empty(),
+            runtime,
         };
         writer.stage_fragment(blockdag::vocabulary_fragment())?;
         Ok(writer)
+    }
+
+    fn prepare(
+        pile: &mut P,
+        signer: &SigningKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+    ) -> Result<(Collection<SimpleArchive>, FactArchive)> {
+        let source = crate::collection_names::open_configured_acquiring(
+            pile,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
+        )?;
+        let (succinct, rank9) = crate::storage::fact_pair(pile, source)?;
+        runtime.block_on(async {
+            crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
+            crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+        }).context("maintain Archive import facts")?;
+        let reader = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
+        let current = crate::storage::acquire_facts(&reader, rank9)
+            .context("read Archive import facts")?;
+        Ok((source, current))
     }
 
     pub fn stage_fragment(&mut self, fragment: Fragment) -> Result<()> {
@@ -147,7 +175,7 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
         // remain semantically unreachable until a signed COMMIT names the
         // facts which reference them.
         let embedded = embedded_blobs(blobs);
-        stage_embedded_blobs(self.pile.borrow_mut(), embedded)?;
+        stage_embedded_blobs(&mut self.pile, embedded)?;
 
         // Only the lightweight logical delta remains resident between source
         // fragments. Data and metadata archives are constructed once at the
@@ -182,13 +210,12 @@ impl<P: BorrowMut<Pile>> ArchiveImportWriter<P> {
         let published = fragment.facts().clone();
         let commit = self
             .pile
-            .borrow_mut()
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
         drop(
-            pollster::block_on(crate::storage::ensure_downstream(
-                self.pile.borrow_mut(),
+            self.runtime.block_on(crate::storage::ensure_downstream(
+                &mut self.pile,
                 self.collection,
                 &self.signer,
             ))
@@ -279,7 +306,7 @@ fn extend_archive(current: &FactArchive, additions: &TribleSet) -> FactArchive {
     ])
 }
 
-fn close_pile<T>(pile: Pile, result: Result<T>, failure_context: &str) -> Result<T> {
+fn close_pile<T>(pile: impl StorageClose, result: Result<T>, failure_context: &str) -> Result<T> {
     match (result, pile.close()) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
@@ -306,9 +333,36 @@ pub async fn ensure_local(
 pub fn ensure_local_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
-    storage.with_pile(|pile, signer| {
-        let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    storage.with_store(|store, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let mut local = store.store();
+        let pile = &mut *local;
         pollster::block_on(ensure_facts(pile, source, signer))
+    })
+}
+
+/// Foreground observation. The caller retains its `Storage::scope` through
+/// its last payload read; the observation itself does not extend store life.
+pub(crate) fn ensure_acquiring_with_storage(
+    storage: &crate::storage::Storage,
+) -> Result<AttachedSnapshot<
+    crate::storage::AcquiringReader<crate::storage::FacultySnapshot>,
+    Rank9AcceleratedSuccinctArchiveBlob,
+>> {
+    storage.with_store(|store, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
+        runtime.block_on(async {
+            crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
+            crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone())
+            .attached_acquiring(rank9).context("attach frozen Archive facts")
     })
 }
 
@@ -355,7 +409,7 @@ pub struct SuccinctIndexReport {
     pub target_collection: Inline<Handle<SimpleArchive>>,
 }
 
-pub async fn ensure_succinct_index(
+pub fn ensure_succinct_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<SuccinctIndexReport> {
@@ -368,11 +422,18 @@ pub async fn ensure_succinct_index(
 pub fn ensure_succinct_index_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<SuccinctIndexReport> {
-    storage.with_pile(|pile, signer| {
-        let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        let observed = pollster::block_on(ensure_facts(pile, source, signer))?;
-        let (succinct, rank9) = fact_views(pile, source)?;
-        let snapshot = observed.snapshot();
+    storage.with_store(|store, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
+        runtime.block_on(async {
+            crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
+            crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let snapshot = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
+        crate::storage::acquire_facts(&snapshot, rank9)?;
         let source_elements = snapshot
             .collection(source)
             .context("attach Archive source")?
@@ -381,7 +442,7 @@ pub fn ensure_succinct_index_with_storage(
             .len();
         Ok(SuccinctIndexReport {
             source_elements,
-            lag: FactLag::of(snapshot, source, succinct, rank9)?,
+            lag: FactLag::of(&snapshot, source, succinct, rank9)?,
             source_collection: source.handle(),
             target_collection: rank9.handle(),
         })
@@ -457,7 +518,7 @@ async fn ensure_bm25(
     })
 }
 
-pub async fn ensure_bm25_index(
+pub fn ensure_bm25_index(
     pile_path: &std::path::Path,
     key_path: Option<&std::path::Path>,
 ) -> Result<Bm25IndexReport> {
@@ -470,11 +531,33 @@ pub async fn ensure_bm25_index(
 pub fn ensure_bm25_index_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<Bm25IndexReport> {
-    storage.with_pile(|pile, signer| {
-        pollster::block_on(async {
-            let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            drop(ensure_facts(pile, source, signer).await?);
-            Ok(ensure_bm25(pile, source, signer).await?.report)
+    storage.with_store(|store, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let target = store.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)?;
+        let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
+        runtime.block_on(async {
+            crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
+            crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
+            crate::storage::tolerate_own_lag(
+                store.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                    target, signer,
+                ).await,
+            )?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let snapshot = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
+        let attached = snapshot.attached_acquiring(target)?;
+        let read = attached.read_with_acquiring::<
+            archive_bm25::ArchiveBlockTextBm25Mapping, archive_bm25::ArchiveBM25View,
+        >()?;
+        Ok(Bm25IndexReport {
+            source_elements: snapshot.collection(source)?.support()?.len(),
+            lagging: read.unread().len(),
+            cover_segments: attached.cover().len(),
+            source_collection: source.handle(),
+            target_collection: target.handle(),
         })
     })
 }
@@ -530,9 +613,13 @@ pub fn ensure_search_local_with_storage(
     archive_bm25::ArchiveBM25View,
     ArchiveSearchLag,
 )> {
-    storage.with_pile(|pile, signer| {
+    storage.with_store(|store, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let mut local = store.store();
+        let pile = &mut *local;
         pollster::block_on(async {
-            let source = open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let target = bm25_target(pile, source)?;
             let (succinct, rank9) = fact_views(pile, source)?;
             drop(ensure_facts(pile, source, signer).await?);
@@ -564,6 +651,51 @@ pub fn ensure_search_local_with_storage(
                 .context("read Archive BM25 cover")?;
             Ok((facts, index, lag))
         })
+    })
+}
+
+/// Acquire a query's fixed Archive fact and BM25 observations. Both views
+/// select their support at the same watermark; exact-byte arrival below does
+/// not reselect either of them. The surrounding operation owns the store.
+pub(crate) fn ensure_search_acquiring_with_storage(
+    storage: &crate::storage::Storage,
+) -> Result<(
+    AttachedSnapshot<
+        crate::storage::AcquiringReader<crate::storage::FacultySnapshot>,
+        Rank9AcceleratedSuccinctArchiveBlob,
+    >,
+    archive_bm25::ArchiveBM25View,
+    ArchiveSearchLag,
+)> {
+    storage.with_store(|store, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        let target = store.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)?;
+        let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
+        runtime.block_on(async {
+            crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
+            crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
+            crate::storage::tolerate_own_lag(
+                store.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                    target, signer,
+                ).await,
+            )?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let after = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
+        let facts = after.attached_acquiring(rank9)?;
+        let search = after.attached_acquiring(target)?;
+        let lag = ArchiveSearchLag {
+            facts: FactLag::of(&after, source, succinct, rank9)?,
+            index: search.residual().len(),
+        };
+        let index = crate::storage::require_complete_attached_read(
+            search.read_with_acquiring::<
+                archive_bm25::ArchiveBlockTextBm25Mapping, archive_bm25::ArchiveBM25View,
+            >()?,
+        )?;
+        Ok((facts, index, lag))
     })
 }
 
@@ -839,6 +971,71 @@ mod tests {
     use tempfile::TempDir;
     use triblespace::core::blob::IntoBlob;
 
+    #[test]
+    fn synchronous_import_sessions_have_an_explicit_tokio_blocking_boundary() {
+        let runtime = crate::storage::runtime().unwrap();
+        runtime.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                let directory = TempDir::new().unwrap();
+                let pile = directory.path().join("imports.pile");
+                let key = directory.path().join("imports.key");
+                std::fs::File::create(&pile).unwrap();
+                initialize_signer(&pile, Some(&key)).unwrap();
+                let mut archive = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+                archive.stage_fragment(projection("async-worker", "body")).unwrap();
+                assert!(archive.finish(Ok(())).unwrap().1.is_some());
+
+                let mut code = crate::code::ingest::CodeImportWriter::open(&pile, Some(&key)).unwrap();
+                code.stage_fragment(entity! { metadata::description: "code import worker" }).unwrap();
+                assert!(code.commit_unit().unwrap().is_some());
+                code.close(Ok(())).unwrap();
+
+                // Failed construction drops its owned runtime on the same
+                // blocking worker, never on the async executor.
+                let absent = directory.path().join("absent").join("pile");
+                assert!(ArchiveImportWriter::open(&absent, Some(&key)).is_err());
+            }).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn import_writer_retains_exact_byte_acquisition_until_close() {
+        use triblespace::core::repo::BlobStoreList;
+
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        std::fs::File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let snapshot = writer.pile.snapshot().unwrap();
+        let reader = crate::storage::AcquiringReader::new(snapshot.clone(), writer.runtime.clone());
+        let body = "an import body staged after the captured observation";
+        let fragment = entity! { metadata::description: body };
+        let handle = find!(
+            handle: Inline<Handle<UTF8String>>,
+            pattern!(fragment.facts(), [{ metadata::description: ?handle }])
+        ).next().unwrap();
+        assert!(!snapshot.contains_blob(handle).unwrap());
+
+        writer.stage_fragment(fragment).unwrap();
+        // A later exact byte is available through the still-owned Leech even
+        // though the reader's facts, residency and proof observation are old.
+        let fetched: View<str> = BlobStoreGet::get(&reader, handle).unwrap();
+        assert_eq!(fetched.as_ref(), body);
+        assert!(!reader.contains_blob(handle).unwrap());
+        assert!(writer.commit_unit().unwrap().is_some());
+        writer.close(Ok(())).unwrap();
+
+        // Closing, not the captured reader, owns acquisition lifetime. It
+        // cannot silently reopen a pile or endpoint after the writer ends.
+        assert!(BlobStoreGet::get::<View<str>, UTF8String>(&reader, handle).is_err());
+        let mut reopened = open_pile_strict(&pile).unwrap();
+        let bytes: View<str> = BlobStoreGet::get(&reopened.snapshot().unwrap(), handle).unwrap();
+        assert_eq!(bytes.as_ref(), body);
+        reopened.close().unwrap();
+    }
+
     fn projection(locator: &str, text: &str) -> Fragment {
         let fact = blockdag::text_fact(
             schema::content_fact::modality::TEXT,
@@ -956,7 +1153,7 @@ mod tests {
         locator: &str,
         text: &str,
     ) -> CollectionCommit {
-        let mut writer = pollster::block_on(ArchiveImportWriter::open(pile, Some(key))).unwrap();
+        let mut writer = ArchiveImportWriter::open(pile, Some(key)).unwrap();
         writer.stage_fragment(projection(locator, text)).unwrap();
         writer.finish(Ok(())).unwrap().1.unwrap()
     }
@@ -996,7 +1193,7 @@ mod tests {
 
         let fragment = projection("session:staged", "resident only after commit");
         let embedded = first_embedded_handle(&fragment);
-        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         writer.stage_fragment(fragment).unwrap();
 
         assert!(writer.delta_len() > 0);
@@ -1035,7 +1232,7 @@ mod tests {
         let fragment = projection("session:aborted", "unreachable after source failure");
         let embedded = first_embedded_handle(&fragment);
 
-        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         writer.stage_fragment(fragment).unwrap();
         let error = writer
             .finish::<()>(Err(anyhow!("source projection failed")))
@@ -1077,7 +1274,7 @@ mod tests {
             metadata::name: "later annotation",
         };
 
-        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         writer.stage_fragment(fragment.clone()).unwrap();
         assert!(writer.commit_unit().unwrap().is_some());
         // The reader prepares the projection; the writer only commits.
@@ -1154,7 +1351,7 @@ mod tests {
         drop(facts);
         drop(snapshot);
 
-        let mut retry = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         retry.stage_fragment(fragment).unwrap();
         retry.stage_fragment(annotation).unwrap();
         assert_eq!(retry.delta_len(), 0);
@@ -1212,11 +1409,11 @@ mod tests {
         initialize_archive_fixture(&pile, &key);
 
         let fragment = projection("session:one", "one");
-        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         writer.stage_fragment(fragment.clone()).unwrap();
         let (_, first) = writer.finish(Ok(())).unwrap();
         let first = first.unwrap();
-        let mut retry = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         let length = std::fs::metadata(&pile).unwrap().len();
         retry.stage_fragment(fragment).unwrap();
         let (_, repeated) = retry.finish(Ok(())).unwrap();
@@ -1272,7 +1469,7 @@ mod tests {
         )
         .unwrap();
         let expected = fragment.root().unwrap();
-        let mut writer = pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         writer.stage_fragment(fragment).unwrap();
         writer.finish(Ok(())).unwrap();
 
@@ -1333,13 +1530,13 @@ mod tests {
         let first_fragment = projection("session:one", "shared");
         let first_len = first_fragment.facts().len();
         let mut first_writer =
-            pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         first_writer.stage_fragment(first_fragment.clone()).unwrap();
         let first = first_writer.finish(Ok(())).unwrap().1.unwrap();
 
         let second_fragment = projection("session:two", "shared");
         let mut second_writer =
-            pollster::block_on(ArchiveImportWriter::open(&pile, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         second_writer.stage_fragment(first_fragment).unwrap();
         assert_eq!(second_writer.delta_len(), 0, "known fragment is a replay");
         second_writer
@@ -1367,7 +1564,7 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
         assert_eq!((report.source_elements, report.cover_segments), (0, 0));
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
@@ -1395,8 +1592,8 @@ mod tests {
         let commit = pile.commit(collection, &signer, Fragment::empty()).unwrap();
         pile.close().unwrap();
 
-        let succinct = pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap();
-        let bm25 = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        let succinct = ensure_succinct_index(&pile_path, Some(&key)).unwrap();
+        let bm25 = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
         assert_eq!(succinct.source_elements, 1);
         assert_eq!((bm25.source_elements, bm25.cover_segments), (1, 1));
 
@@ -1439,7 +1636,7 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         let mut writer =
-            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer
             .stage_fragment(projection_at_modality(
                 "session:text",
@@ -1498,7 +1695,7 @@ mod tests {
             projection_after_at("other/root", "independent", Some(7.0), &[]);
 
         let mut writer =
-            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         // Deliberately stage out of causal and temporal order. The collection
         // is a set; replay order must come solely from canonical semantics.
         writer.stage_fragment(regressed_child).unwrap();
@@ -1540,18 +1737,18 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         let mut writer =
-            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer
             .stage_fragment(projection("session:index", "exact succinct"))
             .unwrap();
         writer.finish(Ok(())).unwrap();
 
-        let report = pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap();
+        let report = ensure_succinct_index(&pile_path, Some(&key)).unwrap();
 
         assert_eq!(report.source_elements, 1);
         let length = std::fs::metadata(&pile_path).unwrap().len();
         assert_eq!(
-            pollster::block_on(ensure_succinct_index(&pile_path, Some(&key))).unwrap(),
+            ensure_succinct_index(&pile_path, Some(&key)).unwrap(),
             report
         );
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
@@ -1602,19 +1799,19 @@ mod tests {
 
         for (locator, text) in [("session:alpha", "alpha"), ("session:beta", "beta")] {
             let mut writer =
-                pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+                ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
             writer.stage_fragment(projection(locator, text)).unwrap();
             writer.finish(Ok(())).unwrap();
         }
 
-        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
 
         assert_eq!(report.source_elements, 2);
         assert_eq!(report.lagging, 0);
         assert_eq!(report.cover_segments, 2);
         let length = std::fs::metadata(&pile_path).unwrap().len();
         assert_eq!(
-            pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap(),
+            ensure_bm25_index(&pile_path, Some(&key)).unwrap(),
             report
         );
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
@@ -1657,14 +1854,14 @@ mod tests {
 
         for (locator, seconds) in [("session:first", 1.0), ("session:second", 2.0)] {
             let mut writer =
-                pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+                ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
             writer
                 .stage_fragment(projection_at(locator, "shared closure needle", seconds))
                 .unwrap();
             writer.finish(Ok(())).unwrap();
         }
 
-        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
         assert_eq!(report.source_elements, 2);
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         let hits = search
@@ -1685,7 +1882,7 @@ mod tests {
 
         let first_fragment = projection("session:first", "alpha");
         let mut writer =
-            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer.stage_fragment(first_fragment).unwrap();
         writer.finish(Ok(())).unwrap();
         let first = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
@@ -1702,7 +1899,7 @@ mod tests {
 
         let second_fragment = projection("session:second", "beta βeta 🛰️");
         let mut writer =
-            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer.stage_fragment(second_fragment.clone()).unwrap();
         writer.finish(Ok(())).unwrap();
 
@@ -1717,7 +1914,7 @@ mod tests {
 
         let before = std::fs::metadata(&pile_path).unwrap().len();
         let mut retry =
-            pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         retry.stage_fragment(second_fragment).unwrap();
         retry.finish(Ok(())).unwrap();
         let after_retry = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
@@ -1766,12 +1963,12 @@ mod tests {
         assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
         drop(archive);
 
-        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
         assert_eq!(report.source_elements, 3);
         assert_eq!(report.lagging, 1, "only the split block's node is residual");
         let length = std::fs::metadata(&pile_path).unwrap().len();
         assert_eq!(
-            pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap(),
+            ensure_bm25_index(&pile_path, Some(&key)).unwrap(),
             report
         );
         assert_eq!(
@@ -1808,7 +2005,7 @@ mod tests {
         for word in ["one", "two", "three", "four", "five"] {
             commit_projection(&pile_path, &key, &format!("session:{word}"), word);
         }
-        let report = pollster::block_on(ensure_bm25_index(&pile_path, Some(&key))).unwrap();
+        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
         assert_eq!(report.lagging, 0);
         assert_eq!(report.cover_segments, 1);
         let (_, index, lag) =
@@ -2222,7 +2419,7 @@ mod tests {
         let signer = initialize_archive_fixture(&pile_path, &key);
         for (name, transcript) in [("first.jsonl", FIRST), ("second.jsonl", SECOND)] {
             let mut writer =
-                pollster::block_on(ArchiveImportWriter::open(&pile_path, Some(&key))).unwrap();
+                ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
             let projection = crate::archive_claude_code::project_bytes(
                 name,
                 Bytes::from_source(transcript.as_bytes().to_vec()),

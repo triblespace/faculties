@@ -204,10 +204,10 @@ impl Imagine {
             );
             super::configuration::preflight(&directory, options.variant)?;
             let pile = self.sources.weights(options.variant);
-            let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
-                .with_context(|| format!("freeze FLUX model collection at {}", pile.display()))?;
-            let weights = FluxWeights::from_snapshot(snapshot, variant)
-                .context("select native FLUX components")?;
+            let weights = crate::model_storage::with_snapshot(&pile, "FLUX", |snapshot| {
+                FluxWeights::from_snapshot(snapshot.clone(), variant)
+                    .context("select native FLUX components")
+            })?;
             let started = std::time::Instant::now();
             let image = Flux2Pipeline::generate_f16(
                 &options.prompt,

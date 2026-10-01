@@ -1,9 +1,9 @@
+#[cfg(test)]
 use crate::storage::FactRead;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured;
 use crate::schemas::headspace::{
     playground_config, DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID, KIND_CONFIG_ID, KIND_LIVE_RECORD,
 };
@@ -11,7 +11,6 @@ use crate::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::load_signer;
-use crate::storage::open_secrets_collection_read;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use reqwest::blocking::Client;
@@ -298,15 +297,19 @@ impl WebStorage<'_> {
     /// Resolve Headspace once and decrypt exactly the credential versions it
     /// names. Labels and timestamps never participate in runtime selection.
     fn open_web_secrets(&self) -> Result<ApiKeys> {
-        self.storage.with_pile(|pile, signer| {
-            let result = pollster::block_on(async {
-                let source = open_configured(pile, HEADSPACE_SCOPE_ID, signer.verifying_key())?;
+        self.storage.with_store(|store, signer, runtime| {
+            let source = crate::collection_names::open_configured_acquiring(
+                store, HEADSPACE_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let secrets_collection = crate::storage::open_secrets_collection_acquiring(
+                store, signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
+            let (headspace_rank9, secrets) = runtime.block_on(async {
                 let headspace_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let headspace_rank9 =
                     pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, headspace_succinct)?;
 
-                let secrets_collection =
-                    open_secrets_collection_read(pile, signer.verifying_key())?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
                 crate::storage::tolerate_own_lag(
@@ -322,31 +325,35 @@ impl WebStorage<'_> {
                     .await
                     .context("observe configured Secrets collection")?;
 
-                // Observe Headspace and Secrets through one final immutable pile
-                // snapshot, then project only the facts Web actually consumes.
-                let reader = secrets.store_snapshot();
-                let facts = reader
-                    .read_facts(headspace_rank9)
-                    .context("read maintained Headspace collection")?;
-                let versions = web_secret_versions(&facts)?;
-
-                Ok(ApiKeys {
-                    tavily: open_web_secret(&secrets, signer, &versions.tavily, "Tavily")?,
-                    exa: open_web_secret(&secrets, signer, &versions.exa, "Exa")?,
-                })
-            });
-            result
+                Ok::<_, anyhow::Error>((headspace_rank9, secrets))
+            })?;
+            // Every query shares one frozen prefix. Only exact payload reads
+            // acquire bytes; no key or message selection is retried.
+            let reader = crate::storage::AcquiringReader::new(
+                secrets.store_snapshot().clone(), runtime.clone(),
+            );
+            let facts = crate::storage::acquire_facts(&reader, headspace_rank9)
+                .context("read maintained Headspace collection")?;
+            let secrets = secret_storage::snapshot_acquiring(reader, secrets_collection)?;
+            let versions = web_secret_versions(&facts)?;
+            Ok(ApiKeys {
+                tavily: open_web_secret(&secrets, signer, &versions.tavily, "Tavily")?,
+                exa: open_web_secret(&secrets, signer, &versions.exa, "Exa")?,
+            })
         })
     }
 
     fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
-        self.storage.with_pile(|pile, signer| {
+        self.storage.with_store(|store, signer, runtime| {
+            let collection = crate::collection_names::open_configured_acquiring(
+                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
             fragment.describe_with(entity! { metadata::description: description });
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             pile.commit(collection, signer, fragment)
                 .context("commit Web observation")?;
             drop(
-                pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context("Web facts were committed, but ensuring their derived views failed")?,
             );
             Ok(())
@@ -424,8 +431,8 @@ where
 /// Repeated attribute values are alternatives, not a cardinality error. A
 /// reference that is absent from this local Secrets view therefore does not
 /// mask another usable reference asserted on the same Headspace state.
-fn open_web_secret(
-    secrets: &SecretsSnapshot<triblespace::core::repo::pile::PileSnapshot>,
+fn open_web_secret<R: triblespace::core::repo::BlobStoreGet>(
+    secrets: &SecretsSnapshot<R>,
     signer: &SigningKey,
     versions: &BTreeSet<Id>,
     role: &str,

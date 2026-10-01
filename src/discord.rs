@@ -132,7 +132,7 @@ pub fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-pub fn read_text(reader: &PileSnapshot, handle: TextHandle, label: &str) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle, label: &str) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read {label} blob {}", hex::encode_upper(handle.raw)))?;
@@ -559,7 +559,7 @@ where
 /// Discord's REST message object does not version profile fields. If several
 /// names have been observed, all distinct names are shown rather than making a
 /// false latest-name claim.
-pub fn user_labels<P>(facts: &P, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>>
+pub fn user_labels<P>(facts: &P, reader: &impl BlobStoreGet) -> Result<BTreeMap<Id, String>>
 where
     P: TriblePattern,
 {
@@ -622,7 +622,7 @@ where
     Ok(labels)
 }
 
-pub fn channel_labels<P>(facts: &P, reader: &PileSnapshot) -> Result<BTreeMap<Id, String>>
+pub fn channel_labels<P>(facts: &P, reader: &impl BlobStoreGet) -> Result<BTreeMap<Id, String>>
 where
     P: TriblePattern,
 {

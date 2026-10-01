@@ -25,6 +25,7 @@ use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
@@ -146,14 +147,17 @@ pub fn publish_events_with_storage(
     for fragment in &fragments {
         validate_fragment(fragment).context("validate self-contained Cognition event")?;
     }
-    storage.with_pile(|pile, signer| {
-        let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-        crate::collection_names::require_command_write_admission(
+    storage.with_store(|pile, signer, runtime| {
+        let collection = crate::collection_names::open_configured_acquiring(
+            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        )?;
+        crate::collection_names::require_command_write_admission_acquiring(
             pile,
             collection,
             signer,
             "Cognition",
             "reason",
+            runtime,
         )?;
         let mut commits = Vec::with_capacity(fragments.len());
         for fragment in fragments {
@@ -169,7 +173,7 @@ pub fn publish_events_with_storage(
         }
         if !commits.is_empty() {
             drop(
-                pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context(
                         "Cognition facts were committed, but ensuring their derived views failed",
                     )?,
@@ -207,7 +211,7 @@ pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> 
 
 /// Explicitly validate a maintained Cognition archive without flattening its
 /// physical shards into a second fact store.
-pub fn validate_archive(reader: &PileSnapshot, facts: &FactArchive) -> Result<()> {
+pub fn validate_archive(reader: &impl BlobStoreGet, facts: &FactArchive) -> Result<()> {
     validate_singleton_fields(facts.iter())?;
     validate_payloads(reader, None::<&PileSnapshot>, facts.iter())
 }
@@ -427,7 +431,7 @@ fn raw_blob_field(attribute: Id) -> Option<&'static str> {
 }
 
 fn validate_payloads<Overlay>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     facts: impl IntoIterator<Item = Trible>,
 ) -> Result<()>
@@ -482,7 +486,7 @@ where
 }
 
 fn read_text_overlay<Overlay>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<View<str>>
@@ -498,7 +502,7 @@ where
 }
 
 fn read_raw_overlay<Overlay>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     handle: RawHandle,
 ) -> Result<anybytes::Bytes>

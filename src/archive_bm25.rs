@@ -33,7 +33,7 @@ use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, IntoInline, RawInline};
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, StoreRead};
+use triblespace::core::repo::{BlobStoreGet, StoreRead};
 use triblespace::core::trible::Fragment;
 use triblespace::core::trible::TribleSet;
 use triblespace::macros::entity;
@@ -63,7 +63,7 @@ pub type ArchiveBM25View = PortableBM25View<GenId, WordHash>;
 #[derive(Debug)]
 enum DeriveValidation {
     Ready(Blob<PortableBM25Blob>),
-    /// A selected text payload is not resident; the first one, by handle.
+    /// A selected text payload is unavailable; the first one, by handle.
     Pending(Inline<Handle<UTF8String>>),
     Rejected(String),
 }
@@ -179,11 +179,12 @@ fn mapping_fragment() -> Fragment {
 
 /// Build one exact portable Archive BM25 element.
 ///
-/// A missing selected payload is an operational cache miss for an active
-/// builder. A later exact ensure retries with a fresh attachment reader.
+/// Selected text is read by its exact handle. A resident reader stays local;
+/// an acquiring reader may obtain those bytes without advancing the selected
+/// source node. Unavailable text is an operational cache miss for the builder.
 pub fn derive_element<R>(reader: &R, source: Blob<SimpleArchive>) -> Result<Blob<PortableBM25Blob>>
 where
-    R: BlobStoreGet + BlobStoreMeta,
+    R: BlobStoreGet,
 {
     match derive_for_validation(reader, source)? {
         DeriveValidation::Ready(blob) => Ok(blob),
@@ -197,7 +198,7 @@ where
 
 fn derive_for_validation<R>(reader: &R, source: Blob<SimpleArchive>) -> Result<DeriveValidation>
 where
-    R: BlobStoreGet + BlobStoreMeta,
+    R: BlobStoreGet,
 {
     let plan = match projection_plan(source) {
         Ok(plan) => plan,
@@ -205,8 +206,10 @@ where
     };
 
     // Resolve each distinct payload once, while retaining its occurrence in
-    // every part that names it. Scan all resident siblings before Pending so
-    // malformed bytes cannot hide behind one evicted payload.
+    // every part that names it. Try every required sibling before Pending so
+    // malformed bytes cannot hide behind one unavailable payload. Do not test
+    // frozen residency first: an acquiring reader can obtain exact text even
+    // though this observation correctly keeps reporting it as nonresident.
     let handles: BTreeSet<_> = plan
         .documents
         .values()
@@ -215,11 +218,14 @@ where
     let mut token_cache = BTreeMap::new();
     let mut missing = None;
     for handle in handles {
-        if reader.metadata(handle)?.is_none() {
-            missing.get_or_insert(handle);
-            continue;
-        }
-        let blob: Blob<UTF8String> = reader.get(handle)?;
+        let blob: Blob<UTF8String> = match reader.get(handle) {
+            Ok(blob) => blob,
+            Err(error) if triblespace::core::repo::is_missing_blob(&error) => {
+                missing.get_or_insert(handle);
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         let text: View<str> = match blob.bytes.clone().view() {
             Ok(text) => text,
             Err(error) => {
@@ -435,6 +441,51 @@ mod tests {
 
     fn derive(reader: &PileSnapshot, source: Blob<SimpleArchive>) -> Blob<PortableBM25Blob> {
         derive_element(reader, source).unwrap()
+    }
+
+    #[test]
+    fn a_cold_residual_block_acquires_its_text_without_changing_residency() {
+        use triblespace::core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt,
+            CollectionStoreExt,
+        };
+        use triblespace::core::repo::{BlobStoreList, StorageClose};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cold-archive-bm25.pile");
+        File::create(&path).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[113; 32]);
+        let mut store = crate::storage::open_store_as(&path, signer.verifying_key()).unwrap();
+        let root = store.collection("cold Archive BM25", CollectionPolicy::new(
+            AdmissionPolicy::direct(signer.verifying_key()),
+            AdmissionPolicy::direct(signer.verifying_key()),
+        )).unwrap();
+        let target = store.attach_with(root, ArchiveBlockTextBm25Mapping).unwrap();
+        let (node, attachments) = source_and_attachments(text_block(&[
+            (schema::content_fact::modality::TEXT, "late comet comet"),
+        ]));
+        let facts = TribleSet::try_from_blob(node.clone()).unwrap();
+        store.commit(root, &signer, facts.into()).unwrap();
+        let frozen = store.snapshot().unwrap();
+        assert!(derive_element(&frozen, node.clone()).is_err());
+        assert!(attachments.iter().all(|blob| !frozen.contains_blob(blob.get_handle()).unwrap()));
+
+        // Exact lookup can now find the bytes in the owning Leech, but the
+        // selected node and residency observation remain the older ones.
+        for blob in attachments.iter().cloned() {
+            store.put::<UnknownBlob, _>(blob).unwrap();
+        }
+        let runtime = std::sync::Arc::new(crate::storage::runtime().unwrap());
+        let reader = crate::storage::AcquiringReader::new(frozen, runtime);
+        let selected = reader.attached_acquiring(target).unwrap();
+        assert_eq!(selected.residual().len(), 1);
+        let index = crate::storage::require_complete_attached_read(
+            selected.read_with_acquiring::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>().unwrap(),
+        ).unwrap();
+        assert_eq!(index.segments().iter().map(|segment| segment.doc_count()).sum::<usize>(), 1);
+        assert!(attachments.iter().all(|blob| !reader.contains_blob(blob.get_handle()).unwrap()));
+        assert!(store.health().started_at.is_none());
+        store.close().unwrap();
     }
 
     #[test]

@@ -692,7 +692,7 @@ where
 }
 
 pub fn coverage_head<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     catalog: &P,
     source: Id,
 ) -> Result<Option<CoverageHead>>
@@ -937,7 +937,7 @@ where
 }
 
 /// Decode the exact tenant coordinate of a native source.
-pub fn source_label<P>(reader: &PileSnapshot, catalog: &P, source: Id) -> Result<String>
+pub fn source_label<P>(reader: &impl BlobStoreGet, catalog: &P, source: Id) -> Result<String>
 where
     P: TriblePattern,
 {
@@ -955,7 +955,7 @@ where
 /// Decode every source-scoped chat identity without choosing among conflicting
 /// values. Structural ambiguity is an error, not a display-name fallback.
 pub fn chat_labels<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     catalog: &P,
     source: Id,
 ) -> Result<BTreeMap<Id, String>>
@@ -1479,7 +1479,7 @@ fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
 }
 
 fn read_utf8string(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     handle: Inline<Handle<UTF8String>>,
     field: &str,
 ) -> Result<String> {
@@ -1490,7 +1490,7 @@ fn read_utf8string(
 }
 
 /// Decode one Teams text attachment with field-specific context.
-pub fn read_text(reader: &PileSnapshot, handle: TextHandle, field: &str) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle, field: &str) -> Result<String> {
     read_utf8string(reader, handle, field)
 }
 

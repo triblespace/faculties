@@ -257,6 +257,57 @@ where
     Ok(collection)
 }
 
+/// Open a configured descriptor at a synchronous foreground I/O boundary.
+/// Only exact descriptor/name bytes may be acquired; no records are selected
+/// again after acquisition. Call outside `Runtime::block_on`.
+pub fn open_configured_acquiring<S>(
+    storage: &mut S,
+    scope: Id,
+    authority: VerifyingKey,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot:
+        BlobStoreGet + CollectionRead + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+{
+    let Some(handle) = configured_handle(scope)? else {
+        return open_configured(storage, scope, authority);
+    };
+    let snapshot = storage.snapshot().context("freeze configured collection")?;
+    let reader = crate::storage::AcquiringReader::new(snapshot.clone(), runtime.clone());
+    let collection = open_exact_in(&reader, scope, handle)?;
+    if let Some(warning) = empty_beside_content(&snapshot, scope, handle) {
+        eprintln!("warning: {warning}");
+    }
+    Ok(collection)
+}
+
+/// READ admission over frozen proofs with exact descriptor, name, and
+/// capability-definition acquisition. Unavailable or inapplicable evidence
+/// still grants nothing; obtaining bytes does not discover new proofs.
+pub fn open_configured_read_acquiring<S>(
+    storage: &mut S,
+    scope: Id,
+    subject: VerifyingKey,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreList
+        + CapabilityProofRead
+        + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+{
+    let Some(handle) = configured_handle(scope)? else {
+        return open(storage, scope, subject).context("register signer-private descriptor");
+    };
+    let snapshot = storage
+        .snapshot()
+        .context("freeze configured collection READ evidence")?;
+    let reader = crate::storage::AcquiringReader::new(snapshot, runtime.clone());
+    open_exact_read_in(&reader, scope, subject, handle)
+}
+
 /// The silent failure a re-mint produces, made audible: the configured
 /// generation holds nothing while other generations of the same name hold
 /// records. Not a refusal, because an empty new generation beside dead ones
@@ -340,10 +391,41 @@ where
     let snapshot = store
         .snapshot()
         .map_err(|error| anyhow!("freeze {faculty} publication authority: {error}"))?;
+    require_command_write_in(&snapshot, collection, signer, faculty, reader_hint)
+}
+
+/// The command WRITE guard with exact-byte acquisition and frozen proof evidence.
+/// Like the other acquiring entry points, call only at the synchronous boundary.
+pub fn require_command_write_admission_acquiring<S>(
+    store: &mut S,
+    collection: Collection<SimpleArchive>,
+    signer: &ed25519_dalek::SigningKey,
+    faculty: &str,
+    reader_hint: &str,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+) -> anyhow::Result<()>
+where
+    S: SnapshotSource,
+    S::Snapshot: CapabilityProofRead + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+{
+    let snapshot = store.snapshot().context("freeze publication authority")?;
+    let reader = crate::storage::AcquiringReader::new(snapshot, runtime.clone());
+    require_command_write_in(&reader, collection, signer, faculty, reader_hint)
+}
+
+fn require_command_write_in<S>(
+    snapshot: &S,
+    collection: Collection<SimpleArchive>,
+    signer: &ed25519_dalek::SigningKey,
+    faculty: &str,
+    reader_hint: &str,
+) -> anyhow::Result<()>
+where
+    S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+{
     let admitted = collection
-        .writer_is_admitted(&snapshot, signer.verifying_key())
+        .writer_is_admitted_acquiring(snapshot, signer.verifying_key())
         .map_err(|error| anyhow!("check {faculty} collection WRITE admission: {error}"))?;
-    drop(snapshot);
     if !admitted {
         bail!(
             "key {} is not admitted to write the {faculty} collection {}. The record would be \
@@ -406,7 +488,7 @@ where
     let collection = open_exact_descriptor_in(snapshot, scope, handle)?;
     let expected = require_name(scope);
     if !collection
-        .reader_is_admitted(snapshot, subject)
+        .reader_is_admitted_acquiring(snapshot, subject)
         .context("check configured collection READ admission")?
     {
         bail!(
@@ -475,6 +557,218 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type MemorySnapshot = <MemoryRepo as SnapshotSource>::Snapshot;
+
+    /// Exact-byte provider for startup tests. Its proof view never advances
+    /// when a requested blob is supplied from the later source observation.
+    #[derive(Clone)]
+    struct StartupSnapshot {
+        frozen: MemorySnapshot,
+        source: MemorySnapshot,
+        requested: std::sync::Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+    }
+
+    impl StoreSnapshot for StartupSnapshot {}
+
+    impl CapabilityProofRead for StartupSnapshot {
+        type ProofsError = <MemorySnapshot as CapabilityProofRead>::ProofsError;
+        type ProofIter<'a> = <MemorySnapshot as CapabilityProofRead>::ProofIter<'a>;
+
+        fn proofs(&self) -> Result<Self::ProofIter<'_>, Self::ProofsError> {
+            self.frozen.proofs()
+        }
+    }
+
+    impl BlobStoreList for StartupSnapshot {
+        type Err = <MemorySnapshot as BlobStoreList>::Err;
+        type Iter<'a> = <MemorySnapshot as BlobStoreList>::Iter<'a>;
+
+        fn blobs(&self) -> Self::Iter<'_> {
+            self.frozen.blobs()
+        }
+    }
+
+    impl triblespace::core::repo::async_store::AsyncBlobStoreGet for StartupSnapshot {
+        type GetError<E: std::error::Error + Send + Sync + 'static> =
+            <MemorySnapshot as BlobStoreGet>::GetError<E>;
+
+        fn get<T, E>(
+            &self,
+            handle: Inline<triblespace::core::inline::encodings::hash::Handle<E>>,
+        ) -> impl std::future::Future<Output = Result<T, Self::GetError<T::Error>>> + Send
+        where
+            E: triblespace::core::blob::BlobEncoding + 'static,
+            T: TryFromBlob<E>,
+            triblespace::core::inline::encodings::hash::Handle<E>:
+                triblespace::core::inline::InlineEncoding,
+        {
+            let raw = handle.raw;
+            async move {
+                let handle =
+                    Inline::<triblespace::core::inline::encodings::hash::Handle<E>>::new(raw);
+                if self.frozen.contains_blob(handle).unwrap() {
+                    return self.frozen.get(handle);
+                }
+                self.requested.lock().unwrap().push(raw);
+                self.source.get(handle)
+            }
+        }
+    }
+
+    fn startup_reader(
+        source: &mut MemoryRepo,
+        missing: Option<[u8; 32]>,
+        include_proofs: bool,
+    ) -> (
+        crate::storage::AcquiringReader<StartupSnapshot>,
+        StartupSnapshot,
+    ) {
+        use anybytes::Bytes;
+        use triblespace::core::blob::encodings::UnknownBlob;
+        let source = source.snapshot().unwrap();
+        let mut local = MemoryRepo::default();
+        for info in source.blobs() {
+            let handle = info.unwrap().handle;
+            if Some(handle.raw) != missing {
+                let bytes: Bytes = source.get(handle).unwrap();
+                local.put::<UnknownBlob, _>(bytes).unwrap();
+            }
+        }
+        if include_proofs {
+            for proof in source.proofs().unwrap() {
+                local.insert_proof(proof.unwrap()).unwrap();
+            }
+        }
+        let snapshot = StartupSnapshot {
+            frozen: local.snapshot().unwrap(),
+            source,
+            requested: Default::default(),
+        };
+        let reader = crate::storage::AcquiringReader::new(
+            snapshot.clone(),
+            std::sync::Arc::new(crate::storage::runtime().unwrap()),
+        );
+        (reader, snapshot)
+    }
+
+    #[test]
+    fn startup_acquires_missing_descriptor_and_name_without_relaxing_validation() {
+        let owner = SigningKey::from_bytes(&[0x65; 32]);
+        let mut source = MemoryRepo::default();
+        let collection = open(&mut source, wiki::DEFAULT_SCOPE_ID, owner.verifying_key()).unwrap();
+        let snapshot = source.snapshot().unwrap();
+        let descriptor: Blob<SimpleArchive> = snapshot.get(collection.handle()).unwrap();
+        let name = descriptor::name(&TribleSet::try_from_blob(descriptor).unwrap())
+            .unwrap()
+            .unwrap();
+        for missing in [collection.handle().raw, name.raw] {
+            let (reader, evidence) = startup_reader(&mut source, Some(missing), true);
+            assert!(open_exact_in(
+                &evidence.frozen,
+                wiki::DEFAULT_SCOPE_ID,
+                collection.handle()
+            )
+            .is_err());
+            assert_eq!(
+                open_exact_in(&reader, wiki::DEFAULT_SCOPE_ID, collection.handle()).unwrap(),
+                collection
+            );
+            let requested = evidence.requested.lock().unwrap();
+            assert!(!requested.is_empty());
+            assert!(requested.iter().all(|handle| *handle == missing));
+            drop(requested);
+            assert!(
+                !reader
+                    .contains_blob(Inline::<
+                        triblespace::core::inline::encodings::hash::Handle<
+                            triblespace::core::blob::encodings::UnknownBlob,
+                        >,
+                    >::new(missing))
+                    .unwrap(),
+                "acquisition must not advance frozen residency"
+            );
+        }
+        let (reader, evidence) = startup_reader(&mut source, None, true);
+        assert!(open_exact_in(&reader, relations::DEFAULT_SCOPE_ID, collection.handle()).is_err());
+        assert!(evidence.requested.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_acquires_admission_definitions_but_never_later_proofs() {
+        let owner = SigningKey::from_bytes(&[0x66; 32]);
+        let subject = SigningKey::from_bytes(&[0x67; 32]);
+        let outsider = SigningKey::from_bytes(&[0x68; 32]);
+        let mut source = MemoryRepo::default();
+        let collection = open(&mut source, wiki::DEFAULT_SCOPE_ID, owner.verifying_key()).unwrap();
+        grant_collection_read(
+            &mut source,
+            collection.handle(),
+            &owner,
+            subject.verifying_key(),
+        )
+        .unwrap();
+        let definition = triblespace::core::collection::read_capability();
+        let (reader, evidence) = startup_reader(&mut source, Some(definition.raw), true);
+        assert!(open_exact_read_in(
+            &evidence.frozen,
+            wiki::DEFAULT_SCOPE_ID,
+            subject.verifying_key(),
+            collection.handle()
+        )
+        .is_err());
+        assert_eq!(
+            open_exact_read_in(
+                &reader,
+                wiki::DEFAULT_SCOPE_ID,
+                subject.verifying_key(),
+                collection.handle()
+            )
+            .unwrap(),
+            collection
+        );
+        assert!(evidence.requested.lock().unwrap().contains(&definition.raw));
+
+        let (resident, evidence) = startup_reader(&mut source, None, true);
+        assert!(open_exact_read_in(
+            &resident,
+            wiki::DEFAULT_SCOPE_ID,
+            outsider.verifying_key(),
+            collection.handle()
+        )
+        .is_err());
+        assert!(evidence.requested.lock().unwrap().is_empty());
+
+        let (before_grant, _) = startup_reader(&mut source, Some(definition.raw), false);
+        assert!(
+            open_exact_read_in(
+                &before_grant,
+                wiki::DEFAULT_SCOPE_ID,
+                subject.verifying_key(),
+                collection.handle()
+            )
+            .is_err(),
+            "provider's newer proof must not enter frozen admission"
+        );
+        assert!(before_grant.proofs().unwrap().next().is_none());
+
+        let (_, mut offline) = startup_reader(&mut source, Some(definition.raw), true);
+        offline.source = offline.frozen.clone();
+        let offline = crate::storage::AcquiringReader::new(
+            offline,
+            std::sync::Arc::new(crate::storage::runtime().unwrap()),
+        );
+        assert!(
+            open_exact_read_in(
+                &offline,
+                wiki::DEFAULT_SCOPE_ID,
+                subject.verifying_key(),
+                collection.handle()
+            )
+            .is_err(),
+            "an unavailable definition cannot grant READ"
+        );
+    }
 
     /// A host with no configured handle may mint the private descriptor on an
     /// empty pile, but not beside a generation of the same name that already

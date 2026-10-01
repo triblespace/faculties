@@ -164,7 +164,7 @@ fn run_import_all(
     if source == CliImportSource::Codex {
         // The batch case that matters: 3,161 refused Codex rollouts, and the
         // open is ~9.3 s against ~1 s of projection. One open, N commits.
-        let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+        let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
         let result = (|| {
             for (index, path) in paths.iter().enumerate() {
                 eprintln!("[{}/{total}] {}", index + 1, path.display());
@@ -201,7 +201,7 @@ fn run_import(
 }
 
 fn run_agy_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_agy::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -213,7 +213,7 @@ fn run_agy_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -
 }
 
 fn run_chatgpt_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_chatgpt::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -229,7 +229,7 @@ fn run_claude_code_import(
     path: &Path,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_claude_code::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -241,7 +241,7 @@ fn run_claude_code_import(
 }
 
 fn run_codex_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let result = run_codex_into(&mut writer, path, out);
     writer.close(result)
 }
@@ -267,7 +267,7 @@ fn run_claude_web_import(
     path: &Path,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_claude_web::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -279,7 +279,7 @@ fn run_claude_web_import(
 }
 
 fn run_copilot_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_copilot::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)
@@ -291,7 +291,7 @@ fn run_copilot_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_
 }
 
 fn run_gemini_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = pollster::block_on(ArchiveImportWriter::open(storage.pile, storage.key))?;
+    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
     let projection = archive_gemini::project_path(path, |projected| {
         writer
             .stage_fragment(projected.fragment)

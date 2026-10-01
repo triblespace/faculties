@@ -3,6 +3,7 @@
 
 use super::{CaptureRow, IntervalValue, RawHandle, TextHandle};
 use crate::clock;
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::files::presentation::{present, ViewOptions};
 use crate::out::Part;
@@ -16,9 +17,9 @@ use std::path::PathBuf;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use crate::storage::{AcquiringReader, FacultySnapshot};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
@@ -298,7 +299,7 @@ pub(super) fn interval_key(interval: IntervalValue) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn latest_intent(snapshot: &super::BodySnapshot) -> Result<Option<IntentObservation>> {
+fn latest_intent<R: BlobStoreGet>(snapshot: &super::BodySnapshot<R>) -> Result<Option<IntentObservation>> {
     let Some(row) = super::latest_intent(snapshot.facts(), snapshot.intent_register())? else {
         return Ok(None);
     };
@@ -320,18 +321,17 @@ struct BodyStorage<'a> {
 
 impl BodyStorage<'_> {
     fn publish(&self, fragment: Fragment) -> Result<()> {
-        self.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            crate::collection_names::require_command_write_admission(
-                pile,
-                collection,
-                signer,
-                "Body",
-                "body show",
+        self.storage.with_store(|store, signer, runtime| {
+            let collection = crate::collection_names::open_configured_acquiring(
+                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
             )?;
+            crate::collection_names::require_command_write_admission_acquiring(
+                store, collection, signer, "Body", "body show", runtime,
+            )?;
+            let pile = store;
             pile.commit(collection, signer, fragment)
                 .context("publish native Body collection fragment")?;
-            pollster::block_on(async {
+            runtime.block_on(async {
                 let intents = super::intent_register_collection(pile, signer.verifying_key())?;
                 crate::storage::seed_attached(pile, intents, signer).await?;
                 crate::storage::ensure_downstream(pile, collection, signer).await?;
@@ -342,33 +342,40 @@ impl BodyStorage<'_> {
         })
     }
 
-    fn with_pile<T>(
-        &self,
-        f: impl FnOnce(&mut Pile, &ed25519_dalek::SigningKey) -> Result<T>,
-    ) -> Result<T> {
-        self.storage.with_pile(f)
-    }
-
-    fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>) -> Result<T> {
-        self.with_pile(|pile, signer| {
-            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    fn with_view<T>(&self, f: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>) -> Result<T> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let source = crate::collection_names::open_configured_acquiring(
+                pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
             let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let collection_rank9 =
                 pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze resident Body fact collection")?;
-            let facts = store_snapshot
-                .read_facts(collection_rank9)
+            let store_snapshot = AcquiringReader::new(
+                pile.snapshot().context("freeze Body fact collection")?, runtime.clone(),
+            );
+            let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
                 .context("read maintained Body fact collection")?;
             f(&facts, &store_snapshot)
         })
     }
 
-    fn with_indexed_view<T>(&self, f: impl FnOnce(&super::BodySnapshot) -> Result<T>) -> Result<T> {
-        self.with_pile(|pile, signer| {
-            let snapshot = pollster::block_on(super::materialize_indexed_collection(pile, signer))?;
-            f(&snapshot)
+    fn with_indexed_view<T>(&self, f: impl FnOnce(&super::BodySnapshot<AcquiringReader<FacultySnapshot>>) -> Result<T>) -> Result<T> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let source = crate::collection_names::open_configured_acquiring(
+                pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+            let target = super::intent_register_collection(pile, signer.verifying_key())?;
+            let store_snapshot = AcquiringReader::new(pile.snapshot()?, runtime.clone());
+            let facts = crate::storage::acquire_facts(&store_snapshot, rank9)?;
+            let intents = store_snapshot.attached_acquiring(target)?
+                .read_acquiring::<triblespace::core::collection::lww_register::LwwIndex>()?;
+            if !intents.unread().is_empty() {
+                bail!("Body intent register has {} unread foundations", intents.unread().len());
+            }
+            let intents = intents.into_value().query()?;
+            f(&super::BodySnapshot { facts, store_snapshot, intents })
         })
     }
 }

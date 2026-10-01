@@ -7,6 +7,7 @@
 //! reconciliation is another monotonic child, never deletion, a mutable head,
 //! or clock-based arbitration.
 
+#[cfg(test)]
 use crate::storage::FactView;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -14,7 +15,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::clock;
-use crate::collection_names::{configured_handle, open_configured, open_exact_in};
+#[cfg(test)]
+use crate::collection_names::open_configured;
+use crate::collection_names::open_configured_acquiring;
 use crate::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
@@ -27,11 +30,10 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
-use triblespace::core::repo::async_store::Blocking;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
-type RelationsReader = Blocking<<FacultyStore as SnapshotSource>::Snapshot>;
+type RelationsReader = crate::storage::AcquiringReader<<FacultyStore as SnapshotSource>::Snapshot>;
 
 struct RelationsStorage<'a> {
     pile: &'a mut FacultyStore,
@@ -925,12 +927,8 @@ impl Relations {
         execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
-            let collection = if let Some(handle) = configured_handle(DEFAULT_SCOPE_ID)? {
-                let reader = Blocking::with_runtime(pile.snapshot()?, Arc::clone(runtime));
-                open_exact_in(&reader, DEFAULT_SCOPE_ID, handle)?
-            } else {
-                open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?
-            };
+            let collection =
+                open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
             with_relations_view(pile, signer, runtime, collection, read_only, execute)
         })
     }
@@ -1062,16 +1060,16 @@ fn with_relations_view<T>(
     let reader = pile
         .snapshot()
         .context("freeze resident Relations fact collection")?;
+    let reader = crate::storage::AcquiringReader::new(reader, Arc::clone(runtime));
     let observed = reader
-        .attached(facts_rank9)
+        .attached_acquiring(facts_rank9)
         .context("observe Relations Rank9 projection")?;
-    let view = observed
-        .facts()
+    let view = crate::storage::acquire_attached_facts(&observed)
         .context("read Relations Rank9 projection")?;
     // Only exact payload gets may acquire here. Facts, records, proofs,
     // and their interpretation instant remain those of this observation.
-    // Dispatch stays outside block_on: Blocking owns the one CLI boundary.
-    let payload_reader = Blocking::with_runtime(reader.clone(), Arc::clone(runtime));
+    // Dispatch stays outside block_on: exact byte reads use the retained runtime.
+    let payload_reader = reader;
     let mut storage = RelationsStorage {
         pile,
         signer,
@@ -1400,7 +1398,7 @@ mod tests {
         assert!(!frozen.contains_blob(label).unwrap());
         let observed = frozen.attached(rank9).unwrap();
         let view = observed.facts().unwrap();
-        let reader = Blocking::with_runtime(frozen.clone(), Arc::clone(&runtime));
+        let reader = crate::storage::AcquiringReader::new(frozen.clone(), Arc::clone(&runtime));
 
         // Model bytes arriving in shared backing after the semantic snapshot.
         // Exact get may use them; it must not adopt the later person's facts.

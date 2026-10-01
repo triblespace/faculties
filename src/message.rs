@@ -21,7 +21,6 @@ pub use operations::{
 use anyhow::{bail, Context, Result};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
@@ -306,7 +305,7 @@ pub fn read_fragment(
 }
 
 /// Read one message body from the snapshot that observed its handle.
-pub fn read_body(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+pub fn read_body(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let view: anybytes::View<str> = reader
         .get(handle)
         .with_context(|| format!("read Message body {}", hex::encode(handle.raw)))?;

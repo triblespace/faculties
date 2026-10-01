@@ -72,20 +72,20 @@ pub struct BodyCatalog {
 /// Facts, known intent winners, and the attachment reader come from one
 /// immutable post-maintenance store snapshot. Each target contributes its
 /// resident view; their supports need not be identical.
-pub struct BodySnapshot {
+pub struct BodySnapshot<R = PileSnapshot> {
     facts: FactArchive,
-    store_snapshot: PileSnapshot,
+    store_snapshot: R,
     intents: LwwQuery,
 }
 
-impl BodySnapshot {
+impl<R> BodySnapshot<R> {
     /// Shard-preserving facts from the resident target collection.
     pub fn facts(&self) -> &FactArchive {
         &self.facts
     }
 
     /// Store snapshot shared by the selected fact and intent views.
-    pub fn store_snapshot(&self) -> &PileSnapshot {
+    pub fn store_snapshot(&self) -> &R {
         &self.store_snapshot
     }
 
@@ -95,7 +95,7 @@ impl BodySnapshot {
     }
 
     /// Consume the coherent snapshot into facts, store snapshot, and index.
-    pub fn into_parts(self) -> (FactArchive, PileSnapshot, LwwQuery) {
+    pub fn into_parts(self) -> (FactArchive, R, LwwQuery) {
         (self.facts, self.store_snapshot, self.intents)
     }
 }

@@ -318,14 +318,30 @@ fn with_model<T>(
     storage: &crate::storage::Storage,
     operation: impl FnOnce(&GaugeModel) -> Result<T>,
 ) -> Result<T> {
-    storage.with_pile(|pile, signer| {
-        let snapshot = pollster::block_on(wiki_model::query_snapshot(pile, signer))
-            .context("query maintained Wiki collection")?;
-        let model = GaugeModel::load(
-            snapshot.store_snapshot(),
-            snapshot.facts(),
-            snapshot.latest(),
+    use crate::storage::AcquiringReader;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    };
+    use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+    use triblespace::core::collection::latest::LatestIndex;
+    use triblespace::core::repo::SnapshotSource;
+
+    storage.with_store(|pile, signer, runtime| {
+        let source = crate::collection_names::open_configured_acquiring(
+            pile, crate::schemas::wiki::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
         )?;
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+        let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+        let latest = wiki_model::latest_for_source(pile, source)?;
+        let reader = AcquiringReader::new(
+            pile.snapshot().context("freeze Gauge's Wiki observation")?,
+            std::sync::Arc::clone(runtime),
+        );
+        let facts = crate::storage::acquire_facts(&reader, rank9)?;
+        let latest = crate::storage::require_complete_attached_read(
+            reader.attached_acquiring(latest)?.read_acquiring::<LatestIndex>()?,
+        )?;
+        let model = GaugeModel::load(&reader, &facts, &latest)?;
         operation(&model)
     })
 }

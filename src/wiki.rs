@@ -1044,7 +1044,7 @@ pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
     load_catalog_with_order(space, &order)
 }
 
-fn validate_payloads(reader: &PileSnapshot, catalog: &WikiCatalog) -> Result<()> {
+fn validate_payloads(reader: &impl BlobStoreGet, catalog: &WikiCatalog) -> Result<()> {
     for revision in catalog.revisions.revision_records() {
         let title = read_text(reader, revision.title)
             .with_context(|| format!("read Wiki revision {:x} title", revision.id))?;
@@ -1072,7 +1072,7 @@ fn validate_payloads(reader: &PileSnapshot, catalog: &WikiCatalog) -> Result<()>
     Ok(())
 }
 
-pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
+pub fn validate_known_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
     for fact in facts {
         if fact.a() == &attrs::title.id()
             || fact.a() == &attrs::content.id()
@@ -1091,7 +1091,7 @@ pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Resu
 ///
 /// This is the migration/import and test-oracle boundary. Durable application
 /// reads should use [`query_snapshot`].
-pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<WikiCatalog> {
+pub fn validate_catalog(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<WikiCatalog> {
     let catalog = load_catalog(facts)?;
     validate_payloads(reader, &catalog)?;
     Ok(catalog)
@@ -1100,7 +1100,7 @@ pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<Wiki
 /// Validate one Wiki fact snapshot using an already attached supersession
 /// order for exactly that snapshot's source cover.
 pub fn validate_catalog_with_order<O>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &TribleSet,
     order: &O,
 ) -> Result<WikiCatalog>
@@ -1160,7 +1160,7 @@ pub fn tag_record(name: &str) -> Result<(Fragment, Id, String)> {
     }
 }
 
-pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader.get(handle)?;
     Ok(value.to_string())
 }
@@ -1246,7 +1246,7 @@ pub fn tag_display_name(catalog: &WikiCatalog, reader: &PileSnapshot, id: Id) ->
 /// an iteration-order winner.
 pub fn tag_display_name_from_facts<P: TriblePattern>(
     facts: &P,
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     id: Id,
 ) -> Result<String> {
     let mut names = BTreeSet::new();
@@ -1325,7 +1325,7 @@ pub struct FrontierModel {
 
 impl FrontierModel {
     pub fn load<P: TriblePattern>(
-        reader: &PileSnapshot,
+        reader: &impl BlobStoreGet,
         facts: &P,
         latest: &LatestIndex,
     ) -> Result<Self> {

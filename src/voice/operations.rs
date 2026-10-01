@@ -1,12 +1,14 @@
 //! Typed Voice persistence; routing reads close before any device or model work.
 
 use crate::clock;
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
 #[cfg(test)]
 use crate::storage::open_pile_strict_as;
-use crate::storage::FactArchive;
-use crate::storage::FactRead;
+use crate::storage::{AcquiringReader, FactArchive, FacultyStore};
+#[cfg(test)]
+use crate::storage::FacultySnapshot;
 use crate::voice as voice_model;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -16,9 +18,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::Pile;
-#[cfg(test)]
-use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -183,12 +182,13 @@ struct VoiceStorage<'a> {
 }
 
 struct VoiceSession<'a> {
-    pile: &'a mut Pile,
+    pile: &'a mut FacultyStore,
+    runtime: &'a std::sync::Arc<tokio::runtime::Runtime>,
     collection: Collection<SimpleArchive>,
     signer: &'a ed25519_dalek::SigningKey,
     facts: FactArchive,
     #[cfg(test)]
-    reader: PileSnapshot,
+    reader: AcquiringReader<FacultySnapshot>,
 }
 
 impl VoiceSession<'_> {
@@ -199,19 +199,20 @@ impl VoiceSession<'_> {
     ) -> Result<CollectionCommit> {
         voice_model::validate_staged_payloads(&mut fragment)?;
         fragment.describe_with(entity! { metadata::description: description });
-        crate::collection_names::require_command_write_admission(
+        crate::collection_names::require_command_write_admission_acquiring(
             self.pile,
             self.collection,
             self.signer,
             "Voice",
             "voice route show",
+            self.runtime,
         )?;
         let commit = self
             .pile
             .commit(self.collection, self.signer, fragment)
             .context("commit Voice fragment")?;
         drop(
-            pollster::block_on(crate::storage::ensure_downstream(
+            self.runtime.block_on(crate::storage::ensure_downstream(
                 self.pile,
                 self.collection,
                 self.signer,
@@ -227,10 +228,12 @@ impl VoiceStorage<'_> {
         &self,
         operation: impl FnOnce(&mut VoiceSession<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_pile(|pile, signer| {
+        self.storage.with_store(|store, signer, runtime| {
+            let collection = crate::collection_names::open_configured_acquiring(
+                store, COLLECTION_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
             let result = (|| {
-                let collection =
-                    open_configured(pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
                 let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
                 let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
                     collection,
@@ -238,7 +241,7 @@ impl VoiceStorage<'_> {
                 )?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
-                pollster::block_on(async {
+                runtime.block_on(async {
                     crate::storage::tolerate_own_lag(
                         pile.maintain_attached(maintained_succinct, signer).await,
                     )?;
@@ -247,14 +250,15 @@ impl VoiceStorage<'_> {
                     )
                 })
                 .context("maintain Voice fact collection")?;
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze maintained Voice fact collection")?;
-                let facts = store_snapshot
-                    .read_facts(maintained_rank9)
+                let store_snapshot = AcquiringReader::new(
+                    pile.snapshot().context("freeze maintained Voice fact collection")?,
+                    runtime.clone(),
+                );
+                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
                     .context("read maintained Voice fact collection")?;
                 operation(&mut VoiceSession {
                     pile,
+                    runtime,
                     collection,
                     signer,
                     facts,

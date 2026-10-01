@@ -363,7 +363,7 @@ where
 /// cardinality error or iterator-order winner. Additional facts are ignored,
 /// entity ids remain opaque, and only frontier payloads are read.
 pub fn current_profile<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &P,
     anchor: Id,
 ) -> Result<Resolution<ProfileValue>>
@@ -425,7 +425,7 @@ where
 /// frontier. This explicit roster result is for callers which actually need
 /// every profile; point readers should call [`current_profile`] instead.
 pub fn current_profiles<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &P,
 ) -> Result<BTreeMap<Id, Resolution<ProfileValue>>>
 where
@@ -500,7 +500,7 @@ where
 
 /// Project the global current Headspace configuration directly from typed
 /// rows. Only its explicit observation DAG chooses the frontier.
-pub fn current_config<P>(reader: &PileSnapshot, facts: &P) -> Result<Resolution<ConfigValue>>
+pub fn current_config<P>(reader: &impl BlobStoreGet, facts: &P) -> Result<Resolution<ConfigValue>>
 where
     P: TriblePattern + ?Sized,
 {
@@ -1149,7 +1149,7 @@ fn validate_config_value(value: &ConfigValue) -> Result<()> {
     Ok(())
 }
 
-fn load_text_from(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+fn load_text_from(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Headspace text payload {}", hex::encode(handle.raw)))?;
@@ -1157,7 +1157,7 @@ fn load_text_from(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 }
 
 fn load_text_overlay<Overlay>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<String>
@@ -1183,7 +1183,7 @@ where
 }
 
 fn project_catalog<P, Overlay>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     facts: &P,
 ) -> Result<Catalog>
@@ -1357,7 +1357,7 @@ pub fn validate_catalog_union(
 
 /// Project complete retained history, representing structural or payload
 /// failure as `Resolution::Invalid` rather than choosing an implicit winner.
-pub fn project<P>(reader: &PileSnapshot, facts: &P) -> Catalog
+pub fn project<P>(reader: &impl BlobStoreGet, facts: &P) -> Catalog
 where
     P: TriblePattern + ?Sized,
 {
@@ -1365,7 +1365,7 @@ where
 }
 
 /// Project complete retained history for an explicit historical operation.
-pub fn project_result<P>(reader: &PileSnapshot, facts: &P) -> Result<Catalog>
+pub fn project_result<P>(reader: &impl BlobStoreGet, facts: &P) -> Result<Catalog>
 where
     P: TriblePattern + ?Sized,
 {

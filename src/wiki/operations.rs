@@ -6,8 +6,8 @@
 //! still compiler execution: a hosted untrusted deployment needs independent
 //! CPU/memory limits. Embedding methods use the configured local model runtime.
 
+#[cfg(test)]
 use crate::storage::FactRead;
-use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 #[cfg(test)]
@@ -16,12 +16,14 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::clock;
-use crate::collection_names::{configured_handle, open_configured, open_exact_in};
+use crate::collection_names::open_configured_acquiring;
+#[cfg(test)]
+use crate::collection_names::open_configured;
 #[cfg(feature = "local-embed")]
 use crate::schemas::embeddings::{self, Embedding768};
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use crate::schemas::wiki::{self as schema, extract_link_targets};
-use crate::storage::{read, FactArchive, FacultySnapshot, FacultyStore, Storage};
+use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use crate::wiki::{
     self as wiki_model, EntryRecord, FrontierModel, LinkClass, LinkReference, RevisionDraft,
     RevisionRecord,
@@ -217,7 +219,7 @@ impl WikiStorage<'_> {
         f: impl FnOnce(
             &mut FacultyStore,
             &ed25519_dalek::SigningKey,
-            &tokio::runtime::Runtime,
+            &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
         self.storage
@@ -233,11 +235,17 @@ impl WikiStorage<'_> {
         prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            runtime.block_on(async {
-                let source =
-                    open_source(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).await?;
-                views_in(pile, source, signer, scopes, prepare).await
-            })
+            let source = open_configured_acquiring(
+                pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let mut auxiliaries = Vec::with_capacity(scopes.len());
+            for &(scope, label) in scopes {
+                let collection = open_configured_acquiring(
+                    pile, scope, signer.verifying_key(), runtime,
+                )?;
+                auxiliaries.push((collection, label));
+            }
+            views_in(pile, source, signer, &auxiliaries, runtime, prepare)
         })
     }
 
@@ -257,7 +265,9 @@ impl WikiStorage<'_> {
     #[cfg(feature = "local-embed")]
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer, runtime| {
-            let collection = runtime.block_on(open_source(pile, scope, signer.verifying_key()))?;
+            let collection = open_configured_acquiring(
+                pile, scope, signer.verifying_key(), runtime,
+            )?;
             let commit = pile
                 .commit(collection, signer, fragment)
                 .context("publish native collection fragment")?;
@@ -272,21 +282,15 @@ impl WikiStorage<'_> {
 
     fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer, runtime| {
-            let collection = runtime.block_on(open_source(
+            let collection = open_configured_acquiring(
                 pile,
                 schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
-            ))?;
-            let snapshot = pile
-                .snapshot()
-                .context("freeze Wiki publication authority")?;
-            anyhow::ensure!(
-                collection
-                    .writer_is_admitted(&snapshot, signer.verifying_key())
-                    .context("check Wiki source WRITE admission")?,
-                "publishing a Wiki fragment requires source collection WRITE"
-            );
-            drop(snapshot);
+                runtime,
+            )?;
+            crate::collection_names::require_command_write_admission_acquiring(
+                pile, collection, signer, "Wiki", "wiki show", runtime,
+            )?;
             let commit = pile
                 .commit(collection, signer, fragment)
                 .context("publish Wiki fragment")?;
@@ -308,20 +312,17 @@ impl WikiStorage<'_> {
     }
 }
 
-/// Preparation attaches the views as they stand, whatever the signer may
-/// write and whether it reads or is about to edit: a write ensures its own
-/// images after its commit, and each other writer derives its own. It never
-/// acquires the sources first. Their payloads feed no view this key reads,
-/// since nobody derives another key's commits, so acquiring them would only
-/// let a payload nobody can hand over refuse the operation. An edit
-/// supersedes the frontier it can see, and editing from a frontier another
-/// node has already moved branches that entry's history, which is what a
-/// monotone store is for.
-async fn views_in<T>(
+/// Preparation selects facts and latest-state support once, acquiring exact
+/// residual payloads and then the bodies the operation actually reads. It
+/// does not replace either selected view after a cache fill. An edit therefore
+/// supersedes the frontier it saw; later delivered revisions may branch that
+/// entry's history, which is what a monotone store is for.
+fn views_in<T>(
     pile: &mut FacultyStore,
     wiki_source: Collection<blobencodings::SimpleArchive>,
-    signer: &ed25519_dalek::SigningKey,
-    scopes: &[(Id, &str)],
+    _signer: &ed25519_dalek::SigningKey,
+    scopes: &[(Collection<blobencodings::SimpleArchive>, &str)],
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     mut prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
 ) -> Result<T> {
     let wiki_succinct = pile
@@ -332,8 +333,7 @@ async fn views_in<T>(
         .context("register Wiki Rank9 collection")?;
     let latest = wiki_model::latest_for_source(pile, wiki_source)?;
     let mut auxiliaries = Vec::with_capacity(scopes.len());
-    for &(scope, label) in scopes {
-        let source = open_source(pile, scope, signer.verifying_key()).await?;
+    for &(source, label) in scopes {
         let succinct = pile
             .attach::<SuccinctArchiveBlob>(source, ())
             .with_context(|| format!("register {label} Succinct collection"))?;
@@ -342,37 +342,36 @@ async fn views_in<T>(
             .with_context(|| format!("register {label} Rank9 collection"))?;
         auxiliaries.push((rank9, label));
     }
-    // Positive membership makes latest a normal joined relation. Missing
-    // maintenance is an older resident answer, never a demand for equal source
-    // support or a new query-time supersession scan.
+    // Facts and latest are selected at one store boundary; their fixed
+    // residuals are read below without running publication or maintenance.
     let reader = pile
         .snapshot()
         .context("freeze Wiki and auxiliary snapshot")?;
-    let observed_facts = reader
-        .attached(wiki_rank9)
+    let acquiring = AcquiringReader::new(reader.clone(), runtime.clone());
+    let observed_facts = acquiring
+        .attached_acquiring(wiki_rank9)
         .context("observe Wiki fact collection")?;
-    let observed_latest = reader
-        .attached(latest)
+    let observed_latest = acquiring
+        .attached_acquiring(latest)
         .context("observe Wiki supersession index")?;
-    // No read refuses for being behind. There is no globally consistent
-    // state to be behind of, so "stands for every admitted commit" is a
-    // closed-world claim; an edit made from the frontier this node can see
-    // branches that entity's history a little, which is what a monotone
-    // store is for. The edit ensures its own images after it commits.
-    let facts = observed_facts
-        .facts()
+    // This is the history this observation knows, not a globally complete
+    // history. Read every selected foundation or report its missing bytes;
+    // never silently turn a selected-but-unread foundation into absence.
+    // An unseen later commit can still branch an edit's history. The edit
+    // ensures its own images after it commits.
+    let facts = crate::storage::acquire_attached_facts(&observed_facts)
         .context("read Wiki fact collection")?;
     // The index over the same foundations the facts read: a revision no
     // attachment reaches yet is built in memory.
-    let latest = observed_latest
-        .read::<LatestIndex>()
-        .context("read Wiki supersession index")?
-        .into_value();
+    let latest = crate::storage::require_complete_attached_read(
+        observed_latest
+            .read_acquiring::<LatestIndex>()
+            .context("read Wiki supersession index")?,
+    )?;
     let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
     for (rank9, label) in &auxiliaries {
         auxiliary_facts.push(
-            reader
-                .read_facts(*rank9)
+            crate::storage::acquire_facts(&acquiring, *rank9)
                 .with_context(|| format!("read {label} fact collection"))?,
         );
     }
@@ -382,29 +381,12 @@ async fn views_in<T>(
         latest,
     };
     let snapshot = view.reader.clone();
-    read(pile, &snapshot, |reader| {
+    runtime.block_on(read(pile, &snapshot, |reader| {
         // New bytes may be resident, but the fact archives and latest relation
         // never select a newer frontier during payload preparation.
         view.reader = reader.clone();
         prepare(&view, &auxiliary_facts)
-    })
-    .await
-}
-
-async fn open_source(
-    pile: &mut FacultyStore,
-    scope: Id,
-    authority: ed25519_dalek::VerifyingKey,
-) -> Result<Collection<blobencodings::SimpleArchive>> {
-    if let Some(handle) = configured_handle(scope)? {
-        let snapshot = pile.snapshot()?;
-        read(pile, &snapshot, |reader| {
-            open_exact_in(reader, scope, handle)
-        })
-        .await
-    } else {
-        open_configured(pile, scope, authority)
-    }
+    }))
 }
 
 fn now_interval() -> Result<Inline<inlineencodings::NsTAIInterval>> {
@@ -2271,9 +2253,9 @@ mod tests {
         let owner_read = || {
             storage
                 .with_pile(|pile, signer, runtime| {
-                    runtime.block_on(views_in(pile, source, signer, &[], |view, _| {
+                    views_in(pile, source, signer, &[], runtime, |view, _| {
                         Ok(view.clone())
-                    }))
+                    })
                 })
                 .unwrap()
         };
@@ -2393,13 +2375,14 @@ mod tests {
             fixture.carry(&[auxiliary]);
             let warm = storage
                 .with_pile(|pile, signer, runtime| {
-                    runtime.block_on(views_in(
+                    views_in(
                         pile,
                         source,
                         signer,
-                        &[(FILES_SCOPE_ID, "Files")],
+                        &[(auxiliary, "Files")],
+                        runtime,
                         |view, _| Ok(view.clone()),
-                    ))
+                    )
                 })
                 .unwrap();
             let entry = wiki_model::entry(&warm.facts, &warm.latest, root).unwrap();
@@ -2438,11 +2421,12 @@ mod tests {
                     assert!(pile.health().started_at.is_none());
                     assert!(!pile.health().store.serving_snapshot);
 
-                    runtime.block_on(views_in(
+                    views_in(
                         pile,
                         source,
                         signer,
-                        &[(FILES_SCOPE_ID, "Files")],
+                        &[(auxiliary, "Files")],
+                        runtime,
                         |view, auxiliaries| {
                             let entry = wiki_model::entry(&view.facts, &view.latest, root).unwrap();
                             assert_eq!(
@@ -2460,7 +2444,7 @@ mod tests {
                             );
                             Ok(())
                         },
-                    ))?;
+                    )?;
                     let after = pile.snapshot()?;
                     assert!(!after.contains_blob(cold)?);
                     assert_eq!(after.records()?.collect::<Result<Vec<_>, _>>()?, records);

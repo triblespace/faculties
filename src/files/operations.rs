@@ -3,15 +3,18 @@
 //! Callers use typed operations directly; no CLI invocation or MCP value enters here.
 
 use crate::clock;
-use crate::collection_names::{configured_handle, open, open_exact_in};
+use crate::collection_names::{configured_handle, open, open_configured_acquiring};
+#[cfg(test)]
+use crate::collection_names::open_exact_in;
 use crate::files as file_capability;
 use crate::out::Out;
 use crate::schemas::embeddings;
 use crate::schemas::files::{
     file, page, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_PAGE,
 };
+#[cfg(test)]
 use crate::storage::FactRead;
-use crate::storage::{read, FactArchive, FacultySnapshot, FacultyStore, Storage};
+use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use hifitime::efmt::consts::ISO8601_DATE;
@@ -27,7 +30,9 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionStoreExt};
+#[cfg(feature = "local-embed")]
+use triblespace::core::collection::CollectionSnapshotExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
@@ -233,19 +238,14 @@ fn with_files_store<T>(
         &mut FacultyStore,
         Collection<SimpleArchive>,
         &SigningKey,
-        &tokio::runtime::Runtime,
+        &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<T>,
 ) -> Result<T> {
     // Authority is durable and explicit: ordinary Files commands never mint a
     // new signer and never fall back to an ephemeral identity.
     storage.with_store(|store, signer, runtime| {
-        let collection = if let Some(handle) = configured_handle(DEFAULT_SCOPE_ID)? {
-            let snapshot = store
-                .snapshot()
-                .context("snapshot configured Files descriptor")?;
-            runtime.block_on(read(store, &snapshot, |reader| {
-                open_exact_in(reader, DEFAULT_SCOPE_ID, handle)
-            }))?
+        let collection = if configured_handle(DEFAULT_SCOPE_ID)?.is_some() {
+            open_configured_acquiring(store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?
         } else {
             open(store, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .context("register signer-private Files descriptor")?
@@ -284,7 +284,7 @@ fn with_files_view<T>(
         &SigningKey,
         &FactArchive,
         &FacultySnapshot,
-        &tokio::runtime::Runtime,
+        &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<T>,
 ) -> Result<T> {
     with_files_store(storage, |store, collection, signer, runtime| {
@@ -298,14 +298,14 @@ fn files_view_in<T>(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     f: impl FnOnce(
         &mut FacultyStore,
         Collection<SimpleArchive>,
         &SigningKey,
         &FactArchive,
         &FacultySnapshot,
-        &tokio::runtime::Runtime,
+        &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<T>,
 ) -> Result<T> {
     {
@@ -318,8 +318,8 @@ fn files_view_in<T>(
         let reader = store
             .snapshot()
             .context("freeze the Files views as they stand")?;
-        let space = reader
-            .read_facts(rank9)
+        let acquiring = AcquiringReader::new(reader.clone(), runtime.clone());
+        let space = crate::storage::acquire_facts(&acquiring, rank9)
             .context("read Files fact collection")?;
         f(store, collection, signer, &space, &reader, runtime)
     }
@@ -410,8 +410,8 @@ const SEMANTIC_COMPUTE: &str = "gb10";
 /// new descriptor; another model or observation in the same collection does
 /// not.
 #[cfg(feature = "local-embed")]
-fn semantic_index(
-    descriptors: &PileSnapshot,
+fn semantic_index<R: triblespace::core::repo::StoreRead>(
+    descriptors: &R,
     kind: Kind,
     compute: &str,
 ) -> Result<SemanticIndex<embeddings::Embedding768>> {
@@ -446,23 +446,20 @@ fn semantic_lag_note(kind: Kind, unindexed: usize) -> String {
     )
 }
 
-/// Register the index descriptor of one kind (idempotent) and return its
-/// collection.
+/// Register the index descriptor of one kind (idempotent) from the same
+/// frozen model observation used by its query or golden check.
 #[cfg(feature = "local-embed")]
-fn semantic_target(
+fn semantic_target<R: triblespace::core::repo::StoreRead>(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     kind: Kind,
     compute: &str,
+    descriptors: &R,
 ) -> Result<Collection<NvFp4CosineSet<embeddings::Embedding768>>> {
-    let descriptors = store
-        .snapshot()
-        .context("freeze the pile for the Files semantic index")?;
     let policy = collection
-        .policy(&descriptors)
+        .policy(descriptors)
         .context("read Files source collection policy")?;
-    let index = semantic_index(&descriptors, kind, compute)?;
-    drop(descriptors);
+    let index = semantic_index(descriptors, kind, compute)?;
     store
         .derive_with(collection, index, policy)
         .with_context(|| format!("register the Files {kind} index"))
@@ -503,7 +500,7 @@ fn maintain_semantic(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     every_file: bool,
 ) -> Result<SemanticUpkeep> {
     maintain_semantic_on(
@@ -523,23 +520,25 @@ fn maintain_semantic_on(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     every_file: bool,
     compute: &str,
 ) -> Result<SemanticUpkeep> {
+    // Golden checks and both target descriptors use the same observation.
+    // Acquiring a body may add bytes, never change the model chosen midway.
+    let frozen = AcquiringReader::new(
+        store.snapshot().context("freeze the Files semantic models")?,
+        runtime.clone(),
+    );
     if local_compute() == compute {
         // The golden vectors first: this device must embed the fixed inputs
         // to what the model collection records before it publishes a row.
-        let frozen = store
-            .snapshot()
-            .context("freeze the pile for the golden vectors")?;
         crate::nomic::golden_report(&frozen)?.admit()?;
-        drop(frozen);
     }
     let mut targets = Vec::with_capacity(Kind::ALL.len());
     let mut failures = Vec::new();
     for kind in Kind::ALL {
-        let target = match semantic_target(store, collection, kind, compute) {
+        let target = match semantic_target(store, collection, kind, compute, &frozen) {
             Ok(target) => target,
             Err(error) => {
                 failures.push(error);
@@ -600,6 +599,7 @@ fn semantic_failures(failures: Vec<anyhow::Error>) -> Result<()> {
 fn cmd_golden(
     store: &mut FacultyStore,
     signer: &SigningKey,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     publish: bool,
     out: &mut Out<'_>,
 ) -> Result<()> {
@@ -610,11 +610,12 @@ fn cmd_golden(
                 local_compute()
             );
         }
-        crate::nomic::golden_publish(store, signer)?
+        crate::nomic::golden_publish(store, signer, runtime)?
     } else {
-        let frozen = store
-            .snapshot()
-            .context("freeze the pile for the golden vectors")?;
+        let frozen = AcquiringReader::new(
+            store.snapshot().context("freeze the pile for the golden vectors")?,
+            runtime.clone(),
+        );
         (crate::nomic::golden_report(&frozen)?, Vec::new())
     };
     for row in &report.rows {
@@ -672,13 +673,13 @@ fn load_mm7b() -> Result<Mm7bEmbedder> {
         }
     };
     eprintln!("files: loading nomic-embed-multimodal-7b (once, ~20s)…");
-    let snapshot = mary::model_collection::load_model_collection_local_latest(&pile)
-        .context("discover and freeze the sole native Mary MM7B model collection")?;
-    mary::persist::load_nomic_mm7b_aliased_from_snapshot(
-        snapshot,
-        &tok,
-        mary::nn::backend::WgpuDevice::default(),
-    )
+    crate::model_storage::with_snapshot(&pile, MODEL, |snapshot| {
+        mary::persist::load_nomic_mm7b_aliased_from_snapshot(
+            snapshot.clone(),
+            &tok,
+            mary::nn::backend::WgpuDevice::default(),
+        )
+    })
 }
 
 /// Embed image bytes into the 3584-d 7b space.
@@ -813,7 +814,7 @@ fn cmd_add(
     pile: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     path: &Path,
     mime_override: Option<&str>,
     tags: &[String],
@@ -1580,7 +1581,7 @@ fn cmd_index(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     out: &mut Out<'_>,
 ) -> Result<()> {
     #[cfg(not(feature = "local-embed"))]
@@ -1598,15 +1599,16 @@ fn index_on(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     out: &mut Out<'_>,
     compute: &str,
 ) -> Result<()> {
     let (targets, snapshot, mut failures) =
         maintain_semantic_on(store, collection, signer, runtime, true, compute)?;
+    let snapshot = AcquiringReader::new(snapshot, runtime.clone());
     for (kind, target) in targets {
         let index = snapshot
-            .collection(target)
+            .collection_acquiring(target)
             .with_context(|| format!("observe the Files {kind} index"))
             .and_then(|observed| {
                 observed
@@ -1645,7 +1647,7 @@ fn cmd_embed7b<P: TriblePattern>(
     signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
     space: &P,
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     force: bool,
     out: &mut Out<'_>,
 ) -> Result<()> {
@@ -1853,7 +1855,7 @@ fn cmd_embed7b_pdf<P: TriblePattern>(
     signer: &SigningKey,
     runtime: &tokio::runtime::Runtime,
     space: &P,
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     force: bool,
     dpi: u32,
     file_limit: usize,
@@ -2025,16 +2027,17 @@ fn cmd_similar<P: TriblePattern>(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     space: &P,
-    reader: &PileSnapshot,
+    snapshot: &FacultySnapshot,
     options: &SimilarityOptions<'_>,
     out: &mut Out<'_>,
 ) -> Result<()> {
+    let reader = AcquiringReader::new(snapshot.clone(), runtime.clone());
     if options.mm7b {
         return cmd_similar_mm7b(
             space,
-            reader,
+            &reader,
             options.id,
             options.text,
             options.floor,
@@ -2050,7 +2053,7 @@ fn cmd_similar<P: TriblePattern>(
     }
     #[cfg(feature = "local-embed")]
     {
-        let (query_vec, query_contents, label) = similarity_query(space, reader, options)?;
+        let (query_vec, query_contents, label) = similarity_query(space, &reader, &reader, options)?;
 
         // The indexes as they stand: a query is a read and never waits on the
         // GPU. `files add` embeds the file it just saved, and any earlier
@@ -2068,19 +2071,19 @@ fn cmd_similar<P: TriblePattern>(
         for kind in kinds {
             targets.push((
                 kind,
-                semantic_target(store, collection, kind, SEMANTIC_COMPUTE)?,
+                semantic_target(store, collection, kind, SEMANTIC_COMPUTE, &reader)?,
             ));
         }
-        let snapshot = store
-            .snapshot()
-            .context("freeze the pile for the Files semantic index")?;
+        let snapshot = AcquiringReader::new(
+            store.snapshot().context("freeze the Files semantic index")?, runtime.clone(),
+        );
         // One reconstruction scan per index; an index not asked about scores
         // nothing and its branch of the query below is empty.
         let mut image_cosines = ReconstructedCosines::default();
         let mut text_cosines = ReconstructedCosines::default();
         for (kind, target) in &targets {
             let index = snapshot
-                .collection(*target)
+                .collection_acquiring(*target)
                 .with_context(|| format!("observe the Files {kind} index"))?
                 .view::<NvFp4CosineIndex<embeddings::Embedding768>>()
                 .with_context(|| format!("read the Files {kind} index"))?;
@@ -2178,8 +2181,8 @@ fn cmd_similar<P: TriblePattern>(
             for (cos, content) in hits {
                 let held = &holders[content];
                 let eid = *held.first().expect("every hit has a holder");
-                let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
-                let mime = read_mime(space, reader, eid)?.unwrap_or_else(|| "?".into());
+                let name = read_name(space, &reader, eid)?.unwrap_or_else(|| "?".into());
+                let mime = read_mime(space, &reader, eid)?.unwrap_or_else(|| "?".into());
                 let hash = handle_hex(*content);
                 let tags = tags_of(space, eid);
                 let tagstr = if tags.is_empty() {
@@ -2206,14 +2209,15 @@ fn cmd_similar<P: TriblePattern>(
 /// indexes embed them (image or text by content). A file query also names its
 /// own contents, which its answer leaves out.
 #[cfg(feature = "local-embed")]
-fn similarity_query<P: TriblePattern>(
+fn similarity_query<P: TriblePattern, R: triblespace::core::repo::StoreRead>(
     space: &P,
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
+    models: &R,
     options: &SimilarityOptions<'_>,
 ) -> Result<(Vec<f32>, std::collections::BTreeSet<FileHandle>, String)> {
     let selector = match (options.text, options.id) {
         (Some(text), _) => {
-            let vector = crate::nomic::load_text_embedder_in(reader)?.embed_query(text)?;
+            let vector = crate::nomic::load_text_embedder_in(models)?.embed_query(text)?;
             return Ok((vector, Default::default(), format!("{text:?}")));
         }
         (None, Some(selector)) => selector,
@@ -2228,10 +2232,10 @@ fn similarity_query<P: TriblePattern>(
         .context("read the query file's bytes")?;
     let name = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
     let vector = match classify(bytes.as_ref()) {
-        Content::Image => crate::nomic::load_vision_embedder_in(reader)?
+        Content::Image => crate::nomic::load_vision_embedder_in(models)?
             .embed_image(bytes.as_ref())
             .context("embed the query image")?,
-        Content::Pdf(text) | Content::Text(text) => crate::nomic::load_text_embedder_in(reader)?
+        Content::Pdf(text) | Content::Text(text) => crate::nomic::load_text_embedder_in(models)?
             .embed_document(&text)
             .context("embed the query document")?,
         Content::Other => {
@@ -2299,7 +2303,7 @@ fn similar_contents<P: TriblePattern>(
 /// reuses that file's stored 7b vector (image→image).
 fn cmd_similar_mm7b<P: TriblePattern>(
     space: &P,
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     id: Option<&str>,
     text: Option<&str>,
     floor: f32,
@@ -2677,8 +2681,8 @@ impl Files {
             bail!("`files golden` needs the embedders — rebuild with --features local-embed");
         }
         #[cfg(feature = "local-embed")]
-        with_files_store(&self.storage, |store, _collection, signer, _runtime| {
-            cmd_golden(store, signer, publish, out)
+        with_files_store(&self.storage, |store, _collection, signer, runtime| {
+            cmd_golden(store, signer, runtime, publish, out)
         })
     }
 
@@ -2689,6 +2693,7 @@ impl Files {
         with_files_view(
             &self.storage,
             |store, collection, signer, facts, snapshot, runtime| {
+                let reader = AcquiringReader::new(snapshot.clone(), runtime.clone());
                 if options.pdf {
                     cmd_embed7b_pdf(
                         store,
@@ -2696,7 +2701,7 @@ impl Files {
                         signer,
                         runtime,
                         facts,
-                        snapshot,
+                        &reader,
                         options.force,
                         options.dpi,
                         options.limit,
@@ -2710,7 +2715,7 @@ impl Files {
                         signer,
                         runtime,
                         facts,
-                        snapshot,
+                        &reader,
                         options.force,
                         out,
                     )
@@ -3542,6 +3547,52 @@ mod tests {
 
     #[cfg(feature = "local-embed")]
     #[test]
+    fn semantic_targets_keep_the_model_observation_used_by_the_operation() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+
+        let fixture = TestPile::new();
+        let publisher = SigningKey::from_bytes(&[0x76; 32]);
+        let mut pile = Pile::open(&fixture.path).unwrap();
+        for fragment in [
+            native_model_fragment(crate::nomic::NOMIC_TEXT_MODEL, "text.weight", 1.0),
+            native_model_fragment(crate::nomic::NOMIC_VISION_MODEL, "vision.weight", 2.0),
+            native_tokenizer_fragment(crate::nomic::NOMIC_TEXT_MODEL, WORDPIECE),
+        ] {
+            mary::model_collection::publish_model_fragment(&mut pile, &publisher, fragment)
+                .unwrap();
+        }
+        pile.close().unwrap();
+
+        let storage = Storage::new(fixture.path.clone(), None);
+        storage
+            .with_store(|store, _, runtime| {
+                let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+                let files = store.collection("files", policy)?;
+                let frozen = AcquiringReader::new(store.snapshot()?, runtime.clone());
+                let models = crate::nomic::index_models_in(&frozen)?;
+                let before = semantic_target(store, files, Kind::Text, SEMANTIC_COMPUTE, &frozen)?;
+
+                // A later admitted model would make a fresh selection ambiguous.
+                // It must not replace the model used by this command's query/check.
+                let model_collection =
+                    mary::model_collection::model_graph_collections_in(&frozen)?[0];
+                store.commit(
+                    model_collection,
+                    &publisher,
+                    native_model_fragment(crate::nomic::NOMIC_TEXT_MODEL, "later.weight", 3.0),
+                )?;
+                let after = semantic_target(store, files, Kind::Text, SEMANTIC_COMPUTE, &frozen)?;
+                assert_eq!(before, after);
+                assert_eq!(models, crate::nomic::index_models_in(&frozen)?);
+                let current = AcquiringReader::new(store.snapshot()?, runtime.clone());
+                assert!(crate::nomic::index_models_in(&current).is_err());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[cfg(feature = "local-embed")]
+    #[test]
     fn semantic_descriptor_ignores_observations_extra_models_and_support_packaging() {
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, DeriveMapping};
 
@@ -4021,7 +4072,8 @@ mod tests {
                     policy,
                 )?;
                 drop(runtime.block_on(store.ensure(exact, &deriver))?);
-                let text = semantic_target(store, files, Kind::Text, ELSEWHERE)?;
+                let descriptors = AcquiringReader::new(store.snapshot()?, runtime.clone());
+                let text = semantic_target(store, files, Kind::Text, ELSEWHERE, &descriptors)?;
                 let records = |store: &mut FacultyStore, collection: CollectionHandle| {
                     store
                         .snapshot()
@@ -4137,8 +4189,9 @@ mod tests {
                     policy,
                 )?;
                 drop(runtime.block_on(store.ensure(exact, &deriver))?);
-                let image = semantic_target(store, files, Kind::Image, ELSEWHERE)?;
-                let text = semantic_target(store, files, Kind::Text, ELSEWHERE)?;
+                let descriptors = AcquiringReader::new(store.snapshot()?, runtime.clone());
+                let image = semantic_target(store, files, Kind::Image, ELSEWHERE, &descriptors)?;
+                let text = semantic_target(store, files, Kind::Text, ELSEWHERE, &descriptors)?;
                 let records = |store: &mut FacultyStore, collection: CollectionHandle| {
                     store
                         .snapshot()

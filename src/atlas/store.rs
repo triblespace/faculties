@@ -1,7 +1,6 @@
 //! Callable Atlas operations over the configured collection, without output
 //! routing, CLI invocations, or MCP values.
 
-use crate::storage::FactRead;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -12,16 +11,15 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::{find, pattern, Id};
 
 use super::{named_entries, named_entry, AtlasEntry};
-use crate::collection_names::open_configured;
+use crate::collection_names::open_configured_acquiring;
 use crate::schemas::atlas::DEFAULT_SCOPE_ID;
-use crate::storage::{FactArchive, Storage};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Storage};
 
-/// A local Atlas reader. Each operation maintains the existing collection
+/// An acquiring Atlas reader. Each operation opens the existing collection
 /// mappings, then projects facts and attachments from one final snapshot.
 /// Returned entries are owned observations, not a second mutable catalog.
 ///
@@ -83,18 +81,20 @@ impl Store {
 
     fn with_view<T>(
         &self,
-        operation: impl FnOnce(&FactArchive, &PileSnapshot) -> Result<T>,
+        operation: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_pile(|pile, signer| {
-            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        self.storage.with_store(|pile, signer, runtime| {
+            let source = open_configured_acquiring(
+                pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
             let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let collection_rank9 =
                 pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
-            let store_snapshot = pile
-                .snapshot()
-                .context("freeze resident Atlas fact collection")?;
-            let facts = store_snapshot
-                .read_facts(collection_rank9)
+            let store_snapshot = AcquiringReader::new(
+                pile.snapshot().context("freeze Atlas fact collection")?,
+                std::sync::Arc::clone(runtime),
+            );
+            let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
                 .context("read maintained Atlas fact collection")?;
             operation(&facts, &store_snapshot)
         })

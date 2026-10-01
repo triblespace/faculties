@@ -1,5 +1,6 @@
 //! `mail` — collection-native RFC 5322 evidence, intent, and receipt faculty.
 
+#[cfg(test)]
 use crate::storage::FactRead;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -20,7 +21,7 @@ use crate::schemas::{
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
-use crate::storage::{open_secrets_collection, open_secrets_collection_read, FactArchive};
+use crate::storage::{open_secrets_collection, open_secrets_collection_read, AcquiringReader, FactArchive, FacultySnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -33,7 +34,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
+type PileSnapshot = AcquiringReader<FacultySnapshot>;
 use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -282,7 +283,7 @@ struct Storage {
 
 impl Storage {
     fn from_storage(storage: crate::storage::Storage, scopes: Scopes) -> Result<Self> {
-        let signer = storage.with_pile(|_, signer| Ok(signer.clone()))?;
+        let signer = storage.with_store(|_, signer, _| Ok(signer.clone()))?;
         Ok(Self {
             storage,
             signer,
@@ -301,7 +302,16 @@ impl Storage {
     }
 
     fn views(&self) -> Result<Views> {
-        self.storage.with_pile(|pile, _| {
+        self.storage.with_store(|store, _, runtime| {
+            for scope in [self.scopes.mail, self.scopes.files, self.scopes.decide, self.scopes.relations] {
+                crate::collection_names::open_configured_acquiring(
+                    store, scope, self.signer.verifying_key(), runtime,
+                )?;
+            }
+            crate::storage::open_secrets_collection_acquiring(
+                store, self.signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
             let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot, secrets) = {
                 let mail_collection =
                     open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
@@ -334,7 +344,7 @@ impl Storage {
                 // never maintains and never waits for a source commit nothing
                 // has attached yet, which it reads from its own bytes; a write
                 // attaches the source's frontier after its commit.
-                let secrets = pollster::block_on(async {
+                let secrets = runtime.block_on(async {
                     let secrets = secret_storage::ensure_and_snapshot(
                         pile,
                         secrets_collection,
@@ -348,18 +358,15 @@ impl Storage {
                 // every maintained view through that same world so Mail
                 // facts, file payloads, decisions, relations, and credentials can
                 // never be assembled from different store prefixes.
-                let store_snapshot = secrets.store_snapshot().clone();
-                let mail_facts = store_snapshot
-                    .read_facts(mail_rank9)
+                let store_snapshot = AcquiringReader::new(secrets.store_snapshot().clone(), runtime.clone());
+                let secrets = secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
+                let mail_facts = crate::storage::acquire_facts(&store_snapshot, mail_rank9)
                     .context("read maintained Mail fact collection")?;
-                let files_facts = store_snapshot
-                    .read_facts(files_rank9)
+                let files_facts = crate::storage::acquire_facts(&store_snapshot, files_rank9)
                     .context("read maintained Files fact collection")?;
-                let decide_facts = store_snapshot
-                    .read_facts(decide_rank9)
+                let decide_facts = crate::storage::acquire_facts(&store_snapshot, decide_rank9)
                     .context("read maintained Decide fact collection")?;
-                let relations_facts = store_snapshot
-                    .read_facts(relations_rank9)
+                let relations_facts = crate::storage::acquire_facts(&store_snapshot, relations_rank9)
                     .context("read maintained Relations fact collection")?;
                 (
                     mail_facts,
@@ -393,7 +400,11 @@ impl Storage {
     }
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
-        self.storage.with_pile(|pile, _| {
+        self.storage.with_store(|store, _, runtime| {
+            crate::storage::open_secrets_collection_acquiring(
+                store, self.signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
             let collection = open_secrets_collection(&mut *pile, self.signer.verifying_key())?;
             secret_storage::add_secret(
                 &mut *pile,
@@ -408,15 +419,18 @@ impl Storage {
     }
 
     fn publish(&self, scope: Id, fragment: Fragment, description: &str) -> Result<()> {
-        self.storage.with_pile(|pile, _| {
+        self.storage.with_store(|store, _, runtime| {
+            let collection = crate::collection_names::open_configured_acquiring(
+                store, scope, self.signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
             let mut fragment = fragment;
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            let collection = open_configured(pile, scope, self.signer.verifying_key())?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
             self.published.set(true);
             drop(
-                pollster::block_on(crate::storage::ensure_downstream(
+                runtime.block_on(crate::storage::ensure_downstream(
                     pile,
                     collection,
                     &self.signer,

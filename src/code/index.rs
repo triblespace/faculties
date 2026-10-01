@@ -27,13 +27,13 @@
 //! acceleration — only speed does. A collection this size that re-indexed itself
 //! on every read would make `code find` cost what an `orient wake` costs.
 
-use crate::storage::FactView;
+use crate::storage::{AcquiringReader, FacultyStore};
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Context, Result};
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::inline::TryFromInline;
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25View};
@@ -43,7 +43,6 @@ use triblespace_search::tokens::{code_tokens, WordHash};
 use crate::code::operations::{
     hit, keeps, placements_of_item, provenance, select_scans, Code, Filter, Hit, Provenance, Texts,
 };
-use crate::collection_names::open_configured;
 use crate::schemas::code::{attrs, DEFAULT_SCOPE_ID};
 use crate::storage::FactArchive;
 
@@ -114,7 +113,7 @@ const DISTINGUISHING: usize = 3;
 const UBIQUITOUS: &[&str] = &["std", "crate", "super", "self", "core", "alloc"];
 
 fn register(
-    pile: &mut triblespace::core::repo::pile::Pile,
+    pile: &mut FacultyStore,
     source: Collection<SimpleArchive>,
     attribute: Id,
 ) -> Result<Collection<PortableBM25Blob>> {
@@ -131,51 +130,35 @@ fn register(
 impl Code {
     /// Build or refresh both lexical covers. The only verb that maintains.
     pub fn index(&self) -> Result<IndexReport> {
-        self.storage().with_pile(|pile, signer| {
-            pollster::block_on(async {
-                // Each index is attached to the source's frontier after its
-                // carry.
-                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-                let doc_target = register(pile, source, attrs::doc.id())?;
-                let text_target = register(pile, source, attrs::source_tokens.id())?;
-
-                let after = pile
+        self.storage().with_store(|store, signer, runtime| {
+            let source = crate::collection_names::open_configured_acquiring(
+                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let doc_target = register(store, source, attrs::doc.id())?;
+            let text_target = register(store, source, attrs::source_tokens.id())?;
+            let (doc_snapshot, text_snapshot) = runtime.block_on(async {
+                let doc_snapshot = store
                     .maintain_attached(doc_target, signer)
                     .await
                     .context("maintain Code prose BM25 cover")?;
-                let doc_documents = match after.attached(doc_target) {
-                    Ok(attached) => attached
-                        .view::<CodeBM25View>()
-                        .map(|view| view.segments().iter().map(|index| index.doc_count()).sum())
-                        .unwrap_or(0),
-                    // A cover that has never been maintained is not an error.
-                    Err(_) => 0,
-                };
-
-                let after = pile
+                let text_snapshot = store
                     .maintain_attached(text_target, signer)
                     .await
                     .context("maintain Code token BM25 cover")?;
-                let text_documents = match after.attached(text_target) {
-                    Ok(attached) => attached
-                        .view::<CodeBM25View>()
-                        .map(|view| view.segments().iter().map(|index| index.doc_count()).sum())
-                        .unwrap_or(0),
-                    // A cover that has never been maintained is not an error.
-                    Err(_) => 0,
-                };
-
-                let source_elements = match after.collection(source) {
-                    Ok(attached) => attached.support().map(|support| support.len()).unwrap_or(0),
-                    Err(_) => 0,
-                };
-
-                Ok(IndexReport {
-                    doc_documents,
-                    text_documents,
-                    source_elements,
-                })
-            })
+                Ok::<_, anyhow::Error>((doc_snapshot, text_snapshot))
+            })?;
+            let doc_snapshot = AcquiringReader::new(doc_snapshot, runtime.clone());
+            let text_snapshot = AcquiringReader::new(text_snapshot, runtime.clone());
+            let doc_documents = crate::storage::require_complete_attached_read(
+                doc_snapshot.attached_acquiring(doc_target)?.read_acquiring::<CodeBM25View>()?,
+            )?
+                .segments().iter().map(|index| index.doc_count()).sum();
+            let text_documents = crate::storage::require_complete_attached_read(
+                text_snapshot.attached_acquiring(text_target)?.read_acquiring::<CodeBM25View>()?,
+            )?
+                .segments().iter().map(|index| index.doc_count()).sum();
+            let source_elements = text_snapshot.collection(source)?.support()?.len();
+            Ok(IndexReport { doc_documents, text_documents, source_elements })
         })
     }
 
@@ -193,9 +176,19 @@ impl Code {
         top: usize,
         filter: &Filter,
     ) -> Result<SearchReport> {
+        self.with_operation(|code| code.search_scoped(query, tier, top, filter))
+    }
+
+    fn search_scoped(
+        &self,
+        query: &str,
+        tier: Tier,
+        top: usize,
+        filter: &Filter,
+    ) -> Result<SearchReport> {
         let scores = self.bm25_scores(query, tier)?;
-        let observed = crate::code::ingest::ensure_local_with_storage(self.storage())?;
-        let facts = observed.facts().context("read Code facts")?;
+        let observed = self.observe()?;
+        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -301,25 +294,25 @@ cover is behind them: run `code index`."
 impl Code {
     fn bm25_scores(&self, query: &str, tier: Tier) -> Result<BTreeMap<Id, f32>> {
         let terms = code_tokens(query);
-        self.storage().with_pile(|pile, signer| {
-            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-            let doc_target = register(pile, source, attrs::doc.id())?;
-            let text_target = register(pile, source, attrs::source_tokens.id())?;
-            let snapshot = pile.snapshot().context("freeze Code search snapshot")?;
+        self.storage().with_store(|store, signer, runtime| {
+            let source = crate::collection_names::open_configured_acquiring(
+                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let doc_target = register(store, source, attrs::doc.id())?;
+            let text_target = register(store, source, attrs::source_tokens.id())?;
+            let snapshot = AcquiringReader::new(
+                store.snapshot().context("freeze Code search snapshot")?, runtime.clone(),
+            );
 
             let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
             let accumulate = |target: Collection<PortableBM25Blob>,
                               weight: f32,
                               scores: &mut BTreeMap<Id, f32>|
              -> Result<()> {
-                let Ok(attached) = snapshot.attached(target) else {
-                    // A cover that has never been maintained is not an error; it
-                    // is a cover that is behind, and the caller is told so.
-                    return Ok(());
-                };
-                let Ok(view) = attached.view::<CodeBM25View>() else {
-                    return Ok(());
-                };
+                let attached = snapshot.attached_acquiring(target)?;
+                let view = crate::storage::require_complete_attached_read(
+                    attached.read_acquiring::<CodeBM25View>()?,
+                )?;
                 let query = view.query().context("prepare Code BM25 query")?;
                 for (document, score) in query.query_multi(&terms) {
                     let id = Id::try_from_inline(&document).map_err(|error| {
@@ -359,7 +352,7 @@ impl Code {
 /// at a glance.
 fn attach_evidence(
     facts: &FactArchive,
-    reader: &triblespace::core::repo::pile::PileSnapshot,
+    reader: &crate::code::operations::CodeReader,
     groups: &mut [SearchGroup],
 ) {
     let mut top: Option<BTreeSet<String>> = None;
@@ -414,6 +407,43 @@ fn attach_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cold_text_bm25_residual_fetches_exact_text_on_the_frozen_view() {
+        use triblespace::core::blob::{Blob, IntoBlob};
+        use triblespace::core::blob::encodings::utf8string::UTF8String;
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::repo::{BlobStoreList, BlobStorePut, StorageClose};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cold-code-bm25.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[114; 32]);
+        let mut store = crate::storage::open_store_as(&path, signer.verifying_key()).unwrap();
+        let root = store.collection("cold Code BM25", CollectionPolicy::new(
+            AdmissionPolicy::direct(signer.verifying_key()),
+            AdmissionPolicy::direct(signer.verifying_key()),
+        )).unwrap();
+        let target = register(&mut store, root, attrs::doc.id()).unwrap();
+        let text: Blob<UTF8String> = String::from("a delayed GPU kernel").to_blob();
+        let handle = text.get_handle();
+        store.commit(root, &signer, entity! { attrs::doc: handle }).unwrap();
+        let frozen = store.snapshot().unwrap();
+        let passive = frozen.attached(target).unwrap().read::<CodeBM25View>().unwrap();
+        assert_eq!(passive.unread().len(), 1);
+
+        store.put::<UTF8String, _>(text).unwrap();
+        let runtime = std::sync::Arc::new(crate::storage::runtime().unwrap());
+        let reader = AcquiringReader::new(frozen, runtime);
+        let selected = reader.attached_acquiring(target).unwrap();
+        let read = selected.read_acquiring::<CodeBM25View>().unwrap();
+        assert!(read.unread().is_empty());
+        assert_eq!(read.value().segments().iter().map(|segment| segment.doc_count()).sum::<usize>(), 1);
+        assert_eq!(selected.residual().len(), 1);
+        assert!(!reader.contains_blob(handle).unwrap());
+        assert!(store.health().started_at.is_none());
+        store.close().unwrap();
+    }
 
     #[test]
     fn a_tier_name_round_trips() {

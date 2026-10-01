@@ -14,7 +14,7 @@ use crate::storage::initialize_signer;
 use crate::storage::open_secrets_collection;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{open_secrets_collection_read, FactArchive, Storage};
+use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use hifitime::{Epoch, TimeScale};
@@ -32,13 +32,14 @@ use triblespace::core::collection::{
 };
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
 use triblespace::prelude::*;
 
 use crate::clock;
+use crate::collection_names::open_configured_acquiring;
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::files as file_capability;
 use crate::schemas::archive::{archive, RawBytes};
@@ -48,7 +49,8 @@ use crate::teams as teams_core;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveAccess {
-    /// Query the maintained resident archive without Graph or credential access.
+    /// Query the frozen archive without Graph or credential access. Missing
+    /// referenced bytes may be acquired from the colony.
     Resident,
     /// Complete one finite delta round before observing the archive.
     Synchronize,
@@ -542,7 +544,7 @@ struct TeamsStorage {
 #[derive(Clone)]
 struct CollectionView {
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: AcquiringReader<FacultySnapshot>,
 }
 
 struct TeamsSession {
@@ -551,10 +553,10 @@ struct TeamsSession {
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
     support: Support<SimpleArchive>,
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: AcquiringReader<FacultySnapshot>,
     signer: ed25519_dalek::SigningKey,
     secret_collection: secret_storage::SecretsCollection,
-    secrets: SecretsSnapshot<PileSnapshot>,
+    secrets: SecretsSnapshot<AcquiringReader<FacultySnapshot>>,
     notices: Vec<String>,
 }
 
@@ -632,18 +634,19 @@ impl TeamsSession {
 
         fragment.describe_with(entity! { metadata::description: description });
         let storage = self.storage.clone();
-        storage.with_pile(|pile, _| {
-            crate::collection_names::require_command_write_admission(
+        storage.with_store(|pile, _, runtime| {
+            crate::collection_names::require_command_write_admission_acquiring(
                 pile,
                 self.collection,
                 &self.signer,
                 "Teams",
                 "teams read",
+                runtime,
             )?;
             let commit = pile
                 .commit(self.collection, &self.signer, fragment)
                 .context("commit Teams fragment")?;
-            pollster::block_on(async {
+            runtime.block_on(async {
                 // A write derives its own leaves into every view of its
                 // collection, so the commit is readable through them at once.
                 drop(
@@ -651,8 +654,9 @@ impl TeamsSession {
                         .await
                         .context("Teams fragment was committed, but ensuring its views failed")?,
                 );
-                self.refresh_secrets_for_async(pile, None).await
+                Ok::<_, anyhow::Error>(())
             })?;
+            self.refresh_secrets_for(pile, None, runtime)?;
             Ok(Some(commit))
         })
     }
@@ -662,30 +666,30 @@ impl TeamsSession {
         // support. Only Secrets gets a new observation here.
         let support = self.support.clone();
         let storage = self.storage.clone();
-        storage.with_pile(|pile, _| {
-            pollster::block_on(self.refresh_secrets_for_async(pile, Some(support)))
+        storage.with_store(|pile, _, runtime| {
+            self.refresh_secrets_for(pile, Some(support), runtime)
         })
     }
 
-    async fn refresh_secrets_for_async(
+    fn refresh_secrets_for(
         &mut self,
-        pile: &mut Pile,
+        pile: &mut FacultyStore,
         support: Option<Support<SimpleArchive>>,
+        runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<()> {
-        let secrets =
-            secret_storage::ensure_and_snapshot(pile, self.secret_collection, &self.signer)
-                .await
-                .context("refresh configured Secrets collection for Teams")?;
-        let reader = secrets.store_snapshot().clone();
+        let snapshot = runtime.block_on(self.secret_collection.ensure(pile, &self.signer))
+            .context("refresh configured Secrets collection for Teams")?;
+        let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
+        let secrets = secret_storage::snapshot_acquiring(reader.clone(), self.secret_collection)?;
         // A credential-only refresh keeps the session's Teams facts and
         // support as they were selected; only Secrets and the reader move.
         // A Teams commit observes the ordinary view at this final snapshot.
         if support.is_none() {
             let observed = reader
-                .attached(self.rank9)
+                .attached_acquiring(self.rank9)
                 .context("attach Teams through Secrets snapshot")?;
             let support = observed.support().clone();
-            let facts = crate::storage::attached_facts(&observed)
+            let facts = crate::storage::acquire_attached_facts(&observed)
                 .context("read Teams through Secrets snapshot")?;
             drop(observed);
             self.support = support;
@@ -704,7 +708,7 @@ impl TeamsSession {
     ) -> Result<Id> {
         let secret = self
             .storage
-            .with_pile(|pile, _| {
+            .with_store(|pile, _, _| {
                 secret_storage::add_secret(
                     pile,
                     &self.signer,
@@ -726,19 +730,23 @@ impl TeamsSession {
 impl TeamsStorage {
     fn with_session<T>(&self, operation: impl FnOnce(&mut TeamsSession) -> Result<T>) -> Result<T> {
         self.storage.scope(|storage| {
-            let mut session = storage.with_pile(|pile, signer| {
-                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let mut session = storage.with_store(|pile, signer, runtime| {
+                let collection = open_configured_acquiring(
+                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+                )?;
                 let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
                 let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
                     collection,
                     maintained_succinct,
                 )?;
-                let secret_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
+                let secret_collection = open_secrets_collection_acquiring(
+                    pile, signer.verifying_key(), runtime,
+                )?;
                 // The session carries the source and attaches the frontier
                 // the carry leaves; a commit neither attachment reaches yet
                 // is read from its own bytes, and what this key cannot
                 // attach is lag, not a failure.
-                let secrets = pollster::block_on(async {
+                let snapshot = runtime.block_on(async {
                     crate::storage::tolerate_own_lag(
                         pile.maintain_attached(maintained_succinct, signer).await,
                     )
@@ -747,18 +755,18 @@ impl TeamsStorage {
                         pile.maintain_attached(maintained_rank9, signer).await,
                     )
                     .context("maintain Teams fact collection")?;
-                    let secrets =
-                        secret_storage::ensure_and_snapshot(pile, secret_collection, signer)
+                    let snapshot = secret_collection.ensure(pile, signer)
                             .await
                             .context("observe configured Secrets collection for Teams")?;
-                    Ok::<_, anyhow::Error>(secrets)
+                    Ok::<_, anyhow::Error>(snapshot)
                 })?;
-                let reader = secrets.store_snapshot().clone();
+                let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
+                let secrets = secret_storage::snapshot_acquiring(reader.clone(), secret_collection)?;
                 let observed = reader
-                    .attached(maintained_rank9)
+                    .attached_acquiring(maintained_rank9)
                     .context("observe Teams through Secrets snapshot")?;
                 let support = observed.support().clone();
-                let facts = crate::storage::attached_facts(&observed)
+                let facts = crate::storage::acquire_attached_facts(&observed)
                     .context("read Teams through Secrets snapshot")?;
                 drop(observed);
                 Ok(TeamsSession {
@@ -1227,7 +1235,7 @@ fn now_epoch_secs() -> Result<i64> {
     Ok(clock::now()?.to_unix_seconds() as i64)
 }
 
-fn load_context<P>(reader: &PileSnapshot, catalog: &P, source_id: Id) -> Result<PresentationContext>
+fn load_context<P>(reader: &impl BlobStoreGet, catalog: &P, source_id: Id) -> Result<PresentationContext>
 where
     P: TriblePattern,
 {
@@ -1469,7 +1477,7 @@ where
 }
 
 fn load_chat_map<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     catalog: &P,
     source_id: Id,
 ) -> Result<HashMap<Id, String>>
@@ -1493,7 +1501,7 @@ where
 }
 
 fn load_message_external_map<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     catalog: &P,
     source_id: Id,
 ) -> Result<HashMap<Id, String>>
@@ -1524,7 +1532,7 @@ where
 }
 
 fn load_known_messages<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     catalog: &P,
     source_id: Id,
 ) -> Result<Vec<KnownMessage>>
@@ -1565,7 +1573,7 @@ where
 }
 
 fn read_utf8string(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     handle: Inline<Handle<UTF8String>>,
     field: &str,
 ) -> Result<String> {
@@ -2674,7 +2682,7 @@ fn list_attachments(
 }
 
 fn attachment_rows<P>(
-    _reader: &PileSnapshot,
+    _reader: &impl BlobStoreGet,
     catalog: &P,
     source_id: Id,
     chat_filter: Option<&HashSet<Id>>,
@@ -3172,7 +3180,7 @@ fn inline_u256_to_u128(value: Inline<U256BE>) -> Result<u128> {
 }
 
 fn coverage_head<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     catalog: &P,
     source_id: Id,
 ) -> Result<Option<CoverageHead>>

@@ -4,7 +4,7 @@
 //! meaningful with its denominator, and a tool that says "absent" without
 //! saying absent *from what* is how the fourth wrong absence claim gets made.
 
-use crate::storage::FactView;
+use crate::storage::{AcquiringReader, FacultySnapshot};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -14,8 +14,8 @@ use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::collection::AttachedSnapshot;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 #[allow(unused_imports)]
 use triblespace::prelude::blobencodings::RawBytes;
 #[allow(unused_imports)]
@@ -225,7 +225,8 @@ pub struct IngestOptions {
 
 // ── reading ─────────────────────────────────────────────────────────────
 
-type Observed = AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>;
+pub(crate) type CodeReader = AcquiringReader<FacultySnapshot>;
+type Observed = AttachedSnapshot<CodeReader, Rank9AcceleratedSuccinctArchiveBlob>;
 
 /// A per-invocation memo of blob text.
 ///
@@ -234,12 +235,12 @@ type Observed = AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBl
 /// dropped with it. Nothing queries it, nothing joins against it, and it never
 /// answers a question the pile was not asked.
 pub(crate) struct Texts<'a> {
-    reader: &'a PileSnapshot,
+    reader: &'a CodeReader,
     seen: HashMap<[u8; 32], String>,
 }
 
 impl<'a> Texts<'a> {
-    pub(crate) fn new(reader: &'a PileSnapshot) -> Self {
+    pub(crate) fn new(reader: &'a CodeReader) -> Self {
         Self {
             reader,
             seen: HashMap::new(),
@@ -283,8 +284,24 @@ impl Code {
         Self { storage }
     }
 
-    fn observe(&self) -> Result<Observed> {
-        ingest::ensure_local_with_storage(&self.storage)
+    pub(crate) fn observe(&self) -> Result<Observed> {
+        self.storage.with_store(|store, signer, runtime| {
+            let source = crate::collection_names::open_configured_acquiring(
+                store, crate::schemas::code::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
+            runtime.block_on(async {
+                crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            AcquiringReader::new(store.snapshot()?, runtime.clone()).attached_acquiring(rank9)
+                .context("attach Code facts from one frozen observation")
+        })
+    }
+
+    pub(crate) fn with_operation<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.storage.scope(|storage| operation(&Self::with_storage(storage.clone())))
     }
 
     // ── ingest ──────────────────────────────────────────────────────────
@@ -323,8 +340,8 @@ impl Code {
             return Ok(report);
         }
 
-        report.repos = self.storage.with_pile(|pile, signer| {
-            let mut writer = pollster::block_on(ingest::CodeImportWriter::from_pile(pile, signer))?;
+        report.repos = self.storage.with_store(|store, signer, runtime| {
+            let mut writer = ingest::CodeImportWriter::from_store(store, signer, runtime.clone())?;
             let mut rows = Vec::new();
             for plan in plans {
                 rows.push(ingest_repository(&mut writer, plan)?);
@@ -340,8 +357,12 @@ impl Code {
 
     /// Where is `name` defined — and if nowhere, say so with a denominator.
     pub fn find(&self, name: &str, filter: &Filter) -> Result<Answer> {
+        self.with_operation(|code| code.find_scoped(name, filter))
+    }
+
+    fn find_scoped(&self, name: &str, filter: &Filter) -> Result<Answer> {
         let observed = self.observe()?;
-        let facts = observed.facts().context("read Code facts")?;
+        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -389,8 +410,12 @@ impl Code {
     /// What names `identifier` — definitions included, since a definition names
     /// itself.
     pub fn uses(&self, identifier: &str, filter: &Filter) -> Result<Answer> {
+        self.with_operation(|code| code.uses_scoped(identifier, filter))
+    }
+
+    fn uses_scoped(&self, identifier: &str, filter: &Filter) -> Result<Answer> {
         let observed = self.observe()?;
-        let facts = observed.facts().context("read Code facts")?;
+        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -423,8 +448,12 @@ impl Code {
 
     /// Which `use` roots appear in the catalogued corpus, and how often.
     pub fn imports(&self, root: &str, filter: &Filter) -> Result<(usize, Provenance)> {
+        self.with_operation(|code| code.imports_scoped(root, filter))
+    }
+
+    fn imports_scoped(&self, root: &str, filter: &Filter) -> Result<(usize, Provenance)> {
         let observed = self.observe()?;
-        let facts = observed.facts().context("read Code facts")?;
+        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -435,8 +464,12 @@ impl Code {
 
     /// Everything the catalogue holds about one item.
     pub fn show(&self, selector: &str, with_source: bool) -> Result<ItemDetail> {
+        self.with_operation(|code| code.show_scoped(selector, with_source))
+    }
+
+    fn show_scoped(&self, selector: &str, with_source: bool) -> Result<ItemDetail> {
         let observed = self.observe()?;
-        let facts = observed.facts().context("read Code facts")?;
+        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let filter = Filter::default();
@@ -485,8 +518,17 @@ impl Code {
         cross_repo: bool,
         filter: &Filter,
     ) -> Result<DuplicateReport> {
+        self.with_operation(|code| code.duplicates_scoped(min_lines, cross_repo, filter))
+    }
+
+    fn duplicates_scoped(
+        &self,
+        min_lines: u64,
+        cross_repo: bool,
+        filter: &Filter,
+    ) -> Result<DuplicateReport> {
         let observed = self.observe()?;
-        let facts = observed.facts().context("read Code facts")?;
+        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -568,8 +610,12 @@ impl Code {
 
     /// What the catalogue holds, per revision.
     pub fn stats(&self, filter: &Filter) -> Result<StatsReport> {
+        self.with_operation(|code| code.stats_scoped(filter))
+    }
+
+    fn stats_scoped(&self, filter: &Filter) -> Result<StatsReport> {
         let observed = self.observe()?;
-        let facts = observed.facts().context("read Code facts")?;
+        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -783,10 +829,16 @@ pub fn worktree_commit(sources: &[(String, Vec<u8>)]) -> String {
     format!("worktree:{}", hasher.finalize().to_hex())
 }
 
-fn ingest_repository<P: std::borrow::BorrowMut<triblespace::core::repo::pile::Pile>>(
+fn ingest_repository<P>(
     writer: &mut ingest::CodeImportWriter<P>,
     plan: RepoPlan,
-) -> Result<RepoIngest> {
+) -> Result<RepoIngest>
+where
+    P: triblespace::core::repo::Store
+        + triblespace::core::repo::async_store::AsyncBlobStoreAcquire
+        + Send,
+    P::Snapshot: triblespace::core::repo::async_store::AsyncBlobStoreGet,
+{
     let repo_handle = code::text_handle(&plan.repo);
     let commit_handle = code::text_handle(&plan.commit);
     let scan_core = code::scan_core(repo_handle, commit_handle);
@@ -1141,7 +1193,7 @@ fn resolve_item(
 /// Addressing the unit rather than the path matters: two revisions of one file
 /// are two units with the same path, and slicing the wrong one would print
 /// lines that do not say what the reported line number says they do.
-fn item_source(facts: &FactArchive, reader: &PileSnapshot, hit: &Hit) -> Result<Option<String>> {
+fn item_source(facts: &FactArchive, reader: &CodeReader, hit: &Hit) -> Result<Option<String>> {
     for handle in code::unit_content(facts, hit.unit) {
         let bytes: anybytes::Bytes = match reader.get(handle) {
             Ok(bytes) => bytes,

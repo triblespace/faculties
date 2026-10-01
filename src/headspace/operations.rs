@@ -2,7 +2,6 @@
 //! Storage acquisition and each publication retain the existing shared snapshot
 //! boundaries. Plaintext is exposed only by an explicit show_secrets request.
 use crate::out::Out;
-use crate::storage::FactRead;
 
 #[derive(Clone, Debug)]
 pub struct Headspace {
@@ -144,13 +143,17 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::clock;
+use crate::collection_names::open_configured_acquiring;
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::headspace::{self, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use crate::schemas::headspace::DEFAULT_SCOPE_ID;
 use crate::secrets::{self as secrets_model, storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::load_signer;
-use crate::storage::{open_secrets_collection, open_secrets_collection_read, FactArchive};
+use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FacultySnapshot, FactArchive};
+#[cfg(test)]
+use crate::storage::open_secrets_collection;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -159,18 +162,17 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
 struct CollectionView {
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: AcquiringReader<FacultySnapshot>,
 }
 
 struct Views {
     headspace: CollectionView,
-    secrets: SecretsSnapshot<PileSnapshot>,
+    secrets: SecretsSnapshot<AcquiringReader<FacultySnapshot>>,
 }
 
 struct Storage {
@@ -180,7 +182,7 @@ struct Storage {
 
 impl Storage {
     fn from_storage(storage: crate::storage::Storage) -> Result<Self> {
-        let signer = storage.with_pile(|_, signer| Ok(signer.clone()))?;
+        let signer = storage.with_store(|_, signer, _| Ok(signer.clone()))?;
         Ok(Self { storage, signer })
     }
 
@@ -193,16 +195,18 @@ impl Storage {
     }
 
     fn views(&self) -> Result<Views> {
-        self.storage.with_pile(|pile, _| {
-            let source = open_configured(pile, DEFAULT_SCOPE_ID, self.signer.verifying_key())?;
+        self.storage.with_store(|pile, _, runtime| {
+            let source = open_configured_acquiring(
+                pile, DEFAULT_SCOPE_ID, self.signer.verifying_key(), runtime,
+            )?;
             let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let collection_rank9 =
                 pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
             let secrets_collection =
-                open_secrets_collection_read(pile, self.signer.verifying_key())?;
+                open_secrets_collection_acquiring(pile, self.signer.verifying_key(), runtime)?;
             // The source is carried and its frontier attached; a commit left
             // unattached is read from its own bytes.
-            let secrets = pollster::block_on(async {
+            let snapshot = runtime.block_on(async {
                 crate::storage::tolerate_own_lag(
                     pile.maintain_attached(collection_succinct, &self.signer)
                         .await,
@@ -212,17 +216,16 @@ impl Storage {
                     pile.maintain_attached(collection_rank9, &self.signer).await,
                 )
                 .context("maintain Headspace fact collection")?;
-                let secrets =
-                    secret_storage::ensure_and_snapshot(pile, secrets_collection, &self.signer)
+                let snapshot = secrets_collection.ensure(pile, &self.signer)
                         .await
                         .context("observe configured Secrets collection")?;
-                Ok::<_, anyhow::Error>(secrets)
+                Ok::<_, anyhow::Error>(snapshot)
             })?;
+            let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
+            let secrets = secret_storage::snapshot_acquiring(reader.clone(), secrets_collection)?;
             // Attach Headspace through the same final immutable physical snapshot
             // that backs every Secrets lookup in this view.
-            let reader = secrets.store_snapshot().clone();
-            let facts = reader
-                .read_facts(collection_rank9)
+            let facts = crate::storage::acquire_facts(&reader, collection_rank9)
                 .context("read maintained Headspace collection")?;
             let headspace = CollectionView { facts, reader };
             Ok(Views { headspace, secrets })
@@ -230,8 +233,10 @@ impl Storage {
     }
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
-        self.storage.with_pile(|pile, _| {
-            let collection = open_secrets_collection(pile, self.signer.verifying_key())?;
+        self.storage.with_store(|pile, _, runtime| {
+            let collection = open_secrets_collection_acquiring(
+                pile, self.signer.verifying_key(), runtime,
+            )?;
             secret_storage::add_secret(
                 pile,
                 &self.signer,
@@ -245,20 +250,23 @@ impl Storage {
     }
 
     fn publish(&self, scope: Id, mut fragment: Fragment, description: &str) -> Result<()> {
-        self.storage.with_pile(|pile, _| {
+        self.storage.with_store(|pile, _, runtime| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            let collection = open_configured(pile, scope, self.signer.verifying_key())?;
-            crate::collection_names::require_command_write_admission(
+            let collection = open_configured_acquiring(
+                pile, scope, self.signer.verifying_key(), runtime,
+            )?;
+            crate::collection_names::require_command_write_admission_acquiring(
                 pile,
                 collection,
                 &self.signer,
                 "Headspace",
                 "headspace show",
+                runtime,
             )?;
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
             drop(
-                pollster::block_on(crate::storage::ensure_downstream(
+                runtime.block_on(crate::storage::ensure_downstream(
                     pile,
                     collection,
                     &self.signer,
@@ -921,7 +929,7 @@ mod tests {
 
     use std::fs::File;
 
-    use crate::storage::{initialize_signer, open_pile_strict};
+    use crate::storage::{initialize_signer, open_pile_strict, FactRead};
     use triblespace::core::repo::StoreSnapshot;
     fn cli(pile: &Path, key: &Path, command: Command) -> Cli {
         Cli {

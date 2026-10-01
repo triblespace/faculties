@@ -24,7 +24,8 @@ use crate::schemas::posture::{CARRIER_CONTAINER_MEMBER, CARRIER_GIT_BLOB, CARRIE
 use crate::schemas::posture::{EXEMPLAR_BENIGN, KIND_EXEMPLAR};
 #[cfg(test)]
 use crate::storage::open_pile_strict;
-use crate::storage::FactArchive;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot};
+#[cfg(test)]
 use crate::storage::FactView;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
@@ -39,7 +40,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+type PileSnapshot = AcquiringReader<FacultySnapshot>;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
@@ -272,6 +273,9 @@ impl Posture {
             storage: &self.storage,
         }
     }
+    fn with_operation<T>(&self, operation: impl FnOnce(PostureStorage<'_>) -> Result<T>) -> Result<T> {
+        self.storage.scope(|storage| operation(PostureStorage { storage }))
+    }
     /// Deterministic resident scan. No model, filesystem input, or stdin access.
     pub fn scan(
         &self,
@@ -284,36 +288,36 @@ impl Posture {
             .iter()
             .map(|document| inspect_document(document.name, document.bytes))
             .collect();
-        finish_scan(self.storage(), label, files, Vec::new(), dry_run)
+        self.with_operation(|storage| finish_scan(storage, label, files, Vec::new(), dry_run))
     }
     /// Explicit host operation: walks local files, reporting every omission.
     pub fn scan_path(&self, path: &Path, dry_run: bool) -> Result<ScanReport> {
-        cmd_scan(self.storage(), path, dry_run)
+        self.with_operation(|storage| cmd_scan(storage, path, dry_run))
     }
     pub fn list(&self, options: ListOptions) -> Result<FindingList> {
-        cmd_list(
-            self.storage(),
+        self.with_operation(|storage| cmd_list(
+            storage,
             options.scan.map(fmt_id),
             options.examples,
             options.include_resolved,
-        )
+        ))
     }
     pub fn coverage(&self, scan: Option<Id>) -> Result<Option<Coverage>> {
-        cmd_coverage(self.storage(), scan.map(fmt_id))
+        self.with_operation(|storage| cmd_coverage(storage, scan.map(fmt_id)))
     }
     pub fn scans(&self) -> Result<Vec<ScanRecord>> {
-        cmd_scans(self.storage())
+        self.with_operation(cmd_scans)
     }
     pub fn vocab_add(&self, term: &str, channel: &str, why: Option<&str>) -> Result<PolicyReceipt> {
-        cmd_vocab_add(self.storage(), term, channel, why)
+        self.with_operation(|storage| cmd_vocab_add(storage, term, channel, why))
     }
     pub fn vocab_list(&self, channel: Option<&str>) -> Result<Vec<VocabularyChannel>> {
-        cmd_vocab_list(self.storage(), channel)
+        self.with_operation(|storage| cmd_vocab_list(storage, channel))
     }
     /// Explicit local-model work; unavailable without the local-embed feature.
     /// Prose is literal, including strings beginning with '@'.
     pub fn exemplar(&self, text: &str, channel: &str, benign: bool) -> Result<PolicyReceipt> {
-        cmd_exemplar(self.storage(), text, channel, benign)
+        self.with_operation(|storage| cmd_exemplar(storage, text, channel, benign))
     }
     /// Explicit local-model work over resident text. No input path is opened.
     pub fn semantic(
@@ -336,7 +340,7 @@ impl Posture {
                     SemanticDocument::Text(PathBuf::from(document.name), document.text.to_owned())
                 }
             });
-            semantic_texts(self.storage(), texts, channel, threshold, Vec::new())
+            self.with_operation(|storage| semantic_texts(storage, texts, channel, threshold, Vec::new()))
         }
         #[cfg(not(feature = "local-embed"))]
         bail!("built without the local-embed feature; the semantic tier is unavailable")
@@ -348,7 +352,7 @@ impl Posture {
         channel: &str,
         threshold: f32,
     ) -> Result<SemanticReport> {
-        cmd_semantic(self.storage(), path, channel, threshold)
+        self.with_operation(|storage| cmd_semantic(storage, path, channel, threshold))
     }
     /// Audits an explicit local Git repository and publishes its complete scan
     /// before returning. A blocked report is data, never process::exit.
@@ -356,7 +360,7 @@ impl Posture {
         if revisions.is_empty() {
             bail!("Git audit requires at least one revision");
         }
-        cmd_git(self.storage(), revisions, channel, repo)
+        self.with_operation(|storage| cmd_git(storage, revisions, channel, repo))
     }
     /// Explicit host operation; may query GitHub visibility through gh.
     pub fn sweep(
@@ -366,7 +370,7 @@ impl Posture {
         all: bool,
         history: bool,
     ) -> Result<SweepReport> {
-        cmd_sweep(self.storage(), root, channel, all, history)
+        self.with_operation(|storage| cmd_sweep(storage, root, channel, all, history))
     }
     /// Explicit host mutation. The executable to install is a caller choice,
     /// not the embedding Rust program's current executable.
@@ -379,15 +383,15 @@ impl Posture {
         pre_push: bool,
         post_commit: bool,
     ) -> Result<HookReport> {
-        install_hooks(
-            self.storage(),
+        self.with_operation(|storage| install_hooks(
+            storage,
             repo,
             executable,
             channel,
             remote_match,
             pre_push,
             post_commit,
-        )
+        ))
     }
 }
 
@@ -2101,7 +2105,13 @@ impl PostureStorage<'_> {
     fn load_scopes(&self, scopes: &[(Id, &str)]) -> Result<Vec<CollectionView>> {
         // Authority is loaded before storage is touched. Ordinary reads and
         // writes never mint an identity or substitute an ephemeral signer.
-        self.storage.with_pile(|pile, signer| {
+        self.storage.with_store(|store, signer, runtime| {
+            for (scope, _) in scopes {
+                crate::collection_names::open_configured_acquiring(
+                    store, *scope, signer.verifying_key(), runtime,
+                )?;
+            }
+            let pile = store;
             let result = (|| {
                 // Register every descriptor before advancing the fact chains.
                 let mut succinct = Vec::with_capacity(scopes.len());
@@ -2122,7 +2132,7 @@ impl PostureStorage<'_> {
                 }
                 // Carry each root and attach its frontier; a commit left
                 // unattached is read from its own bytes.
-                pollster::block_on(async {
+                runtime.block_on(async {
                     for (index, (_, label)) in scopes.iter().enumerate() {
                         crate::storage::tolerate_own_lag(
                             pile.maintain_attached(succinct[index], signer).await,
@@ -2138,19 +2148,15 @@ impl PostureStorage<'_> {
 
                 // Every logical view is attached through this one immutable
                 // post-maintenance watermark.
-                let reader = pile
-                    .snapshot()
-                    .context("freeze maintained Posture store snapshot")?;
+                let reader = AcquiringReader::new(
+                    pile.snapshot().context("freeze maintained Posture store snapshot")?,
+                    runtime.clone(),
+                );
                 scopes
                     .iter()
                     .zip(rank9)
                     .map(|((_, label), collection)| {
-                        let facts = reader
-                            .attached(collection)
-                            .with_context(|| {
-                                format!("observe maintained Posture {label} collection")
-                            })?
-                            .facts()
+                        let facts = crate::storage::acquire_facts(&reader, collection)
                             .with_context(|| {
                                 format!("read maintained Posture {label} collection")
                             })?;
@@ -2229,13 +2235,13 @@ impl PostureStorage<'_> {
         self.with_store(
             DEFAULT_POLICY_SCOPE_ID,
             "policy",
-            |pile, collection, signer| {
+            |pile, collection, signer, runtime| {
                 fragment.describe_with(entity! { metadata::description: description.to_owned() });
                 let commit = pile
                     .commit(collection, signer, fragment)
                     .context("commit authored Posture policy fragment")?;
                 drop(
-                    pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                    runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                         .context(
                             "Posture policy facts were committed, but ensuring their derived views failed",
                         )?,
@@ -2246,13 +2252,13 @@ impl PostureStorage<'_> {
     }
 
     fn publish_scan(&self, mut fragment: Fragment, description: &str) -> Result<CollectionCommit> {
-        self.with_store(DEFAULT_SCAN_SCOPE_ID, "scan", |pile, collection, signer| {
+        self.with_store(DEFAULT_SCAN_SCOPE_ID, "scan", |pile, collection, signer, runtime| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
             let commit = pile
                 .commit(collection, signer, fragment)
                 .context("commit authored Posture scan fragment")?;
             drop(
-                pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context(
                     "Posture scan facts were committed, but ensuring their derived views failed",
                 )?,
@@ -2266,19 +2272,22 @@ impl PostureStorage<'_> {
         scope: Id,
         label: &str,
         operation: impl FnOnce(
-            &mut Pile,
+            &mut crate::storage::FacultyStore,
             Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
+            &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_pile(|pile, signer| {
+        self.storage.with_store(|store, signer, runtime| {
+            let collection = crate::collection_names::open_configured_acquiring(
+                store, scope, signer.verifying_key(), runtime,
+            )
+            .with_context(|| format!("open Posture {label} collection"))?;
             let result = (|| {
-                let collection = open_configured(pile, scope, signer.verifying_key())
-                    .with_context(|| format!("open Posture {label} collection"))?;
                 // The action distinguishes a failed COMMIT from failed
                 // upkeep after COMMIT; do not hide that result behind a
                 // generic publication-failed context.
-                operation(pile, collection, signer)
+                operation(store, collection, signer, runtime)
             })();
             result
         })

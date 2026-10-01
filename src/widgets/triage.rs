@@ -30,7 +30,7 @@ use crate::triage::{
     self as triage_model, PatternSummary, QueueCounts, ScanOptions, ScanReport, ScanSources,
     SourceView, UnreadMessages, UnreadUnavailable,
 };
-use crate::widgets::storage::{DatasetRevision, DatasetView, SecretsView};
+use crate::widgets::storage::{DatasetRevision, DatasetView, SecretsView, WidgetReader};
 use triblespace::core::id::Id;
 
 /// How many timeline events to keep in the live snapshot. Older
@@ -154,7 +154,7 @@ struct TriageLive {
     suggestions: Vec<String>,
 }
 
-fn source_view<'a>(view: DatasetView<'a>) -> SourceView<'a, FactArchive> {
+fn source_view<'a>(view: DatasetView<'a>) -> SourceView<'a, FactArchive, WidgetReader> {
     SourceView {
         facts: view.facts,
         reader: view.reader,

@@ -18,12 +18,12 @@
 //! storage models.
 
 use std::path::{Path, PathBuf};
-use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::StoreRead;
 
 use crate::schemas::embeddings::Embedding768;
 use anybytes::View;
 use anyhow::{anyhow, Context, Result};
-use mary::model_collection::ModelPileSnapshot;
+use mary::model_collection::ModelSnapshot;
 use mary::selection::{ModelSelector, TokenizerSelector};
 use triblespace::core::collection::CollectionHandle;
 use triblespace::macros::{entity, find, pattern};
@@ -42,20 +42,6 @@ fn working_pile() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("PILE is not set; the nomic models are read from the working pile"))
 }
 
-fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
-    // Discover the sole policy descriptor and freeze its admitted cover from
-    // one observed prefix. Selection and attachment reads then share that
-    // exact pile snapshot.
-    let snapshot =
-        mary::model_collection::load_model_collection_local_latest(path).with_context(|| {
-            format!(
-                "discover and freeze the sole native Mary collection for {model} in {}",
-                path.display()
-            )
-        })?;
-    Ok(snapshot)
-}
-
 /// The weight roots a pile may carry for one source, most wanted first: the
 /// calibrated packed NVFP4 model (`mary::calibrate`, label
 /// `nvfp4-calibrated`) when the pile has one, else the native f32 import.
@@ -64,46 +50,29 @@ fn load_model_snapshot(path: &Path, model: &str) -> Result<ModelPileSnapshot> {
 const NOMIC_QUANTIZATIONS: [&str; 2] = ["nvfp4-calibrated", mary::persist::QUANTIZATION_NATIVE];
 
 /// The first root of `source` in the pile, in [`NOMIC_QUANTIZATIONS`] order.
-fn select_weights(
-    snapshot: &ModelPileSnapshot,
+fn select_weights<R: BlobStoreGet>(
+    snapshot: &ModelSnapshot<R>,
     source: &str,
     pile: &Path,
 ) -> Result<std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    let quantization = NOMIC_QUANTIZATIONS
-        .iter()
-        .copied()
-        .find(|quantization| {
-            mary::selection::select_model_roots(
-                snapshot.facts(),
-                snapshot.store(),
-                ModelSelector::Source {
-                    source,
-                    quantization,
-                },
-            )
-            .is_ok()
-        })
-        .with_context(|| {
-            format!(
-                "{} carries no {source} root labelled {} (pack it in with nomic_pack --append)",
-                pile.display(),
-                NOMIC_QUANTIZATIONS.join(" or ")
-            )
-        })?;
-    mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        ModelSelector::Source {
-            source,
-            quantization,
-        },
-    )
-    .with_context(|| {
-        format!(
-            "select {quantization} {source} weights from {}",
-            pile.display()
-        )
-    })
+    for quantization in NOMIC_QUANTIZATIONS {
+        let roots = mary::selection::matching_model_roots_acquiring(
+            snapshot.facts(), snapshot.store(),
+            ModelSelector::Source { source, quantization },
+        )?;
+        if roots.is_empty() {
+            continue;
+        }
+        return mary::selection::load_keymap_for_roots(
+            snapshot.facts(), snapshot.store(), &roots,
+        ).with_context(|| format!(
+            "select {quantization} {source} weights from {}", pile.display(),
+        ));
+    }
+    Err(anyhow!(
+        "{} carries no {source} root labelled {} (pack it in with nomic_pack --append)",
+        pile.display(), NOMIC_QUANTIZATIONS.join(" or "),
+    ))
 }
 
 /// Load nomic-embed-text-v1.5 from the working pile's model collection.
@@ -113,29 +82,33 @@ fn select_weights(
 /// rather than adding a compatibility path to ordinary inference.
 pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
     let pile = working_pile()?;
-    let snapshot = load_model_snapshot(&pile, NOMIC_TEXT_MODEL)?;
-    text_embedder_from(&snapshot, &pile)
+    crate::model_storage::with_snapshot(&pile, NOMIC_TEXT_MODEL, |snapshot| text_embedder_from(snapshot, &pile))
 }
 
 /// [`load_text_embedder`] from a pile snapshot the caller already holds (a
 /// command that has the working pile open should not open it twice).
-pub fn load_text_embedder_in(
-    store: &PileSnapshot,
+pub fn load_text_embedder_in<R: StoreRead>(
+    store: &R,
 ) -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
-    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+    let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(store)
         .context("freeze the working pile's model collection for nomic-embed-text")?;
     text_embedder_from(&snapshot, Path::new("the working pile"))
 }
 
-fn text_embedder_from(
-    snapshot: &ModelPileSnapshot,
+fn text_embedder_from<R: BlobStoreGet>(
+    snapshot: &ModelSnapshot<R>,
     pile: &Path,
 ) -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
     let keymap = select_weights(snapshot, NOMIC_TEXT_MODEL, pile)?;
-    let tokenizer = mary::selection::load_tokenizer_from_graph(
+    let tokenizer_root = mary::selection::select_tokenizer_root_acquiring(
         snapshot.facts(),
         snapshot.store(),
         TokenizerSelector::Name(NOMIC_TEXT_MODEL),
+    )?;
+    let tokenizer = mary::selection::load_tokenizer_from_graph(
+        snapshot.facts(),
+        snapshot.store(),
+        TokenizerSelector::Root(tokenizer_root),
     )
     .with_context(|| format!("select native Nomic text tokenizer from {}", pile.display()))?;
 
@@ -151,21 +124,20 @@ fn text_embedder_from(
 /// Load nomic-embed-vision-v1.5 from the working pile's model collection.
 pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
     let pile = working_pile()?;
-    let snapshot = load_model_snapshot(&pile, NOMIC_VISION_MODEL)?;
-    vision_embedder_from(&snapshot, &pile)
+    crate::model_storage::with_snapshot(&pile, NOMIC_VISION_MODEL, |snapshot| vision_embedder_from(snapshot, &pile))
 }
 
 /// [`load_vision_embedder`] from a pile snapshot the caller already holds.
-pub fn load_vision_embedder_in(
-    store: &PileSnapshot,
+pub fn load_vision_embedder_in<R: StoreRead>(
+    store: &R,
 ) -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
-    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+    let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(store)
         .context("freeze the working pile's model collection for nomic-embed-vision")?;
     vision_embedder_from(&snapshot, Path::new("the working pile"))
 }
 
-fn vision_embedder_from(
-    snapshot: &ModelPileSnapshot,
+fn vision_embedder_from<R: BlobStoreGet>(
+    snapshot: &ModelSnapshot<R>,
     pile: &Path,
 ) -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
     let keymap = select_weights(snapshot, NOMIC_VISION_MODEL, pile)?;
@@ -196,16 +168,16 @@ pub struct IndexModels {
 /// records the containing collection handle. The descriptor does not change
 /// when the same selected roots acquire observations, share an archive with
 /// another model, or are packaged into different collection support.
-pub fn index_models_in(store: &PileSnapshot) -> Result<IndexModels> {
-    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+pub fn index_models_in<R: StoreRead>(store: &R) -> Result<IndexModels> {
+    let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(store)
         .context("freeze the working pile's model collection for the semantic index")?;
     index_models_from(&snapshot)
 }
 
-fn index_models_from(snapshot: &ModelPileSnapshot) -> Result<IndexModels> {
+fn index_models_from<R: BlobStoreGet>(snapshot: &ModelSnapshot<R>) -> Result<IndexModels> {
     let text_root = preferred_root(snapshot, NOMIC_TEXT_MODEL)?;
     let vision_root = preferred_root(snapshot, NOMIC_VISION_MODEL)?;
-    let tokenizer_root = mary::selection::select_tokenizer_root(
+    let tokenizer_root = mary::selection::select_tokenizer_root_acquiring(
         snapshot.facts(),
         snapshot.store(),
         TokenizerSelector::Name(NOMIC_TEXT_MODEL),
@@ -221,19 +193,16 @@ fn index_models_from(snapshot: &ModelPileSnapshot) -> Result<IndexModels> {
 
 /// The root [`select_weights`] would load for `source`: the first label in
 /// [`NOMIC_QUANTIZATIONS`] that has exactly one root.
-fn preferred_root(snapshot: &ModelPileSnapshot, source: &str) -> Result<triblespace::core::id::Id> {
+fn preferred_root<R: BlobStoreGet>(snapshot: &ModelSnapshot<R>, source: &str) -> Result<triblespace::core::id::Id> {
     for quantization in NOMIC_QUANTIZATIONS {
-        let roots = match mary::selection::select_model_roots(
+        let roots = mary::selection::matching_model_roots_acquiring(
             snapshot.facts(),
             snapshot.store(),
             ModelSelector::Source {
                 source,
                 quantization,
             },
-        ) {
-            Ok(roots) => roots,
-            Err(_) => continue,
-        };
+        )?;
         match roots.as_slice() {
             [root] => return Ok(*root),
             [] => continue,
@@ -273,6 +242,41 @@ mod tests {
                 "max_input_chars_per_word": 100,
                 "vocab": {"[UNK]": 0, "hello": 1}}
     }"###;
+
+    #[test]
+    fn preferred_quantization_never_falls_back_after_a_label_read_failure() {
+        use triblespace::core::blob::{Blob, IntoBlob};
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[37; 32]);
+        let collection = repo.collection(
+            mary::model_collection::mary_model_graph_name(),
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(key.verifying_key()),
+                AdmissionPolicy::direct(key.verifying_key()),
+            ),
+        ).unwrap();
+        let native = weight_fragment(NOMIC_TEXT_MODEL, "native.weight", 1.0);
+        repo.commit(collection, &key, native).unwrap();
+        let absent: Blob<UTF8String> = "an unread packed-model label".to_owned().to_blob();
+        repo.commit(collection, &key, entity! {
+            attrs::source: absent.get_handle(),
+            attrs::quantization: NOMIC_QUANTIZATIONS[0],
+            attrs::member: fucid(),
+        }).unwrap();
+        let frozen = repo.snapshot().unwrap();
+        let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(&frozen).unwrap();
+        let error = preferred_root(&snapshot, NOMIC_TEXT_MODEL).unwrap_err();
+        assert!(error.to_string().contains("read source label"));
+        assert!(select_weights(&snapshot, NOMIC_TEXT_MODEL, Path::new("fixture")).is_err());
+        // The packed candidate becomes a known non-match, so native fallback
+        // is now justified without changing the collection's records.
+        repo.put::<UTF8String, _>(absent).unwrap();
+        let available = repo.snapshot().unwrap();
+        let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(&available).unwrap();
+        assert!(preferred_root(&snapshot, NOMIC_TEXT_MODEL).is_ok());
+    }
 
     fn weight_fragment(source: &str, tensor_name: &str, value: f32) -> Fragment {
         let mut fragment = Fragment::empty();
@@ -355,68 +359,74 @@ mod tests {
             ],
         );
 
-        let text = load_model_snapshot(text_file.path(), NOMIC_TEXT_MODEL)
-            .expect("load one text collection snapshot");
-        assert_eq!(text.support().len(), 2);
+        crate::model_storage::with_snapshot(text_file.path(), NOMIC_TEXT_MODEL, |text| {
+            assert_eq!(text.support().len(), 2);
 
-        // Freeze really means freeze: a later same-coordinate model commit
-        // cannot change the facts used for either half of this text load.
-        publish(
-            text_file.path(),
-            [weight_fragment(NOMIC_TEXT_MODEL, "text.weight", 9.0)],
-        );
-        let text_keymap = mary::selection::load_keymap_from_graph(
-            text.facts(),
-            text.store(),
-            ModelSelector::Source {
-                source: NOMIC_TEXT_MODEL,
-                quantization: mary::persist::QUANTIZATION_NATIVE,
-            },
-        )
-        .expect("select text weights from frozen snapshot");
-        assert_eq!(text_keymap["text.weight"], (vec![1.25], vec![1]));
-        let tokenizer = mary::selection::load_tokenizer_from_graph(
-            text.facts(),
-            text.store(),
-            TokenizerSelector::Name(NOMIC_TEXT_MODEL),
-        )
-        .expect("select tokenizer from the same frozen snapshot");
-        assert_eq!(tokenizer.token_to_id("hello"), Some(1));
+            // Freeze really means freeze: a later same-coordinate model commit
+            // cannot change the facts used for either half of this text load.
+            publish(
+                text_file.path(),
+                [weight_fragment(NOMIC_TEXT_MODEL, "text.weight", 9.0)],
+            );
+            let text_keymap = mary::selection::load_keymap_from_graph(
+                text.facts(),
+                text.store(),
+                ModelSelector::Source {
+                    source: NOMIC_TEXT_MODEL,
+                    quantization: mary::persist::QUANTIZATION_NATIVE,
+                },
+            )
+            .expect("select text weights from frozen snapshot");
+            assert_eq!(text_keymap["text.weight"], (vec![1.25], vec![1]));
+            let tokenizer = mary::selection::load_tokenizer_from_graph(
+                text.facts(),
+                text.store(),
+                TokenizerSelector::Name(NOMIC_TEXT_MODEL),
+            )
+            .expect("select tokenizer from the same frozen snapshot");
+            assert_eq!(tokenizer.token_to_id("hello"), Some(1));
+            Ok(())
+        })
+        .expect("load and use one text collection snapshot with its owner alive");
 
-        let widened = load_model_snapshot(text_file.path(), NOMIC_TEXT_MODEL)
-            .expect("load later widened text snapshot");
-        let collision = mary::selection::load_keymap_from_graph(
-            widened.facts(),
-            widened.store(),
-            ModelSelector::Source {
-                source: NOMIC_TEXT_MODEL,
-                quantization: mary::persist::QUANTIZATION_NATIVE,
-            },
-        )
-        .expect_err("later shard with a duplicate tensor must fail closed");
-        assert!(
-            collision.to_string().contains("appears in both root"),
-            "unexpected collision diagnostic: {collision}"
-        );
+        crate::model_storage::with_snapshot(text_file.path(), NOMIC_TEXT_MODEL, |widened| {
+            let collision = mary::selection::load_keymap_from_graph(
+                widened.facts(),
+                widened.store(),
+                ModelSelector::Source {
+                    source: NOMIC_TEXT_MODEL,
+                    quantization: mary::persist::QUANTIZATION_NATIVE,
+                },
+            )
+            .expect_err("later shard with a duplicate tensor must fail closed");
+            assert!(
+                collision.to_string().contains("appears in both root"),
+                "unexpected collision diagnostic: {collision}"
+            );
+            Ok(())
+        })
+        .expect("load later widened text snapshot");
 
         let vision_file = NamedTempFile::new().expect("create vision pile");
         publish(
             vision_file.path(),
             [weight_fragment(NOMIC_VISION_MODEL, "vision.weight", 2.5)],
         );
-        let vision = load_model_snapshot(vision_file.path(), NOMIC_VISION_MODEL)
-            .expect("load one vision collection snapshot");
-        assert_eq!(vision.support().len(), 1);
-        let vision_keymap = mary::selection::load_keymap_from_graph(
-            vision.facts(),
-            vision.store(),
-            ModelSelector::Source {
-                source: NOMIC_VISION_MODEL,
-                quantization: mary::persist::QUANTIZATION_NATIVE,
-            },
-        )
-        .expect("select vision weights from frozen snapshot");
-        assert_eq!(vision_keymap["vision.weight"], (vec![2.5], vec![1]));
+        crate::model_storage::with_snapshot(vision_file.path(), NOMIC_VISION_MODEL, |vision| {
+            assert_eq!(vision.support().len(), 1);
+            let vision_keymap = mary::selection::load_keymap_from_graph(
+                vision.facts(),
+                vision.store(),
+                ModelSelector::Source {
+                    source: NOMIC_VISION_MODEL,
+                    quantization: mary::persist::QUANTIZATION_NATIVE,
+                },
+            )
+            .expect("select vision weights from frozen snapshot");
+            assert_eq!(vision_keymap["vision.weight"], (vec![2.5], vec![1]));
+            Ok(())
+        })
+        .expect("load and use one vision collection snapshot with its owner alive");
     }
 
     #[test]
@@ -575,10 +585,9 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Embed the golden inputs with the models the index pins and read what the
 /// model collection records for them.
-pub fn golden_report(store: &PileSnapshot) -> Result<GoldenReport> {
+pub fn golden_report<R: StoreRead>(store: &R) -> Result<GoldenReport> {
     use mary::embed::LocalEmbedder as _;
-    use triblespace::core::repo::BlobStoreGet;
-    let snapshot = mary::model_collection::snapshot_model_collection_in(store)
+    let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(store)
         .context("freeze the working pile's model collection for the golden vectors")?;
     let roots = index_models_from(&snapshot)?;
     let facts = snapshot.facts();
@@ -680,11 +689,13 @@ pub fn golden_report(store: &PileSnapshot) -> Result<GoldenReport> {
 pub fn golden_publish(
     store: &mut crate::storage::FacultyStore,
     signer: &ed25519_dalek::SigningKey,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
 ) -> Result<(GoldenReport, Vec<&'static str>)> {
     use triblespace::core::repo::SnapshotSource;
-    let snapshot = store
-        .snapshot()
-        .context("freeze the pile for the golden vectors")?;
+    let snapshot = crate::storage::AcquiringReader::new(
+        store.snapshot().context("freeze the pile for the golden vectors")?,
+        runtime.clone(),
+    );
     let report = golden_report(&snapshot)?;
     let collection =
         mary::model_collection::ModelCollection::open(&snapshot, report.model_collection)
@@ -692,12 +703,13 @@ pub fn golden_publish(
     drop(snapshot);
     let (fragment, recorded) = report.unrecorded_observations();
     if !recorded.is_empty() {
-        crate::collection_names::require_command_write_admission(
+        crate::collection_names::require_command_write_admission_acquiring(
             store,
             collection,
             signer,
             "golden-report model",
             "files golden",
+            runtime,
         )?;
         store
             .commit(collection, signer, fragment)

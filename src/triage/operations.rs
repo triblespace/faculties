@@ -1,7 +1,6 @@
 //! Finite Triage inspections over one maintained immutable multi-collection view.
 //! Domain observations are shared with the existing Triage model and widgets.
 use crate::out::Out;
-use crate::storage::FactView;
 
 #[derive(Clone, Debug)]
 pub struct Triage {
@@ -30,8 +29,10 @@ impl Triage {
         Self { storage }
     }
     fn with_snapshot(&self, operation: impl FnOnce(&TriageSnapshot) -> Result<()>) -> Result<()> {
-        let snapshot = self.storage.with_pile(TriageSnapshot::load)?;
-        operation(&snapshot)
+        self.storage.with_store(|store, signer, runtime| {
+            let snapshot = TriageSnapshot::load(store, signer, runtime)?;
+            operation(&snapshot)
+        })
     }
     pub fn scan(&self, options: &InspectOptions, out: &mut Out<'_>) -> Result<()> {
         self.with_snapshot(|snapshot| {
@@ -85,7 +86,7 @@ use crate::schemas::triage::cog;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{open_secrets_collection_read, FactArchive};
+use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FacultySnapshot, FacultyStore, FactArchive};
 use crate::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
     collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
@@ -99,24 +100,24 @@ use serde::{Deserialize, Serialize};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type Interval = Inline<inlineencodings::NsTAIInterval>;
+type TriageReader = AcquiringReader<FacultySnapshot>;
 
 /// One canonical collection value observed through the frozen pile prefix.
 struct CollectionView {
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: TriageReader,
 }
 
 impl CollectionView {
-    fn source(&self) -> SourceView<'_, FactArchive> {
+    fn source(&self) -> SourceView<'_, FactArchive, TriageReader> {
         SourceView {
             facts: &self.facts,
             reader: &self.reader,
@@ -126,13 +127,17 @@ impl CollectionView {
 
 /// One immutable pile world plus one explicit local signing identity.
 struct TriageSnapshot {
-    store_snapshot: PileSnapshot,
+    store_snapshot: TriageReader,
     collections: BTreeMap<Id, FactArchive>,
-    secrets: SecretsSnapshot<PileSnapshot>,
+    secrets: SecretsSnapshot<TriageReader>,
 }
 
 impl TriageSnapshot {
-    fn load(pile: &mut Pile, signer: &ed25519_dalek::SigningKey) -> Result<Self> {
+    fn load(
+        pile: &mut FacultyStore,
+        signer: &ed25519_dalek::SigningKey,
+        runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    ) -> Result<Self> {
         // Loading is deliberately strict: a diagnostic read must never mint a
         // new identity, create a pile, or admit somebody else's COMMITs.
         let mut registered = Vec::new();
@@ -146,7 +151,7 @@ impl TriageSnapshot {
             (MESSAGE_SCOPE_ID, "Message"),
         ] {
             let source =
-                crate::collection_names::open_configured(pile, scope, signer.verifying_key())
+                crate::collection_names::open_configured_acquiring(pile, scope, signer.verifying_key(), runtime)
                     .with_context(|| format!("register {label} collection"))?;
             let succinct_collection = pile
                 .attach::<SuccinctArchiveBlob>(source, ())
@@ -159,10 +164,10 @@ impl TriageSnapshot {
             rank9.push(rank9_collection);
         }
 
-        let secrets_collection = open_secrets_collection_read(pile, signer.verifying_key())?;
+        let secrets_collection = open_secrets_collection_acquiring(pile, signer.verifying_key(), runtime)?;
         // Carry each root and attach its frontier; a commit left unattached
         // is read from its own bytes.
-        let secrets = pollster::block_on(async {
+        let snapshot = runtime.block_on(async {
             for (index, (_, label)) in registered.iter().enumerate() {
                 crate::storage::tolerate_own_lag(
                     pile.maintain_attached(succinct[index], signer).await,
@@ -173,22 +178,20 @@ impl TriageSnapshot {
                 )
                 .with_context(|| format!("maintain {label} fact archive"))?;
             }
-            let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
+            let snapshot = secrets_collection.ensure(pile, signer)
                 .await
                 .context("observe configured Secrets collection")?;
-            Ok::<_, anyhow::Error>(secrets)
+            Ok::<_, anyhow::Error>(snapshot)
         })?;
 
         // Secrets attachment already owns the one later immutable snapshot.
         // Reuse it so facts, attachments, and credentials inhabit literally
         // the same known-prefix observation.
-        let store_snapshot = secrets.store_snapshot().clone();
+        let store_snapshot = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
+        let secrets = secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
         let mut collections = BTreeMap::new();
         for ((scope, label), collection) in registered.iter().zip(&rank9) {
-            let archive = store_snapshot
-                .attached(*collection)
-                .with_context(|| format!("attach maintained {label} collection"))?
-                .facts()
+            let archive = crate::storage::acquire_facts(&store_snapshot, *collection)
                 .with_context(|| format!("read maintained {label} collection"))?;
             collections.insert(*scope, archive);
         }
@@ -203,7 +206,7 @@ impl TriageSnapshot {
     #[cfg(test)]
     fn open(pile_path: &Path, key: Option<&Path>) -> Result<Self> {
         crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned))
-            .with_pile(Self::load)
+            .with_store(Self::load)
     }
 
     fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {
@@ -229,7 +232,7 @@ impl TriageSnapshot {
         Ok((view, projected))
     }
 
-    fn secrets(&self) -> &SecretsSnapshot<PileSnapshot> {
+    fn secrets(&self) -> &SecretsSnapshot<TriageReader> {
         &self.secrets
     }
 
@@ -353,7 +356,7 @@ fn first_line(text: &str) -> String {
         .to_owned()
 }
 
-fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
         .with_context(|| format!("read UTF8String {}", hex::encode(handle.raw)))?;
@@ -678,7 +681,7 @@ fn timeline(snapshot: &TriageSnapshot, recent: usize, out: &mut Out<'_>) -> Resu
     Ok(())
 }
 
-fn chunk_text<P: TriblePattern>(reader: &PileSnapshot, space: &P, id: Id) -> Result<String> {
+fn chunk_text<P: TriblePattern>(reader: &impl BlobStoreGet, space: &P, id: Id) -> Result<String> {
     if let Some(handle) = chunk_summary_handle(space, id) {
         return memory_model::read_text(reader, handle);
     }
@@ -857,7 +860,7 @@ fn select_request(state: &ExecState, turn: usize) -> Result<&ExecRequestRow> {
 }
 
 fn contexts_for_turn<P: TriblePattern>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     space: &P,
     exec_state: &ExecState,
     request: Id,

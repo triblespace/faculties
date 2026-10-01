@@ -142,12 +142,43 @@ pub fn snapshot<R>(store_snapshot: R, collection: SecretsCollection) -> Result<S
 where
     R: StoreRead,
 {
-    let observed = store_snapshot
-        .attached(collection.rank9)
-        .context("observe maintained Secrets collection")?;
-    let succinct = store_snapshot
-        .attached(collection.succinct)
-        .context("observe maintained Succinct Secrets collection")?;
+    snapshot_with(store_snapshot, collection, false)
+}
+
+/// Select encrypted evidence and proof records once, acquiring exact bytes
+/// required by that selection through the supplied reader. Replication and
+/// maintenance retain the passive [`snapshot`] boundary; this is the explicit
+/// foreground read path. Acquisition does not grant delivery authority.
+pub fn snapshot_acquiring<R>(
+    store_snapshot: R,
+    collection: SecretsCollection,
+) -> Result<SecretsSnapshot<R>>
+where
+    R: StoreRead,
+{
+    snapshot_with(store_snapshot, collection, true)
+}
+
+fn snapshot_with<R>(
+    store_snapshot: R,
+    collection: SecretsCollection,
+    acquire: bool,
+) -> Result<SecretsSnapshot<R>>
+where
+    R: StoreRead,
+{
+    let observed = if acquire {
+        store_snapshot.attached_acquiring(collection.rank9)
+    } else {
+        store_snapshot.attached(collection.rank9)
+    }
+    .context("observe maintained Secrets collection")?;
+    let succinct = if acquire {
+        store_snapshot.attached_acquiring(collection.succinct)
+    } else {
+        store_snapshot.attached(collection.succinct)
+    }
+    .context("observe maintained Succinct Secrets collection")?;
     let lag = SecretsLag {
         succinct: succinct.residual().len(),
         rank9: observed.residual().len(),
@@ -155,7 +186,12 @@ where
     let (support, facts) = if observed.cover().is_empty() && observed.residual().is_empty() {
         (observed.support().clone(), None)
     } else {
-        let (facts, unread) = succinctarchive_union::read_attached(&observed)
+        let read = if acquire {
+            succinctarchive_union::read_attached_acquiring(&observed)
+        } else {
+            succinctarchive_union::read_attached(&observed)
+        };
+        let (facts, unread) = read
             .context("read maintained Secrets collection")?
             .into_parts();
         // What the facts stand for: the attachments' foundations and every

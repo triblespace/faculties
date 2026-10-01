@@ -489,7 +489,7 @@ pub fn legacy_import_direction(facts: &TribleSet, legacy_entity: Id) -> Result<I
 }
 
 fn imported_payload_union<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     legacy_entity: Id,
@@ -649,7 +649,7 @@ fn imported_payload_union<Overlay: BlobStoreGet>(
 
 /// Strictly decode one exact historical payload from a resident pile.
 pub fn imported_payload(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &TribleSet,
     legacy_entity: Id,
 ) -> Result<ImportedPayloadRecord> {
@@ -1432,14 +1432,14 @@ fn read_local_text(fragment: &Fragment, handle: TextHandle) -> Result<String> {
     Ok(value.to_string())
 }
 
-pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Mail text blob {}", hex::encode(handle.raw)))?;
     Ok(value.to_string())
 }
 
-pub fn read_bytes(reader: &PileSnapshot, handle: BytesHandle) -> Result<Vec<u8>> {
+pub fn read_bytes(reader: &impl BlobStoreGet, handle: BytesHandle) -> Result<Vec<u8>> {
     let value: anybytes::Bytes = reader
         .get(handle)
         .with_context(|| format!("read Mail byte blob {}", hex::encode(handle.raw)))?;
@@ -1447,7 +1447,7 @@ pub fn read_bytes(reader: &PileSnapshot, handle: BytesHandle) -> Result<Vec<u8>>
 }
 
 fn text_union<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     handle: TextHandle,
 ) -> Result<String> {
@@ -1464,7 +1464,7 @@ fn text_union<Overlay: BlobStoreGet>(
 }
 
 fn bytes_union<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     handle: BytesHandle,
 ) -> Result<Vec<u8>> {
@@ -1481,7 +1481,7 @@ fn bytes_union<Overlay: BlobStoreGet>(
 }
 
 fn archive_union<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     handle: ArchiveHandle,
 ) -> Result<TribleSet> {
@@ -1499,7 +1499,7 @@ fn archive_union<Overlay: BlobStoreGet>(
 /// Decode and prove one exact canonical Files record through the same blob
 /// overlay used for an unpublished cross-collection candidate.
 fn file_attachment_union<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     file: Id,
@@ -1557,7 +1557,7 @@ fn file_attachment_union<Overlay: BlobStoreGet>(
 /// The query itself selects the Files vocabulary this consumer understands.
 /// Unlike import validation, this path neither reconstructs the intrinsic id
 /// nor rejects additive facts that another version may understand.
-fn file_attachment<P>(reader: &PileSnapshot, facts: &P, file: Id) -> Result<AttachmentData>
+fn file_attachment<P>(reader: &impl BlobStoreGet, facts: &P, file: Id) -> Result<AttachmentData>
 where
     P: TriblePattern,
 {
@@ -1599,7 +1599,7 @@ where
 }
 
 fn validate_source_text_payloads<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     source_facts: &TribleSet,
 ) -> Result<()> {
@@ -1757,7 +1757,7 @@ where
 
 /// Resolve the exact Decide frontier which authorizes a send.
 pub fn authorized_send<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     decide_facts: &P,
     draft_id: Id,
 ) -> Result<(Id, Vec<Id>)>
@@ -1798,7 +1798,7 @@ where
 /// The account schema stores one immutable secret id, so this path performs no
 /// name or “latest version” arbitration and has no password-identity fallback.
 pub fn open_account<R, P>(
-    mail_reader: &PileSnapshot,
+    mail_reader: &impl BlobStoreGet,
     mail_facts: &P,
     secrets: &SecretsSnapshot<R>,
     anchor: Id,
@@ -1838,7 +1838,7 @@ fn config_owner_map(facts: &TribleSet) -> Result<HashMap<Id, AccountConfigRecord
 }
 
 fn validate_send_heads<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     decide_facts: &TribleSet,
     decision: Id,
@@ -1917,7 +1917,7 @@ fn normalized_mailboxes(
 }
 
 fn validate_attempt_rendering(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&impl BlobStoreGet>,
     mail_facts: &TribleSet,
     files_facts: &TribleSet,
@@ -2015,7 +2015,7 @@ fn validate_attempt_rendering(
 
 /// Exact structural and cross-collection validation for one Mail materialization.
 pub fn validate_catalog<R>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &TribleSet,
     files_facts: &TribleSet,
     decide_facts: &TribleSet,
@@ -2054,7 +2054,7 @@ pub fn validate_secret_references<R>(
 /// The stopped-world cutover uses this while each target collection is being
 /// materialized independently; [`validate_catalog`] remains the required
 /// final candidate predicate once Files, Decide, and Relations are available.
-pub fn validate_local_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
+pub fn validate_local_catalog(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
     validate_catalog_inner(
         reader,
         None::<&PileSnapshot>,
@@ -2069,7 +2069,7 @@ pub fn validate_local_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Resul
 /// Local preflight counterpart of [`validate_catalog_union`], used by the
 /// cutover planner before cross-collection candidate materialization exists.
 pub fn validate_local_catalog_union(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     current: &TribleSet,
     fragment: &Fragment,
 ) -> Result<TribleSet> {
@@ -2095,7 +2095,7 @@ pub fn validate_local_catalog_union(
 /// Preflight the exact set union a Mail publication would create, including
 /// the new fragment's in-memory blobs, without writing pile bytes.
 pub fn validate_catalog_union<R>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     current: &TribleSet,
     fragment: &Fragment,
     files_facts: &TribleSet,
@@ -2121,7 +2121,7 @@ pub fn validate_catalog_union<R>(
 /// that have not reached the pile yet.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_catalog_union_with_blobs<R>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     current: &TribleSet,
     mail_fragment: &Fragment,
     blob_overlay: &Fragment,
@@ -2152,7 +2152,7 @@ pub fn validate_catalog_union_with_blobs<R>(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_catalog_inner<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     files_facts: &TribleSet,
@@ -2627,7 +2627,7 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
 /// cutover. They remain inert evidence: native commands never create or query
 /// these kinds, while their canonical shadows use the current ontology.
 fn validate_legacy_evidence<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
 ) -> Result<TribleSet> {
@@ -2775,7 +2775,7 @@ where
 }
 
 fn text_values<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &P,
     id: Id,
     attribute: &Attribute<inlineencodings::Handle<blobencodings::UTF8String>>,
@@ -2838,7 +2838,7 @@ where
 }
 
 pub fn projection_view<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &P,
     projection_id: Id,
 ) -> Result<ProjectionView>
@@ -2920,7 +2920,7 @@ where
 }
 
 fn wire_claimed_message_id_union<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     facts: &TribleSet,
     wire_id: Id,
@@ -2945,7 +2945,7 @@ fn wire_claimed_message_id_union<Overlay: BlobStoreGet>(
 }
 
 pub fn wire_claimed_message_id<P>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     facts: &P,
     wire_id: Id,
 ) -> Result<Option<String>>
@@ -2975,7 +2975,7 @@ where
 }
 
 pub fn materialize_draft<M, F>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     mail_facts: &M,
     files_facts: &F,
     id: Id,
@@ -3029,7 +3029,7 @@ where
 }
 
 fn materialize_draft_union<Overlay: BlobStoreGet>(
-    reader: &PileSnapshot,
+    reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
     mail_facts: &TribleSet,
     files_facts: &TribleSet,
@@ -3313,8 +3313,8 @@ fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
 /// execution is therefore an affine authority which deployments must
 /// serialize per account rather than running concurrently on replicas.
 pub fn prepare_send<M, F, D>(
-    mail_reader: &PileSnapshot,
-    decide_reader: &PileSnapshot,
+    mail_reader: &impl BlobStoreGet,
+    decide_reader: &impl BlobStoreGet,
     mail_facts: &M,
     files_facts: &F,
     decide_facts: &D,

@@ -36,13 +36,15 @@
 //!   linkedin review [--limit N]
 //!   linkedin resolve <id-a> <id-b> --same | --distinct
 
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::relations::{self, Head, ProfileInput};
 use crate::schemas::linkedin;
 use crate::schemas::relations::DEFAULT_SCOPE_ID;
 #[cfg(test)]
 use crate::storage;
-use crate::storage::FactArchive;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
+#[cfg(test)]
 use crate::storage::FactView;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,7 +55,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
 use triblespace::macros::entity;
 use triblespace::prelude::*;
@@ -291,7 +292,7 @@ struct RelationsStorage<'a> {
 #[derive(Clone)]
 struct RelationsView {
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: AcquiringReader<FacultySnapshot>,
 }
 
 impl RelationsStorage<'_> {
@@ -301,15 +302,19 @@ impl RelationsStorage<'_> {
     fn with_store<T>(
         &self,
         operation: impl FnOnce(
-            &mut Pile,
+            &mut FacultyStore,
             Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &RelationsView,
+            &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_pile(|pile, signer| {
-            let (collection, view) = pollster::block_on(async {
-                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+        self.storage.with_store(|store, signer, runtime| {
+            let collection = crate::collection_names::open_configured_acquiring(
+                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            )?;
+            let pile = store;
+            let maintained_rank9 = runtime.block_on(async {
                 let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
                 let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
                     collection,
@@ -325,29 +330,21 @@ impl RelationsStorage<'_> {
                     pile.maintain_attached(maintained_rank9, signer).await,
                 )
                 .context("maintain Relations fact collection")?;
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze maintained Relations fact collection")?;
-                let observed = store_snapshot
-                    .attached(maintained_rank9)
-                    .context("observe Relations Rank9 projection")?;
-                let facts = observed
-                    .facts()
-                    .context("read Relations Rank9 projection")?;
-                Ok::<_, anyhow::Error>((
-                    collection,
-                    RelationsView {
-                        facts,
-                        reader: store_snapshot,
-                    },
-                ))
+                Ok::<_, anyhow::Error>(maintained_rank9)
             })?;
-            operation(pile, collection, signer, &view)
+            let reader = AcquiringReader::new(
+                pile.snapshot().context("freeze maintained Relations fact collection")?,
+                runtime.clone(),
+            );
+            let facts = crate::storage::acquire_facts(&reader, maintained_rank9)
+                .context("read Relations Rank9 projection")?;
+            let view = RelationsView { facts, reader };
+            operation(pile, collection, signer, &view, runtime)
         })
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&RelationsView) -> Result<T>) -> Result<T> {
-        self.with_store(|_, _, _, view| operation(view))
+        self.with_store(|_, _, _, view, _| operation(view))
     }
 
     /// Publish at most one complete, locally constructed Relations fragment.
@@ -356,21 +353,22 @@ impl RelationsStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&RelationsView) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_store(|pile, collection, signer, view| {
+        self.with_store(|pile, collection, signer, view, runtime| {
             let (fragment, value) = operation(view)?;
             if let Some(mut fragment) = fragment {
                 fragment.describe_with(entity! { metadata::description: description });
-                crate::collection_names::require_command_write_admission(
+                crate::collection_names::require_command_write_admission_acquiring(
                     pile,
                     collection,
                     signer,
                     "Relations",
                     "relations list",
+                    runtime,
                 )?;
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Relations fragment")?;
                 drop(
-                    pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                    runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                         .context(
                         "Relations facts were committed, but ensuring their derived views failed",
                     )?,

@@ -982,7 +982,7 @@ pub fn priority_ranks(
     ranks
 }
 
-pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader.get(handle).context("load Compass text")?;
     Ok(value.to_string())
 }
@@ -991,7 +991,7 @@ pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
 /// Kind names are descriptive catalog sugar and are deliberately excluded:
 /// the legacy CLI emitted some of those handles without retaining their blob,
 /// and a missing label must not make otherwise-complete board data unreadable.
-pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
+pub fn validate_known_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
     validate_structure(facts)?;
     for fact in facts {
         if fact.a() == &board::title.id()

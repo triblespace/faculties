@@ -1,5 +1,7 @@
 //! Resident-only health input with admitted foreground maintenance.
-//! No host activation or blob acquisition is part of this path.
+//! Opening its configured descriptors may acquire their exact bytes; report
+//! maintenance and passive attention remain local and never fetch health payloads.
+//! An explicit `show` acquires the fixed selected report and its queried labels.
 //!
 //! The maintained targets remain the query sources. The values built below
 //! are just one report's output and attention IDs, never a second health store.
@@ -31,18 +33,14 @@ pub(super) struct HealthSources {
 }
 
 impl HealthSources {
-    pub(super) fn open(
+    pub(super) async fn open(
         pile: &mut FacultyStore,
         signer: &SigningKey,
         max_age: Duration,
     ) -> Result<Self> {
+        let health = OrientSource::open(pile, signer, schema::DEFAULT_SCOPE_ID, "Swarm health").await?;
+        let relations = OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
         let mut local = pile.store();
-        let mut open = |scope, label| {
-            let source = open_configured(&mut *local, scope, signer.verifying_key())?;
-            OrientSource::register(&mut *local, source, label)
-        };
-        let health = open(schema::DEFAULT_SCOPE_ID, "Swarm health")?;
-        let relations = open(RELATIONS_SCOPE_ID, "Relations")?;
         let presentations = ReceiptSource::register(&mut *local, signer)?;
         let latest = local.attach::<LwwRegisterBlob>(
             health.source,
@@ -110,6 +108,53 @@ impl HealthSources {
         let _receipt_note = self.maintain(pile, signer)?;
         let now = clock::now()?;
         self.at(pile.snapshot()?, now)
+    }
+
+    /// The explicitly requested dashboard may fetch missing authority and
+    /// selected report bytes. This first selection uses the same frozen
+    /// records and proofs throughout; passive attention uses `at` instead.
+    pub(super) async fn observe_acquiring(
+        &self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+    ) -> Result<HealthObservation> {
+        let _receipt_note = self.maintain(pile, signer)?;
+        let snapshot = pile.snapshot()?;
+        let now = clock::now()?;
+        let health = self.health;
+        let relations = self.relations;
+        let latest_target = self.latest;
+        let presentations_target = self.presentations.rank9;
+        let max_age = self.max_age;
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+            let observe = |source: OrientSource| -> Result<OrientFact> {
+                let collection = reader.attached_acquiring(source.rank9)?;
+                let view = crate::storage::acquire_attached_facts(&collection)?;
+                Ok(OrientFact { collection: collection.into_frozen(), view })
+            };
+            let latest_collection = reader.attached_acquiring(latest_target)?;
+            let latest = crate::storage::require_complete_attached_read(
+                latest_collection.read_acquiring::<LwwIndex>()?,
+            )?.query()?;
+            let presentations = reader.attached(presentations_target)?;
+            Ok(HealthObservation {
+                snapshot,
+                evaluated_at: now,
+                facts: observe(health)?,
+                latest,
+                latest_collection: latest_collection.into_frozen(),
+                relations: observe(relations)?,
+                // Show presents this dashboard regardless of old receipts.
+                // Do not fetch historical receipt bytes it never consults.
+                presentations: ReceiptObservation {
+                    collection: presentations.into_frozen(),
+                    view: FactArchive::new(Vec::new()),
+                },
+                max_age,
+            })
+        }).await.context("join frozen health input selection")?
     }
 
     fn maintain_if_changed(
@@ -312,6 +357,28 @@ pub(super) struct HealthReport {
 }
 
 impl HealthObservation {
+    /// A requested dashboard may wait for its exact selected facts and labels.
+    /// Passive health attention deliberately does not: a disconnected observer
+    /// must be able to report the outage before ordinary network acquisition.
+    pub(super) async fn report_acquiring(&self) -> Result<HealthReport> {
+        let facts = self.facts.view.clone();
+        let latest = self.latest.clone();
+        let snapshot = self.snapshot.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let now = self.evaluated_at;
+        let max_age = self.max_age;
+        tokio::task::spawn_blocking(move || {
+            let reader = crate::storage::AcquiringReader::with_handle(snapshot, runtime);
+            render_health(&facts, &latest, &reader, now, max_age, Detail::Full)
+        }).await.context("join requested health report acquisition")
+    }
+
+    pub(super) async fn persona_acquiring(&self, pile: &mut FacultyStore, input: &str) -> Result<Id> {
+        read(pile, &self.snapshot, |reader| {
+            resolve_resident_persona(self.relations.view(), reader, input)
+        }).await
+    }
+
     fn is_current(&self, snapshot: &FacultySnapshot) -> bool {
         self.facts.is_current(snapshot)
             && self.latest_collection.is_current(snapshot)
@@ -592,7 +659,7 @@ impl AttentionView {
 }
 
 fn collection_label(
-    snapshot: &FacultySnapshot,
+    snapshot: &impl BlobStoreGet,
     handle: Inline<inlineencodings::Handle<SimpleArchive>>,
 ) -> String {
     let encoded = hex::encode(handle.raw);
@@ -629,7 +696,7 @@ enum Detail {
 fn render_health(
     facts: &FactArchive,
     latest: &LwwQuery,
-    snapshot: &FacultySnapshot,
+    snapshot: &impl BlobStoreGet,
     now: Epoch,
     max_age: Duration,
     detail: Detail,
@@ -815,7 +882,7 @@ mod tests {
             let signer = SigningKey::from_bytes(&[71; 32]);
             let mut store = open_store_as(&path, signer.verifying_key()).unwrap();
             let sources =
-                HealthSources::open(&mut store, &signer, Duration::from_secs(60)).unwrap();
+                test_block_on(HealthSources::open(&mut store, &signer, Duration::from_secs(60))).unwrap();
             Self {
                 store,
                 sources,
@@ -1294,7 +1361,7 @@ mod tests {
         // A new watcher has no process-local receipt state to lean on. Its
         // first poll carries the committed receipt through the ordinary set.
         let mut rearmed =
-            HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60)).unwrap();
+            test_block_on(HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60))).unwrap();
         parts.clear();
         let mut emit = |part| {
             parts.push(part);
@@ -1370,7 +1437,7 @@ mod tests {
         assert!(!text.contains("not refreshed"), "{text}");
 
         let mut rearmed =
-            HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60)).unwrap();
+            test_block_on(HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60))).unwrap();
         let (fired, text) = poll(&mut rearmed, &mut f.store);
         assert!(!fired, "a delivered report must not repeat: {text}");
         assert!(text.is_empty(), "{text}");

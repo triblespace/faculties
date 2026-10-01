@@ -805,7 +805,7 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, TextRule)>> 
     Ok(texts)
 }
 
-fn load_text_from(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+fn load_text_from(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Decide text payload {}", hex::encode(handle.raw)))?;
@@ -885,7 +885,7 @@ pub fn validate_catalog_union(
     Ok(expected)
 }
 
-pub fn read_text(reader: &PileSnapshot, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     load_text_from(reader, handle)
 }
 

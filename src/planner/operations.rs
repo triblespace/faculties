@@ -1,11 +1,12 @@
 //! Planner operations over resident input and frozen authorized collections.
-use crate::storage::FactRead;
 #[cfg(test)]
 use crate::storage::FactView;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::clock;
+use crate::collection_names::open_configured_acquiring;
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::planner::{
     self as planner_model, cancellation_fragment, event_fragment, note_fragment, read_text,
@@ -13,7 +14,7 @@ use crate::planner::{
     STATUS_TENTATIVE, TRANSP_OPAQUE,
 };
 use crate::schemas::planner::{event, DEFAULT_SCOPE_ID, KIND_EVENT_ID};
-use crate::storage::FactArchive;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use hifitime::Epoch;
@@ -26,7 +27,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::CollectionSnapshotExt;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -297,28 +297,31 @@ struct PlannerStorage<'a> {
 
 struct LoadedPlanner {
     facts: FactArchive,
-    reader: PileSnapshot,
+    reader: AcquiringReader<FacultySnapshot>,
 }
 
 impl PlannerStorage<'_> {
     fn with_store<T>(
         &self,
         operation: impl FnOnce(
-            &mut Pile,
+            &mut FacultyStore,
             Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &LoadedPlanner,
+            &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_pile(|pile, signer| {
+        self.storage.with_store(|pile, signer, runtime| {
             let result = (|| {
-                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let source = open_configured_acquiring(
+                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+                )?;
                 let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let collection_rank9 = pile
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
-                // Derive this key's own commits into each view; the root is
-                // not acquired, and what the views lack is lag.
-                pollster::block_on(async {
+                // Keep the existing upkeep step, then select one observation
+                // whose missing residual bytes the foreground read can fetch.
+                runtime.block_on(async {
                     crate::storage::tolerate_own_lag(
                         pile.maintain_attached(collection_succinct, signer).await,
                     )?;
@@ -327,24 +330,24 @@ impl PlannerStorage<'_> {
                     )
                 })
                 .context("maintain Planner fact collection")?;
-                let store_snapshot = pile
-                    .snapshot()
-                    .context("freeze maintained Planner fact collection")?;
-                let facts = store_snapshot
-                    .read_facts(collection_rank9)
+                let store_snapshot = AcquiringReader::new(
+                    pile.snapshot().context("freeze maintained Planner fact collection")?,
+                    runtime.clone(),
+                );
+                let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
                     .context("attach maintained Planner fact collection")?;
                 let loaded = LoadedPlanner {
                     facts,
                     reader: store_snapshot,
                 };
-                operation(pile, source, signer, &loaded)
+                operation(pile, source, signer, &loaded, runtime)
             })();
             result
         })
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&LoadedPlanner) -> Result<T>) -> Result<T> {
-        self.with_store(|_, _, _, loaded| operation(loaded))
+        self.with_store(|_, _, _, loaded, _| operation(loaded))
     }
 
     fn update<T>(
@@ -352,21 +355,22 @@ impl PlannerStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&LoadedPlanner) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_store(|pile, collection, signer, loaded| {
+        self.with_store(|pile, collection, signer, loaded, runtime| {
             let (fragment, value) = operation(loaded)?;
             if let Some(mut fragment) = fragment {
                 fragment.describe_with(entity! { metadata::description: description });
-                crate::collection_names::require_command_write_admission(
+                crate::collection_names::require_command_write_admission_acquiring(
                     pile,
                     collection,
                     signer,
                     "Planner",
                     "planner list",
+                    runtime,
                 )?;
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
                 drop(
-                    pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                    runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
                         .context(
                             "Planner facts were committed, but ensuring their derived views failed",
                         )?,

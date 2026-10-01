@@ -5,18 +5,22 @@
 //! complete event set. Relations is a separate native collection used only to
 //! resolve human selectors and render labels.
 
+#[cfg(test)]
 use crate::storage::FactRead;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::clock;
+#[cfg(test)]
 use crate::collection_names::open_configured;
+use crate::collection_names::open_configured_acquiring;
 use crate::relations::{self, Head, SelectorOutcome};
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID;
 use crate::status;
-use crate::storage::FactArchive;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -24,7 +28,8 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+#[cfg(test)]
+use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -103,8 +108,8 @@ impl Status {
 
     /// Load only the current event text for each window, from one frozen view.
     pub fn list(&self) -> Result<Vec<WindowStatus>> {
-        self.storage().with_pile(|pile, signer| {
-            let observation = maintain_and_observe_status(pile, signer)?;
+        self.storage().with_store(|pile, signer, runtime| {
+            let observation = maintain_and_observe_status(pile, signer, runtime)?;
             let latest = status::latest_per_window(status::load_status_rows(&observation.status)?)?;
             let mut rows: Vec<WindowStatus> = latest
                 .into_values()
@@ -134,8 +139,8 @@ impl Status {
     /// Select one window before acquiring any history text. A zero limit keeps
     /// the header/count while acquiring no event text.
     pub fn show(&self, selector: &str, limit: usize) -> Result<StatusHistory> {
-        self.storage().with_pile(|pile, signer| {
-            let observation = maintain_and_observe_status(pile, signer)?;
+        self.storage().with_store(|pile, signer, runtime| {
+            let observation = maintain_and_observe_status(pile, signer, runtime)?;
             let window =
                 resolve_window_id(&observation.snapshot, &observation.relations, selector)?;
             let label = window_label(&observation.snapshot, &observation.relations, window)?;
@@ -184,16 +189,24 @@ struct StatusStorage<'a> {
 struct StatusObservation {
     status: FactArchive,
     relations: FactArchive,
-    snapshot: PileSnapshot,
+    snapshot: AcquiringReader<FacultySnapshot>,
 }
 
 /// The maintained Relations relation needed while resolving a Status writer.
 struct RelationsObservation {
     relations: FactArchive,
-    snapshot: PileSnapshot,
+    snapshot: AcquiringReader<FacultySnapshot>,
 }
 
 impl StatusStorage<'_> {
+    fn with_store<T>(
+        &self,
+        f: impl FnOnce(&mut FacultyStore, &SigningKey, &Arc<tokio::runtime::Runtime>) -> Result<T>,
+    ) -> Result<T> {
+        self.storage.with_store(f)
+    }
+
+    #[cfg(test)]
     fn with_pile<T>(&self, f: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>) -> Result<T> {
         // Authority is loaded before storage is touched. No ordinary command
         // mints an identity or substitutes an ephemeral signer.
@@ -201,13 +214,19 @@ impl StatusStorage<'_> {
     }
 }
 
-fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<StatusObservation> {
+fn maintain_and_observe_status(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    runtime: &Arc<tokio::runtime::Runtime>,
+) -> Result<StatusObservation> {
     // Register every descriptor before advancing the two fact chains.
-    let status_source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let status_source =
+        open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
     let status_succinct = pile.attach::<SuccinctArchiveBlob>(status_source, ())?;
     let status_rank9 =
         pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(status_source, status_succinct)?;
-    let relations_source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+    let relations_source =
+        open_configured_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
     let relations_succinct = pile.attach::<SuccinctArchiveBlob>(relations_source, ())?;
     let relations_rank9 =
         pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(relations_source, relations_succinct)?;
@@ -215,26 +234,36 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
     // Derive this key's own commits into each view. The roots are not
     // acquired: a view is read as it stands, other windows' statuses reach it
     // through their own derivations, and what nobody has derived yet is lag.
-    pollster::block_on(async {
-        crate::storage::tolerate_own_lag(pile.maintain_attached(status_succinct, signer).await)
+    {
+        // Preserve the existing resident-only upkeep. Release the backend
+        // guard before any reader is allowed to acquire through the Leech.
+        let mut local = pile.store();
+        pollster::block_on(async {
+            crate::storage::tolerate_own_lag(
+                local.maintain_attached(status_succinct, signer).await,
+            )
             .context("maintain Status fact collection")?;
-        crate::storage::tolerate_own_lag(pile.maintain_attached(status_rank9, signer).await)
-            .context("maintain Status fact collection")?;
-        crate::storage::tolerate_own_lag(pile.maintain_attached(relations_succinct, signer).await)
+            crate::storage::tolerate_own_lag(local.maintain_attached(status_rank9, signer).await)
+                .context("maintain Status fact collection")?;
+            crate::storage::tolerate_own_lag(
+                local.maintain_attached(relations_succinct, signer).await,
+            )
             .context("maintain Relations fact collection")?;
-        crate::storage::tolerate_own_lag(pile.maintain_attached(relations_rank9, signer).await)
+            crate::storage::tolerate_own_lag(
+                local.maintain_attached(relations_rank9, signer).await,
+            )
             .context("maintain Relations fact collection")?;
-        Ok::<_, anyhow::Error>(())
-    })?;
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
 
     let snapshot = pile
         .snapshot()
         .context("freeze maintained Status/Relations snapshot")?;
-    let status = snapshot
-        .read_facts(status_rank9)
+    let snapshot = AcquiringReader::new(snapshot, Arc::clone(runtime));
+    let status = crate::storage::acquire_facts(&snapshot, status_rank9)
         .context("read Status Rank9 collection")?;
-    let relations = snapshot
-        .read_facts(relations_rank9)
+    let relations = crate::storage::acquire_facts(&snapshot, relations_rank9)
         .context("read Relations Rank9 collection")?;
     Ok(StatusObservation {
         status,
@@ -244,25 +273,32 @@ fn maintain_and_observe_status(pile: &mut Pile, signer: &SigningKey) -> Result<S
 }
 
 fn maintain_and_observe_relations(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     signer: &SigningKey,
+    runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<RelationsObservation> {
-    let source = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+    let source =
+        open_configured_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
     let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
     let collection_rank9 =
         pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
-    pollster::block_on(async {
-        crate::storage::tolerate_own_lag(
-            pile.maintain_attached(collection_succinct, signer).await,
-        )?;
-        crate::storage::tolerate_own_lag(pile.maintain_attached(collection_rank9, signer).await)
-    })
-    .context("maintain Relations fact collection")?;
+    {
+        let mut local = pile.store();
+        pollster::block_on(async {
+            crate::storage::tolerate_own_lag(
+                local.maintain_attached(collection_succinct, signer).await,
+            )?;
+            crate::storage::tolerate_own_lag(
+                local.maintain_attached(collection_rank9, signer).await,
+            )
+        })
+        .context("maintain Relations fact collection")?;
+    }
     let snapshot = pile
         .snapshot()
         .context("freeze maintained Relations snapshot")?;
-    let relations = snapshot
-        .read_facts(collection_rank9)
+    let snapshot = AcquiringReader::new(snapshot, Arc::clone(runtime));
+    let relations = crate::storage::acquire_facts(&snapshot, collection_rank9)
         .context("read Relations Rank9 collection")?;
     Ok(RelationsObservation {
         relations,
@@ -271,25 +307,35 @@ fn maintain_and_observe_relations(
 }
 
 fn commit_status(
-    pile: &mut Pile,
+    pile: &mut FacultyStore,
     signer: &SigningKey,
     fragment: Fragment,
+    runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<CollectionCommit> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    crate::collection_names::require_command_write_admission(
+    let collection =
+        open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+    crate::collection_names::require_command_write_admission_acquiring(
         pile,
         collection,
         signer,
         "Status",
         "status list",
+        runtime,
     )?;
     let commit = pile
         .commit(collection, signer, fragment)
         .context("commit authored Status event")?;
-    drop(
-        pollster::block_on(crate::storage::ensure_downstream(pile, collection, signer))
+    {
+        let mut local = pile.store();
+        drop(
+            pollster::block_on(crate::storage::ensure_downstream(
+                &mut *local,
+                collection,
+                signer,
+            ))
             .context("Status facts were committed, but ensuring their derived views failed")?,
-    );
+        );
+    }
     Ok(commit)
 }
 
@@ -300,9 +346,10 @@ fn fmt_id(id: Id) -> String {
 /// Exact ids deliberately do not require Relations membership. Labels and
 /// aliases use the complete native Relations read model and fail closed on
 /// ambiguity or a forked profile/lifecycle track.
-fn resolve_window_id<P>(reader: &PileSnapshot, facts: &P, input: &str) -> Result<Id>
+fn resolve_window_id<P, R>(reader: &R, facts: &P, input: &str) -> Result<Id>
 where
     P: TriblePattern,
+    R: triblespace::core::repo::BlobStoreGet,
 {
     let input = input.trim();
     if let Some(id) = Id::from_hex(input) {
@@ -316,9 +363,10 @@ where
 
 /// Render a Relations label without hiding unsettled state. Unknown anchors
 /// remain valid Status windows and render as their exact id.
-fn window_label<P>(reader: &PileSnapshot, facts: &P, window: Id) -> Result<String>
+fn window_label<P, R>(reader: &R, facts: &P, window: Id) -> Result<String>
 where
     P: TriblePattern,
+    R: triblespace::core::repo::BlobStoreGet,
 {
     if !relations::person_anchors(facts).contains(&window) {
         return Ok(fmt_id(window));
@@ -353,15 +401,15 @@ fn store_status_at(
     text: &str,
     at: status::IntervalValue,
 ) -> Result<SetStatus> {
-    storage.with_pile(|pile, signer| {
-        let observation = maintain_and_observe_relations(pile, signer)?;
+    storage.with_store(|pile, signer, runtime| {
+        let observation = maintain_and_observe_relations(pile, signer, runtime)?;
         let window = resolve_window_id(&observation.snapshot, &observation.relations, selector)?;
         drop(observation);
         let fragment = status::status_fragment(window, text, at)?;
         let event = fragment
             .root()
             .expect("Status event has one intrinsic root");
-        let commit = commit_status(pile, signer, fragment)?;
+        let commit = commit_status(pile, signer, fragment, runtime)?;
         Ok(SetStatus {
             event,
             commit,
@@ -468,8 +516,8 @@ mod tests {
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
 
         storage(&fixture)
-            .with_pile(|pile, signer| {
-                let observation = maintain_and_observe_status(pile, signer)?;
+            .with_store(|pile, signer, runtime| {
+                let observation = maintain_and_observe_status(pile, signer, runtime)?;
                 assert_eq!(status::load_status_rows(&observation.status)?.len(), 1);
                 Ok(())
             })
@@ -483,8 +531,8 @@ mod tests {
         store_status_at(storage(&fixture), &fmt_id(window), "first", at(20.0)).unwrap();
         store_status_at(storage(&fixture), &fmt_id(window), "second", at(21.0)).unwrap();
         storage(&fixture)
-            .with_pile(|pile, signer| {
-                let observation = maintain_and_observe_status(pile, signer)?;
+            .with_store(|pile, signer, runtime| {
+                let observation = maintain_and_observe_status(pile, signer, runtime)?;
                 assert_eq!(status::load_status_rows(&observation.status)?.len(), 2);
                 Ok(())
             })
@@ -493,8 +541,8 @@ mod tests {
         let key = fs::read(&fixture.key).unwrap();
 
         storage(&fixture)
-            .with_pile(|pile, signer| {
-                let observation = maintain_and_observe_status(pile, signer)?;
+            .with_store(|pile, signer, runtime| {
+                let observation = maintain_and_observe_status(pile, signer, runtime)?;
                 assert_eq!(status::load_status_rows(&observation.status)?.len(), 2);
                 Ok(())
             })
@@ -521,8 +569,8 @@ mod tests {
         pile.close().unwrap();
 
         storage(&fixture)
-            .with_pile(|pile, signer| {
-                let observation = maintain_and_observe_status(pile, signer)?;
+            .with_store(|pile, signer, runtime| {
+                let observation = maintain_and_observe_status(pile, signer, runtime)?;
                 let rows = status::load_status_rows(&observation.status)?;
                 assert!(rows.is_empty());
 
@@ -562,8 +610,8 @@ mod tests {
         );
 
         storage(&fixture)
-            .with_pile(|pile, signer| {
-                let observation = maintain_and_observe_relations(pile, signer)?;
+            .with_store(|pile, signer, runtime| {
+                let observation = maintain_and_observe_relations(pile, signer, runtime)?;
                 assert_eq!(
                     resolve_window_id(&observation.snapshot, &observation.relations, "example")?,
                     person
@@ -595,8 +643,8 @@ mod tests {
         publish_relations(&fixture, second_fragment);
 
         storage(&fixture)
-            .with_pile(|pile, signer| {
-                let observation = maintain_and_observe_relations(pile, signer)?;
+            .with_store(|pile, signer, runtime| {
+                let observation = maintain_and_observe_relations(pile, signer, runtime)?;
                 assert_eq!(
                     resolve_window_id(
                         &observation.snapshot,
@@ -622,8 +670,8 @@ mod tests {
             relations::profile_fragment(first, profile("fork-b", &[]), &[first_profile]).unwrap(),
         );
         storage(&fixture)
-            .with_pile(|pile, signer| {
-                let observation = maintain_and_observe_relations(pile, signer)?;
+            .with_store(|pile, signer, runtime| {
+                let observation = maintain_and_observe_relations(pile, signer, runtime)?;
                 assert!(
                     resolve_window_id(&observation.snapshot, &observation.relations, "fork-a")
                         .is_err()

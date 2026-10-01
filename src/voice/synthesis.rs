@@ -196,16 +196,12 @@ impl Synthesizer {
             std::fs::read(&self.sources.reference_wav).context("read configured reference WAV")?;
         let (sample_count, sample_rate) = reference_metadata(&reference)?;
         preflight_reference_codes(&self.sources.reference_codes)?;
-        let snapshot =
-            mary::model_collection::load_model_collection_local_latest(&self.sources.pile)
-                .with_context(|| {
-                    format!(
-                        "freeze native Qwen3-TTS collection {}",
-                        self.sources.pile.display()
-                    )
-                })?;
-        let weights = mary::speak::Qwen3TtsWeights::from_snapshot(snapshot, self.sources.variant)
-            .context("select configured native Qwen3-TTS cohort")?;
+        let weights = crate::model_storage::with_snapshot(
+            &self.sources.pile, "Qwen3-TTS", |snapshot| {
+                mary::speak::Qwen3TtsWeights::from_snapshot(snapshot.clone(), self.sources.variant)
+                    .context("select configured native Qwen3-TTS cohort")
+            },
+        )?;
         let session = mary::speak::Synthesizer::spawn(
             weights,
             &self.sources.reference_wav,
