@@ -152,7 +152,7 @@ impl HealthSources {
                     collection: presentations.into_frozen(),
                     view: FactArchive::new(vec![
                         triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(
-                            TribleSet::new(),
+                            &TribleSet::new(),
                         ),
                     ]),
                 },

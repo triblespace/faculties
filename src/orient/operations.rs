@@ -1096,7 +1096,7 @@ async fn observe_snapshot_acquiring(
             // demand historical receipt payloads it will never consult.
             FactArchive::new(vec![
                 triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(
-                    TribleSet::new(),
+                    &TribleSet::new(),
                 ),
             ])
         };
