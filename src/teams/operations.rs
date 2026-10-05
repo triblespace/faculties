@@ -14,7 +14,10 @@ use crate::storage::initialize_signer;
 use crate::storage::open_secrets_collection;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
+use crate::storage::{
+    open_secrets_collection_acquiring, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore,
+    Storage,
+};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use hifitime::{Epoch, TimeScale};
@@ -38,9 +41,9 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, 
 use triblespace::prelude::*;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_configured;
+use crate::collection_names::open_configured_acquiring;
 use crate::files as file_capability;
 use crate::schemas::archive::{archive, RawBytes};
 use crate::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
@@ -50,7 +53,7 @@ use crate::teams as teams_core;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveAccess {
     /// Query the frozen archive without Graph or credential access. Missing
-    /// referenced bytes may be acquired from the colony.
+    /// referenced bytes may be acquired from peers.
     Resident,
     /// Complete one finite delta round before observing the archive.
     Synchronize,
@@ -666,9 +669,8 @@ impl TeamsSession {
         // support. Only Secrets gets a new observation here.
         let support = self.support.clone();
         let storage = self.storage.clone();
-        storage.with_store(|pile, _, runtime| {
-            self.refresh_secrets_for(pile, Some(support), runtime)
-        })
+        storage
+            .with_store(|pile, _, runtime| self.refresh_secrets_for(pile, Some(support), runtime))
     }
 
     fn refresh_secrets_for(
@@ -677,7 +679,8 @@ impl TeamsSession {
         support: Option<Support<SimpleArchive>>,
         runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<()> {
-        let snapshot = runtime.block_on(self.secret_collection.ensure(pile, &self.signer))
+        let snapshot = runtime
+            .block_on(self.secret_collection.ensure(pile, &self.signer))
             .context("refresh configured Secrets collection for Teams")?;
         let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
         let secrets = secret_storage::snapshot_acquiring(reader.clone(), self.secret_collection)?;
@@ -732,16 +735,18 @@ impl TeamsStorage {
         self.storage.scope(|storage| {
             let mut session = storage.with_store(|pile, signer, runtime| {
                 let collection = open_configured_acquiring(
-                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
                 )?;
                 let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
                 let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
                     collection,
                     maintained_succinct,
                 )?;
-                let secret_collection = open_secrets_collection_acquiring(
-                    pile, signer.verifying_key(), runtime,
-                )?;
+                let secret_collection =
+                    open_secrets_collection_acquiring(pile, signer.verifying_key(), runtime)?;
                 // The session carries the source and attaches the frontier
                 // the carry leaves; a commit neither attachment reaches yet
                 // is read from its own bytes, and what this key cannot
@@ -755,13 +760,15 @@ impl TeamsStorage {
                         pile.maintain_attached(maintained_rank9, signer).await,
                     )
                     .context("maintain Teams fact collection")?;
-                    let snapshot = secret_collection.ensure(pile, signer)
-                            .await
-                            .context("observe configured Secrets collection for Teams")?;
+                    let snapshot = secret_collection
+                        .ensure(pile, signer)
+                        .await
+                        .context("observe configured Secrets collection for Teams")?;
                     Ok::<_, anyhow::Error>(snapshot)
                 })?;
                 let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
-                let secrets = secret_storage::snapshot_acquiring(reader.clone(), secret_collection)?;
+                let secrets =
+                    secret_storage::snapshot_acquiring(reader.clone(), secret_collection)?;
                 let observed = reader
                     .attached_acquiring(maintained_rank9)
                     .context("observe Teams through Secrets snapshot")?;
@@ -1235,7 +1242,11 @@ fn now_epoch_secs() -> Result<i64> {
     Ok(clock::now()?.to_unix_seconds() as i64)
 }
 
-fn load_context<P>(reader: &impl BlobStoreGet, catalog: &P, source_id: Id) -> Result<PresentationContext>
+fn load_context<P>(
+    reader: &impl BlobStoreGet,
+    catalog: &P,
+    source_id: Id,
+) -> Result<PresentationContext>
 where
     P: TriblePattern,
 {
