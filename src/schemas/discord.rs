@@ -23,6 +23,12 @@
 //! first import explicit; ordinary intervals may advance a reader only when
 //! they connect to that baseline cover.
 //!
+//! Something said in a voice channel is a message there too: its anchor is
+//! the utterance itself ([`discord::kind_utterance`]: who spoke, in which
+//! channel, from when), since no snowflake names it, and its observation
+//! carries the transcript as content and the audio beside it
+//! ([`discord::utterance_audio`]).
+//!
 //! Coverage says what is stored, not what was heard: `discord read` brings a
 //! channel's history in with the same observations `discord live`'s intake
 //! stores. Where a channel's live intake begins is therefore a fact of its
@@ -30,7 +36,7 @@
 //! tells what was sent while the channel was heard from its history.
 
 use triblespace::macros::id_hex;
-use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
@@ -108,6 +114,13 @@ pub mod discord {
         /// Minted with `trible genid` on 2026-09-26:
         /// `066E9645CB6045F63AA0E9BFBC064337`.
         "066E9645CB6045F63AA0E9BFBC064337" as pub heard_from: NsTAIInterval;
+        /// The audio of a spoken utterance's observation ([`kind_utterance`]):
+        /// what was said, as a 16 kHz mono 16-bit PCM WAV, beside the
+        /// transcript in `archive::content`.
+        ///
+        /// Minted with `trible genid` on 2026-10-05:
+        /// `C86AF50A0542619BE20A22EFFBE15033`.
+        "C86AF50A0542619BE20A22EFFBE15033" as pub utterance_audio: Handle<RawBytes>;
     }
 
     /// Root id for describing the Discord protocol in metadata.
@@ -176,4 +189,14 @@ pub mod discord {
     /// `C6AF15CBF07E7E6537752837DE056917`.
     #[allow(non_upper_case_globals)]
     pub const kind_intake: Id = id_hex!("C6AF15CBF07E7E6537752837DE056917");
+    /// Tag for the stable anchor of something said in a voice channel: who
+    /// ([`user`]) spoke in which [`channel`], from when
+    /// (`metadata::created_at`). It is a message anchor like one a snowflake
+    /// derives, linked from its observations through [`message`], but no
+    /// Discord message id names it, so it carries no [`message_id`].
+    ///
+    /// Minted with `trible genid` on 2026-10-05:
+    /// `3D20B9F91AE85C3778B71123578F1599`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_utterance: Id = id_hex!("3D20B9F91AE85C3778B71123578F1599");
 }
