@@ -242,6 +242,8 @@ mod tests {
                 intake::Work::Update(message) => format!("update {}", message["id"]),
                 intake::Work::Account(user) => format!("account {user}"),
                 intake::Work::Backfill => "backfill".to_owned(),
+                intake::Work::Utterance(_) => "utterance".to_owned(),
+                intake::Work::NoMessages => "no messages".to_owned(),
             })
             .collect();
         assert_eq!(

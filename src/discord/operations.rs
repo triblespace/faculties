@@ -160,6 +160,43 @@ pub struct ObservedMessage {
     pub variant_index: usize,
     pub variant_count: usize,
 }
+/// Something one user said in a voice channel: what `discord live` hears,
+/// stored as a message in that channel ([`Discord::observe_utterance`]).
+///
+/// Its Debug output names the channel, the user and the sizes, never the
+/// transcript, so that a log line can never carry what was said.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Utterance {
+    pub channel: u64,
+    pub user: u64,
+    /// When it began, in milliseconds since the Unix epoch.
+    pub start_ms: u64,
+    pub transcript: String,
+    /// What was said, as a 16 kHz mono 16-bit PCM WAV.
+    pub wav: Vec<u8>,
+}
+
+impl std::fmt::Debug for Utterance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Utterance")
+            .field("channel", &self.channel)
+            .field("user", &self.user)
+            .field("start_ms", &self.start_ms)
+            .field("transcript_chars", &self.transcript.chars().count())
+            .field("wav_bytes", &self.wav.len())
+            .finish()
+    }
+}
+
+impl Utterance {
+    /// When it began, as the point interval a message's
+    /// `metadata::created_at` is.
+    pub fn started(&self) -> Inline<NsTAIInterval> {
+        let moment = Epoch::from_unix_duration(hifitime::Unit::Millisecond * self.start_ms as i64);
+        epoch_interval(moment)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct History {
     pub channel_id: Option<String>,
@@ -320,6 +357,32 @@ impl Discord {
         self.storage().publish(
             fragment,
             format!("discord: observed message {message_id} in channel {channel_id}"),
+        )
+    }
+    /// Store something said in a voice channel as a message there, with its
+    /// audio ([`discord_model::utterance_fragment`]). `floor` is where intake
+    /// hears the channel from: the channel is recorded as heard from there
+    /// ([`discord_model::intake_fragment`]) in the same commit, as
+    /// [`Self::observe`] records a text channel, so readers take the
+    /// utterance for news. The same utterance stored again converges on the
+    /// same observation.
+    pub fn observe_utterance(&self, utterance: &Utterance, floor: u64) -> Result<CollectionCommit> {
+        let channel = utterance.channel.to_string();
+        let mut fragment = discord_model::utterance_fragment(
+            &channel,
+            &utterance.user.to_string(),
+            utterance.started(),
+            &utterance.transcript,
+            utterance.wav.clone(),
+        )?;
+        fragment += discord_model::intake_fragment(&channel, floor)?;
+        self.storage().publish(
+            fragment,
+            format!(
+                "discord: heard user {} in voice channel {channel} at {}",
+                utterance.user,
+                format_interval(utterance.started())
+            ),
         )
     }
     /// Record the Discord user a bot token of this pile authenticates as, so

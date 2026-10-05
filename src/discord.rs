@@ -25,6 +25,7 @@ pub mod voice;
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
     ObservedMessage, PageRequest, PullOptions, PullReport, ReadOptions, Rest, SendReceipt, Source,
+    Utterance,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

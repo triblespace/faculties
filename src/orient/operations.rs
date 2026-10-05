@@ -8888,4 +8888,107 @@ mod tests {
         );
         assert!(!text.contains("the disk is connected"), "{text}");
     }
+
+    /// What the voice connection hears of somebody is stored through intake
+    /// as a Discord message in the voice channel, and is news like a written
+    /// one: its transcript is its text, and it carries its audio.
+    #[test]
+    fn an_utterance_heard_in_voice_is_news_with_its_audio() {
+        use crate::discord::intake::{floor_at, Done, Intake, Work};
+        crate::test_support::clear_ambient_environment();
+        let runtime = runtime().unwrap();
+        let fixture = TestPile::new();
+        let key = fixture.dir.join("discord.key");
+        let signer = crate::storage::initialize_signer(&fixture.path, Some(&key)).unwrap();
+        let discord = crate::discord::Discord::new(fixture.path.clone(), Some(key));
+        let reader_id = id(94);
+        runtime.block_on(async {
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&mut pile, &signer, false)
+                .await
+                .unwrap();
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &signer, profile)
+                .unwrap();
+            pile.close().unwrap();
+        });
+
+        // Hearing alone: no text channel, no DMs.
+        let mut intake = Intake::new(
+            discord,
+            Box::new(DiscordFake::default()),
+            Vec::new(),
+            false,
+            fixture.dir.join("intake"),
+            floor_at(UNIX_EPOCH + Duration::from_millis(1_790_455_273_191)),
+        );
+        let voice = 1553078566332403895_u64;
+        let speaker = 100000000000000400_u64;
+        let wav = b"RIFF\x24\0\0\0WAVEfmt and the samples".to_vec();
+        let utterance = crate::discord::Utterance {
+            channel: voice,
+            user: speaker,
+            start_ms: 1_790_455_300_000,
+            transcript: "can you hear me?".to_owned(),
+            wav: wav.clone(),
+        };
+        assert_eq!(
+            intake.handle(Work::Utterance(utterance)).unwrap(),
+            Done::Stored
+        );
+
+        let News::Report { text, events } =
+            runtime.block_on(take_news(&fixture.path, &signer, reader_id))
+        else {
+            panic!("what somebody said in voice is news");
+        };
+        assert_eq!(events.len(), 1, "{text}");
+        assert!(
+            text.contains(&format!(
+                "News: Discord message from {speaker} in channel {voice}: can you hear me?"
+            )),
+            "{text}"
+        );
+
+        let (handles, audio) = runtime.block_on(async {
+            let mut pile = open_store_as(&fixture.path, signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&mut pile, &signer, false)
+                .await
+                .unwrap();
+            maintain_sources(&mut pile, &signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let found = read(&mut pile, &observation.snapshot, |view| {
+                let query = observation.query(view);
+                let handles: Vec<Inline<inlineencodings::Handle<blobencodings::RawBytes>>> = find!(
+                    audio: Inline<inlineencodings::Handle<blobencodings::RawBytes>>,
+                    pattern!(query.discord, [{
+                        _?observation @
+                        metadata::tag: archive::kind_message,
+                        discord::utterance_audio: ?audio,
+                    }])
+                )
+                .collect();
+                let audio = handles
+                    .first()
+                    .map(|handle| read_bytes(&query.payloads, *handle, "utterance audio"))
+                    .transpose()?;
+                Ok((handles, audio))
+            })
+            .await
+            .unwrap();
+            pile.close().unwrap();
+            found
+        });
+        assert_eq!(handles.len(), 1, "one observation carries the audio");
+        assert_eq!(audio, Some(wav));
+    }
 }

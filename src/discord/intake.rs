@@ -39,12 +39,22 @@
 //! session heard it; nothing a pull does moves a floor, so a backfill that
 //! caught up has pulled everything its floors let in.
 //!
+//! With hearing on (the `discord-hearing` feature), what the allowlisted
+//! users say in the voice channel comes here too, transcribed, and is stored
+//! as a message in that channel ([`Work::Utterance`]): intake is the one
+//! writer of the discord collection. The voice channel is heard from the
+//! first time an utterance is stored in it (its floor is kept under
+//! `voice/<id>`). An utterance whose write fails is kept in the state
+//! directory, as `unstored-speech/<channel>-<user>-<start>.txt` (the
+//! transcript) and `.wav` (the audio), and never fetched again: Discord has no
+//! copy of it.
+//!
 //! The pile and the downloads block, so intake runs on a thread of its own,
 //! and nothing that happens there reaches the rest of the process: every
 //! failure is logged, a panic included, and the work goes on.
 
 use super::gateway::{DIRECT_MESSAGES, GUILD_MESSAGES, MESSAGE_CONTENT};
-use crate::discord::{Discord, Source, DISCORD_EPOCH_MS};
+use crate::discord::{Discord, Source, Utterance, DISCORD_EPOCH_MS};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -71,6 +81,10 @@ const PULLS: usize = 5;
 const UNSTORED: &str = "unstored";
 /// What the marker of a kept new message in a DM channel ends in.
 const NEW_DM: &str = "new";
+/// Where each voice channel's floor is kept, beside `channels/` and `dms/`.
+const VOICE: &str = "voice";
+/// Where utterances whose write failed are kept, transcript and audio.
+pub const UNSTORED_SPEECH: &str = "unstored-speech";
 
 pub struct Intake {
     discord: Discord,
@@ -101,6 +115,12 @@ pub enum Work {
     Account(String),
     /// Pull every configured channel and every DM channel seen before.
     Backfill,
+    /// Something said in the voice channel, transcribed.
+    Utterance(Utterance),
+    /// Discord refused the message intents while hearing goes on: no more
+    /// messages are stored, nor channels pulled (their content would be
+    /// empty); utterances still are.
+    NoMessages,
 }
 
 /// What one piece of work came to.
@@ -184,6 +204,28 @@ impl Intake {
                 Ok(Done::Recorded)
             }
             Work::Backfill => Ok(self.backfill()),
+            Work::Utterance(utterance) => self.utterance(utterance),
+            Work::NoMessages => {
+                self.channels.clear();
+                self.dms = false;
+                Ok(Done::Recorded)
+            }
+        }
+    }
+
+    /// Store an utterance as a message in its voice channel, which is heard
+    /// from the first time one is stored in it. One whose write fails is
+    /// kept in the state directory: nothing can fetch it again.
+    fn utterance(&mut self, utterance: Utterance) -> Result<Done> {
+        let stored = self
+            .keep_floor(VOICE, utterance.channel, self.floor)
+            .and_then(|floor| self.discord.observe_utterance(&utterance, floor));
+        match stored {
+            Ok(_) => Ok(Done::Stored),
+            Err(error) => {
+                keep_utterance(&self.directory.join(UNSTORED_SPEECH), &utterance);
+                Err(error)
+            }
         }
     }
 
@@ -686,6 +728,23 @@ pub fn start(mut intake: Intake) -> Worker {
                     ),
                     Work::Account(user) => format!("the bot account {user}"),
                     Work::Backfill => "the backfill".to_owned(),
+                    Work::NoMessages => "the end of message intake".to_owned(),
+                    // Never what was said: only who, where, when and how much.
+                    Work::Utterance(utterance) => format!(
+                        "the utterance of user {} in voice channel {} at {} ms ({} characters, \
+                         {} bytes of audio)",
+                        utterance.user,
+                        utterance.channel,
+                        utterance.start_ms,
+                        utterance.transcript.chars().count(),
+                        utterance.wav.len()
+                    ),
+                };
+                // An utterance is kept should storing it panic: nothing can
+                // fetch it again.
+                let spoken = match &work {
+                    Work::Utterance(utterance) => Some(utterance.clone()),
+                    _ => None,
                 };
                 let handled =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| intake.handle(work)));
@@ -713,6 +772,12 @@ pub fn start(mut intake: Intake) -> Worker {
                         }
                     }
                     Ok(Ok(_)) => {}
+                    Ok(Err(error)) if spoken.is_some() => {
+                        eprintln!(
+                            "[discord] storing {what} failed: {error:#}; it is kept in \
+                             {UNSTORED_SPEECH}/"
+                        );
+                    }
                     Ok(Err(error)) => {
                         eprintln!(
                             "[discord] storing {what} failed: {error:#}; a backfill fetches it \
@@ -722,7 +787,12 @@ pub fn start(mut intake: Intake) -> Worker {
                     }
                     Err(_) => {
                         eprintln!("[discord] storing {what} panicked; intake goes on");
-                        retry.soon(Instant::now());
+                        match spoken {
+                            Some(utterance) => {
+                                keep_utterance(&intake.directory.join(UNSTORED_SPEECH), &utterance)
+                            }
+                            None => retry.soon(Instant::now()),
+                        }
                     }
                 }
             }
@@ -737,7 +807,26 @@ pub fn start(mut intake: Intake) -> Worker {
     }
 }
 
+/// A way into the intake thread besides [`Worker::send`], for work that does
+/// not come from the gateway session: what the voice connection hears.
+#[derive(Clone)]
+pub struct Inbox(std::sync::mpsc::Sender<Work>);
+
+impl Inbox {
+    /// Hand `work` to the intake thread; it comes back if the thread is gone.
+    pub fn send(&self, work: Work) -> std::result::Result<(), Work> {
+        self.0.send(work).map_err(|refused| refused.0)
+    }
+}
+
 impl Worker {
+    /// Another way into the intake thread, while it runs. The thread ends
+    /// once every way in is dropped, so an inbox handed out delays the end of
+    /// [`Self::stop`] (up to its limit) until its holder lets go.
+    pub fn inbox(&self) -> Option<Inbox> {
+        self.sender.clone().map(Inbox)
+    }
+
     /// A worker whose work goes to `sender`, with no thread of its own.
     #[cfg(test)]
     pub fn from_sender(sender: std::sync::mpsc::Sender<Work>) -> Self {
@@ -777,6 +866,37 @@ impl Worker {
 
 fn snowflake(value: &Value) -> Option<u64> {
     value.as_str().and_then(|id| id.parse().ok())
+}
+
+/// Keep an utterance whose write failed in `directory`: its transcript as
+/// `<channel>-<user>-<start>.txt` and its audio as the `.wav` beside it, each
+/// written aside and renamed in, so neither is ever half there. A failure to
+/// keep it is logged with its size, never its words.
+pub fn keep_utterance(directory: &std::path::Path, utterance: &Utterance) {
+    let name = format!(
+        "{}-{}-{}",
+        utterance.channel, utterance.user, utterance.start_ms
+    );
+    let kept = std::fs::create_dir_all(directory).and_then(|()| {
+        for (extension, bytes) in [
+            ("wav", utterance.wav.as_slice()),
+            ("txt", utterance.transcript.as_bytes()),
+        ] {
+            let staging = directory.join(format!(".{name}.{extension}"));
+            std::fs::write(&staging, bytes)?;
+            std::fs::rename(&staging, directory.join(format!("{name}.{extension}")))?;
+        }
+        Ok(())
+    });
+    if let Err(error) = kept {
+        eprintln!(
+            "[discord] the utterance {name} ({} characters, {} bytes of audio) could not be \
+             kept in {}: {error}; it is lost",
+            utterance.transcript.chars().count(),
+            utterance.wav.len(),
+            directory.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2165,5 +2285,98 @@ mod tests {
         assert!(intake
             .handle(Work::Account("not a snowflake".to_owned()))
             .is_err());
+    }
+
+    /// Something said in the voice channel is stored as a message there,
+    /// once however often it comes, and the channel is heard from the first
+    /// time; a write that fails keeps the transcript and the audio in the
+    /// state directory, since nothing can fetch them again.
+    #[test]
+    fn an_utterance_is_stored_once_or_kept_when_it_cannot_be() {
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[], false);
+        assert_eq!(
+            intake.intents(),
+            0,
+            "hearing alone asks for no message intent"
+        );
+        let voice = CHANNEL + 5;
+        let utterance = Utterance {
+            channel: voice,
+            user: AUTHOR.parse().unwrap(),
+            start_ms: 1_790_000_000_000,
+            transcript: "can you hear me?".to_owned(),
+            wav: b"RIFF and the rest".to_vec(),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                intake.handle(Work::Utterance(utterance.clone())).unwrap(),
+                Done::Stored
+            );
+        }
+        assert_eq!(
+            fixture.stored(voice),
+            [("can you hear me?".to_owned(), 0, 1)]
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.state.join(VOICE).join(voice.to_string())).unwrap(),
+            FLOOR.to_string(),
+            "the voice channel is heard from where intake began"
+        );
+        assert!(!fixture.state.join(UNSTORED_SPEECH).exists());
+
+        // A pile that cannot be written.
+        let mut broken = Intake::new(
+            Discord::new(fixture.state.join("no.pile"), None),
+            Box::new(fixture.fake.clone()),
+            Vec::new(),
+            false,
+            fixture.state.clone(),
+            FLOOR,
+        );
+        let later = Utterance {
+            start_ms: 1_790_000_005_000,
+            ..utterance
+        };
+        assert!(broken.handle(Work::Utterance(later.clone())).is_err());
+        let kept = fixture.state.join(UNSTORED_SPEECH);
+        let name = format!("{voice}-{AUTHOR}-1790000005000");
+        assert_eq!(
+            std::fs::read_to_string(kept.join(format!("{name}.txt"))).unwrap(),
+            later.transcript
+        );
+        assert_eq!(
+            std::fs::read(kept.join(format!("{name}.wav"))).unwrap(),
+            later.wav
+        );
+        assert_eq!(
+            std::fs::read_dir(&kept).unwrap().count(),
+            2,
+            "nothing half kept"
+        );
+    }
+
+    /// When Discord refuses the message intents but hearing goes on, intake
+    /// stores no more messages and pulls nothing.
+    #[test]
+    fn no_messages_leaves_only_utterances() {
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[CHANNEL], true);
+        assert_eq!(intake.handle(Work::NoMessages).unwrap(), Done::Recorded);
+        let message = rest("100000000000000901", CHANNEL, "hello", None);
+        assert_eq!(
+            intake.handle(Work::Message(gateway(&message))).unwrap(),
+            Done::Ignored
+        );
+        assert_eq!(
+            intake.handle(Work::Backfill).unwrap(),
+            Done::Backfilled {
+                channels: 0,
+                failed: 0,
+                more: false,
+                unstored: 0
+            }
+        );
+        assert!(fixture.fake.pages.lock().unwrap().is_empty());
     }
 }
