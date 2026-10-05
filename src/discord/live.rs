@@ -7,7 +7,9 @@
 //! into the discord collection, where orient finds them. With a voice channel
 //! configured, a voice connection hangs off the same session (`voice`, built
 //! with the `discord-voice` feature): the bot joins the channel through the
-//! session and speaks what `discord say` queues in the state directory.
+//! session and speaks what `discord say` queues in the state directory; with
+//! the `discord-hearing` feature and users to hear, it also hears them, and
+//! what they say goes into the collection through intake.
 //!
 //! The process runs until the gateway session ends for good, the speech model
 //! cannot load or breaks, or it is asked to stop. Nothing else ends it:
@@ -29,7 +31,8 @@ const INTAKE_DRAIN: Duration = Duration::from_secs(20);
 
 /// The state directory `discord live` and `discord say` share: `say/` holds
 /// queued lines, `said/` spoken ones and `failed/` the ones that could not be
-/// spoken; `intake/` is intake's.
+/// spoken; `intake/` is intake's, utterances that could not be stored
+/// included.
 #[derive(Clone, Debug)]
 pub struct StateDir {
     root: PathBuf,
@@ -104,6 +107,15 @@ pub async fn run(live: Live) -> Result<()> {
     let voiced = live.voice.is_some();
     #[cfg(not(feature = "discord-voice"))]
     let voiced = false;
+    // Hearing stores what it hears through intake, which therefore stays
+    // when Discord refuses the message intents; only messages stop.
+    #[cfg(feature = "discord-hearing")]
+    let hears = live
+        .voice
+        .as_ref()
+        .is_some_and(|voice| voice.hearing.is_some());
+    #[cfg(not(feature = "discord-hearing"))]
+    let hears = false;
     // A voice connection needs voice's intents and goes on without intake's
     // if Discord refuses them; without one, intake's are all the session is
     // for.
@@ -128,9 +140,12 @@ pub async fn run(live: Live) -> Result<()> {
         backoff: gateway::BACKOFF,
     });
     #[cfg(feature = "discord-voice")]
-    let mut voice_task = live
-        .voice
-        .map(|config| voice::start(config, live.token.clone(), discord.commands.clone()));
+    let mut voice_task = live.voice.map(|config| {
+        let heard = hears
+            .then(|| intake.as_ref().and_then(intake::Worker::inbox))
+            .flatten();
+        voice::start(config, live.token.clone(), discord.commands.clone(), heard)
+    });
     #[cfg(not(feature = "discord-voice"))]
     let mut voice_task: Option<Beside> = None;
 
@@ -157,7 +172,15 @@ pub async fn run(live: Live) -> Result<()> {
             Some(event) = discord.events.recv() => {
                 let dispatch = match event {
                     gateway::Event::Refused(_) => {
-                        if let Some(worker) = intake.take() {
+                        if hears {
+                            if let Some(worker) = &mut intake {
+                                eprintln!(
+                                    "[discord] message intake is off: Discord refused the \
+                                     message intents; what is heard is still stored"
+                                );
+                                worker.send(intake::Work::NoMessages);
+                            }
+                        } else if let Some(worker) = intake.take() {
                             eprintln!("[discord] intake is off: Discord refused the message intents");
                             tokio::spawn(worker.stop(INTAKE_DRAIN));
                         }

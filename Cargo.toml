@@ -168,6 +168,12 @@ duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
 # hands out. Without it, `discord live` runs intake alone and `discord say`
 # says voice is not built in. Off by default: the model runtime is heavy.
 discord-voice = ["voice", "dep:songbird", "dep:symphonia", "dep:async-trait"]
+# Hearing in `discord live`'s voice channel: songbird's receive path decodes
+# what the allowlisted users (`--hear-user`) say, an energy segmenter cuts it
+# into utterances, and mary's Voxtral streaming transcriber turns each into
+# text, stored with its audio as a message in the voice channel. Nobody else's
+# audio is kept. Off by default, like discord-voice, which it builds on.
+discord-hearing = ["discord-voice", "songbird/receive", "mary/voxtral"]
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"
@@ -259,6 +265,11 @@ tempfile = "3"
 # Root patches are not inherited; this source/registry difference is deliberate.
 [patch.crates-io]
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
+# SOURCE-BUILD-ONLY: songbird 0.6.0 with its receive path fixed (branch
+# dave-receive-fix): VoiceTick decodes exactly the Opus frame (no DAVE trailer,
+# no RTP padding), loss concealment is one tick at any rate and channel count,
+# and receive builds without the gateway feature.
+songbird = { path = "../songbird" }
 
 # Debug info was 94.7% of a debug binary here: the `trible` test binary
 # measured 1.97 GB, of which only 110 MB was code. Cargo never collects old

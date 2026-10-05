@@ -29,9 +29,15 @@
 //! several times in a row, end the process, so that its supervisor starts it
 //! again with a fresh model.
 //!
+//! With the `discord-hearing` feature and `--hear-user`, the bot also hears
+//! the allowlisted users in the channel ([`super::hearing`]): songbird then
+//! decodes what it receives to 16 kHz mono, and what they say is stored as
+//! messages in the voice channel through intake.
+//!
 //! Built with the `discord-voice` feature.
 
 use super::gateway;
+use super::intake::Inbox;
 use super::live::{Beside, StateDir};
 use crate::voice::synthesis::{ModelSources, Synthesizer};
 use anyhow::{anyhow, Context, Result};
@@ -133,6 +139,9 @@ pub struct Config {
     pub greeting: String,
     /// The state directory whose queue is spoken.
     pub state: StateDir,
+    /// Who is heard in the channel, and with what model; nobody without it.
+    #[cfg(feature = "discord-hearing")]
+    pub hearing: Option<super::hearing::Config>,
 }
 
 /// Start the voice connection's task beside the gateway session, which
@@ -141,11 +150,19 @@ pub struct Config {
 /// coming, and leaves the channel either way. Nothing else ends it: gateway
 /// reconnects, lost voice connections and a line that could not be spoken
 /// are all recovered from while the speech model stays loaded.
-pub fn start(config: Config, token: String, commands: mpsc::UnboundedSender<Value>) -> Beside {
+///
+/// `intake` is where what is heard is stored, with hearing configured;
+/// hearing is off without it.
+pub fn start(
+    config: Config,
+    token: String,
+    commands: mpsc::UnboundedSender<Value>,
+    intake: Option<Inbox>,
+) -> Beside {
     let (dispatches, inbox) = mpsc::unbounded_channel();
     Beside {
         dispatches,
-        task: tokio::spawn(run(config, token, inbox, commands)),
+        task: tokio::spawn(run(config, token, inbox, commands, intake)),
     }
 }
 
@@ -154,6 +171,7 @@ async fn run(
     token: String,
     mut dispatches: mpsc::UnboundedReceiver<Value>,
     commands: mpsc::UnboundedSender<Value>,
+    intake: Option<Inbox>,
 ) -> Result<()> {
     let Config {
         guild,
@@ -161,8 +179,14 @@ async fn run(
         announce,
         greeting,
         state,
+        #[cfg(feature = "discord-hearing")]
+        hearing,
     } = config;
-    let driver = Arc::new(Mutex::new(Driver::new(songbird::Config::default())));
+    #[cfg(feature = "discord-hearing")]
+    let driver = voice_driver(channel, hearing, intake);
+    #[cfg(not(feature = "discord-hearing"))]
+    let driver = voice_driver(channel, intake);
+    let driver = Arc::new(Mutex::new(driver));
     let (lost, mut losses) = mpsc::unbounded_channel();
     let interruptions = Arc::new(AtomicU64::new(0));
     let events = VoiceEvents {
@@ -279,6 +303,32 @@ async fn run(
     // Leave the channel on the gateway too, so the bot does not linger in it.
     let _ = commands.send(gateway::voice_state(guild, None));
     outcome
+}
+
+/// The voice driver, hearing the channel when hearing is configured and
+/// intake is there to store what it hears.
+fn voice_driver(
+    channel: NonZeroU64,
+    #[cfg(feature = "discord-hearing")] hearing: Option<super::hearing::Config>,
+    intake: Option<Inbox>,
+) -> Driver {
+    #[cfg(feature = "discord-hearing")]
+    if let Some(hearing) = hearing {
+        let users = hearing.users.len();
+        let Some(intake) = intake else {
+            eprintln!("[discord] hearing is off: there is no intake to store what is heard");
+            return Driver::new(songbird::Config::default());
+        };
+        let mut driver =
+            Driver::new(songbird::Config::default().decode_mode(super::hearing::decode_mode()));
+        match super::hearing::start(hearing, channel.get(), intake, &mut driver) {
+            Ok(()) => eprintln!("[discord] hearing {users} user(s) in voice channel {channel}"),
+            Err(error) => eprintln!("[discord] hearing is off: {error:#}"),
+        }
+        return driver;
+    }
+    let _ = (channel, intake);
+    Driver::new(songbird::Config::default())
 }
 
 /// The voice connection as the task keeps it: whether one works (what the
