@@ -71,6 +71,18 @@ enum Command {
         /// What to say, spoken after everything queued before it.
         text: String,
     },
+    /// Hear a recorded clip the way `live --hear-model` hears its voice
+    /// channel, without Discord or a pile: a 16 kHz mono 16-bit WAV is cut
+    /// into utterances, and each is transcribed and printed with its timing
+    /// and words. Nothing is stored.
+    #[cfg(feature = "discord-hearing")]
+    Hear {
+        /// The Voxtral model pile, weights and tokenizer.
+        #[arg(long, value_name = "PILE")]
+        hear_model: PathBuf,
+        /// The clip.
+        wav: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -181,6 +193,8 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Command::Collection(command) => command,
         Command::Live(args) => return run_live(&cli, args),
         Command::Say { state, text } => return say(state.state_dir, &text, out),
+        #[cfg(feature = "discord-hearing")]
+        Command::Hear { hear_model, wav } => return hear(&hear_model, &wav, out),
     };
     let token = require_token(&cli)?;
     let pile = cli
@@ -355,6 +369,21 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
     // up past its own bounded shutdown.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     outcome
+}
+
+/// `discord hear`: a clip heard as the voice channel is.
+#[cfg(feature = "discord-hearing")]
+fn hear(model: &std::path::Path, wav: &std::path::Path, out: &mut Out<'_>) -> Result<()> {
+    // Panics on anything but a 16-bit mono WAV.
+    let (clip, rate) = mary::models::f5::wav::read_pcm16_mono(wav);
+    if rate as usize != super::hearing::RATE {
+        bail!(
+            "{} is at {rate} Hz; hearing takes {} Hz",
+            wav.display(),
+            super::hearing::RATE
+        );
+    }
+    super::hearing::hear_clip(model, &clip, out)
 }
 
 /// `discord say`: queue one line for the voice connection to speak.

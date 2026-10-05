@@ -447,6 +447,44 @@ fn store(ear: &mut dyn Transcribe, spoken: Spoken, channel: u64, intake: &Inbox,
     }
 }
 
+/// `discord hear`: a recorded clip, mono at [`RATE`], heard the way the
+/// voice channel is but without Discord or a pile: one speaker's 20 ms ticks
+/// through the same [`Listener`] and transcriber. Each utterance is written
+/// to `out` with where it began in the clip, how long it is, how long it took
+/// to transcribe, and its words, since the clip is the caller's own. Nothing
+/// is stored.
+pub fn hear_clip(model: &Path, clip: &[f32], out: &mut crate::out::Out<'_>) -> Result<()> {
+    let started = Instant::now();
+    let mut ear = voxtral::Voxtral::load(model)?;
+    out.line(format!(
+        "transcriber loaded in {:.1} s",
+        started.elapsed().as_secs_f64()
+    ))?;
+    let mut listener = Listener::default();
+    let mut spoken = Vec::new();
+    for (tick, samples) in (0..).zip(clip.chunks(TICK)) {
+        let samples = samples.iter().map(|&s| (s * 32768.0) as i16).collect();
+        let moment = Moment {
+            at_ms: 20 * tick,
+            heard: vec![Heard::Audio { user: 0, samples }],
+        };
+        listener.hear(moment, &mut |s| spoken.push(s));
+    }
+    listener.flush(&mut |s| spoken.push(s));
+    for spoken in spoken {
+        let started = Instant::now();
+        let text = ear.transcribe(&spoken.samples)?;
+        out.line(format!(
+            "at {:.2} s, {:.2} s of audio transcribed in {:.1} s: {}",
+            spoken.start_ms as f64 / 1000.0,
+            spoken.samples.len() as f64 / RATE as f64,
+            started.elapsed().as_secs_f64(),
+            text.trim()
+        ))?;
+    }
+    Ok(())
+}
+
 /// A 16-bit mono PCM WAV of `samples` at [`RATE`]. They came from 16-bit PCM
 /// divided by 32768, so they go back exactly.
 pub fn wav_pcm16(samples: &[f32]) -> Vec<u8> {
