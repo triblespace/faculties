@@ -170,10 +170,11 @@ duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
 discord-voice = ["voice", "dep:songbird", "dep:symphonia", "dep:async-trait"]
 # Hearing in `discord live`'s voice channel: songbird's receive path decodes
 # what the allowlisted users (`--hear-user`) say, an energy segmenter cuts it
-# into utterances, and mary's Voxtral streaming transcriber turns each into
-# text, stored with its audio as a message in the voice channel. Nobody else's
-# audio is kept. Off by default, like discord-voice, which it builds on.
-discord-hearing = ["discord-voice", "songbird/receive", "mary/voxtral"]
+# into utterances, and mary's Voxtral streaming transcriber (`mary::hear`, on
+# CUDA) turns each into text, stored with its audio as a message in the voice
+# channel. Nobody else's audio is kept. Off by default, like discord-voice,
+# which it builds on.
+discord-hearing = ["discord-voice", "songbird/receive", "mary/voxtral-cuda"]
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"

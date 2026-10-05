@@ -11,12 +11,12 @@
 //! list is forgotten at once. A thread of its own ([`Listener`]) runs the
 //! energy segmenter `hear` uses on each heard user's stream (Discord clients
 //! stop sending during silence, and a silent tick counts as 20 ms of zeros),
-//! and transcribes every finished utterance with mary's Voxtral streaming
-//! transcriber, which loads once, before the first one ([`Transcribe`] is the
-//! seam its backend changes behind). The utterance goes to intake, the one
-//! writer of the discord collection ([`super::intake::Work::Utterance`]), and
-//! is kept in the state directory, transcript and audio, when that write
-//! fails or intake is gone.
+//! and transcribes every finished utterance with `mary::hear`'s Voxtral
+//! streaming transcriber on CUDA, which loads once, before the first one
+//! ([`Transcribe`] is the seam its backend changes behind). The utterance
+//! goes to intake, the one writer of the discord collection
+//! ([`super::intake::Work::Utterance`]), and is kept in the state directory,
+//! transcript and audio, when that write fails or intake is gone.
 //!
 //! Logs carry who, where, when and how much, never what was said.
 //!
@@ -32,9 +32,10 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
-/// The rate everything here runs at: songbird decodes to it, the segmenter
-/// cuts at it, Voxtral hears it, and the audio is kept at it.
-pub const RATE: usize = 16_000;
+/// The rate everything here runs at: the rate Voxtral hears, which songbird
+/// decodes to ([`decode_mode`]), the segmenter cuts at, and the audio is kept
+/// at.
+pub const RATE: usize = mary::models::voxtral::config::SAMPLE_RATE;
 /// Samples in one 20 ms voice tick at [`RATE`].
 const TICK: usize = RATE / 50;
 /// A heard user's stream that went this long without a tick (its SSRC
@@ -46,15 +47,14 @@ const GAP_MS: u64 = 1_000;
 pub struct Config {
     /// The users whose speech is heard; nobody else's audio is kept.
     pub users: BTreeSet<u64>,
-    /// The Voxtral model pile.
+    /// The Voxtral model pile, weights and tokenizer.
     pub model: PathBuf,
-    /// Voxtral's `tekken.json` tokenizer.
-    pub tekken: PathBuf,
     /// Where an utterance intake cannot take is kept.
     pub unstored: PathBuf,
 }
 
-/// The songbird decoding hearing needs: mono at [`RATE`].
+/// The songbird decoding hearing needs: mono at [`RATE`], as 16-bit samples
+/// the [`Listener`] turns into f32.
 pub fn decode_mode() -> songbird::driver::DecodeMode {
     songbird::driver::DecodeMode::Decode(songbird::driver::DecodeConfig::new(
         songbird::driver::Channels::Mono,
@@ -83,12 +83,12 @@ pub fn start(
     ] {
         driver.add_global_event(songbird::Event::Core(event), receiver.clone());
     }
-    let (model, tekken, unstored) = (config.model, config.tekken, config.unstored);
+    let (model, unstored) = (config.model, config.unstored);
     std::thread::Builder::new()
         .name("discord-hearing".to_owned())
         .spawn(move || {
             let load = move || -> Result<Box<dyn Transcribe>> {
-                Ok(Box::new(voxtral::Voxtral::load(&model, &tekken)?))
+                Ok(Box::new(voxtral::Voxtral::load(&model)?))
             };
             hear(moments, load, channel, &intake, &unstored);
         })
@@ -471,57 +471,46 @@ fn now_ms() -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-/// mary's Voxtral-Mini-4B-Realtime, streaming, behind [`Transcribe`].
+/// mary's Voxtral-Mini-4B-Realtime, streaming on CUDA (`mary::hear`, with
+/// mary's `voxtral-cuda`), behind [`Transcribe`].
 mod voxtral {
     use super::Transcribe;
     use anyhow::{Context, Result};
-    use mary::models::voxtral::config::{
-        delay_tokens, N_FFT, OFFLINE_BUFFER_TOKENS, SAMPLES_PER_TOK,
-    };
-    use mary::models::voxtral::fast::RealtimeTranscriber;
-    use mary::models::voxtral::pipeline::StreamingTranscriber;
-    use mary::models::voxtral::VoxtralWeights;
     use std::path::Path;
 
-    /// The backend Voxtral runs on: what mary offers for it on this build
-    /// (fusion-wrapped f16 over wgpu). The one line that changes for CUDA.
-    type Backend = mary::nn::backend::BFusedHalf;
     /// How far the text lags the audio, mary's default for the stream.
     const DELAY_MS: usize = 480;
-    /// Audio tokens one utterance can take (80 ms each): the segmenter cuts
-    /// at 28 s, 350 tokens, plus the prompt and the trailing silence.
-    const MAX_TOKENS: usize = 1024;
 
     pub struct Voxtral {
-        stt: RealtimeTranscriber<Backend>,
+        ears: mary::hear::Ears,
     }
 
     impl Voxtral {
-        pub fn load(model: &Path, tekken: &Path) -> Result<Self> {
-            let snapshot = mary::model_collection::load_model_collection_local_latest(model)
-                .with_context(|| format!("open the Voxtral model pile {}", model.display()))?;
-            let loader = VoxtralWeights::from_snapshot(snapshot)?.into_loader();
-            let device = Default::default();
-            let stt = RealtimeTranscriber::<Backend>::load(&loader, tekken, MAX_TOKENS, &device)
-                .with_context(|| format!("load Voxtral with {}", tekken.display()))?;
-            Ok(Self { stt })
+        /// Load the weights and the tokenizer from the model pile, and
+        /// compile the stream's kernels before the first utterance.
+        pub fn load(model: &Path) -> Result<Self> {
+            let ears = mary::hear::Ears::load(model)
+                .with_context(|| format!("load Voxtral from {}", model.display()))?;
+            Ok(Self { ears })
         }
     }
 
     impl Transcribe for Voxtral {
+        /// One stream per utterance; what does not fit in one stream's
+        /// positions (about ten minutes) goes on in the next.
         fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
-            let mut stream = StreamingTranscriber::new(&self.stt, DELAY_MS);
-            // After the utterance, the trailing silence the offline path
-            // pads with, so the delayed text comes out whole.
-            let align = (SAMPLES_PER_TOK - samples.len() % SAMPLES_PER_TOK) % SAMPLES_PER_TOK;
-            let tail = align
-                + (delay_tokens(DELAY_MS) + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK
-                + N_FFT / 2;
-            stream.push(samples);
-            if !stream.is_finished() {
-                stream.push(&vec![0.0; tail]);
+            let mut text = String::new();
+            let mut rest = samples;
+            loop {
+                let mut listening = self.ears.listen(DELAY_MS);
+                let (now, later) = rest.split_at(rest.len().min(listening.room()));
+                text += &listening.push(now);
+                text += &listening.finish();
+                if later.is_empty() {
+                    return Ok(text);
+                }
+                rest = later;
             }
-            Ok(stream.text())
         }
     }
 }
@@ -642,6 +631,17 @@ mod tests {
         listener.flush(&mut |s| spoken.push(s));
         assert_eq!(spoken.len(), 1);
         assert!(spoken.iter().all(|s| s.user == JP));
+    }
+
+    /// Discord hands over what the transcriber hears: mono at [`RATE`],
+    /// Voxtral's rate.
+    #[test]
+    fn songbird_decodes_to_what_voxtral_hears() {
+        let songbird::driver::DecodeMode::Decode(decode) = decode_mode() else {
+            panic!("hearing decodes");
+        };
+        assert_eq!(decode.channels, songbird::driver::Channels::Mono);
+        assert_eq!(u32::from(decode.sample_rate) as usize, RATE);
     }
 
     /// A tick stream as songbird hands it over: silence as silent ticks
