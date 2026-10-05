@@ -10,9 +10,9 @@
 //! Discord's one gateway session ([`gateway`]), stores the messages it reads
 //! in the collection ([`intake`]), and, with the `discord-voice` feature,
 //! joins a voice channel through the same session to speak what `discord say`
-//! queues; with the `discord-hearing` feature it also hears the allowlisted
-//! users there ([`hearing`]), and stores what they say, transcript and audio,
-//! as messages in the voice channel ([`utterance_fragment`]).
+//! queues; with the `discord-hearing` feature it also hears everybody else
+//! there ([`hearing`]), and stores what each says, transcript and audio, as
+//! messages in the voice channel ([`utterance_fragment`]).
 
 pub mod cli;
 pub mod gateway;

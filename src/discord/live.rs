@@ -8,8 +8,8 @@
 //! configured, a voice connection hangs off the same session (`voice`, built
 //! with the `discord-voice` feature): the bot joins the channel through the
 //! session and speaks what `discord say` queues in the state directory; with
-//! the `discord-hearing` feature and users to hear, it also hears them, and
-//! what they say goes into the collection through intake.
+//! the `discord-hearing` feature and a model to hear with, it also hears the
+//! channel, and what is said there goes into the collection through intake.
 //!
 //! The process runs until the gateway session ends for good, the speech model
 //! cannot load or breaks, or it is asked to stop. Nothing else ends it:

@@ -29,10 +29,10 @@
 //! several times in a row, end the process, so that its supervisor starts it
 //! again with a fresh model.
 //!
-//! With the `discord-hearing` feature and `--hear-user`, the bot also hears
-//! the allowlisted users in the channel ([`super::hearing`]): songbird then
-//! decodes what it receives to 16 kHz mono, and what they say is stored as
-//! messages in the voice channel through intake.
+//! With the `discord-hearing` feature and `--hear-model`, the bot also hears
+//! everybody else in the channel ([`super::hearing`]): songbird then decodes
+//! what it receives to 16 kHz mono, and what each says is stored as a message
+//! in the voice channel through intake.
 //!
 //! Built with the `discord-voice` feature.
 
@@ -139,7 +139,7 @@ pub struct Config {
     pub greeting: String,
     /// The state directory whose queue is spoken.
     pub state: StateDir,
-    /// Who is heard in the channel, and with what model; nobody without it.
+    /// What the channel is heard with; nobody is heard without it.
     #[cfg(feature = "discord-hearing")]
     pub hearing: Option<super::hearing::Config>,
 }
@@ -314,7 +314,6 @@ fn voice_driver(
 ) -> Driver {
     #[cfg(feature = "discord-hearing")]
     if let Some(hearing) = hearing {
-        let users = hearing.users.len();
         let Some(intake) = intake else {
             eprintln!("[discord] hearing is off: there is no intake to store what is heard");
             return Driver::new(songbird::Config::default());
@@ -322,7 +321,7 @@ fn voice_driver(
         let mut driver =
             Driver::new(songbird::Config::default().decode_mode(super::hearing::decode_mode()));
         match super::hearing::start(hearing, channel.get(), intake, &mut driver) {
-            Ok(()) => eprintln!("[discord] hearing {users} user(s) in voice channel {channel}"),
+            Ok(()) => eprintln!("[discord] hearing voice channel {channel}"),
             Err(error) => eprintln!("[discord] hearing is off: {error:#}"),
         }
         return driver;

@@ -39,10 +39,10 @@
 //! session heard it; nothing a pull does moves a floor, so a backfill that
 //! caught up has pulled everything its floors let in.
 //!
-//! With hearing on (the `discord-hearing` feature), what the allowlisted
-//! users say in the voice channel comes here too, transcribed, and is stored
-//! as a message in that channel ([`Work::Utterance`]): intake is the one
-//! writer of the discord collection. The voice channel is heard from the
+//! With hearing on (the `discord-hearing` feature), what is said in the voice
+//! channel comes here too, transcribed, and is stored as a message in that
+//! channel ([`Work::Utterance`]): intake is the one writer of the discord
+//! collection. The voice channel is heard from the
 //! first time an utterance is stored in it (its floor is kept under
 //! `voice/<id>`). An utterance whose write fails is kept in the state
 //! directory, as `unstored-speech/<channel>-<user>-<start>.txt` (the

@@ -1,22 +1,22 @@
-//! What the voice connection of `discord live` hears: the speech of the
-//! allowlisted users (`--hear-user`), cut into utterances, transcribed, and
-//! stored with its audio as messages in the voice channel.
+//! What the voice connection of `discord live` hears: the speech of everybody
+//! in the voice channel but the bot itself, cut into utterances, transcribed,
+//! and stored with its audio as messages in the voice channel, each under the
+//! user who said it.
 //!
 //! songbird's receive path decodes every speaker's audio to 16 kHz mono and
 //! hands it over once per 20 ms tick, keyed by SSRC; Discord says whose SSRC
 //! is whose as each user starts speaking. The handler on the driver ([`Ears`])
-//! maps only the allowlisted users' SSRCs, and copies only their audio out of
-//! a tick into a channel before it returns: anybody else's audio is never
-//! copied, kept or logged, and an SSRC Discord gives to somebody not on the
-//! list is forgotten at once. A thread of its own ([`Listener`]) runs the
-//! energy segmenter `hear` uses on each heard user's stream (Discord clients
-//! stop sending during silence, and a silent tick counts as 20 ms of zeros),
-//! and transcribes every finished utterance with `mary::hear`'s Voxtral
-//! streaming transcriber on CUDA, which loads once, before the first one
-//! ([`Transcribe`] is the seam its backend changes behind). The utterance
-//! goes to intake, the one writer of the discord collection
-//! ([`super::intake::Work::Utterance`]), and is kept in the state directory,
-//! transcript and audio, when that write fails or intake is gone.
+//! maps the SSRCs Discord names, never the bot's own (which the driver learns
+//! as it connects), and copies their audio out of a tick into a channel before
+//! it returns; an SSRC Discord names nobody for is never heard. A thread of
+//! its own ([`Listener`]) runs the energy segmenter `hear` uses on each heard
+//! user's stream (Discord clients stop sending during silence, and a silent
+//! tick counts as 20 ms of zeros), and transcribes every finished utterance
+//! with `mary::hear`'s Voxtral streaming transcriber on CUDA, which loads
+//! once, before the first one ([`Transcribe`] is the seam its backend changes
+//! behind). The utterance goes to intake, the one writer of the discord
+//! collection ([`super::intake::Work::Utterance`]), and is kept in the state
+//! directory, transcript and audio, when that write fails or intake is gone.
 //!
 //! Logs carry who, where, when and how much, never what was said.
 //!
@@ -26,7 +26,7 @@ use super::intake::{self, Inbox, Work};
 use crate::discord::Utterance;
 use crate::hear::segmenter::{Segment, Segmenter, VadConfig};
 use anyhow::{Context, Result};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -43,10 +43,8 @@ const TICK: usize = RATE / 50;
 /// utterance's time is never taken from a clock that stood still.
 const GAP_MS: u64 = 1_000;
 
-/// Who is heard, and with what.
+/// What hearing runs with.
 pub struct Config {
-    /// The users whose speech is heard; nobody else's audio is kept.
-    pub users: BTreeSet<u64>,
     /// The Voxtral model pile, weights and tokenizer.
     pub model: PathBuf,
     /// Where an utterance intake cannot take is kept.
@@ -73,10 +71,12 @@ pub fn start(
 ) -> Result<()> {
     let (heard, moments) = mpsc::channel();
     let receiver = Receiver {
-        ears: Arc::new(Mutex::new(Ears::new(config.users))),
+        ears: Arc::new(Mutex::new(Ears::default())),
         heard,
     };
     for event in [
+        songbird::CoreEvent::DriverConnect,
+        songbird::CoreEvent::DriverReconnect,
         songbird::CoreEvent::SpeakingStateUpdate,
         songbird::CoreEvent::VoiceTick,
         songbird::CoreEvent::ClientDisconnect,
@@ -96,7 +96,7 @@ pub fn start(
     Ok(())
 }
 
-/// One heard user's share of a voice tick, or their leaving.
+/// One speaker's share of a voice tick, or their leaving.
 #[derive(Debug, PartialEq)]
 pub enum Heard {
     /// 20 ms (or a packet's worth) of what they said, mono at [`RATE`].
@@ -124,27 +124,28 @@ pub enum Sent<'a> {
     Absent,
 }
 
-/// Which SSRCs are heard: only those Discord said belong to an allowlisted
-/// user. Everything else in a tick is never looked at.
-#[derive(Debug)]
+/// Which SSRCs are heard, and as whom: those Discord said belong to a user,
+/// but never the bot's own. Everything else in a tick is never looked at.
+#[derive(Debug, Default)]
 pub struct Ears {
-    allowed: BTreeSet<u64>,
+    /// The SSRC the bot sends with on its current connection.
+    own: Option<u32>,
     speakers: HashMap<u32, u64>,
 }
 
 impl Ears {
-    pub fn new(allowed: BTreeSet<u64>) -> Self {
-        Self {
-            allowed,
-            speakers: HashMap::new(),
-        }
+    /// The driver connected (again) and sends with `ssrc`: that SSRC is the
+    /// bot's own, and is not heard.
+    pub fn connected(&mut self, ssrc: u32) {
+        self.own = Some(ssrc);
+        self.speakers.remove(&ssrc);
     }
 
     /// Discord says `ssrc` is `user` (a speaking state update). An SSRC of
-    /// anybody not on the list, or of nobody named, is forgotten, so that its
-    /// audio is never taken for an allowlisted user's.
+    /// nobody named, or the bot's own, is forgotten, so that its audio is
+    /// never taken for anybody's.
     pub fn speaking(&mut self, ssrc: u32, user: Option<u64>) {
-        match user.filter(|user| self.allowed.contains(user)) {
+        match user.filter(|_| self.own != Some(ssrc)) {
             Some(user) => {
                 // A user has one SSRC at a time.
                 self.speakers.retain(|_, heard| *heard != user);
@@ -182,9 +183,10 @@ impl Ears {
     }
 }
 
-/// The handler on the driver: maps SSRCs as Discord names them, and copies
-/// each tick's audio of the heard users into the hearing thread's channel
-/// without waiting for it.
+/// The handler on the driver: learns the bot's own SSRC as the driver
+/// connects, maps the others as Discord names them, and copies each tick's
+/// audio of the heard users into the hearing thread's channel without
+/// waiting for it.
 #[derive(Clone)]
 struct Receiver {
     ears: Arc<Mutex<Ears>>,
@@ -214,6 +216,10 @@ impl Receiver {
 impl songbird::EventHandler for Receiver {
     async fn act(&self, context: &songbird::EventContext<'_>) -> Option<songbird::Event> {
         match context {
+            songbird::EventContext::DriverConnect(connect)
+            | songbird::EventContext::DriverReconnect(connect) => {
+                self.ears().connected(connect.ssrc);
+            }
             songbird::EventContext::SpeakingStateUpdate(speaking) => {
                 self.ears()
                     .speaking(speaking.ssrc, speaking.user_id.map(|user| user.0));
@@ -518,9 +524,11 @@ mod voxtral {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     const JP: u64 = 100000000000000400;
     const OTHER: u64 = 100000000000000500;
+    const BOT: u64 = 100000000000000600;
 
     /// `ms` of a 220 Hz tone, loud enough to be speech, as ticks of samples.
     fn tone(ms: usize) -> Vec<Vec<i16>> {
@@ -568,12 +576,15 @@ mod tests {
         spoken
     }
 
-    /// Only an allowlisted user's SSRC is ever looked up in a tick, so
-    /// nobody else's samples are copied, let alone segmented; an SSRC Discord
-    /// hands to somebody else is forgotten at once.
+    /// Everybody Discord names is heard, each as themselves, and the bot
+    /// never: its SSRC is forgotten once the driver says it is the bot's, and
+    /// so is the new one after a reconnect. An SSRC Discord names nobody for
+    /// is never even looked up.
     #[test]
-    fn only_allowlisted_speakers_are_heard() {
-        let mut ears = Ears::new(BTreeSet::from([JP]));
+    fn everybody_but_the_bot_is_heard_each_as_themselves() {
+        let mut ears = Ears::default();
+        ears.speaking(9, Some(BOT));
+        ears.connected(9);
         ears.speaking(1, Some(JP));
         ears.speaking(2, Some(OTHER));
         ears.speaking(3, None);
@@ -595,15 +606,18 @@ mod tests {
         for i in 0..100 {
             talking.set(i >= 30);
             let heard = ears.tick(&sent);
-            let expected = if talking.get() {
-                Heard::Audio {
-                    user: JP,
-                    samples: loud.clone(),
+            let of = |user| {
+                if talking.get() {
+                    Heard::Audio {
+                        user,
+                        samples: loud.clone(),
+                    }
+                } else {
+                    Heard::Silence { user }
                 }
-            } else {
-                Heard::Silence { user: JP }
             };
-            assert_eq!(heard, [expected]);
+            assert_eq!(heard.len(), 2);
+            assert!(heard.contains(&of(JP)) && heard.contains(&of(OTHER)));
             listener.hear(
                 Moment {
                     at_ms: 20 * i,
@@ -612,25 +626,31 @@ mod tests {
                 &mut |s| spoken.push(s),
             );
         }
-        assert_eq!(*asked.borrow(), BTreeSet::from([1]));
-        assert!(!listener.streams.contains_key(&OTHER));
+        assert_eq!(*asked.borrow(), BTreeSet::from([1, 2]));
+        listener.flush(&mut |s| spoken.push(s));
+        let users: BTreeSet<u64> = spoken.iter().map(|s| s.user).collect();
+        assert_eq!(spoken.len(), 2, "one utterance each");
+        assert_eq!(users, BTreeSet::from([JP, OTHER]));
 
-        // Discord gives JP's old SSRC to somebody else: it is not heard.
-        ears.speaking(1, Some(OTHER));
+        // The driver reconnects with another SSRC, which Discord then names
+        // as the bot's: it is not heard either.
+        ears.connected(5);
+        ears.speaking(5, Some(BOT));
         asked.borrow_mut().clear();
-        assert!(ears.tick(&sent).is_empty());
-        assert!(asked.borrow().is_empty());
+        assert_eq!(ears.tick(&sent).len(), 2);
+        assert_eq!(*asked.borrow(), BTreeSet::from([1, 2]));
+
+        // Discord gives JP's old SSRC to OTHER, who has one SSRC at a time.
+        ears.speaking(1, Some(OTHER));
+        talking.set(false);
+        assert_eq!(ears.tick(&sent), [Heard::Silence { user: OTHER }]);
 
         // JP comes back on a new SSRC; leaving forgets it.
         ears.speaking(4, Some(JP));
-        assert_eq!(ears.tick(&sent).len(), 1);
+        assert_eq!(ears.tick(&sent).len(), 2);
         assert!(ears.left(JP));
-        assert!(ears.tick(&sent).is_empty());
-        assert!(!ears.left(OTHER), "nobody else was ever heard");
-
-        listener.flush(&mut |s| spoken.push(s));
-        assert_eq!(spoken.len(), 1);
-        assert!(spoken.iter().all(|s| s.user == JP));
+        assert_eq!(ears.tick(&sent), [Heard::Silence { user: OTHER }]);
+        assert!(!ears.left(BOT), "the bot was never heard");
     }
 
     /// Discord hands over what the transcriber hears: mono at [`RATE`],

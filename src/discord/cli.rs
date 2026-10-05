@@ -16,7 +16,7 @@ use std::{fs, io::Read, path::PathBuf};
 const NO_VOICE: &str =
     "voice is not built into this discord binary; build it with the discord-voice feature";
 
-/// What `discord live --hear-user` answers in a build without hearing.
+/// What `discord live --hear-model` answers in a build without hearing.
 #[cfg(not(feature = "discord-hearing"))]
 const NO_HEARING: &str = "hearing is not built into this discord binary; build it with the \
      discord-hearing feature";
@@ -115,17 +115,13 @@ struct LiveArgs {
     /// message the process hears in it.
     #[arg(long)]
     intake_dms: bool,
-    /// Hear what this user says in the voice channel (global Discord
-    /// snowflake, repeatable): each utterance is transcribed and stored with
-    /// its audio as a message in the voice channel, where orient finds it.
-    /// Nobody else's audio is kept, copied or logged; without this flag
-    /// nobody is heard. Needs --hear-model, a pile, and a build with the
+    /// Hear everybody in the voice channel but the bot, with the Voxtral
+    /// model pile (weights and tokenizer) at this path: each utterance is
+    /// transcribed and stored with its audio as a message in the voice
+    /// channel, under the user who said it, where orient finds it. Without
+    /// it nobody is heard. Needs a pile, and a build with the
     /// discord-hearing feature.
-    #[arg(long = "hear-user", value_name = "USER_ID", requires = "voice_channel")]
-    hear_users: Vec<NonZeroU64>,
-    /// The Voxtral model pile hearing transcribes with, weights and
-    /// tokenizer; without it, nobody is heard.
-    #[arg(long, value_name = "PILE")]
+    #[arg(long, value_name = "PILE", requires = "voice_channel")]
     hear_model: Option<PathBuf>,
 }
 
@@ -281,7 +277,6 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
         greeting,
         intake_channels,
         intake_dms,
-        hear_users,
         hear_model,
     } = args;
     // clap asks for --guild and --voice-channel together.
@@ -294,34 +289,11 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
         let _ = (announce, greeting);
     }
     #[cfg(not(feature = "discord-hearing"))]
-    {
-        if !hear_users.is_empty() {
-            bail!(NO_HEARING);
-        }
-        let _ = hear_model;
+    if hear_model.is_some() {
+        bail!(NO_HEARING);
     }
-    // Hearing needs users to hear and a model to hear them with.
-    #[cfg(feature = "discord-hearing")]
-    let hearing = match (hear_users.is_empty(), hear_model) {
-        (true, _) => None,
-        (false, None) => {
-            eprintln!("[discord] hearing is off: --hear-user needs --hear-model");
-            None
-        }
-        (false, Some(model)) => Some((
-            hear_users
-                .iter()
-                .map(|user| user.get())
-                .collect::<std::collections::BTreeSet<_>>(),
-            model,
-        )),
-    };
-    #[cfg(feature = "discord-hearing")]
-    let hears = hearing.is_some();
-    #[cfg(not(feature = "discord-hearing"))]
-    let hears = false;
     // What is heard is stored through intake, which hearing therefore runs.
-    let wants_intake = !intake_channels.is_empty() || intake_dms || hears;
+    let wants_intake = !intake_channels.is_empty() || intake_dms || hear_model.is_some();
     if voice.is_none() && !wants_intake {
         bail!(NOTHING_TO_RUN);
     }
@@ -372,8 +344,7 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
             announce,
             greeting,
             #[cfg(feature = "discord-hearing")]
-            hearing: hearing.map(|(users, model)| super::hearing::Config {
-                users,
+            hearing: hear_model.map(|model| super::hearing::Config {
                 model,
                 unstored: state.intake().join(intake::UNSTORED_SPEECH),
             }),
@@ -505,10 +476,11 @@ mod tests {
         assert_eq!(cli.pile, Some(PathBuf::from("/p")));
     }
 
-    /// Hearing is a list of users and a model; a user is heard only in the
-    /// voice channel, and the tokenizer is in the model pile.
+    /// Hearing is a model, and nobody to name: whoever is in the voice
+    /// channel is heard, so it needs one. There is no list of users to hear,
+    /// and no tokenizer beside the model pile.
     #[test]
-    fn live_hears_the_listed_users_with_a_model() {
+    fn live_hears_the_voice_channel_with_a_model() {
         let cli = Cli::try_parse_from([
             "discord",
             "live",
@@ -516,10 +488,6 @@ mod tests {
             "1",
             "--voice-channel",
             "2",
-            "--hear-user",
-            "3",
-            "--hear-user",
-            "4",
             "--hear-model",
             "/m/voxtral.pile",
         ])
@@ -527,28 +495,14 @@ mod tests {
         let Some(Command::Live(live)) = cli.command else {
             panic!("live parses as live");
         };
-        assert_eq!(
-            live.hear_users
-                .iter()
-                .map(|user| user.get())
-                .collect::<Vec<_>>(),
-            [3, 4]
-        );
         assert_eq!(live.hear_model, Some(PathBuf::from("/m/voxtral.pile")));
-        assert!(Cli::try_parse_from(["discord", "live", "--hear-user", "3"]).is_err());
-        assert!(Cli::try_parse_from([
-            "discord",
-            "live",
-            "--guild",
-            "1",
-            "--voice-channel",
-            "2",
-            "--hear-model",
-            "/m/voxtral.pile",
-            "--hear-tokenizer",
-            "/m/tekken.json",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["discord", "live", "--hear-model", "/m/voxtral.pile"]).is_err()
+        );
+        for gone in [["--hear-user", "3"], ["--hear-tokenizer", "/m/tekken.json"]] {
+            let args = ["discord", "live", "--guild", "1", "--voice-channel", "2"];
+            assert!(Cli::try_parse_from(args.iter().chain(&gone)).is_err());
+        }
     }
 
     /// `discord live` names only what this build can run, and a build without
