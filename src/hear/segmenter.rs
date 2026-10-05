@@ -1,7 +1,7 @@
 //! The existing rate-local VAD; no transport, device, model, or file input.
 
 #[derive(Clone, Debug)]
-pub(super) struct VadConfig {
+pub(crate) struct VadConfig {
     frame_ms: usize,
     start_frames: usize,
     hangover_ms: usize,
@@ -29,17 +29,17 @@ impl Default for VadConfig {
 }
 
 /// A finished utterance at the segmenter's native rate.
-pub(super) struct Segment {
-    pub(super) samples: Vec<f32>,
+pub(crate) struct Segment {
+    pub(crate) samples: Vec<f32>,
     /// Sample rate of `samples` — the rate the segmenter ran at, which is the
     /// capture rate live and 16 kHz for recorded clips.
-    pub(super) rate: usize,
-    pub(super) start_s: f64,
-    pub(super) end_s: f64,
+    pub(crate) rate: usize,
+    pub(crate) start_s: f64,
+    pub(crate) end_s: f64,
 }
 
 impl Segment {
-    pub(super) fn dur_s(&self) -> f64 {
+    pub(crate) fn dur_s(&self) -> f64 {
         self.end_s - self.start_s
     }
 }
@@ -47,7 +47,7 @@ impl Segment {
 /// Streaming energy-VAD segmenter. Feed arbitrary-size mono chunks at a fixed
 /// rate; complete utterances go to `emit`. The SAME code path serves the live
 /// capture and recorded files, which is what makes `hear once` a real gate.
-pub(super) struct Segmenter {
+pub(crate) struct Segmenter {
     cfg: VadConfig,
     rate: usize,
     frame: usize,
@@ -65,7 +65,7 @@ pub(super) struct Segmenter {
 }
 
 impl Segmenter {
-    pub(super) fn new(rate: usize, cfg: VadConfig) -> Self {
+    pub(crate) fn new(rate: usize, cfg: VadConfig) -> Self {
         let frame = rate * cfg.frame_ms / 1000;
         let preroll_cap = rate * cfg.preroll_ms / 1000;
         Segmenter {
@@ -86,7 +86,7 @@ impl Segmenter {
         }
     }
 
-    pub(super) fn push(&mut self, chunk: &[f32], emit: &mut impl FnMut(Segment)) {
+    pub(crate) fn push(&mut self, chunk: &[f32], emit: &mut impl FnMut(Segment)) {
         self.pending.extend_from_slice(chunk);
         while self.pending.len() >= self.frame {
             let frame: Vec<f32> = self.pending.drain(..self.frame).collect();
@@ -95,7 +95,7 @@ impl Segmenter {
     }
 
     /// End of stream/file: close any open utterance.
-    pub(super) fn flush(&mut self, emit: &mut impl FnMut(Segment)) {
+    pub(crate) fn flush(&mut self, emit: &mut impl FnMut(Segment)) {
         if !self.pending.is_empty() {
             let rest = std::mem::take(&mut self.pending);
             if self.in_speech {
@@ -113,7 +113,7 @@ impl Segmenter {
     /// self-echo), the speech state clears, the adaptive noise floor is KEPT
     /// (no re-warm-up on every reply), and the stream clock still advances so
     /// later timestamps stay stream-relative.
-    pub(super) fn pause_skip(&mut self, n: u64) {
+    pub(crate) fn pause_skip(&mut self, n: u64) {
         self.pending.clear();
         self.preroll.clear();
         self.current.clear();
