@@ -3,9 +3,9 @@
 //! Inputs are literal native values. CLI paths/pipes and MCP argument decoding
 //! belong to their explicit frontends, never to these operations.
 
-use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 #[cfg(test)]
 use crate::collection_names::open_exact_in;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 use crate::schemas::compass::{
     board, latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, DEFAULT_STATUSES,
     KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
@@ -25,6 +25,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
+use triblespace::core::collection::CollectionHandle;
 use triblespace::core::metadata;
 #[cfg(test)]
 use triblespace::core::repo::pile::PileSnapshot;
@@ -265,7 +266,9 @@ fn status_union(
     let mut index = LwwIndex::default();
     for target in targets {
         index = index.union(&storage::require_complete_attached_read(
-            reader.attached_acquiring(*target)?.read_acquiring::<LwwIndex>()?,
+            reader
+                .attached_acquiring(*target)?
+                .read_acquiring::<LwwIndex>()?,
         )?);
     }
     Ok(index.query()?)
@@ -285,30 +288,43 @@ impl CompassStorage<'_> {
             &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_store(|pile, signer, runtime| f(pile, signer, runtime))
+        self.storage
+            .with_store(|pile, signer, runtime| f(pile, signer, runtime))
     }
 
     /// Prepare a pure read against fixed facts/status and an acquiring blob
     /// reader. Printing and other effects belong after this returns.
     fn with_view<T>(
         &self,
-        mut f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,
+        mut f: impl FnMut(
+            &FactArchive,
+            &AcquiringReader<FacultySnapshot>,
+            &LwwQuery,
+            &[(CollectionHandle, FactArchive)],
+        ) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            let sources = read_union_acquiring(
-                pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime,
-            )?;
+            let sources =
+                read_union_acquiring(pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime)?;
             let rank9 = storage::rank9_union(pile, &sources)?;
             let status_targets = sources
                 .iter()
                 .map(|source| compass::status_register_for_source(pile, *source))
                 .collect::<Result<Vec<_>>>()?;
             let reader = AcquiringReader::new(
-                pile.snapshot().context("freeze Compass facts and status")?, runtime.clone(),
+                pile.snapshot().context("freeze Compass facts and status")?,
+                runtime.clone(),
             );
-            let facts = storage::acquire_union_facts(&reader, &rank9)?;
+            let members = sources
+                .iter()
+                .zip(&rank9)
+                .map(|(source, rank9)| {
+                    Ok((source.handle(), storage::acquire_facts(&reader, *rank9)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let facts = storage::union_facts(members.iter().map(|(_, facts)| Ok(facts.clone())))?;
             let status = status_union(&reader, &status_targets)?;
-            f(&facts, &reader, &status)
+            f(&facts, &reader, &status, &members)
         })
     }
 
@@ -318,7 +334,11 @@ impl CompassStorage<'_> {
     fn update<P, T>(
         &self,
         persona: Option<&str>,
-        mut prepare: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, Option<Id>) -> Result<P>,
+        mut prepare: impl FnMut(
+            &FactArchive,
+            &AcquiringReader<FacultySnapshot>,
+            Option<Id>,
+        ) -> Result<P>,
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
         let target = self.storage.target();
@@ -328,16 +348,22 @@ impl CompassStorage<'_> {
             // commits, then attaches the source's frontier so the write is
             // readable through the attached views. Reads never maintain.
             let compass_source = write_target_acquiring(
-                pile, COMPASS_SCOPE_ID, signer.verifying_key(), target, runtime,
+                pile,
+                COMPASS_SCOPE_ID,
+                signer.verifying_key(),
+                target,
+                runtime,
             )?;
-            let compass_sources = read_union_acquiring(
-                pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime,
-            )?;
+            let compass_sources =
+                read_union_acquiring(pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime)?;
             let compass_rank9 = storage::rank9_union(pile, &compass_sources)
                 .context("register the Compass fact collections")?;
             let relations_rank9 = if persona.is_some() {
                 let sources = read_union_acquiring(
-                    pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime,
+                    pile,
+                    RELATIONS_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
                 )?;
                 Some(
                     storage::rank9_union(pile, &sources)
@@ -351,7 +377,9 @@ impl CompassStorage<'_> {
             // validation and persona resolution cannot mix collection
             // watermarks.
             let reader = AcquiringReader::new(
-                pile.snapshot().context("freeze Compass/Relations snapshot")?, runtime.clone(),
+                pile.snapshot()
+                    .context("freeze Compass/Relations snapshot")?,
+                runtime.clone(),
             );
             // No read refuses for being behind. There is no globally
             // consistent state to be behind of: another node holds commits
@@ -373,7 +401,12 @@ impl CompassStorage<'_> {
             let (fragment, value) = author(prepared)?;
             if let Some(fragment) = fragment {
                 crate::collection_names::require_command_write_admission_acquiring(
-                    pile, compass_source, signer, "Compass", "compass list", runtime,
+                    pile,
+                    compass_source,
+                    signer,
+                    "Compass",
+                    "compass list",
+                    runtime,
                 )?;
                 pile.commit(compass_source, signer, fragment)
                     .context("commit Compass collection fragment")?;
@@ -393,7 +426,11 @@ impl CompassStorage<'_> {
     }
 }
 
-fn task_title<P: TriblePattern>(reader: &impl BlobStoreGet, space: &P, task_id: Id) -> Result<String> {
+fn task_title<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    task_id: Id,
+) -> Result<String> {
     find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
         .next()
         .map(|handle| read_text(reader, handle))
@@ -554,6 +591,7 @@ fn render_board<P: TriblePattern>(
     status_filter: &[String],
     tag_filter: &[String],
     show_done: bool,
+    provenance: impl Fn(Id) -> Option<String>,
 ) -> Result<String> {
     let goal_ids = all_goal_ids(space);
     let priority_ranks = compass::priority_ranks(
@@ -629,12 +667,15 @@ fn render_board<P: TriblePattern>(
             let indent = "  ".repeat(depth);
             writeln!(
                 output,
-                "{}- [{}] {}{}{}",
+                "{}- [{}] {}{}{}{}",
                 indent,
                 row.id_hex,
                 row.title,
                 row.tag_suffix(),
-                row.note_suffix()
+                row.note_suffix(),
+                provenance(row.id)
+                    .map(|label| format!(" [{label}]"))
+                    .unwrap_or_default(),
             )?;
         }
     }
@@ -841,7 +882,7 @@ fn list(
         validate_short("status", status)?;
     }
 
-    storage.with_view(|space, reader, status_register| {
+    storage.with_view(|space, reader, status_register, members| {
         render_board(
             reader,
             space,
@@ -849,6 +890,7 @@ fn list(
             &status_filter,
             &tag_filter,
             show_done,
+            |goal| crate::collection_names::provenance(reader, members, goal),
         )
     })
 }
@@ -1090,7 +1132,7 @@ fn render_goal<P: TriblePattern>(
 }
 
 fn show(storage: CompassStorage<'_>, id: String) -> Result<String> {
-    storage.with_view(|space, reader, status_register| {
+    storage.with_view(|space, reader, status_register, _| {
         let task_id = resolve_task_id(&id, space)?;
         render_goal(reader, space, status_register, task_id)
     })
@@ -1196,7 +1238,7 @@ fn deprioritize(
 }
 
 fn resolve(storage: CompassStorage<'_>, prefix: String) -> Result<Id> {
-    storage.with_view(|space, _reader, _status_register| resolve_task_id(&prefix, space))
+    storage.with_view(|space, _reader, _status_register, _| resolve_task_id(&prefix, space))
 }
 
 #[cfg(test)]
@@ -1292,7 +1334,8 @@ mod tests {
         storage
             .storage
             .with_pile(|pile, signer| {
-                let source = crate::collection_names::open(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+                let source =
+                    crate::collection_names::open(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
                 carry(pile, source, signer);
                 Ok(())
             })
@@ -1437,6 +1480,7 @@ mod tests {
                     &[],
                     &["shown".to_owned()],
                     false,
+                    |_| None,
                 )
             }))
             .unwrap();
@@ -1600,6 +1644,7 @@ mod tests {
                     &[],
                     &[],
                     false,
+                    |_| None,
                 )
             }))
             .unwrap();
@@ -1662,7 +1707,8 @@ mod tests {
         let storage = Storage::new(pile_path.clone(), Some(key));
         let (succinct, rank9, status) = storage
             .with_pile(|pile, signer| {
-                let source = crate::collection_names::open(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+                let source =
+                    crate::collection_names::open(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let status = compass::status_register_collection(pile, signer.verifying_key())?;
@@ -1739,7 +1785,7 @@ mod tests {
         )
         .unwrap();
         let goal = storage
-            .with_view(|facts, _, _| Ok(*compass::goal_ids(facts).iter().next().unwrap()))
+            .with_view(|facts, _, _, _| Ok(*compass::goal_ids(facts).iter().next().unwrap()))
             .unwrap();
 
         // Compass preserves unrelated open-world facts. Multiple values on
@@ -1765,7 +1811,7 @@ mod tests {
         // A raw commit is the worker's to carry; no faculty write ensured it.
         carry_storage(storage);
         storage
-            .with_view(|facts, _, status_register| {
+            .with_view(|facts, _, status_register, _| {
                 assert_eq!(
                     latest_status_event(facts, status_register, goal)
                         .map(|(_, value, _)| value)
@@ -1782,7 +1828,7 @@ mod tests {
 
         move_goal(storage, format!("{goal:x}"), "doing".to_owned(), None).unwrap();
         storage
-            .with_view(|facts, _, status_register| {
+            .with_view(|facts, _, status_register, _| {
                 assert_eq!(
                     latest_status_event(facts, status_register, goal)
                         .map(|(_, value, _)| value)

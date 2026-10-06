@@ -34,7 +34,9 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::latest::LatestIndex;
-use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{
+    CollectionCommit, CollectionHandle, CollectionSnapshotExt, CollectionStoreExt,
+};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -208,6 +210,9 @@ struct WikiStorage<'a> {
 #[derive(Clone)]
 struct WikiView {
     facts: FactArchive,
+    /// Each collection of the read-union and its facts: where a row came
+    /// from, when there is more than one.
+    members: Vec<(CollectionHandle, FactArchive)>,
     reader: FacultySnapshot,
     latest: LatestIndex,
 }
@@ -235,7 +240,10 @@ impl WikiStorage<'_> {
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
             let sources = read_union_acquiring(
-                pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+                pile,
+                schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let mut auxiliaries = Vec::with_capacity(scopes.len());
             for &(scope, label) in scopes {
@@ -290,7 +298,12 @@ impl WikiStorage<'_> {
                 runtime,
             )?;
             crate::collection_names::require_command_write_admission_acquiring(
-                pile, collection, signer, "Wiki", "wiki show", runtime,
+                pile,
+                collection,
+                signer,
+                "Wiki",
+                "wiki show",
+                runtime,
             )?;
             let commit = pile
                 .commit(collection, signer, fragment)
@@ -349,8 +362,18 @@ fn views_in<T>(
     // never silently turn a selected-but-unread foundation into absence.
     // An unseen later commit can still branch an edit's history. The edit
     // ensures its own images after it commits.
-    let facts = crate::storage::acquire_union_facts(&acquiring, &wiki_rank9)
+    let members = wiki_sources
+        .iter()
+        .zip(&wiki_rank9)
+        .map(|(source, rank9)| {
+            Ok((
+                source.handle(),
+                crate::storage::acquire_facts(&acquiring, *rank9)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()
         .context("read Wiki fact collection")?;
+    let facts = crate::storage::union_facts(members.iter().map(|(_, facts)| Ok(facts.clone())))?;
     // The index over the same foundations the facts read: a revision no
     // attachment reaches yet is built in memory. Across collections it is
     // their union, so a revision any of them supersedes is not live.
@@ -375,6 +398,7 @@ fn views_in<T>(
     }
     let mut view = WikiView {
         facts,
+        members,
         reader,
         latest,
     };
@@ -1488,10 +1512,13 @@ fn cmd_list(
             for head in &entry.frontier {
                 writeln!(
                     report,
-                    "  {:x}  {}{}",
+                    "  {:x}  {}{}{}",
                     head.id,
                     revision_title(&view.reader, head)?,
-                    format_tags(&view.facts, &view.reader, &head.tags)?
+                    format_tags(&view.facts, &view.reader, &head.tags)?,
+                    crate::collection_names::provenance(&view.reader, &view.members, head.id)
+                        .map(|label| format!("  [{label}]"))
+                        .unwrap_or_default(),
                 )
                 .unwrap();
             }
@@ -2140,8 +2167,11 @@ mod tests {
         let (succinct, rank9, latest) = fixture
             .storage
             .with_pile(|pile, signer| {
-                let source =
-                    crate::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let source = crate::collection_names::open(
+                    pile,
+                    schema::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 Ok((
@@ -2425,7 +2455,9 @@ mod tests {
                         signer,
                         later,
                     )?;
-                    pile.insert(triblespace::core::collection::CollectionRecord::Commit(arriving))?;
+                    pile.insert(triblespace::core::collection::CollectionRecord::Commit(
+                        arriving,
+                    ))?;
                     let cold = inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(
                         arriving.data(),
                     );

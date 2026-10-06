@@ -55,13 +55,15 @@ use triblespace::core::collection::{
     CollectionRead, CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
+use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, SnapshotSource, StoreSnapshot,
 };
 use triblespace::core::trible::TribleSet;
-use triblespace::prelude::{find, pattern};
+use triblespace::prelude::{exists, find, pattern};
 
 use crate::schemas::{
     atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings, files,
@@ -499,6 +501,37 @@ where
         ),
         None => label_of(collection),
     }
+}
+
+/// Which collections of a read-union hold facts about `entity`, as
+/// [`label`]s, when the union has more than one collection to tell apart;
+/// `None` when it reads one, or none of them says anything about `entity`.
+///
+/// `members` pairs each collection of the union with its facts, as the read
+/// that shows the row took them.
+pub fn provenance<S, P>(
+    snapshot: &S,
+    members: &[(CollectionHandle, P)],
+    entity: Id,
+) -> Option<String>
+where
+    S: BlobStoreList + BlobStoreGet,
+    P: TriblePattern,
+{
+    if members.len() < 2 {
+        return None;
+    }
+    let labels: Vec<String> = members
+        .iter()
+        .filter(|(_, facts)| {
+            exists!(
+                (attribute: Id, value: Inline<UnknownInline>),
+                pattern!(facts, [{ entity @ ?attribute: ?value }])
+            )
+        })
+        .map(|(collection, _)| label(snapshot, *collection))
+        .collect();
+    (!labels.is_empty()).then(|| labels.join("; "))
 }
 
 fn label_of(collection: CollectionHandle) -> String {

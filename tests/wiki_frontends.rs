@@ -618,10 +618,11 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
 
 /// One Wiki read spans every Wiki collection its key may READ. A revision a
 /// friend's collection supersedes is not on the frontier, though the owner's
-/// own collection still holds it live.
+/// own collection still holds it live, and each row says which collection
+/// and owner it came from once there is more than one.
 #[test]
-fn a_union_frontier_spans_collections() {
-    use faculties::collection_names::open;
+fn a_union_frontier_spans_collections_and_labels_their_rows() {
+    use faculties::collection_names::{label, open};
     use faculties::schemas::wiki::DEFAULT_SCOPE_ID;
     use faculties::storage::{load_signer, Storage};
     use triblespace::core::collection::latest::LatestIndex;
@@ -666,6 +667,13 @@ fn a_union_frontier_spans_collections() {
         !listed.contains(&format!("{first:x}")),
         "a revision superseded in another collection is not live: {listed}"
     );
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let friends = label(&snapshot, theirs.handle());
+    drop(snapshot);
+    pile.close().unwrap();
+    assert!(friends.contains(&hex::encode_upper(&friend.verifying_key().to_bytes()[..8])));
+    assert!(listed.contains(&friends), "{listed}");
 
     // The owner's own collection alone still holds the first revision live:
     // only the union knows the friend superseded it.

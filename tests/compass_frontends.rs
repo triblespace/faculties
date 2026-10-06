@@ -796,3 +796,57 @@ fn output_failure_does_not_retry_or_erase_an_already_published_action() {
     let (facts, _) = fixture.snapshot();
     assert_eq!(compass::goal_ids(&facts).len(), 1);
 }
+
+/// A Compass board reads every Compass collection its key may READ and says,
+/// on each goal, which collection and owner it came from once there is more
+/// than one. One collection's board stays unlabelled.
+#[test]
+fn a_board_over_two_collections_labels_each_goal() {
+    use faculties::collection_names::{label, open};
+    use faculties::schemas::compass::DEFAULT_SCOPE_ID;
+    use faculties::storage::Storage;
+    use triblespace::core::collection::grant_collection_read;
+
+    let fixture = Fixture::new();
+    let mine = fixture
+        .operations()
+        .add("the owner's goal", AddOptions::default())
+        .unwrap();
+    let alone = fixture.operations().list(ListOptions::default()).unwrap();
+    assert!(alone.contains("the owner's goal"));
+    assert!(!alone.contains("owned by"), "{alone}");
+
+    let friend_key = fixture.directory.path().join("friend.key");
+    initialize_signer(&fixture.pile, Some(&friend_key)).unwrap();
+    let owner = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+    let friend = load_signer(&fixture.pile, Some(&friend_key)).unwrap();
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let ours = open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key()).unwrap();
+    let theirs = open(&mut pile, DEFAULT_SCOPE_ID, friend.verifying_key()).unwrap();
+    grant_collection_read(&mut pile, theirs.handle(), &friend, owner.verifying_key()).unwrap();
+    pile.close().unwrap();
+    let friends = Compass::with_storage(
+        Storage::new(fixture.pile.clone(), Some(friend_key)).with_target(Some(theirs.handle())),
+    )
+    .add("the friend's goal", AddOptions::default())
+    .unwrap();
+
+    let board = fixture.operations().list(ListOptions::default()).unwrap();
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let (our_label, their_label) = (
+        label(&snapshot, ours.handle()),
+        label(&snapshot, theirs.handle()),
+    );
+    drop(snapshot);
+    pile.close().unwrap();
+    let row = |goal: Id| {
+        board
+            .lines()
+            .find(|line| line.contains(&format!("{goal:x}")))
+            .unwrap_or_else(|| panic!("{goal:x} is on the board: {board}"))
+    };
+    assert!(row(mine.goal).contains(&our_label), "{board}");
+    assert!(row(friends.goal).contains(&their_label), "{board}");
+    assert!(their_label.contains(&hex::encode_upper(&friend.verifying_key().to_bytes()[..8])));
+}
