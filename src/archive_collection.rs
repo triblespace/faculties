@@ -226,32 +226,38 @@ where
     /// idempotence check would re-stage facts this commit already carries —
     /// which is the whole reason resumed Codex rollouts (they replay large
     /// parent prefixes) are cheap to ingest in sequence rather than expensive.
+    /// It is read back from the frontier's Rank9 attachments, which the
+    /// commit's own attachment pass has just built, as the next open would
+    /// read it: one segment per frontier node, so carrying bounds it too. A
+    /// foundation whose bytes are not here is left out, never fetched; that
+    /// can only make a later fragment stage facts again, which the union
+    /// absorbs.
     pub fn commit_unit(&mut self) -> Result<Option<CollectionCommit>> {
+        let Some(commit) = self.publish()? else {
+            return Ok(None);
+        };
+        if self.uncarried < CARRY_EVERY {
+            self.ensure_downstream()?;
+        } else {
+            self.carry()?;
+        }
+        let (_, rank9) = crate::storage::fact_pair(&mut self.pile, self.collection)?;
+        self.current = crate::storage::FactRead::read_facts(&self.pile.snapshot()?, rank9)
+            .context("read back the published Archive facts")?;
+        Ok(Some(commit))
+    }
+
+    /// Commit the staged delta, if any, as one signed COMMIT.
+    fn publish(&mut self) -> Result<Option<CollectionCommit>> {
         if self.delta.facts().is_empty() {
             return Ok(None);
         }
         let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
-        let published = fragment.facts().clone();
         let commit = self
             .pile
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Archive projection unit")?;
-        self.current = extend_archive(&self.current, &published);
         self.uncarried += 1;
-        if self.uncarried < CARRY_EVERY {
-            self.ensure_downstream()?;
-            return Ok(Some(commit));
-        }
-        self.carry()?;
-        // Read back what the carry left, as the next open would: the
-        // frontier's attachments stand for every commit this writer made,
-        // so the per-commit segments `extend_archive` added are dropped. A
-        // foundation whose bytes are not here is left out, never fetched;
-        // that can only make a later fragment stage facts again, which the
-        // union absorbs.
-        let (_, rank9) = crate::storage::fact_pair(&mut self.pile, self.collection)?;
-        self.current = crate::storage::FactRead::read_facts(&self.pile.snapshot()?, rank9)
-            .context("read back the carried Archive facts")?;
         Ok(Some(commit))
     }
 
@@ -289,9 +295,11 @@ where
         self.ensure_downstream()
     }
 
-    /// Publish what is still staged and carry what this writer committed.
+    /// Publish what is still staged and carry what this writer committed,
+    /// before it closes: the carry's attachment pass also attaches the last
+    /// commit, and nothing is read back.
     fn settle(&mut self) -> Result<Option<CollectionCommit>> {
-        let commit = self.commit_unit()?;
+        let commit = self.publish()?;
         if self.uncarried > 0 {
             self.carry()?;
         }
@@ -368,15 +376,6 @@ fn fact_archive_contains(facts: &FactArchive, fact: &Trible) -> bool {
         inlineencodings::GenId::inline_from(*fact.a()),
         *fact.v::<UnknownInline>(),
     ))
-}
-
-fn extend_archive(current: &FactArchive, additions: &TribleSet) -> FactArchive {
-    if additions.is_empty() {
-        return current.clone();
-    }
-    current.with_segments([
-        triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(additions),
-    ])
 }
 
 fn close_pile<T>(pile: impl StorageClose, result: Result<T>, failure_context: &str) -> Result<T> {
