@@ -86,7 +86,9 @@ use crate::schemas::triage::cog;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FacultySnapshot, FacultyStore, FactArchive};
+use crate::storage::{
+    open_secrets_collection_acquiring, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore,
+};
 use crate::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
     collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
@@ -97,9 +99,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use serde::{Deserialize, Serialize};
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
+#[cfg(test)]
 use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
@@ -141,8 +141,6 @@ impl TriageSnapshot {
         // Loading is deliberately strict: a diagnostic read must never mint a
         // new identity, create a pile, or admit somebody else's COMMITs.
         let mut registered = Vec::new();
-        let mut succinct = Vec::new();
-        let mut rank9 = Vec::new();
         for (scope, label) in [
             (COGNITION_SCOPE_ID, "Cognition"),
             (HEADSPACE_SCOPE_ID, "Headspace"),
@@ -150,35 +148,30 @@ impl TriageSnapshot {
             (RELATIONS_SCOPE_ID, "Relations"),
             (MESSAGE_SCOPE_ID, "Message"),
         ] {
-            let source =
-                crate::collection_names::open_configured_acquiring(pile, scope, signer.verifying_key(), runtime)
-                    .with_context(|| format!("register {label} collection"))?;
-            let succinct_collection = pile
-                .attach::<SuccinctArchiveBlob>(source, ())
-                .with_context(|| format!("register succinct {label} collection"))?;
-            let rank9_collection = pile
-                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct_collection)
-                .with_context(|| format!("register Rank9 {label} collection"))?;
-            registered.push((scope, label));
-            succinct.push(succinct_collection);
-            rank9.push(rank9_collection);
+            let sources = crate::collection_names::read_union_acquiring(
+                pile,
+                scope,
+                signer.verifying_key(),
+                runtime,
+            )
+            .with_context(|| format!("find the {label} collections"))?;
+            let pairs = crate::storage::fact_pairs(pile, &sources)
+                .with_context(|| format!("register the {label} fact collections"))?;
+            registered.push((scope, label, pairs));
         }
 
-        let secrets_collection = open_secrets_collection_acquiring(pile, signer.verifying_key(), runtime)?;
+        let secrets_collection =
+            open_secrets_collection_acquiring(pile, signer.verifying_key(), None, runtime)?;
         // Carry each root and attach its frontier; a commit left unattached
         // is read from its own bytes.
         let snapshot = runtime.block_on(async {
-            for (index, (_, label)) in registered.iter().enumerate() {
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(succinct[index], signer).await,
-                )
-                .with_context(|| format!("maintain {label} succinct fact archive"))?;
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(rank9[index], signer).await,
-                )
-                .with_context(|| format!("maintain {label} fact archive"))?;
+            for (_, label, pairs) in &registered {
+                crate::storage::maintain_fact_pairs(pile, pairs, signer)
+                    .await
+                    .with_context(|| format!("maintain {label} fact archive"))?;
             }
-            let snapshot = secrets_collection.ensure(pile, signer)
+            let snapshot = secrets_collection
+                .ensure(pile, signer)
                 .await
                 .context("observe configured Secrets collection")?;
             Ok::<_, anyhow::Error>(snapshot)
@@ -188,10 +181,12 @@ impl TriageSnapshot {
         // Reuse it so facts, attachments, and credentials inhabit literally
         // the same known-prefix observation.
         let store_snapshot = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
-        let secrets = secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
+        let secrets =
+            secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
         let mut collections = BTreeMap::new();
-        for ((scope, label), collection) in registered.iter().zip(&rank9) {
-            let archive = crate::storage::acquire_facts(&store_snapshot, *collection)
+        for (scope, label, pairs) in &registered {
+            let rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
+            let archive = crate::storage::acquire_union_facts(&store_snapshot, &rank9)
                 .with_context(|| format!("read maintained {label} collection"))?;
             collections.insert(*scope, archive);
         }

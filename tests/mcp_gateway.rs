@@ -276,12 +276,10 @@ fn real_workers_preserve_media_isolation_revocation_and_reconnects() {
             .expect("set PLAYGROUND_HTTP_BINARY to the exact cohort executable"),
     );
     assert!(binary.is_absolute());
-    for variable in ["TRIBLESPACE_COLLECTION_FILES", "TRIBLESPACE_PEERS"] {
-        assert!(
-            std::env::var_os(variable).is_none(),
-            "unset {variable} for fixture seeding"
-        );
-    }
+    assert!(
+        std::env::var_os("TRIBLESPACE_PEERS").is_none(),
+        "unset TRIBLESPACE_PEERS for fixture seeding"
+    );
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let alice = Tenant::new(root, "alice");

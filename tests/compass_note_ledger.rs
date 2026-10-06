@@ -51,12 +51,9 @@ impl TestPile {
                 faculties::schemas::relations::DEFAULT_SCOPE_ID,
                 faculties::schemas::compass::DEFAULT_SCOPE_ID,
             ] {
-                let source = faculties::collection_names::open_configured(
-                    &mut pile,
-                    scope,
-                    signer.verifying_key(),
-                )
-                .unwrap();
+                let source =
+                    faculties::collection_names::open(&mut pile, scope, signer.verifying_key())
+                        .unwrap();
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
                 let rank9 = pile
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)

@@ -6,7 +6,6 @@
 //! stricter whole-fragment validators below remain explicit migration and test
 //! tools rather than a gate in front of every read.
 
-use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod cli;
@@ -18,6 +17,8 @@ pub use operations::*;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -26,10 +27,9 @@ use triblespace::core::collection::{CollectionRead, CollectionSnapshotExt, Colle
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, SnapshotSource};
 use triblespace::prelude::*;
 
-use crate::collection_names::open_configured;
 use crate::schemas::body::{capture, intent, DEFAULT_SCOPE_ID, KIND_CAPTURE, KIND_INTENT};
 use crate::storage::FactArchive;
 
@@ -108,15 +108,31 @@ impl<R> BodySnapshot<R> {
 /// intrinsic event id, matching the historical JIT reader exactly. Capture
 /// rows form an independent `KIND_CAPTURE` register in the same target bytes;
 /// [`latest_intent`] scopes the read with `winner(KIND_INTENT)`.
+///
+/// This is the register over the collection `authority` writes by default,
+/// the one its writes maintain; [`intent_register_for_source`] is the
+/// register of any one Body collection. A read-union's intents are the union
+/// of its collections' registers ([`LwwIndex::union`]).
 pub fn intent_register_collection<S>(
     store: &mut S,
     authority: VerifyingKey,
 ) -> Result<Collection<LwwRegisterBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + BlobStoreList + CollectionRead,
 {
-    let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
+    let source = crate::collection_names::write_target(store, DEFAULT_SCOPE_ID, authority, None)?;
+    intent_register_for_source(store, source)
+}
+
+/// The intent register over one Body collection.
+pub fn intent_register_for_source<S>(
+    store: &mut S,
+    source: Collection<SimpleArchive>,
+) -> Result<Collection<LwwRegisterBlob>>
+where
+    S: CollectionStoreExt,
+{
     let target =
         store.attach::<LwwRegisterBlob>(source, (metadata::tag.id(), metadata::created_at.id()))?;
     Ok(target)
@@ -541,22 +557,30 @@ pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<BodySnapshot> {
-    let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
-    let target = intent_register_collection(pile, signer.verifying_key())?;
+    let sources =
+        crate::collection_names::read_union(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let rank9 = crate::storage::rank9_union(pile, &sources)?;
+    let targets = sources
+        .iter()
+        .map(|source| intent_register_for_source(pile, *source))
+        .collect::<Result<Vec<_>>>()?;
     let store_snapshot = pile.snapshot().context("freeze resident Body targets")?;
-    let facts = store_snapshot
-        .read_facts(rank9)
+    let facts = crate::storage::read_union_facts(&store_snapshot, &rank9)
         .context("read maintained Body fact collection")?;
     // The register over the same foundations the facts read, the commits
     // no attachment reaches built in memory.
-    let intents = store_snapshot
-        .attached(target)
-        .map_err(|error| anyhow!("observe Body intent register: {error}"))?
-        .read::<LwwIndex>()
-        .map_err(|error| anyhow!("read Body intent register: {error}"))?
-        .into_value()
+    let mut index = LwwIndex::default();
+    for target in targets {
+        index = index.union(
+            &store_snapshot
+                .attached(target)
+                .map_err(|error| anyhow!("observe Body intent register: {error}"))?
+                .read::<LwwIndex>()
+                .map_err(|error| anyhow!("read Body intent register: {error}"))?
+                .into_value(),
+        );
+    }
+    let intents = index
         .query()
         .map_err(|error| anyhow!("prepare Body intent register query: {error}"))?;
     Ok(BodySnapshot {
@@ -569,7 +593,9 @@ pub async fn materialize_indexed_collection(
 /// The worker's carry for tests: the fact chain and the intent register.
 #[cfg(test)]
 pub(crate) fn carry_for_tests(pile: &mut Pile, signer: &SigningKey) {
-    let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+    let source =
+        crate::collection_names::write_target(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), None)
+            .unwrap();
     crate::storage::carry_facts(pile, source, signer);
     let target = intent_register_collection(pile, signer.verifying_key()).unwrap();
     drop(pollster::block_on(pile.maintain_attached(target, signer)).unwrap());
@@ -615,7 +641,6 @@ mod tests {
         use triblespace::core::repo::{BlobStorePut, WantRead};
 
         pollster::block_on(async {
-            std::env::remove_var(crate::collection_names::override_env_name(DEFAULT_SCOPE_ID));
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("body.pile");
             std::fs::File::create(&path).unwrap();
@@ -623,7 +648,8 @@ mod tests {
             let mut pile =
                 crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
             let source =
-                open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+                crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                    .unwrap();
             let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
                 .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)

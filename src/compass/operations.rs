@@ -3,9 +3,9 @@
 //! Inputs are literal native values. CLI paths/pipes and MCP argument decoding
 //! belong to their explicit frontends, never to these operations.
 
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 #[cfg(test)]
-use crate::collection_names::{open_configured, open_exact_in};
+use crate::collection_names::open_exact_in;
 use crate::schemas::compass::{
     board, latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, DEFAULT_STATUSES,
     KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
@@ -20,10 +20,11 @@ use hifitime::Epoch;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::metadata;
 #[cfg(test)]
 use triblespace::core::repo::pile::PileSnapshot;
@@ -255,6 +256,21 @@ fn extract_reference_values(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// The status register of a read-union: every collection's register, ranked
+/// together.
+fn status_union(
+    reader: &AcquiringReader<FacultySnapshot>,
+    targets: &[Collection<LwwRegisterBlob>],
+) -> Result<LwwQuery> {
+    let mut index = LwwIndex::default();
+    for target in targets {
+        index = index.union(&storage::require_complete_attached_read(
+            reader.attached_acquiring(*target)?.read_acquiring::<LwwIndex>()?,
+        )?);
+    }
+    Ok(index.query()?)
+}
+
 #[derive(Clone, Copy)]
 struct CompassStorage<'a> {
     storage: &'a Storage,
@@ -279,19 +295,19 @@ impl CompassStorage<'_> {
         mut f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            let source = open_configured_acquiring(
+            let sources = read_union_acquiring(
                 pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime,
             )?;
-            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
-            let status_target = compass::status_register_for_source(pile, source)?;
+            let rank9 = storage::rank9_union(pile, &sources)?;
+            let status_targets = sources
+                .iter()
+                .map(|source| compass::status_register_for_source(pile, *source))
+                .collect::<Result<Vec<_>>>()?;
             let reader = AcquiringReader::new(
                 pile.snapshot().context("freeze Compass facts and status")?, runtime.clone(),
             );
-            let facts = storage::acquire_facts(&reader, rank9)?;
-            let status = storage::require_complete_attached_read(
-                reader.attached_acquiring(status_target)?.read_acquiring::<LwwIndex>()?,
-            )?.query()?;
+            let facts = storage::acquire_union_facts(&reader, &rank9)?;
+            let status = status_union(&reader, &status_targets)?;
             f(&facts, &reader, &status)
         })
     }
@@ -305,31 +321,28 @@ impl CompassStorage<'_> {
         mut prepare: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, Option<Id>) -> Result<P>,
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
+        let target = self.storage.target();
         self.with_pile(|pile, signer, runtime| {
             // Register every representation and attach the resident views
             // through one query snapshot for this action; the write authors,
             // commits, then attaches the source's frontier so the write is
             // readable through the attached views. Reads never maintain.
-            let compass_source = open_configured_acquiring(
+            let compass_source = write_target_acquiring(
+                pile, COMPASS_SCOPE_ID, signer.verifying_key(), target, runtime,
+            )?;
+            let compass_sources = read_union_acquiring(
                 pile, COMPASS_SCOPE_ID, signer.verifying_key(), runtime,
             )?;
-            let compass_succinct = pile
-                .attach::<SuccinctArchiveBlob>(compass_source, ())
-                .context("register Compass Succinct collection")?;
-            let compass_rank9 = pile
-                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(compass_source, compass_succinct)
-                .context("register Compass Rank9 collection")?;
+            let compass_rank9 = storage::rank9_union(pile, &compass_sources)
+                .context("register the Compass fact collections")?;
             let relations_rank9 = if persona.is_some() {
-                let source = open_configured_acquiring(
+                let sources = read_union_acquiring(
                     pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime,
                 )?;
-                let succinct = pile
-                    .attach::<SuccinctArchiveBlob>(source, ())
-                    .context("register Relations Succinct collection")?;
-                let rank9 = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-                    .context("register Relations Rank9 collection")?;
-                Some(rank9)
+                Some(
+                    storage::rank9_union(pile, &sources)
+                        .context("register the Relations fact collections")?,
+                )
             } else {
                 None
             };
@@ -347,10 +360,10 @@ impl CompassStorage<'_> {
             // the branching of one entity's history a little. A priority
             // change reads what it can see, like everything else, and
             // ensures its own images after it commits.
-            let facts = storage::acquire_facts(&reader, compass_rank9)
+            let facts = storage::acquire_union_facts(&reader, &compass_rank9)
                 .context("read Compass fact collection")?;
             let by = if let (Some(persona), Some(rank9)) = (persona, relations_rank9) {
-                let relations = storage::acquire_facts(&reader, rank9)
+                let relations = storage::acquire_union_facts(&reader, &rank9)
                     .context("read Relations fact collection for Compass persona")?;
                 Some(resolve_persona_id(&relations, &reader, persona)?)
             } else {
@@ -1279,7 +1292,7 @@ mod tests {
         storage
             .storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+                let source = crate::collection_names::open(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
                 carry(pile, source, signer);
                 Ok(())
             })
@@ -1649,7 +1662,7 @@ mod tests {
         let storage = Storage::new(pile_path.clone(), Some(key));
         let (succinct, rank9, status) = storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
+                let source = crate::collection_names::open(pile, COMPASS_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let status = compass::status_register_collection(pile, signer.verifying_key())?;

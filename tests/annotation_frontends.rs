@@ -43,7 +43,7 @@ fn text_call(faculty: &dyn Faculty, name: &str, args: serde_json::Value) -> Stri
 fn facts(pile: &Path, key: &Path) -> TribleSet {
     let signer = load_signer(pile, Some(key)).unwrap();
     let mut store = open_pile_strict(pile).unwrap();
-    let collection = faculties::collection_names::open_configured(
+    let collection = faculties::collection_names::open(
         &mut store,
         faculties::schemas::cognition::DEFAULT_SCOPE_ID,
         signer.verifying_key(),

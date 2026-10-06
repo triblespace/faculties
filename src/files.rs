@@ -35,7 +35,6 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
-use crate::collection_names::open_configured;
 use crate::schemas::embeddings;
 use crate::schemas::files::{file, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT, KIND_MEDIA_TYPE};
 
@@ -982,17 +981,20 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileSnapshot)> {
-    let collection = open_configured(
+    let sources = crate::collection_names::read_union(
         pile,
         crate::schemas::files::DEFAULT_SCOPE_ID,
         signer.verifying_key(),
     )?;
     let store_snapshot = pile.snapshot().context("freeze Files store snapshot")?;
-    let facts = store_snapshot
-        .collection(collection)
-        .context("attach Files collection")?
-        .view::<TribleSet>()
-        .context("read Files collection")?;
+    let mut facts = TribleSet::new();
+    for source in sources {
+        facts += store_snapshot
+            .collection(source)
+            .context("attach Files collection")?
+            .view::<TribleSet>()
+            .context("read Files collection")?;
+    }
     Ok((facts, store_snapshot))
 }
 
@@ -1006,10 +1008,11 @@ pub fn commit_collection(
     signer: &SigningKey,
     fragment: Fragment,
 ) -> Result<CollectionCommit> {
-    let collection = open_configured(
+    let collection = crate::collection_names::write_target(
         pile,
         crate::schemas::files::DEFAULT_SCOPE_ID,
         signer.verifying_key(),
+        None,
     )?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Files collection fragment: {error}"))

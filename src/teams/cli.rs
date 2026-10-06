@@ -21,6 +21,11 @@ pub struct Cli {
     /// initialize explicitly with `trible pile signing-key init <pile>`.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     /// Concrete Microsoft Entra tenant used to select a collection auth
     /// profile. It may be omitted only when exactly one profile source exists.
     #[arg(long, env = "TEAMS_TENANT")]
@@ -332,7 +337,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let delta_url = std::env::var("TEAMS_DELTA_URL")
         .ok()
         .unwrap_or(cli.delta_url);
-    let operations = Teams::new(cli.pile, cli.key)
+    let operations = Teams::with_storage(crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target))
         .with_tenant(cli.tenant.clone())
         .with_delta_url(delta_url);
     let present_as = cli.present_as.as_deref().unwrap_or("");

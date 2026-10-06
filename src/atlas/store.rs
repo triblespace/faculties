@@ -5,17 +5,13 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::{find, pattern, Id};
 
 use super::{named_entries, named_entry, AtlasEntry};
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::read_union_acquiring;
 use crate::schemas::atlas::DEFAULT_SCOPE_ID;
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Storage};
 
@@ -84,17 +80,14 @@ impl Store {
         operation: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
-            let source = open_configured_acquiring(
-                pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
-            )?;
-            let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-            let collection_rank9 =
-                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
+            let sources =
+                read_union_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+            let collection_rank9 = crate::storage::rank9_union(pile, &sources)?;
             let store_snapshot = AcquiringReader::new(
                 pile.snapshot().context("freeze Atlas fact collection")?,
                 std::sync::Arc::clone(runtime),
             );
-            let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
+            let facts = crate::storage::acquire_union_facts(&store_snapshot, &collection_rank9)
                 .context("read maintained Atlas fact collection")?;
             operation(&facts, &store_snapshot)
         })

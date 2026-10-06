@@ -68,14 +68,6 @@ impl Fixture {
             ])
             .args(["--persona", &self.who()])
             .env_remove("ORIENT_TRACE_REFRESH");
-        for (name, _) in std::env::vars_os() {
-            if name
-                .to_string_lossy()
-                .starts_with(faculties::collection_names::COLLECTION_OVERRIDE_PREFIX)
-            {
-                command.env_remove(name);
-            }
-        }
         if let Some(trace) = trace {
             command.env("ORIENT_TRACE_REFRESH", trace);
         }
@@ -107,8 +99,7 @@ impl Fixture {
         let mut pile =
             faculties::storage::open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         let collection =
-            faculties::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
-                .unwrap();
+            faculties::collection_names::open(&mut pile, scope, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
         pile.close().unwrap();
     }
@@ -131,12 +122,9 @@ impl Fixture {
                 faculties::schemas::wiki::DEFAULT_SCOPE_ID,
                 health::DEFAULT_SCOPE_ID,
             ] {
-                let source = faculties::collection_names::open_configured(
-                    &mut pile,
-                    scope,
-                    signer.verifying_key(),
-                )
-                .unwrap();
+                let source =
+                    faculties::collection_names::open(&mut pile, scope, signer.verifying_key())
+                        .unwrap();
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
                 let rank9 = pile
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
@@ -160,8 +148,13 @@ impl Fixture {
                 faculties::compass::status_register_collection(&mut pile, signer.verifying_key())
                     .unwrap();
             drop(pile.maintain_attached(status, &signer).await.unwrap());
-            let latest =
-                faculties::wiki::latest_collection(&mut pile, signer.verifying_key()).unwrap();
+            let wiki = faculties::collection_names::open(
+                &mut pile,
+                faculties::schemas::wiki::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )
+            .unwrap();
+            let latest = faculties::wiki::latest_for_source(&mut pile, wiki).unwrap();
             drop(pile.maintain_attached(latest, &signer).await.unwrap());
         });
         pile.close().unwrap();
@@ -899,7 +892,6 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     assert_ne!(owner.verifying_key(), other.verifying_key());
     // Opened as the owner, whose MAPs this store believes.
     let mut pile = faculties::storage::open_pile_strict_as(&f.pile, owner.verifying_key()).unwrap();
-    let mut overrides = Vec::new();
     for scope in [
         faculties::schemas::message::DEFAULT_SCOPE_ID,
         faculties::schemas::relations::DEFAULT_SCOPE_ID,
@@ -909,10 +901,6 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
         // The source's READ is the only grant: the fact pair attached to it
         // names no policy, and every host builds its own attachments.
         grant_collection_read(&mut pile, source.handle(), &owner, other.verifying_key()).unwrap();
-        overrides.push((
-            faculties::collection_names::override_env_name(scope),
-            hex::encode(source.handle().raw),
-        ));
     }
     let first_receipts = pile
         .collection(
@@ -937,7 +925,7 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     }
 
     // A readable old mixed-persona ledger is not the new zooid's receipt
-    // source, even if deployment still supplies the legacy override.
+    // source.
     let legacy = faculties::collection_names::open(
         &mut pile,
         faculties::schemas::orient::DEFAULT_SCOPE_ID,
@@ -958,12 +946,6 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
         drop(pile.maintain_attached(succinct, &owner).await.unwrap());
         drop(pile.maintain_attached(rank9, &owner).await.unwrap());
     });
-    overrides.push((
-        faculties::collection_names::override_env_name(
-            faculties::schemas::orient::DEFAULT_SCOPE_ID,
-        ),
-        hex::encode(legacy.handle().raw),
-    ));
     pile.close().unwrap();
 
     f.call("orient_poll", json!({"persona": f.who(), "peek": false}));
@@ -973,7 +955,6 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
         .is_empty());
     let run_other = |consume: bool| {
         let mut command = f.process_with_key(&other_key, None);
-        command.envs(overrides.iter().map(|(name, value)| (name, value)));
         command.arg("poll");
         if !consume {
             command.arg("--peek");

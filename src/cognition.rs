@@ -25,8 +25,6 @@ use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{find, id_hex, pattern};
 use triblespace::prelude::*;
 
-#[cfg(test)]
-use crate::collection_names::open_configured;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::schemas::patience::{exec_schema as patience, KIND_TIMEOUT_EXTENSION_ID};
 use crate::schemas::reason::{reason_schema as reason, KIND_REASON_ID};
@@ -147,9 +145,10 @@ pub fn publish_events_with_storage(
     for fragment in &fragments {
         validate_fragment(fragment).context("validate self-contained Cognition event")?;
     }
+    let target = storage.target();
     storage.with_store(|pile, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
-            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let collection = crate::collection_names::write_target_acquiring(
+            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), target, runtime,
         )?;
         crate::collection_names::require_command_write_admission_acquiring(
             pile,
@@ -563,7 +562,9 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
-        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
         let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
@@ -602,7 +603,9 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
-        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
         let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)

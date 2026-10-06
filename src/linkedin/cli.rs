@@ -15,6 +15,11 @@ pub struct Cli {
     /// Existing durable signing-key file. Reads and writes never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     #[command(subcommand)]
     command: Command,
 }
@@ -98,7 +103,9 @@ fn review(value: &ReviewReport, out: &mut Out<'_>) -> Result<()> {
 }
 
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let operations = LinkedIn::new(cli.pile, cli.key);
+    let operations = LinkedIn::with_storage(
+        crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target),
+    );
     match cli.command {
         Command::Import { snapshot, dry_run } => {
             let raw = std::fs::read(&snapshot)

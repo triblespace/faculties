@@ -23,9 +23,7 @@ use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as JsonValue};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
+use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::blob::Bytes;
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt, Support,
@@ -38,9 +36,9 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, 
 use triblespace::prelude::*;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 #[cfg(test)]
-use crate::collection_names::open_configured;
+use crate::collection_names::open;
 use crate::files as file_capability;
 use crate::schemas::archive::{archive, RawBytes};
 use crate::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
@@ -550,8 +548,8 @@ struct CollectionView {
 struct TeamsSession {
     storage: Storage,
     collection: Collection<SimpleArchive>,
-    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    support: Support<SimpleArchive>,
+    rank9: Vec<Collection<Rank9AcceleratedSuccinctArchiveBlob>>,
+    support: Vec<Support<SimpleArchive>>,
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
     signer: ed25519_dalek::SigningKey,
@@ -674,7 +672,7 @@ impl TeamsSession {
     fn refresh_secrets_for(
         &mut self,
         pile: &mut FacultyStore,
-        support: Option<Support<SimpleArchive>>,
+        support: Option<Vec<Support<SimpleArchive>>>,
         runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<()> {
         let snapshot = runtime.block_on(self.secret_collection.ensure(pile, &self.signer))
@@ -685,13 +683,7 @@ impl TeamsSession {
         // support as they were selected; only Secrets and the reader move.
         // A Teams commit observes the ordinary view at this final snapshot.
         if support.is_none() {
-            let observed = reader
-                .attached_acquiring(self.rank9)
-                .context("attach Teams through Secrets snapshot")?;
-            let support = observed.support().clone();
-            let facts = crate::storage::acquire_attached_facts(&observed)
-                .context("read Teams through Secrets snapshot")?;
-            drop(observed);
+            let (support, facts) = observe_union(&reader, &self.rank9)?;
             self.support = support;
             self.facts = facts;
         }
@@ -727,34 +719,51 @@ impl TeamsSession {
     }
 }
 
+/// The support and facts of every Rank9 view of a read-union, observed
+/// through one reader.
+fn observe_union(
+    reader: &AcquiringReader<FacultySnapshot>,
+    rank9: &[Collection<Rank9AcceleratedSuccinctArchiveBlob>],
+) -> Result<(Vec<Support<SimpleArchive>>, FactArchive)> {
+    let mut support = Vec::with_capacity(rank9.len());
+    let facts = crate::storage::union_facts(rank9.iter().map(|view| {
+        let observed = reader
+            .attached_acquiring(*view)
+            .context("observe Teams through Secrets snapshot")?;
+        support.push(observed.support().clone());
+        crate::storage::acquire_attached_facts(&observed)
+            .context("read Teams through Secrets snapshot")
+    }))?;
+    Ok((support, facts))
+}
+
 impl TeamsStorage {
     fn with_session<T>(&self, operation: impl FnOnce(&mut TeamsSession) -> Result<T>) -> Result<T> {
         self.storage.scope(|storage| {
+            let target = storage.target();
             let mut session = storage.with_store(|pile, signer, runtime| {
-                let collection = open_configured_acquiring(
+                let collection = write_target_acquiring(
+                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), target, runtime,
+                )?;
+                // Read every Teams collection; write the target. A target
+                // nothing has committed to yet is read too, so the session
+                // sees its own first write.
+                let mut sources = read_union_acquiring(
                     pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
                 )?;
-                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    collection,
-                    maintained_succinct,
-                )?;
-                let secret_collection = open_secrets_collection_acquiring(
-                    pile, signer.verifying_key(), runtime,
-                )?;
+                if !sources.contains(&collection) {
+                    sources.push(collection);
+                }
+                let pairs = crate::storage::fact_pairs(pile, &sources)?;
+                let secret_collection = open_secrets_collection_acquiring(pile, signer.verifying_key(), None, runtime)?;
                 // The session carries the source and attaches the frontier
                 // the carry leaves; a commit neither attachment reaches yet
                 // is read from its own bytes, and what this key cannot
                 // attach is lag, not a failure.
                 let snapshot = runtime.block_on(async {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(maintained_succinct, signer).await,
-                    )
-                    .context("maintain Teams fact collection")?;
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(maintained_rank9, signer).await,
-                    )
-                    .context("maintain Teams fact collection")?;
+                    crate::storage::maintain_fact_pairs(pile, &pairs, signer)
+                        .await
+                        .context("maintain Teams fact collection")?;
                     let snapshot = secret_collection.ensure(pile, signer)
                             .await
                             .context("observe configured Secrets collection for Teams")?;
@@ -762,13 +771,8 @@ impl TeamsStorage {
                 })?;
                 let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
                 let secrets = secret_storage::snapshot_acquiring(reader.clone(), secret_collection)?;
-                let observed = reader
-                    .attached_acquiring(maintained_rank9)
-                    .context("observe Teams through Secrets snapshot")?;
-                let support = observed.support().clone();
-                let facts = crate::storage::acquire_attached_facts(&observed)
-                    .context("read Teams through Secrets snapshot")?;
-                drop(observed);
+                let maintained_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
+                let (support, facts) = observe_union(&reader, &maintained_rank9)?;
                 Ok(TeamsSession {
                     storage: storage.clone(),
                     collection,
@@ -3702,7 +3706,7 @@ mod tests {
     fn initialize_test_secrets(fixture: &Fixture) -> (Id, Id) {
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
         let client_id = secret_storage::add_secret(
             &mut pile,
             &signer,
@@ -3795,7 +3799,7 @@ mod tests {
                     crate::storage::carry_facts(pile, session.collection, signer);
                     pile.snapshot().map_err(Into::into)
                 })?;
-                assert_ne!(later.attached(session.rank9)?.support(), &support);
+                assert_ne!(later.attached(session.rank9[0])?.support(), &support[0]);
                 drop(later);
                 let observed_at = clock::point_now()?;
                 let secret =
@@ -3868,7 +3872,7 @@ mod tests {
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
         let collection =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+            open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, historical).unwrap();
         pile.close().unwrap();
 

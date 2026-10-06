@@ -1256,31 +1256,37 @@ fn record_utterance(pile_path: &Path, key: Option<&Path>, text: &str) -> Result<
     let stamp = clock::point_now()?;
     let mut fragment = crate::voice::utterance_fragment(CHANNEL_SHOUT, text, None, stamp)?;
 
-    crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned))
-        .with_store(|pile, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
-            pile, COLLECTION_SCOPE_ID, signer.verifying_key(), runtime,
-        )?;
-        crate::voice::validate_staged_payloads(&mut fragment)?;
-        fragment.describe_with(entity! { metadata::description: "duplex spoke" });
-        crate::collection_names::require_command_write_admission_acquiring(
-            pile,
-            collection,
-            signer,
-            "Duplex",
-            "voice route show",
-            runtime,
-        )?;
-        pile.commit(collection, signer, fragment)
-            .context("commit the utterance")?;
-        drop(
-            runtime.block_on(crate::storage::ensure_downstream(
-                pile, collection, signer,
-            ))
-            .context("Duplex utterance was committed, but ensuring its derived views failed")?,
-        );
-        Ok(())
-    })
+    crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned)).with_store(
+        |pile, signer, runtime| {
+            let collection = crate::collection_names::write_target_acquiring(
+                pile,
+                COLLECTION_SCOPE_ID,
+                signer.verifying_key(),
+                None,
+                runtime,
+            )?;
+            crate::voice::validate_staged_payloads(&mut fragment)?;
+            fragment.describe_with(entity! { metadata::description: "duplex spoke" });
+            crate::collection_names::require_command_write_admission_acquiring(
+                pile,
+                collection,
+                signer,
+                "Duplex",
+                "voice route show",
+                runtime,
+            )?;
+            pile.commit(collection, signer, fragment)
+                .context("commit the utterance")?;
+            drop(
+                runtime
+                    .block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                    .context(
+                        "Duplex utterance was committed, but ensuring its derived views failed",
+                    )?,
+            );
+            Ok(())
+        },
+    )
 }
 
 // ── the loop ───────────────────────────────────────────────────────────────

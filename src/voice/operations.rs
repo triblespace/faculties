@@ -1,22 +1,20 @@
 //! Typed Voice persistence; routing reads close before any device or model work.
 
 use crate::clock;
-#[cfg(test)]
-use crate::collection_names::open_configured;
 use crate::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
 #[cfg(test)]
 use crate::storage::open_pile_strict_as;
-use crate::storage::{AcquiringReader, FactArchive, FacultyStore};
 #[cfg(test)]
 use crate::storage::FacultySnapshot;
+use crate::storage::{AcquiringReader, FactArchive, FacultyStore};
 use crate::voice as voice_model;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
@@ -184,7 +182,7 @@ struct VoiceStorage<'a> {
 struct VoiceSession<'a> {
     pile: &'a mut FacultyStore,
     runtime: &'a std::sync::Arc<tokio::runtime::Runtime>,
-    collection: Collection<SimpleArchive>,
+    target: Option<CollectionHandle>,
     signer: &'a ed25519_dalek::SigningKey,
     facts: FactArchive,
     #[cfg(test)]
@@ -199,9 +197,16 @@ impl VoiceSession<'_> {
     ) -> Result<CollectionCommit> {
         voice_model::validate_staged_payloads(&mut fragment)?;
         fragment.describe_with(entity! { metadata::description: description });
+        let collection = crate::collection_names::write_target_acquiring(
+            self.pile,
+            COLLECTION_SCOPE_ID,
+            self.signer.verifying_key(),
+            self.target,
+            self.runtime,
+        )?;
         crate::collection_names::require_command_write_admission_acquiring(
             self.pile,
-            self.collection,
+            collection,
             self.signer,
             "Voice",
             "voice route show",
@@ -209,15 +214,16 @@ impl VoiceSession<'_> {
         )?;
         let commit = self
             .pile
-            .commit(self.collection, self.signer, fragment)
+            .commit(collection, self.signer, fragment)
             .context("commit Voice fragment")?;
         drop(
-            self.runtime.block_on(crate::storage::ensure_downstream(
-                self.pile,
-                self.collection,
-                self.signer,
-            ))
-            .context("Voice facts were committed, but ensuring their derived views failed")?,
+            self.runtime
+                .block_on(crate::storage::ensure_downstream(
+                    self.pile,
+                    collection,
+                    self.signer,
+                ))
+                .context("Voice facts were committed, but ensuring their derived views failed")?,
         );
         Ok(commit)
     }
@@ -228,38 +234,34 @@ impl VoiceStorage<'_> {
         &self,
         operation: impl FnOnce(&mut VoiceSession<'_>) -> Result<T>,
     ) -> Result<T> {
+        let target = self.storage.target();
         self.storage.with_store(|store, signer, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, COLLECTION_SCOPE_ID, signer.verifying_key(), runtime,
+            let sources = crate::collection_names::read_union_acquiring(
+                store,
+                COLLECTION_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             let result = (|| {
-                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    collection,
-                    maintained_succinct,
-                )?;
+                let pairs = crate::storage::fact_pairs(pile, &sources)?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
-                runtime.block_on(async {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(maintained_succinct, signer).await,
-                    )?;
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(maintained_rank9, signer).await,
-                    )
-                })
-                .context("maintain Voice fact collection")?;
+                runtime
+                    .block_on(crate::storage::maintain_fact_pairs(pile, &pairs, signer))
+                    .context("maintain Voice fact collection")?;
+                let maintained_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
                 let store_snapshot = AcquiringReader::new(
-                    pile.snapshot().context("freeze maintained Voice fact collection")?,
+                    pile.snapshot()
+                        .context("freeze maintained Voice fact collection")?,
                     runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
+                let facts = crate::storage::acquire_union_facts(&store_snapshot, &maintained_rank9)
                     .context("read maintained Voice fact collection")?;
                 operation(&mut VoiceSession {
                     pile,
                     runtime,
-                    collection,
+                    target,
                     signer,
                     facts,
                     #[cfg(test)]
@@ -404,7 +406,7 @@ mod tests {
 
         let signer = crate::storage::load_signer(&pile, Some(&key)).unwrap();
         let mut pile_storage = open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
-        let collection = open_configured(
+        let collection = crate::collection_names::open(
             &mut pile_storage,
             COLLECTION_SCOPE_ID,
             signer.verifying_key(),
@@ -430,8 +432,11 @@ mod tests {
             capability
                 .storage
                 .with_pile(|pile, signer| {
-                    let source =
-                        open_configured(pile, COLLECTION_SCOPE_ID, signer.verifying_key())?;
+                    let source = crate::collection_names::open(
+                        pile,
+                        COLLECTION_SCOPE_ID,
+                        signer.verifying_key(),
+                    )?;
                     let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                     let rank9 =
                         pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;

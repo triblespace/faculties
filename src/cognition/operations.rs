@@ -4,13 +4,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
-use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::repo::SnapshotSource;
 
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::read_union_acquiring;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::storage::Storage;
 
@@ -45,15 +41,14 @@ impl Cognition {
 
     pub fn check(&self) -> Result<CheckReport> {
         self.storage.with_store(|pile, signer, runtime| {
-            let source = open_configured_acquiring(
+            let sources = read_union_acquiring(
                 pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
             )?;
-            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+            let rank9 = crate::storage::rank9_union(pile, &sources)?;
             let snapshot = crate::storage::AcquiringReader::new(
                 pile.snapshot().context("freeze Cognition fact collection")?, runtime.clone(),
             );
-            let facts = crate::storage::acquire_facts(&snapshot, rank9)
+            let facts = crate::storage::acquire_union_facts(&snapshot, &rank9)
                 .context("read Cognition Rank9 collection")?;
             super::validate_archive(&snapshot, &facts)?;
             Ok(CheckReport {

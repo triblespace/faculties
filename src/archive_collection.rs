@@ -9,8 +9,8 @@
 
 #[cfg(test)]
 use crate::storage::FactView;
-use std::sync::Arc;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use triblespace::core::collection::AttachedSnapshot;
 
 use anybytes::Bytes;
@@ -27,9 +27,9 @@ use triblespace::core::collection::{
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store};
-use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -43,7 +43,7 @@ use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
 use crate::storage::{FactArchive, FactLag, FacultyStore};
 
 #[cfg(test)]
-use crate::collection_names::open_configured;
+use crate::collection_names::open;
 #[cfg(test)]
 use triblespace::core::collection::{
     CollectionAttachment, CollectionMap, CollectionRecord, CollectionStore,
@@ -69,10 +69,7 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
 impl ArchiveImportWriter {
     /// Open a synchronous import session. Async callers run the complete
     /// open/stage/finish lifetime on a blocking worker, not inside their runtime.
-    pub fn open(
-        pile_path: &std::path::Path,
-        key_path: Option<&std::path::Path>,
-    ) -> Result<Self> {
+    pub fn open(pile_path: &std::path::Path, key_path: Option<&std::path::Path>) -> Result<Self> {
         let signer = crate::storage::load_signer(pile_path, key_path)?;
         let runtime = Arc::new(crate::storage::runtime()?);
         let mut pile = crate::storage::open_store_as(pile_path, signer.verifying_key())?;
@@ -135,20 +132,23 @@ where
         signer: &SigningKey,
         runtime: &Arc<tokio::runtime::Runtime>,
     ) -> Result<(Collection<SimpleArchive>, FactArchive)> {
-        let source = crate::collection_names::open_configured_acquiring(
+        let source = crate::collection_names::write_target_acquiring(
             pile,
             schema::DEFAULT_SCOPE_ID,
             signer.verifying_key(),
+            None,
             runtime,
         )?;
         let (succinct, rank9) = crate::storage::fact_pair(pile, source)?;
-        runtime.block_on(async {
-            crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
-            crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
-        }).context("maintain Archive import facts")?;
+        runtime
+            .block_on(async {
+                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+            })
+            .context("maintain Archive import facts")?;
         let reader = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
-        let current = crate::storage::acquire_facts(&reader, rank9)
-            .context("read Archive import facts")?;
+        let current =
+            crate::storage::acquire_facts(&reader, rank9).context("read Archive import facts")?;
         Ok((source, current))
     }
 
@@ -214,14 +214,15 @@ where
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
         drop(
-            self.runtime.block_on(crate::storage::ensure_downstream(
-                &mut self.pile,
-                self.collection,
-                &self.signer,
-            ))
-            .context(
-                "Archive projection unit was committed, but ensuring its derived views failed",
-            )?,
+            self.runtime
+                .block_on(crate::storage::ensure_downstream(
+                    &mut self.pile,
+                    self.collection,
+                    &self.signer,
+                ))
+                .context(
+                    "Archive projection unit was committed, but ensuring its derived views failed",
+                )?,
         );
         Ok(Some(commit))
     }
@@ -334,8 +335,12 @@ pub fn ensure_local_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            store,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let mut local = store.store();
         let pile = &mut *local;
@@ -347,13 +352,19 @@ pub fn ensure_local_with_storage(
 /// its last payload read; the observation itself does not extend store life.
 pub(crate) fn ensure_acquiring_with_storage(
     storage: &crate::storage::Storage,
-) -> Result<AttachedSnapshot<
-    crate::storage::AcquiringReader<crate::storage::FacultySnapshot>,
-    Rank9AcceleratedSuccinctArchiveBlob,
->> {
+) -> Result<
+    AttachedSnapshot<
+        crate::storage::AcquiringReader<crate::storage::FacultySnapshot>,
+        Rank9AcceleratedSuccinctArchiveBlob,
+    >,
+> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            store,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
         runtime.block_on(async {
@@ -362,7 +373,8 @@ pub(crate) fn ensure_acquiring_with_storage(
             Ok::<_, anyhow::Error>(())
         })?;
         crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone())
-            .attached_acquiring(rank9).context("attach frozen Archive facts")
+            .attached_acquiring(rank9)
+            .context("attach frozen Archive facts")
     })
 }
 
@@ -423,8 +435,12 @@ pub fn ensure_succinct_index_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<SuccinctIndexReport> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            store,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
         runtime.block_on(async {
@@ -532,8 +548,12 @@ pub fn ensure_bm25_index_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<Bm25IndexReport> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            store,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let target = store.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
@@ -541,9 +561,11 @@ pub fn ensure_bm25_index_with_storage(
             crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
             crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
             crate::storage::tolerate_own_lag(
-                store.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                    target, signer,
-                ).await,
+                store
+                    .maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                        target, signer,
+                    )
+                    .await,
             )?;
             Ok::<_, anyhow::Error>(())
         })?;
@@ -614,8 +636,12 @@ pub fn ensure_search_local_with_storage(
     ArchiveSearchLag,
 )> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            store,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let mut local = store.store();
         let pile = &mut *local;
@@ -668,8 +694,12 @@ pub(crate) fn ensure_search_acquiring_with_storage(
     ArchiveSearchLag,
 )> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            store,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let target = store.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
@@ -677,9 +707,11 @@ pub(crate) fn ensure_search_acquiring_with_storage(
             crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
             crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
             crate::storage::tolerate_own_lag(
-                store.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                    target, signer,
-                ).await,
+                store
+                    .maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                        target, signer,
+                    )
+                    .await,
             )?;
             Ok::<_, anyhow::Error>(())
         })?;
@@ -982,11 +1014,15 @@ mod tests {
                 std::fs::File::create(&pile).unwrap();
                 initialize_signer(&pile, Some(&key)).unwrap();
                 let mut archive = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-                archive.stage_fragment(projection("async-worker", "body")).unwrap();
+                archive
+                    .stage_fragment(projection("async-worker", "body"))
+                    .unwrap();
                 assert!(archive.finish(Ok(())).unwrap().1.is_some());
 
-                let mut code = crate::code::ingest::CodeImportWriter::open(&pile, Some(&key)).unwrap();
-                code.stage_fragment(entity! { metadata::description: "code import worker" }).unwrap();
+                let mut code =
+                    crate::code::ingest::CodeImportWriter::open(&pile, Some(&key)).unwrap();
+                code.stage_fragment(entity! { metadata::description: "code import worker" })
+                    .unwrap();
                 assert!(code.commit_unit().unwrap().is_some());
                 code.close(Ok(())).unwrap();
 
@@ -994,7 +1030,9 @@ mod tests {
                 // blocking worker, never on the async executor.
                 let absent = directory.path().join("absent").join("pile");
                 assert!(ArchiveImportWriter::open(&absent, Some(&key)).is_err());
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
         });
     }
 
@@ -1015,7 +1053,9 @@ mod tests {
         let handle = find!(
             handle: Inline<Handle<UTF8String>>,
             pattern!(fragment.facts(), [{ metadata::description: ?handle }])
-        ).next().unwrap();
+        )
+        .next()
+        .unwrap();
         assert!(!snapshot.contains_blob(handle).unwrap());
 
         writer.stage_fragment(fragment).unwrap();
@@ -1436,8 +1476,7 @@ mod tests {
         let fragment = projection("session:duplicate-author", "one payload");
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection =
-            open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let collection = open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let admitted = pile.commit(collection, &signer, fragment.clone()).unwrap();
         let foreign = SigningKey::from_bytes(&[0xA7; 32]);
         let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
@@ -1529,14 +1568,12 @@ mod tests {
 
         let first_fragment = projection("session:one", "shared");
         let first_len = first_fragment.facts().len();
-        let mut first_writer =
-            ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut first_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         first_writer.stage_fragment(first_fragment.clone()).unwrap();
         let first = first_writer.finish(Ok(())).unwrap().1.unwrap();
 
         let second_fragment = projection("session:two", "shared");
-        let mut second_writer =
-            ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut second_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         second_writer.stage_fragment(first_fragment).unwrap();
         assert_eq!(second_writer.delta_len(), 0, "known fragment is a replay");
         second_writer
@@ -1587,8 +1624,7 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let collection =
-            open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let collection = open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let commit = pile.commit(collection, &signer, Fragment::empty()).unwrap();
         pile.close().unwrap();
 
@@ -1635,8 +1671,7 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        let mut writer =
-            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer
             .stage_fragment(projection_at_modality(
                 "session:text",
@@ -1694,8 +1729,7 @@ mod tests {
         let (independent, independent_id) =
             projection_after_at("other/root", "independent", Some(7.0), &[]);
 
-        let mut writer =
-            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         // Deliberately stage out of causal and temporal order. The collection
         // is a set; replay order must come solely from canonical semantics.
         writer.stage_fragment(regressed_child).unwrap();
@@ -1736,8 +1770,7 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        let mut writer =
-            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer
             .stage_fragment(projection("session:index", "exact succinct"))
             .unwrap();
@@ -1798,8 +1831,7 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         for (locator, text) in [("session:alpha", "alpha"), ("session:beta", "beta")] {
-            let mut writer =
-                ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
             writer.stage_fragment(projection(locator, text)).unwrap();
             writer.finish(Ok(())).unwrap();
         }
@@ -1810,10 +1842,7 @@ mod tests {
         assert_eq!(report.lagging, 0);
         assert_eq!(report.cover_segments, 2);
         let length = std::fs::metadata(&pile_path).unwrap().len();
-        assert_eq!(
-            ensure_bm25_index(&pile_path, Some(&key)).unwrap(),
-            report
-        );
+        assert_eq!(ensure_bm25_index(&pile_path, Some(&key)).unwrap(), report);
         assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), length);
 
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
@@ -1853,8 +1882,7 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         for (locator, seconds) in [("session:first", 1.0), ("session:second", 2.0)] {
-            let mut writer =
-                ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
             writer
                 .stage_fragment(projection_at(locator, "shared closure needle", seconds))
                 .unwrap();
@@ -1881,8 +1909,7 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         let first_fragment = projection("session:first", "alpha");
-        let mut writer =
-            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer.stage_fragment(first_fragment).unwrap();
         writer.finish(Ok(())).unwrap();
         let first = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
@@ -1898,8 +1925,7 @@ mod tests {
         drop(first);
 
         let second_fragment = projection("session:second", "beta βeta 🛰️");
-        let mut writer =
-            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer.stage_fragment(second_fragment.clone()).unwrap();
         writer.finish(Ok(())).unwrap();
 
@@ -1913,8 +1939,7 @@ mod tests {
         drop(extended);
 
         let before = std::fs::metadata(&pile_path).unwrap().len();
-        let mut retry =
-            ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+        let mut retry = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         retry.stage_fragment(second_fragment).unwrap();
         retry.finish(Ok(())).unwrap();
         let after_retry = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
@@ -1949,8 +1974,7 @@ mod tests {
             projection_split_across_source_elements("session:split", "closure needle");
         let signer = load_signer(&pile_path, Some(&key)).unwrap();
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
-        let collection =
-            open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let collection = open(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let block_commit = pile.commit(collection, &signer, block_element).unwrap();
         let remainder_commit = pile.commit(collection, &signer, remainder_element).unwrap();
         let target = test_target(&mut pile, collection);
@@ -1967,10 +1991,7 @@ mod tests {
         assert_eq!(report.source_elements, 3);
         assert_eq!(report.lagging, 1, "only the split block's node is residual");
         let length = std::fs::metadata(&pile_path).unwrap().len();
-        assert_eq!(
-            ensure_bm25_index(&pile_path, Some(&key)).unwrap(),
-            report
-        );
+        assert_eq!(ensure_bm25_index(&pile_path, Some(&key)).unwrap(), report);
         assert_eq!(
             std::fs::metadata(&pile_path).unwrap().len(),
             length,
@@ -2418,8 +2439,7 @@ mod tests {
         let key = directory.path().join("archive.key");
         let signer = initialize_archive_fixture(&pile_path, &key);
         for (name, transcript) in [("first.jsonl", FIRST), ("second.jsonl", SECOND)] {
-            let mut writer =
-                ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
+            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
             let projection = crate::archive_claude_code::project_bytes(
                 name,
                 Bytes::from_source(transcript.as_bytes().to_vec()),

@@ -133,7 +133,7 @@ fn check_validates_known_selected_attachments_and_emits_no_false_success() {
     let signer = faculties::storage::load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
     let mut pile =
         faculties::storage::open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
-    let collection = faculties::collection_names::open_configured(
+    let collection = faculties::collection_names::open(
         &mut pile,
         faculties::schemas::cognition::DEFAULT_SCOPE_ID,
         signer.verifying_key(),

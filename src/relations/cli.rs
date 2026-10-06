@@ -21,6 +21,11 @@ pub struct Cli {
     /// Existing durable signing-key file. Reads and writes never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -296,7 +301,9 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return output.line(Cli::command().render_help().to_string());
     };
-    let operations = Relations::new(cli.pile, cli.key);
+    let operations = Relations::with_storage(
+        crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target),
+    );
     match command {
         Command::Add {
             label,

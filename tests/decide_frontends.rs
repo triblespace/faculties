@@ -2,7 +2,7 @@
 use anybytes::Bytes;
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use faculties::collection_names::open_configured;
+use faculties::collection_names::open;
 use faculties::decide::{
     self, cli, mcp, Decide, FactorSide, ListOptions, Resolution, RESULT_BENIGN,
 };
@@ -42,7 +42,7 @@ impl Fixture {
     fn commits(&self) -> usize {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
-        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let source = open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let count = source.admitted(&pile.snapshot().unwrap()).unwrap().len();
         pile.close().unwrap();
         count

@@ -1555,10 +1555,10 @@ mod tests {
     };
     use triblespace::core::repo::pile::Pile;
 
-    use crate::collection_names::open_configured;
+    use crate::collection_names::open;
     use crate::schemas::headspace::{playground_config, DEFAULT_SCOPE_ID, KIND_LIVE_RECORD};
     use crate::secrets;
-    use crate::storage::{open_secrets_collection, open_secrets_collection_read, FactArchive};
+    use crate::storage::{open_secrets_collection, FactArchive};
     fn test_id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
     }
@@ -1576,7 +1576,7 @@ mod tests {
     }
 
     fn materialize(pile: &mut Pile, scope: Id, signer: &SigningKey) -> (FactArchive, PileSnapshot) {
-        let source = open_configured(pile, scope, signer.verifying_key()).unwrap();
+        let source = open(pile, scope, signer.verifying_key()).unwrap();
         let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
@@ -1591,7 +1591,7 @@ mod tests {
     }
 
     fn commit(pile: &mut Pile, scope: Id, signer: &SigningKey, fragment: Fragment) {
-        let collection = open_configured(pile, scope, signer.verifying_key()).unwrap();
+        let collection = open(pile, scope, signer.verifying_key()).unwrap();
         pile.commit(collection, signer, fragment).unwrap();
     }
 
@@ -1731,7 +1731,7 @@ mod tests {
         let path = directory.path().join("headspace.pile");
         let signer = SigningKey::from_bytes(&[0x41; 32]);
         let mut pile = test_pile(&path, &signer);
-        let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
         let first_id = secrets::storage::add_secret(
             &mut pile,
             &signer,
@@ -1743,7 +1743,7 @@ mod tests {
         .unwrap();
         secrets::storage::add_secret(&mut pile, &signer, collection, "hs/model", b"second", at(4))
             .unwrap();
-        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
         let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
             &mut pile, collection, &signer,
         ))
@@ -1783,7 +1783,7 @@ mod tests {
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, fragment);
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
         let catalog = project_result(&reader, &facts).unwrap();
-        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
         let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
             &mut pile, collection, &signer,
         ))

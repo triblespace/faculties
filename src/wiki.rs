@@ -14,7 +14,6 @@ pub mod operations;
 
 pub use operations::{Export, ImportDocument, ListOptions, Wiki};
 
-use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
@@ -22,9 +21,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attestation;
 use triblespace::core::collection::latest::{LatestBlob, LatestIndex};
-use triblespace::core::collection::{
-    CollectionCommit, CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
-};
+use triblespace::core::collection::{CollectionCommit, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::query::TriblePattern;
@@ -32,16 +29,13 @@ use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
 
-use crate::collection_names::open_configured;
+use crate::collection_names::{read_union, write_target};
 use crate::schemas::wiki::{
     attrs, authorship_fragment, extract_link_targets, revision_fragment,
     revision_fragment_from_handles, TextHandle, DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION,
     KIND_VERSION_ID, TAG_ARCHIVED_ID, TAG_SPECS,
 };
 use crate::storage::FactArchive;
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type PublicKeyValue = Inline<inlineencodings::ED25519PublicKey>;
@@ -267,20 +261,11 @@ impl WikiSnapshot {
     }
 }
 
-/// Maintained positive latest-state projection used for Wiki frontiers.
-pub fn latest_collection<S>(
-    store: &mut S,
-    authority: VerifyingKey,
-) -> Result<Collection<LatestBlob>>
-where
-    S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
-{
-    let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
-    latest_for_source(store, source)
-}
-
-pub(crate) fn latest_for_source<S>(
+/// Maintained positive latest-state projection of one Wiki collection. The
+/// frontier of a read-union is the union of its collections' projections
+/// ([`LatestIndex::union`]): a revision one collection supersedes is not live
+/// in the union, whichever collection holds it.
+pub fn latest_for_source<S>(
     store: &mut S,
     source: Collection<blobencodings::SimpleArchive>,
 ) -> Result<Collection<LatestBlob>>
@@ -1631,13 +1616,16 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileSnapshot)> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let sources = read_union(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let facts = store_snapshot
-        .collection(collection)
-        .context("attach Wiki collection")?
-        .view::<TribleSet>()
-        .context("read Wiki collection")?;
+    let mut facts = TribleSet::new();
+    for source in sources {
+        facts += store_snapshot
+            .collection(source)
+            .context("attach Wiki collection")?
+            .view::<TribleSet>()
+            .context("read Wiki collection")?;
+    }
     validate_catalog(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
 }
@@ -1650,22 +1638,28 @@ pub fn materialize_collection(
 /// flatten the collection or validate a closed-world catalog before asking
 /// their actual query.
 pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<WikiQuerySnapshot> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, succinct)?;
-    let target = latest_collection(pile, signer.verifying_key())?;
+    let sources = read_union(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let rank9 = crate::storage::rank9_union(pile, &sources)?;
+    let targets = sources
+        .iter()
+        .map(|source| latest_for_source(pile, *source))
+        .collect::<Result<Vec<_>>>()?;
     let store_snapshot = pile.snapshot().context("freeze resident Wiki targets")?;
-    let facts = store_snapshot
-        .read_facts(rank9)
+    let facts = crate::storage::read_union_facts(&store_snapshot, &rank9)
         .context("read Wiki fact collection")?;
     // The index over the same foundations the facts read: revisions no
     // attachment reaches yet are built in memory.
-    let latest = store_snapshot
-        .attached(target)
-        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
-        .read::<LatestIndex>()
-        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
-        .into_value();
+    let mut latest = LatestIndex::default();
+    for target in targets {
+        latest = latest.union(
+            &store_snapshot
+                .attached(target)
+                .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
+                .read::<LatestIndex>()
+                .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
+                .into_value(),
+        );
+    }
     Ok(WikiQuerySnapshot {
         facts,
         store_snapshot,
@@ -1686,8 +1680,8 @@ pub async fn materialize_indexed_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<WikiSnapshot> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let target = latest_collection(pile, signer.verifying_key())?;
+    let collection = write_target(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), None)?;
+    let target = latest_for_source(pile, collection)?;
     crate::storage::seed_attached(pile, target, signer)
         .await
         .context("seed the Wiki supersession index")?;
@@ -1696,19 +1690,32 @@ pub async fn materialize_indexed_collection(
             .await
             .context("ensure the Wiki views before materializing")?,
     );
+    let sources = read_union(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let targets = sources
+        .iter()
+        .map(|source| latest_for_source(pile, *source))
+        .collect::<Result<Vec<_>>>()?;
     let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let source = store_snapshot
-        .collection(collection)
-        .context("attach Wiki collection")?;
-    let facts = source.view::<TribleSet>().context("read Wiki collection")?;
-    let (latest, unread) = store_snapshot
-        .attached(target)
-        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
-        .read::<LatestIndex>()
-        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
-        .into_parts();
-    let latest_lag = unread.len();
-    drop(source);
+    let mut facts = TribleSet::new();
+    for source in &sources {
+        facts += store_snapshot
+            .collection(*source)
+            .context("attach Wiki collection")?
+            .view::<TribleSet>()
+            .context("read Wiki collection")?;
+    }
+    let mut latest = LatestIndex::default();
+    let mut latest_lag = 0;
+    for target in targets {
+        let (index, unread) = store_snapshot
+            .attached(target)
+            .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
+            .read::<LatestIndex>()
+            .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
+            .into_parts();
+        latest = latest.union(&index);
+        latest_lag += unread.len();
+    }
     // This explicit migration/import projection retains the complete-facts
     // reference oracle; ordinary readers join the positive index directly.
     let catalog = validate_catalog(&store_snapshot, &facts)?;
@@ -1729,7 +1736,7 @@ pub fn commit_collection(
     // The signature is curation of this fragment into the collection. Author
     // attribution lives inside the revision artifact and is intentionally not
     // inferred from, or forced equal to, this signer.
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let collection = write_target(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), None)?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Wiki collection fragment: {error}"))
 }
@@ -1737,9 +1744,9 @@ pub fn commit_collection(
 /// The worker's carry for tests: the fact chain and the supersession index.
 #[cfg(test)]
 pub(crate) fn carry_for_tests(pile: &mut Pile, signer: &SigningKey) {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+    let collection = write_target(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), None).unwrap();
     crate::storage::carry_facts(pile, collection, signer);
-    let target = latest_collection(pile, signer.verifying_key()).unwrap();
+    let target = latest_for_source(pile, collection).unwrap();
     drop(pollster::block_on(pile.maintain_attached(target, signer)).unwrap());
 }
 
@@ -2069,7 +2076,8 @@ mod tests {
         let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         commit_collection(&mut pile, &signer, author_fragment + root_fragment).unwrap();
         let collection =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let cover_before = collection.admitted(&store_snapshot).unwrap();
         let snapshot =

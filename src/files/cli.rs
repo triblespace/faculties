@@ -20,6 +20,13 @@ const SHARED: &[Param] = &[
     .ambient()
     .optional()
     .env("TRIBLESPACE_KEY"),
+    Param::caller(
+        "target",
+        "The collection writes go to (64 hex digits, optionally blake3:); \
+         without it, the one Files collection rooted at the signing key",
+    )
+    .ambient()
+    .optional(),
     Param::caller("wemm-pile", "Dedicated finished WeMM BF16 model pile; operator must keep its mapped prefix immutable through CUDA teardown")
         .path().ambient().optional().env("WEMM_PILE"),
     Param::caller("wemm-assets", "Directory containing the exact pinned config.json, tokenizer.json and chat_template.jinja")
@@ -233,9 +240,16 @@ fn execute_with_input(
         invocation.flag("wemm") || invocation.get("wemm-floor").is_none(),
         "--wemm-floor requires --wemm; no legacy threshold substitution was made"
     );
-    let files = Files::new(
-        invocation.require_path("pile")?.to_owned(),
-        invocation.path("key").map(Path::to_owned),
+    let target = invocation
+        .get("target")
+        .map(crate::collection_names::parse_target)
+        .transpose()?;
+    let files = Files::with_storage(
+        crate::storage::Storage::new(
+            invocation.require_path("pile")?.to_owned(),
+            invocation.path("key").map(Path::to_owned),
+        )
+        .with_target(target),
     );
     match invocation.verb().name {
         "add" => files.add_path(

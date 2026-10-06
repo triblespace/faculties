@@ -21,6 +21,11 @@ pub struct Cli {
     /// initialize explicitly with `trible pile signing-key init <pile>`.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     /// Reachy daemon base URL (the `shout` Reachy-speaker target).
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
@@ -178,7 +183,9 @@ fn execute_stream(cli: Cli) -> Result<()> {
 }
 
 pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
-    let voice = Voice::new(cli.pile, cli.key);
+    let voice = Voice::with_storage(
+        crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target),
+    );
     let synthesizer = Synthesizer::new(ModelSources::from_environment());
     let device = Device::new(voice.clone(), cli.daemon, cli.soma, synthesizer.clone());
     match cli.command {

@@ -5,9 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
-#[cfg(test)]
-use crate::collection_names::open_configured;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 use crate::planner::{
     self as planner_model, cancellation_fragment, event_fragment, note_fragment, read_text,
     EventDraft, EventRow, IntervalValue, TextHandle, STATUS_CANCELLED, STATUS_CONFIRMED,
@@ -19,13 +17,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use hifitime::Epoch;
 use rrule::{RRuleSet, Tz};
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 #[cfg(test)]
 use triblespace::core::collection::CollectionSnapshotExt;
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
@@ -305,7 +303,6 @@ impl PlannerStorage<'_> {
         &self,
         operation: impl FnOnce(
             &mut FacultyStore,
-            Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &LoadedPlanner,
             &std::sync::Arc<tokio::runtime::Runtime>,
@@ -313,41 +310,34 @@ impl PlannerStorage<'_> {
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
             let result = (|| {
-                let source = open_configured_acquiring(
-                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
-                )?;
-                let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-                let collection_rank9 = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
+                let sources =
+                    read_union_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+                let pairs = crate::storage::fact_pairs(pile, &sources)?;
                 // Keep the existing upkeep step, then select one observation
                 // whose missing residual bytes the foreground read can fetch.
-                runtime.block_on(async {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(collection_succinct, signer).await,
-                    )?;
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(collection_rank9, signer).await,
-                    )
-                })
-                .context("maintain Planner fact collection")?;
+                runtime
+                    .block_on(crate::storage::maintain_fact_pairs(pile, &pairs, signer))
+                    .context("maintain Planner fact collection")?;
+                let collection_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
                 let store_snapshot = AcquiringReader::new(
-                    pile.snapshot().context("freeze maintained Planner fact collection")?,
+                    pile.snapshot()
+                        .context("freeze maintained Planner fact collection")?,
                     runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
+                let facts = crate::storage::acquire_union_facts(&store_snapshot, &collection_rank9)
                     .context("attach maintained Planner fact collection")?;
                 let loaded = LoadedPlanner {
                     facts,
                     reader: store_snapshot,
                 };
-                operation(pile, source, signer, &loaded, runtime)
+                operation(pile, signer, &loaded, runtime)
             })();
             result
         })
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&LoadedPlanner) -> Result<T>) -> Result<T> {
-        self.with_store(|_, _, _, loaded, _| operation(loaded))
+        self.with_store(|_, _, loaded, _| operation(loaded))
     }
 
     fn update<T>(
@@ -355,10 +345,18 @@ impl PlannerStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&LoadedPlanner) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_store(|pile, collection, signer, loaded, runtime| {
+        let target = self.storage.target();
+        self.with_store(|pile, signer, loaded, runtime| {
             let (fragment, value) = operation(loaded)?;
             if let Some(mut fragment) = fragment {
                 fragment.describe_with(entity! { metadata::description: description });
+                let collection = write_target_acquiring(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    target,
+                    runtime,
+                )?;
                 crate::collection_names::require_command_write_admission_acquiring(
                     pile,
                     collection,
@@ -370,7 +368,8 @@ impl PlannerStorage<'_> {
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
                 drop(
-                    runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                    runtime
+                        .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                         .context(
                             "Planner facts were committed, but ensuring their derived views failed",
                         )?,
@@ -385,7 +384,8 @@ impl PlannerStorage<'_> {
     #[cfg(test)]
     fn payload_count(&self) -> Result<usize> {
         self.storage.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let collection =
+                crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot()?;
             Ok(collection.admitted(&store_snapshot)?.len())
         })
@@ -1074,7 +1074,8 @@ fn event_and_initial_note_are_one_commit_a_preparing_reader_observes() {
     capability
         .storage
         .with_pile(|pile, signer| {
-            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let source =
+                crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
             let snapshot = pollster::block_on(async {

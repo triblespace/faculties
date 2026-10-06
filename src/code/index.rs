@@ -131,8 +131,12 @@ impl Code {
     /// Build or refresh both lexical covers. The only verb that maintains.
     pub fn index(&self) -> Result<IndexReport> {
         self.storage().with_store(|store, signer, runtime| {
-            let source = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let source = crate::collection_names::write_target_acquiring(
+                store,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                None,
+                runtime,
             )?;
             let doc_target = register(store, source, attrs::doc.id())?;
             let text_target = register(store, source, attrs::source_tokens.id())?;
@@ -150,15 +154,29 @@ impl Code {
             let doc_snapshot = AcquiringReader::new(doc_snapshot, runtime.clone());
             let text_snapshot = AcquiringReader::new(text_snapshot, runtime.clone());
             let doc_documents = crate::storage::require_complete_attached_read(
-                doc_snapshot.attached_acquiring(doc_target)?.read_acquiring::<CodeBM25View>()?,
+                doc_snapshot
+                    .attached_acquiring(doc_target)?
+                    .read_acquiring::<CodeBM25View>()?,
             )?
-                .segments().iter().map(|index| index.doc_count()).sum();
+            .segments()
+            .iter()
+            .map(|index| index.doc_count())
+            .sum();
             let text_documents = crate::storage::require_complete_attached_read(
-                text_snapshot.attached_acquiring(text_target)?.read_acquiring::<CodeBM25View>()?,
+                text_snapshot
+                    .attached_acquiring(text_target)?
+                    .read_acquiring::<CodeBM25View>()?,
             )?
-                .segments().iter().map(|index| index.doc_count()).sum();
+            .segments()
+            .iter()
+            .map(|index| index.doc_count())
+            .sum();
             let source_elements = text_snapshot.collection(source)?.support()?.len();
-            Ok(IndexReport { doc_documents, text_documents, source_elements })
+            Ok(IndexReport {
+                doc_documents,
+                text_documents,
+                source_elements,
+            })
         })
     }
 
@@ -295,13 +313,18 @@ impl Code {
     fn bm25_scores(&self, query: &str, tier: Tier) -> Result<BTreeMap<Id, f32>> {
         let terms = code_tokens(query);
         self.storage().with_store(|store, signer, runtime| {
-            let source = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let source = crate::collection_names::write_target_acquiring(
+                store,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                None,
+                runtime,
             )?;
             let doc_target = register(store, source, attrs::doc.id())?;
             let text_target = register(store, source, attrs::source_tokens.id())?;
             let snapshot = AcquiringReader::new(
-                store.snapshot().context("freeze Code search snapshot")?, runtime.clone(),
+                store.snapshot().context("freeze Code search snapshot")?,
+                runtime.clone(),
             );
 
             let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
@@ -410,8 +433,8 @@ mod tests {
 
     #[test]
     fn a_cold_text_bm25_residual_fetches_exact_text_on_the_frozen_view() {
-        use triblespace::core::blob::{Blob, IntoBlob};
         use triblespace::core::blob::encodings::utf8string::UTF8String;
+        use triblespace::core::blob::{Blob, IntoBlob};
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
         use triblespace::core::repo::{BlobStoreList, BlobStorePut, StorageClose};
 
@@ -420,16 +443,27 @@ mod tests {
         std::fs::File::create(&path).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[114; 32]);
         let mut store = crate::storage::open_store_as(&path, signer.verifying_key()).unwrap();
-        let root = store.collection("cold Code BM25", CollectionPolicy::new(
-            AdmissionPolicy::direct(signer.verifying_key()),
-            AdmissionPolicy::direct(signer.verifying_key()),
-        )).unwrap();
+        let root = store
+            .collection(
+                "cold Code BM25",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(signer.verifying_key()),
+                    AdmissionPolicy::direct(signer.verifying_key()),
+                ),
+            )
+            .unwrap();
         let target = register(&mut store, root, attrs::doc.id()).unwrap();
         let text: Blob<UTF8String> = String::from("a delayed GPU kernel").to_blob();
         let handle = text.get_handle();
-        store.commit(root, &signer, entity! { attrs::doc: handle }).unwrap();
+        store
+            .commit(root, &signer, entity! { attrs::doc: handle })
+            .unwrap();
         let frozen = store.snapshot().unwrap();
-        let passive = frozen.attached(target).unwrap().read::<CodeBM25View>().unwrap();
+        let passive = frozen
+            .attached(target)
+            .unwrap()
+            .read::<CodeBM25View>()
+            .unwrap();
         assert_eq!(passive.unread().len(), 1);
 
         store.put::<UTF8String, _>(text).unwrap();
@@ -438,7 +472,14 @@ mod tests {
         let selected = reader.attached_acquiring(target).unwrap();
         let read = selected.read_acquiring::<CodeBM25View>().unwrap();
         assert!(read.unread().is_empty());
-        assert_eq!(read.value().segments().iter().map(|segment| segment.doc_count()).sum::<usize>(), 1);
+        assert_eq!(
+            read.value()
+                .segments()
+                .iter()
+                .map(|segment| segment.doc_count())
+                .sum::<usize>(),
+            1
+        );
         assert_eq!(selected.residual().len(), 1);
         assert!(!reader.contains_blob(handle).unwrap());
         assert!(store.health().started_at.is_none());

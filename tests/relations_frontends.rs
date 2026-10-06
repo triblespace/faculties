@@ -1,7 +1,7 @@
 //! Native Relations receipts, explicit frontends, and fork-visible updates.
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use faculties::collection_names::open_configured;
+use faculties::collection_names::open;
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::relations::{
@@ -45,8 +45,7 @@ impl Fixture {
     fn snapshot(&self) -> (TribleSet, PileSnapshot) {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
-        let collection =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let collection = open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let facts = read_fact_collection(collection, &snapshot).unwrap().0;
         pile.close().unwrap();

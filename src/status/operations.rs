@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::clock;
-#[cfg(test)]
-use crate::collection_names::open_configured;
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 use crate::relations::{self, Head, SelectorOutcome};
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID;
@@ -23,10 +21,11 @@ use crate::storage::{load_signer, open_pile_strict};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{CollectionCommit, CollectionHandle, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
 #[cfg(test)]
 use triblespace::core::repo::pile::Pile;
@@ -219,17 +218,13 @@ fn maintain_and_observe_status(
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<StatusObservation> {
-    // Register every descriptor before advancing the two fact chains.
-    let status_source =
-        open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
-    let status_succinct = pile.attach::<SuccinctArchiveBlob>(status_source, ())?;
-    let status_rank9 =
-        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(status_source, status_succinct)?;
-    let relations_source =
-        open_configured_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
-    let relations_succinct = pile.attach::<SuccinctArchiveBlob>(relations_source, ())?;
-    let relations_rank9 =
-        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(relations_source, relations_succinct)?;
+    // Register every descriptor before advancing the fact chains.
+    let status_sources =
+        read_union_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+    let status_pairs = crate::storage::fact_pairs(pile, &status_sources)?;
+    let relations_sources =
+        read_union_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
+    let relations_pairs = crate::storage::fact_pairs(pile, &relations_sources)?;
 
     // Derive this key's own commits into each view. The roots are not
     // acquired: a view is read as it stands, other windows' statuses reach it
@@ -239,31 +234,24 @@ fn maintain_and_observe_status(
         // guard before any reader is allowed to acquire through the Leech.
         let mut local = pile.store();
         pollster::block_on(async {
-            crate::storage::tolerate_own_lag(
-                local.maintain_attached(status_succinct, signer).await,
-            )
-            .context("maintain Status fact collection")?;
-            crate::storage::tolerate_own_lag(local.maintain_attached(status_rank9, signer).await)
+            crate::storage::maintain_fact_pairs(&mut *local, &status_pairs, signer)
+                .await
                 .context("maintain Status fact collection")?;
-            crate::storage::tolerate_own_lag(
-                local.maintain_attached(relations_succinct, signer).await,
-            )
-            .context("maintain Relations fact collection")?;
-            crate::storage::tolerate_own_lag(
-                local.maintain_attached(relations_rank9, signer).await,
-            )
-            .context("maintain Relations fact collection")?;
-            Ok::<_, anyhow::Error>(())
+            crate::storage::maintain_fact_pairs(&mut *local, &relations_pairs, signer)
+                .await
+                .context("maintain Relations fact collection")
         })?;
     }
+    let status_rank9: Vec<_> = status_pairs.iter().map(|(_, rank9)| *rank9).collect();
+    let relations_rank9: Vec<_> = relations_pairs.iter().map(|(_, rank9)| *rank9).collect();
 
     let snapshot = pile
         .snapshot()
         .context("freeze maintained Status/Relations snapshot")?;
     let snapshot = AcquiringReader::new(snapshot, Arc::clone(runtime));
-    let status = crate::storage::acquire_facts(&snapshot, status_rank9)
+    let status = crate::storage::acquire_union_facts(&snapshot, &status_rank9)
         .context("read Status Rank9 collection")?;
-    let relations = crate::storage::acquire_facts(&snapshot, relations_rank9)
+    let relations = crate::storage::acquire_union_facts(&snapshot, &relations_rank9)
         .context("read Relations Rank9 collection")?;
     Ok(StatusObservation {
         status,
@@ -277,28 +265,23 @@ fn maintain_and_observe_relations(
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<RelationsObservation> {
-    let source =
-        open_configured_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
-    let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-    let collection_rank9 =
-        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
+    let sources = read_union_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
+    let pairs = crate::storage::fact_pairs(pile, &sources)?;
     {
         let mut local = pile.store();
-        pollster::block_on(async {
-            crate::storage::tolerate_own_lag(
-                local.maintain_attached(collection_succinct, signer).await,
-            )?;
-            crate::storage::tolerate_own_lag(
-                local.maintain_attached(collection_rank9, signer).await,
-            )
-        })
+        pollster::block_on(crate::storage::maintain_fact_pairs(
+            &mut *local,
+            &pairs,
+            signer,
+        ))
         .context("maintain Relations fact collection")?;
     }
+    let collection_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
     let snapshot = pile
         .snapshot()
         .context("freeze maintained Relations snapshot")?;
     let snapshot = AcquiringReader::new(snapshot, Arc::clone(runtime));
-    let relations = crate::storage::acquire_facts(&snapshot, collection_rank9)
+    let relations = crate::storage::acquire_union_facts(&snapshot, &collection_rank9)
         .context("read Relations Rank9 collection")?;
     Ok(RelationsObservation {
         relations,
@@ -310,10 +293,16 @@ fn commit_status(
     pile: &mut FacultyStore,
     signer: &SigningKey,
     fragment: Fragment,
+    target: Option<CollectionHandle>,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<CollectionCommit> {
-    let collection =
-        open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+    let collection = write_target_acquiring(
+        pile,
+        DEFAULT_SCOPE_ID,
+        signer.verifying_key(),
+        target,
+        runtime,
+    )?;
     crate::collection_names::require_command_write_admission_acquiring(
         pile,
         collection,
@@ -401,6 +390,7 @@ fn store_status_at(
     text: &str,
     at: status::IntervalValue,
 ) -> Result<SetStatus> {
+    let target = storage.storage.target();
     storage.with_store(|pile, signer, runtime| {
         let observation = maintain_and_observe_relations(pile, signer, runtime)?;
         let window = resolve_window_id(&observation.snapshot, &observation.relations, selector)?;
@@ -409,7 +399,7 @@ fn store_status_at(
         let event = fragment
             .root()
             .expect("Status event has one intrinsic root");
-        let commit = commit_status(pile, signer, fragment, runtime)?;
+        let commit = commit_status(pile, signer, fragment, target, runtime)?;
         Ok(SetStatus {
             event,
             commit,
@@ -473,7 +463,11 @@ mod tests {
     fn publish_relations(fixture: &Fixture, fragment: Fragment) {
         storage(fixture)
             .with_pile(|pile, signer| {
-                let collection = open_configured(pile, RELATIONS_SCOPE_ID, signer.verifying_key())?;
+                let collection = crate::collection_names::open(
+                    pile,
+                    RELATIONS_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
                 pile.commit(collection, signer, fragment)?;
                 Ok(())
             })
@@ -489,7 +483,8 @@ mod tests {
             .unwrap();
         storage(&fixture)
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let source =
+                    crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let prepared = pollster::block_on(async {
@@ -559,7 +554,8 @@ mod tests {
         let local = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let foreign = SigningKey::from_bytes(&[0x84; 32]);
         let collection =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, local.verifying_key()).unwrap();
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, local.verifying_key())
+                .unwrap();
         pile.commit(
             collection,
             &foreign,
@@ -574,7 +570,8 @@ mod tests {
                 let rows = status::load_status_rows(&observation.status)?;
                 assert!(rows.is_empty());
 
-                let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let collection =
+                    crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let store_snapshot = pile.snapshot()?;
                 assert!(collection.admitted(&store_snapshot)?.is_empty());
                 let discovered = crate::storage::discovered_records(&store_snapshot)?;

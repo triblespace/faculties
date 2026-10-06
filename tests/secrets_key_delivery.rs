@@ -36,7 +36,6 @@ fn default_local_owner_can_add_and_open() {
             "--key",
             key.to_str().unwrap(),
         ]);
-        command.env_remove("TRIBLESPACE_COLLECTION_SECRETS");
         command
     };
     let added = successful(
@@ -151,7 +150,8 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     pile.close().unwrap();
-    let handle = hex::encode(collection.handle().raw);
+    // A read opens every Secrets collection here: the owner's is found
+    // without naming it.
     let command = || {
         let mut command = Command::new(env!("CARGO_BIN_EXE_secrets"));
         command.args([
@@ -160,7 +160,6 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
             "--key",
             recipient_path.to_str().unwrap(),
         ]);
-        command.env("TRIBLESPACE_COLLECTION_SECRETS", &handle);
         command
     };
     assert_eq!(
@@ -224,8 +223,9 @@ fn cli_grant_and_selected_maintenance_do_not_grant_collection_access() {
             path.to_str().unwrap(),
             "--key",
             key.to_str().unwrap(),
+            "--target",
+            &handle,
         ]);
-        command.env("TRIBLESPACE_COLLECTION_SECRETS", &handle);
         command
     };
     let add = |value: &str| {

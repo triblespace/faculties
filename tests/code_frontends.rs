@@ -50,13 +50,7 @@ fn git(dir: &Path, args: &[&str]) {
 impl Fixture {
     fn new() -> Self {
         // Ambient deployment state must never reach a fixture.
-        for variable in [
-            "DRIVE_ENDPOINT",
-            "DRIVE_KEY",
-            "TRIBLESPACE_COLLECTION_CODE",
-            "TRIBLESPACE_KEY",
-            "PILE",
-        ] {
+        for variable in ["DRIVE_ENDPOINT", "DRIVE_KEY", "TRIBLESPACE_KEY", "PILE"] {
             std::env::remove_var(variable);
         }
         std::env::set_var("PERSONA", "ambient-not-a-target");

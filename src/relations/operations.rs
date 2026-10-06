@@ -15,9 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::clock;
-#[cfg(test)]
-use crate::collection_names::open_configured;
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::read_union_acquiring;
 use crate::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
@@ -26,10 +24,13 @@ use crate::storage::{FactArchive, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+#[cfg(test)]
+use triblespace::core::collection::CollectionSnapshotExt;
+use triblespace::core::collection::{Collection, CollectionHandle, CollectionStoreExt};
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
@@ -38,7 +39,7 @@ type RelationsReader = crate::storage::AcquiringReader<<FacultyStore as Snapshot
 struct RelationsStorage<'a> {
     pile: &'a mut FacultyStore,
     signer: &'a SigningKey,
-    collection: Collection<SimpleArchive>,
+    target: Option<CollectionHandle>,
     facts: &'a FactArchive,
     reader: &'a RelationsReader,
 }
@@ -59,13 +60,19 @@ impl RelationsStorage<'_> {
     ) -> Result<T> {
         let (fragment, result) = f(self.facts, self.reader)?;
         if let Some(fragment) = fragment {
+            let collection = crate::collection_names::write_target(
+                self.pile,
+                DEFAULT_SCOPE_ID,
+                self.signer.verifying_key(),
+                self.target,
+            )?;
             self.pile
-                .commit(self.collection, self.signer, fragment)
+                .commit(collection, self.signer, fragment)
                 .context("commit authored Relations fragment")?;
             drop(
                 pollster::block_on(crate::storage::ensure_downstream(
                     self.pile,
-                    self.collection,
+                    collection,
                     self.signer,
                 ))
                 .context(
@@ -926,10 +933,11 @@ impl Relations {
         read_only: bool,
         execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
     ) -> Result<T> {
+        let target = self.storage.target();
         self.storage.with_store(|pile, signer, runtime| {
-            let collection =
-                open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
-            with_relations_view(pile, signer, runtime, collection, read_only, execute)
+            let sources =
+                read_union_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+            with_relations_view(pile, signer, runtime, &sources, target, read_only, execute)
         })
     }
 
@@ -1034,13 +1042,12 @@ fn with_relations_view<T>(
     pile: &mut FacultyStore,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
-    collection: Collection<SimpleArchive>,
+    sources: &[Collection<SimpleArchive>],
+    target: Option<CollectionHandle>,
     read_only: bool,
     execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
 ) -> Result<T> {
-    let facts_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-    let facts_rank9 =
-        pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, facts_succinct)?;
+    let pairs = crate::storage::fact_pairs(pile, sources)?;
     // Mutation preparation first derives this key's own commits into the
     // views, so an update reads what this key already wrote. It prepares on
     // the resident views as they then stand: another writer's pending update
@@ -1049,22 +1056,15 @@ fn with_relations_view<T>(
     // attaches what is there and never maintains, whoever the signer is.
     if !read_only {
         runtime
-            .block_on(async {
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(facts_succinct, signer).await,
-                )?;
-                crate::storage::tolerate_own_lag(pile.maintain_attached(facts_rank9, signer).await)
-            })
+            .block_on(crate::storage::maintain_fact_pairs(pile, &pairs, signer))
             .context("maintain Relations fact collection")?;
     }
+    let facts_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
     let reader = pile
         .snapshot()
         .context("freeze resident Relations fact collection")?;
     let reader = crate::storage::AcquiringReader::new(reader, Arc::clone(runtime));
-    let observed = reader
-        .attached_acquiring(facts_rank9)
-        .context("observe Relations Rank9 projection")?;
-    let view = crate::storage::acquire_attached_facts(&observed)
+    let view = crate::storage::acquire_union_facts(&reader, &facts_rank9)
         .context("read Relations Rank9 projection")?;
     // Only exact payload gets may acquire here. Facts, records, proofs,
     // and their interpretation instant remain those of this observation.
@@ -1073,7 +1073,7 @@ fn with_relations_view<T>(
     let mut storage = RelationsStorage {
         pile,
         signer,
-        collection,
+        target,
         facts: &view,
         reader: &payload_reader,
     };
@@ -1116,7 +1116,8 @@ mod tests {
         let storage = Storage::new(pile_path.clone(), Some(key));
         let (succinct, rank9) = storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let source =
+                    crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 Ok((
                     succinct,
@@ -1241,17 +1242,33 @@ mod tests {
         .unwrap();
         // The worker carries the newly authored person; a read attaches it.
         crate::storage::carry_facts(&mut pile, source, &owner);
-        with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
-            assert!(list_people(storage, 20, false, false)?.contains("Ada"));
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &owner,
+            &runtime,
+            &[source],
+            Some(source.handle()),
+            true,
+            |storage| {
+                assert!(list_people(storage, 20, false, false)?.contains("Ada"));
+                Ok(())
+            },
+        )
         .unwrap();
 
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-        with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
-            assert!(show_person(storage, "Ada".to_owned())?.contains("Ada"));
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &reader,
+            &runtime,
+            &[source],
+            Some(source.handle()),
+            true,
+            |storage| {
+                assert!(show_person(storage, "Ada".to_owned())?.contains("Ada"));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(
             pile.snapshot().unwrap().select_records(&selectors).unwrap(),
@@ -1269,16 +1286,24 @@ mod tests {
         // The second person is not attached yet: a reader reads its commit
         // from the bytes, and attaches nothing.
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-        with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
-            assert_eq!(
-                relations::person_anchors(storage.facts),
-                BTreeSet::from([first, second])
-            );
-            let list = list_people(storage, 20, false, false)?;
-            assert!(list.contains("Ada"));
-            assert!(list.contains("Grace"));
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &reader,
+            &runtime,
+            &[source],
+            Some(source.handle()),
+            true,
+            |storage| {
+                assert_eq!(
+                    relations::person_anchors(storage.facts),
+                    BTreeSet::from([first, second])
+                );
+                let list = list_people(storage, 20, false, false)?;
+                assert!(list.contains("Ada"));
+                assert!(list.contains("Grace"));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(
             pile.snapshot().unwrap().select_records(&selectors).unwrap(),
@@ -1290,11 +1315,19 @@ mod tests {
         // read. The attachments' lag counts the unattached commit for whoever
         // asks, as this test does below.
         let mut mutation_prepared = false;
-        with_relations_view(&mut pile, &reader, &runtime, source, false, |storage| {
-            mutation_prepared = true;
-            assert!(list_people(storage, 20, false, false)?.contains("Grace"));
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &reader,
+            &runtime,
+            &[source],
+            Some(source.handle()),
+            false,
+            |storage| {
+                mutation_prepared = true;
+                assert!(list_people(storage, 20, false, false)?.contains("Grace"));
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(mutation_prepared);
         assert_eq!(
@@ -1308,13 +1341,21 @@ mod tests {
         // Once the worker has carried the second person, the read is the
         // same, now from the attachment.
         crate::storage::carry_facts(&mut pile, source, &owner);
-        with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
-            assert_eq!(
-                relations::person_anchors(storage.facts),
-                BTreeSet::from([first, second])
-            );
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &owner,
+            &runtime,
+            &[source],
+            Some(source.handle()),
+            true,
+            |storage| {
+                assert_eq!(
+                    relations::person_anchors(storage.facts),
+                    BTreeSet::from([first, second])
+                );
+                Ok(())
+            },
+        )
         .unwrap();
         pile.close().unwrap();
     }
@@ -1329,7 +1370,8 @@ mod tests {
         let signer = load_signer(&pile, Some(&key)).unwrap();
         let mut store = open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
         let collection =
-            open_configured(&mut store, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+            crate::collection_names::open(&mut store, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
         let facts_succinct = store.attach::<SuccinctArchiveBlob>(collection, ()).unwrap();
         let facts_rank9 = store
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, facts_succinct)
@@ -1415,7 +1457,7 @@ mod tests {
         let mut storage = RelationsStorage {
             pile: &mut pile,
             signer: &signer,
-            collection,
+            target: Some(collection.handle()),
             facts: &view,
             reader: &reader,
         };

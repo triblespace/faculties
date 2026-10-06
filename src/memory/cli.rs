@@ -46,6 +46,11 @@ pub struct Cli {
     /// Existing durable signing-key file. Reads and writes never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     pub key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    pub target: Option<triblespace::core::collection::CollectionHandle>,
     /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
     #[arg(value_name = "ID", trailing_var_arg = true, allow_hyphen_values = true)]
     pub ids: Vec<String>,
@@ -68,7 +73,9 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
             .line(Cli::command().render_long_help().to_string())
             .map(|()| 0);
     }
-    let memory = Memory::new(cli.pile, cli.key);
+    let memory = Memory::with_storage(
+        crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target),
+    );
     let args = &cli.ids[1..];
     let one = |usage: &str| -> Result<&str> {
         if args.len() != 1 {

@@ -63,7 +63,8 @@ impl Archive {
         &self,
         operation: impl FnOnce(ArchiveStorage<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.storage.scope(|storage| operation(ArchiveStorage { storage }))
+        self.storage
+            .scope(|storage| operation(ArchiveStorage { storage }))
     }
     /// Publish one resident source atomically after complete successful scanning.
     /// Attachments are resident export filenames for ChatGPT and exact pointer
@@ -202,7 +203,7 @@ use crate::archive_collection::{
 use crate::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use crate::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
 #[cfg(test)]
-use crate::collection_names::open_configured;
+use crate::collection_names::open;
 use crate::comb::{self as comb_model, CursorDraft, CursorResolution, CursorState};
 use crate::schemas::blockdag as archive_schema;
 use crate::schemas::memory::DEFAULT_COMB_SCOPE_ID;
@@ -252,27 +253,23 @@ impl ArchiveStorage<'_> {
 
     fn load_comb(&self) -> Result<FactArchive> {
         self.storage.with_store(|store, signer, runtime| {
-            let source = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+            let sources = crate::collection_names::read_union_acquiring(
+                store,
+                DEFAULT_COMB_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
-            let rank9 = runtime.block_on(async {
-                let succinct = pile
-                    .attach::<SuccinctArchiveBlob>(source, ())
-                    .context("register Succinct Comb cursor collection")?;
-                let rank9 = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-                    .context("register Rank9 Comb cursor collection")?;
-                // The source is carried and its frontier attached; a cursor
-                // left unattached is read from its own bytes.
-                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
-                    .context("maintain Succinct Comb cursor collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
-                    .context("maintain Rank9 Comb cursor collection")?;
-                Ok::<_, anyhow::Error>(rank9)
-            })?;
+            let pairs = crate::storage::fact_pairs(pile, &sources)
+                .context("register the Comb cursor collections")?;
+            // Each source is carried and its frontier attached; a cursor
+            // left unattached is read from its own bytes.
+            runtime
+                .block_on(crate::storage::maintain_fact_pairs(pile, &pairs, signer))
+                .context("maintain the Comb cursor collections")?;
+            let rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
             let reader = AcquiringReader::new(pile.snapshot()?, runtime.clone());
-            crate::storage::acquire_facts(&reader, rank9)
+            crate::storage::acquire_union_facts(&reader, &rank9)
                 .context("read Comb cursor collection")
         })
     }
@@ -283,11 +280,20 @@ impl ArchiveStorage<'_> {
     /// store snapshot. Later payload reads keep that same boundary.
     fn load_replay(&self) -> Result<ReplayView> {
         self.storage.with_store(|store, signer, runtime| {
-            let archive_source = crate::collection_names::open_configured_acquiring(
-                store, archive_schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            // The Archive's search and fact views are attached to the
+            // collection it writes; the cursors are read from every Comb.
+            let archive_source = crate::collection_names::write_target_acquiring(
+                store,
+                archive_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                None,
+                runtime,
             )?;
-            let comb_source = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+            let comb_sources = crate::collection_names::read_union_acquiring(
+                store,
+                DEFAULT_COMB_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             let (archive_rank9, comb_rank9) = runtime.block_on(async {
@@ -297,22 +303,15 @@ impl ArchiveStorage<'_> {
                 let archive_rank9 = pile
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(archive_source, archive_succinct)
                     .context("register Rank9 Archive fact collection")?;
-                let comb_succinct = pile
-                    .attach::<SuccinctArchiveBlob>(comb_source, ())
-                    .context("register Succinct Comb cursor collection")?;
-                let comb_rank9 = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(comb_source, comb_succinct)
-                    .context("register Rank9 Comb cursor collection")?;
+                let comb_pairs = crate::storage::fact_pairs(pile, &comb_sources)
+                    .context("register the Comb cursor collections")?;
 
                 // Maintain locally, then freeze both views once. Foreground
                 // acquisition below fills only that snapshot's residual and
                 // queried bodies; it never advances the cursor boundary.
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(comb_succinct, signer).await,
-                )
-                .context("maintain Succinct Comb cursor collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain_attached(comb_rank9, signer).await)
-                    .context("maintain Rank9 Comb cursor collection")?;
+                crate::storage::maintain_fact_pairs(pile, &comb_pairs, signer)
+                    .await
+                    .context("maintain the Comb cursor collections")?;
                 crate::storage::tolerate_own_lag(
                     pile.maintain_attached(archive_succinct, signer).await,
                 )
@@ -321,16 +320,23 @@ impl ArchiveStorage<'_> {
                     pile.maintain_attached(archive_rank9, signer).await,
                 )
                 .context("maintain Rank9 Archive replay facts")?;
+                let comb_rank9: Vec<_> = comb_pairs.iter().map(|(_, rank9)| *rank9).collect();
                 Ok::<_, anyhow::Error>((archive_rank9, comb_rank9))
             })?;
             let after = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Archive replay snapshot")?,
+                pile.snapshot()
+                    .context("freeze maintained Archive replay snapshot")?,
                 runtime.clone(),
             );
-            let archive = after.attached_acquiring(archive_rank9).context("attach Archive replay facts")?;
-            let comb_facts = crate::storage::acquire_facts(&after, comb_rank9)
+            let archive = after
+                .attached_acquiring(archive_rank9)
+                .context("attach Archive replay facts")?;
+            let comb_facts = crate::storage::acquire_union_facts(&after, &comb_rank9)
                 .context("read Comb cursor collection")?;
-            Ok(ReplayView { archive, comb_facts })
+            Ok(ReplayView {
+                archive,
+                comb_facts,
+            })
         })
     }
 }
@@ -1204,14 +1210,19 @@ fn active_archive_cursor(
 
 fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
     storage.storage.with_store(|store, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
-            store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+        let collection = crate::collection_names::write_target_acquiring(
+            store,
+            DEFAULT_COMB_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let pile = store;
         let result = (|| {
             pile.commit(collection, signer, fragment)
                 .context("publish archive replay cursor")?;
-            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            runtime
+                .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context(
                     "Archive replay cursor was committed, but ensuring its derived views failed",
                 )
@@ -1698,11 +1709,8 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        let first = archive_collection::ensure_succinct_index(
-            &fixture.pile,
-            Some(&fixture.key),
-        )
-        .unwrap();
+        let first =
+            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
         assert_eq!(first.source_elements, 1);
         assert_ne!(first.source_collection, first.target_collection);
@@ -1719,30 +1727,20 @@ mod tests {
             1
         );
         drop(archive);
-        let repeated = archive_collection::ensure_succinct_index(
-            &fixture.pile,
-            Some(&fixture.key),
-        )
-        .unwrap();
+        let repeated =
+            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(repeated, first);
 
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
 
-        let first_bm25 = archive_collection::ensure_bm25_index(
-            &fixture.pile,
-            Some(&fixture.key),
-        )
-        .unwrap();
+        let first_bm25 =
+            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
         assert_eq!(first_bm25.source_elements, 1);
         assert_eq!(first_bm25.cover_segments, 1);
         let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(
-            archive_collection::ensure_bm25_index(
-                &fixture.pile,
-                Some(&fixture.key),
-            )
-            .unwrap(),
+            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key),).unwrap(),
             first_bm25
         );
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_bm25);
@@ -1907,7 +1905,7 @@ mod tests {
         };
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let collection = open_configured(
+        let collection = open(
             &mut pile,
             archive_schema::DEFAULT_SCOPE_ID,
             signer.verifying_key(),

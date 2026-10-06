@@ -16,7 +16,6 @@ pub use operations::{
     AddOptions, AddedGoal, AddedNote, Compass, ListOptions, MovedGoal, NoteOptions, PriorityChange,
 };
 
-use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
@@ -30,16 +29,17 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, CapabilityProofRead, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
-use crate::collection_names::open_configured;
+use crate::collection_names::{read_union, write_target};
 use crate::schemas::compass::{
     board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
     KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
 };
 use crate::storage::FactArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -80,20 +80,25 @@ impl<R> CompassSnapshot<R> {
     }
 }
 
-/// The exact maintained LWW projection used for current Compass status.
+/// The exact maintained LWW projection of current Compass status over the
+/// collection `authority` writes by default: the one its writes maintain.
 pub fn status_register_collection<S>(
     store: &mut S,
     authority: VerifyingKey,
 ) -> Result<Collection<LwwRegisterBlob>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    <S as SnapshotSource>::Snapshot:
+        BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
 {
-    let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
+    let source = write_target(store, DEFAULT_SCOPE_ID, authority, None)?;
     status_register_for_source(store, source)
 }
 
-fn status_register_for_source<S>(
+/// The status register over one Compass collection. A read-union's status
+/// is the union of its collections' registers ([`LwwIndex::union`]): the
+/// latest status of a goal wins whichever collection holds it.
+pub fn status_register_for_source<S>(
     store: &mut S,
     source: Collection<blobencodings::SimpleArchive>,
 ) -> Result<Collection<LwwRegisterBlob>>
@@ -1053,13 +1058,16 @@ pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
 ) -> Result<(TribleSet, PileSnapshot)> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let sources = read_union(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let store_snapshot = pile.snapshot().context("freeze Compass store snapshot")?;
-    let facts = store_snapshot
-        .collection(collection)
-        .context("attach Compass collection")?
-        .view::<TribleSet>()
-        .context("read Compass collection")?;
+    let mut facts = TribleSet::new();
+    for source in sources {
+        facts += store_snapshot
+            .collection(source)
+            .context("attach Compass collection")?
+            .view::<TribleSet>()
+            .context("read Compass collection")?;
+    }
     validate_known_payloads(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
 }
@@ -1075,8 +1083,8 @@ pub async fn materialize_indexed_collection<S>(
 where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
-    let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    materialize_indexed_source(pile, source).await
+    let sources = read_union(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    materialize_indexed_sources(pile, &sources).await
 }
 
 /// Attach the resident Compass views: the fact archive carried over the
@@ -1090,29 +1098,36 @@ where
 /// write. A write ensures its own images before it returns, so its author
 /// reads it back at once; a commit that arrived by sync and that nobody has
 /// imaged yet waits for the worker, like one nobody has synced.
-async fn materialize_indexed_source<S>(
+async fn materialize_indexed_sources<S>(
     pile: &mut S,
-    source: Collection<blobencodings::SimpleArchive>,
+    sources: &[Collection<blobencodings::SimpleArchive>],
 ) -> Result<CompassSnapshot<S::Snapshot>>
 where
     S: Store + AsyncBlobStoreAcquire + Send,
 {
-    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
-    let status_target = status_register_for_source(pile, source)?;
+    let rank9 = crate::storage::rank9_union(pile, sources)?;
+    let status_targets = sources
+        .iter()
+        .map(|source| status_register_for_source(pile, *source))
+        .collect::<Result<Vec<_>>>()?;
     let store_snapshot = pile.snapshot().context("freeze resident Compass targets")?;
-    let fact_archive = store_snapshot
-        .read_facts(rank9)
+    let fact_archive = crate::storage::read_union_facts(&store_snapshot, &rank9)
         .context("read Compass fact collection")?;
     // The register over the same foundations the facts read: its cover, and
     // every commit no attachment reaches built in memory, so a status the
     // facts hold is never missing from its winners.
-    let status = store_snapshot
-        .attached(status_target)
-        .context("observe Compass status register")?
-        .read::<LwwIndex>()
-        .context("read Compass status register")?
-        .into_value()
+    let mut index = LwwIndex::default();
+    for status_target in status_targets {
+        index = index.union(
+            &store_snapshot
+                .attached(status_target)
+                .context("observe Compass status register")?
+                .read::<LwwIndex>()
+                .context("read Compass status register")?
+                .into_value(),
+        );
+    }
+    let status = index
         .query()
         .context("prepare Compass status register query")?;
     Ok(CompassSnapshot {
@@ -1136,9 +1151,9 @@ pub fn commit_collection<S>(
 ) -> Result<CollectionCommit>
 where
     S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreGet + CollectionRead,
+    S::Snapshot: BlobStoreGet + BlobStoreList + CollectionRead,
 {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+    let collection = write_target(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), None)?;
     pile.commit(collection, signer, fragment)
         .context("commit Compass collection fragment")
 }
@@ -1186,7 +1201,7 @@ mod tests {
             let (mut first, goal) = goal_fragment("first", vec![], None, at(1)).unwrap();
             first += status_fragment(goal, "doing", None, at(1)).unwrap();
             store.commit(source, &owner, first).unwrap();
-            let resident = materialize_indexed_source(&mut store, source)
+            let resident = materialize_indexed_sources(&mut store, &[source])
                 .await
                 .unwrap();
             let register = status_register_for_source(&mut store, source).unwrap();
@@ -1223,7 +1238,7 @@ mod tests {
             first += status_fragment(goal, "todo", None, at(1)).unwrap();
             store.commit(source, &owner, first).unwrap();
             carry(&mut store, source, &owner).await;
-            let warm = materialize_indexed_source(&mut store, source)
+            let warm = materialize_indexed_sources(&mut store, &[source])
                 .await
                 .unwrap();
             assert_eq!(
@@ -1256,7 +1271,7 @@ mod tests {
             // and the new goal's status are winners before the worker
             // attaches the commit.
             for _signer in [&reader, &owner] {
-                let resident = materialize_indexed_source(&mut store, source)
+                let resident = materialize_indexed_sources(&mut store, &[source])
                     .await
                     .unwrap();
                 assert_eq!(
@@ -1297,7 +1312,7 @@ mod tests {
             }
 
             carry(&mut store, source, &owner).await;
-            let current = materialize_indexed_source(&mut store, source)
+            let current = materialize_indexed_sources(&mut store, &[source])
                 .await
                 .unwrap();
             assert_eq!(
@@ -1351,7 +1366,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
 
-            let resident = materialize_indexed_source(&mut store, source)
+            let resident = materialize_indexed_sources(&mut store, &[source])
                 .await
                 .unwrap();
             assert_eq!(goal_ids(resident.facts()), BTreeSet::from([goal]));
@@ -1381,7 +1396,7 @@ mod tests {
             // and the worker has carried them.
             assert_eq!(store.commit(source, &owner, later).unwrap(), arriving);
             carry(&mut store, source, &owner).await;
-            let current = materialize_indexed_source(&mut store, source)
+            let current = materialize_indexed_sources(&mut store, &[source])
                 .await
                 .unwrap();
             assert_eq!(goal_ids(current.facts()), BTreeSet::from([goal, new_goal]));

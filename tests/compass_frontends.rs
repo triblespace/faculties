@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use faculties::collection_names::open_configured;
+use faculties::collection_names::open;
 use faculties::compass::{self, AddOptions, Compass, ListOptions, NoteOptions};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
@@ -67,7 +67,7 @@ impl Fixture {
             faculties::schemas::compass::DEFAULT_SCOPE_ID,
             faculties::schemas::relations::DEFAULT_SCOPE_ID,
         ] {
-            let source = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
+            let source = open(&mut pile, scope, signer.verifying_key()).unwrap();
             carry_facts(&mut pile, source, &signer);
         }
         let status =
@@ -117,8 +117,10 @@ fn clean_child(command: &mut Command) {
     }
 }
 
-/// A writer with source WRITE and nothing else appends, and every command
-/// succeeds. The CLI opens the store as the writer's key, so the writer is
+/// A writer with source WRITE appends to the source it names with
+/// `--target`, and every command succeeds; READ on the source and on
+/// Relations is what puts them in its reads. The CLI opens the store as the
+/// writer's key, so the writer is
 /// the host of that store: its write attaches what it wrote under its own
 /// key -- MAPs no other key believes -- and its own reads see it at once,
 /// prefixes included. The owner's reads see the same actions from their
@@ -127,7 +129,9 @@ fn clean_child(command: &mut Command) {
 #[test]
 fn source_writer_appends_actions_and_reads_them_without_view_grants() {
     use faculties::storage::FactRead;
-    use triblespace::core::collection::{grant_collection_write, CollectionRecord};
+    use triblespace::core::collection::{
+        grant_collection_read, grant_collection_write, CollectionRecord,
+    };
 
     let fixture = Fixture::new();
     let first = fixture
@@ -178,19 +182,23 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
     let denied_key = fixture.directory.path().join("ungranted.key");
     initialize_signer(&fixture.pile, Some(&denied_key)).unwrap();
     let mut pile = Pile::open_as(&fixture.pile, owner.verifying_key()).unwrap();
-    let source = faculties::collection_names::open_configured(
+    let source = faculties::collection_names::open(
         &mut pile,
         faculties::schemas::compass::DEFAULT_SCOPE_ID,
         owner.verifying_key(),
     )
     .unwrap();
-    let relations = faculties::collection_names::open_configured(
+    let relations = faculties::collection_names::open(
         &mut pile,
         faculties::schemas::relations::DEFAULT_SCOPE_ID,
         owner.verifying_key(),
     )
     .unwrap();
     grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
+    // The writer reads what it appends, and the persona it appends as.
+    for input in [source, relations] {
+        grant_collection_read(&mut pile, input.handle(), &owner, writer.verifying_key()).unwrap();
+    }
     let (succinct, rank9) = faculties::storage::fact_pair(&mut pile, source).unwrap();
     let status = compass::status_register_collection(&mut pile, owner.verifying_key()).unwrap();
     let snapshot = pile.snapshot().unwrap();
@@ -224,14 +232,8 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
             .arg("--key")
             .arg(key)
             .args(["--persona", "source-writer"])
-            .env(
-                "TRIBLESPACE_COLLECTION_COMPASS",
-                hex::encode(source.handle().raw),
-            )
-            .env(
-                "TRIBLESPACE_COLLECTION_RELATIONS",
-                hex::encode(relations.handle().raw),
-            );
+            .arg("--target")
+            .arg(hex::encode(source.handle().raw));
         command
     };
     // Each append succeeds and adds one COMMIT by the writer into the source;
@@ -331,7 +333,7 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
         .output()
         .unwrap();
     assert!(!denied.status.success());
-    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("not admitted to write"));
     assert_eq!(records(), before, "a refused command publishes nothing");
 
     // A prefix resolves against what the writer's store reads, which holds

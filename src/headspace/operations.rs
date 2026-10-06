@@ -143,9 +143,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
-#[cfg(test)]
-use crate::collection_names::open_configured;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 use crate::headspace::{self, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
 use crate::schemas::headspace::DEFAULT_SCOPE_ID;
 use crate::secrets::{self as secrets_model, storage as secret_storage, SecretsSnapshot};
@@ -157,6 +155,7 @@ use crate::storage::open_secrets_collection;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -196,26 +195,18 @@ impl Storage {
 
     fn views(&self) -> Result<Views> {
         self.storage.with_store(|pile, _, runtime| {
-            let source = open_configured_acquiring(
+            let sources = read_union_acquiring(
                 pile, DEFAULT_SCOPE_ID, self.signer.verifying_key(), runtime,
             )?;
-            let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-            let collection_rank9 =
-                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
+            let pairs = crate::storage::fact_pairs(pile, &sources)?;
             let secrets_collection =
-                open_secrets_collection_acquiring(pile, self.signer.verifying_key(), runtime)?;
-            // The source is carried and its frontier attached; a commit left
+                open_secrets_collection_acquiring(pile, self.signer.verifying_key(), None, runtime)?;
+            // Each source is carried and its frontier attached; a commit left
             // unattached is read from its own bytes.
             let snapshot = runtime.block_on(async {
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(collection_succinct, &self.signer)
-                        .await,
-                )
-                .context("maintain Headspace fact collection")?;
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(collection_rank9, &self.signer).await,
-                )
-                .context("maintain Headspace fact collection")?;
+                crate::storage::maintain_fact_pairs(pile, &pairs, &self.signer)
+                    .await
+                    .context("maintain Headspace fact collection")?;
                 let snapshot = secrets_collection.ensure(pile, &self.signer)
                         .await
                         .context("observe configured Secrets collection")?;
@@ -225,7 +216,8 @@ impl Storage {
             let secrets = secret_storage::snapshot_acquiring(reader.clone(), secrets_collection)?;
             // Attach Headspace through the same final immutable physical snapshot
             // that backs every Secrets lookup in this view.
-            let facts = crate::storage::acquire_facts(&reader, collection_rank9)
+            let collection_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
+            let facts = crate::storage::acquire_union_facts(&reader, &collection_rank9)
                 .context("read maintained Headspace collection")?;
             let headspace = CollectionView { facts, reader };
             Ok(Views { headspace, secrets })
@@ -234,9 +226,7 @@ impl Storage {
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         self.storage.with_store(|pile, _, runtime| {
-            let collection = open_secrets_collection_acquiring(
-                pile, self.signer.verifying_key(), runtime,
-            )?;
+            let collection = open_secrets_collection_acquiring(pile, self.signer.verifying_key(), None, runtime)?;
             secret_storage::add_secret(
                 pile,
                 &self.signer,
@@ -250,10 +240,15 @@ impl Storage {
     }
 
     fn publish(&self, scope: Id, mut fragment: Fragment, description: &str) -> Result<()> {
+        // The command's target names the Headspace collection; another
+        // faculty's collection takes its own default.
+        let target = (scope == DEFAULT_SCOPE_ID)
+            .then(|| self.storage.target())
+            .flatten();
         self.storage.with_store(|pile, _, runtime| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            let collection = open_configured_acquiring(
-                pile, scope, self.signer.verifying_key(), runtime,
+            let collection = write_target_acquiring(
+                pile, scope, self.signer.verifying_key(), target, runtime,
             )?;
             crate::collection_names::require_command_write_admission_acquiring(
                 pile,
@@ -935,6 +930,7 @@ mod tests {
         Cli {
             pile: pile.to_owned(),
             key: Some(key.to_owned()),
+            target: None,
             command: Some(command),
         }
     }
@@ -981,7 +977,7 @@ mod tests {
         storage
             .storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let source = crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let snapshot = pollster::block_on(async {
@@ -1090,7 +1086,7 @@ mod tests {
 
         let signer = load_signer(&pile, Some(&key)).unwrap();
         let mut store = open_pile_strict(&pile).unwrap();
-        let collection = open_secrets_collection(&mut store, signer.verifying_key()).unwrap();
+        let collection = open_secrets_collection(&mut store, signer.verifying_key(), None).unwrap();
         let version = secret_storage::add_secret(
             &mut store,
             &signer,

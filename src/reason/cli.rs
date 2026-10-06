@@ -19,6 +19,11 @@ pub(crate) struct Cli {
     /// initialize explicitly with `trible pile signing-key init <pile>`.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     /// Turn id to annotate (hex). Defaults to $TURN_ID.
     #[arg(long)]
     turn_id: Option<String>,
@@ -103,7 +108,9 @@ pub fn run() -> Result<()> {
         bail!("reason text is empty");
     }
 
-    let reason = super::Reason::new(cli.pile, cli.key);
+    let reason = super::Reason::with_storage(
+        crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target),
+    );
     if cli.command.is_empty() {
         return crate::cli::with_output("reason", |out| {
             let id = reason.record(&text, turn_id, worker_id)?;

@@ -5,11 +5,9 @@
 //! that a process environment is a copy taken at start which cannot be
 //! invalidated, and a file is a copy a process reads once; a collection is
 //! neither, because opening the pile is the thing every faculty call already
-//! does.
-//!
-//! The environment still WINS when it is set, because pinning one collection
-//! for one command is ordinary and has to keep working. What changes is that an
-//! environment value which DISAGREES with the pile now says so.
+//! does. No faculty reads a collection from the environment; a command that
+//! writes somewhere other than its default names the collection with
+//! `--target` ([`crate::collection_names::write_target`]).
 
 use ed25519_dalek::VerifyingKey;
 
@@ -114,62 +112,6 @@ where
             )
         }
     }
-}
-
-/// Which source a resolved handle came from, and whether they disagreed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Source {
-    /// Only the environment supplied one.
-    Environment,
-    /// Only the pile's configuration supplied one.
-    Stored,
-    /// Both did, and they agree. Nothing to say.
-    Agreed,
-    /// Both did and they DISAGREE. The environment is used and this is worth
-    /// a word, because it is the shape a stale process takes.
-    EnvironmentOverridesStored,
-}
-
-/// Decide between an environment value and the stored one.
-///
-/// Pure, and separate from both the reading and the printing, so the
-/// precedence can be tested without a pile or a process environment. The
-/// caller compares PARSED handles rather than text and passes the verdict in as
-/// `equal`, so that `blake3:AB…` and `ab…` count as agreement rather than as
-/// drift -- a warning that fires on every call is noise, and noise is what
-/// stops anyone reading the one that matters.
-pub fn decide(from_env: bool, from_stored: bool, equal: bool) -> Option<Source> {
-    match (from_env, from_stored) {
-        (true, true) if equal => Some(Source::Agreed),
-        (true, true) => Some(Source::EnvironmentOverridesStored),
-        (true, false) => Some(Source::Environment),
-        (false, true) => Some(Source::Stored),
-        (false, false) => None,
-    }
-}
-
-/// Say, on stderr, that an environment override disagrees with the pile.
-///
-/// Deliberately not an error. An operator pinning one collection for one
-/// command is ordinary and must keep working; what must not happen is that a
-/// process carrying a whole retired generation looks exactly like a correct
-/// one. Both values are printed in full, because a truncated handle is not
-/// enough to tell which generation you are on.
-pub fn report_override_divergence(variable: &str, from_env: &str, from_stored: &str) {
-    eprintln!(
-        "{}",
-        override_divergence_note(variable, from_env, from_stored)
-    );
-}
-
-/// The text of that note, separated so it can be asserted on.
-pub fn override_divergence_note(variable: &str, from_env: &str, from_stored: &str) -> String {
-    format!(
-        "note: {variable} is set to {from_env} but this pile's {COLLECTION_NAME} collection says \
-         {from_stored}; using the environment. A process environment is a copy taken when the \
-         process started and does not update when the configuration changes -- if this is not \
-         deliberate, start a fresh shell."
-    )
 }
 
 #[cfg(test)]
@@ -376,30 +318,5 @@ mod tests {
         let text = format!("{error:#}");
         assert!(text.contains("concurrent"), "{text}");
         assert!(text.contains("supersede"), "{text}");
-    }
-
-    #[test]
-    fn the_environment_wins_but_a_disagreement_is_reported() {
-        assert_eq!(decide(true, true, true), Some(Source::Agreed));
-        assert_eq!(
-            decide(true, true, false),
-            Some(Source::EnvironmentOverridesStored)
-        );
-        assert_eq!(decide(true, false, false), Some(Source::Environment));
-        assert_eq!(decide(false, true, false), Some(Source::Stored));
-        assert_eq!(decide(false, false, false), None);
-    }
-
-    /// A note that does not carry both handles in full cannot tell you which
-    /// generation you are on, which is the only question it exists to answer.
-    #[test]
-    fn the_note_carries_both_values_whole() {
-        let note = override_divergence_note("TRIBLESPACE_COLLECTION_MESSAGE", "aaaa", "bbbb");
-        assert!(note.contains("TRIBLESPACE_COLLECTION_MESSAGE"), "{note}");
-        assert!(note.contains("aaaa") && note.contains("bbbb"), "{note}");
-        assert!(
-            note.contains("copy taken when the process started"),
-            "{note}"
-        );
     }
 }

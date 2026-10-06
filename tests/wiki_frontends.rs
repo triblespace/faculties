@@ -40,7 +40,7 @@ impl Fixture {
     fn published_revisions(&self) -> usize {
         let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = faculties::storage::open_pile_strict(&self.pile).unwrap();
-        let collection = faculties::collection_names::open_configured(
+        let collection = faculties::collection_names::open(
             &mut pile,
             faculties::schemas::wiki::DEFAULT_SCOPE_ID,
             signer.verifying_key(),
@@ -378,12 +378,7 @@ fn executable_export_stays_raw_while_show_uses_the_configured_sensory_route() {
                 "DRIVE_ENDPOINT",
                 "invalid-endpoint-must-only-affect-perception",
             );
-        for name in [
-            "DRIVE_KEY",
-            "TRIBLESPACE_PEERS",
-            "TRIBLESPACE_COLLECTION_WIKI",
-            "TRIBLESPACE_COLLECTION_FILES",
-        ] {
+        for name in ["DRIVE_KEY", "TRIBLESPACE_PEERS"] {
             command.env_remove(name);
         }
         let output = command.output().unwrap();
@@ -421,8 +416,10 @@ fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
     Server::new(&registered).unwrap();
 }
 
-/// A writer with source WRITE and nothing else creates, imports and edits,
-/// and every command succeeds. The CLI opens the store as the writer's key,
+/// A writer with source WRITE creates, imports and edits in the source it
+/// names with `--target`, and every command succeeds; READ on the source and
+/// on Files is what puts them in its reads. The CLI opens the store as the
+/// writer's key,
 /// so the writer is the host of that store: its write attaches what it
 /// wrote under its own key -- MAPs no other key believes. The owner's reads
 /// see the writer's revisions from their bytes before its worker attaches
@@ -431,7 +428,9 @@ fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
 #[test]
 fn source_writer_commits_revisions_and_every_reader_sees_them() {
     use std::collections::BTreeSet;
-    use triblespace::core::collection::{grant_collection_write, CollectionRecord};
+    use triblespace::core::collection::{
+        grant_collection_read, grant_collection_write, CollectionRecord,
+    };
     use triblespace::prelude::*;
 
     let fixture = Fixture::new();
@@ -452,19 +451,23 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
     initialize_signer(&fixture.pile, Some(&denied_key)).unwrap();
 
     let mut pile = Pile::open_as(&fixture.pile, owner.verifying_key()).unwrap();
-    let source = faculties::collection_names::open_configured(
+    let source = faculties::collection_names::open(
         &mut pile,
         faculties::schemas::wiki::DEFAULT_SCOPE_ID,
         owner.verifying_key(),
     )
     .unwrap();
-    let files = faculties::collection_names::open_configured(
+    let files = faculties::collection_names::open(
         &mut pile,
         faculties::schemas::files::DEFAULT_SCOPE_ID,
         owner.verifying_key(),
     )
     .unwrap();
     grant_collection_write(&mut pile, source.handle(), &owner, writer.verifying_key()).unwrap();
+    // The writer reads what it writes, and the Files it links against.
+    for input in [source, files] {
+        grant_collection_read(&mut pile, input.handle(), &owner, writer.verifying_key()).unwrap();
+    }
     for input in [source, files] {
         let (succinct, rank9) = faculties::storage::fact_pair(&mut pile, input).unwrap();
         let snapshot = pile.snapshot().unwrap();
@@ -476,7 +479,7 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
             assert_eq!(source.admitted(&snapshot).unwrap().len(), 2);
         }
     }
-    let latest = faculties::wiki::latest_collection(&mut pile, owner.verifying_key()).unwrap();
+    let latest = faculties::wiki::latest_for_source(&mut pile, source).unwrap();
     assert!(latest.policy(&pile.snapshot().unwrap()).is_err());
     pile.close().unwrap();
 
@@ -508,14 +511,8 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
             .arg(&fixture.pile)
             .arg("--key")
             .arg(key)
-            .env(
-                "TRIBLESPACE_COLLECTION_WIKI",
-                hex::encode(source.handle().raw),
-            )
-            .env(
-                "TRIBLESPACE_COLLECTION_FILES",
-                hex::encode(files.handle().raw),
-            );
+            .arg("--target")
+            .arg(hex::encode(source.handle().raw));
         command
     };
     // Each revision succeeds and adds one COMMIT by the writer into the
@@ -581,7 +578,7 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
         .output()
         .unwrap();
     assert!(!denied.status.success());
-    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("not admitted to write"));
     assert_eq!(
         records(),
         before,
@@ -617,4 +614,71 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
         assert!(listing.contains("source writer"), "{listing}");
         assert!(listing.contains("imported by source writer"), "{listing}");
     }
+}
+
+/// One Wiki read spans every Wiki collection its key may READ. A revision a
+/// friend's collection supersedes is not on the frontier, though the owner's
+/// own collection still holds it live.
+#[test]
+fn a_union_frontier_spans_collections() {
+    use faculties::collection_names::open;
+    use faculties::schemas::wiki::DEFAULT_SCOPE_ID;
+    use faculties::storage::{load_signer, Storage};
+    use triblespace::core::collection::latest::LatestIndex;
+    use triblespace::core::collection::{grant_collection_read, CollectionSnapshotExt};
+    use triblespace::core::repo::pile::Pile;
+
+    let fixture = Fixture::new();
+    let friend_key = fixture.directory.path().join("friend.key");
+    initialize_signer(&fixture.pile, Some(&friend_key)).unwrap();
+    let owner = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+    let friend = load_signer(&fixture.pile, Some(&friend_key)).unwrap();
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let mine = open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key()).unwrap();
+    let theirs = open(&mut pile, DEFAULT_SCOPE_ID, friend.verifying_key()).unwrap();
+    grant_collection_read(&mut pile, mine.handle(), &owner, friend.verifying_key()).unwrap();
+    grant_collection_read(&mut pile, theirs.handle(), &friend, owner.verifying_key()).unwrap();
+    pile.close().unwrap();
+
+    let first = fixture
+        .wiki()
+        .create("shared page", "the owner's words", &[], false)
+        .unwrap();
+    // Only the owner's collection holds records, so the friend names its
+    // own collection: the default would refuse to choose for it.
+    let friend_wiki = Wiki::with_storage(
+        Storage::new(fixture.pile.clone(), Some(friend_key.clone()))
+            .with_target(Some(theirs.handle())),
+    );
+    let second = friend_wiki
+        .edit(
+            &format!("{first:x}"),
+            Some("the friend's words"),
+            None,
+            &[],
+            false,
+        )
+        .unwrap();
+
+    let listed = fixture.wiki().list(&ListOptions::default()).unwrap();
+    assert!(listed.contains(&format!("{second:x}")), "{listed}");
+    assert!(
+        !listed.contains(&format!("{first:x}")),
+        "a revision superseded in another collection is not live: {listed}"
+    );
+
+    // The owner's own collection alone still holds the first revision live:
+    // only the union knows the friend superseded it.
+    let mut pile = Pile::open(&fixture.pile).unwrap();
+    let latest = faculties::wiki::latest_for_source(&mut pile, mine).unwrap();
+    let snapshot = pile.snapshot().unwrap();
+    let alone = snapshot
+        .attached(latest)
+        .unwrap()
+        .read::<LatestIndex>()
+        .unwrap()
+        .into_value();
+    assert!(alone.contains(first));
+    drop(snapshot);
+    pile.close().unwrap();
 }

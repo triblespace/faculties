@@ -1,4 +1,5 @@
-//! Canonical root descriptors for faculty collections.
+//! Canonical root descriptors for faculty collections, which of them a faculty
+//! reads, and which one it writes.
 //!
 //! A root collection used to be anchored by an opaque minted scope id. It
 //! discriminated roots correctly and told a reader nothing: the id lived as a
@@ -11,8 +12,35 @@
 //! The scope ids have not gone anywhere — they remain each schema's stable
 //! identifier and the key this table is read by, because the migration that
 //! re-seats existing data has to speak both languages at once.
+//!
+//! # Reading every collection of a name
+//!
+//! One name can stand for several collections: this host's own, one somebody
+//! shared with it, an older generation. A faculty reads every one of them its
+//! key may READ ([`read_union`]), and where it shows a person rows from more
+//! than one, it says which collection and owner each came from ([`label`]).
+//! The candidates are the collections this pile holds records for and the
+//! ones a held proof names the key in ([`available`]). The owners of a
+//! collection are the keys its policies are rooted at ([`owners`]).
+//!
+//! # Writing to one target
+//!
+//! A write goes to exactly one collection: the target the command names, or
+//! else the default ([`write_target`]): the one same-named collection with the
+//! writer's key among its policy roots, else the one with the writer's key as
+//! its only root, else an error naming the candidates. The candidates are the
+//! same-named collections this pile holds records for. A host's private
+//! descriptor is registered before anything commits to it and has no record
+//! until then, so counting descriptors instead would make every host's empty
+//! private descriptor a candidate beside the collection it actually writes.
+//! A pile holding no record of the name at all starts the writer's private
+//! collection.
+//!
+//! Nothing here reads the process environment: an environment is a copy taken
+//! when the process started, and a stale one used to point long-lived shells
+//! at retired generations while every pile said otherwise.
 
-use std::ffi::OsString;
+use std::collections::BTreeSet;
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context};
@@ -21,16 +49,19 @@ use ed25519_dalek::VerifyingKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, TryFromBlob};
+use triblespace::core::capability::policy::{admission_policy_root, resource_policy};
 use triblespace::core::collection::{
-    descriptor, generation, records::CollectionHandle, Collection, CollectionRead,
-    CollectionRecordSelector, CollectionRegistrationError, CollectionStoreExt,
+    descriptor, records::CollectionHandle, records::KIND_COLLECTION_DESCRIPTOR, Collection,
+    CollectionRead, CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
+use triblespace::core::metadata;
 use triblespace::core::repo::{
     BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, SnapshotSource, StoreSnapshot,
 };
 use triblespace::core::trible::TribleSet;
+use triblespace::prelude::{find, pattern};
 
 use crate::schemas::{
     atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings, files,
@@ -121,252 +152,384 @@ pub fn require_name(scope: Id) -> &'static str {
 /// The private policy deliberately shared by every current faculty root.
 pub use triblespace::core::collection::private_policy;
 
-/// Prefix for exact descriptor overrides understood by every faculty.
-///
-/// The suffix is the canonical collection name, uppercased with `-` replaced
-/// by `_`: `wiki` is `TRIBLESPACE_COLLECTION_WIKI`, while `memory-journal` is
-/// `TRIBLESPACE_COLLECTION_MEMORY_JOURNAL`. Keeping one variable per name lets
-/// a process which reads several faculty collections select each one
-/// independently instead of applying one ambient collection identity to all
-/// of them.
-pub const COLLECTION_OVERRIDE_PREFIX: &str = "TRIBLESPACE_COLLECTION_";
-
-/// Deterministic environment-variable name for one faculty collection.
-pub fn override_env_name(scope: Id) -> String {
-    let name = require_name(scope);
-    let mut variable = String::with_capacity(COLLECTION_OVERRIDE_PREFIX.len() + name.len());
-    variable.push_str(COLLECTION_OVERRIDE_PREFIX);
-    variable.extend(name.bytes().map(|byte| match byte {
-        b'a'..=b'z' => char::from(byte - b'a' + b'A'),
-        b'A'..=b'Z' | b'0'..=b'9' => char::from(byte),
-        b'-' => '_',
-        _ => panic!("collection name {name:?} cannot form an environment variable"),
-    }));
-    variable
+/// The keys `descriptor`'s capability policies are rooted at, each once, in
+/// byte order: the owners of the collection it describes.
+pub fn owners(descriptor: &TribleSet) -> Vec<VerifyingKey> {
+    let mut owners: Vec<VerifyingKey> = find!(
+        root: VerifyingKey,
+        pattern!(descriptor, [
+            { _?collection @
+                metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                resource_policy: _?binding,
+            },
+            { _?binding @ admission_policy_root: ?root },
+        ])
+    )
+    .collect();
+    owners.sort_unstable_by_key(VerifyingKey::to_bytes);
+    owners.dedup();
+    owners
 }
 
-fn parse_override(variable: &str, raw: OsString) -> anyhow::Result<CollectionHandle> {
-    let raw = raw
-        .into_string()
-        .map_err(|_| anyhow!("{variable} is not valid UTF-8"))?;
+/// A root collection's descriptor facts and name, from bytes this snapshot
+/// holds. Anything else -- an absent or undecodable descriptor, a derived
+/// collection, a name that is not here -- is simply not a named root, and
+/// nothing is fetched to find out.
+fn resident_root<S>(snapshot: &S, handle: CollectionHandle) -> Option<(TribleSet, View<str>)>
+where
+    S: BlobStoreList + BlobStoreGet,
+{
+    if !snapshot.contains_blob(handle).ok()? {
+        return None;
+    }
+    let facts: TribleSet = snapshot.get(handle).ok()?;
+    let name = descriptor::name(&facts).ok()??;
+    if !snapshot.contains_blob(name).ok()? {
+        return None;
+    }
+    let name = snapshot.get::<View<str>, UTF8String>(name).ok()?;
+    Some((facts, name))
+}
+
+/// Every collection a held proof names `key` in, and every collection this
+/// pile holds records for that `key` owns: the collections this key can
+/// read from or be given to.
+///
+/// A proof names a key when the key is one of its delegates, so a grant
+/// lists its collection for the key it was issued to. The proofs are not
+/// validated here; admission decides what they authorize.
+pub fn available<S>(snapshot: &S, key: VerifyingKey) -> anyhow::Result<BTreeSet<CollectionHandle>>
+where
+    S: CollectionRead + CapabilityProofRead + BlobStoreList + BlobStoreGet,
+{
+    let mut available = granted(snapshot, key)?;
+    for handle in snapshot
+        .collections()
+        .map_err(|error| anyhow!("list collections: {error}"))?
+    {
+        if resident_root(snapshot, handle).is_some_and(|(facts, _)| owners(&facts).contains(&key)) {
+            available.insert(handle);
+        }
+    }
+    Ok(available)
+}
+
+/// The resources the held proofs name `key` in.
+fn granted<S>(snapshot: &S, key: VerifyingKey) -> anyhow::Result<BTreeSet<CollectionHandle>>
+where
+    S: CapabilityProofRead,
+{
+    let mut granted = BTreeSet::new();
+    for proof in snapshot
+        .proofs()
+        .map_err(|error| anyhow!("list held proofs: {error}"))?
+    {
+        let proof = proof.map_err(|error| anyhow!("read a held proof: {error}"))?;
+        if proof.delegated_keys().any(|delegate| delegate == key) {
+            granted.insert(CollectionHandle::new(proof.resource().into_bytes()));
+        }
+    }
+    Ok(granted)
+}
+
+/// Every collection of `scope`'s name that `key` may READ in `snapshot`, in
+/// handle order: the read-union a faculty reads.
+///
+/// The candidates are the collections the snapshot holds records for and
+/// the ones a held proof names `key` in, which together cover every
+/// [`available`] one; a candidate counts when it is a root whose
+/// descriptor and name are here and carry the faculty's name. Admission
+/// reads the snapshot's frozen proofs; through an acquiring reader it may
+/// fetch the capability definitions those proofs name, never the
+/// descriptors themselves.
+pub fn read_union_in<S>(
+    snapshot: &S,
+    scope: Id,
+    key: VerifyingKey,
+) -> anyhow::Result<Vec<Collection<SimpleArchive>>>
+where
+    S: StoreSnapshot + CollectionRead + CapabilityProofRead + BlobStoreList + BlobStoreGet,
+{
+    let name = require_name(scope);
+    let mut candidates = granted(snapshot, key)?;
+    candidates.extend(
+        snapshot
+            .collections()
+            .map_err(|error| anyhow!("list collections: {error}"))?,
+    );
+    let mut readable = Vec::new();
+    for handle in candidates {
+        if !resident_root(snapshot, handle).is_some_and(|(_, found)| &*found == name) {
+            continue;
+        }
+        let Ok(collection) = Collection::<SimpleArchive>::open(snapshot, handle) else {
+            continue;
+        };
+        if collection
+            .reader_is_admitted_acquiring(snapshot, key)
+            .with_context(|| format!("check READ admission to {name} {}", label_of(handle)))?
+        {
+            readable.push(collection);
+        }
+    }
+    Ok(readable)
+}
+
+/// [`read_union_in`] over a snapshot of `storage` taken now.
+pub fn read_union<S>(
+    storage: &mut S,
+    scope: Id,
+    key: VerifyingKey,
+) -> anyhow::Result<Vec<Collection<SimpleArchive>>>
+where
+    S: SnapshotSource,
+    S::Snapshot:
+        StoreSnapshot + CollectionRead + CapabilityProofRead + BlobStoreList + BlobStoreGet,
+{
+    let snapshot = storage.snapshot().with_context(|| {
+        format!(
+            "freeze the store to find the {} collections",
+            require_name(scope)
+        )
+    })?;
+    read_union_in(&snapshot, scope, key)
+}
+
+/// [`read_union`] at a synchronous foreground I/O boundary: admission may
+/// acquire the capability definitions the frozen proofs name. Call outside
+/// `Runtime::block_on`.
+pub fn read_union_acquiring<S>(
+    storage: &mut S,
+    scope: Id,
+    key: VerifyingKey,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+) -> anyhow::Result<Vec<Collection<SimpleArchive>>>
+where
+    S: SnapshotSource,
+    S::Snapshot: StoreSnapshot
+        + CollectionRead
+        + CapabilityProofRead
+        + BlobStoreList
+        + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+{
+    let snapshot = storage.snapshot().with_context(|| {
+        format!(
+            "freeze the store to find the {} collections",
+            require_name(scope)
+        )
+    })?;
+    let reader = crate::storage::AcquiringReader::new(snapshot, runtime.clone());
+    read_union_in(&reader, scope, key)
+}
+
+/// The collection a write by `key` to `scope` goes to: `target` when the
+/// caller names one, else the default.
+///
+/// The default is the one same-named collection this pile holds records for
+/// with `key` among its policy roots, else the one with `key` as its only
+/// root, else an error naming every candidate and its owners. A pile with no
+/// record of the name starts the writer's private collection, registering
+/// it. A named target must be a root carrying the faculty's name; it need
+/// not hold anything yet.
+///
+/// Choosing a target checks no admission. A command applies
+/// [`require_command_write_admission`] to the target before it publishes;
+/// publication itself stays unconditional, because later evidence may admit
+/// an offline commit.
+pub fn write_target<S>(
+    storage: &mut S,
+    scope: Id,
+    key: VerifyingKey,
+    target: Option<CollectionHandle>,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: CollectionRead + BlobStoreList + BlobStoreGet,
+{
+    let snapshot = storage.snapshot().with_context(|| {
+        format!(
+            "freeze the store to choose the {} target",
+            require_name(scope)
+        )
+    })?;
+    if let Some(target) = target {
+        return open_exact_in(&snapshot, scope, target);
+    }
+    let chosen = default_target_in(&snapshot, scope, key)?;
+    drop(snapshot);
+    match chosen {
+        Some(collection) => Ok(collection),
+        None => open(storage, scope, key).context("register the writer's private descriptor"),
+    }
+}
+
+/// [`write_target`] at a synchronous foreground I/O boundary: a named target
+/// whose descriptor or name is not here is acquired. Call outside
+/// `Runtime::block_on`.
+pub fn write_target_acquiring<S>(
+    storage: &mut S,
+    scope: Id,
+    key: VerifyingKey,
+    target: Option<CollectionHandle>,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: CollectionRead
+        + BlobStoreList
+        + BlobStoreGet
+        + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+{
+    let Some(target) = target else {
+        return write_target(storage, scope, key, None);
+    };
+    let snapshot = storage.snapshot().with_context(|| {
+        format!(
+            "freeze the store to open the {} target",
+            require_name(scope)
+        )
+    })?;
+    let reader = crate::storage::AcquiringReader::new(snapshot, runtime.clone());
+    open_exact_in(&reader, scope, target)
+}
+
+/// Every root collection with `scope`'s name that `snapshot` holds records
+/// for, in handle order, whoever may read it: the candidates a default write
+/// target is chosen from.
+pub fn named_in<S>(snapshot: &S, scope: Id) -> anyhow::Result<Vec<Collection<SimpleArchive>>>
+where
+    S: CollectionRead + BlobStoreList + BlobStoreGet,
+{
+    let name = require_name(scope);
+    let mut named = Vec::new();
+    for handle in snapshot
+        .collections()
+        .map_err(|error| anyhow!("list collections: {error}"))?
+    {
+        if !resident_root(snapshot, handle).is_some_and(|(_, found)| &*found == name) {
+            continue;
+        }
+        if let Ok(collection) = Collection::<SimpleArchive>::open(snapshot, handle) {
+            named.push(collection);
+        }
+    }
+    Ok(named)
+}
+
+/// Parse a `--target` collection handle: 64 hexadecimal digits, optionally
+/// prefixed `blake3:`, as every handle here is printed.
+pub fn parse_target(raw: &str) -> anyhow::Result<CollectionHandle> {
     let raw = raw.trim();
     let raw = raw.strip_prefix("blake3:").unwrap_or(raw);
     if raw.len() != 64 {
-        bail!("{variable} must be one exact 64-digit hexadecimal collection descriptor handle");
+        bail!("a collection handle is 64 hexadecimal digits, optionally prefixed blake3:");
     }
     let mut bytes = [0_u8; 32];
-    hex::decode_to_slice(raw, &mut bytes)
-        .with_context(|| format!("{variable} is not a hexadecimal collection descriptor handle"))?;
+    hex::decode_to_slice(raw, &mut bytes).context("a collection handle is hexadecimal")?;
     Ok(Inline::new(bytes))
 }
 
-/// Exact descriptor selected for `scope` by the environment, if it supplies one.
-///
-/// Invalid values fail loudly. Falling back to a signer-private descriptor in
-/// that case would silently fork a shared collection into a different identity.
-///
-/// This is the ENVIRONMENT half only. The other half -- what this pile's own
-/// `config` collection resolves the name to -- needs a snapshot, and so lives
-/// in [`open_configured`], which already has one. Keeping this function
-/// storage-free is what lets callers that hold no pile still ask the question.
-pub fn configured_handle(scope: Id) -> anyhow::Result<Option<CollectionHandle>> {
-    let variable = override_env_name(scope);
-    match std::env::var_os(&variable) {
-        Some(raw) => Ok(Some(parse_override(&variable, raw)?)),
-        None => Ok(None),
-    }
-}
-
-/// Open the operator-selected exact descriptor, or construct the ordinary
-/// signer-private faculty descriptor when no override is present.
-///
-/// The override path is non-registering: its canonical descriptor must already
-/// be resident and carry the name assigned to this faculty scope. Local
-/// publication is intentionally unconditional; WRITE admission decides which
-/// commits enter an admitted snapshot, and later evidence may activate an
-/// earlier offline commit.
-pub fn open_configured<S>(
-    storage: &mut S,
+/// The default write target in `snapshot`, or `None` when it holds no record
+/// of a collection with `scope`'s name.
+pub(crate) fn default_target_in<S>(
+    snapshot: &S,
     scope: Id,
-    authority: VerifyingKey,
-) -> anyhow::Result<Collection<SimpleArchive>>
+    key: VerifyingKey,
+) -> anyhow::Result<Option<Collection<SimpleArchive>>>
 where
-    S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CollectionRead,
+    S: CollectionRead + BlobStoreList + BlobStoreGet,
 {
-    let Some(handle) = configured_handle(scope)? else {
-        let collection =
-            open(storage, scope, authority).context("register signer-private descriptor")?;
-        // A host with no configured handle must not quietly start a new
-        // generation beside ones the other hosts already write to. The private
-        // descriptor is only content until something commits to it, so
-        // registering it costs nothing; using it here would.
-        //
-        // A private generation that already holds commits is not being
-        // started: it is this host's own collection, reopened. Siblings with
-        // content of their own do not change that -- `cat` of another host's
-        // pile brings in exactly such siblings, and the merge must not stop
-        // this host from opening what it already wrote.
-        let snapshot = storage
-            .snapshot()
-            .context("freeze store to look for other generations of this name")?;
-        if let Some(report) = generation::named_generations(&snapshot, collection.handle())
-            .map_err(|error| anyhow!("look for other generations: {error}"))?
-        {
-            if report.selected().commits() == 0 && report.strands_records() {
-                let variable = override_env_name(scope);
-                let siblings: Vec<String> = report
-                    .siblings()
-                    .iter()
-                    .filter(|sibling| sibling.commits() > 0)
-                    .map(|sibling| {
-                        format!(
-                            "blake3:{} ({} commit(s))",
-                            hex::encode(sibling.handle().raw),
-                            sibling.commits()
-                        )
-                    })
-                    .collect();
-                bail!(
-                    "{} is not configured on this host and this pile already holds {} \
-                     generation(s) of {:?} with content: {}. Set {variable} to the one \
-                     this host should use instead of starting another.",
-                    variable,
-                    siblings.len(),
-                    require_name(scope),
-                    siblings.join(", ")
-                );
-            }
-        }
-        return Ok(collection);
-    };
-
-    let snapshot = storage
-        .snapshot()
-        .context("freeze store while opening configured collection descriptor")?;
-    let collection = open_exact_in(&snapshot, scope, handle)?;
-    if let Some(warning) = empty_beside_content(&snapshot, scope, handle) {
-        eprintln!("warning: {warning}");
+    let name = require_name(scope);
+    let candidates: Vec<(Collection<SimpleArchive>, Vec<VerifyingKey>)> =
+        named_in(snapshot, scope)?
+            .into_iter()
+            .map(|collection| {
+                let roots = resident_root(snapshot, collection.handle())
+                    .map(|(facts, _)| owners(&facts))
+                    .unwrap_or_default();
+                (collection, roots)
+            })
+            .collect();
+    if candidates.is_empty() {
+        return Ok(None);
     }
-    Ok(collection)
-}
-
-/// Open a configured descriptor at a synchronous foreground I/O boundary.
-/// Only exact descriptor/name bytes may be acquired; no records are selected
-/// again after acquisition. Call outside `Runtime::block_on`.
-pub fn open_configured_acquiring<S>(
-    storage: &mut S,
-    scope: Id,
-    authority: VerifyingKey,
-    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
-) -> anyhow::Result<Collection<SimpleArchive>>
-where
-    S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot:
-        BlobStoreGet + CollectionRead + triblespace::core::repo::async_store::AsyncBlobStoreGet,
-{
-    let Some(handle) = configured_handle(scope)? else {
-        return open_configured(storage, scope, authority);
-    };
-    let snapshot = storage.snapshot().context("freeze configured collection")?;
-    let reader = crate::storage::AcquiringReader::new(snapshot.clone(), runtime.clone());
-    let collection = open_exact_in(&reader, scope, handle)?;
-    if let Some(warning) = empty_beside_content(&snapshot, scope, handle) {
-        eprintln!("warning: {warning}");
-    }
-    Ok(collection)
-}
-
-/// READ admission over frozen proofs with exact descriptor, name, and
-/// capability-definition acquisition. Unavailable or inapplicable evidence
-/// still grants nothing; obtaining bytes does not discover new proofs.
-pub fn open_configured_read_acquiring<S>(
-    storage: &mut S,
-    scope: Id,
-    subject: VerifyingKey,
-    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
-) -> anyhow::Result<Collection<SimpleArchive>>
-where
-    S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreList
-        + CapabilityProofRead
-        + triblespace::core::repo::async_store::AsyncBlobStoreGet,
-{
-    let Some(handle) = configured_handle(scope)? else {
-        return open(storage, scope, subject).context("register signer-private descriptor");
-    };
-    let snapshot = storage
-        .snapshot()
-        .context("freeze configured collection READ evidence")?;
-    let reader = crate::storage::AcquiringReader::new(snapshot, runtime.clone());
-    open_exact_read_in(&reader, scope, subject, handle)
-}
-
-/// The silent failure a re-mint produces, made audible: the configured
-/// generation holds nothing while other generations of the same name hold
-/// records. Not a refusal, because an empty new generation beside dead ones
-/// is also what a deliberate cutover looks like the moment before its drain,
-/// and for some names (orient) the old content is never meant to be carried.
-/// Costs one indexed probe on a healthy host; the whole-store detector runs
-/// only when the configured generation is empty.
-fn empty_beside_content<S>(snapshot: &S, scope: Id, handle: CollectionHandle) -> Option<String>
-where
-    S: CollectionRead + BlobStoreGet,
-{
-    let selected = std::collections::BTreeSet::from([CollectionRecordSelector::Collection(handle)]);
-    if !snapshot
-        .select_records(&selected)
-        .map(|records| records.is_empty())
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    let report = generation::named_generations(snapshot, handle).ok()??;
-    if !report.strands_records() {
-        return None;
-    }
-    let holding = report
-        .siblings()
+    let rooted: Vec<Collection<SimpleArchive>> = candidates
         .iter()
-        .filter(|sibling| sibling.commits() > 0)
-        .count();
-    Some(format!(
-        "{} names an empty generation of {:?} (blake3:{}) while {} other generation(s) in this \
-         pile hold {} record(s); if this host was meant to read them, drain them into this \
-         generation (trible pile collection adopt --into blake3:{} --siblings) or configure \
-         the generation that holds them",
-        override_env_name(scope),
-        require_name(scope),
-        hex::encode(handle.raw),
-        holding,
-        report.stranded_records(),
-        hex::encode(handle.raw),
-    ))
+        .filter(|(_, owners)| owners.contains(&key))
+        .map(|(collection, _)| *collection)
+        .collect();
+    let only: Vec<Collection<SimpleArchive>> = candidates
+        .iter()
+        .filter(|(_, owners)| owners.len() == 1 && owners.contains(&key))
+        .map(|(collection, _)| *collection)
+        .collect();
+    match (rooted.as_slice(), only.as_slice()) {
+        ([collection], _) | (_, [collection]) => Ok(Some(*collection)),
+        _ => bail!(
+            "{} {name:?} collections are here and none is the default for key {}: it must be the \
+             one rooted at that key, or else the one rooted at that key alone. Pass --target with \
+             one of: {}",
+            candidates.len(),
+            hex::encode_upper(key.to_bytes()),
+            candidates
+                .iter()
+                .map(|(collection, owners)| format!(
+                    "blake3:{} (owned by {})",
+                    hex::encode(collection.handle().raw),
+                    owner_list(owners)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
-/// Open the operator-selected exact descriptor for a reader, or construct the
-/// ordinary signer-private descriptor when no override is present.
-///
-/// Unlike [`open_configured`], an exact override requires READ rather than
-/// WRITE admission. This is the appropriate boundary for consumers of a
-/// shared collection which never publish to it. Admission uses the descriptor
-/// and proof evidence in the supplied frozen snapshot.
+/// How a person tells one collection of a name from another: its handle and
+/// its owners, shortened. A descriptor that is not here shows its handle
+/// alone.
+pub fn label<S>(snapshot: &S, collection: CollectionHandle) -> String
+where
+    S: BlobStoreList + BlobStoreGet,
+{
+    match resident_root(snapshot, collection) {
+        Some((facts, _)) => format!(
+            "{} owned by {}",
+            label_of(collection),
+            owner_list(&owners(&facts))
+        ),
+        None => label_of(collection),
+    }
+}
+
+fn label_of(collection: CollectionHandle) -> String {
+    format!("blake3:{}", hex::encode(&collection.raw[..8]))
+}
+
+fn owner_list(owners: &[VerifyingKey]) -> String {
+    if owners.is_empty() {
+        return "nobody".to_owned();
+    }
+    owners
+        .iter()
+        .map(|owner| hex::encode_upper(&owner.to_bytes()[..8]))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Refuse a COMMAND whose record would be published but never admitted.
 ///
-/// [`open_configured`] says why publication itself stays unconditional, and
-/// that stays true: a library may publish an offline COMMIT that later
-/// evidence activates. What must not stay silent is a command a person typed.
-/// An unadmitted COMMIT is appended and then invisible — every read goes
-/// through a maintained projection that carries admitted support only — so the
-/// command prints an id, exits zero, and changes nothing anyone can observe.
-/// That is how a wrong signing key ran for eight hours without a single
-/// symptom.
+/// Publication itself stays unconditional: a library may publish an offline
+/// COMMIT that later evidence activates. What must not stay silent is a
+/// command a person typed. An unadmitted COMMIT is appended and then
+/// invisible — every read goes through a maintained projection that carries
+/// admitted support only — so the command prints an id, exits zero, and
+/// changes nothing anyone can observe. That is how a wrong signing key ran
+/// for eight hours without a single symptom.
 ///
-/// On the ordinary path this can never fire: the descriptor's WRITE authority
-/// IS the signer's own key, so admission is self-satisfied. It exists for the
-/// override path, where `TRIBLESPACE_COLLECTION_<FACULTY>` names an exact
-/// descriptor whose authority may be somebody else's key — which is precisely
-/// the configuration that produced the incident.
+/// A command applies this to its write target ([`write_target`]). The
+/// default target is a collection rooted at the writer's key, but a root of
+/// one policy need not be admitted by the other, and a named target may be
+/// somebody else's collection entirely.
 ///
 /// `faculty` names the collection in the message and `reader_hint` names a
 /// command whose output would silently not change, because "your write went
@@ -433,30 +596,12 @@ where
     Ok(())
 }
 
-pub fn open_configured_read<S>(
-    storage: &mut S,
-    scope: Id,
-    subject: VerifyingKey,
-) -> anyhow::Result<Collection<SimpleArchive>>
-where
-    S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + BlobStoreList + CapabilityProofRead,
-{
-    let Some(handle) = configured_handle(scope)? else {
-        return open(storage, scope, subject).context("register signer-private descriptor");
-    };
-
-    let snapshot = storage
-        .snapshot()
-        .context("freeze store while opening configured collection descriptor")?;
-    open_exact_read_in(&snapshot, scope, subject, handle)
-}
-
 /// Open and validate one exact faculty descriptor in an existing snapshot.
 ///
 /// This is the coherent publication-boundary form used by callers which
-/// already froze a pile prefix. It validates only the descriptor's type and
-/// faculty name. Local publication does not require present WRITE admission.
+/// already froze a pile prefix, and the form a named write target takes. It
+/// validates only the descriptor's type and faculty name. Local publication
+/// does not require present WRITE admission.
 pub fn open_exact_in<S>(
     snapshot: &S,
     scope: Id,
@@ -465,66 +610,29 @@ pub fn open_exact_in<S>(
 where
     S: BlobStoreGet,
 {
-    open_exact_descriptor_in(snapshot, scope, handle)
-}
-
-/// Open and validate one exact faculty descriptor for a READ-only consumer
-/// using the snapshot's frozen descriptor and proof evidence.
-pub fn open_exact_read_in<S>(
-    snapshot: &S,
-    scope: Id,
-    subject: VerifyingKey,
-    handle: CollectionHandle,
-) -> anyhow::Result<Collection<SimpleArchive>>
-where
-    S: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead,
-{
-    let collection = open_exact_descriptor_in(snapshot, scope, handle)?;
     let expected = require_name(scope);
-    if !collection
-        .reader_is_admitted_acquiring(snapshot, subject)
-        .context("check configured collection READ admission")?
-    {
-        bail!(
-            "durable signer {} is not admitted to READ configured collection {:?}",
-            hex::encode(subject.to_bytes()),
-            expected,
-        );
-    }
-    Ok(collection)
-}
-
-fn open_exact_descriptor_in<S>(
-    snapshot: &S,
-    scope: Id,
-    handle: CollectionHandle,
-) -> anyhow::Result<Collection<SimpleArchive>>
-where
-    S: BlobStoreGet,
-{
-    let collection = Collection::open(snapshot, handle).with_context(|| {
-        format!(
-            "open exact {} descriptor from {}",
-            require_name(scope),
-            override_env_name(scope)
-        )
-    })?;
+    let collection = Collection::open(snapshot, handle)
+        .with_context(|| format!("open {expected} collection {}", label_of(handle)))?;
     let blob: Blob<SimpleArchive> = snapshot
         .get(handle)
-        .context("read configured collection descriptor while checking its name")?;
+        .context("read collection descriptor while checking its name")?;
     let facts = TribleSet::try_from_blob(blob)
-        .context("decode configured collection descriptor while checking its name")?;
+        .context("decode collection descriptor while checking its name")?;
     let name_handle = descriptor::name(&facts)
-        .context("decode configured collection name")?
-        .ok_or_else(|| anyhow!("configured faculty collection is derived and has no root name"))?;
+        .context("decode collection name")?
+        .ok_or_else(|| {
+            anyhow!(
+                "faculty collection {} is derived and has no root name",
+                label_of(handle)
+            )
+        })?;
     let name: View<str> = snapshot
         .get::<View<str>, UTF8String>(name_handle)
-        .context("read configured collection name")?;
-    let expected = require_name(scope);
+        .context("read collection name")?;
     if &*name != expected {
         bail!(
-            "{} names collection {:?}, not expected faculty collection {:?}",
-            override_env_name(scope),
+            "collection {} is named {:?}, not the expected faculty collection {:?}",
+            label_of(handle),
             &*name,
             expected,
         );
@@ -571,6 +679,19 @@ mod tests {
 
         fn proofs(&self) -> Result<Self::ProofIter<'_>, Self::ProofsError> {
             self.frozen.proofs()
+        }
+    }
+
+    impl CollectionRead for StartupSnapshot {
+        type RecordsError = <MemorySnapshot as CollectionRead>::RecordsError;
+        type RecordIter<'a> = <MemorySnapshot as CollectionRead>::RecordIter<'a>;
+
+        fn records(&self) -> Result<Self::RecordIter<'_>, Self::RecordsError> {
+            self.frozen.records()
+        }
+
+        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+            self.frozen.collections()
         }
     }
 
@@ -689,12 +810,13 @@ mod tests {
     }
 
     #[test]
-    fn startup_acquires_admission_definitions_but_never_later_proofs() {
+    fn startup_union_acquires_admission_definitions_but_never_later_proofs() {
         let owner = SigningKey::from_bytes(&[0x66; 32]);
         let subject = SigningKey::from_bytes(&[0x67; 32]);
         let outsider = SigningKey::from_bytes(&[0x68; 32]);
+        let wiki = wiki::DEFAULT_SCOPE_ID;
         let mut source = MemoryRepo::default();
-        let collection = open(&mut source, wiki::DEFAULT_SCOPE_ID, owner.verifying_key()).unwrap();
+        let collection = open(&mut source, wiki, owner.verifying_key()).unwrap();
         grant_collection_read(
             &mut source,
             collection.handle(),
@@ -704,44 +826,28 @@ mod tests {
         .unwrap();
         let definition = triblespace::core::collection::read_capability();
         let (reader, evidence) = startup_reader(&mut source, Some(definition.raw), true);
-        assert!(open_exact_read_in(
-            &evidence.frozen,
-            wiki::DEFAULT_SCOPE_ID,
-            subject.verifying_key(),
-            collection.handle()
-        )
-        .is_err());
+        assert!(
+            read_union_in(&evidence.frozen, wiki, subject.verifying_key())
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            open_exact_read_in(
-                &reader,
-                wiki::DEFAULT_SCOPE_ID,
-                subject.verifying_key(),
-                collection.handle()
-            )
-            .unwrap(),
-            collection
+            read_union_in(&reader, wiki, subject.verifying_key()).unwrap(),
+            [collection]
         );
         assert!(evidence.requested.lock().unwrap().contains(&definition.raw));
 
         let (resident, evidence) = startup_reader(&mut source, None, true);
-        assert!(open_exact_read_in(
-            &resident,
-            wiki::DEFAULT_SCOPE_ID,
-            outsider.verifying_key(),
-            collection.handle()
-        )
-        .is_err());
+        assert!(read_union_in(&resident, wiki, outsider.verifying_key())
+            .unwrap()
+            .is_empty());
         assert!(evidence.requested.lock().unwrap().is_empty());
 
         let (before_grant, _) = startup_reader(&mut source, Some(definition.raw), false);
         assert!(
-            open_exact_read_in(
-                &before_grant,
-                wiki::DEFAULT_SCOPE_ID,
-                subject.verifying_key(),
-                collection.handle()
-            )
-            .is_err(),
+            read_union_in(&before_grant, wiki, subject.verifying_key())
+                .unwrap()
+                .is_empty(),
             "provider's newer proof must not enter frozen admission"
         );
         assert!(before_grant.proofs().unwrap().next().is_none());
@@ -753,118 +859,252 @@ mod tests {
             std::sync::Arc::new(crate::storage::runtime().unwrap()),
         );
         assert!(
-            open_exact_read_in(
-                &offline,
-                wiki::DEFAULT_SCOPE_ID,
-                subject.verifying_key(),
-                collection.handle()
-            )
-            .is_err(),
+            read_union_in(&offline, wiki, subject.verifying_key())
+                .unwrap()
+                .is_empty(),
             "an unavailable definition cannot grant READ"
         );
     }
 
-    /// A host with no configured handle may mint the private descriptor on an
-    /// empty pile, but not beside a generation of the same name that already
-    /// holds content: that is how a fourth generation would start by accident.
-    #[test]
-    fn open_configured_refuses_to_start_a_generation_beside_one_with_content() {
-        use triblespace::core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
-
-        let scope = decide::DEFAULT_SCOPE_ID;
-        let variable = override_env_name(scope);
-        assert!(
-            std::env::var_os(&variable).is_none(),
-            "{variable} must be unset for this test"
-        );
-        let mut store = MemoryRepo::default();
-        let mac = SigningKey::from_bytes(&[71; 32]);
-        let sky = SigningKey::from_bytes(&[72; 32]);
-
-        // An empty pile: the private descriptor is the only generation.
-        let first = open_configured(&mut store, scope, mac.verifying_key())
-            .expect("the first generation on an empty pile");
-        // Still fine while nobody has committed anything anywhere.
-        open_configured(&mut store, scope, sky.verifying_key())
-            .expect("a second descriptor is only content until something commits");
-
-        store
-            .insert(CollectionRecord::Commit(CollectionCommit::sign(
-                &mac,
-                first.handle(),
-                Inline::new([1; 32]),
-                Inline::new([2; 32]),
-            )))
-            .unwrap();
-        let error = open_configured(&mut store, scope, sky.verifying_key())
-            .expect_err("a generation with content exists; refuse to start another")
-            .to_string();
-        assert!(error.contains(&variable), "{error}");
-        assert!(error.contains(&hex::encode(first.handle().raw)), "{error}");
-        // The same host's own generation, reopened, is not "another".
-        open_configured(&mut store, scope, mac.verifying_key())
-            .expect("reopening the generation that holds the content");
-
-        // Nor is it once a sibling holds content of its own, which is what
-        // `cat` of another host's pile produces: each host keeps opening the
-        // generation it already wrote to.
-        let theirs = open(&mut store, scope, sky.verifying_key()).unwrap();
-        store
-            .insert(CollectionRecord::Commit(CollectionCommit::sign(
-                &sky,
-                theirs.handle(),
-                Inline::new([3; 32]),
-                Inline::new([4; 32]),
-            )))
-            .unwrap();
-        open_configured(&mut store, scope, mac.verifying_key())
-            .expect("a sibling with content does not stop a host reopening its own");
-        open_configured(&mut store, scope, sky.verifying_key())
-            .expect("each host with content reopens its own generation");
-        // A host with nothing of its own is still starting one, and refused.
-        let fresh = SigningKey::from_bytes(&[70; 32]);
-        open_configured(&mut store, scope, fresh.verifying_key())
-            .expect_err("an empty generation beside content is still not started");
+    fn key(byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[byte; 32])
     }
 
-    /// A configured generation that reads empty while a same-named sibling
-    /// holds records is the re-mint failure that ran silently four times;
-    /// it is now said out loud, and only then.
-    #[test]
-    fn an_empty_configured_generation_beside_content_is_named_not_silent() {
-        use triblespace::core::collection::{CollectionCommit, CollectionRecord, CollectionStore};
+    /// A policy rooted at every one of `keys`, any one of which suffices.
+    fn shared(keys: &[&SigningKey]) -> CollectionPolicy {
+        let roots = keys.iter().map(|key| key.verifying_key());
+        CollectionPolicy::new(
+            AdmissionPolicy::quorum(roots.clone(), 1, None).unwrap(),
+            AdmissionPolicy::quorum(roots, 1, None).unwrap(),
+        )
+    }
 
-        let scope = decide::DEFAULT_SCOPE_ID;
-        let mut store = MemoryRepo::default();
-        let mac = SigningKey::from_bytes(&[73; 32]);
-        let sky = SigningKey::from_bytes(&[74; 32]);
-        let old = open(&mut store, scope, mac.verifying_key()).unwrap();
-        let new = open(&mut store, scope, sky.verifying_key()).unwrap();
-
-        // Both empty: nothing to say.
-        let snapshot = store.snapshot().unwrap();
-        assert_eq!(empty_beside_content(&snapshot, scope, new.handle()), None);
-
+    /// Give `collection` a record, which is what makes it a candidate.
+    fn commit(store: &mut MemoryRepo, collection: Collection<SimpleArchive>, signer: &SigningKey) {
         store
-            .insert(CollectionRecord::Commit(CollectionCommit::sign(
-                &mac,
-                old.handle(),
-                Inline::new([1; 32]),
-                Inline::new([2; 32]),
-            )))
+            .commit(
+                collection,
+                signer,
+                entity! { metadata::description: "content".to_owned() },
+            )
             .unwrap();
+    }
+
+    fn handles(collections: Vec<Collection<SimpleArchive>>) -> BTreeSet<CollectionHandle> {
+        collections
+            .into_iter()
+            .map(|collection| collection.handle())
+            .collect()
+    }
+
+    #[test]
+    fn available_collections_are_the_granted_and_the_owned() {
+        let (me, other) = (key(0x11), key(0x12));
+        let mut store = MemoryRepo::default();
+        let mine = open(&mut store, wiki::DEFAULT_SCOPE_ID, me.verifying_key()).unwrap();
+        commit(&mut store, mine, &me);
+        let theirs = open(&mut store, compass::DEFAULT_SCOPE_ID, other.verifying_key()).unwrap();
+        commit(&mut store, theirs, &other);
+        // Granted, and nothing of it is here yet.
+        let granted = open(
+            &mut store,
+            relations::DEFAULT_SCOPE_ID,
+            other.verifying_key(),
+        )
+        .unwrap();
+        grant_collection_read(&mut store, granted.handle(), &other, me.verifying_key()).unwrap();
+        // Registered and never written: no record lists it.
+        open(&mut store, decide::DEFAULT_SCOPE_ID, me.verifying_key()).unwrap();
+
         let snapshot = store.snapshot().unwrap();
-        // The generation holding the content is fine to configure.
-        assert_eq!(empty_beside_content(&snapshot, scope, old.handle()), None);
-        // The empty one beside it is named, with the remedy.
-        let warning = empty_beside_content(&snapshot, scope, new.handle())
-            .expect("an empty generation beside content is said out loud");
-        assert!(
-            warning.contains(&hex::encode(new.handle().raw)),
-            "{warning}"
+        assert_eq!(
+            available(&snapshot, me.verifying_key()).unwrap(),
+            BTreeSet::from([mine.handle(), granted.handle()])
         );
-        assert!(warning.contains("--siblings"), "{warning}");
-        assert!(warning.contains(&override_env_name(scope)), "{warning}");
+        assert_eq!(
+            available(&snapshot, other.verifying_key()).unwrap(),
+            BTreeSet::from([theirs.handle()])
+        );
+    }
+
+    #[test]
+    fn the_read_union_is_every_collection_of_the_name_the_key_may_read() {
+        let (me, other, stranger) = (key(0x21), key(0x22), key(0x23));
+        let wiki = wiki::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        let mine = open(&mut store, wiki, me.verifying_key()).unwrap();
+        commit(&mut store, mine, &me);
+        let theirs = open(&mut store, wiki, other.verifying_key()).unwrap();
+        commit(&mut store, theirs, &other);
+        let elsewhere = open(&mut store, relations::DEFAULT_SCOPE_ID, me.verifying_key()).unwrap();
+        commit(&mut store, elsewhere, &me);
+
+        assert_eq!(
+            handles(read_union(&mut store, wiki, me.verifying_key()).unwrap()),
+            BTreeSet::from([mine.handle()])
+        );
+        grant_collection_read(&mut store, theirs.handle(), &other, me.verifying_key()).unwrap();
+        assert_eq!(
+            handles(read_union(&mut store, wiki, me.verifying_key()).unwrap()),
+            BTreeSet::from([mine.handle(), theirs.handle()])
+        );
+        assert!(read_union(&mut store, wiki, stranger.verifying_key())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_pile_without_the_name_starts_the_writers_private_collection() {
+        let me = key(0x31);
+        let decide = decide::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        // Another name's collection is no candidate.
+        let elsewhere = open(&mut store, relations::DEFAULT_SCOPE_ID, me.verifying_key()).unwrap();
+        commit(&mut store, elsewhere, &me);
+        assert_eq!(
+            write_target(&mut store, decide, me.verifying_key(), None).unwrap(),
+            open(&mut store, decide, me.verifying_key()).unwrap()
+        );
+    }
+
+    #[test]
+    fn the_default_is_the_one_collection_rooted_at_the_writer() {
+        let (me, other) = (key(0x41), key(0x42));
+        let decide = decide::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        let together = store.collection("decide", shared(&[&me, &other])).unwrap();
+        commit(&mut store, together, &other);
+        let theirs = open(&mut store, decide, other.verifying_key()).unwrap();
+        commit(&mut store, theirs, &other);
+        // The writer's private descriptor, registered and never written.
+        open(&mut store, decide, me.verifying_key()).unwrap();
+        assert_eq!(
+            write_target(&mut store, decide, me.verifying_key(), None).unwrap(),
+            together
+        );
+    }
+
+    #[test]
+    fn else_the_default_is_the_one_rooted_at_the_writer_alone() {
+        let (me, other) = (key(0x51), key(0x52));
+        let decide = decide::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        let together = store.collection("decide", shared(&[&me, &other])).unwrap();
+        commit(&mut store, together, &other);
+        let mine = open(&mut store, decide, me.verifying_key()).unwrap();
+        commit(&mut store, mine, &me);
+        assert_eq!(
+            write_target(&mut store, decide, me.verifying_key(), None).unwrap(),
+            mine
+        );
+    }
+
+    #[test]
+    fn else_there_is_no_default_and_the_error_names_every_candidate() {
+        let (me, one, two) = (key(0x61), key(0x62), key(0x63));
+        let decide = decide::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        let first = store.collection("decide", shared(&[&me, &one])).unwrap();
+        commit(&mut store, first, &one);
+        let second = store.collection("decide", shared(&[&me, &two])).unwrap();
+        commit(&mut store, second, &two);
+        let text = format!(
+            "{:#}",
+            write_target(&mut store, decide, me.verifying_key(), None).unwrap_err()
+        );
+        for candidate in [first, second] {
+            assert!(
+                text.contains(&hex::encode(candidate.handle().raw)),
+                "{text}"
+            );
+        }
+        assert!(text.contains("--target"), "{text}");
+        // A key rooted in exactly one of them has its default.
+        assert_eq!(
+            write_target(&mut store, decide, one.verifying_key(), None).unwrap(),
+            first
+        );
+        let stranger = key(0x64);
+        let text = format!(
+            "{:#}",
+            write_target(&mut store, decide, stranger.verifying_key(), None).unwrap_err()
+        );
+        assert!(text.contains(&hex::encode(first.handle().raw)), "{text}");
+    }
+
+    #[test]
+    fn a_named_target_is_used_as_named_when_it_carries_the_name() {
+        let (me, other) = (key(0x71), key(0x72));
+        let decide = decide::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        let theirs = open(&mut store, decide, other.verifying_key()).unwrap();
+        assert_eq!(
+            write_target(
+                &mut store,
+                decide,
+                me.verifying_key(),
+                Some(theirs.handle())
+            )
+            .unwrap(),
+            theirs
+        );
+        let misnamed = open(&mut store, relations::DEFAULT_SCOPE_ID, me.verifying_key()).unwrap();
+        let text = format!(
+            "{:#}",
+            write_target(
+                &mut store,
+                decide,
+                me.verifying_key(),
+                Some(misnamed.handle())
+            )
+            .unwrap_err()
+        );
+        assert!(
+            text.contains("not the expected faculty collection"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_target_without_write_is_refused_by_the_command_guard() {
+        let (me, other) = (key(0x81), key(0x82));
+        let decide = decide::DEFAULT_SCOPE_ID;
+        let mut store = MemoryRepo::default();
+        let theirs = open(&mut store, decide, other.verifying_key()).unwrap();
+        let target = write_target(
+            &mut store,
+            decide,
+            me.verifying_key(),
+            Some(theirs.handle()),
+        )
+        .unwrap();
+        let text = format!(
+            "{:#}",
+            require_command_write_admission(&mut store, target, &me, "Decide", "decide show")
+                .unwrap_err()
+        );
+        assert!(text.contains("not admitted to write"), "{text}");
+        grant_collection_write(&mut store, theirs.handle(), &other, me.verifying_key()).unwrap();
+        require_command_write_admission(&mut store, target, &me, "Decide", "decide show").unwrap();
+    }
+
+    #[test]
+    fn a_label_names_the_collection_and_its_owners() {
+        let (me, other) = (key(0x91), key(0x92));
+        let mut store = MemoryRepo::default();
+        let together = store.collection("wiki", shared(&[&me, &other])).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let text = label(&snapshot, together.handle());
+        assert!(
+            text.contains(&hex::encode(&together.handle().raw[..8])),
+            "{text}"
+        );
+        for owner in [&me, &other] {
+            assert!(
+                text.contains(&hex::encode_upper(&owner.verifying_key().to_bytes()[..8])),
+                "{text}"
+            );
+        }
     }
 
     /// The guard refuses an unadmitted writer and says enough to fix it.
@@ -913,30 +1153,23 @@ mod tests {
             .expect("publication stays unconditional");
     }
 
-    use std::collections::BTreeSet;
-
     use ed25519_dalek::SigningKey;
-    use triblespace::core::capability::{CapabilityProof, CapabilityResource};
-    use triblespace::core::collection::grant_collection_read;
-    use triblespace::core::metadata;
+    use triblespace::core::collection::{
+        grant_collection_read, grant_collection_write, AdmissionPolicy, CollectionPolicy,
+    };
+    use triblespace::core::inline::Inline;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::{CapabilityProofStore, SnapshotSource};
-    use triblespace::core::trible::TribleSet;
+    use triblespace::core::repo::CapabilityProofStore;
     use triblespace::macros::entity;
 
     #[test]
     fn every_name_is_nonempty_and_no_two_scopes_share_one() {
         let mut names = BTreeSet::new();
         let mut scopes = BTreeSet::new();
-        let mut variables = BTreeSet::new();
         for (scope, name) in table() {
             assert!(!name.is_empty());
             assert!(names.insert(name), "two scopes both claim the name {name}");
             assert!(scopes.insert(scope), "scope {scope:X} appears twice");
-            assert!(
-                variables.insert(override_env_name(scope)),
-                "two collections normalize to one override variable"
-            );
         }
     }
 
@@ -968,28 +1201,6 @@ mod tests {
     }
 
     #[test]
-    fn override_names_and_handles_are_exact() {
-        assert_eq!(
-            override_env_name(memory::DEFAULT_SCOPE_ID),
-            "TRIBLESPACE_COLLECTION_MEMORY_JOURNAL"
-        );
-        let variable = override_env_name(wiki::DEFAULT_SCOPE_ID);
-        let raw = "ab".repeat(32);
-        assert_eq!(
-            parse_override(&variable, OsString::from(&raw)).unwrap().raw,
-            [0xab; 32]
-        );
-        assert_eq!(
-            parse_override(&variable, OsString::from(format!("blake3:{raw}")))
-                .unwrap()
-                .raw,
-            [0xab; 32]
-        );
-        assert!(parse_override(&variable, OsString::from("ab")).is_err());
-        assert!(parse_override(&variable, OsString::from("zz".repeat(32))).is_err());
-    }
-
-    #[test]
     fn exact_publication_open_requires_the_expected_name_not_current_write_admission() {
         let operator = SigningKey::from_bytes(&[0x41; 32]);
         let tenant = SigningKey::from_bytes(&[0x52; 32]);
@@ -1012,85 +1223,6 @@ mod tests {
             open_exact_in(&snapshot, wiki::DEFAULT_SCOPE_ID, wrong_name.handle()).unwrap_err();
         assert!(error
             .to_string()
-            .contains("not expected faculty collection"));
-    }
-
-    #[test]
-    fn exact_read_open_requires_current_read_admission() {
-        let operator = SigningKey::from_bytes(&[0x61; 32]);
-        let reader = SigningKey::from_bytes(&[0x62; 32]);
-        let mut store = MemoryRepo::default();
-        let shared = store
-            .collection("wiki", private_policy(operator.verifying_key()))
-            .unwrap();
-
-        let snapshot = store.snapshot().unwrap();
-        let error = open_exact_read_in(
-            &snapshot,
-            wiki::DEFAULT_SCOPE_ID,
-            reader.verifying_key(),
-            shared.handle(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("is not admitted to READ"));
-        drop(snapshot);
-
-        grant_collection_read(
-            &mut store,
-            shared.handle(),
-            &operator,
-            reader.verifying_key(),
-        )
-        .unwrap();
-        let snapshot = store.snapshot().unwrap();
-        assert_eq!(
-            open_exact_read_in(
-                &snapshot,
-                wiki::DEFAULT_SCOPE_ID,
-                reader.verifying_key(),
-                shared.handle(),
-            )
-            .unwrap(),
-            shared
-        );
-    }
-
-    #[test]
-    fn exact_read_open_reuses_unchanged_snapshot_evidence() {
-        let operator = SigningKey::from_bytes(&[0x63; 32]);
-        let reader = SigningKey::from_bytes(&[0x64; 32]);
-        let mut store = MemoryRepo::default();
-        let shared = store
-            .collection("wiki", private_policy(operator.verifying_key()))
-            .unwrap();
-        store
-            .insert_proof(CapabilityProof::new(
-                CapabilityResource::from(shared.handle()),
-                &operator,
-                triblespace::core::collection::read_capability(),
-                reader.verifying_key(),
-            ))
-            .unwrap();
-        let valid = store.snapshot().unwrap();
-        let later = store.snapshot().unwrap();
-        assert!(later.changes_since(&valid).is_empty());
-        assert!(valid.changes_since(&later).is_empty());
-        assert!(open_exact_read_in(
-            &later,
-            wiki::DEFAULT_SCOPE_ID,
-            reader.verifying_key(),
-            shared.handle(),
-        )
-        .is_ok());
-        assert_eq!(
-            open_exact_read_in(
-                &valid.clone(),
-                wiki::DEFAULT_SCOPE_ID,
-                reader.verifying_key(),
-                shared.handle(),
-            )
-            .unwrap(),
-            shared
-        );
+            .contains("not the expected faculty collection"));
     }
 }

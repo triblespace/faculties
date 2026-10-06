@@ -1040,7 +1040,7 @@ fn foreign_scan_commits_are_stored_but_inert_without_write_admission() {
     let mut pile = open_pile_strict(&store.pile).unwrap();
     let local = crate::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
     let collection =
-        open_configured(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
+        crate::collection_names::open(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
     let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x91; 32]);
     // Publication is an unconditional local ledger append. Admission is a
     // separate read concern rooted in this collection's immutable WRITE
@@ -1092,7 +1092,7 @@ fn unauthorized_duplicate_claim_does_not_poison_scan_atomicity() {
     let mut pile = open_pile_strict(&store.pile).unwrap();
     let local = crate::storage::load_signer(&store.pile, Some(&store.key)).unwrap();
     let collection =
-        open_configured(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
+        crate::collection_names::open(&mut pile, DEFAULT_SCAN_SCOPE_ID, local.verifying_key()).unwrap();
     let foreign = ed25519_dalek::SigningKey::from_bytes(&[0x92; 32]);
     let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
     assert_eq!(duplicate.data(), admitted.data());

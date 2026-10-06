@@ -74,8 +74,7 @@ use triblespace::core::metadata::MetaDescribe;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, ReadError};
 use triblespace::core::repo::{
-    BlobStoreGet, BlobStoreList, CapabilityProofRead, MissingBlob, SnapshotSource, StorageClose,
-    Store, StoreRead,
+    BlobStoreGet, BlobStoreList, MissingBlob, SnapshotSource, StorageClose, Store, StoreRead,
 };
 use triblespace::core::signing_key_file;
 use triblespace::core::trible::{Fragment, TribleSet};
@@ -113,6 +112,7 @@ pub struct Storage {
     pile: PathBuf,
     key: Option<PathBuf>,
     shared: Option<Arc<Mutex<Option<Session>>>>,
+    target: Option<CollectionHandle>,
 }
 
 struct Session {
@@ -149,6 +149,7 @@ impl std::fmt::Debug for Storage {
             .field("pile", &self.pile)
             .field("key", &self.key)
             .field("shared", &self.shared.is_some())
+            .field("target", &self.target.map(|target| hex::encode(target.raw)))
             .finish()
     }
 }
@@ -161,7 +162,7 @@ impl Storage {
         if self.shared.is_some() {
             self.clone()
         } else {
-            Self::shared(self.pile.clone(), self.key.clone())
+            Self::shared(self.pile.clone(), self.key.clone()).with_target(self.target)
         }
     }
     /// Configure operation-scoped storage, suitable for a short-lived CLI.
@@ -170,6 +171,7 @@ impl Storage {
             pile,
             key,
             shared: None,
+            target: None,
         }
     }
 
@@ -181,7 +183,23 @@ impl Storage {
             pile,
             key,
             shared: Some(Arc::new(Mutex::new(None))),
+            target: None,
         }
+    }
+
+    /// Write to `target` instead of the default write target, sharing this
+    /// owner's store. A faculty applies it to the collection it writes as its
+    /// own and refuses a target that does not carry that collection's name
+    /// ([`crate::collection_names::write_target`]); what it writes to another
+    /// faculty's collection goes to that one's default. Reads are unaffected.
+    pub fn with_target(mut self, target: Option<CollectionHandle>) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// The collection writes go to when the caller named one.
+    pub fn target(&self) -> Option<CollectionHandle> {
+        self.target
     }
 
     pub fn path(&self) -> &Path {
@@ -200,7 +218,7 @@ impl Storage {
         if self.shared.is_some() {
             return operation(self);
         }
-        let storage = Self::shared(self.pile.clone(), self.key.clone());
+        let storage = Self::shared(self.pile.clone(), self.key.clone()).with_target(self.target);
         let result = operation(&storage);
         storage.finish(result)
     }
@@ -461,25 +479,38 @@ fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
     ))
 }
 
-/// Open the explicitly configured Secrets policy boundary for publication.
+/// Open the Secrets collection a write goes to: `target` when given, else
+/// the default write target ([`crate::collection_names::write_target`]).
 ///
-/// `TRIBLESPACE_COLLECTION_SECRETS` selects an exact shared source descriptor;
-/// otherwise a signer-private `secrets` descriptor is registered with an
-/// explicit, separate key-delivery policy under that owner.
-/// This selects the exact descriptor but deliberately performs no admission
-/// check: local publication is unconditional, and WRITE admission is applied
-/// when collection snapshots admit commits.
+/// The writer's private `secrets` descriptor carries an explicit, separate
+/// key-delivery policy under that owner, so it is registered here rather
+/// than through the plain faculty policy. This performs no admission check:
+/// local publication is unconditional, and WRITE admission is applied when
+/// collection snapshots admit commits.
 pub fn open_secrets_collection<S>(
     store: &mut S,
     subject: VerifyingKey,
+    target: Option<CollectionHandle>,
 ) -> Result<crate::secrets::storage::SecretsCollection>
 where
     S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreGet,
+    S::Snapshot: BlobStoreGet + BlobStoreList + CollectionRead,
 {
     let scope = crate::secrets::DEFAULT_SCOPE_ID;
-    let Some(handle) = crate::collection_names::configured_handle(scope)? else {
-        return crate::secrets::storage::SecretsCollection::register(
+    let snapshot = store
+        .snapshot()
+        .context("freeze the store to choose the Secrets target")?;
+    let chosen = match target {
+        Some(target) => Some(crate::collection_names::open_exact_in(
+            &snapshot, scope, target,
+        )?),
+        None => crate::collection_names::default_target_in(&snapshot, scope, subject)?,
+    };
+    drop(snapshot);
+    match chosen {
+        Some(source) => crate::secrets::storage::SecretsCollection::from_source(store, source)
+            .context("register maintained Secrets collection descriptors"),
+        None => crate::secrets::storage::SecretsCollection::register(
             store,
             crate::collection_names::require_name(scope),
             crate::collection_names::private_policy(subject).with_capability(
@@ -487,58 +518,65 @@ where
                 triblespace::core::collection::AdmissionPolicy::direct(subject),
             ),
         )
-        .context("register signer-private Secrets descriptor with key-delivery policy");
-    };
-    let snapshot = store
-        .snapshot()
-        .context("freeze configured Secrets descriptor")?;
-    let source = crate::collection_names::open_exact_in(&snapshot, scope, handle)
-        .context("open configured Secrets source collection")?;
-    drop(snapshot);
-    crate::secrets::storage::SecretsCollection::from_source(store, source)
-        .context("register maintained Secrets collection descriptors")
+        .context("register signer-private Secrets descriptor with key-delivery policy"),
+    }
 }
 
-/// Open the explicitly configured Secrets policy boundary for local reads.
+/// Every Secrets collection a local read opens: each one with the name
+/// that this pile holds records for, whether or not the reader may READ it.
 ///
 /// Collection READ controls encrypted-evidence replication, not opening an
-/// already-delivered local wrap. This retains exact descriptor/type/name
-/// selection and ordinary signed WRITE admission of the facts, but adds no
-/// READ or key-delivery expiry check to decryption by possession. An unset
-/// override registers an explicit signer-private key-delivery policy.
-pub fn open_secrets_collection_read<S>(
+/// already-delivered local wrap, so a Secrets read adds no READ or
+/// key-delivery expiry check to decryption by possession. Each source keeps
+/// its exact descriptor, type and name, and the ordinary signed WRITE
+/// admission of its facts.
+pub fn open_secrets_collections_read<S>(
     store: &mut S,
-    subject: VerifyingKey,
-) -> Result<crate::secrets::storage::SecretsCollection>
+) -> Result<Vec<crate::secrets::storage::SecretsCollection>>
 where
     S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreGet,
+    S::Snapshot: BlobStoreGet + BlobStoreList + CollectionRead,
 {
-    open_secrets_collection(store, subject)
+    let snapshot = store
+        .snapshot()
+        .context("freeze the store to find the Secrets collections")?;
+    let sources = crate::collection_names::named_in(&snapshot, crate::secrets::DEFAULT_SCOPE_ID)?;
+    drop(snapshot);
+    sources
+        .into_iter()
+        .map(|source| {
+            crate::secrets::storage::SecretsCollection::from_source(store, source)
+                .context("register maintained Secrets collection descriptors")
+        })
+        .collect()
 }
 
-/// Open Secrets at a synchronous acquisition boundary. This preserves its
-/// explicit private key-delivery policy and local-wrap possession semantics:
-/// acquiring exact descriptor/name bytes adds no READ or expiry check.
+/// [`open_secrets_collection`] at a synchronous acquisition boundary: a
+/// named target whose descriptor or name is not here is acquired. Acquiring
+/// exact descriptor/name bytes adds no READ or expiry check.
 pub fn open_secrets_collection_acquiring<S>(
     store: &mut S,
     subject: VerifyingKey,
+    target: Option<CollectionHandle>,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<crate::secrets::storage::SecretsCollection>
 where
     S: CollectionStoreExt + SnapshotSource,
-    S::Snapshot: BlobStoreGet + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+    S::Snapshot: BlobStoreGet
+        + BlobStoreList
+        + CollectionRead
+        + triblespace::core::repo::async_store::AsyncBlobStoreGet,
 {
-    let scope = crate::secrets::DEFAULT_SCOPE_ID;
-    let Some(handle) = crate::collection_names::configured_handle(scope)? else {
-        return open_secrets_collection(store, subject);
+    let Some(target) = target else {
+        return open_secrets_collection(store, subject, None);
     };
     let snapshot = store
         .snapshot()
-        .context("freeze configured Secrets descriptor")?;
+        .context("freeze the Secrets target descriptor")?;
     let reader = AcquiringReader::new(snapshot, Arc::clone(runtime));
-    let source = crate::collection_names::open_exact_in(&reader, scope, handle)
-        .context("open configured Secrets source collection")?;
+    let source =
+        crate::collection_names::open_exact_in(&reader, crate::secrets::DEFAULT_SCOPE_ID, target)
+            .context("open the Secrets target collection")?;
     crate::secrets::storage::SecretsCollection::from_source(store, source)
         .context("register maintained Secrets collection descriptors")
 }
@@ -577,11 +615,11 @@ impl TargetDiscovery {
 
 /// Discover one target directly through the native collection-record store.
 ///
-/// `scope` resolves the faculty's canonical name. Without an exact override,
-/// `authority` seeds the descriptor's direct READ and WRITE policies; with an
-/// override, the selected descriptor keeps its own immutable policies. The
-/// returned handle selects records. No definition registry, blob scan, or
-/// legacy pin lookup participates in target discovery.
+/// `scope` resolves the faculty's canonical name, and the collection is the
+/// default write target of `authority`
+/// ([`crate::collection_names::write_target`]). The returned handle selects
+/// records. No definition registry, blob scan, or legacy pin lookup
+/// participates in target discovery.
 pub fn discover_target<S>(
     store: &mut S,
     scope: Id,
@@ -589,9 +627,9 @@ pub fn discover_target<S>(
 ) -> Result<TargetDiscovery>
 where
     S: CollectionStoreExt + SnapshotSource,
-    <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
+    <S as SnapshotSource>::Snapshot: BlobStoreGet + BlobStoreList + CollectionRead,
 {
-    let collection = crate::collection_names::open_configured(store, scope, authority)
+    let collection = crate::collection_names::write_target(store, scope, authority, None)
         .context("open target collection descriptor")?;
     let snapshot = store
         .snapshot()
@@ -1059,7 +1097,7 @@ pub fn publish_fragment(
 pub fn carry_scope(pile_path: &Path, key_path: Option<&Path>, scope: Id) -> Result<()> {
     let (mut pile, signer) = open_pile_signed(pile_path, key_path)?;
     let collection =
-        crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+        crate::collection_names::write_target(&mut pile, scope, signer.verifying_key(), None)
             .context("open native collection descriptor")?;
     carry_facts(&mut pile, collection, &signer);
     finish_pile(pile, Ok(()))
@@ -1073,7 +1111,7 @@ pub fn publish_fragments(
 ) -> Result<Vec<CollectionCommit>> {
     let (mut pile, signer) = open_pile_signed(pile_path, key_path)?;
     let collection =
-        crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
+        crate::collection_names::write_target(&mut pile, scope, signer.verifying_key(), None)
             .context("open native collection descriptor")?;
     let result = (|| {
         let mut commits = Vec::new();
@@ -1902,8 +1940,7 @@ mod tests {
         // the whole tier.
         let mut pile = open_pile_strict_as(&files.pile, signer.verifying_key()).unwrap();
         let collection =
-            crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
-                .unwrap();
+            crate::collection_names::open(&mut pile, scope, signer.verifying_key()).unwrap();
         drop(pollster::block_on(pile.maintain(collection, &signer)).unwrap());
         pile.close().unwrap();
 
@@ -1967,8 +2004,7 @@ mod tests {
             Some(signer.verifying_key().to_bytes())
         );
         let collection =
-            crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
-                .unwrap();
+            crate::collection_names::open(&mut pile, scope, signer.verifying_key()).unwrap();
         drop(pollster::block_on(pile.maintain(collection, &signer)).unwrap());
         pile.close().unwrap();
 
@@ -2331,6 +2367,111 @@ where
         .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
         .map_err(|error| anyhow!("attach the Rank9 collection: {error}"))?;
     Ok((succinct, rank9))
+}
+
+/// Register the fact pair over every collection of a read-union, in the
+/// same order. Registration only: nothing is maintained here.
+pub fn fact_pairs<S>(
+    pile: &mut S,
+    sources: &[Collection<SimpleArchive>],
+) -> Result<
+    Vec<(
+        Collection<SuccinctArchiveBlob>,
+        Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    )>,
+>
+where
+    S: CollectionStoreExt,
+{
+    sources
+        .iter()
+        .map(|source| {
+            let succinct = pile
+                .attach::<SuccinctArchiveBlob>(*source, ())
+                .map_err(|error| anyhow!("attach the Succinct collection: {error}"))?;
+            let rank9 = pile
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(*source, succinct)
+                .map_err(|error| anyhow!("attach the Rank9 collection: {error}"))?;
+            Ok((succinct, rank9))
+        })
+        .collect()
+}
+
+/// The Rank9 collections of [`fact_pairs`]: what a reader of a read-union
+/// attaches.
+pub fn rank9_union<S>(
+    pile: &mut S,
+    sources: &[Collection<SimpleArchive>],
+) -> Result<Vec<Collection<Rank9AcceleratedSuccinctArchiveBlob>>>
+where
+    S: CollectionStoreExt,
+{
+    Ok(fact_pairs(pile, sources)?
+        .into_iter()
+        .map(|(_, rank9)| rank9)
+        .collect())
+}
+
+/// Carry each source of a read-union into its fact pair as `signer`. What a
+/// pair cannot attach is its lag ([`tolerate_own_lag`]), read from its own
+/// bytes.
+pub async fn maintain_fact_pairs<S>(
+    pile: &mut S,
+    pairs: &[(
+        Collection<SuccinctArchiveBlob>,
+        Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    )],
+    signer: &SigningKey,
+) -> Result<()>
+where
+    S: Store + AsyncBlobStoreAcquire + Send,
+{
+    for (succinct, rank9) in pairs {
+        tolerate_own_lag(pile.maintain_attached(*succinct, signer).await)
+            .map_err(|error| anyhow!("maintain the Succinct collection: {error}"))?;
+        tolerate_own_lag(pile.maintain_attached(*rank9, signer).await)
+            .map_err(|error| anyhow!("maintain the Rank9 collection: {error}"))?;
+    }
+    Ok(())
+}
+
+/// The facts of every collection of a read-union as one archive: the
+/// shards of each, behind one relation. A union of no collections holds no
+/// facts.
+pub fn union_facts(archives: impl IntoIterator<Item = Result<FactArchive>>) -> Result<FactArchive> {
+    let mut union: Option<FactArchive> = None;
+    for archive in archives {
+        let archive = archive?;
+        union = Some(match union {
+            Some(union) => union.union(&archive),
+            None => archive,
+        });
+    }
+    Ok(union.unwrap_or_else(|| {
+        FactArchive::new(vec![
+            triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(
+                &TribleSet::new(),
+            ),
+        ])
+    }))
+}
+
+/// [`acquire_facts`] over every Rank9 collection of a read-union, as one
+/// archive.
+pub fn acquire_union_facts<R: StoreRead>(
+    reader: &R,
+    rank9: &[Collection<Rank9AcceleratedSuccinctArchiveBlob>],
+) -> Result<FactArchive> {
+    union_facts(rank9.iter().map(|view| acquire_facts(reader, *view)))
+}
+
+/// [`FactRead::read_facts`] over every Rank9 collection of a read-union, as
+/// one archive.
+pub fn read_union_facts<R: StoreRead>(
+    snapshot: &R,
+    rank9: &[Collection<Rank9AcceleratedSuccinctArchiveBlob>],
+) -> Result<FactArchive> {
+    union_facts(rank9.iter().map(|view| snapshot.read_facts(*view)))
 }
 
 /// Attach the parent's current frontier into an attached collection once if

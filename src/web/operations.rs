@@ -17,6 +17,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use serde_json::json;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -298,28 +299,27 @@ impl WebStorage<'_> {
     /// names. Labels and timestamps never participate in runtime selection.
     fn open_web_secrets(&self) -> Result<ApiKeys> {
         self.storage.with_store(|store, signer, runtime| {
-            let source = crate::collection_names::open_configured_acquiring(
-                store, HEADSPACE_SCOPE_ID, signer.verifying_key(), runtime,
+            let sources = crate::collection_names::read_union_acquiring(
+                store,
+                HEADSPACE_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let secrets_collection = crate::storage::open_secrets_collection_acquiring(
-                store, signer.verifying_key(), runtime,
+                store,
+                signer.verifying_key(),
+                None,
+                runtime,
             )?;
             let pile = store;
             let (headspace_rank9, secrets) = runtime.block_on(async {
-                let headspace_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-                let headspace_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, headspace_succinct)?;
-
+                let pairs = crate::storage::fact_pairs(pile, &sources)?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(headspace_succinct, signer).await,
-                )
-                .context("maintain Headspace fact collection")?;
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(headspace_rank9, signer).await,
-                )
-                .context("maintain Headspace fact collection")?;
+                crate::storage::maintain_fact_pairs(pile, &pairs, signer)
+                    .await
+                    .context("maintain Headspace fact collection")?;
+                let headspace_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
 
                 let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                     .await
@@ -330,9 +330,10 @@ impl WebStorage<'_> {
             // Every query shares one frozen prefix. Only exact payload reads
             // acquire bytes; no key or message selection is retried.
             let reader = crate::storage::AcquiringReader::new(
-                secrets.store_snapshot().clone(), runtime.clone(),
+                secrets.store_snapshot().clone(),
+                runtime.clone(),
             );
-            let facts = crate::storage::acquire_facts(&reader, headspace_rank9)
+            let facts = crate::storage::acquire_union_facts(&reader, &headspace_rank9)
                 .context("read maintained Headspace collection")?;
             let secrets = secret_storage::snapshot_acquiring(reader, secrets_collection)?;
             let versions = web_secret_versions(&facts)?;
@@ -344,16 +345,22 @@ impl WebStorage<'_> {
     }
 
     fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
+        let target = self.storage.target();
         self.storage.with_store(|store, signer, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let collection = crate::collection_names::write_target_acquiring(
+                store,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                target,
+                runtime,
             )?;
             let pile = store;
             fragment.describe_with(entity! { metadata::description: description });
             pile.commit(collection, signer, fragment)
                 .context("commit Web observation")?;
             drop(
-                runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                runtime
+                    .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context("Web facts were committed, but ensuring their derived views failed")?,
             );
             Ok(())

@@ -3436,7 +3436,7 @@ mod tests {
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use crate::collection_names::open_configured;
+    use crate::collection_names::open;
     use crate::relations::{self, ProfileInput};
     use crate::schemas::{
         decide as decide_schema, files as files_schema, mail as mail_schema,
@@ -3444,8 +3444,7 @@ mod tests {
     };
     use crate::secrets::storage as secret_storage;
     use crate::storage::{
-        load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
-        publish_fragment,
+        load_signer, open_pile_strict, open_secrets_collection, publish_fragment,
     };
     use crate::test_support::initialize_open_collection_fixture;
     use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -3510,32 +3509,32 @@ mod tests {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
             let mut pile = open_pile_strict(&self.pile).unwrap();
             let secrets_collection =
-                open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+                open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
             let secrets = pollster::block_on(secret_storage::ensure_and_snapshot(
                 &mut pile,
                 secrets_collection,
                 &signer,
             ))
             .unwrap();
-            let mail = open_configured(
+            let mail = open(
                 &mut pile,
                 mail_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             )
             .unwrap();
-            let files = open_configured(
+            let files = open(
                 &mut pile,
                 files_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             )
             .unwrap();
-            let decide = open_configured(
+            let decide = open(
                 &mut pile,
                 decide_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
             )
             .unwrap();
-            let relations = open_configured(
+            let relations = open(
                 &mut pile,
                 relations_schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
@@ -3568,7 +3567,8 @@ mod tests {
         fn add_secret(&self, name: &str, plaintext: &[u8], created_at: IntervalValue) -> Id {
             let signer = self.signer();
             let mut pile = open_pile_strict(&self.pile).unwrap();
-            let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
+            let collection =
+                open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
             let secret = secret_storage::add_secret(
                 &mut pile, &signer, collection, name, plaintext, created_at,
             )

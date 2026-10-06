@@ -7,7 +7,7 @@ use anybytes::Bytes;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use clap::Parser;
-use faculties::collection_names::open_configured;
+use faculties::collection_names::open;
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
 use faculties::posture::{
@@ -47,7 +47,7 @@ impl Fixture {
     fn commits(&self, scope: Id) -> usize {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
-        let collection = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
+        let collection = open(&mut pile, scope, signer.verifying_key()).unwrap();
         let count = collection
             .admitted(&pile.snapshot().unwrap())
             .unwrap()

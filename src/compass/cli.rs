@@ -17,6 +17,11 @@ pub struct Cli {
     /// Existing durable signing-key file. Reads and writes never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     /// Acting persona (relations label or 32-char hex id). When set,
     /// status and note events record who made them — the audit trail gains the
     /// actor, and `orient wait` watchers can absorb their own edits.
@@ -110,7 +115,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return output.line(Cli::command().render_help().to_string());
     };
-    let compass = Compass::new(cli.pile, cli.key);
+    let compass = Compass::with_storage(crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target));
     let persona = cli.persona.as_deref();
     match command {
         Command::Add {

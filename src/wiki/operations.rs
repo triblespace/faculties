@@ -16,9 +16,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
-#[cfg(test)]
-use crate::collection_names::open_configured;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 #[cfg(feature = "local-embed")]
 use crate::schemas::embeddings::{self, Embedding768};
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
@@ -31,6 +29,7 @@ use crate::wiki::{
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(test)]
 use hifitime::Epoch;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -235,17 +234,16 @@ impl WikiStorage<'_> {
         prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            let source = open_configured_acquiring(
+            let sources = read_union_acquiring(
                 pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
             )?;
             let mut auxiliaries = Vec::with_capacity(scopes.len());
             for &(scope, label) in scopes {
-                let collection = open_configured_acquiring(
-                    pile, scope, signer.verifying_key(), runtime,
-                )?;
-                auxiliaries.push((collection, label));
+                let collections =
+                    read_union_acquiring(pile, scope, signer.verifying_key(), runtime)?;
+                auxiliaries.push((collections, label));
             }
-            views_in(pile, source, signer, &auxiliaries, runtime, prepare)
+            views_in(pile, &sources, signer, &auxiliaries, runtime, prepare)
         })
     }
 
@@ -265,9 +263,10 @@ impl WikiStorage<'_> {
     #[cfg(feature = "local-embed")]
     fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer, runtime| {
-            let collection = open_configured_acquiring(
-                pile, scope, signer.verifying_key(), runtime,
-            )?;
+            // The target names the Wiki; another faculty's collection takes
+            // its own default.
+            let collection =
+                write_target_acquiring(pile, scope, signer.verifying_key(), None, runtime)?;
             let commit = pile
                 .commit(collection, signer, fragment)
                 .context("publish native collection fragment")?;
@@ -281,11 +280,13 @@ impl WikiStorage<'_> {
     }
 
     fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
+        let target = self.storage.target();
         self.with_pile(|pile, signer, runtime| {
-            let collection = open_configured_acquiring(
+            let collection = write_target_acquiring(
                 pile,
                 schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
+                target,
                 runtime,
             )?;
             crate::collection_names::require_command_write_admission_acquiring(
@@ -319,28 +320,23 @@ impl WikiStorage<'_> {
 /// entry's history, which is what a monotone store is for.
 fn views_in<T>(
     pile: &mut FacultyStore,
-    wiki_source: Collection<blobencodings::SimpleArchive>,
+    wiki_sources: &[Collection<blobencodings::SimpleArchive>],
     _signer: &ed25519_dalek::SigningKey,
-    scopes: &[(Collection<blobencodings::SimpleArchive>, &str)],
+    scopes: &[(Vec<Collection<blobencodings::SimpleArchive>>, &str)],
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     mut prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
 ) -> Result<T> {
-    let wiki_succinct = pile
-        .attach::<SuccinctArchiveBlob>(wiki_source, ())
-        .context("register Wiki Succinct collection")?;
-    let wiki_rank9 = pile
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(wiki_source, wiki_succinct)
-        .context("register Wiki Rank9 collection")?;
-    let latest = wiki_model::latest_for_source(pile, wiki_source)?;
+    let wiki_rank9 = crate::storage::rank9_union(pile, wiki_sources)
+        .context("register the Wiki fact collections")?;
+    let latest = wiki_sources
+        .iter()
+        .map(|source| wiki_model::latest_for_source(pile, *source))
+        .collect::<Result<Vec<_>>>()?;
     let mut auxiliaries = Vec::with_capacity(scopes.len());
-    for &(source, label) in scopes {
-        let succinct = pile
-            .attach::<SuccinctArchiveBlob>(source, ())
-            .with_context(|| format!("register {label} Succinct collection"))?;
-        let rank9 = pile
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-            .with_context(|| format!("register {label} Rank9 collection"))?;
-        auxiliaries.push((rank9, label));
+    for (sources, label) in scopes {
+        let rank9 = crate::storage::rank9_union(pile, sources)
+            .with_context(|| format!("register the {label} fact collections"))?;
+        auxiliaries.push((rank9, *label));
     }
     // Facts and latest are selected at one store boundary; their fixed
     // residuals are read below without running publication or maintenance.
@@ -348,30 +344,32 @@ fn views_in<T>(
         .snapshot()
         .context("freeze Wiki and auxiliary snapshot")?;
     let acquiring = AcquiringReader::new(reader.clone(), runtime.clone());
-    let observed_facts = acquiring
-        .attached_acquiring(wiki_rank9)
-        .context("observe Wiki fact collection")?;
-    let observed_latest = acquiring
-        .attached_acquiring(latest)
-        .context("observe Wiki supersession index")?;
     // This is the history this observation knows, not a globally complete
     // history. Read every selected foundation or report its missing bytes;
     // never silently turn a selected-but-unread foundation into absence.
     // An unseen later commit can still branch an edit's history. The edit
     // ensures its own images after it commits.
-    let facts = crate::storage::acquire_attached_facts(&observed_facts)
+    let facts = crate::storage::acquire_union_facts(&acquiring, &wiki_rank9)
         .context("read Wiki fact collection")?;
     // The index over the same foundations the facts read: a revision no
-    // attachment reaches yet is built in memory.
-    let latest = crate::storage::require_complete_attached_read(
-        observed_latest
-            .read_acquiring::<LatestIndex>()
-            .context("read Wiki supersession index")?,
-    )?;
+    // attachment reaches yet is built in memory. Across collections it is
+    // their union, so a revision any of them supersedes is not live.
+    let mut union = LatestIndex::default();
+    for latest in latest {
+        let observed = acquiring
+            .attached_acquiring(latest)
+            .context("observe Wiki supersession index")?;
+        union = union.union(&crate::storage::require_complete_attached_read(
+            observed
+                .read_acquiring::<LatestIndex>()
+                .context("read Wiki supersession index")?,
+        )?);
+    }
+    let latest = union;
     let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
     for (rank9, label) in &auxiliaries {
         auxiliary_facts.push(
-            crate::storage::acquire_facts(&acquiring, *rank9)
+            crate::storage::acquire_union_facts(&acquiring, rank9)
                 .with_context(|| format!("read {label} fact collection"))?,
         );
     }
@@ -2143,7 +2141,7 @@ mod tests {
             .storage
             .with_pile(|pile, signer| {
                 let source =
-                    open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                    crate::collection_names::open(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 Ok((
@@ -2253,7 +2251,7 @@ mod tests {
         let owner_read = || {
             storage
                 .with_pile(|pile, signer, runtime| {
-                    views_in(pile, source, signer, &[], runtime, |view, _| {
+                    views_in(pile, &[source], signer, &[], runtime, |view, _| {
                         Ok(view.clone())
                     })
                 })
@@ -2377,9 +2375,9 @@ mod tests {
                 .with_pile(|pile, signer, runtime| {
                     views_in(
                         pile,
-                        source,
+                        &[source],
                         signer,
-                        &[(auxiliary, "Files")],
+                        &[(vec![auxiliary], "Files")],
                         runtime,
                         |view, auxiliaries| {
                             let entry = wiki_model::entry(&view.facts, &view.latest, root).unwrap();
@@ -2441,9 +2439,9 @@ mod tests {
 
                     let error = views_in(
                         pile,
-                        source,
+                        &[source],
                         signer,
-                        &[(auxiliary, "Files")],
+                        &[(vec![auxiliary], "Files")],
                         runtime,
                         |_, _| -> Result<()> {
                             panic!("an incomplete observation must not reach the reader")
@@ -2565,7 +2563,7 @@ mod tests {
                     if let Some(arrival) = arrival.take() {
                         let signer = load_signer(&fixture.pile, Some(&fixture.key))?;
                         let mut writer = crate::storage::open_pile_strict(&fixture.pile)?;
-                        let source = open_configured(
+                        let source = crate::collection_names::open(
                             &mut writer,
                             schema::DEFAULT_SCOPE_ID,
                             signer.verifying_key(),

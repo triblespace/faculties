@@ -95,7 +95,7 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
     use std::collections::BTreeSet;
     use std::process::Command;
 
-    use faculties::collection_names::{open, override_env_name};
+    use faculties::collection_names::open;
     use faculties::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
     use faculties::schemas::memory::DEFAULT_SCOPE_ID;
     use faculties::storage::Storage;
@@ -103,8 +103,8 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
     use triblespace::core::collection::{
-        CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
-        CollectionStoreExt,
+        grant_collection_read, CollectionRead, CollectionRecord, CollectionSnapshotExt,
+        CollectionStore, CollectionStoreExt,
     };
     use triblespace::core::metadata;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
@@ -116,7 +116,7 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
     let reader_key = fixture.directory.path().join("reader.key");
     let reader = initialize_signer(&fixture.pile, Some(&reader_key)).unwrap();
     let storage = Storage::new(fixture.pile.clone(), Some(fixture.key.clone()));
-    let (source, cold, before, warm_id) = storage
+    let (cold, before, warm_id) = storage
         .with_pile(|pile, owner| {
             assert_ne!(reader.verifying_key(), owner.verifying_key());
             let source = open(pile, DEFAULT_SCOPE_ID, owner.verifying_key())?;
@@ -166,23 +166,21 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
             drop(root);
             assert!(!source.writer_is_admitted(&snapshot, reader.verifying_key())?);
             assert_eq!(snapshot.wants()?.count(), 0);
+            drop(snapshot);
+            // READ is what puts the owner's Memory in the reader's reads.
+            grant_collection_read(pile, source.handle(), owner, reader.verifying_key())?;
+            let snapshot = pile.snapshot()?;
             let before = snapshot.records()?.collect::<Result<Vec<_>, _>>()?;
-            Ok((source, cold, before, warm_id))
+            Ok((cold, before, warm_id))
         })
         .unwrap();
 
-    // The override belongs only to this child. Both keys address exactly the
-    // same resident descriptors, without a process-global environment change.
     let output = Command::new(env!("CARGO_BIN_EXE_memory"))
         .arg("--pile")
         .arg(&fixture.pile)
         .arg("--key")
         .arg(&reader_key)
         .arg(format!("{warm_id:x}"))
-        .env(
-            override_env_name(DEFAULT_SCOPE_ID),
-            hex::encode(source.handle().raw),
-        )
         .env_remove("DRIVE_ENDPOINT")
         .output()
         .unwrap();

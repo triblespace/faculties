@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use anybytes::Bytes;
 use anyhow::Result;
 use clap::Parser;
-use faculties::collection_names::open_configured;
+use faculties::collection_names::open;
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::message::{
     cli, mcp, AckAllOptions, ListOptions, Message, MessageStatus, MessageText, Recipient,
@@ -101,7 +101,7 @@ impl Fixture {
         let before = fs::metadata(&self.pile).unwrap().len();
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
-        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let source = open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
@@ -148,8 +148,6 @@ impl Fixture {
             "DRIVE_KEY",
             "PERSONA",
             "TRIBLESPACE_PEERS",
-            "TRIBLESPACE_COLLECTION_MESSAGE",
-            "TRIBLESPACE_COLLECTION_RELATIONS",
         ] {
             command.env_remove(variable);
         }
@@ -178,8 +176,7 @@ impl Fixture {
     fn message_commits(&self) -> usize {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
-        let collection =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let collection = open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let count = collection
             .admitted(&pile.snapshot().unwrap())
             .unwrap()

@@ -38,7 +38,8 @@ impl HealthSources {
         signer: &SigningKey,
         max_age: Duration,
     ) -> Result<Self> {
-        let health = OrientSource::open(pile, signer, schema::DEFAULT_SCOPE_ID, "Swarm health").await?;
+        let health =
+            OrientSource::open(pile, signer, schema::DEFAULT_SCOPE_ID, "Swarm health").await?;
         let relations = OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
         let mut local = pile.store();
         let presentations = ReceiptSource::register(&mut *local, signer)?;
@@ -132,12 +133,16 @@ impl HealthSources {
             let observe = |source: OrientSource| -> Result<OrientFact> {
                 let collection = reader.attached_acquiring(source.rank9)?;
                 let view = crate::storage::acquire_attached_facts(&collection)?;
-                Ok(OrientFact { collection: collection.into_frozen(), view })
+                Ok(OrientFact {
+                    collection: collection.into_frozen(),
+                    view,
+                })
             };
             let latest_collection = reader.attached_acquiring(latest_target)?;
             let latest = crate::storage::require_complete_attached_read(
                 latest_collection.read_acquiring::<LwwIndex>()?,
-            )?.query()?;
+            )?
+            .query()?;
             let presentations = reader.attached(presentations_target)?;
             Ok(HealthObservation {
                 snapshot,
@@ -158,7 +163,9 @@ impl HealthSources {
                 },
                 max_age,
             })
-        }).await.context("join frozen health input selection")?
+        })
+        .await
+        .context("join frozen health input selection")?
     }
 
     fn maintain_if_changed(
@@ -374,13 +381,20 @@ impl HealthObservation {
         tokio::task::spawn_blocking(move || {
             let reader = crate::storage::AcquiringReader::with_handle(snapshot, runtime);
             render_health(&facts, &latest, &reader, now, max_age, Detail::Full)
-        }).await.context("join requested health report acquisition")
+        })
+        .await
+        .context("join requested health report acquisition")
     }
 
-    pub(super) async fn persona_acquiring(&self, pile: &mut FacultyStore, input: &str) -> Result<Id> {
+    pub(super) async fn persona_acquiring(
+        &self,
+        pile: &mut FacultyStore,
+        input: &str,
+    ) -> Result<Id> {
         read(pile, &self.snapshot, |reader| {
             resolve_resident_persona(self.relations.view(), reader, input)
-        }).await
+        })
+        .await
     }
 
     fn is_current(&self, snapshot: &FacultySnapshot) -> bool {
@@ -885,8 +899,12 @@ mod tests {
             // Test-only author, never a live transport or pile identity.
             let signer = SigningKey::from_bytes(&[71; 32]);
             let mut store = open_store_as(&path, signer.verifying_key()).unwrap();
-            let sources =
-                test_block_on(HealthSources::open(&mut store, &signer, Duration::from_secs(60))).unwrap();
+            let sources = test_block_on(HealthSources::open(
+                &mut store,
+                &signer,
+                Duration::from_secs(60),
+            ))
+            .unwrap();
             Self {
                 store,
                 sources,
@@ -1159,7 +1177,11 @@ mod tests {
     fn foreground_dashboard_needs_no_historical_receipt_shards() {
         let mut f = Fixture::new();
         test_block_on(async {
-            let observation = f.sources.observe_acquiring(&mut f.store, &f.signer).await.unwrap();
+            let observation = f
+                .sources
+                .observe_acquiring(&mut f.store, &f.signer)
+                .await
+                .unwrap();
             let report = observation.report_acquiring().await.unwrap();
             assert!(report.text.contains("not observed / not configured"));
             assert!(report.attention.is_empty());
@@ -1375,8 +1397,12 @@ mod tests {
 
         // A new watcher has no process-local receipt state to lean on. Its
         // first poll carries the committed receipt through the ordinary set.
-        let mut rearmed =
-            test_block_on(HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60))).unwrap();
+        let mut rearmed = test_block_on(HealthSources::open(
+            &mut f.store,
+            &f.signer,
+            Duration::from_secs(60),
+        ))
+        .unwrap();
         parts.clear();
         let mut emit = |part| {
             parts.push(part);
@@ -1451,8 +1477,12 @@ mod tests {
         assert!(fired);
         assert!(!text.contains("not refreshed"), "{text}");
 
-        let mut rearmed =
-            test_block_on(HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60))).unwrap();
+        let mut rearmed = test_block_on(HealthSources::open(
+            &mut f.store,
+            &f.signer,
+            Duration::from_secs(60),
+        ))
+        .unwrap();
         let (fired, text) = poll(&mut rearmed, &mut f.store);
         assert!(!fired, "a delivered report must not repeat: {text}");
         assert!(text.is_empty(), "{text}");
@@ -1636,7 +1666,8 @@ mod tests {
             .put::<blobencodings::UTF8String, _>("unrelated hydrated payload".to_owned())
             .unwrap();
         let unrelated =
-            open_configured(&mut f.store, MESSAGE_SCOPE_ID, f.signer.verifying_key()).unwrap();
+            crate::collection_names::open(&mut f.store, MESSAGE_SCOPE_ID, f.signer.verifying_key())
+                .unwrap();
         f.store
             .commit(
                 unrelated,
@@ -2111,7 +2142,8 @@ mod tests {
             }
             + entity! { metadata::tag: &schema::KIND_REPORT };
         let unrelated =
-            open_configured(&mut f.store, MESSAGE_SCOPE_ID, f.signer.verifying_key()).unwrap();
+            crate::collection_names::open(&mut f.store, MESSAGE_SCOPE_ID, f.signer.verifying_key())
+                .unwrap();
         f.store.commit(unrelated, &f.signer, facts.clone()).unwrap();
         assert!(f
             .observe_at(at(1.0))

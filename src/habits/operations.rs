@@ -6,17 +6,17 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured;
 use crate::habits::{self, DeclaredState, Habit, State};
 use crate::schemas::habit::{Condition, DEFAULT_SCOPE_ID};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionCommit, CollectionHandle, CollectionStoreExt};
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
@@ -88,10 +88,7 @@ impl Habits {
             .map_err(anyhow::Error::msg)?
             .cooldown_secs;
         let carried = script.map(|bytes| (habits::script_digest(bytes), bytes.len()));
-        let needs_relations = !personas
-            .iter()
-            .all(|input| Id::from_hex(input.trim()).is_some());
-        with_habits(&self.storage, needs_relations, |session| {
+        with_habits(&self.storage, |session| {
             // Exact ids need no Relations membership. Resolve labels only when
             // the caller supplied them; an omitted audience stays global.
             let mut targets = Vec::new();
@@ -105,30 +102,23 @@ impl Habits {
                         .filter_map(|input| Id::from_hex(input.trim())),
                 );
             } else {
-                let source = open_configured(
+                let sources = crate::collection_names::read_union_acquiring(
                     session.pile,
                     crate::schemas::relations::DEFAULT_SCOPE_ID,
                     session.signer.verifying_key(),
+                    session.runtime,
                 )?;
-                let succinct = session.pile.attach::<SuccinctArchiveBlob>(source, ())?;
-                let rank9 = session
-                    .pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+                let pairs = crate::storage::fact_pairs(session.pile, &sources)?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and a persona the views lack is lag.
-                session.runtime.block_on(async {
-                    crate::storage::tolerate_own_lag(
-                        session
-                            .pile
-                            .maintain_attached(succinct, session.signer)
-                            .await,
-                    )?;
-                    crate::storage::tolerate_own_lag(
-                        session.pile.maintain_attached(rank9, session.signer).await,
-                    )
-                })?;
+                session.runtime.block_on(crate::storage::maintain_fact_pairs(
+                    session.pile,
+                    &pairs,
+                    session.signer,
+                ))?;
+                let rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
                 let snapshot = AcquiringReader::new(session.pile.snapshot()?, session.runtime.clone());
-                let facts = crate::storage::acquire_facts(&snapshot, rank9)?;
+                let facts = crate::storage::acquire_union_facts(&snapshot, &rank9)?;
                 for input in personas {
                     let input = input.trim();
                     targets.push(match Id::from_hex(input) {
@@ -184,7 +174,7 @@ impl Habits {
     }
     /// Inspect one exact definition or unambiguous label; history stays readable.
     pub fn show(&self, selector: &str) -> Result<HabitObservation> {
-        with_habits(&self.storage, false, |session| {
+        with_habits(&self.storage, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let definition = select_habit(&definitions, selector)?.clone();
             Ok(HabitObservation {
@@ -197,7 +187,7 @@ impl Habits {
     /// true, stored predicates run in the pile directory after the frozen
     /// observation has been acquired and storage closed.
     pub fn list(&self, evaluate_conditions: bool) -> Result<HabitList> {
-        let (rows, superseded) = with_habits(&self.storage, false, |session| {
+        let (rows, superseded) = with_habits(&self.storage, |session| {
             let rows = habits::rows(&session.reader, &session.facts)?;
             let ids = habits::definition_ids(&session.facts);
             let superseded = habits::superseded_definition_ids(&session.facts);
@@ -220,7 +210,7 @@ impl Habits {
         })
     }
     pub fn done(&self, selector: &str) -> Result<HabitOccurrence> {
-        with_habits(&self.storage, false, |session| {
+        with_habits(&self.storage, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let superseded = habits::superseded_definition_ids(&session.facts);
             let habit = select_live_habit(&definitions, &superseded, selector)?.clone();
@@ -234,7 +224,7 @@ impl Habits {
         })
     }
     pub fn set_state(&self, selector: &str, state: DeclaredState) -> Result<HabitStateChange> {
-        with_habits(&self.storage, false, |session| {
+        with_habits(&self.storage, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let superseded = habits::superseded_definition_ids(&session.facts);
             let habit = select_live_habit(&definitions, &superseded, selector)?.clone();
@@ -276,7 +266,7 @@ impl Habits {
 struct HabitSession<'a> {
     pile: &'a mut FacultyStore,
     runtime: &'a std::sync::Arc<tokio::runtime::Runtime>,
-    collection: Collection<SimpleArchive>,
+    target: Option<CollectionHandle>,
     signer: &'a SigningKey,
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
@@ -284,18 +274,25 @@ struct HabitSession<'a> {
 
 impl HabitSession<'_> {
     fn commit(&mut self, fragment: Fragment) -> Result<CollectionCommit> {
+        let collection = crate::collection_names::write_target_acquiring(
+            self.pile,
+            DEFAULT_SCOPE_ID,
+            self.signer.verifying_key(),
+            self.target,
+            self.runtime,
+        )?;
         crate::collection_names::require_command_write_admission_acquiring(
             self.pile,
-            self.collection,
+            collection,
             self.signer,
             "Habit",
             "habit list",
             self.runtime,
         )?;
-        let commit = self.pile.commit(self.collection, self.signer, fragment)
+        let commit = self.pile.commit(collection, self.signer, fragment)
             .context("commit Habit fragment")?;
         self.runtime.block_on(crate::storage::ensure_downstream(
-            self.pile, self.collection, self.signer,
+            self.pile, collection, self.signer,
         ))
         .context("Habit facts were committed, but ensuring their derived views failed")?;
         Ok(commit)
@@ -326,32 +323,25 @@ pub(super) fn commit_habit_fragment(
 
 fn with_habits<T>(
     storage: &Storage,
-    needs_relations: bool,
     operation: impl FnOnce(&mut HabitSession<'_>) -> Result<T>,
 ) -> Result<T> {
+    let target = storage.target();
     storage.with_store(|store, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
+        let sources = crate::collection_names::read_union_acquiring(
             store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
         )?;
-        if needs_relations {
-            crate::collection_names::open_configured_acquiring(
-                store, crate::schemas::relations::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
-            )?;
-        }
         let pile = store;
-        let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-        let maintained_rank9 =
-            pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, maintained_succinct)?;
+        let maintained_rank9 = crate::storage::rank9_union(pile, &sources)?;
         let reader = AcquiringReader::new(
             pile.snapshot().context("freeze Habit fact collection")?,
             runtime.clone(),
         );
-        let facts = crate::storage::acquire_facts(&reader, maintained_rank9)
+        let facts = crate::storage::acquire_union_facts(&reader, &maintained_rank9)
             .context("read maintained Habit fact collection")?;
         operation(&mut HabitSession {
             pile,
             runtime,
-            collection,
+            target,
             signer,
             facts,
             reader,
@@ -495,7 +485,7 @@ mod tests {
         habits::publish(&pile, Some(&key), successor).unwrap();
 
         let storage = Storage::new(pile.clone(), Some(key.clone()));
-        let (definitions, superseded) = with_habits(&storage, false, |session| {
+        let (definitions, superseded) = with_habits(&storage, |session| {
             Ok((
                 habits::definitions(&session.reader, &session.facts)?,
                 habits::superseded_definition_ids(&session.facts),

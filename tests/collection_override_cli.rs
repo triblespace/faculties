@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use ed25519_dalek::SigningKey;
@@ -21,7 +21,7 @@ struct TestPile {
 
 impl TestPile {
     fn new() -> Self {
-        let directory = tempfile::tempdir().expect("create collection override fixture");
+        let directory = tempfile::tempdir().expect("create collection target fixture");
         let pile = directory.path().join("shared.pile");
         let tenant_key = directory.path().join("tenant.key");
         fs::File::create(&pile).expect("create pile");
@@ -33,24 +33,56 @@ impl TestPile {
             tenant_key,
         }
     }
+
+    fn key(&self, name: &str) -> PathBuf {
+        let key = self._directory.path().join(name);
+        faculties::storage::initialize_signer(&self.pile, Some(&key)).expect("initialize signer");
+        key
+    }
 }
 
-fn run_relations(fixture: &TestPile, collection: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_relations"))
+fn relations(fixture: &TestPile, key: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_relations"));
+    command
         .arg("--pile")
         .arg(&fixture.pile)
         .arg("--key")
-        .arg(&fixture.tenant_key)
-        .arg("add")
-        .arg("Ada")
-        .env("TRIBLESPACE_COLLECTION_RELATIONS", collection)
-        .env_remove("TRIBLESPACE_PEERS")
-        .output()
-        .expect("run relations")
+        .arg(key)
+        .env_remove("TRIBLESPACE_PEERS");
+    command
+}
+
+fn succeeded(output: Output) -> Output {
+    assert!(
+        output.status.success(),
+        "relations failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    output
+}
+
+/// The collections the commits in `pile` went to, one entry per commit, in
+/// byte order.
+fn committed_to(pile: &Path) -> Vec<[u8; 32]> {
+    let mut pile = Pile::open(pile).expect("open fixture pile");
+    let mut collections: Vec<_> = pile
+        .snapshot()
+        .expect("freeze fixture pile")
+        .records()
+        .expect("read records")
+        .map(|record| record.expect("decode record"))
+        .filter_map(|record| match record {
+            CollectionRecord::Commit(commit) => Some(commit.collection().raw),
+            _ => None,
+        })
+        .collect();
+    pile.close().expect("close fixture pile");
+    collections.sort_unstable();
+    collections
 }
 
 #[test]
-fn configured_collection_retains_offline_cli_commit_until_write_is_granted() {
+fn a_named_target_retains_an_offline_cli_commit_until_write_is_granted() {
     let fixture = TestPile::new();
     let root = SigningKey::from_bytes(&[0x41; 32]);
     let tenant = faculties::storage::load_signer(&fixture.pile, Some(&fixture.tenant_key))
@@ -68,19 +100,11 @@ fn configured_collection_retains_offline_cli_commit_until_write_is_granted() {
 
     // Local publication retains a signed claim even without present WRITE
     // admission. Admission is a property of the reader's frozen evidence.
-    let published = run_relations(&fixture, &handle);
-    eprintln!(
-        "fixture CLI stdout: {}",
-        String::from_utf8_lossy(&published.stdout)
-    );
-    eprintln!(
-        "fixture CLI stderr: {}",
-        String::from_utf8_lossy(&published.stderr)
-    );
-    assert!(
-        published.status.success(),
-        "local publication failed: {}",
-        String::from_utf8_lossy(&published.stderr),
+    succeeded(
+        relations(&fixture, &fixture.tenant_key)
+            .args(["--target", &handle, "add", "Ada"])
+            .output()
+            .expect("run relations"),
     );
 
     let mut pile = Pile::open(&fixture.pile).expect("reopen fixture pile");
@@ -107,7 +131,6 @@ fn configured_collection_retains_offline_cli_commit_until_write_is_granted() {
         .expect("observe collection before the grant");
     assert!(unadmitted.support().unwrap().is_empty());
     assert!(unadmitted.cover().is_empty());
-    eprintln!("before grant: retained_commits=1 admitted_members=0");
 
     grant_collection_write(
         &mut pile,
@@ -126,23 +149,85 @@ fn configured_collection_retains_offline_cli_commit_until_write_is_granted() {
     assert!(admitted.support().unwrap().contains(member));
     assert_eq!(admitted.cover().len(), 1);
     assert!(admitted.cover().contains(member));
-    assert!(after
-        .records()
-        .expect("read post-grant collection records")
-        .map(|record| record.expect("decode post-grant record"))
-        .filter_map(|record| match record {
-            CollectionRecord::Commit(commit) => Some(commit),
-            _ => None,
-        })
-        .eq(std::iter::once(original)));
     assert!(frozen
         .collection(collection)
         .expect("reobserve the frozen pre-grant evidence")
         .support()
         .unwrap()
         .is_empty());
-    assert!(unadmitted.support().unwrap().is_empty());
-    assert!(unadmitted.cover().is_empty());
-    eprintln!("after grant: retained_commits=1 admitted_members=1");
     pile.close().expect("close granted fixture pile");
+}
+
+/// The variables that used to select a faculty's collection are ignored: a
+/// shell carrying one reads and writes exactly what a clean shell does.
+#[test]
+fn collection_environment_variables_change_nothing() {
+    let fixture = TestPile::new();
+    let other_key = fixture.key("other.key");
+    let tenant = faculties::storage::load_signer(&fixture.pile, Some(&fixture.tenant_key))
+        .expect("load tenant signer");
+    let other = faculties::storage::load_signer(&fixture.pile, Some(&other_key))
+        .expect("load other signer");
+
+    succeeded(
+        relations(&fixture, &fixture.tenant_key)
+            .args(["add", "Ada"])
+            .output()
+            .expect("run relations"),
+    );
+    succeeded(
+        relations(&fixture, &other_key)
+            .args(["add", "Bob"])
+            .output()
+            .expect("run relations"),
+    );
+    let mut pile = Pile::open(&fixture.pile).expect("open fixture pile");
+    let mine = faculties::collection_names::open(
+        &mut pile,
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+        tenant.verifying_key(),
+    )
+    .expect("the tenant's relations");
+    let theirs = faculties::collection_names::open(
+        &mut pile,
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+        other.verifying_key(),
+    )
+    .expect("the other key's relations");
+    pile.close().expect("close fixture pile");
+    let mut expected = vec![mine.handle().raw, theirs.handle().raw];
+    expected.sort_unstable();
+    assert_eq!(committed_to(&fixture.pile), expected);
+
+    let stale = |command: &mut Command| {
+        command
+            .env(
+                "TRIBLESPACE_COLLECTION_RELATIONS",
+                hex::encode(theirs.handle().raw),
+            )
+            .env("TRIBLESPACE_COLLECTION_WIKI", "not even a handle");
+    };
+    let clean = succeeded(
+        relations(&fixture, &fixture.tenant_key)
+            .arg("list")
+            .output()
+            .expect("run relations"),
+    );
+    let mut with_environment = relations(&fixture, &fixture.tenant_key);
+    stale(&mut with_environment);
+    let with_environment = succeeded(with_environment.arg("list").output().expect("run"));
+    assert_eq!(with_environment.stdout, clean.stdout);
+    assert!(String::from_utf8_lossy(&clean.stdout).contains("Ada"));
+    assert!(!String::from_utf8_lossy(&clean.stdout).contains("Bob"));
+
+    let mut write = relations(&fixture, &fixture.tenant_key);
+    stale(&mut write);
+    succeeded(write.args(["add", "Cy"]).output().expect("run relations"));
+    expected.push(mine.handle().raw);
+    expected.sort_unstable();
+    assert_eq!(
+        committed_to(&fixture.pile),
+        expected,
+        "the write goes to the default target, not the collection the variable names"
+    );
 }

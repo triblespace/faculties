@@ -24,6 +24,11 @@ pub struct Cli {
     /// Existing durable signing-key file. Reads and writes never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     /// Daemon base URL
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
@@ -138,10 +143,17 @@ pub fn main() -> Result<()> {
     }
     crate::cli::with_output("body", |out| execute(cli, out))
 }
-fn storage(pile: Option<PathBuf>, key: Option<PathBuf>) -> Result<Body> {
-    Ok(Body::new(
-        pile.context("this command requires --pile (or PILE); hardware-only commands do not")?,
-        key,
+fn storage(
+    pile: Option<PathBuf>,
+    key: Option<PathBuf>,
+    target: Option<triblespace::core::collection::CollectionHandle>,
+) -> Result<Body> {
+    Ok(Body::with_storage(
+        crate::storage::Storage::new(
+            pile.context("this command requires --pile (or PILE); hardware-only commands do not")?,
+            key,
+        )
+        .with_target(target),
     ))
 }
 fn seconds(value: f64) -> Result<Duration> {
@@ -166,7 +178,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             out.line(name.to_lowercase())
         }
         Some(Command::Intent { text }) => {
-            let body = storage(cli.pile, cli.key)?;
+            let body = storage(cli.pile, cli.key, cli.target)?;
             if let Some(text) = text {
                 presentation::intent_set(&body.set_intent(&text)?, out)
             } else {
@@ -179,12 +191,12 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             }
         }
         Some(Command::Look { note }) => presentation::captured(
-            &device.look(&storage(cli.pile, cli.key)?, note.as_deref())?,
+            &device.look(&storage(cli.pile, cli.key, cli.target)?, note.as_deref())?,
             out,
         ),
-        Some(Command::List) => presentation::list(&storage(cli.pile, cli.key)?.list()?, out),
+        Some(Command::List) => presentation::list(&storage(cli.pile, cli.key, cli.target)?.list()?, out),
         Some(Command::Get { id, output }) => {
-            let export = storage(cli.pile, cli.key)?.get(&id)?;
+            let export = storage(cli.pile, cli.key, cli.target)?.get(&id)?;
             if output.as_deref() == Some("@-") {
                 let uri = export.uri();
                 out.blob(export.bytes, "application/octet-stream", uri)
@@ -268,7 +280,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             note,
         }) => {
             let body = if keep {
-                Some(storage(cli.pile, cli.key)?)
+                Some(storage(cli.pile, cli.key, cli.target)?)
             } else {
                 None
             };

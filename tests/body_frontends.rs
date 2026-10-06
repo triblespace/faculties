@@ -40,7 +40,7 @@ impl Fixture {
     fn commits(&self) -> usize {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
-        let source = faculties::collection_names::open_configured(
+        let source = faculties::collection_names::open(
             &mut pile,
             faculties::schemas::body::DEFAULT_SCOPE_ID,
             signer.verifying_key(),

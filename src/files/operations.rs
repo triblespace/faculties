@@ -7,7 +7,9 @@
 pub mod wemm;
 
 use crate::clock;
-use crate::collection_names::{configured_handle, open, open_configured_acquiring};
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
+#[cfg(test)]
+use crate::collection_names::open;
 #[cfg(test)]
 use crate::collection_names::open_exact_in;
 use crate::files as file_capability;
@@ -31,6 +33,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -247,13 +250,15 @@ fn with_files_store<T>(
 ) -> Result<T> {
     // Authority is durable and explicit: ordinary Files commands never mint a
     // new signer and never fall back to an ephemeral identity.
+    let target = storage.target();
     storage.with_store(|store, signer, runtime| {
-        let collection = if configured_handle(DEFAULT_SCOPE_ID)?.is_some() {
-            open_configured_acquiring(store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?
-        } else {
-            open(store, DEFAULT_SCOPE_ID, signer.verifying_key())
-                .context("register signer-private Files descriptor")?
-        };
+        let collection = write_target_acquiring(
+            store,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            target,
+            runtime,
+        )?;
         f(store, collection, signer, runtime)
     })
 }
@@ -292,41 +297,54 @@ fn with_files_view<T>(
     ) -> Result<T>,
 ) -> Result<T> {
     with_files_store(storage, |store, collection, signer, runtime| {
-        files_view_in(store, collection, signer, runtime, f)
+        let sources =
+            read_union_acquiring(store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+        files_view_in(store, &sources, runtime, |store, facts, snapshot, runtime| {
+            f(store, collection, signer, facts, snapshot, runtime)
+        })
     })
 }
 
-/// Attach the Files views of one already-opened source collection; see
-/// [`with_files_view`] for the maintenance rule.
-fn files_view_in<T>(
-    store: &mut FacultyStore,
-    collection: Collection<SimpleArchive>,
-    signer: &SigningKey,
-    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+/// [`with_files_view`] for a command that only reads: it chooses no write
+/// target, so a pile whose default target is ambiguous still reads.
+fn with_files_read<T>(
+    storage: &Storage,
     f: impl FnOnce(
         &mut FacultyStore,
-        Collection<SimpleArchive>,
-        &SigningKey,
         &FactArchive,
         &FacultySnapshot,
         &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<T>,
 ) -> Result<T> {
-    {
-        let succinct = store
-            .attach::<SuccinctArchiveBlob>(collection, ())
-            .context("register Files Succinct collection")?;
-        let rank9 = store
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, succinct)
-            .context("register Files Rank9 collection")?;
-        let reader = store
-            .snapshot()
-            .context("freeze the Files views as they stand")?;
-        let acquiring = AcquiringReader::new(reader.clone(), runtime.clone());
-        let space = crate::storage::acquire_facts(&acquiring, rank9)
-            .context("read Files fact collection")?;
-        f(store, collection, signer, &space, &reader, runtime)
-    }
+    storage.with_store(|store, signer, runtime| {
+        let sources =
+            read_union_acquiring(store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+        files_view_in(store, &sources, runtime, f)
+    })
+}
+
+/// Attach the Files views of a read-union's collections as one fact
+/// archive; see [`with_files_view`] for the maintenance rule.
+fn files_view_in<T>(
+    store: &mut FacultyStore,
+    sources: &[Collection<SimpleArchive>],
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    f: impl FnOnce(
+        &mut FacultyStore,
+        &FactArchive,
+        &FacultySnapshot,
+        &std::sync::Arc<tokio::runtime::Runtime>,
+    ) -> Result<T>,
+) -> Result<T> {
+    let rank9 =
+        crate::storage::rank9_union(store, sources).context("register the Files fact collections")?;
+    let reader = store
+        .snapshot()
+        .context("freeze the Files views as they stand")?;
+    let acquiring = AcquiringReader::new(reader.clone(), runtime.clone());
+    let space = crate::storage::acquire_union_facts(&acquiring, &rank9)
+        .context("read Files fact collection")?;
+    f(store, &space, &reader, runtime)
 }
 
 // ── tree builder ─────────────────────────────────────────────────────────
@@ -2536,7 +2554,7 @@ impl Files {
 
     /// Original payload only: neither MIME nor filename is needed for export.
     pub fn get(&self, id: &str) -> Result<Export> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             load_export(store, rt, facts, snapshot, id)
         })
     }
@@ -2547,14 +2565,14 @@ impl Files {
         options: &super::presentation::ViewOptions,
     ) -> Result<crate::out::Part> {
         options.validate()?;
-        let selected = with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        let selected = with_files_read(&self.storage, |store, facts, snapshot, rt| {
             load_view(store, rt, facts, snapshot, id)
         })?;
         super::presentation::present(selected.bytes, &selected.mime_type, options)
     }
 
     pub fn extract(&self, id: &str, destination: Option<&Path>) -> Result<Extraction> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             prepare_extraction(store, rt, facts, snapshot, id, destination)
         })
     }
@@ -2597,7 +2615,7 @@ impl Files {
     }
 
     pub fn list(&self, tags: &[String], mime: Option<&str>) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| {
                 cmd_list(facts, reader, tags, mime)
             }))
@@ -2605,7 +2623,7 @@ impl Files {
     }
 
     pub fn show(&self, id: &str) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| cmd_show(facts, reader, id)))
         })
     }
@@ -2640,7 +2658,7 @@ impl Files {
     }
 
     pub fn search(&self, query: &str) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| {
                 cmd_search(facts, reader, query)
             }))
@@ -2729,13 +2747,13 @@ impl Files {
     }
 
     pub fn imports(&self) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| cmd_imports(facts, reader)))
         })
     }
 
     pub fn tree(&self, id: &str, depth: Option<usize>) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| {
                 cmd_tree(facts, reader, id, depth)
             }))
@@ -2748,7 +2766,7 @@ impl Files {
         &self,
         selectors: &[String],
     ) -> Result<Vec<Result<file_capability::FileReference>>> {
-        with_files_view(&self.storage, |_, _, _, facts, _, _| {
+        with_files_read(&self.storage, |_, facts, _, _| {
             Ok(selectors
                 .iter()
                 .map(|selector| file_capability::resolve_reference(facts, selector))
@@ -2757,7 +2775,7 @@ impl Files {
     }
 
     pub fn diff(&self, left: &str, right: &str) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        with_files_read(&self.storage, |store, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| {
                 cmd_diff(facts, reader, left, right)
             }))
@@ -3806,7 +3824,7 @@ mod tests {
     fn empty_native_collection_opens_as_an_empty_catalog() {
         let test_pile = TestPile::new();
         let storage = Storage::new(test_pile.path.clone(), None);
-        with_files_view(&storage, |_, _, _, space, _reader, _rt| {
+        with_files_read(&storage, |_, space, _reader, _rt| {
             assert!(find!(
                 id: Id,
                 pattern!(space, [{ ?id @ metadata::tag: _?kind }])
@@ -3852,7 +3870,7 @@ mod tests {
         .unwrap();
         // A read maintains nothing: it takes the attachment of the carried
         // commit and reads the uncarried one from its own bytes.
-        with_files_view(&owner, |_, _, _, space, _, _| {
+        with_files_read(&owner, |_, space, _, _| {
             assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
             Ok(())
         })
@@ -3866,19 +3884,13 @@ mod tests {
         let reader = Storage::new(test_pile.path.clone(), Some(reader_key));
         let authority = load_signer(&test_pile.path, None).unwrap().verifying_key();
         reader
-            .with_store(|store, signer, runtime| {
+            .with_store(|store, _, runtime| {
                 let collection = open(store, DEFAULT_SCOPE_ID, authority)
                     .context("open the owner's Files collection")?;
-                files_view_in(
-                    store,
-                    collection,
-                    signer,
-                    runtime,
-                    |_, _, _, space, _, _| {
-                        assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
-                        Ok(())
-                    },
-                )
+                files_view_in(store, &[collection], runtime, |_, space, _, _| {
+                    assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
+                    Ok(())
+                })
             })
             .unwrap();
 
@@ -3889,25 +3901,19 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        with_files_view(&owner, |_, _, _, space, _, _| {
+        with_files_read(&owner, |_, space, _, _| {
             assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
             Ok(())
         })
         .unwrap();
         reader
-            .with_store(|store, signer, runtime| {
+            .with_store(|store, _, runtime| {
                 let collection = open(store, DEFAULT_SCOPE_ID, authority)
                     .context("open the owner's Files collection")?;
-                files_view_in(
-                    store,
-                    collection,
-                    signer,
-                    runtime,
-                    |_, _, _, space, _, _| {
-                        assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
-                        Ok(())
-                    },
-                )
+                files_view_in(store, &[collection], runtime, |_, space, _, _| {
+                    assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
+                    Ok(())
+                })
             })
             .unwrap();
     }
@@ -3938,7 +3944,7 @@ mod tests {
 
         let first_out = test_pile.dir.join("first.png");
         let second_out = test_pile.dir.join("second.txt");
-        with_files_view(&storage, |store, _, _, space, reader, rt| {
+        with_files_read(&storage, |store, space, reader, rt| {
             assert_eq!(
                 find!(
                     entity: Id,
@@ -3999,7 +4005,7 @@ mod tests {
         })
         .unwrap();
 
-        with_files_view(&storage, |_, _, _, space, _reader, _rt| {
+        with_files_read(&storage, |_, space, _reader, _rt| {
             assert_eq!(
                 file_capability::resolve_selector(space, &format!("{file_id:x}"))?,
                 file_id

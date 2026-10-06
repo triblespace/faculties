@@ -23,6 +23,11 @@ struct Cli {
     /// Existing durable node signing-key file. Commands never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     #[command(subcommand)]
     command: Command,
 }
@@ -117,7 +122,9 @@ fn load_value(raw: String) -> Result<Zeroizing<Vec<u8>>> {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let operations = Secrets::new(cli.pile, cli.key);
+    let operations = Secrets::with_storage(
+        crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target),
+    );
     match cli.command {
         // An explicit secret export is never sensory output, even with Drive.
         Command::Get { secret } => {

@@ -36,24 +36,24 @@
 //!   linkedin review [--limit N]
 //!   linkedin resolve <id-a> <id-b> --same | --distinct
 
-#[cfg(test)]
-use crate::collection_names::open_configured;
 use crate::relations::{self, Head, ProfileInput};
 use crate::schemas::linkedin;
 use crate::schemas::relations::DEFAULT_SCOPE_ID;
 #[cfg(test)]
 use crate::storage;
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 #[cfg(test)]
 use crate::storage::FactView;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+#[cfg(test)]
+use triblespace::core::collection::CollectionSnapshotExt;
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::macros::entity;
@@ -303,48 +303,40 @@ impl RelationsStorage<'_> {
         &self,
         operation: impl FnOnce(
             &mut FacultyStore,
-            Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &RelationsView,
             &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|store, signer, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let sources = crate::collection_names::read_union_acquiring(
+                store,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
-            let maintained_rank9 = runtime.block_on(async {
-                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    collection,
-                    maintained_succinct,
-                )?;
-                // Derive this key's own commits into each view; the root is
-                // not acquired, and what the views lack is lag.
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(maintained_succinct, signer).await,
-                )
+            let pairs = crate::storage::fact_pairs(pile, &sources)?;
+            // Derive this key's own commits into each view; the root is
+            // not acquired, and what the views lack is lag.
+            runtime
+                .block_on(crate::storage::maintain_fact_pairs(pile, &pairs, signer))
                 .context("maintain Relations fact collection")?;
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(maintained_rank9, signer).await,
-                )
-                .context("maintain Relations fact collection")?;
-                Ok::<_, anyhow::Error>(maintained_rank9)
-            })?;
+            let maintained_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
             let reader = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Relations fact collection")?,
+                pile.snapshot()
+                    .context("freeze maintained Relations fact collection")?,
                 runtime.clone(),
             );
-            let facts = crate::storage::acquire_facts(&reader, maintained_rank9)
+            let facts = crate::storage::acquire_union_facts(&reader, &maintained_rank9)
                 .context("read Relations Rank9 projection")?;
             let view = RelationsView { facts, reader };
-            operation(pile, collection, signer, &view, runtime)
+            operation(pile, signer, &view, runtime)
         })
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&RelationsView) -> Result<T>) -> Result<T> {
-        self.with_store(|_, _, _, view, _| operation(view))
+        self.with_store(|_, _, view, _| operation(view))
     }
 
     /// Publish at most one complete, locally constructed Relations fragment.
@@ -353,10 +345,18 @@ impl RelationsStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&RelationsView) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
-        self.with_store(|pile, collection, signer, view, runtime| {
+        let target = self.storage.target();
+        self.with_store(|pile, signer, view, runtime| {
             let (fragment, value) = operation(view)?;
             if let Some(mut fragment) = fragment {
                 fragment.describe_with(entity! { metadata::description: description });
+                let collection = crate::collection_names::write_target_acquiring(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    target,
+                    runtime,
+                )?;
                 crate::collection_names::require_command_write_admission_acquiring(
                     pile,
                     collection,
@@ -393,7 +393,8 @@ impl RelationsStorage<'_> {
     #[cfg(test)]
     fn payload_count(&self) -> Result<usize> {
         self.storage.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let collection =
+                crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let store_snapshot = pile.snapshot()?;
             Ok(collection.admitted(&store_snapshot)?.len())
         })
@@ -1373,7 +1374,8 @@ mod tests {
         fixture
             .storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                let source =
+                    crate::collection_names::open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
                 let snapshot = pollster::block_on(async {

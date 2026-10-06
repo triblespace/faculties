@@ -200,7 +200,7 @@ fn recorded_utterance_is_observed_by_a_preparing_voice_read() {
     let signer = crate::storage::initialize_signer(&path, None).unwrap();
     record_utterance(&path, None, "generated transcript").unwrap();
     let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
-    let source = crate::collection_names::open_configured(
+    let source = crate::collection_names::open(
         &mut pile,
         crate::schemas::voice::COLLECTION_SCOPE_ID,
         signer.verifying_key(),

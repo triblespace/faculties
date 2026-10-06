@@ -319,28 +319,36 @@ fn with_model<T>(
     operation: impl FnOnce(&GaugeModel) -> Result<T>,
 ) -> Result<T> {
     use crate::storage::AcquiringReader;
-    use triblespace::core::blob::encodings::succinctarchive::{
-        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-    };
-    use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
     use triblespace::core::collection::latest::LatestIndex;
+    use triblespace::core::collection::CollectionSnapshotExt;
     use triblespace::core::repo::SnapshotSource;
 
     storage.with_store(|pile, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            pile, crate::schemas::wiki::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let sources = crate::collection_names::read_union_acquiring(
+            pile,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
         )?;
-        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-        let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
-        let latest = wiki_model::latest_for_source(pile, source)?;
+        let rank9 = crate::storage::rank9_union(pile, &sources)?;
+        let latest = sources
+            .iter()
+            .map(|source| wiki_model::latest_for_source(pile, *source))
+            .collect::<Result<Vec<_>>>()?;
         let reader = AcquiringReader::new(
             pile.snapshot().context("freeze Gauge's Wiki observation")?,
             std::sync::Arc::clone(runtime),
         );
-        let facts = crate::storage::acquire_facts(&reader, rank9)?;
-        let latest = crate::storage::require_complete_attached_read(
-            reader.attached_acquiring(latest)?.read_acquiring::<LatestIndex>()?,
-        )?;
+        let facts = crate::storage::acquire_union_facts(&reader, &rank9)?;
+        let mut union = LatestIndex::default();
+        for latest in latest {
+            union = union.union(&crate::storage::require_complete_attached_read(
+                reader
+                    .attached_acquiring(latest)?
+                    .read_acquiring::<LatestIndex>()?,
+            )?);
+        }
+        let latest = union;
         let model = GaugeModel::load(&reader, &facts, &latest)?;
         operation(&model)
     })

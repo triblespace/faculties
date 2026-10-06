@@ -513,53 +513,74 @@ pub fn import(pile_path: &Path, key_path: Option<&Path>) -> Result<ImportReport>
 /// Import using the caller's explicit store owner, without reopening a shared pile.
 pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportReport> {
     storage.with_store(|pile, signer, runtime| {
-        let wiki_source = crate::collection_names::open_configured_acquiring(
-            pile, crate::schemas::wiki::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let wiki_source = crate::collection_names::write_target_acquiring(
+            pile,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
-        let compass_source = crate::collection_names::open_configured_acquiring(
-            pile, crate::schemas::compass::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let compass_source = crate::collection_names::write_target_acquiring(
+            pile,
+            crate::schemas::compass::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let latest = wiki_model::latest_for_source(pile, wiki_source)?;
-        runtime.block_on(async {
-            crate::storage::seed_attached(pile, latest, signer).await?;
-            crate::storage::ensure_downstream(pile, wiki_source, signer).await?;
-            Ok::<_, anyhow::Error>(())
-        }).context("ensure Wiki before bootstrap import")?;
+        runtime
+            .block_on(async {
+                crate::storage::seed_attached(pile, latest, signer).await?;
+                crate::storage::ensure_downstream(pile, wiki_source, signer).await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .context("ensure Wiki before bootstrap import")?;
 
         // Bootstrap is an explicit whole-catalog import oracle. Read every
         // admitted foundation through one fixed snapshot, even if its payload
         // has not arrived locally. Validation below keeps its strict contract.
-        let read_all = |source: triblespace::core::collection::Collection<
-            triblespace::prelude::blobencodings::SimpleArchive,
-        >, reader: &crate::storage::AcquiringReader<crate::storage::FacultySnapshot>|
-         -> Result<triblespace::core::trible::TribleSet> {
-            let mut facts = triblespace::core::trible::TribleSet::new();
-            for handle in source.admitted(reader)?.members() {
-                facts += reader.get::<triblespace::core::trible::TribleSet, _>(handle)?;
-            }
-            Ok(facts)
-        };
+        let read_all =
+            |source: triblespace::core::collection::Collection<
+                triblespace::prelude::blobencodings::SimpleArchive,
+            >,
+             reader: &crate::storage::AcquiringReader<crate::storage::FacultySnapshot>|
+             -> Result<triblespace::core::trible::TribleSet> {
+                let mut facts = triblespace::core::trible::TribleSet::new();
+                for handle in source.admitted(reader)?.members() {
+                    facts += reader.get::<triblespace::core::trible::TribleSet, _>(handle)?;
+                }
+                Ok(facts)
+            };
         let before = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
         let wiki_before = read_all(wiki_source, &before)?;
         let catalog = wiki_model::validate_catalog(&before, &wiki_before)?;
         let (wiki, wiki_roots) = wiki_fragment(&signer.verifying_key(), Some((&catalog, &before)))?;
-        let seed = PortableSeed { wiki, compass: compass_fragment()?, wiki_roots };
+        let seed = PortableSeed {
+            wiki,
+            compass: compass_fragment()?,
+            wiki_roots,
+        };
         let expected_wiki = seed.wiki.facts().clone();
         let expected_compass = seed.compass.facts().clone();
         let wiki_commit = pile.commit(wiki_source, signer, seed.wiki)?;
-        runtime.block_on(async {
-            crate::storage::seed_attached(pile, latest, signer).await?;
-            crate::storage::ensure_downstream(pile, wiki_source, signer).await?;
-            Ok::<_, anyhow::Error>(())
-        }).context("Bootstrap Wiki was committed, but ensuring its views failed")?;
-        let compass_commit = pile.commit(compass_source, signer, seed.compass)
+        runtime
+            .block_on(async {
+                crate::storage::seed_attached(pile, latest, signer).await?;
+                crate::storage::ensure_downstream(pile, wiki_source, signer).await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .context("Bootstrap Wiki was committed, but ensuring its views failed")?;
+        let compass_commit = pile
+            .commit(compass_source, signer, seed.compass)
             .context("Wiki bootstrap facts were committed, but Compass publication failed")?;
-        runtime.block_on(async {
-            let status = compass::status_register_collection(pile, signer.verifying_key())?;
-            crate::storage::seed_attached(pile, status, signer).await?;
-            crate::storage::ensure_downstream(pile, compass_source, signer).await?;
-            Ok::<_, anyhow::Error>(())
-        }).context("Bootstrap Compass was committed, but ensuring its views failed")?;
+        runtime
+            .block_on(async {
+                let status = compass::status_register_collection(pile, signer.verifying_key())?;
+                crate::storage::seed_attached(pile, status, signer).await?;
+                crate::storage::ensure_downstream(pile, compass_source, signer).await?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .context("Bootstrap Compass was committed, but ensuring its views failed")?;
 
         let after = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
         let wiki_after = read_all(wiki_source, &after)?;
@@ -572,7 +593,11 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
         if !expected_compass.difference(&compass_after).is_empty() {
             bail!("Compass collection omitted portable bootstrap facts after publication");
         }
-        Ok(ImportReport { generation: generation(), wiki_commit, compass_commit })
+        Ok(ImportReport {
+            generation: generation(),
+            wiki_commit,
+            compass_commit,
+        })
     })
 }
 
@@ -658,8 +683,7 @@ mod tests {
             ),
         ] {
             let source =
-                crate::collection_names::open_configured(&mut pile, scope, signer.verifying_key())
-                    .unwrap();
+                crate::collection_names::open(&mut pile, scope, signer.verifying_key()).unwrap();
             let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
                 .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)

@@ -60,7 +60,7 @@ impl Fixture {
     fn secret(&self) -> Id {
         let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut pile = open_pile_strict(&self.pile).unwrap();
-        let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
         let id = faculties::secrets::storage::add_secret(
             &mut pile,
             &signer,

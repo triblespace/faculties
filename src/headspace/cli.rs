@@ -20,6 +20,11 @@ pub struct Cli {
     /// Existing durable collection signer. Ordinary commands never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     pub(super) key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    pub(super) target: Option<triblespace::core::collection::CollectionHandle>,
     #[command(subcommand)]
     pub(super) command: Option<Command>,
 }
@@ -155,7 +160,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return out.line(Cli::command().render_long_help().to_string());
     };
-    let headspace = Headspace::new(cli.pile, cli.key);
+    let headspace = Headspace::with_storage(crate::storage::Storage::new(cli.pile, cli.key).with_target(cli.target));
     match command {
         Command::Show { show_secrets } => headspace.show(show_secrets, out),
         Command::List => headspace.list(out),

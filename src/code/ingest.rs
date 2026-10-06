@@ -29,9 +29,9 @@ use triblespace::core::collection::{
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStorePut, SnapshotSource, StorageClose, Store};
-use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::prelude::*;
 
 use crate::schemas::code::DEFAULT_SCOPE_ID;
@@ -50,10 +50,7 @@ pub struct CodeImportWriter<P = FacultyStore> {
 impl CodeImportWriter {
     /// Open a synchronous import session. Async callers run the complete
     /// open/stage/close lifetime on a blocking worker, not inside their runtime.
-    pub fn open(
-        pile_path: &std::path::Path,
-        key_path: Option<&std::path::Path>,
-    ) -> Result<Self> {
+    pub fn open(pile_path: &std::path::Path, key_path: Option<&std::path::Path>) -> Result<Self> {
         let signer = crate::storage::load_signer(pile_path, key_path)?;
         let runtime = Arc::new(crate::storage::runtime()?);
         let mut pile = crate::storage::open_store_as(pile_path, signer.verifying_key())?;
@@ -115,17 +112,23 @@ where
         signer: &SigningKey,
         runtime: &Arc<tokio::runtime::Runtime>,
     ) -> Result<(Collection<SimpleArchive>, FactArchive)> {
-        let source = crate::collection_names::open_configured_acquiring(
-            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            pile,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let (succinct, rank9) = crate::storage::fact_pair(pile, source)?;
-        runtime.block_on(async {
-            crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
-            crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
-        }).context("maintain Code import facts")?;
+        runtime
+            .block_on(async {
+                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+            })
+            .context("maintain Code import facts")?;
         let reader = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
-        let current = crate::storage::acquire_facts(&reader, rank9)
-            .context("read Code import facts")?;
+        let current =
+            crate::storage::acquire_facts(&reader, rank9).context("read Code import facts")?;
         Ok((source, current))
     }
 
@@ -303,8 +306,12 @@ pub fn ensure_local_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = crate::collection_names::write_target_acquiring(
+            store,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            None,
+            runtime,
         )?;
         let mut local = store.store();
         let pile = &mut *local;

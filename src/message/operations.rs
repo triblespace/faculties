@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::read_union_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_exact_in;
 use crate::message::{self, IntervalValue};
@@ -19,10 +19,11 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use itertools::Itertools;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::intersectionconstraint::and;
 use triblespace::core::query::sortedsliceconstraint::SortedSlice;
@@ -205,7 +206,7 @@ type MessageFacts = FactArchive;
 struct MessageStorage<'a> {
     pile: &'a mut FacultyStore,
     signer: &'a SigningKey,
-    collection: Collection<SimpleArchive>,
+    target: Option<CollectionHandle>,
     reader: &'a FacultySnapshot,
     messages: &'a MessageFacts,
     relations: &'a MessageFacts,
@@ -220,11 +221,16 @@ impl MessageStorage<'_> {
     ) -> Result<T> {
         let (fragment, value) = operation(self.messages, self.relations)?;
         if let Some(mut fragment) = fragment {
+            let collection = crate::collection_names::write_target(
+                self.pile,
+                DEFAULT_SCOPE_ID,
+                self.signer.verifying_key(),
+                self.target,
+            )?;
             let snapshot = self
                 .pile
                 .snapshot()
                 .context("freeze Message publication authority")?;
-            let collection = self.collection;
             let subject = self.signer.verifying_key();
             let runtime = tokio::runtime::Handle::current();
             let admitted = tokio::task::spawn_blocking(move || {
@@ -241,10 +247,10 @@ impl MessageStorage<'_> {
             );
             fragment.describe_with(entity! { metadata::description: description });
             self.pile
-                .commit(self.collection, self.signer, fragment)
+                .commit(collection, self.signer, fragment)
                 .context("commit authored Message fragment")?;
             drop(
-                crate::storage::ensure_downstream(self.pile, self.collection, self.signer)
+                crate::storage::ensure_downstream(self.pile, collection, self.signer)
                     .await
                     .context(
                         "Message fragment was committed, but ensuring its derived views failed",
@@ -712,25 +718,26 @@ fn with_storage<T>(
     capability: &Message,
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
+    let target = capability.storage.target();
     capability.storage.with_store(|pile, signer, runtime| {
-        let relations_source = open_configured_acquiring(
+        let relations_sources = read_union_acquiring(
             pile,
             DEFAULT_RELATIONS_SCOPE_ID,
             signer.verifying_key(),
             runtime,
         )?;
-        let message_source =
-            open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+        let message_sources =
+            read_union_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
         let (reader, relation_facts, message_facts) = runtime.block_on(message_views(
             pile,
             signer,
-            relations_source,
-            message_source,
+            &relations_sources,
+            &message_sources,
         ))?;
         let mut storage = MessageStorage {
             pile,
             signer,
-            collection: message_source,
+            target,
             reader: &reader,
             messages: &message_facts,
             relations: &relation_facts,
@@ -742,15 +749,17 @@ fn with_storage<T>(
 async fn message_views(
     pile: &mut FacultyStore,
     _signer: &SigningKey,
-    relations_source: Collection<SimpleArchive>,
-    message_source: Collection<SimpleArchive>,
+    relations_sources: &[Collection<SimpleArchive>],
+    message_sources: &[Collection<SimpleArchive>],
 ) -> Result<(FacultySnapshot, MessageFacts, MessageFacts)> {
     let trace = std::env::var_os("MESSAGE_RESIDUAL_TRACE").is_some();
     let started = std::time::Instant::now();
     // Reads attach what the maintenance worker carried and never maintain:
     // each chain is only registered here so its Rank9 handle can be attached.
-    let relations_rank9 = register_fact_chain(pile, relations_source, "Relations")?;
-    let message_rank9 = register_fact_chain(pile, message_source, "Message")?;
+    let relations_rank9 = crate::storage::rank9_union(pile, relations_sources)
+        .context("register the Relations fact collections")?;
+    let message_rank9 = crate::storage::rank9_union(pile, message_sources)
+        .context("register the Message fact collections")?;
     let registered_at = started.elapsed();
     // Both query views retain their selected support. Later selected-text
     // acquisition may add bytes, but never replaces these frozen facts.
@@ -761,9 +770,9 @@ async fn message_views(
         // Select only once, after resolving definitions against this frozen
         // proof/record evidence. No cache fill advances the observation.
         let acquiring = storage::AcquiringReader::with_handle(acquiring_snapshot, runtime);
-        let relations = storage::acquire_facts(&acquiring, relations_rank9)
+        let relations = storage::acquire_union_facts(&acquiring, &relations_rank9)
             .context("read Relations Rank9 projection")?;
-        let messages = storage::acquire_facts(&acquiring, message_rank9)
+        let messages = storage::acquire_union_facts(&acquiring, &message_rank9)
             .context("read Message Rank9 projection")?;
         Ok::<_, anyhow::Error>((relations, messages))
     })
@@ -778,22 +787,6 @@ async fn message_views(
         );
     }
     Ok((reader, relation_facts, message_facts))
-}
-
-/// Register the Succinct and Rank9 pair over `source` and return the Rank9
-/// handle a reader attaches. Registration only: nothing is maintained here.
-fn register_fact_chain(
-    pile: &mut FacultyStore,
-    source: Collection<SimpleArchive>,
-    name: &'static str,
-) -> Result<Collection<Rank9AcceleratedSuccinctArchiveBlob>> {
-    let succinct = pile
-        .attach::<SuccinctArchiveBlob>(source, ())
-        .with_context(|| format!("register {name} Succinct collection"))?;
-    let rank9 = pile
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-        .with_context(|| format!("register {name} Rank9 collection"))?;
-    Ok(rank9)
 }
 
 #[cfg(test)]
@@ -1023,8 +1016,8 @@ mod tests {
                 .block_on(message_views(
                     &mut pile,
                     &observer,
-                    relations_source,
-                    message_source,
+                    &[relations_source],
+                    &[message_source],
                 ))
                 .unwrap();
             assert_eq!(
@@ -1034,7 +1027,7 @@ mod tests {
             let mut input = MessageStorage {
                 pile: &mut pile,
                 signer: &observer,
-                collection: message_source,
+                target: Some(message_source.handle()),
                 reader: &snapshot,
                 messages: &message_facts,
                 relations: &relation_facts,
@@ -1069,16 +1062,16 @@ mod tests {
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &observer,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &observer,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &observer,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1108,16 +1101,16 @@ mod tests {
 
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1130,17 +1123,17 @@ mod tests {
         // same observed receipt again is a no-op that publishes nothing.
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let before_noop = pile.snapshot().unwrap().select_records(&selectors).unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1157,16 +1150,16 @@ mod tests {
         );
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1248,8 +1241,8 @@ mod tests {
                 .block_on(message_views(
                     &mut pile,
                     &sender,
-                    relations_source,
-                    message_source,
+                    &[relations_source],
+                    &[message_source],
                 ))
                 .unwrap(),
         );
@@ -1282,11 +1275,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &sender,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &sender,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         assert!(message_source
             .writer_is_admitted(&snapshot, sender.verifying_key())
@@ -1294,7 +1287,7 @@ mod tests {
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &sender,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1349,16 +1342,16 @@ mod tests {
         );
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1374,16 +1367,16 @@ mod tests {
         assert!(lag(&mut pile).is_current(), "{:?}", lag(&mut pile));
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1443,16 +1436,16 @@ mod tests {
 
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -1499,11 +1492,11 @@ mod tests {
             .collect::<Vec<_>>();
         let error = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .err()
             .expect("an unavailable selected member must not become a partial success");
         let unread = &error
@@ -1612,11 +1605,11 @@ mod tests {
         // in both chains from their own bytes; it publishes nothing.
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &message_owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &message_owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         assert_eq!(
             relations::person_anchors(&relation_facts),
@@ -1634,11 +1627,11 @@ mod tests {
         carry(&mut pile, &runtime, message_source, &message_owner);
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &message_owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &message_owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         assert_eq!(
             relations::person_anchors(&relation_facts),
@@ -2068,16 +2061,16 @@ mod tests {
         carry(&mut pile, &runtime, message_source, &owner);
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -2305,11 +2298,11 @@ mod tests {
         carry(&mut pile, &runtime, message_source, &owner);
         let (_old_reader, old_relations, old_messages) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let later_person = test_id(65);
         pile.commit(
@@ -2342,11 +2335,11 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let after = pile
             .snapshot()
@@ -2389,11 +2382,11 @@ mod tests {
         let bytes_after = std::fs::metadata(file.path()).unwrap().len();
         let (_, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         assert_eq!(
             visible(&message_facts),
@@ -2455,16 +2448,16 @@ mod tests {
         carry(&mut pile, &runtime, relations_source, &owner);
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -2499,16 +2492,16 @@ mod tests {
 
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -2526,16 +2519,16 @@ mod tests {
 
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
@@ -2577,11 +2570,11 @@ mod tests {
                 .unwrap();
         let (snapshot, relation_facts, message_facts) = runtime
             .block_on(message_views(
-                &mut pile,
-                &owner,
-                relations_source,
-                message_source,
-            ))
+                    &mut pile,
+                    &owner,
+                    &[relations_source],
+                    &[message_source],
+                ))
             .unwrap();
         // This admitted but malformed input arrives after the operation's
         // frozen view. It cannot prevent the raw COMMIT; it does prevent
@@ -2607,7 +2600,7 @@ mod tests {
         let mut input = MessageStorage {
             pile: &mut pile,
             signer: &owner,
-            collection: message_source,
+            target: Some(message_source.handle()),
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,

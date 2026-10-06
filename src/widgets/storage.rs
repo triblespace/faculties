@@ -20,14 +20,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::collection::latest::LatestIndex;
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
+#[cfg(test)]
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::collection::{
     AttachedSnapshot, Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt,
-    CollectionStoreExt, Cover, Support,
+    Cover, Support,
 };
 #[cfg(test)]
 use triblespace::core::repo::pile::Pile;
@@ -35,7 +36,6 @@ use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
-use crate::collection_names::open_configured;
 use crate::schemas::atlas::DEFAULT_SCOPE_ID as ATLAS_SCOPE_ID;
 use crate::schemas::blockdag::DEFAULT_SCOPE_ID as ARCHIVE_SCOPE_ID;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
@@ -53,7 +53,9 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
-use crate::storage::{open_secrets_collection_read, AcquiringReader, FacultySnapshot, FacultyStore, FactArchive, Storage};
+use crate::storage::{
+    open_secrets_collection, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage,
+};
 
 /// Frozen widget data with exact-body acquisition through its owning state.
 pub type WidgetReader = AcquiringReader<FacultySnapshot>;
@@ -193,6 +195,11 @@ impl DatasetRevision {
         hasher.update(b"faculties.viewer.dataset-revision.v4");
         Self::hash_attached(&mut hasher, attached, unread);
         Self(*hasher.finalize().as_bytes())
+    }
+
+    /// The revision of a dataset no readable collection holds.
+    fn empty() -> Self {
+        Self(*blake3::hash(b"faculties.viewer.dataset-revision.v4").as_bytes())
     }
 
     fn include_attached<R, E>(&mut self, attached: &AttachedSnapshot<R, E>, unread: &Support)
@@ -689,25 +696,37 @@ fn load_consistent_inputs(
 fn load_inputs(storage: &Storage, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
     storage
         .with_store(|store, signer, runtime| {
+            let mut unions = BTreeMap::new();
             for (scope, _) in collection_scopes(sources) {
-                crate::collection_names::open_configured_acquiring(
-                    store, scope, signer.verifying_key(), runtime,
-                )?;
+                unions.insert(
+                    scope,
+                    crate::collection_names::read_union_acquiring(
+                        store,
+                        scope,
+                        signer.verifying_key(),
+                        runtime,
+                    )?,
+                );
             }
             if sources.contains(&SourceKey::Secrets) {
                 crate::storage::open_secrets_collection_acquiring(
-                    store, signer.verifying_key(), runtime,
+                    store,
+                    signer.verifying_key(),
+                    None,
+                    runtime,
                 )?;
             }
-            load_inputs_from_store(store, signer, sources, runtime)
+            load_inputs_from_store(store, signer, sources, &unions, runtime)
                 .map_err(anyhow::Error::msg)
         })
         .map_err(|error| format!("load viewer storage: {error:#}"))
 }
 
-/// One scope's facts, read through its attached Rank9 cover with the
+/// One collection's facts, read through its attached Rank9 cover with the
 /// residual read from its bytes, and the revision that identifies exactly
-/// what that read holds.
+/// what that read holds. A dataset of several collections chains their
+/// revisions the same way, in `load_inputs_from_store`.
+#[cfg(test)]
 fn attached_facts_and_revision<R>(
     snapshot: &R,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
@@ -718,9 +737,8 @@ where
     let attached = snapshot
         .attached_acquiring(rank9)
         .map_err(|error| anyhow::anyhow!("attach the Rank9 fact cover: {error}"))?;
-    let read = triblespace::core::collection::succinctarchive_union::read_attached_acquiring(
-        &attached,
-    )?;
+    let read =
+        triblespace::core::collection::succinctarchive_union::read_attached_acquiring(&attached)?;
     let revision = DatasetRevision::from_attached(&attached, read.unread());
     let facts = crate::storage::require_complete_attached_read(read)?;
     Ok((facts, revision))
@@ -730,37 +748,39 @@ fn load_inputs_from_store(
     pile: &mut FacultyStore,
     signer: &ed25519_dalek::SigningKey,
     sources: &BTreeSet<SourceKey>,
+    unions: &BTreeMap<Id, Vec<Collection<SimpleArchive>>>,
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
 ) -> Result<LoadedInputs, String> {
     let loaded = (|| {
-        let mut by_scope = BTreeMap::<Id, Collection<Rank9AcceleratedSuccinctArchiveBlob>>::new();
+        let mut by_scope =
+            BTreeMap::<Id, Vec<Collection<Rank9AcceleratedSuccinctArchiveBlob>>>::new();
         let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwQuery>>::new();
         let mut latest_by_scope = BTreeMap::<Id, BTreeMap<Id, LatestIndex>>::new();
+        let union = |scope: Id| unions.get(&scope).map(Vec::as_slice).unwrap_or_default();
 
-        let mut collections = Vec::new();
         for (scope, label) in collection_scopes(sources) {
-            let source = open_configured(pile, scope, signer.verifying_key())
-                .map_err(|error| format!("register {label} collection: {error:#}"))?;
-            let succinct = pile
-                .attach::<SuccinctArchiveBlob>(source, ())
-                .map_err(|error| format!("register Succinct {label} collection: {error:#}"))?;
-            let rank9 = pile
-                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-                .map_err(|error| format!("register Rank9 {label} collection: {error:#}"))?;
-            collections.push((scope, label, source, succinct, rank9));
+            let rank9 = crate::storage::rank9_union(pile, union(scope))
+                .map_err(|error| format!("register the {label} fact collections: {error:#}"))?;
+            by_scope.insert(scope, rank9);
         }
 
-        let compass_register = sources
+        let compass_registers = sources
             .contains(&SourceKey::Compass)
             .then(|| {
-                crate::compass::status_register_collection(pile, signer.verifying_key())
+                union(COMPASS_SCOPE_ID)
+                    .iter()
+                    .map(|source| crate::compass::status_register_for_source(pile, *source))
+                    .collect::<anyhow::Result<Vec<_>>>()
                     .map_err(|error| format!("register Compass status collection: {error:#}"))
             })
             .transpose()?;
         let wiki_latest = sources
             .contains(&SourceKey::Wiki)
             .then(|| {
-                crate::wiki::latest_collection(pile, signer.verifying_key())
+                union(WIKI_SCOPE_ID)
+                    .iter()
+                    .map(|source| crate::wiki::latest_for_source(pile, *source))
+                    .collect::<anyhow::Result<Vec<_>>>()
                     .map_err(|error| format!("register Wiki observation collection: {error:#}"))
             })
             .transpose()?;
@@ -768,7 +788,7 @@ fn load_inputs_from_store(
         let secrets_collection = sources
             .contains(&SourceKey::Secrets)
             .then(|| {
-                open_secrets_collection_read(pile, signer.verifying_key())
+                open_secrets_collection(pile, signer.verifying_key(), None)
                     .map_err(|error| format!("open configured Secrets collection: {error:#}"))
             })
             .transpose()?;
@@ -777,12 +797,12 @@ fn load_inputs_from_store(
         // maintains. Positive indexes are independently maintained query
         // relations: their support need not equal fact support to admit only
         // known winners.
-        for (scope, _, _, _, rank9) in collections {
-            by_scope.insert(scope, rank9);
-        }
 
         let secrets = if let Some(collection) = secrets_collection {
-            let snapshot = runtime.block_on(secret_storage::ensure_and_snapshot(pile, collection, signer))
+            let snapshot = runtime
+                .block_on(secret_storage::ensure_and_snapshot(
+                    pile, collection, signer,
+                ))
                 .map_err(|error| format!("observe configured Secrets collection: {error:#}"))?;
             Some(snapshot)
         } else {
@@ -801,9 +821,11 @@ fn load_inputs_from_store(
         };
         let store_snapshot = AcquiringReader::new(store_snapshot, runtime.clone());
         let secrets = secrets_collection
-            .map(|collection| secret_storage::snapshot_acquiring(store_snapshot.clone(), collection)
-                .map(LoadedSecrets::new)
-                .map_err(|error| format!("read configured Secrets collection: {error:#}")))
+            .map(|collection| {
+                secret_storage::snapshot_acquiring(store_snapshot.clone(), collection)
+                    .map(LoadedSecrets::new)
+                    .map_err(|error| format!("read configured Secrets collection: {error:#}"))
+            })
             .transpose()?;
 
         let mut facts_by_scope = BTreeMap::new();
@@ -814,30 +836,53 @@ fn load_inputs_from_store(
                 .find(|source| source.scope == *scope)
                 .expect("every maintained viewer scope has a source label")
                 .label;
-            let (facts, revision) = attached_facts_and_revision(&store_snapshot, *rank9)
-                .map_err(|error| format!("read maintained {label} collection: {error:#}"))?;
-            revisions_by_scope.insert(*scope, revision);
+            let mut revision: Option<DatasetRevision> = None;
+            let facts = crate::storage::union_facts(rank9.iter().map(|rank9| {
+                let attached = store_snapshot
+                    .attached_acquiring(*rank9)
+                    .map_err(|error| anyhow::anyhow!("attach the Rank9 fact cover: {error}"))?;
+                let read =
+                    triblespace::core::collection::succinctarchive_union::read_attached_acquiring(
+                        &attached,
+                    )?;
+                match revision.as_mut() {
+                    Some(revision) => revision.include_attached(&attached, read.unread()),
+                    None => {
+                        revision = Some(DatasetRevision::from_attached(&attached, read.unread()))
+                    }
+                }
+                crate::storage::require_complete_attached_read(read)
+            }))
+            .map_err(|error| format!("read maintained {label} collection: {error:#}"))?;
+            revisions_by_scope.insert(*scope, revision.unwrap_or_else(DatasetRevision::empty));
             facts_by_scope.insert(*scope, facts);
         }
 
-        if let Some(target) = compass_register {
-            let collection = store_snapshot
-                .attached_acquiring(target)
-                .map_err(|error| format!("attach Compass status register: {error}"))?;
-            let (index, unread) = collection
-                .read_acquiring::<LwwIndex>()
-                .map_err(|error| format!("read Compass status register: {error}"))?
-                .into_parts();
-            if !unread.is_empty() {
-                return Err(format!("Compass status register has {} unread foundations", unread.len()));
+        if let Some(targets) = compass_registers {
+            let mut union = LwwIndex::default();
+            for target in targets {
+                let collection = store_snapshot
+                    .attached_acquiring(target)
+                    .map_err(|error| format!("attach Compass status register: {error}"))?;
+                let (index, unread) = collection
+                    .read_acquiring::<LwwIndex>()
+                    .map_err(|error| format!("read Compass status register: {error}"))?
+                    .into_parts();
+                if !unread.is_empty() {
+                    return Err(format!(
+                        "Compass status register has {} unread foundations",
+                        unread.len()
+                    ));
+                }
+                revisions_by_scope
+                    .get_mut(&COMPASS_SCOPE_ID)
+                    .expect("Compass facts were attached")
+                    .include_attached(&collection, &unread);
+                union = union.union(&index);
             }
-            let index = index
+            let index = union
                 .query()
                 .map_err(|error| format!("prepare Compass status register query: {error}"))?;
-            revisions_by_scope
-                .get_mut(&COMPASS_SCOPE_ID)
-                .expect("Compass facts were attached")
-                .include_attached(&collection, &unread);
             lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
                 (
                     crate::schemas::compass::board::status_of.id(),
@@ -847,25 +892,32 @@ fn load_inputs_from_store(
             );
         }
 
-        if let Some(target) = wiki_latest {
-            let collection = store_snapshot
-                .attached_acquiring(target)
-                .map_err(|error| format!("attach Wiki supersession index: {error}"))?;
-            let (index, unread) = collection
-                .read_acquiring::<LatestIndex>()
-                .map_err(|error| format!("read Wiki supersession index: {error}"))?
-                .into_parts();
-            if !unread.is_empty() {
-                return Err(format!("Wiki latest index has {} unread foundations", unread.len()));
+        if let Some(targets) = wiki_latest {
+            let mut union = LatestIndex::default();
+            for target in targets {
+                let collection = store_snapshot
+                    .attached_acquiring(target)
+                    .map_err(|error| format!("attach Wiki supersession index: {error}"))?;
+                let (index, unread) = collection
+                    .read_acquiring::<LatestIndex>()
+                    .map_err(|error| format!("read Wiki supersession index: {error}"))?
+                    .into_parts();
+                if !unread.is_empty() {
+                    return Err(format!(
+                        "Wiki latest index has {} unread foundations",
+                        unread.len()
+                    ));
+                }
+                revisions_by_scope
+                    .get_mut(&WIKI_SCOPE_ID)
+                    .expect("Wiki facts were attached")
+                    .include_attached(&collection, &unread);
+                union = union.union(&index);
             }
-            revisions_by_scope
-                .get_mut(&WIKI_SCOPE_ID)
-                .expect("Wiki facts were attached")
-                .include_attached(&collection, &unread);
             latest_by_scope
                 .entry(WIKI_SCOPE_ID)
                 .or_default()
-                .insert(triblespace::core::metadata::supersedes.id(), index);
+                .insert(triblespace::core::metadata::supersedes.id(), union);
         }
 
         let datasets = COLLECTION_SOURCE_CATALOG
@@ -1206,15 +1258,21 @@ mod tests {
             .unwrap();
         let missing_snapshot = store.snapshot().unwrap();
         let error = attached_facts_and_revision(&missing_snapshot, rank9)
-            .err().expect("a foreground dataset must not silently omit the missing commit");
-        let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>()
+            .err()
+            .expect("a foreground dataset must not silently omit the missing commit");
+        let incomplete = error
+            .downcast_ref::<crate::storage::IncompleteAttachedRead>()
             .expect("the failure names incomplete selected support");
         assert_eq!(incomplete.unread.len(), 1);
-        assert_eq!(incomplete.unread.members().next(), Some(payload.get_handle()));
+        assert_eq!(
+            incomplete.unread.members().next(),
+            Some(payload.get_handle())
+        );
         // The revision law still distinguishes this failed observation from
         // the later complete one; no partial dataset is exposed or cached.
         let gap = DatasetRevision::from_attached(
-            &missing_snapshot.attached_acquiring(rank9).unwrap(), &incomplete.unread,
+            &missing_snapshot.attached_acquiring(rank9).unwrap(),
+            &incomplete.unread,
         );
         assert_ne!(read_raw, gap);
         store.put::<SimpleArchive, _>(payload).unwrap();

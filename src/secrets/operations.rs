@@ -1,9 +1,9 @@
 //! Configured native operations over the standalone encrypted Secrets core.
 use crate::clock;
 use crate::secrets::{self, storage as secret_storage};
-use crate::storage::{AcquiringReader, FacultySnapshot};
 #[cfg(test)]
-use crate::storage::open_secrets_collection_read;
+use crate::storage::open_secrets_collection;
+use crate::storage::{AcquiringReader, FacultySnapshot};
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
@@ -36,9 +36,13 @@ impl Secrets {
     }
     /// Encrypt resident bytes once, returning the exact newly authored version.
     pub fn add(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
+        let target = self.storage.target();
         self.storage().with_store(|pile, signer, runtime| {
             let collection = crate::storage::open_secrets_collection_acquiring(
-                pile, signer.verifying_key(), runtime,
+                pile,
+                signer.verifying_key(),
+                target,
+                runtime,
             )?;
             let secret = secret_storage::add_secret(
                 pile,
@@ -49,45 +53,51 @@ impl Secrets {
                 clock::point_now()?,
             )?;
             drop(
-                runtime.block_on(crate::storage::ensure_downstream(
-                    pile,
-                    collection.source(),
-                    signer,
-                ))
-                .context("Encrypted secret was committed, but ensuring its derived views failed")?,
+                runtime
+                    .block_on(crate::storage::ensure_downstream(
+                        pile,
+                        collection.source(),
+                        signer,
+                    ))
+                    .context(
+                        "Encrypted secret was committed, but ensuring its derived views failed",
+                    )?,
             );
             Ok(secret)
         })
     }
     /// Explicitly open one exact version. Callers decide how plaintext is used.
+    /// The version may be in any Secrets collection here; decryption is by
+    /// possession of a wrap, whoever owns the collection.
     pub fn get(&self, secret: Id) -> Result<Zeroizing<Vec<u8>>> {
         self.storage().with_store(|pile, signer, runtime| {
-            let collection = crate::storage::open_secrets_collection_acquiring(
-                pile, signer.verifying_key(), runtime,
-            )?;
-            let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
-            snapshot.open(secret, signer).map(Zeroizing::new)
+            for collection in crate::storage::open_secrets_collections_read(pile)? {
+                let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
+                if snapshot.contains(secret) {
+                    return snapshot.open(secret, signer).map(Zeroizing::new);
+                }
+            }
+            anyhow::bail!("no Secrets collection here holds secret version {secret:x}")
         })
     }
     /// Metadata only. Listing never attempts plaintext decryption.
+    /// Every Secrets collection here is listed, as [`Self::get`] opens them.
     pub fn list(&self) -> Result<Vec<SecretMetadata>> {
         self.storage().with_store(|pile, signer, runtime| {
-            let collection = crate::storage::open_secrets_collection_acquiring(
-                pile, signer.verifying_key(), runtime,
-            )?;
-            let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
-            let Some(facts) = snapshot.facts() else {
-                return Ok(Vec::new());
-            };
-            secrets::secret_rows(facts)
-                .into_iter()
-                .map(|row| {
-                    Ok(SecretMetadata {
+            let mut listed = Vec::new();
+            for collection in crate::storage::open_secrets_collections_read(pile)? {
+                let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
+                let Some(facts) = snapshot.facts() else {
+                    continue;
+                };
+                for row in secrets::secret_rows(facts) {
+                    listed.push(SecretMetadata {
                         id: row.id,
                         name: secrets::read_text(snapshot.store_snapshot(), row.name)?,
-                    })
-                })
-                .collect()
+                    });
+                }
+            }
+            Ok(listed)
         })
     }
     /// Explicit key-delivery maintenance; does not grant new capabilities.
@@ -95,9 +105,13 @@ impl Secrets {
         self.maintain_selected(&[])
     }
     pub fn maintain_selected(&self, selected: &[SecretTarget]) -> Result<usize> {
+        let target = self.storage.target();
         self.storage().with_store(|pile, signer, runtime| {
             let collection = crate::storage::open_secrets_collection_acquiring(
-                pile, signer.verifying_key(), runtime,
+                pile,
+                signer.verifying_key(),
+                target,
+                runtime,
             )?;
             let snapshot = acquiring_snapshot(pile, collection, signer, runtime, true)?;
             let count = secret_storage::maintain_selected_recipient_envelopes(
@@ -133,20 +147,22 @@ impl Secrets {
         limits: DeliveryLimits,
         delegate: bool,
     ) -> Result<Vec<CapabilityProofId>> {
+        let write_to = self.storage.target();
         self.storage().with_store(|pile, signer, runtime| {
             let collection = crate::storage::open_secrets_collection_acquiring(
-                pile, signer.verifying_key(), runtime,
+                pile,
+                signer.verifying_key(),
+                write_to,
+                runtime,
             )?;
             let snapshot = match target {
-                SecretTarget::Resource(_) => {
-                    secret_storage::snapshot_acquiring(
-                        AcquiringReader::new(pile.snapshot()?, std::sync::Arc::clone(runtime)),
-                        collection,
-                    )?
-                }
-                SecretTarget::Secret(_) => acquiring_snapshot(
-                    pile, collection, signer, runtime, false,
+                SecretTarget::Resource(_) => secret_storage::snapshot_acquiring(
+                    AcquiringReader::new(pile.snapshot()?, std::sync::Arc::clone(runtime)),
+                    collection,
                 )?,
+                SecretTarget::Secret(_) => {
+                    acquiring_snapshot(pile, collection, signer, runtime, false)?
+                }
             };
             secrets::resource::grant(pile, signer, &snapshot, target, recipient, limits, delegate)
         })
@@ -186,16 +202,23 @@ fn acquiring_snapshot(
     } else {
         runtime.block_on(collection.ensure(store, signer))
     };
-    let snapshot = match result {
-        Ok(snapshot) => snapshot,
-        Err(error) if !maintain && matches!(
+    let snapshot =
+        match result {
+            Ok(snapshot) => snapshot,
+            Err(error)
+                if !maintain
+                    && matches!(
             error.downcast_ref::<triblespace::core::collection::CollectionRealizationError>(),
             Some(triblespace::core::collection::CollectionRealizationError::HostMismatch { .. })
-        ) => store.snapshot()?,
-        Err(error) => return Err(error),
-    };
+        ) =>
+            {
+                store.snapshot()?
+            }
+            Err(error) => return Err(error),
+        };
     secret_storage::snapshot_acquiring(
-        AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime)), collection,
+        AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime)),
+        collection,
     )
 }
 
@@ -214,7 +237,7 @@ mod tests {
             .unwrap();
 
         let mut pile = crate::storage::open_pile_strict(&path).unwrap();
-        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let collection = open_secrets_collection(&mut pile, signer.verifying_key(), None).unwrap();
         // The ordinary read path prepares the target, exactly as get/list do.
         let snapshot = pollster::block_on(secret_storage::ensure_and_snapshot(
             &mut pile, collection, &signer,

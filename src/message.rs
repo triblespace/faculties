@@ -321,7 +321,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::collection_names::open_configured;
+    use crate::collection_names::open;
     use crate::schemas::message::DEFAULT_SCOPE_ID;
     use crate::schemas::relations::DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID;
     use crate::storage::{discover_target, open_pile_strict_as};
@@ -633,7 +633,7 @@ mod tests {
         .0;
 
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
-        let relations_collection = open_configured(
+        let relations_collection = open(
             &mut pile,
             DEFAULT_RELATIONS_SCOPE_ID,
             signer.verifying_key(),
@@ -643,8 +643,7 @@ mod tests {
             .unwrap();
 
         let team = signer.verifying_key();
-        let messages =
-            open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let messages = open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let succinct = pile.attach::<SuccinctArchiveBlob>(messages, ()).unwrap();
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(messages, succinct)

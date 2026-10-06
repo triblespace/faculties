@@ -4,9 +4,9 @@ use crate::storage::FactView;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 #[cfg(test)]
-use crate::collection_names::open_configured;
+use crate::collection_names::open;
 use crate::decide::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
@@ -14,11 +14,11 @@ use crate::schemas::decide::DEFAULT_SCOPE_ID;
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::CollectionStoreExt;
 use triblespace::core::metadata;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
@@ -334,7 +334,6 @@ impl DecideStorage<'_> {
         &self,
         operation: impl FnOnce(
             &mut FacultyStore,
-            Collection<SimpleArchive>,
             &ed25519_dalek::SigningKey,
             &CollectionView,
             &std::sync::Arc<tokio::runtime::Runtime>,
@@ -342,22 +341,17 @@ impl DecideStorage<'_> {
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
             let result = (|| {
-                let collection = open_configured_acquiring(
+                let sources = read_union_acquiring(
                     pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
                 )?;
-                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    collection,
-                    maintained_succinct,
-                )?;
+                let maintained_rank9 = crate::storage::rank9_union(pile, &sources)?;
                 let store_snapshot = AcquiringReader::new(
                     pile.snapshot().context("freeze Decide fact collection")?, runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
+                let facts = crate::storage::acquire_union_facts(&store_snapshot, &maintained_rank9)
                     .context("read maintained Decide fact collection")?;
                 operation(
                     pile,
-                    collection,
                     signer,
                     &CollectionView {
                         facts,
@@ -371,7 +365,7 @@ impl DecideStorage<'_> {
     }
 
     fn with_view<T>(&self, operation: impl FnOnce(&CollectionView) -> Result<T>) -> Result<T> {
-        self.with_store(|_, _, _, view, _| operation(view))
+        self.with_store(|_, _, view, _| operation(view))
     }
 
     fn update<T>(
@@ -379,9 +373,17 @@ impl DecideStorage<'_> {
         description: &'static str,
         operation: impl FnOnce(&CollectionView) -> Result<(Fragment, T)>,
     ) -> Result<T> {
-        self.with_store(|pile, collection, signer, view, runtime| {
+        let target = self.storage.target();
+        self.with_store(|pile, signer, view, runtime| {
             let (mut fragment, value) = operation(view)?;
             fragment.describe_with(entity! { metadata::description: description });
+            let collection = write_target_acquiring(
+                pile,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                target,
+                runtime,
+            )?;
             crate::collection_names::require_command_write_admission_acquiring(
                 pile,
                 collection,
@@ -537,7 +539,7 @@ fn proposed_decision_is_one_commit_a_preparing_reader_observes() {
     capability
         .storage
         .with_pile(|pile, signer| {
-            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let source = open(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
             let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
             // Maintenance is the reader's job now: prepare the projection here,

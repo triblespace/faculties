@@ -2829,7 +2829,8 @@ mod tests {
         let mut pile = Pile::open(&path).unwrap();
         let signer = SigningKey::from_bytes(&[0x31; 32]);
         let collection =
-            crate::storage::open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
+            crate::storage::open_secrets_collection(&mut pile, signer.verifying_key(), None)
+                .unwrap();
 
         let exact = crate::secrets::storage::add_secret(
             &mut pile,
@@ -2853,7 +2854,7 @@ mod tests {
         assert_ne!(exact, later);
 
         let collection =
-            crate::storage::open_secrets_collection_read(&mut pile, signer.verifying_key())
+            crate::storage::open_secrets_collection(&mut pile, signer.verifying_key(), None)
                 .unwrap();
         let secrets = pollster::block_on(crate::secrets::storage::ensure_and_snapshot(
             &mut pile, collection, &signer,

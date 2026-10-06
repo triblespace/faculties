@@ -40,6 +40,11 @@ pub struct Cli {
     /// initialize explicitly with trible pile signing-key init.
     #[arg(long, env = "TRIBLESPACE_KEY", global = true)]
     key: Option<PathBuf>,
+    /// The collection writes go to, as a handle (64 hex digits, optionally
+    /// `blake3:`). Without it a write goes to the one collection of this
+    /// name rooted at the signing key. Reads are unaffected.
+    #[arg(long, global = true, value_parser = crate::collection_names::parse_target)]
+    target: Option<triblespace::core::collection::CollectionHandle>,
     /// Discord bot token. Use @path or @- to avoid exposing it in argv.
     #[arg(long, env = "DISCORD_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
@@ -173,7 +178,9 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let pile = cli
         .pile
         .ok_or_else(|| anyhow!("missing pile; pass --pile or set PILE"))?;
-    let operations = Discord::new(pile, cli.key).with_token(token);
+    let operations =
+        Discord::with_storage(crate::storage::Storage::new(pile, cli.key).with_target(cli.target))
+            .with_token(token);
     match command {
         CommandMode::Send { channel_id, text } => {
             let text = crate::text_arg(&text, "message text")?;
@@ -296,7 +303,9 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
             // One store for the life of the process, rather than one pile
             // open per message.
             let intake = Intake::new(
-                Discord::with_storage(crate::storage::Storage::shared(pile, cli.key.clone())),
+                Discord::with_storage(
+                    crate::storage::Storage::shared(pile, cli.key.clone()).with_target(cli.target),
+                ),
                 Box::new(Rest::new(token.clone())),
                 intake_channels,
                 intake_dms,

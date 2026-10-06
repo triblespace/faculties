@@ -74,7 +74,8 @@ impl Memory {
         &self,
         operation: impl FnOnce(MemoryStorage<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.storage.scope(|storage| operation(MemoryStorage { storage }))
+        self.storage
+            .scope(|storage| operation(MemoryStorage { storage }))
     }
 
     /// An id/alias prefix or a temporal range is a domain selector, not argv.
@@ -337,7 +338,7 @@ use crate::schemas::{blockdag as archive_schema, cognition as cognition_schema};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 // The shared recollection renderer and accessors also serve Orient in-process.
-use crate::collection_names::{open_configured, open_configured_acquiring};
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 use crate::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
     chunk_end_at, chunk_image_handle, chunk_lens_handle, chunk_observed_at, chunk_references,
@@ -407,27 +408,59 @@ impl MemoryStorage<'_> {
     /// operations keep this shared store alive through their final rendering.
     fn with_store<T>(
         &self,
-        scopes: &[Id],
         operation: impl FnOnce(
             &mut FacultyStore,
             &ed25519_dalek::SigningKey,
             &std::sync::Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        self.storage.with_store(|store, signer, runtime| {
-            for &scope in scopes {
-                open_configured_acquiring(store, scope, signer.verifying_key(), runtime)?;
-            }
-            operation(store, signer, runtime)
-        })
+        self.storage.with_store(operation)
+    }
+
+    /// Every collection of `scope`'s name the signer may READ: the
+    /// read-union a load attaches and maintains.
+    fn sources(
+        store: &mut FacultyStore,
+        scope: Id,
+        signer: &ed25519_dalek::SigningKey,
+        runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    ) -> Result<Vec<Collection<blobencodings::SimpleArchive>>> {
+        read_union_acquiring(store, scope, signer.verifying_key(), runtime)
+    }
+
+    /// Register the fact pair over every source of a read-union and carry
+    /// each into its attachments, returning the Rank9 collections. Read the
+    /// resident target, not a complete historical root; a commit left
+    /// unattached is read from its own bytes.
+    async fn maintained_rank9(
+        pile: &mut FacultyStore,
+        sources: &[Collection<blobencodings::SimpleArchive>],
+        signer: &ed25519_dalek::SigningKey,
+        label: &str,
+    ) -> Result<Vec<Collection<Rank9AcceleratedSuccinctArchiveBlob>>> {
+        let mut rank9 = Vec::with_capacity(sources.len());
+        for source in sources {
+            let succinct = pile
+                .attach::<SuccinctArchiveBlob>(*source, ())
+                .with_context(|| format!("register Succinct {label} collection"))?;
+            let collection = pile
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(*source, succinct)
+                .with_context(|| format!("register Rank9 {label} collection"))?;
+            crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
+                .with_context(|| format!("maintain Succinct {label} collection"))?;
+            crate::storage::tolerate_own_lag(pile.maintain_attached(collection, signer).await)
+                .with_context(|| format!("maintain Rank9 {label} collection"))?;
+            rank9.push(collection);
+        }
+        Ok(rank9)
     }
 
     fn attach_collection(
-        collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+        collections: &[Collection<Rank9AcceleratedSuccinctArchiveBlob>],
         store_snapshot: &PileSnapshot,
         label: &str,
     ) -> Result<CollectionView> {
-        let facts = crate::storage::acquire_facts(store_snapshot, collection)
+        let facts = crate::storage::acquire_union_facts(store_snapshot, collections)
             .with_context(|| format!("attach maintained {label} collection"))?;
         Ok(CollectionView {
             facts,
@@ -436,95 +469,60 @@ impl MemoryStorage<'_> {
     }
 
     fn load_memory_from_snapshot(
-        collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+        collections: &[Collection<Rank9AcceleratedSuccinctArchiveBlob>],
         store_snapshot: &PileSnapshot,
     ) -> Result<LoadedMemory> {
-        let memory = Self::attach_collection(collection, store_snapshot, "Memory")?;
+        let memory = Self::attach_collection(collections, store_snapshot, "Memory")?;
         Ok(LoadedMemory { memory })
     }
 
     /// Freeze maintained Memory alone for ordinary commands.
     fn load(&self) -> Result<LoadedMemory> {
-        self.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
-            let collection = runtime.block_on(async {
-                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let succinct = pile
-                    .attach::<SuccinctArchiveBlob>(source, ())
-                    .context("register Succinct Memory collection")?;
-                let collection = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-                    .context("register Rank9 Memory collection")?;
-                // Read the resident target, not a complete historical root.
-                // Carry the source and attach its frontier; a commit left
-                // unattached is read from its own bytes.
-                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
-                    .context("maintain Succinct Memory collection")?;
-                crate::storage::tolerate_own_lag(pile.maintain_attached(collection, signer).await)
-                    .context("maintain Rank9 Memory collection")?;
-                Ok::<_, anyhow::Error>(collection)
-            })?;
+        self.with_store(|pile, signer, runtime| {
+            let sources = Self::sources(pile, MEMORY_SCOPE_ID, signer, runtime)?;
+            let collections =
+                runtime.block_on(Self::maintained_rank9(pile, &sources, signer, "Memory"))?;
             let store_snapshot = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Memory snapshot")?,
+                pile.snapshot()
+                    .context("freeze maintained Memory snapshot")?,
                 runtime.clone(),
             );
-            Self::load_memory_from_snapshot(collection, &store_snapshot)
+            Self::load_memory_from_snapshot(&collections, &store_snapshot)
         })
     }
 
     /// Freeze Memory and shared Embeddings from one snapshot for semantic or
     /// context-cover reads.
     fn load_context(&self, with_embeddings: bool) -> Result<LoadedContext> {
-        let scopes = if with_embeddings {
-            &[MEMORY_SCOPE_ID, EMBEDDINGS_SCOPE_ID][..]
-        } else {
-            &[MEMORY_SCOPE_ID][..]
-        };
-        self.with_store(scopes, |pile, signer, runtime| {
-            let (memory_collection, embeddings_collections) = runtime.block_on(async {
-                let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let memory_succinct = pile
-                    .attach::<SuccinctArchiveBlob>(memory_source, ())
-                    .context("register Succinct Memory collection")?;
-                let memory_collection = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(memory_source, memory_succinct)
-                    .context("register Rank9 Memory collection")?;
-                let embeddings_collections = if with_embeddings {
-                    let source =
-                        open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
-                    let succinct = pile
-                        .attach::<SuccinctArchiveBlob>(source, ())
-                        .context("register Succinct shared Embeddings collection")?;
-                    let rank9 = pile
-                        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-                        .context("register Rank9 shared Embeddings collection")?;
-                    Some((succinct, rank9))
-                } else {
-                    None
+        self.with_store(|pile, signer, runtime| {
+            let memory_sources = Self::sources(pile, MEMORY_SCOPE_ID, signer, runtime)?;
+            let embeddings_sources = if with_embeddings {
+                Some(Self::sources(pile, EMBEDDINGS_SCOPE_ID, signer, runtime)?)
+            } else {
+                None
+            };
+            let (memory_collections, embeddings_collections) = runtime.block_on(async {
+                let memory =
+                    Self::maintained_rank9(pile, &memory_sources, signer, "Memory").await?;
+                let embeddings = match &embeddings_sources {
+                    Some(sources) => Some(
+                        Self::maintained_rank9(pile, sources, signer, "shared Embeddings").await?,
+                    ),
+                    None => None,
                 };
-                for (succinct, rank9, label) in [(memory_succinct, memory_collection, "Memory")]
-                    .into_iter()
-                    .chain(
-                        embeddings_collections
-                            .map(|(succinct, rank9)| (succinct, rank9, "shared Embeddings")),
-                    )
-                {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(succinct, signer).await,
-                    )
-                    .with_context(|| format!("maintain Succinct {label} collection"))?;
-                    crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
-                        .with_context(|| format!("maintain Rank9 {label} collection"))?;
-                }
-                Ok::<_, anyhow::Error>((memory_collection, embeddings_collections))
+                Ok::<_, anyhow::Error>((memory, embeddings))
             })?;
             let store_snapshot = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Memory/Embeddings snapshot")?,
+                pile.snapshot()
+                    .context("freeze maintained Memory/Embeddings snapshot")?,
                 runtime.clone(),
             );
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let memory = Self::load_memory_from_snapshot(&memory_collections, &store_snapshot)?;
             let embeddings = match embeddings_collections {
-                Some((_, collection)) => Some(Self::attach_collection(
-                    collection, &store_snapshot, "shared Embeddings",
+                Some(collections) => Some(Self::attach_collection(
+                    &collections,
+                    &store_snapshot,
+                    "shared Embeddings",
                 )?),
                 None => None,
             };
@@ -534,146 +532,106 @@ impl MemoryStorage<'_> {
 
     /// Freeze Memory and Comb together for cursor transitions.
     fn load_comb(&self) -> Result<LoadedComb> {
-        self.with_store(&[MEMORY_SCOPE_ID, DEFAULT_COMB_SCOPE_ID], |pile, signer, runtime| {
-            let (memory_collection, comb_source) = runtime.block_on(async {
-                let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let memory_succinct = pile
-                    .attach::<SuccinctArchiveBlob>(memory_source, ())
-                    .context("register Succinct Memory collection")?;
-                let memory_collection = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(memory_source, memory_succinct)
-                    .context("register Rank9 Memory collection")?;
-                let comb_source =
-                    open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(memory_succinct, signer).await,
-                )
-                .context("maintain Succinct Memory collection")?;
-                crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(memory_collection, signer).await,
-                )
-                .context("maintain Rank9 Memory collection")?;
-                Ok::<_, anyhow::Error>((memory_collection, comb_source))
-            })?;
+        self.with_store(|pile, signer, runtime| {
+            let memory_sources = Self::sources(pile, MEMORY_SCOPE_ID, signer, runtime)?;
+            let comb_sources = Self::sources(pile, DEFAULT_COMB_SCOPE_ID, signer, runtime)?;
+            let memory_collections = runtime.block_on(Self::maintained_rank9(
+                pile,
+                &memory_sources,
+                signer,
+                "Memory",
+            ))?;
             let store_snapshot = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Memory and Comb snapshot")?,
+                pile.snapshot()
+                    .context("freeze maintained Memory and Comb snapshot")?,
                 runtime.clone(),
             );
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
-            // The Comb is read from its selected source; acquiring a payload
-            // never replaces its captured foundations with a newer frontier.
-            let facts = store_snapshot
-                .collection_acquiring(comb_source)
-                .context("observe Comb source collection")?
-                .view::<TribleSet>()
-                .context("read Comb source collection")?;
-            Ok(LoadedComb { memory, comb: CombView { facts } })
+            let memory = Self::load_memory_from_snapshot(&memory_collections, &store_snapshot)?;
+            // The Comb is read from its selected sources; acquiring a payload
+            // never replaces their captured foundations with a newer frontier.
+            let mut facts = TribleSet::new();
+            for source in comb_sources {
+                facts += store_snapshot
+                    .collection_acquiring(source)
+                    .context("observe Comb source collection")?
+                    .view::<TribleSet>()
+                    .context("read Comb source collection")?;
+            }
+            Ok(LoadedComb {
+                memory,
+                comb: CombView { facts },
+            })
         })
     }
 
     /// Freeze Memory, Cognition, and Archive from exactly one pile snapshot
     /// for a coherent cross-scope provenance read.
     fn load_provenance(&self) -> Result<LoadedProvenance> {
-        let scopes = [
-            MEMORY_SCOPE_ID,
-            cognition_schema::DEFAULT_SCOPE_ID,
-            archive_schema::DEFAULT_SCOPE_ID,
-        ];
-        self.with_store(&scopes, |pile, signer, runtime| {
-            let (memory_collection, cognition_collection, archive_collection) = runtime.block_on(async {
-                let memory_source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
-                let cognition_source = open_configured(
-                    pile,
-                    cognition_schema::DEFAULT_SCOPE_ID,
-                    signer.verifying_key(),
-                )?;
-                let archive_source = open_configured(
-                    pile,
-                    archive_schema::DEFAULT_SCOPE_ID,
-                    signer.verifying_key(),
-                )?;
-                let memory_succinct = pile
-                    .attach::<SuccinctArchiveBlob>(memory_source, ())
-                    .context("register Succinct Memory collection")?;
-                let memory_collection = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(memory_source, memory_succinct)
-                    .context("register Rank9 Memory collection")?;
-                let cognition_succinct = pile
-                    .attach::<SuccinctArchiveBlob>(cognition_source, ())
-                    .context("register Succinct Cognition collection")?;
-                let cognition_collection = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(
-                        cognition_source,
-                        cognition_succinct,
-                    )
-                    .context("register Rank9 Cognition collection")?;
-                let archive_succinct = pile
-                    .attach::<SuccinctArchiveBlob>(archive_source, ())
-                    .context("register Succinct Archive collection")?;
-                let archive_collection = pile
-                    .attach::<Rank9AcceleratedSuccinctArchiveBlob>(archive_source, archive_succinct)
-                    .context("register Rank9 Archive collection")?;
-                for (succinct, collection, label) in [
-                    (memory_succinct, memory_collection, "Memory"),
-                    (cognition_succinct, cognition_collection, "Cognition"),
-                    (archive_succinct, archive_collection, "Archive"),
-                ] {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(succinct, signer).await,
-                    )
-                    .with_context(|| format!("maintain Succinct {label} collection"))?;
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(collection, signer).await,
-                    )
-                    .with_context(|| format!("maintain Rank9 {label} collection"))?;
-                }
-                Ok::<_, anyhow::Error>((memory_collection, cognition_collection, archive_collection))
-            })?;
+        self.with_store(|pile, signer, runtime| {
+            let memory_sources = Self::sources(pile, MEMORY_SCOPE_ID, signer, runtime)?;
+            let cognition_sources =
+                Self::sources(pile, cognition_schema::DEFAULT_SCOPE_ID, signer, runtime)?;
+            let archive_sources =
+                Self::sources(pile, archive_schema::DEFAULT_SCOPE_ID, signer, runtime)?;
+            let (memory_collections, cognition_collections, archive_collections) = runtime
+                .block_on(async {
+                    Ok::<_, anyhow::Error>((
+                        Self::maintained_rank9(pile, &memory_sources, signer, "Memory").await?,
+                        Self::maintained_rank9(pile, &cognition_sources, signer, "Cognition")
+                            .await?,
+                        Self::maintained_rank9(pile, &archive_sources, signer, "Archive").await?,
+                    ))
+                })?;
             let store_snapshot = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Memory/Cognition/Archive snapshot")?,
+                pile.snapshot()
+                    .context("freeze maintained Memory/Cognition/Archive snapshot")?,
                 runtime.clone(),
             );
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let memory = Self::load_memory_from_snapshot(&memory_collections, &store_snapshot)?;
             Ok(LoadedProvenance {
                 memory,
-                cognition: Self::attach_collection(cognition_collection, &store_snapshot, "Cognition")?,
-                archive: Self::attach_collection(archive_collection, &store_snapshot, "Archive")?,
+                cognition: Self::attach_collection(
+                    &cognition_collections,
+                    &store_snapshot,
+                    "Cognition",
+                )?,
+                archive: Self::attach_collection(&archive_collections, &store_snapshot, "Archive")?,
             })
         })
     }
 
-    fn publish_memory(&self, fragment: Fragment) -> Result<()> {
-        self.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
-            let collection = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+    /// Commit one fragment to `scope`'s write target and ensure its views.
+    /// The command's target names the Memory journal; another collection
+    /// the faculty writes takes its own default.
+    fn publish(&self, scope: Id, fragment: Fragment, what: &str) -> Result<()> {
+        let target = (scope == MEMORY_SCOPE_ID)
+            .then(|| self.storage.target())
+            .flatten();
+        self.with_store(|pile, signer, runtime| {
+            let collection =
+                write_target_acquiring(pile, scope, signer.verifying_key(), target, runtime)?;
             pile.commit(collection, signer, fragment)
-                .context("commit authored Memory fragment")?;
-            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
-                .context("Memory fragment was committed, but ensuring its derived views failed")
+                .with_context(|| format!("commit authored {what}"))?;
+            runtime
+                .block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                .with_context(|| {
+                    format!("{what} was committed, but ensuring its derived views failed")
+                })
                 .map(drop)
         })
+    }
+
+    fn publish_memory(&self, fragment: Fragment) -> Result<()> {
+        self.publish(MEMORY_SCOPE_ID, fragment, "Memory fragment")
     }
 
     #[cfg(feature = "local-embed")]
     fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
-        self.with_store(&[EMBEDDINGS_SCOPE_ID], |pile, signer, runtime| {
-            let collection = open_configured(pile, EMBEDDINGS_SCOPE_ID, signer.verifying_key())?;
-            pile.commit(collection, signer, fragment)
-                .context("commit authored embedding observations")?;
-            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
-                .context("Embedding observations were committed, but ensuring derived views failed")
-                .map(drop)
-        })
+        self.publish(EMBEDDINGS_SCOPE_ID, fragment, "embedding observations")
     }
 
     fn publish_comb(&self, fragment: Fragment) -> Result<()> {
-        self.with_store(&[DEFAULT_COMB_SCOPE_ID], |pile, signer, runtime| {
-            let collection = open_configured(pile, DEFAULT_COMB_SCOPE_ID, signer.verifying_key())?;
-            pile.commit(collection, signer, fragment)
-                .context("commit authored Comb cursor")?;
-            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
-                .context("Comb cursor was committed, but ensuring its derived views failed")
-                .map(drop)
-        })
+        self.publish(DEFAULT_COMB_SCOPE_ID, fragment, "Comb cursor")
     }
 }
 
@@ -2802,7 +2760,8 @@ mod tests {
         let (succinct, rank9) = fixture
             .storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let source =
+                    crate::collection_names::open(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
                 let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 Ok((
                     succinct,
@@ -2892,7 +2851,10 @@ mod tests {
             resolve_chunk_id(&loaded, &format!("{:x}", plain.id)).unwrap(),
             plain.id
         );
-        assert_eq!(chunk_references(&loaded.memory.facts, linked.id), vec![warm]);
+        assert_eq!(
+            chunk_references(&loaded.memory.facts, linked.id),
+            vec![warm]
+        );
         let unknown = ufoid();
         let error = memory
             .create(
@@ -2907,7 +2869,8 @@ mod tests {
         let (source, cold) = fixture
             .storage
             .with_pile(|pile, signer| {
-                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                let source =
+                    crate::collection_names::open(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
                 let (fragment, _) = memory_model::chunk_fragment(text_draft(
                     "unavailable historical member",
                     "2026-08-01T00:00:00",
@@ -2939,8 +2902,13 @@ mod tests {
                 }),
             )
             .unwrap_err();
-        assert!(shown.is_empty(), "an incomplete observation must not be presented");
-        let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>().unwrap();
+        assert!(
+            shown.is_empty(),
+            "an incomplete observation must not be presented"
+        );
+        let incomplete = error
+            .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+            .unwrap();
         assert_eq!(incomplete.unread.collection(), source);
         assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
 
@@ -2949,9 +2917,14 @@ mod tests {
             .storage
             .with_pile(|pile, _| Ok(pile.snapshot()?.select_records(&selectors)?))
             .unwrap();
-        for summary in ["a later journal entry".to_owned(), format!("[earlier](memory:{warm:x})")] {
+        for summary in [
+            "a later journal entry".to_owned(),
+            format!("[earlier](memory:{warm:x})"),
+        ] {
             let error = memory.create(&summary, Some(range), None).unwrap_err();
-            let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>().unwrap();
+            let incomplete = error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .unwrap();
             assert_eq!(incomplete.unread.collection(), source);
             assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
         }
@@ -2993,7 +2966,8 @@ mod tests {
                 scopes
                     .into_iter()
                     .map(|scope| {
-                        let source = open_configured(pile, scope, signer.verifying_key())?;
+                        let source =
+                            crate::collection_names::open(pile, scope, signer.verifying_key())?;
                         pile.commit(source, signer, entity! { &marker @ metadata::tag: &marker })?;
                         Ok(source)
                     })
@@ -3004,7 +2978,10 @@ mod tests {
         let comb = storage.load_comb().unwrap();
         let provenance = storage.load_provenance().unwrap();
         for loaded in [&context.memory, &comb.memory, &provenance.memory] {
-            assert_eq!(resolve_chunk_id(loaded, &format!("{warm:x}")).unwrap(), warm);
+            assert_eq!(
+                resolve_chunk_id(loaded, &format!("{warm:x}")).unwrap(),
+                warm
+            );
         }
         assert_eq!(
             find!(id: Id, pattern!(&comb.comb.facts, [{ ?id @ metadata::tag: &marker }]))
@@ -3050,15 +3027,26 @@ mod tests {
             })
             .unwrap();
         for error in [
-            storage.load_context(true).err().expect("incomplete context"),
+            storage
+                .load_context(true)
+                .err()
+                .expect("incomplete context"),
             storage.load_comb().err().expect("incomplete comb view"),
-            storage.load_provenance().err().expect("incomplete provenance"),
+            storage
+                .load_provenance()
+                .err()
+                .expect("incomplete provenance"),
         ] {
-            let incomplete = error.downcast_ref::<crate::storage::IncompleteAttachedRead>().unwrap();
+            let incomplete = error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .unwrap();
             // Every operation first needs the Memory facts, so its missing
             // selected foundation must be reported, not a partial warm view.
             assert_eq!(incomplete.unread.collection(), sources[0]);
-            assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold[0]]);
+            assert_eq!(
+                incomplete.unread.members().collect::<Vec<_>>(),
+                vec![cold[0]]
+            );
         }
         fixture
             .storage

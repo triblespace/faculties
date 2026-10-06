@@ -9,7 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 use crate::files;
 use crate::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
 use crate::mail_pop;
@@ -21,13 +21,14 @@ use crate::schemas::{
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
-use crate::storage::{open_secrets_collection, open_secrets_collection_read, AcquiringReader, FactArchive, FacultySnapshot};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
 use lettre::address::{Address as SmtpAddress, Envelope as LettreEnvelope};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{SmtpTransport, Transport};
+#[cfg(test)]
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
@@ -303,42 +304,22 @@ impl Storage {
 
     fn views(&self) -> Result<Views> {
         self.storage.with_store(|store, _, runtime| {
-            for scope in [self.scopes.mail, self.scopes.files, self.scopes.decide, self.scopes.relations] {
-                crate::collection_names::open_configured_acquiring(
-                    store, scope, self.signer.verifying_key(), runtime,
-                )?;
-            }
-            crate::storage::open_secrets_collection_acquiring(
-                store, self.signer.verifying_key(), runtime,
-            )?;
+            let key = self.signer.verifying_key();
+            let mail_sources = read_union_acquiring(store, self.scopes.mail, key, runtime)?;
+            let files_sources = read_union_acquiring(store, self.scopes.files, key, runtime)?;
+            let decide_sources = read_union_acquiring(store, self.scopes.decide, key, runtime)?;
+            let relations_sources =
+                read_union_acquiring(store, self.scopes.relations, key, runtime)?;
+            // Credentials are this signer's own: the Secrets collection it
+            // writes them to.
+            let secrets_collection =
+                crate::storage::open_secrets_collection_acquiring(store, key, None, runtime)?;
             let pile = store;
             let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot, secrets) = {
-                let mail_collection =
-                    open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
-                let files_collection =
-                    open_configured(pile, self.scopes.files, self.signer.verifying_key())?;
-                let decide_collection =
-                    open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
-                let relations_collection =
-                    open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
-                let secrets_collection =
-                    open_secrets_collection_read(pile, self.signer.verifying_key())?;
-                let mail_succinct =
-                    pile.attach::<SuccinctArchiveBlob>(mail_collection, ())?;
-                let mail_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(mail_collection, mail_succinct)?;
-                let files_succinct =
-                    pile.attach::<SuccinctArchiveBlob>(files_collection, ())?;
-                let files_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(files_collection, files_succinct)?;
-                let decide_succinct =
-                    pile.attach::<SuccinctArchiveBlob>(decide_collection, ())?;
-                let decide_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(decide_collection, decide_succinct)?;
-                let relations_succinct =
-                    pile.attach::<SuccinctArchiveBlob>(relations_collection, ())?;
-                let relations_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(relations_collection, relations_succinct)?;
+                let mail_rank9 = crate::storage::rank9_union(pile, &mail_sources)?;
+                let files_rank9 = crate::storage::rank9_union(pile, &files_sources)?;
+                let decide_rank9 = crate::storage::rank9_union(pile, &decide_sources)?;
+                let relations_rank9 = crate::storage::rank9_union(pile, &relations_sources)?;
                 // Attach the views as they stand through the same final
                 // target snapshot as the configured Secrets view. A read
                 // never maintains and never waits for a source commit nothing
@@ -360,14 +341,16 @@ impl Storage {
                 // never be assembled from different store prefixes.
                 let store_snapshot = AcquiringReader::new(secrets.store_snapshot().clone(), runtime.clone());
                 let secrets = secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
-                let mail_facts = crate::storage::acquire_facts(&store_snapshot, mail_rank9)
+                let mail_facts = crate::storage::acquire_union_facts(&store_snapshot, &mail_rank9)
                     .context("read maintained Mail fact collection")?;
-                let files_facts = crate::storage::acquire_facts(&store_snapshot, files_rank9)
+                let files_facts = crate::storage::acquire_union_facts(&store_snapshot, &files_rank9)
                     .context("read maintained Files fact collection")?;
-                let decide_facts = crate::storage::acquire_facts(&store_snapshot, decide_rank9)
-                    .context("read maintained Decide fact collection")?;
-                let relations_facts = crate::storage::acquire_facts(&store_snapshot, relations_rank9)
-                    .context("read maintained Relations fact collection")?;
+                let decide_facts =
+                    crate::storage::acquire_union_facts(&store_snapshot, &decide_rank9)
+                        .context("read maintained Decide fact collection")?;
+                let relations_facts =
+                    crate::storage::acquire_union_facts(&store_snapshot, &relations_rank9)
+                        .context("read maintained Relations fact collection")?;
                 (
                     mail_facts,
                     files_facts,
@@ -401,11 +384,10 @@ impl Storage {
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         self.storage.with_store(|store, _, runtime| {
-            crate::storage::open_secrets_collection_acquiring(
-                store, self.signer.verifying_key(), runtime,
+            let collection = crate::storage::open_secrets_collection_acquiring(
+                store, self.signer.verifying_key(), None, runtime,
             )?;
             let pile = store;
-            let collection = open_secrets_collection(&mut *pile, self.signer.verifying_key())?;
             secret_storage::add_secret(
                 &mut *pile,
                 &self.signer,
@@ -419,9 +401,14 @@ impl Storage {
     }
 
     fn publish(&self, scope: Id, fragment: Fragment, description: &str) -> Result<()> {
+        // The command's target names the Mail collection; another faculty's
+        // collection takes its own default.
+        let target = (scope == self.scopes.mail)
+            .then(|| self.storage.target())
+            .flatten();
         self.storage.with_store(|store, _, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, scope, self.signer.verifying_key(), runtime,
+            let collection = write_target_acquiring(
+                store, scope, self.signer.verifying_key(), target, runtime,
             )?;
             let pile = store;
             let mut fragment = fragment;
@@ -1264,7 +1251,7 @@ mod tests {
             let account = id(70);
             let signer = load_signer(&pile, Some(&key)).unwrap();
             let mut store = open_pile_strict(&pile).unwrap();
-            let collection = open_secrets_collection(&mut store, signer.verifying_key()).unwrap();
+            let collection = crate::storage::open_secrets_collection(&mut store, signer.verifying_key(), None).unwrap();
             let credential_id = secret_storage::add_secret(
                 &mut store,
                 &signer,
@@ -1342,7 +1329,7 @@ mod tests {
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
         for scope in [scopes().mail, scopes().files] {
-            let source = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
+            let source = crate::collection_names::open(&mut pile, scope, signer.verifying_key()).unwrap();
             let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
             let rank9 = pile
                 .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
@@ -1381,7 +1368,7 @@ mod tests {
         assert!(text.contains("injected later action failure"));
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
-        let source = open_configured(&mut pile, scopes().mail, signer.verifying_key()).unwrap();
+        let source = crate::collection_names::open(&mut pile, scopes().mail, signer.verifying_key()).unwrap();
         let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)

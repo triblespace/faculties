@@ -37,7 +37,6 @@ use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
 
-use crate::collection_names::open_exact_in;
 use crate::discord as discord_model;
 use crate::files as file_capability;
 use crate::schemas::archive::archive;
@@ -45,9 +44,7 @@ use crate::schemas::discord::{discord, DEFAULT_SCOPE_ID};
 use crate::schemas::files::file;
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
+use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::collection::{
     records::CollectionHandle, Collection, CollectionCommit, CollectionStoreExt,
 };
@@ -217,7 +214,7 @@ impl Discord {
     fn storage(&self) -> DiscordStorage<'_> {
         DiscordStorage {
             storage: &self.storage,
-            collection: None,
+            collection: self.storage.target(),
         }
     }
     fn token(&self) -> Result<&str> {
@@ -358,7 +355,7 @@ struct DiscordSession<'a> {
     pile: &'a mut FacultyStore,
     runtime: &'a std::sync::Arc<tokio::runtime::Runtime>,
     collection: Collection<SimpleArchive>,
-    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    rank9: Vec<Collection<Rank9AcceleratedSuccinctArchiveBlob>>,
     signer: SigningKey,
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
@@ -382,18 +379,21 @@ impl DiscordSession<'_> {
         // views, and refuse to call the commit done if no reader can see it.
         // Merges are the maintenance daemon's.
         drop(
-            self.runtime.block_on(crate::storage::ensure_downstream(
-                self.pile,
-                self.collection,
-                &self.signer,
-            ))
-            .context("Discord fragment was committed, but ensuring its derived views failed")?,
+            self.runtime
+                .block_on(crate::storage::ensure_downstream(
+                    self.pile,
+                    self.collection,
+                    &self.signer,
+                ))
+                .context("Discord fragment was committed, but ensuring its derived views failed")?,
         );
         self.reader = AcquiringReader::new(
-            self.pile.snapshot().context("freeze Discord fact collection after commit")?,
+            self.pile
+                .snapshot()
+                .context("freeze Discord fact collection after commit")?,
             self.runtime.clone(),
         );
-        self.facts = crate::storage::acquire_facts(&self.reader, self.rank9)
+        self.facts = crate::storage::acquire_union_facts(&self.reader, &self.rank9)
             .context("read maintained Discord fact collection after commit")?;
         Ok(commit)
     }
@@ -406,16 +406,13 @@ impl DiscordStorage<'_> {
         authority: VerifyingKey,
         runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<Collection<SimpleArchive>> {
-        let Some(handle) = self.collection else {
-            return crate::collection_names::open_configured_acquiring(
-                pile, DEFAULT_SCOPE_ID, authority, runtime,
-            );
-        };
-        let snapshot = pile
-            .snapshot()
-            .context("freeze store while opening exact Discord collection")?;
-        let reader = crate::storage::AcquiringReader::new(snapshot, runtime.clone());
-        open_exact_in(&reader, DEFAULT_SCOPE_ID, handle)
+        crate::collection_names::write_target_acquiring(
+            pile,
+            DEFAULT_SCOPE_ID,
+            authority,
+            self.collection,
+            runtime,
+        )
     }
 
     /// Prove that this process can publish to the selected collection before
@@ -446,18 +443,27 @@ impl DiscordStorage<'_> {
     ) -> Result<T> {
         self.storage.with_store(|store, signer, runtime| {
             let collection = self.open_collection(store, signer.verifying_key(), runtime)?;
+            let sources = crate::collection_names::read_union_acquiring(
+                store,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
+            )?;
             let pile = store;
             let result = (|| {
-                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
-                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
-                    collection,
-                    maintained_succinct,
-                )?;
+                // Read every Discord collection; write the target. A target
+                // nothing has committed to yet is read too, so the session
+                // sees its own first write.
+                let mut sources = sources;
+                if !sources.contains(&collection) {
+                    sources.push(collection);
+                }
+                let maintained_rank9 = crate::storage::rank9_union(pile, &sources)?;
                 let store_snapshot = AcquiringReader::new(
                     pile.snapshot().context("freeze Discord fact collection")?,
                     runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
+                let facts = crate::storage::acquire_union_facts(&store_snapshot, &maintained_rank9)
                     .context("read maintained Discord fact collection")?;
                 operation(&mut DiscordSession {
                     pile,
