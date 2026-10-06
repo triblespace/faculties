@@ -245,8 +245,10 @@ fn to_intake(
         }
         gateway::Event::Dispatch(dispatch) => {
             route(worker, dispatch);
-            if let Some(change) = members.and_then(|members| members.observe(dispatch, now_ms)) {
-                worker.send(intake::Work::Presence(change));
+            if let Some(members) = members {
+                for change in members.observe(dispatch, now_ms) {
+                    worker.send(intake::Work::Presence(change));
+                }
             }
         }
     }

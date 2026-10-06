@@ -11,14 +11,18 @@
 //!
 //! An update says where a member is now, not where they were, so telling a
 //! join from a mute needs to know who was there: the guild's GUILD_CREATE
-//! lists every voice state, and seeds that knowledge without a change, after
-//! the first READY and after every later one (a new session, which knows
-//! nothing of the last one's). A RESUMED session keeps what it knew, and
-//! Discord replays what it missed meanwhile, so a member who came or went
-//! while it was away is seen then, as it reaches the bot. A new session
-//! misses what changed while there was none: its GUILD_CREATE is taken as
-//! it is. Before the first GUILD_CREATE nobody's coming or going can be
-//! told, and nothing is a change.
+//! lists every voice state, after the first READY and after every later one
+//! (a new session, which knows nothing of the last one's). It is compared
+//! with what the process knew before it. At the process's start that is
+//! nothing, so whoever is in the channel when the bot arrives is seen coming
+//! in then: a bot restarted while somebody sits in the channel must learn
+//! they are there, and so must whatever pauses for them. After a new
+//! session it is what the old one knew, so a member who came or went while
+//! there was no session is seen at the new session's GUILD_CREATE. A RESUMED
+//! session keeps what it knew, and Discord replays what it missed meanwhile,
+//! so a member who came or went while it was away is seen then, as it
+//! reaches the bot. Between a READY and its GUILD_CREATE nobody's coming or
+//! going can be told, and nothing is a change.
 //!
 //! A member is there with one voice session, and a client of theirs that
 //! comes back under a new one takes the member's place in the channel over:
@@ -56,6 +60,10 @@ pub struct Members {
     /// Who is in the channel, with the voice session each is there with
     /// when Discord named it, once the guild's GUILD_CREATE said who was.
     present: Option<BTreeMap<u64, Option<String>>>,
+    /// What the last session knew of who is in the channel, kept across a
+    /// READY for the next GUILD_CREATE to be compared with. Empty at the
+    /// process's start.
+    remembered: BTreeMap<u64, Option<String>>,
     /// When the last change was seen, in milliseconds since the Unix epoch.
     last_seen_ms: u64,
 }
@@ -67,35 +75,65 @@ impl Members {
             channel: channel.get(),
             bot: None,
             present: None,
+            remembered: BTreeMap::new(),
             last_seen_ms: 0,
         }
     }
 
-    /// The change of who is in the channel that `dispatch` makes, if any,
-    /// seen at `now_ms` (milliseconds since the Unix epoch), or a millisecond
-    /// after the last change when that is later.
-    pub fn observe(&mut self, dispatch: &Value, now_ms: u64) -> Option<PresenceChange> {
+    /// The changes of who is in the channel that `dispatch` makes, in the
+    /// order they are seen, each seen at `now_ms` (milliseconds since the
+    /// Unix epoch), or a millisecond after the change before it when that is
+    /// later. Usually none or one; a GUILD_CREATE makes one for every member
+    /// it lists in the channel that the process did not know was there, and
+    /// one for every member it knew that is gone.
+    pub fn observe(&mut self, dispatch: &Value, now_ms: u64) -> Vec<PresenceChange> {
+        self.changes(dispatch, now_ms).unwrap_or_default()
+    }
+
+    fn changes(&mut self, dispatch: &Value, now_ms: u64) -> Option<Vec<PresenceChange>> {
         let d = &dispatch["d"];
         match dispatch["t"].as_str()? {
             "READY" => {
-                // A new session: what the last one knew is gone, until the
-                // guild's GUILD_CREATE says again.
+                // A new session: what the last one knew is remembered for
+                // its GUILD_CREATE to be compared with, and nothing is a
+                // change until then.
                 self.bot = snowflake(&d["user"]["id"]);
-                self.present = None;
+                if let Some(present) = self.present.take() {
+                    self.remembered = present;
+                }
                 None
             }
             "GUILD_CREATE" if snowflake(&d["id"]) == Some(self.guild) => {
-                self.present = d["voice_states"].as_array().map(|states| {
-                    states
-                        .iter()
-                        .filter(|state| snowflake(&state["channel_id"]) == Some(self.channel))
-                        .filter_map(|state| {
-                            Some((snowflake(&state["user_id"])?, voice_session(state)))
-                        })
-                        .filter(|(user, _)| Some(*user) != self.bot)
-                        .collect()
-                });
-                None
+                let states = d["voice_states"].as_array()?;
+                let before = self
+                    .present
+                    .take()
+                    .unwrap_or_else(|| std::mem::take(&mut self.remembered));
+                let mut present = BTreeMap::new();
+                let mut changes = Vec::new();
+                for state in states {
+                    if snowflake(&state["channel_id"]) != Some(self.channel) {
+                        continue;
+                    }
+                    let Some(user) = snowflake(&state["user_id"]) else {
+                        continue;
+                    };
+                    if Some(user) == self.bot {
+                        continue;
+                    }
+                    if !before.contains_key(&user) {
+                        let name = name(&state["member"]["user"]);
+                        changes.push(self.change(user, name, Presence::Joined, now_ms));
+                    }
+                    present.insert(user, voice_session(state));
+                }
+                for user in before.keys() {
+                    if !present.contains_key(user) {
+                        changes.push(self.change(*user, None, Presence::Left, now_ms));
+                    }
+                }
+                self.present = Some(present);
+                Some(changes)
             }
             "VOICE_STATE_UPDATE" if snowflake(&d["guild_id"]) == Some(self.guild) => {
                 let user = snowflake(&d["user_id"])?;
@@ -131,17 +169,29 @@ impl Members {
                     // Still elsewhere.
                     (None, false) => return None,
                 };
-                let seen_ms = now_ms.max(self.last_seen_ms.saturating_add(1));
-                self.last_seen_ms = seen_ms;
-                Some(PresenceChange {
-                    channel: self.channel,
-                    user,
-                    name: name(&d["member"]["user"]),
-                    presence,
-                    seen_ms,
-                })
+                let name = name(&d["member"]["user"]);
+                Some(vec![self.change(user, name, presence, now_ms)])
             }
             _ => None,
+        }
+    }
+
+    /// One change, seen at `now_ms` or a millisecond after the last.
+    fn change(
+        &mut self,
+        user: u64,
+        name: Option<String>,
+        presence: Presence,
+        now_ms: u64,
+    ) -> PresenceChange {
+        let seen_ms = now_ms.max(self.last_seen_ms.saturating_add(1));
+        self.last_seen_ms = seen_ms;
+        PresenceChange {
+            channel: self.channel,
+            user,
+            name,
+            presence,
+            seen_ms,
         }
     }
 }
@@ -228,12 +278,18 @@ mod tests {
     fn changes(members: &mut Members, dispatches: &[Value]) -> Vec<(usize, u64, Presence)> {
         let mut changes = Vec::new();
         for (index, dispatch) in dispatches.iter().enumerate() {
-            if let Some(change) = members.observe(dispatch, 1_790_000_000_000) {
+            for change in members.observe(dispatch, 1_790_000_000_000) {
                 assert_eq!(change.channel, VOICE);
                 changes.push((index, change.user, change.presence));
             }
         }
         changes
+    }
+
+    /// The one change a dispatch makes.
+    fn single(mut changes: Vec<PresenceChange>) -> PresenceChange {
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        changes.remove(0)
     }
 
     /// Coming into the channel is a join, with the member's name, and going
@@ -243,9 +299,7 @@ mod tests {
         let mut members = members();
         members.observe(&ready(), 0);
         members.observe(&guild(&[]), 0);
-        let joined = members
-            .observe(&update(ADA, Some(VOICE), false), 7)
-            .unwrap();
+        let joined = single(members.observe(&update(ADA, Some(VOICE), false), 7));
         assert_eq!(
             joined,
             PresenceChange {
@@ -326,12 +380,15 @@ mod tests {
         );
     }
 
-    /// Whoever GUILD_CREATE lists in the channel was already there, after a
-    /// restart or a new session alike; only what changes after it is a
-    /// change. Before it nothing is, since a mute cannot be told from a join.
-    /// A resumed session keeps what it knew.
+    /// GUILD_CREATE is compared with what the process knew: at its start,
+    /// nothing, so whoever it lists in the channel is seen coming in then
+    /// (not the bot), each a notice of its own; after a new session, what
+    /// the old one knew, so whoever came or went while there was none is
+    /// seen then, and whoever stayed is no change. Before the GUILD_CREATE
+    /// nothing is a change, since a mute cannot be told from a join. A
+    /// resumed session keeps what it knew.
     #[test]
-    fn a_new_session_is_seeded_without_changes() {
+    fn a_guild_create_is_compared_with_what_was_known() {
         let mut members = members();
         members.observe(&ready(), 0);
         assert_eq!(
@@ -339,31 +396,44 @@ mod tests {
             NONE,
             "before GUILD_CREATE"
         );
+        let now = 1_790_000_000_000;
+        let seen: Vec<_> = members
+            .observe(&guild(&[(ADA, VOICE), (GRACE, VOICE), (BOT, VOICE)]), now)
+            .into_iter()
+            .map(|change| (change.user, change.presence, change.seen_ms))
+            .collect();
         assert_eq!(
-            changes(
-                &mut members,
-                &[
-                    guild(&[(ADA, VOICE), (BOT, VOICE)]),
-                    update(ADA, Some(VOICE), true)
-                ]
-            ),
+            seen,
+            [
+                (ADA, Presence::Joined, now),
+                (GRACE, Presence::Joined, now + 1)
+            ],
+            "at the process's start"
+        );
+        assert_eq!(
+            changes(&mut members, &[update(ADA, Some(VOICE), true)]),
             NONE
         );
         // A new session knows nothing of the last one until its
-        // GUILD_CREATE: Ada and Grace are there then, whoever came while
-        // there was no session, and Ada leaving afterwards is a change.
+        // GUILD_CREATE, which says Grace is gone and Eve is there; Ada, who
+        // stayed, is no change, and her leaving afterwards is one.
+        let eve = GRACE + 1;
         assert_eq!(
             changes(
                 &mut members,
                 &[
                     ready(),
-                    update(GRACE, Some(VOICE), false),
-                    guild(&[(ADA, VOICE), (GRACE, VOICE)]),
-                    update(GRACE, Some(VOICE), true),
+                    update(GRACE, None, false),
+                    guild(&[(ADA, VOICE), (eve, VOICE)]),
+                    update(ADA, Some(VOICE), true),
                     update(ADA, None, false),
                 ]
             ),
-            [(4, ADA, Presence::Left)]
+            [
+                (2, eve, Presence::Joined),
+                (2, GRACE, Presence::Left),
+                (4, ADA, Presence::Left)
+            ]
         );
         // Resumed: Discord replays what the session missed, which is a
         // change against what it knew.
@@ -428,7 +498,7 @@ mod tests {
             (update(ADA, None, false), now - 5_000),
             (update(ADA, Some(VOICE), false), now + 60_000),
         ] {
-            let change = members.observe(&dispatch, at).unwrap();
+            let change = single(members.observe(&dispatch, at));
             seen.push((change.seen_ms, change.presence));
         }
         assert_eq!(
