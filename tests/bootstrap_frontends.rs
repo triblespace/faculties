@@ -10,7 +10,7 @@ fn native_and_mcp_import_share_exact_idempotent_publication() {
     let key = directory.path().join("bootstrap.key");
     std::fs::File::create(&pile).unwrap();
     initialize_signer(&pile, Some(&key)).unwrap();
-    let first = pollster::block_on(bootstrap::import(&pile, Some(&key))).unwrap();
+    let first = bootstrap::import(&pile, Some(&key)).unwrap();
     let mcp = Bootstrap::new(pile.clone(), Some(key));
     let before = std::fs::metadata(&pile).unwrap().len();
     let mut text = String::new();

@@ -13,7 +13,6 @@
 
 use ed25519_dalek::VerifyingKey;
 
-use triblespace::core::collection::descriptor;
 use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
@@ -37,10 +36,7 @@ pub use crate::schemas::config::{COLLECTION_NAME, DEFAULT_SCOPE_ID};
 /// open-world answer and the correct fallback -- it is why deriving a handle is
 /// safe for a reader even though it would not be for a writer.
 pub fn handle(authority: VerifyingKey) -> CollectionHandle {
-    descriptor::root_handle_to_read(
-        COLLECTION_NAME,
-        crate::collection_names::private_policy(authority),
-    )
+    triblespace::core::collection::selection::config_handle(authority)
 }
 
 /// The collection this pile configures faculty `scope` to use.
@@ -193,6 +189,17 @@ mod tests {
             handle(key(1)),
             handle(key(2)),
             "one pile's configuration must not be another's"
+        );
+    }
+
+    /// The handle every existing pile's configuration lives at. Core's
+    /// `config_handle_is_pinned` pins the same value for the same key, so the
+    /// faculties and `trible` find one collection.
+    #[test]
+    fn the_handle_is_pinned() {
+        assert_eq!(
+            hex::encode_upper(handle(key(0x2A)).raw),
+            "127AF2EB0A3CD05103BEA7996297584A856B34533002F5B921303C0BDD01E9F7",
         );
     }
 

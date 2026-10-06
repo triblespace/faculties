@@ -22,9 +22,8 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{
-    descriptor, generation, records::CollectionHandle, AdmissionPolicy, Collection,
-    CollectionPolicy, CollectionRead, CollectionRecordSelector, CollectionRegistrationError,
-    CollectionStoreExt,
+    descriptor, generation, records::CollectionHandle, Collection, CollectionRead,
+    CollectionRecordSelector, CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
@@ -120,12 +119,7 @@ pub fn require_name(scope: Id) -> &'static str {
 }
 
 /// The private policy deliberately shared by every current faculty root.
-pub fn private_policy(authority: VerifyingKey) -> CollectionPolicy {
-    CollectionPolicy::new(
-        AdmissionPolicy::direct(authority),
-        AdmissionPolicy::direct(authority),
-    )
-}
+pub use triblespace::core::collection::private_policy;
 
 /// Prefix for exact descriptor overrides understood by every faculty.
 ///
