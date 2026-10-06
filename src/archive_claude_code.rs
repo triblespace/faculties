@@ -126,8 +126,8 @@ pub struct ProjectionSummary {
 /// Files are discovered and emitted deterministically. Each semantic source
 /// occurrence is emitted immediately as a bounded fragment, followed by one
 /// exact source snapshot over offset-addressed chunks. The caller must stage every supplied
-/// fragment into one `ArchiveImportWriter` and call its `finish` only after
-/// projection succeeds; publishing fragments independently can expose an
+/// fragment into one `ArchiveImportWriter` and publish (`commit_unit` or
+/// `finish`) only after projection succeeds; publishing fragments independently can expose an
 /// invalid partial catalog. The projector itself performs no pile writes.
 pub fn project_path<F>(path: &Path, mut emit: F) -> Result<ProjectionSummary>
 where
