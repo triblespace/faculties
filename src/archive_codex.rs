@@ -25,7 +25,7 @@
 //! counted as skipped.
 //!
 //! A Codex fork or resume replays its parent's records into a new file under
-//! new timestamps. Each projected message is therefore received as a
+//! new timestamps. Each projected message's receipt is therefore a
 //! [`blockdag::block_source_projection`]: its identity is the block, which is
 //! the message's content and its place in the conversation, and the line, raw
 //! record, timestamp and path of every occurrence annotate it. A replayed
@@ -606,9 +606,20 @@ impl Projector<'_> {
         // resume replays the parent's records with new timestamps on new
         // lines of a new file, and before this the receipt's identity held
         // the locator and the raw record (timestamp included), so every
-        // replayed record minted a fresh receipt with its own raw blob and
-        // carried the whole closure into the commit again. Now the replay
-        // lands on the parent's receipt.
+        // replayed record minted a fresh receipt and carried its whole
+        // closure into the commit again. Now the replay lands on the
+        // parent's receipt and stages only its occurrence.
+        //
+        // MEASURED 2026-10-06 on sky (GB10, shared): two old-format forks of
+        // one parent (228.6 MB and 229.6 MB, 111.7k and 111.8k projected
+        // records), imported in ONE process into a fresh pile. Pile growth
+        // while importing the second fork: 503.0 MB with the exact-occurrence
+        // receipt, 339.0 MB with this one. Of the 339.0 MB, 229.6 MB is the
+        // second fork's own raw snapshot (every line differs by its
+        // timestamp, so no chunk is shared) and 60.0 MB its per-occurrence
+        // raw-record blobs (one 256-byte-aligned record each, the same in
+        // both runs); the commit's facts and their derived views fell from
+        // about 213 MB to about 49 MB.
         //
         // "Place in the conversation" is read as the predecessor chain, with
         // no conversation id in the key, because that is the simplest key
