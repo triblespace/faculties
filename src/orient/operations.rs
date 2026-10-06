@@ -7014,7 +7014,7 @@ mod tests {
 
     #[test]
     fn an_owned_clock_gets_its_turn_while_a_body_fetch_stalls() {
-        use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
+        use triblespace_net::peer::PeerConfig;
         let fixture = TestPile::new();
         // A leech that knows no peers: an exact acquisition of a handle no
         // provider has occupies its whole budget rather than failing fast.
@@ -7026,9 +7026,6 @@ mod tests {
             fixture.signer.clone(),
             PeerConfig {
                 peers: Vec::new(),
-                qos: ReconcileQos {
-                    direction: ReconcileDirection::ReadOnly,
-                },
                 provider_publication_budget: Some(0),
                 bind: None,
             },

@@ -417,9 +417,9 @@ where
 ///
 /// `TRIBLESPACE_PEERS` supplies comma-separated bootstrap endpoint tickets or
 /// endpoint ids, not blob providers to probe in order. The DHT finds providers.
-/// This foreground client joins no collection gossip topics and announces no
-/// providers. Its ephemeral transport identity is deliberately separate from
-/// both the durable author and any already-running replication daemon.
+/// This foreground client syncs no collection and announces no providers. Its
+/// ephemeral transport identity is deliberately separate from both the durable
+/// author and any already-running replication daemon.
 pub fn open_store(path: &Path) -> Result<FacultyStore> {
     lazy_store(|| open_pile_strict(path))
 }
@@ -438,7 +438,7 @@ fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
     use iroh_base::{EndpointAddr, EndpointId};
     use iroh_tickets::endpoint::EndpointTicket;
     use rand_core::RngCore;
-    use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
+    use triblespace_net::peer::PeerConfig;
 
     let routes = std::env::var("TRIBLESPACE_PEERS").or_else(|error| match error {
         std::env::VarError::NotPresent => Ok(String::new()),
@@ -470,9 +470,6 @@ fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
         key,
         PeerConfig {
             peers,
-            qos: ReconcileQos {
-                direction: ReconcileDirection::ReadOnly,
-            },
             provider_publication_budget: Some(0),
             bind: None,
         },
