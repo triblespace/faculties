@@ -64,7 +64,29 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
     current: FactArchive,
     delta: Fragment,
     runtime: Arc<tokio::runtime::Runtime>,
+    /// Commits published since this writer last carried its source.
+    uncarried: usize,
 }
+
+/// Commits a writer publishes between two carries of its own source.
+///
+/// Every commit is a frontier node of its own until a carry joins it. Each
+/// commit's attachment pass walks the whole frontier, and the writer's known
+/// facts gained one segment per commit, so a writer that never carried paid
+/// more for every commit than for the one before and left the whole carry to
+/// the next process to open the pile. The carry is the one
+/// [`ArchiveImportWriter::prepare`] runs at open.
+///
+/// Sixteen is measured, not derived (sky, one process importing hard-linked
+/// Codex rollouts into a fresh pile; mean wall time per rollout): over 1,000
+/// raw-only rollouts 9.7 ms at 8 and at 16, 10.5 at 32, 11.4 at 64, 14.6 at
+/// 128, against 38-39 ms never carrying; over 400 rollouts of 269
+/// projections each, 192.6 ms at 8 (one early outlier), 182.1 at 16, 183.4
+/// at 32, against 330 ms never carrying. Below the optimum a carry pass
+/// costs more than the frontier it removes; above it the frontier costs
+/// more. Sixteen sits at the measured optimum for both and leaves room for a
+/// pass that costs more on a larger pile.
+const CARRY_EVERY: usize = 16;
 
 impl ArchiveImportWriter {
     /// Open a synchronous import session. Async callers run the complete
@@ -86,6 +108,7 @@ impl ArchiveImportWriter {
                     current,
                     delta: Fragment::empty(),
                     runtime,
+                    uncarried: 0,
                 };
                 if let Err(error) = writer.stage_fragment(blockdag::vocabulary_fragment()) {
                     return close_pile(
@@ -125,6 +148,7 @@ where
             current,
             delta: Fragment::empty(),
             runtime,
+            uncarried: 0,
         };
         writer.stage_fragment(blockdag::vocabulary_fragment())?;
         Ok(writer)
@@ -213,6 +237,27 @@ where
             .commit(self.collection, &self.signer, fragment)
             .context("commit authored Archive projection unit")?;
         self.current = extend_archive(&self.current, &published);
+        self.uncarried += 1;
+        if self.uncarried < CARRY_EVERY {
+            self.ensure_downstream()?;
+            return Ok(Some(commit));
+        }
+        self.carry()?;
+        // Read back what the carry left, as the next open would: the
+        // frontier's attachments stand for every commit this writer made,
+        // so the per-commit segments `extend_archive` added are dropped. A
+        // foundation whose bytes are not here is left out, never fetched;
+        // that can only make a later fragment stage facts again, which the
+        // union absorbs.
+        let (_, rank9) = crate::storage::fact_pair(&mut self.pile, self.collection)?;
+        self.current = crate::storage::FactRead::read_facts(&self.pile.snapshot()?, rank9)
+            .context("read back the carried Archive facts")?;
+        Ok(Some(commit))
+    }
+
+    /// Attach the source's current frontier into every collection attached
+    /// to it, so what was just committed is readable through them.
+    fn ensure_downstream(&mut self) -> Result<()> {
         drop(
             self.runtime.block_on(crate::storage::ensure_downstream(
                 &mut self.pile,
@@ -223,15 +268,43 @@ where
                 "Archive projection unit was committed, but ensuring its derived views failed",
             )?,
         );
-        Ok(Some(commit))
+        Ok(())
+    }
+
+    /// Carry the source to its fixed point -- every tier holding eight nodes
+    /// joined by one MERGE -- and attach the frontier the carry leaves, so
+    /// neither this writer's next commit nor the next opener inherits the
+    /// commits made since the last carry. A store whose host is not this
+    /// writer's key believes none of its merges and is left uncarried, as
+    /// at open.
+    fn carry(&mut self) -> Result<()> {
+        self.runtime
+            .block_on(async {
+                crate::storage::tolerate_own_lag(
+                    self.pile.maintain(self.collection, &self.signer).await,
+                )
+            })
+            .context("Archive projection units were committed, but carrying them failed")?;
+        self.uncarried = 0;
+        self.ensure_downstream()
+    }
+
+    /// Publish what is still staged and carry what this writer committed.
+    fn settle(&mut self) -> Result<Option<CollectionCommit>> {
+        let commit = self.commit_unit()?;
+        if self.uncarried > 0 {
+            self.carry()?;
+        }
+        Ok(commit)
     }
 }
 
 impl ArchiveImportWriter {
-    /// Close the pile, publishing any still-staged delta first.
+    /// Close the pile, publishing any still-staged delta and carrying what
+    /// this writer committed first.
     pub fn close<T>(mut self, surrounding: Result<T>) -> Result<T> {
         let result = surrounding.and_then(|value| {
-            self.commit_unit()?;
+            self.settle()?;
             Ok(value)
         });
         close_pile(
@@ -243,7 +316,7 @@ impl ArchiveImportWriter {
 
     pub fn finish<T>(mut self, surrounding: Result<T>) -> Result<(T, Option<CollectionCommit>)> {
         let result = surrounding.and_then(|value| {
-            let commit = self.commit_unit()?;
+            let commit = self.settle()?;
             Ok((value, commit))
         });
         close_pile(
@@ -1356,6 +1429,85 @@ mod tests {
         retry.stage_fragment(annotation).unwrap();
         assert_eq!(retry.delta_len(), 0);
         assert!(retry.finish(Ok(())).unwrap().1.is_none());
+    }
+
+    /// A writer that commits many times in one process carries its own
+    /// source as it goes. Its frontier stays within the commits since its
+    /// last carry beside fewer than eight nodes per tier, what it reads back
+    /// after a carry still knows every commit, it closes at the carry's
+    /// fixed point, and the next open finds nothing to merge or attach.
+    #[test]
+    fn a_long_writer_carries_its_own_commits() {
+        use triblespace::core::collection::MERGE_FAN_IN;
+
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        let signer = initialize_archive_fixture(&pile, &key);
+
+        // Fills the second tier once and leaves three commits over.
+        let commits = MERGE_FAN_IN * MERGE_FAN_IN + 3;
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let source = writer.collection;
+        let mut widest = 0;
+        for index in 0..commits {
+            writer
+                .stage_fragment(projection(
+                    &format!("session:{index}"),
+                    &format!("body {index}"),
+                ))
+                .unwrap();
+            assert!(writer.commit_unit().unwrap().is_some());
+            let snapshot = writer.pile.snapshot().unwrap();
+            widest = widest.max(snapshot.collection(source).unwrap().cover().len());
+        }
+        let tiers = 3;
+        assert!(
+            widest < CARRY_EVERY + (MERGE_FAN_IN - 1) * tiers && widest < commits,
+            "the frontier reached {widest} nodes over {commits} commits"
+        );
+        writer
+            .stage_fragment(projection("session:0", "body 0"))
+            .unwrap();
+        assert_eq!(
+            writer.delta_len(),
+            0,
+            "the read-back facts know the first commit"
+        );
+        writer.close(Ok(())).unwrap();
+
+        let mut reopened = open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        let merges = discovered_records(&snapshot)
+            .unwrap()
+            .merges()
+            .iter()
+            .filter(|merge| merge.collection() == source.handle())
+            .count();
+        assert_eq!(
+            merges,
+            commits / MERGE_FAN_IN + commits / (MERGE_FAN_IN * MERGE_FAN_IN),
+            "every full tier was joined by the writer"
+        );
+        assert_eq!(
+            snapshot.collection(source).unwrap().cover().len(),
+            1 + commits % MERGE_FAN_IN,
+            "one node for the full second tier and the commits left over"
+        );
+        drop(snapshot);
+        reopened.close().unwrap();
+
+        let length = std::fs::metadata(&pile).unwrap().len();
+        let observed = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
+        assert_eq!(observed.support().len(), commits);
+        assert!(observed.residual().is_empty());
+        drop(observed);
+        assert_eq!(
+            std::fs::metadata(&pile).unwrap().len(),
+            length,
+            "the next open publishes no MERGE and no MAP"
+        );
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
