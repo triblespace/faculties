@@ -14,7 +14,10 @@ use crate::storage::initialize_signer;
 use crate::storage::open_secrets_collection;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
+use crate::storage::{
+    open_secrets_collection_acquiring, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore,
+    Storage,
+};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use hifitime::{Epoch, TimeScale};
@@ -36,9 +39,9 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, 
 use triblespace::prelude::*;
 
 use crate::clock;
-use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 #[cfg(test)]
 use crate::collection_names::open;
+use crate::collection_names::{read_union_acquiring, write_target_acquiring};
 use crate::files as file_capability;
 use crate::schemas::archive::{archive, RawBytes};
 use crate::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
@@ -48,7 +51,7 @@ use crate::teams as teams_core;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveAccess {
     /// Query the frozen archive without Graph or credential access. Missing
-    /// referenced bytes may be acquired from the colony.
+    /// referenced bytes may be acquired from peers.
     Resident,
     /// Complete one finite delta round before observing the archive.
     Synchronize,
@@ -664,9 +667,8 @@ impl TeamsSession {
         // support. Only Secrets gets a new observation here.
         let support = self.support.clone();
         let storage = self.storage.clone();
-        storage.with_store(|pile, _, runtime| {
-            self.refresh_secrets_for(pile, Some(support), runtime)
-        })
+        storage
+            .with_store(|pile, _, runtime| self.refresh_secrets_for(pile, Some(support), runtime))
     }
 
     fn refresh_secrets_for(
@@ -675,7 +677,8 @@ impl TeamsSession {
         support: Option<Vec<Support<SimpleArchive>>>,
         runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<()> {
-        let snapshot = runtime.block_on(self.secret_collection.ensure(pile, &self.signer))
+        let snapshot = runtime
+            .block_on(self.secret_collection.ensure(pile, &self.signer))
             .context("refresh configured Secrets collection for Teams")?;
         let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
         let secrets = secret_storage::snapshot_acquiring(reader.clone(), self.secret_collection)?;
@@ -743,19 +746,23 @@ impl TeamsStorage {
             let target = storage.target();
             let mut session = storage.with_store(|pile, signer, runtime| {
                 let collection = write_target_acquiring(
-                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), target, runtime,
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    target,
+                    runtime,
                 )?;
                 // Read every Teams collection; write the target. A target
                 // nothing has committed to yet is read too, so the session
                 // sees its own first write.
-                let mut sources = read_union_acquiring(
-                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
-                )?;
+                let mut sources =
+                    read_union_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
                 if !sources.contains(&collection) {
                     sources.push(collection);
                 }
                 let pairs = crate::storage::fact_pairs(pile, &sources)?;
-                let secret_collection = open_secrets_collection_acquiring(pile, signer.verifying_key(), None, runtime)?;
+                let secret_collection =
+                    open_secrets_collection_acquiring(pile, signer.verifying_key(), None, runtime)?;
                 // The session carries the source and attaches the frontier
                 // the carry leaves; a commit neither attachment reaches yet
                 // is read from its own bytes, and what this key cannot
@@ -764,13 +771,15 @@ impl TeamsStorage {
                     crate::storage::maintain_fact_pairs(pile, &pairs, signer)
                         .await
                         .context("maintain Teams fact collection")?;
-                    let snapshot = secret_collection.ensure(pile, signer)
-                            .await
-                            .context("observe configured Secrets collection for Teams")?;
+                    let snapshot = secret_collection
+                        .ensure(pile, signer)
+                        .await
+                        .context("observe configured Secrets collection for Teams")?;
                     Ok::<_, anyhow::Error>(snapshot)
                 })?;
                 let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
-                let secrets = secret_storage::snapshot_acquiring(reader.clone(), secret_collection)?;
+                let secrets =
+                    secret_storage::snapshot_acquiring(reader.clone(), secret_collection)?;
                 let maintained_rank9: Vec<_> = pairs.iter().map(|(_, rank9)| *rank9).collect();
                 let (support, facts) = observe_union(&reader, &maintained_rank9)?;
                 Ok(TeamsSession {
@@ -1239,7 +1248,11 @@ fn now_epoch_secs() -> Result<i64> {
     Ok(clock::now()?.to_unix_seconds() as i64)
 }
 
-fn load_context<P>(reader: &impl BlobStoreGet, catalog: &P, source_id: Id) -> Result<PresentationContext>
+fn load_context<P>(
+    reader: &impl BlobStoreGet,
+    catalog: &P,
+    source_id: Id,
+) -> Result<PresentationContext>
 where
     P: TriblePattern,
 {
@@ -3871,8 +3884,7 @@ mod tests {
         // old secret representation itself was deliberately left behind.
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
-        let collection =
-            open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        let collection = open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         pile.commit(collection, &signer, historical).unwrap();
         pile.close().unwrap();
 
