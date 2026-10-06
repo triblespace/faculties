@@ -448,8 +448,8 @@ that application-level DHT merely from an Iroh relay address.
 The owning `Leech<Pile>` uses the ordinary store traits; callers do not need a
 separate reader API. Local reads, writes, and snapshots start no network host.
 The first cold read starts an ephemeral transport identity, separate from the pile signer and any
-running replication daemon. The foreground client subscribes to no collection
-gossip, builds no serving inventory, and advertises no providers, even after
+running replication daemon. The foreground client syncs no collection, builds
+no serving inventory, and advertises no providers, even after
 acquisition has started its host. That host still participates in discovery and
 DHT routing. Exact blob handles remain the read
 capability; acquisition neither authors a `WANT` nor follows every reference

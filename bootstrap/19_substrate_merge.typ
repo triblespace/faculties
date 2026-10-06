@@ -55,11 +55,11 @@ semantics live in the domain model; they are not ambient storage arbitration.
   - Network participation is explicit per descriptor. Discovery may announce
     only that a peer has new state; semantic disclosure requires a valid READ
     proof for that exact collection.
-  - Gossip and anti-entropy carry sparse signed evidence, not permission or
-    automatic full replication. Referenced blobs remain lazy until local WANT
+  - Anti-entropy carries sparse signed evidence, not permission or automatic
+    full replication. Referenced blobs remain lazy until local WANT
     policy asks for them.
   - Trust per assertion, not per channel: COMMITs are signed, so provenance
-    survives any gossip path. Semantic admission still applies exact positive
+    survives any path. Semantic admission still applies exact positive
     WRITE authority when materializing the collection view.
 
 == Further reading

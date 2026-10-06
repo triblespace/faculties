@@ -74,7 +74,7 @@ grant is what lets the same authenticated endpoint receive collection state.
 == Why the boundaries matter
 
   - Knowing a collection handle is not READ authority.
-  - Routing, gossip, DHT presence, and local WANTs grant no capability.
+  - Routing, DHT presence, and local WANTs grant no capability.
   - WRITE decides which signed COMMITs contribute to a snapshot; local storage
     may still retain inactive evidence.
   - READ is checked for the exact descriptor before semantic disclosure. Blob
