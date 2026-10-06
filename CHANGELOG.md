@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Files search runs on one WeMM model. `files index` derives a single index
+  over `file::content` through the windowed WeMM mapping (an image whole;
+  text, HTML text and PDF text layers in windows of at most 248 framed IDs,
+  the first 16 per content; content the model cannot read gets no rows) and
+  prints the commits still to derive; `files similar` ranks by its cosine,
+  joined to the Files facts in one `find!`. The model is named by
+  `WEMM_PILE`, `WEMM_ASSETS` and `WEMM_ROOT`, and its collection is the model
+  pile's single collection, so `--wemm-collection` and the `--wemm` switches
+  are gone. The shared session lives in `faculties::wemm`. Removed: the Nomic
+  image and text indexes and their golden vectors (`files golden`), the 7b
+  space (`files embed7b`, `--mm7b`, MCP `files_embed7b`, the page entities and
+  3584-d encoding), and `--kind`, `--image-floor` and `--text-floor`. Their
+  rows stay in existing piles, unread.
 - `files add` no longer maintains the semantic indexes after saving. On a
   gb10 build it embedded every file of the key that had no row before
   returning, which on 2026-10-06 held one save for 76 minutes. Rows come

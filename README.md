@@ -115,7 +115,7 @@ faculties mcp --pile ./self.pile
 
 `faculties mcp` implements MCP 2025-06-18 over stdio by default, or native
 Streamable HTTP with `--http-listen`. Both transports use the same 34 adapters,
-229 tools, argument decoding, and native image/audio/resource output. The
+228 tools, argument decoding, and native image/audio/resource output. The
 library's `mcp::catalog::{Config, Catalog}` constructs the aggregate independently
 of either transport, without opening storage, keys, devices, or models.
 This server is trusted software, not a filesystem, network, or model-runtime
@@ -129,35 +129,27 @@ tools cannot substitute those paths. Additional launcher configuration is:
 | --- | --- |
 | Discord bot access | Optional `--discord-token` / `DISCORD_TOKEN` |
 | LinkedIn DMA pulls | Optional `--linkedin-token` / `LINKEDIN_TOKEN` |
-| Files semantic search and index maintenance | With `local-embed` (enabled by default), Nomic text and vision roots live in the working pile's `mary-model-graph` collection. No separate model-path setting; index maintenance requires GB10, while other machines read the replicated index |
+| Files semantic index and search | With the `wemm` feature on a GB10: `WEMM_PILE` (the dedicated WeMM model pile), `WEMM_ASSETS` (its pinned config/tokenizer/template directory) and `WEMM_ROOT` (the model root). Other machines carry the replicated index rows but cannot query them |
 | Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
 | Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
 
-The opt-in `wemm` feature adds `files index --wemm` and
-`files similar --wemm --text 'query'` (or a Files selector in place of `--text`).
-It uses **one** resident native WeMM model for both modalities and a new 4096-D
-content-keyed NVFP4 set index; it never falls back to the historical Nomic paths.
-Supply `WEMM_PILE`, `WEMM_COLLECTION` (descriptor handle), `WEMM_ROOT` (opaque
-root), and `WEMM_ASSETS` (the pinned config/tokenizer/template directory), or
-their `--wemm-*` options. This bounded CUDA profile requires actual NVIDIA GB10
-compute 12.1 and one contributing native model collection in the selected pile.
-The model pile must be a dedicated finished artifact, different from the writable
-Files pile even through hard links. The operator must prevent mutation,
-compaction and truncation of its mapped prefix through CUDA runtime teardown;
-read-only opening and inode/size checks do not prove that external guarantee.
+Files search runs on **one** native WeMM model (the `wemm` feature, NVIDIA
+GB10 compute 12.1 only) for text, images and documents in one 4096-D space:
+`files index` / `files similar`. `files index` derives
+NVFP4 rows keyed by content handle from the Files source collection: an
+image whole, and text (HTML reduced to its text, a PDF's text layer) in windows
+of at most 248 framed token IDs, the first 16 per content; content the model
+cannot read gets no rows. Indexing is only ever an explicit command, resumable
+per commit, and prints the commits it still has to derive; saving never embeds.
+Scores are reconstructed NVFP4 cosines, not calibrated relevance; `similar`
+ranks top-k unless given an explicit floor.
 
-Supported content is UTF-8 text of at most 256 **framed** token IDs (no
-truncation), and one complete PNG/JPEG image (fixed 256-patch GPU aspect-fit/
-white-pad preparation, at most 4096×4096 pixels and 64 MiB encoded). There is no
-PDF, crop, caption, video, long-document chunking or batch policy in this Files
-profile. A foundation containing unsupported content reports failure and gets
-no successful partial or empty leaf; other foundations may have progressed.
-Queries reuse the same selected runtime as indexing in the library API. Scores
-are reconstructed NVFP4 cosines, not exact reranks or relevance probabilities;
-default output is ranked top-k with no relevance floor. `--wemm-floor` is an
-explicit optional [-1,1] threshold; historical modality floors are not reused.
-This opt-in does not replace the global legacy defaults, automatic background
-indexing, or MCP's historical selector. No live index migration is implicit.
+Supply `WEMM_PILE`, `WEMM_ASSETS` and `WEMM_ROOT`; the model collection is the
+model pile's single collection. A bind costs 30 to 110 s, paid by every
+command. The model pile must be a dedicated finished artifact, different from
+the writable pile even through hard links, and the operator must prevent
+mutation, compaction and truncation of its mapped prefix until the process
+ends; read-only opening and inode/size checks do not prove that.
 
 Prefer the token environment variables to visible argv; help hides their
 values. Discovery needs neither tokens nor model assets. Resident Discord and

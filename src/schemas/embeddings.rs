@@ -39,23 +39,6 @@ pub const DIM: usize = 768;
 /// `F6BE4C16A56001FEA03A5927C6ED3814`.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("F6BE4C16A56001FEA03A5927C6ED3814");
 
-/// Golden-vector observations for the Files semantic index. These attributes
-/// retain their original 2026-09-14 anchors and embedding encoding; new facts
-/// live on separate observations with Mary's `model_root` reference. Historical
-/// root-owned facts remain readable without rewriting their subjects or ids.
-pub mod golden {
-    use triblespace::prelude::*;
-
-    attributes! {
-        /// nomic-embed-text embeds the fixed golden text to this vector on
-        /// the canonical compute. Minted 2026-09-14.
-        "18AD4630637E03D4A8214A7464D06AAC" as text_embedding: inlineencodings::Handle<super::Embedding768>;
-        /// nomic-embed-vision embeds the fixed golden image to this vector on
-        /// the canonical compute. Minted 2026-09-14.
-        "7415B83D46A1EDD8EE02BE1EBCEE6304" as image_embedding: inlineencodings::Handle<super::Embedding768>;
-    }
-}
-
 // ── dimension-typed embedding encoding ────────────────────────────────────
 
 /// Error decoding a dimension-typed embedding blob.
@@ -136,74 +119,6 @@ pub mod attr {
     use super::*;
     attributes! {
         "BCDCA79081A84E7428A2D06A7F222313" unsafe as embedding: inlineencodings::Handle<super::Embedding768>;
-    }
-}
-
-// ── nomic-embed-multimodal-7b dense space (3584-d) ─────────────────────────
-// A SEPARATE space from the 768-d nomic-v1.5 one above: nomic-embed-multimodal
-// -7b (a Qwen2.5-VL LoRA) emits a 3584-d dense last-token embedding. It is its
-// own coordinate system — text and image queries are comparable *within* it
-// (one model embeds both), but NOT comparable to the 768-d space. A distinct
-// type per space is the whole guard: even if two spaces ever shared a width,
-// the `Handle<_>` keeps their vectors from colliding in one HNSW index.
-
-/// Dimension of the nomic-embed-multimodal-7b dense space.
-pub const DIM_3584: usize = 3584;
-
-/// A 3584-d L2-normalized embedding in the nomic-embed-multimodal-7b space,
-/// length-validated on read (a vector of any other width fails to decode here,
-/// at compile time via the distinct `Handle<_>` and at read time via the check
-/// below). Same wire format as [`Embedding768`] (raw f32 LE) — but a distinct
-/// type, so the two spaces can never be mixed in one index.
-pub struct Embedding3584;
-
-impl BlobEncoding for Embedding3584 {}
-
-impl MetaDescribe for Embedding3584 {
-    fn describe() -> Fragment {
-        let id = id_hex!("3A11703C58FD2E7DB78846565E8FEABB");
-        entity! { ExclusiveId::force_ref(&id) @
-            metadata::name: "Embedding3584",
-            metadata::description: "3584-d [f32] LE embedding blob in the nomic-embed-multimodal-7b dense space (Qwen2.5-VL LoRA; last-token pool, L2-normalized). Length-validated on read so it can never be mixed with another embedding dimension in one HNSW index.",
-            metadata::tag: metadata::KIND_BLOB_ENCODING,
-        }
-    }
-}
-
-impl TryFromBlob<Embedding3584> for View<[f32]> {
-    type Error = EmbeddingDimError;
-    fn try_from_blob(b: Blob<Embedding3584>) -> Result<Self, Self::Error> {
-        let floats = b.bytes.len() / 4;
-        if floats != DIM_3584 {
-            return Err(EmbeddingDimError::WrongLen {
-                expected: DIM_3584,
-                got: floats,
-            });
-        }
-        b.bytes.view().map_err(EmbeddingDimError::View)
-    }
-}
-
-impl Encodes<Vec<f32>> for Embedding3584
-where
-    inlineencodings::Handle<Embedding3584>: InlineEncoding,
-{
-    type Output = Blob<Embedding3584>;
-    fn encode(source: Vec<f32>) -> Blob<Embedding3584> {
-        let mut bytes = Vec::with_capacity(source.len() * 4);
-        for v in &source {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        Blob::new(bytes.into())
-    }
-}
-
-/// The embedding attribute for the 3584-d space — kept distinct from
-/// [`attr::embedding`] so the two spaces index independently.
-pub mod attr_mm7b {
-    use super::*;
-    attributes! {
-        "1BFC43C63FE8A38BC09DB3144859F3FC" unsafe as embedding: inlineencodings::Handle<super::Embedding3584>;
     }
 }
 
@@ -302,31 +217,6 @@ mod tests {
                 Err(EmbeddingDimError::WrongLen {
                     expected: 768,
                     got: 512
-                })
-            ),
-            "wrong dimension is rejected on read"
-        );
-    }
-
-    #[test]
-    fn embedding3584_roundtrips_and_rejects_wrong_dim() {
-        let v: Vec<f32> = (0..DIM_3584).map(|i| i as f32 * 0.0001).collect();
-        let blob = <Embedding3584 as Encodes<Vec<f32>>>::encode(v.clone());
-        let back: View<[f32]> =
-            <View<[f32]> as TryFromBlob<Embedding3584>>::try_from_blob(blob).unwrap();
-        assert_eq!(back.as_ref(), v.as_slice(), "3584-d round-trips byte-exact");
-
-        // A 768-d vector from the OTHER nomic space must not decode here — the
-        // width guard keeps the two spaces from ever sharing an index.
-        let wrong: Vec<f32> = vec![0.0; DIM];
-        let blob = <Embedding3584 as Encodes<Vec<f32>>>::encode(wrong);
-        let err = <View<[f32]> as TryFromBlob<Embedding3584>>::try_from_blob(blob);
-        assert!(
-            matches!(
-                err,
-                Err(EmbeddingDimError::WrongLen {
-                    expected: 3584,
-                    got: 768
                 })
             ),
             "wrong dimension is rejected on read"
