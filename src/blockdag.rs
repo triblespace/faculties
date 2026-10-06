@@ -452,6 +452,60 @@ where
     )
 }
 
+/// Construct the source-scoped receipt of one canonical block, keyed by what
+/// the projected message IS rather than by where it was read.
+///
+/// Its identity is the source namespace and the projected block, nothing else.
+/// The block already fixes the message's content and its place in the
+/// conversation (its predecessor chain), so every source occurrence of that
+/// message converges on this one receipt: the original line, a fork's replayed
+/// copy of it, a resumed rollout's. Where and when each occurrence was read
+/// (locator, exact raw record, timestamp, path) annotates the receipt through
+/// [`source_occurrence`] and never enters its identity.
+///
+/// This is for sources that replay their own history into new files under new
+/// timestamps, as Codex forks do. An exact-occurrence [`source_projection`]
+/// there mints one receipt per replayed record, each carrying its own raw
+/// record, which made every fork cost a full second projection.
+pub fn block_source_projection(source_namespace: Id, block: Fragment) -> Result<Fragment> {
+    rooted(&block, "block")?;
+    let fragment = entity! { _ @
+        schema::source_projection::source_namespace: &source_namespace,
+        schema::source_projection::projects_to*: block,
+    };
+    attach_kind(
+        fragment,
+        schema::source_projection::KIND,
+        "source projection",
+    )
+}
+
+/// One source occurrence of a [`block_source_projection`] receipt, as a
+/// fragment of its own.
+///
+/// It holds only facts about `receipt`: the occurrence's locator, its exact
+/// raw record, and the given occurrence annotations. Keeping it apart from the
+/// receipt's intrinsic closure lets an import skip that closure whole when it
+/// is already known, and stage just the new occurrence.
+pub fn source_occurrence<T>(
+    receipt: Id,
+    source_locator: impl Into<String>,
+    raw_record: T,
+    annotations: ProjectionAnnotations,
+) -> Result<Fragment>
+where
+    T: triblespace::core::blob::IntoBlob<RawBytes>,
+{
+    let mut fragment = Fragment::rooted(receipt, TribleSet::new());
+    let source_locator = fragment.put::<UTF8String, _>(source_locator.into());
+    let raw_record = fragment.put::<RawBytes, _>(raw_record);
+    fragment += entity! { ExclusiveId::force_ref(&receipt) @
+        schema::source_projection::source_locator: source_locator,
+        schema::source_projection::raw_record: raw_record,
+    };
+    annotate_source_projection(fragment, annotations)
+}
+
 /// Attach occurrence-scoped evidence without changing a projection receipt's
 /// intrinsic root.
 pub fn annotate_source_projection(
@@ -1110,8 +1164,6 @@ where
     let mut referenced_blocks = BTreeSet::new();
     for id in &projections {
         let namespace = one_required(&source_namespaces, *id, "source projection namespace")?;
-        let locator = one_required(&source_locators, *id, "source projection locator")?;
-        let raw_record = one_required(&raw_records, *id, "source projection raw record")?;
         let projected = one_required(&projected_blocks, *id, "source projection target block")?;
         if !blocks.contains(&projected) {
             bail!("source projection {id:x} cites missing block {projected:x}");
@@ -1138,32 +1190,52 @@ where
                 );
             }
         }
-        let source_timestamp =
-            one_optional(&source_timestamps, *id, "source projection timestamp")?;
-        if let Some(timestamp) = source_timestamp {
+        // Occurrence evidence is additive: a receipt observed more than once
+        // carries every observation, and no annotation has a cardinality.
+        let locators = values_for(&source_locators, *id);
+        let raws = values_for(&raw_records, *id);
+        let timestamps = values_for(&source_timestamps, *id);
+        for timestamp in &timestamps {
             let _: (i128, i128) = timestamp.try_from_inline().map_err(|error| {
                 anyhow!("source projection {id:x} has invalid timestamp: {error:?}")
             })?;
         }
-        let author = one_optional(&authors, *id, "source projection author")?;
-        let experiencer = one_optional(&experiencers, *id, "source projection experiencer")?;
-        let raw_author = one_optional(&raw_authors, *id, "source projection raw author")?;
-        let raw_role = one_optional(&raw_roles, *id, "source projection raw role")?;
-        let raw_model = one_optional(&raw_models, *id, "source projection raw model")?;
+        let receipt_authors = values_for(&authors, *id);
+        let receipt_experiencers = values_for(&experiencers, *id);
+        let receipt_raw_authors = values_for(&raw_authors, *id);
+        let receipt_raw_roles = values_for(&raw_roles, *id);
+        let receipt_raw_models = values_for(&raw_models, *id);
         let paths = values_for(&source_paths, *id);
 
-        attachments.texts.insert(locator);
-        attachments.raws.insert(raw_record);
-        attachments.texts.extend(raw_author);
-        attachments.texts.extend(raw_role);
-        attachments.texts.extend(raw_model);
+        attachments.texts.extend(locators.iter().copied());
+        attachments.raws.extend(raws.iter().copied());
+        attachments
+            .texts
+            .extend(receipt_raw_authors.iter().copied());
+        attachments.texts.extend(receipt_raw_roles.iter().copied());
+        attachments.texts.extend(receipt_raw_models.iter().copied());
         attachments.texts.extend(paths.iter().copied());
 
-        let core = entity! { _ @
+        // Two receipt cores share this vocabulary. A block receipt
+        // ([`block_source_projection`]) is the namespace and the block alone,
+        // and every locator and raw record annotates it. An exact-occurrence
+        // receipt ([`source_projection`]) holds its one locator and raw record
+        // in its identity.
+        let block_core = entity! { _ @
             schema::source_projection::source_namespace: &namespace,
-            schema::source_projection::source_locator: locator,
-            schema::source_projection::raw_record: raw_record,
             schema::source_projection::projects_to: &projected,
+        };
+        let core = if block_core.root() == Some(*id) {
+            block_core
+        } else {
+            let locator = one_required(&source_locators, *id, "source projection locator")?;
+            let raw_record = one_required(&raw_records, *id, "source projection raw record")?;
+            entity! { _ @
+                schema::source_projection::source_namespace: &namespace,
+                schema::source_projection::source_locator: locator,
+                schema::source_projection::raw_record: raw_record,
+                schema::source_projection::projects_to: &projected,
+            }
         };
         let mut canonical = ensure_intrinsic_with_kind(
             *id,
@@ -1174,12 +1246,14 @@ where
         canonical += entity! { ExclusiveId::force_ref(id) @
             schema::source_projection::semantic_predecessor_support*:
                 predecessor_support.iter(),
-            schema::source_projection::source_timestamp?: source_timestamp,
-            schema::source_projection::author?: author,
-            schema::source_projection::experiencer?: experiencer,
-            schema::source_projection::raw_author?: raw_author,
-            schema::source_projection::raw_role?: raw_role,
-            schema::source_projection::raw_model?: raw_model,
+            schema::source_projection::source_locator*: locators.iter(),
+            schema::source_projection::raw_record*: raws.iter(),
+            schema::source_projection::source_timestamp*: timestamps.iter(),
+            schema::source_projection::author*: receipt_authors.iter(),
+            schema::source_projection::experiencer*: receipt_experiencers.iter(),
+            schema::source_projection::raw_author*: receipt_raw_authors.iter(),
+            schema::source_projection::raw_role*: receipt_raw_roles.iter(),
+            schema::source_projection::raw_model*: receipt_raw_models.iter(),
             files_schema::file::source_path*: paths.iter(),
         }
         .into_facts();

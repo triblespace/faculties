@@ -186,18 +186,24 @@ pub mod source_snapshot {
 
 /// Exact vendor occurrence and projection receipt.
 ///
-/// The first four fields are the identity core. Every other field is
-/// occurrence-scoped evidence attached monotonically after construction.
+/// An exact-occurrence receipt's identity core is the first four fields. A
+/// block receipt (`blockdag::block_source_projection`, used for Codex) has
+/// only `source_namespace` and `projects_to` in its core: its locators and raw
+/// records annotate it, one per observed occurrence, so replayed copies of a
+/// message converge on one receipt. Every other field is occurrence-scoped
+/// evidence attached monotonically after construction.
 pub mod source_projection {
     use super::*;
 
     attributes! {
         /// IDENTITY. Reified source protocol/namespace.
         "3D9FCD3A68CBFBCFD7375E35D63FB87D" unsafe as pub source_namespace: GenId;
-        /// IDENTITY. Vendor id scoped by session, or an append-stable fallback
-        /// coordinate. Never a movable filesystem path by itself.
+        /// IDENTITY of an exact-occurrence receipt; occurrence annotation on a
+        /// block receipt. Vendor id scoped by session, or an append-stable
+        /// fallback coordinate. Never a movable filesystem path by itself.
         "5F3F80B819EBFB04E2AF20852F9FE3E3" unsafe as pub source_locator: Handle<UTF8String>;
-        /// IDENTITY. Exact raw source record bytes.
+        /// IDENTITY of an exact-occurrence receipt; occurrence annotation on a
+        /// block receipt. Exact raw source record bytes.
         "584415CC85A866E45B91C2673C7F794E" unsafe as pub raw_record: Handle<RawBytes>;
         /// IDENTITY. Canonical block produced by this projection.
         "3810AAD922D0523B9A609E4E1EBA9320" unsafe as pub projects_to: GenId;
