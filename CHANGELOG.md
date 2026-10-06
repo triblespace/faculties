@@ -10,6 +10,13 @@ All notable changes to this project will be documented in this file.
   else an error naming the candidates. Wiki and Compass label rows from more
   than one collection with its handle and owners. The
   `TRIBLESPACE_COLLECTION_*` overrides are gone: nothing reads them.
+- `TRIBLESPACE_PEERS` is gone: nothing reads it. A command's first network
+  contact is the pile's sync daemon, named by the key the command signs with,
+  or by the pile's key file for a command that signs nothing. The command dials
+  the daemon at the sockets it recorded in the pile's configuration, or finds
+  it by key. The sharing recipe runs `trible pile net sync` without `--peers`,
+  which the sync redesign removed: each daemon finds the other through the
+  collection's content.
 - Memory and Wiki search in the same WeMM space as Files. `memory index`
   (formerly `memory embed`) derives an index over the journal's
   `ctx::summary` prose and `ctx::image` pictures, `wiki index` (formerly

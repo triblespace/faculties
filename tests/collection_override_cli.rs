@@ -47,8 +47,7 @@ fn relations(fixture: &TestPile, key: &Path) -> Command {
         .arg("--pile")
         .arg(&fixture.pile)
         .arg("--key")
-        .arg(key)
-        .env_remove("TRIBLESPACE_PEERS");
+        .arg(key);
     command
 }
 

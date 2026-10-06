@@ -426,18 +426,22 @@ selected collection covers. Application deadlines use an explicit evaluation
 time, independent of the storage snapshot. Relations uses this reader directly;
 the other live-enabled commands still use the shared payload-retry adapter.
 Neither path emits an implicit `WANT`.
-Configure one or more bootstrap routes as comma-separated Iroh endpoint
-tickets or endpoint IDs:
+The first contact is the pile's own sync daemon, `trible pile net sync`
+running as the pile's key. The daemon records the sockets it is bound to in
+the pile's configuration, and a command that opens the pile reads them and
+dials the daemon there, or finds it by key when none are recorded. The key is
+the one the command signs with, or for a command that signs nothing the pile's
+key file (`TRIBLESPACE_KEY`, else `self.key` beside the pile). There is no
+route to configure:
 
 ```sh
-export TRIBLESPACE_PEERS='<bootstrap endpoint ticket or ID>'
+trible pile net sync "$PILE"   # the pile's daemon, usually already running
 message list assistant
 ```
 
-These routes introduce the DHT; they are not a list of blob providers to probe
-serially. A compatible running provider must hold and advertise the requested
-bytes. With no bootstrap route, a fresh foreground process cannot discover
-that application-level DHT merely from an Iroh relay address.
+The daemon's DHT replies lead on to the providers. A compatible running
+provider must hold and advertise the requested bytes. With no daemon key, a
+fresh foreground process has no first contact and a cold read finds nothing.
 
 The owning `Leech<Pile>` uses the ordinary store traits; callers do not need a
 separate reader API. Local reads, writes, and snapshots start no network host.

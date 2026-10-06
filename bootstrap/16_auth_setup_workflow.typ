@@ -50,14 +50,18 @@ consolidation afterward, and do not use a destructive source-deletion option.
 ```sh
 # Founder selects this collection, then serves and pulls it.
 trible pile net select founder.pile --key root.key "$COLLECTION"
-trible pile net sync founder.pile \
-  --key root.key --peers <invitee-endpoint-ticket-or-id>
+trible pile net sync founder.pile --key root.key
 
 # Invitee runs the symmetric side.
 trible pile net select invitee.pile --key invitee.key "$COLLECTION"
-trible pile net sync invitee.pile \
-  --key invitee.key --peers <founder-endpoint-ticket-or-id>
+trible pile net sync invitee.pile --key invitee.key
 ```
+
+Neither daemon is told where the other is. The peers of a selected collection
+come from its content: the founder's pile holds grants that name the invitee's
+key, and the invitee's pile holds the descriptor and grants the founder signed.
+Each daemon dials the other by key, and iroh's discovery finds the address.
+That is why each daemon runs as the key it signed or was granted with.
 
 Sync peers for a collection only while both piles select it, and a running
 daemon follows `select` and `unselect`; `trible pile net selection` lists what

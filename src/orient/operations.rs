@@ -7121,16 +7121,16 @@ mod tests {
     fn an_owned_clock_gets_its_turn_while_a_body_fetch_stalls() {
         use triblespace_net::peer::PeerConfig;
         let fixture = TestPile::new();
-        // A leech that knows no peers: an exact acquisition of a handle no
-        // provider has occupies its whole budget rather than failing fast.
-        // The foreground store is a Leech now and deliberately refuses
-        // construction from a wired peer, so the stall comes from having
-        // nowhere to ask rather than from a dead wire.
+        // A leech with no daemon to contact: an exact acquisition of a
+        // handle no provider has occupies its whole budget rather than
+        // failing fast. The foreground store is a Leech now and deliberately
+        // refuses construction from a wired peer, so the stall comes from
+        // having nowhere to ask rather than from a dead wire.
         let mut pile: FacultyStore = FacultyStore::lazy(
             crate::storage::open_pile_strict(&fixture.path).unwrap(),
             fixture.signer.clone(),
             PeerConfig {
-                peers: Vec::new(),
+                daemon: None,
                 provider_publication_budget: Some(0),
                 bind: None,
             },

@@ -143,12 +143,7 @@ impl Fixture {
             .arg(&self.pile)
             .arg("--key")
             .arg(&self.key);
-        for variable in [
-            "DRIVE_ENDPOINT",
-            "DRIVE_KEY",
-            "PERSONA",
-            "TRIBLESPACE_PEERS",
-        ] {
+        for variable in ["DRIVE_ENDPOINT", "DRIVE_KEY", "PERSONA"] {
             command.env_remove(variable);
         }
         command

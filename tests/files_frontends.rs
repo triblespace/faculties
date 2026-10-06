@@ -91,7 +91,6 @@ impl Fixture {
             .args(["--key"])
             .arg(&self.key);
         command.env_remove("DRIVE_ENDPOINT");
-        command.env_remove("TRIBLESPACE_PEERS");
         command
     }
 }
@@ -403,7 +402,6 @@ fn executable_mcp_preserves_native_paths_and_isolates_standard_stream_aliases() 
         .arg(&fixture.pile)
         .arg("--key")
         .arg(&fixture.key)
-        .env_remove("TRIBLESPACE_PEERS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

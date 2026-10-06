@@ -378,9 +378,7 @@ fn executable_export_stays_raw_while_show_uses_the_configured_sensory_route() {
                 "DRIVE_ENDPOINT",
                 "invalid-endpoint-must-only-affect-perception",
             );
-        for name in ["DRIVE_KEY", "TRIBLESPACE_PEERS"] {
-            command.env_remove(name);
-        }
+        command.env_remove("DRIVE_KEY");
         let output = command.output().unwrap();
         if verb == "export" {
             assert!(
