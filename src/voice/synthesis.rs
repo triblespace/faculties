@@ -1,32 +1,143 @@
-//! One streaming Qwen3-TTS source, drained either into resident audio or a host sink.
+//! Explicit resident speech backend, drained into existing audio/host sinks.
 use anybytes::Bytes;
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "voice")]
 use std::sync::{Arc, Mutex};
+use triblespace::prelude::Id;
 
 #[derive(Clone, Debug)]
-pub struct ModelSources {
+pub enum ModelSources {
+    Qwen3Tts {
+        pile: PathBuf,
+        reference_wav: PathBuf,
+        reference_text: PathBuf,
+        reference_codes: PathBuf,
+        #[cfg(feature = "voice")]
+        variant: mary::speak::Qwen3TtsVariant,
+    },
+    Breeze(BreezeSources),
+    /// Retain a launcher error until a caller explicitly primes/synthesizes.
+    /// Discovery/construction remains inert; this never selects another model.
+    Invalid(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct BreezeSources {
+    /// Launcher custody promise through CUDA storage teardown, including errors.
+    pub immutable_pile: bool,
     pub pile: PathBuf,
+    pub model_root: Id,
+    pub config_root: Id,
+    pub tokenizer_asset: Id,
+    pub external_codec_root: Id,
+    pub external_codec_config_root: Id,
     pub reference_wav: PathBuf,
     pub reference_text: PathBuf,
-    pub reference_codes: PathBuf,
-    #[cfg(feature = "voice")]
-    pub variant: mary::speak::Qwen3TtsVariant,
+    pub direction: Option<String>,
+    pub cfg_scale: f32,
 }
 impl ModelSources {
     /// Capture launcher configuration without opening any file or device.
     pub fn from_environment() -> Self {
-        let directory = crate::model_dir();
-        Self {
-            pile: std::env::var_os("QWEN3TTS_PILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| directory.join("qwen3tts.pile")),
-            reference_wav: directory.join("ref_voice_v2_24k.wav"),
-            reference_text: directory.join("ref_voice_v2.txt"),
-            reference_codes: directory.join("ref_voice_v2_code.npy"),
-            #[cfg(feature = "voice")]
-            variant: mary::speak::Qwen3TtsVariant::from_env(),
+        Self::from_lookup(&|name| std::env::var_os(name), &crate::model_dir())
+            .unwrap_or_else(|error| Self::Invalid(error.to_string()))
+    }
+
+    fn from_lookup(get: &impl Fn(&str) -> Option<OsString>, directory: &Path) -> Result<Self> {
+        let backend = get("FACULTIES_VOICE_BACKEND").unwrap_or_else(|| "qwen3tts".into());
+        match backend.to_str() {
+            Some("qwen3tts") => Ok(Self::Qwen3Tts {
+                pile: get("QWEN3TTS_PILE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| directory.join("qwen3tts.pile")),
+                reference_wav: directory.join("ref_voice_v2_24k.wav"),
+                reference_text: directory.join("ref_voice_v2.txt"),
+                reference_codes: directory.join("ref_voice_v2_code.npy"),
+                #[cfg(feature = "voice")]
+                variant: if get("MARY_SPEAK_MODEL").as_deref() == Some(std::ffi::OsStr::new("0.6b"))
+                {
+                    mary::speak::Qwen3TtsVariant::Base0_6B
+                } else {
+                    mary::speak::Qwen3TtsVariant::Base1_7B
+                },
+            }),
+            Some("breeze") => {
+                let text = |name: &str| -> Result<String> {
+                    let value = get(name).with_context(|| format!("Breeze requires {name}"))?;
+                    let value = value
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("{name} must be UTF-8"))?;
+                    ensure!(!value.trim().is_empty(), "{name} must not be blank");
+                    Ok(value)
+                };
+                let path = |name: &str| -> Result<PathBuf> {
+                    let value = get(name).with_context(|| format!("Breeze requires {name}"))?;
+                    ensure!(!value.is_empty(), "{name} must not be empty");
+                    Ok(PathBuf::from(value))
+                };
+                let id = |name: &str| -> Result<Id> {
+                    let value = text(name)?;
+                    ensure!(
+                        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                        "{name} must be a full 32-hex opaque ID"
+                    );
+                    Id::from_hex(&value).with_context(|| format!("invalid {name}"))
+                };
+                // This records the launcher's custody promise, not a claim that
+                // an O_RDONLY descriptor or mode bits make memory aliases safe.
+                ensure!(
+                    text("FACULTIES_BREEZE_IMMUTABLE_PILE")? == "1",
+                    "FACULTIES_BREEZE_IMMUTABLE_PILE=1 must affirm immutable mapped bytes through CUDA teardown"
+                );
+                let direction = get("FACULTIES_BREEZE_DIRECTION")
+                    .map(|_| text("FACULTIES_BREEZE_DIRECTION"))
+                    .transpose()?;
+                let cfg_scale = get("FACULTIES_BREEZE_CFG_SCALE")
+                    .map(|_| {
+                        text("FACULTIES_BREEZE_CFG_SCALE")?
+                            .parse::<f32>()
+                            .context("FACULTIES_BREEZE_CFG_SCALE must be numeric")
+                    })
+                    .transpose()?
+                    .unwrap_or(1.0);
+                ensure!(
+                    cfg_scale.is_finite() && cfg_scale > 0.0,
+                    "Breeze CFG scale must be finite and positive"
+                );
+                ensure!(
+                    cfg_scale == 1.0 || direction.is_some(),
+                    "non-unit Breeze CFG requires an explicit direction"
+                );
+                Ok(Self::Breeze(BreezeSources {
+                    immutable_pile: true,
+                    pile: path("FACULTIES_BREEZE_PILE")?,
+                    model_root: id("FACULTIES_BREEZE_MODEL_ROOT")?,
+                    config_root: id("FACULTIES_BREEZE_CONFIG_ROOT")?,
+                    tokenizer_asset: id("FACULTIES_BREEZE_TOKENIZER_ASSET")?,
+                    external_codec_root: id("FACULTIES_BREEZE_EXTERNAL_CODEC_ROOT")?,
+                    external_codec_config_root: id("FACULTIES_BREEZE_EXTERNAL_CODEC_CONFIG_ROOT")?,
+                    reference_wav: path("FACULTIES_BREEZE_REFERENCE_WAV")?,
+                    reference_text: path("FACULTIES_BREEZE_REFERENCE_TEXT")?,
+                    direction,
+                    cfg_scale,
+                }))
+            }
+            _ => anyhow::bail!("FACULTIES_VOICE_BACKEND must be exactly qwen3tts or breeze"),
+        }
+    }
+
+    fn check_backend(&self) -> Result<()> {
+        match self {
+            Self::Invalid(error) => anyhow::bail!("invalid speech configuration: {error}"),
+            Self::Breeze(source) if !source.immutable_pile => anyhow::bail!(
+                "Breeze requires explicit immutable pile custody through CUDA teardown"
+            ),
+            Self::Breeze(_) if !cfg!(feature = "voice-breeze") => {
+                anyhow::bail!("Breeze speech requires a build with the voice-breeze feature")
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -126,6 +237,7 @@ impl Synthesizer {
     /// creates a pause file, writes a journal, or saves audio on the host.
     pub fn synthesize(&self, text: &str) -> Result<AudioClip> {
         super::operations::validate_text(text)?;
+        self.sources.check_backend()?;
         #[cfg(not(feature = "voice"))]
         anyhow::bail!("speech synthesis requires a build with the `voice` feature");
         #[cfg(feature = "voice")]
@@ -148,6 +260,7 @@ impl Synthesizer {
     /// this immediately before it begins accepting text so model loading can
     /// overlap the arrival of the first sentence.
     pub fn prime(&self) -> Result<()> {
+        self.sources.check_backend()?;
         #[cfg(not(feature = "voice"))]
         anyhow::bail!("speech synthesis requires a build with the `voice` feature");
         #[cfg(feature = "voice")]
@@ -188,30 +301,95 @@ impl Synthesizer {
 
     #[cfg(feature = "voice")]
     fn load_resident(&self) -> Result<Resident> {
-        let ref_text = std::fs::read_to_string(&self.sources.reference_text)
+        self.sources.check_backend()?;
+        let (pile, reference_wav, reference_text, reference_codes, variant) = match &self.sources {
+            ModelSources::Qwen3Tts {
+                pile,
+                reference_wav,
+                reference_text,
+                reference_codes,
+                variant,
+            } => (
+                pile,
+                reference_wav,
+                reference_text,
+                reference_codes,
+                variant,
+            ),
+            ModelSources::Breeze(source) => {
+                #[cfg(feature = "voice-breeze")]
+                return Self::load_breeze(source);
+                #[cfg(not(feature = "voice-breeze"))]
+                {
+                    let _ = source;
+                    anyhow::bail!("Breeze speech requires a build with the voice-breeze feature");
+                }
+            }
+            ModelSources::Invalid(error) => anyhow::bail!("invalid speech configuration: {error}"),
+        };
+        let ref_text = std::fs::read_to_string(reference_text)
             .context("read configured reference transcript")?;
         ensure!(!ref_text.trim().is_empty(), "reference transcript is empty");
         // Preflight the reference before Mary's infallible reader sees it.
-        let reference =
-            std::fs::read(&self.sources.reference_wav).context("read configured reference WAV")?;
+        let reference = std::fs::read(reference_wav).context("read configured reference WAV")?;
         let (sample_count, sample_rate) = reference_metadata(&reference)?;
-        preflight_reference_codes(&self.sources.reference_codes)?;
-        let weights = crate::model_storage::with_snapshot(
-            &self.sources.pile, "Qwen3-TTS", |snapshot| {
-                mary::speak::Qwen3TtsWeights::from_snapshot(snapshot.clone(), self.sources.variant)
-                    .context("select configured native Qwen3-TTS cohort")
-            },
-        )?;
+        preflight_reference_codes(reference_codes)?;
+        let weights = crate::model_storage::with_snapshot(pile, "Qwen3-TTS", |snapshot| {
+            mary::speak::Qwen3TtsWeights::from_snapshot(snapshot.clone(), *variant)
+                .context("select configured native Qwen3-TTS cohort")
+        })?;
         let session = mary::speak::Synthesizer::spawn(
             weights,
-            &self.sources.reference_wav,
+            reference_wav,
             ref_text.trim(),
-            &self.sources.reference_codes,
+            reference_codes,
         )?;
         Ok(Resident {
             session,
             reference_seconds: sample_count as f32 / sample_rate as f32,
             reference_chars: ref_text.trim().chars().count(),
+        })
+    }
+
+    #[cfg(feature = "voice-breeze")]
+    fn load_breeze(source: &BreezeSources) -> Result<Resident> {
+        use mary::models::breeze::{
+            generator::GenerationOptions, load::Artifacts, resident::BreezeVoiceConfig,
+        };
+        let ref_text = std::fs::read_to_string(&source.reference_text)
+            .context("read configured Breeze reference transcript")?;
+        // Native FLOAT/PCM16 preflight; never Qwen's PCM16/NPY reference kit.
+        let samples = mary::models::breeze::reference::read_wav(&source.reference_wav)?;
+        let reference_seconds = samples.len() as f32 / 24_000.0;
+        let reference_chars = ref_text.trim().chars().count();
+        drop(samples);
+        let config = BreezeVoiceConfig {
+            pile: source.pile.clone(),
+            artifacts: Artifacts {
+                model_root: source.model_root,
+                config_root: source.config_root,
+                tokenizer_asset: source.tokenizer_asset,
+                external_codec_root: source.external_codec_root,
+                external_codec_config_root: source.external_codec_config_root,
+            },
+            reference_wav: source.reference_wav.clone(),
+            reference_text: ref_text,
+            direction: source.direction.clone(),
+            options: GenerationOptions {
+                cfg_scale: source.cfg_scale,
+                ..Default::default()
+            },
+        };
+        config.validate()?;
+        // SAFETY: the explicit immutable-generation launcher contract was
+        // required during configuration. It covers the genuine pile's mapped
+        // bytes/page prefixes through CUDA storage teardown, also on errors;
+        // neither this reader closing nor a worker dropping lifts that duty.
+        let session = unsafe { mary::speak::Synthesizer::spawn_breeze(config) }?;
+        Ok(Resident {
+            session,
+            reference_seconds,
+            reference_chars,
         })
     }
 }
@@ -358,6 +536,194 @@ pub(super) fn prebuffer_target_secs(total_est_secs: f32, production_rate: f32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn breeze_settings() -> Vec<(&'static str, OsString)> {
+        let id = format!("{:x}", triblespace::prelude::fucid().id);
+        vec![
+            ("FACULTIES_VOICE_BACKEND", "breeze".into()),
+            ("FACULTIES_BREEZE_IMMUTABLE_PILE", "1".into()),
+            ("FACULTIES_BREEZE_PILE", "/explicit/native.pile".into()),
+            ("FACULTIES_BREEZE_MODEL_ROOT", id.clone().into()),
+            ("FACULTIES_BREEZE_CONFIG_ROOT", id.clone().into()),
+            ("FACULTIES_BREEZE_TOKENIZER_ASSET", id.clone().into()),
+            ("FACULTIES_BREEZE_EXTERNAL_CODEC_ROOT", id.clone().into()),
+            ("FACULTIES_BREEZE_EXTERNAL_CODEC_CONFIG_ROOT", id.into()),
+            (
+                "FACULTIES_BREEZE_REFERENCE_WAV",
+                "/explicit/preferred-float.wav".into(),
+            ),
+            (
+                "FACULTIES_BREEZE_REFERENCE_TEXT",
+                "/explicit/known.txt".into(),
+            ),
+        ]
+    }
+
+    fn parse_settings(settings: &[(&str, OsString)]) -> Result<ModelSources> {
+        ModelSources::from_lookup(
+            &|key| {
+                settings
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.clone())
+            },
+            Path::new("/qwen-only-model-directory"),
+        )
+    }
+
+    #[test]
+    fn absent_backend_keeps_qwen_and_its_original_reference_kit() {
+        match parse_settings(&[]).unwrap() {
+            ModelSources::Qwen3Tts {
+                pile,
+                reference_wav,
+                reference_text,
+                reference_codes,
+                ..
+            } => {
+                assert_eq!(pile, Path::new("/qwen-only-model-directory/qwen3tts.pile"));
+                assert_eq!(
+                    reference_wav,
+                    Path::new("/qwen-only-model-directory/ref_voice_v2_24k.wav")
+                );
+                assert_eq!(
+                    reference_text,
+                    Path::new("/qwen-only-model-directory/ref_voice_v2.txt")
+                );
+                assert_eq!(
+                    reference_codes,
+                    Path::new("/qwen-only-model-directory/ref_voice_v2_code.npy")
+                );
+            }
+            _ => panic!("default backend changed"),
+        }
+    }
+
+    #[test]
+    fn backend_names_are_strict_and_errors_do_not_fallback() {
+        for name in ["", "Breeze", " breeze", "qwen", "unknown"] {
+            assert!(parse_settings(&[("FACULTIES_VOICE_BACKEND", name.into())]).is_err());
+        }
+        assert!(
+            ModelSources::Invalid("test configuration error".into())
+                .check_backend()
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "voice")]
+    fn qwen_variant_switch_preserves_exact_previous_fallback_semantics() {
+        for value in [
+            None,
+            Some("0.6b"),
+            Some("1.7b"),
+            Some("unknown"),
+            Some("0.6B"),
+            Some(""),
+        ] {
+            let settings = value
+                .map(|value| vec![("MARY_SPEAK_MODEL", value.into())])
+                .unwrap_or_default();
+            let ModelSources::Qwen3Tts { variant, .. } = parse_settings(&settings).unwrap() else {
+                unreachable!()
+            };
+            let expected = if value == Some("0.6b") {
+                mary::speak::Qwen3TtsVariant::Base0_6B
+            } else {
+                mary::speak::Qwen3TtsVariant::Base1_7B
+            };
+            assert_eq!(variant, expected);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let settings = [("MARY_SPEAK_MODEL", OsString::from_vec(vec![0xff]))];
+            let ModelSources::Qwen3Tts { variant, .. } = parse_settings(&settings).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(variant, mary::speak::Qwen3TtsVariant::Base1_7B);
+        }
+    }
+
+    #[test]
+    fn breeze_configuration_uses_only_its_explicit_assets_and_opaque_ids() {
+        let mut settings = breeze_settings();
+        settings.push(("QWEN3TTS_PILE", "/must-not-be-used.pile".into()));
+        let selected = parse_settings(&settings).unwrap();
+        let ModelSources::Breeze(source) = &selected else {
+            panic!("wrong backend")
+        };
+        assert_eq!(source.pile, Path::new("/explicit/native.pile"));
+        assert_eq!(
+            source.reference_wav,
+            Path::new("/explicit/preferred-float.wav")
+        );
+        assert_eq!(source.reference_text, Path::new("/explicit/known.txt"));
+        assert_eq!(source.cfg_scale, 1.0);
+        assert!(source.direction.is_none());
+        assert!(source.immutable_pile);
+        // Random IDs need not encode a source/model/version or be distinct.
+        assert_eq!(source.model_root, source.external_codec_root);
+        if cfg!(feature = "voice-breeze") {
+            selected.check_backend().unwrap();
+        } else {
+            assert!(
+                selected
+                    .check_backend()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("voice-breeze")
+            );
+        }
+    }
+
+    #[test]
+    fn breeze_rejects_missing_paths_partial_ids_and_unaffirmed_custody_without_io() {
+        for key in [
+            "FACULTIES_BREEZE_PILE",
+            "FACULTIES_BREEZE_REFERENCE_WAV",
+            "FACULTIES_BREEZE_REFERENCE_TEXT",
+            "FACULTIES_BREEZE_IMMUTABLE_PILE",
+        ] {
+            let mut settings = breeze_settings();
+            settings.retain(|(name, _)| *name != key);
+            assert!(parse_settings(&settings).is_err(), "{key}");
+        }
+        for bad in ["abc", "not-a-root", "", "00000000000000000000000000000000"] {
+            let mut settings = breeze_settings();
+            settings
+                .iter_mut()
+                .find(|(name, _)| *name == "FACULTIES_BREEZE_MODEL_ROOT")
+                .unwrap()
+                .1 = bad.into();
+            assert!(parse_settings(&settings).is_err(), "{bad}");
+        }
+        let ModelSources::Breeze(mut source) = parse_settings(&breeze_settings()).unwrap() else {
+            unreachable!()
+        };
+        source.immutable_pile = false;
+        assert!(ModelSources::Breeze(source).check_backend().is_err());
+    }
+
+    #[test]
+    fn breeze_guidance_is_explicit_finite_and_requires_a_direction() {
+        for scale in ["NaN", "inf", "0", "-1", "three"] {
+            let mut settings = breeze_settings();
+            settings.push(("FACULTIES_BREEZE_CFG_SCALE", scale.into()));
+            assert!(parse_settings(&settings).is_err(), "{scale}");
+        }
+        let mut settings = breeze_settings();
+        settings.push(("FACULTIES_BREEZE_CFG_SCALE", "3".into()));
+        assert!(parse_settings(&settings).is_err());
+        settings.push(("FACULTIES_BREEZE_DIRECTION", "Speak softly.".into()));
+        let ModelSources::Breeze(source) = parse_settings(&settings).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(source.cfg_scale, 3.0);
+        assert_eq!(source.direction.as_deref(), Some("Speak softly."));
+    }
+
     #[test]
     fn resident_pcm_matches_existing_header_and_clamps_finite_samples() {
         let audio = AudioClip::from_samples(&[-2.0, 0.0, 2.0], 24_000).unwrap();

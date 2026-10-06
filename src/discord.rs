@@ -10,21 +10,29 @@
 //! Discord's one gateway session ([`gateway`]), stores the messages it reads
 //! in the collection ([`intake`]), and, with the `discord-voice` feature,
 //! joins a voice channel through the same session to speak what `discord say`
-//! queues.
+//! queues; with the `discord-hearing` feature it also hears everybody else
+//! there ([`hearing`]), and stores what each says, transcript and audio, as
+//! messages in the voice channel ([`utterance_fragment`]). Who comes into
+//! and leaves the voice channel ([`presence`]) is stored there too, as
+//! system notices ([`presence_fragment`]).
 
 pub mod cli;
 pub mod gateway;
+#[cfg(feature = "discord-hearing")]
+pub mod hearing;
 pub mod intake;
 pub mod live;
 pub mod mcp;
 pub mod operations;
+pub mod presence;
 pub mod render;
 #[cfg(feature = "discord-voice")]
 pub mod voice;
 
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
-    ObservedMessage, PageRequest, PullOptions, PullReport, ReadOptions, Rest, SendReceipt, Source,
+    ObservedMessage, PageRequest, PresenceChange, PullOptions, PullReport, ReadOptions, Rest,
+    SendReceipt, Source, Utterance,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,7 +44,7 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
-use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
@@ -64,6 +72,129 @@ pub fn validate_snowflake(raw: &str) -> Result<u64> {
 pub fn message_anchor_fragment(external_id: &str) -> Result<Fragment> {
     validate_snowflake(external_id).context("invalid Discord message id")?;
     Ok(entity! { _ @ discord::message_id: external_id.to_owned() })
+}
+
+/// Something said in a voice channel, as a message there: the stable anchor
+/// of who spoke in which channel from when ([`discord::kind_utterance`],
+/// since no snowflake names it), and the observation that links it to the
+/// transcript as content and to the audio, a 16 kHz mono 16-bit PCM WAV
+/// ([`discord::utterance_audio`]). `start` is when the utterance began, as
+/// the point interval a message's `metadata::created_at` is. With the channel
+/// and user anchors, so the fragment stands on its own.
+pub fn utterance_fragment(
+    channel_external_id: &str,
+    user_external_id: &str,
+    start: Inline<NsTAIInterval>,
+    transcript: &str,
+    wav: Vec<u8>,
+) -> Result<Fragment> {
+    let mut fragment = channel_fragment(channel_external_id)?;
+    let channel = fragment.root().expect("intrinsic channel has one root");
+    let author = user_fragment(user_external_id)?;
+    let user = author.root().expect("intrinsic user anchor has one root");
+    fragment += author;
+    let anchor = entity! { _ @
+        metadata::tag: discord::kind_utterance,
+        discord::channel: channel,
+        discord::user: user,
+        metadata::created_at: start,
+    };
+    let utterance = anchor
+        .root()
+        .expect("intrinsic utterance anchor has one root");
+    fragment += anchor;
+    let audio = fragment.put::<RawBytes, _>(wav);
+    fragment += entity! { _ @
+        metadata::tag: archive::kind_message,
+        discord::message: utterance,
+        discord::channel: channel,
+        archive::author: user,
+        archive::content: transcript.to_owned(),
+        metadata::created_at: start,
+        discord::utterance_audio: audio,
+    };
+    Ok(fragment)
+}
+
+/// Somebody coming into or leaving a voice channel: what a presence notice
+/// says happened ([`presence_fragment`]).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Presence {
+    Joined,
+    Left,
+}
+
+impl Presence {
+    /// The tag of the notice's anchor.
+    pub fn tag(self) -> Id {
+        match self {
+            Self::Joined => discord::kind_voice_joined,
+            Self::Left => discord::kind_voice_left,
+        }
+    }
+
+    /// What the member did, as a reader presents it: "<name> joined the
+    /// voice channel", never as something they said or wrote.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Joined => "joined",
+            Self::Left => "left",
+        }
+    }
+}
+
+/// Somebody coming into or leaving a voice channel, as a system notice
+/// there: the stable anchor of who came or went in which channel, seen when
+/// (tagged [`Presence::tag`], since no snowflake names it), the observation
+/// that makes it a message in the channel by that user with no content, and
+/// the mark that it is a notice, not something the user said or wrote
+/// ([`discord::kind_system_notice`]). `seen` is when it was seen, as the
+/// point interval a message's `metadata::created_at` is. With the user's
+/// name as Discord gave it, when it did, as a profile like a message
+/// author's, and the channel and user anchors, so the fragment stands on its
+/// own.
+pub fn presence_fragment(
+    channel_external_id: &str,
+    user_external_id: &str,
+    name: Option<&str>,
+    presence: Presence,
+    seen: Inline<NsTAIInterval>,
+) -> Result<Fragment> {
+    let mut fragment = channel_fragment(channel_external_id)?;
+    let channel = fragment.root().expect("intrinsic channel has one root");
+    let member = user_fragment(user_external_id)?;
+    let user = member.root().expect("intrinsic user anchor has one root");
+    fragment += member;
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        fragment += entity! { _ @
+            metadata::tag: discord::kind_user_profile,
+            discord::user: user,
+            archive::author_name: name.to_owned(),
+        };
+    }
+    let anchor = entity! { _ @
+        metadata::tag: presence.tag(),
+        discord::channel: channel,
+        discord::user: user,
+        metadata::created_at: seen,
+    };
+    let notice = anchor
+        .root()
+        .expect("intrinsic presence anchor has one root");
+    fragment += anchor;
+    fragment += entity! { _ @
+        metadata::tag: archive::kind_message,
+        discord::message: notice,
+        discord::channel: channel,
+        archive::author: user,
+        archive::content: String::new(),
+        metadata::created_at: seen,
+    };
+    fragment += entity! { _ @
+        metadata::tag: discord::kind_system_notice,
+        discord::message: notice,
+    };
+    Ok(fragment)
 }
 
 pub fn channel_fragment(external_id: &str) -> Result<Fragment> {
@@ -251,6 +382,11 @@ where
             pattern!(facts, [{ anchor @ discord::message_id: ?handle }])
         )
         .collect::<BTreeSet<_>>();
+        // An anchor no snowflake names (an utterance's, a presence notice's)
+        // has no message id to check: it is passed over, not refused.
+        if handles.is_empty() {
+            continue;
+        }
         if handles.len() != 1 {
             bail!(
                 "Discord message anchor {anchor:X} has {} external ids",
@@ -381,6 +517,10 @@ pub struct SelectedMessageVersion {
     pub channel: Id,
     pub reply_to: Option<Id>,
     pub attachments: BTreeSet<Id>,
+    /// Somebody coming into or leaving a voice channel, when the message is
+    /// that notice ([`presence_fragment`]): what to present instead of its
+    /// (empty) content.
+    pub presence: Option<Presence>,
     pub variant_index: usize,
     pub variant_count: usize,
 }
@@ -470,6 +610,17 @@ where
             .insert(attachment);
     }
 
+    let mut presences: BTreeMap<Id, Presence> = BTreeMap::new();
+    for presence in [Presence::Joined, Presence::Left] {
+        let tag = presence.tag();
+        for anchor in find!(
+            anchor: Id,
+            pattern!(facts, [{ ?anchor @ metadata::tag: &tag }])
+        ) {
+            presences.insert(anchor, presence);
+        }
+    }
+
     let mut by_anchor: BTreeMap<Id, BTreeMap<SemanticState, BTreeSet<Id>>> = BTreeMap::new();
     for (observation, candidates) in required {
         if candidates.len() != 1 {
@@ -538,6 +689,7 @@ where
                 channel: state.fields.channel,
                 reply_to: state.reply_to,
                 attachments: state.attachments,
+                presence: presences.get(&anchor).copied(),
                 variant_index,
                 variant_count,
             });
@@ -854,6 +1006,52 @@ mod tests {
             at("2026-09-25T16:25:21.257000+00:00"),
             "the message's own timestamp"
         );
+    }
+
+    /// Something said in a voice channel has no Discord message id: a
+    /// reader that checks message ids passes its anchor over instead of
+    /// refusing the collection, and a reader of messages finds it with its
+    /// transcript as content, its audio beside it.
+    #[test]
+    fn an_utterance_anchor_without_a_message_id_is_passed_over() {
+        let start = heard_from(1553506755164504063);
+        let fragment = utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            start,
+            "hello there",
+            b"RIFF and the rest".to_vec(),
+        )
+        .unwrap();
+        let mut staged = fragment.clone();
+        let reader = staged
+            .blobs_mut()
+            .snapshot()
+            .expect("MemoryBlobStore reader creation is infallible");
+        validate_candidate(&reader, &TribleSet::new(), &fragment).unwrap();
+
+        let selected = select_messages(fragment.facts(), None, None).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].created_at, start);
+        assert_eq!(
+            read_text(&reader, selected[0].content, "content").unwrap(),
+            "hello there"
+        );
+        let anchor = selected[0].anchor;
+        assert!(exists!(pattern!(fragment.facts(), [{
+            anchor @ metadata::tag: discord::kind_utterance,
+        }])));
+        let audio: Vec<_> = find!(
+            audio: Inline<Handle<RawBytes>>,
+            pattern!(fragment.facts(), [{
+                _?observation @
+                discord::message: anchor,
+                discord::utterance_audio: ?audio,
+            }])
+        )
+        .collect();
+        let wav: anybytes::Bytes = reader.get(audio[0]).unwrap();
+        assert_eq!(&wav[..], b"RIFF and the rest");
     }
 
     #[test]

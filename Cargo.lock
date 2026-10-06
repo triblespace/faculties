@@ -2427,6 +2427,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
 name = "dasp_sample"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4345,6 +4359,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+
+[[package]]
+name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
@@ -6248,7 +6268,7 @@ dependencies = [
 
 [[package]]
 name = "lissajous"
-version = "0.19.0"
+version = "0.19.1"
 dependencies = [
  "comemo",
  "ctrlc",
@@ -10983,8 +11003,6 @@ dependencies = [
 [[package]]
 name = "songbird"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b9bf4ecb5083685b79a8fc60222f12e4f036e2817c5c341cd2b9ff2b429d237"
 dependencies = [
  "aead",
  "aes-gcm",
@@ -10993,6 +11011,7 @@ dependencies = [
  "bytes",
  "chacha20poly1305",
  "crypto-common 0.1.7",
+ "dashmap",
  "davey",
  "derivative",
  "discortp",
@@ -12298,7 +12317,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "triblespace-core",
  "triblespace-gpu",
@@ -12307,7 +12326,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-core"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "ahash",
  "anybytes",
@@ -12431,7 +12450,7 @@ dependencies = [
 
 [[package]]
 name = "triblespace-net"
-version = "0.47.0"
+version = "0.47.1"
 dependencies = [
  "anybytes",
  "anyhow",

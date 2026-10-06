@@ -62,6 +62,9 @@ struct MessageRow {
     author_name: String,
     channel_id: Id,
     content: String,
+    /// Somebody coming into or leaving a voice channel, when the message is
+    /// that notice: shown as the event, never as its (empty) content.
+    presence: Option<discord::Presence>,
     variant_index: usize,
     variant_count: usize,
 }
@@ -125,6 +128,7 @@ impl DiscordLive {
                         .unwrap_or_else(|| short_hex(message.author)),
                     channel_id: message.channel,
                     content: strip_html(&content),
+                    presence: message.presence,
                     variant_index: message.variant_index,
                     variant_count: message.variant_count,
                 })
@@ -487,14 +491,18 @@ fn render_message_card(
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
                         render_author_chip(ui, &author_label, author_fill);
-                        ui.label(
-                            egui::RichText::new(truncate_to(
+                        let first_line = match msg.presence {
+                            Some(presence) => egui::RichText::new(format!(
+                                "{} the voice channel",
+                                presence.verb()
+                            ))
+                            .italics(),
+                            None => egui::RichText::new(truncate_to(
                                 msg.content.lines().next().unwrap_or("").trim(),
                                 160,
-                            ))
-                            .size(14.0)
-                            .color(text_on_accent),
-                        );
+                            )),
+                        };
+                        ui.label(first_line.size(14.0).color(text_on_accent));
                     });
                 });
 
@@ -601,6 +609,7 @@ mod tests {
             author_name: "author".to_owned(),
             channel_id: id(8),
             content: String::new(),
+            presence: None,
             variant_index,
             variant_count,
         }

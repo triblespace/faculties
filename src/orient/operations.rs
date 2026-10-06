@@ -1877,7 +1877,9 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
 /// and `discord send` record; a message edited or observed again is the same
 /// anchor, so it is news once. As with Teams, news is somebody writing: a
 /// system notice (a pin, a member joining) is not, though Discord gives it an
-/// author.
+/// author. One notice is news all the same: somebody coming into or leaving
+/// the voice channel `discord live` is in, which a window wants to know of as
+/// it wants to know what is said there.
 ///
 /// And news is what was heard: a message sent in a channel at or after the
 /// moment `discord live`'s intake hears the channel from, which intake
@@ -1897,6 +1899,14 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
         }])
     )
     .collect();
+    let presence: BTreeSet<Id> = find!(
+        anchor: Id,
+        or!(
+            pattern!(query.discord, [{ ?anchor @ metadata::tag: discord::kind_voice_joined }]),
+            pattern!(query.discord, [{ ?anchor @ metadata::tag: discord::kind_voice_left }]),
+        )
+    )
+    .collect();
     let notices: BTreeSet<Id> = find!(
         anchor: Id,
         pattern!(query.discord, [{
@@ -1905,6 +1915,7 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
             discord::message: ?anchor,
         }])
     )
+    .filter(|anchor| !presence.contains(anchor))
     .collect();
     find!(
         (anchor: Id, author: Id, created: IntervalValue, heard: IntervalValue),
@@ -1946,6 +1957,12 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
 struct DiscordMessageDetail {
     author: String,
     channel: String,
+    /// Somebody coming into or leaving the voice channel, when the message is
+    /// that notice: presented as the event, never as its (empty) content.
+    presence: Option<discord_model::Presence>,
+    /// When the newest observation says the message was created: for a
+    /// presence notice, when the change was seen.
+    created: Option<IntervalValue>,
     versions: Vec<DiscordVersion>,
     /// The distinct attachment entities of those versions.
     attachments: usize,
@@ -2011,6 +2028,11 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
         .map(|(_, observation)| observation)
         .collect();
     let first = *newest.first().expect("the latest time has an observation");
+    let created = find!(
+        created: IntervalValue,
+        pattern!(query.discord, [{ first @ metadata::created_at: ?created }])
+    )
+    .min_by_key(|created| interval_key(*created));
 
     let author = find!(
         author: Id,
@@ -2140,9 +2162,20 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
         .len();
     let mut versions: Vec<DiscordVersion> = versions.into_values().collect();
     versions.sort();
+    let presence = [
+        discord_model::Presence::Joined,
+        discord_model::Presence::Left,
+    ]
+    .into_iter()
+    .find(|presence| {
+        let tag = presence.tag();
+        exists!(pattern!(query.discord, [{ anchor @ metadata::tag: &tag }]))
+    });
     Ok(DiscordMessageDetail {
         author,
         channel,
+        presence,
+        created,
         versions,
         attachments,
     })
@@ -2152,7 +2185,12 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
 /// channel and whole text, which of how many versions at the newest time it
 /// is when there are more, and per attachment the `files get` that writes its
 /// stored bytes out, or the size Discord declared for one too large to store.
+/// Somebody coming into or leaving the voice channel is printed as that
+/// event, never as text they wrote ([`discord_presence_text`]).
 fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion) -> String {
+    if let Some(presence) = detail.presence {
+        return format!("- {}\n", discord_presence_text(detail, presence));
+    }
     let count = detail.versions.len();
     let of = if count > 1 {
         format!(" (one of {count} versions with the same time)")
@@ -2181,12 +2219,41 @@ fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion)
     text
 }
 
+/// `<name> joined the voice channel <id> at <time>` (or left): what
+/// somebody did, and when it was seen. The time is part of the event, since
+/// a report can hold several changes of one member, and a window may read
+/// it long after they happened.
+fn discord_presence_text(
+    detail: &DiscordMessageDetail,
+    presence: discord_model::Presence,
+) -> String {
+    let mut text = format!(
+        "{} {} the voice channel {}",
+        detail.author,
+        presence.verb(),
+        detail.channel
+    );
+    if let Some(created) = detail.created {
+        text.push_str(" at ");
+        text.push_str(&crate::discord::operations::format_interval(created));
+    }
+    text
+}
+
 /// `Discord message from <author> in channel <id>: <first line>`, and how
 /// many attachments come with it (and how many versions, when Discord gave
-/// more than one the same time). Best effort, like every News line: a body
-/// not yet here only shortens the line; the detail below waits for it.
+/// more than one the same time); for somebody coming into or leaving the
+/// voice channel, `Discord: <name> joined the voice channel <id> at <time>`
+/// (or left). Best effort, like every News line: a body not yet here only
+/// shortens the line; the detail below waits for it.
 fn discord_news_line(query: &OrientQuery<'_>, anchor: Id) -> Option<String> {
     let detail = discord_message_detail(query, anchor).ok()?;
+    if let Some(presence) = detail.presence {
+        return Some(format!(
+            "Discord: {}",
+            discord_presence_text(&detail, presence)
+        ));
+    }
     let mut line = format!(
         "Discord message from {} in channel {}",
         detail.author, detail.channel
@@ -2208,6 +2275,33 @@ fn discord_news_line(query: &OrientQuery<'_>, anchor: Id) -> Option<String> {
         ));
     }
     Some(line)
+}
+
+/// Discord messages in the order they were written, said or seen: by when
+/// they were created (Discord's time for a message, when an utterance began,
+/// when a presence change was seen), then by anchor. Anchors are hashes and
+/// say nothing of time, and for one member coming into and leaving the voice
+/// channel the order is what tells whether they are there now.
+fn discord_in_order(query: &OrientQuery<'_>, anchors: impl IntoIterator<Item = Id>) -> Vec<Id> {
+    let mut timed: Vec<(Option<i128>, Id)> = anchors
+        .into_iter()
+        .map(|anchor| {
+            let created = find!(
+                created: IntervalValue,
+                pattern!(query.discord, [{
+                    _?observation @
+                    metadata::tag: archive::kind_message,
+                    discord::message: anchor,
+                    metadata::created_at: ?created,
+                }])
+            )
+            .map(interval_key)
+            .min();
+            (created, anchor)
+        })
+        .collect();
+    timed.sort();
+    timed.into_iter().map(|(_, anchor)| anchor).collect()
 }
 
 /// Render the same unread native Mail projection that drives `orient wait`.
@@ -3554,14 +3648,13 @@ fn render_news_detail(
             writeln!(out, "- {author}: {content}").unwrap();
         }
     }
-    let new_discord: Vec<Id> = pending
-        .events
-        .values()
-        .filter_map(|event| match event {
+    let new_discord = discord_in_order(
+        query,
+        pending.events.values().filter_map(|event| match event {
             AttentionEvent::Discord(id) => Some(*id),
             _ => None,
-        })
-        .collect();
+        }),
+    );
     if !new_discord.is_empty() {
         writeln!(out, "\nNew Discord messages:").unwrap();
         for message in &new_discord {
@@ -3802,9 +3895,24 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
     }
     use std::fmt::Write as _;
 
+    // Discord's news comes after the rest, in the order it happened: the
+    // other events are by id, which says nothing of time.
+    let discord = discord_in_order(
+        query,
+        pending.events.values().filter_map(|event| match event {
+            AttentionEvent::Discord(anchor) => Some(*anchor),
+            _ => None,
+        }),
+    );
     let mut text = String::new();
-    for event in pending.events.values() {
-        writeln!(text, "News: {}", news_line(query, event)).unwrap();
+    for event in pending
+        .events
+        .values()
+        .filter(|event| !matches!(event, AttentionEvent::Discord(_)))
+        .cloned()
+        .chain(discord.into_iter().map(AttentionEvent::Discord))
+    {
+        writeln!(text, "News: {}", news_line(query, &event)).unwrap();
     }
     text.push_str(&render_news_detail(query, &pending, persona_id)?);
     Ok(News::Report {
@@ -8887,5 +8995,302 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("the disk is connected"), "{text}");
+    }
+
+    /// What the voice connection hears of somebody is stored through intake
+    /// as a Discord message in the voice channel, and is news like a written
+    /// one: its transcript is its text, and it carries its audio.
+    #[test]
+    fn an_utterance_heard_in_voice_is_news_with_its_audio() {
+        use crate::discord::intake::{floor_at, Done, Intake, Work};
+        crate::test_support::clear_ambient_environment();
+        let runtime = runtime().unwrap();
+        let fixture = TestPile::new();
+        let key = fixture.dir.join("discord.key");
+        let signer = crate::storage::initialize_signer(&fixture.path, Some(&key)).unwrap();
+        let discord = crate::discord::Discord::new(fixture.path.clone(), Some(key));
+        let reader_id = id(94);
+        runtime.block_on(async {
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&mut pile, &signer, false)
+                .await
+                .unwrap();
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &signer, profile)
+                .unwrap();
+            pile.close().unwrap();
+        });
+
+        // Hearing alone: no text channel, no DMs.
+        let mut intake = Intake::new(
+            discord,
+            Box::new(DiscordFake::default()),
+            Vec::new(),
+            false,
+            fixture.dir.join("intake"),
+            floor_at(UNIX_EPOCH + Duration::from_millis(1_790_455_273_191)),
+        );
+        let voice = 1553078566332403895_u64;
+        let speaker = 100000000000000400_u64;
+        let wav = b"RIFF\x24\0\0\0WAVEfmt and the samples".to_vec();
+        let utterance = crate::discord::Utterance {
+            channel: voice,
+            user: speaker,
+            start_ms: 1_790_455_300_000,
+            transcript: "can you hear me?".to_owned(),
+            wav: wav.clone(),
+        };
+        assert_eq!(
+            intake.handle(Work::Utterance(utterance)).unwrap(),
+            Done::Stored
+        );
+
+        let News::Report { text, events } =
+            runtime.block_on(take_news(&fixture.path, &signer, reader_id))
+        else {
+            panic!("what somebody said in voice is news");
+        };
+        assert_eq!(events.len(), 1, "{text}");
+        assert!(
+            text.contains(&format!(
+                "News: Discord message from {speaker} in channel {voice}: can you hear me?"
+            )),
+            "{text}"
+        );
+
+        let (handles, audio) = runtime.block_on(async {
+            let mut pile = open_store_as(&fixture.path, signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&mut pile, &signer, false)
+                .await
+                .unwrap();
+            maintain_sources(&mut pile, &signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let found = read(&mut pile, &observation.snapshot, |view| {
+                let query = observation.query(view);
+                let handles: Vec<Inline<inlineencodings::Handle<blobencodings::RawBytes>>> = find!(
+                    audio: Inline<inlineencodings::Handle<blobencodings::RawBytes>>,
+                    pattern!(query.discord, [{
+                        _?observation @
+                        metadata::tag: archive::kind_message,
+                        discord::utterance_audio: ?audio,
+                    }])
+                )
+                .collect();
+                let audio = handles
+                    .first()
+                    .map(|handle| read_bytes(&query.payloads, *handle, "utterance audio"))
+                    .transpose()?;
+                Ok((handles, audio))
+            })
+            .await
+            .unwrap();
+            pile.close().unwrap();
+            found
+        });
+        assert_eq!(handles.len(), 1, "one observation carries the audio");
+        assert_eq!(audio, Some(wav));
+    }
+
+    /// A pile with a reader, and `discord live`'s intake storing into its
+    /// discord collection, which hears the voice channel from
+    /// 1_790_455_273_191 ms on.
+    struct VoiceNews {
+        runtime: tokio::runtime::Runtime,
+        fixture: TestPile,
+        signer: SigningKey,
+        reader: Id,
+        intake: crate::discord::intake::Intake,
+    }
+
+    const VOICE_NEWS_CHANNEL: u64 = 100000000000000201;
+
+    impl VoiceNews {
+        fn new() -> Self {
+            use crate::discord::intake::{floor_at, Intake};
+            crate::test_support::clear_ambient_environment();
+            let runtime = runtime().unwrap();
+            let fixture = TestPile::new();
+            let key = fixture.dir.join("discord.key");
+            let signer = crate::storage::initialize_signer(&fixture.path, Some(&key)).unwrap();
+            let discord = crate::discord::Discord::new(fixture.path.clone(), Some(key));
+            let reader = id(95);
+            runtime.block_on(async {
+                let mut pile =
+                    open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+                let sources = OrientSources::open(&mut pile, &signer, false)
+                    .await
+                    .unwrap();
+                let (profile, _, _) = relations::person_fragment(
+                    reader,
+                    relations::ProfileInput {
+                        label: "reader".to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                pile.commit(sources.relations.source, &signer, profile)
+                    .unwrap();
+                pile.close().unwrap();
+            });
+            let intake = Intake::new(
+                discord,
+                Box::new(DiscordFake::default()),
+                Vec::new(),
+                false,
+                fixture.dir.join("intake"),
+                floor_at(UNIX_EPOCH + Duration::from_millis(1_790_455_273_191)),
+            );
+            Self {
+                runtime,
+                fixture,
+                signer,
+                reader,
+                intake,
+            }
+        }
+
+        /// Ada coming into or leaving the voice channel, seen at `seen_ms`,
+        /// stored through intake.
+        fn presence(&mut self, presence: crate::discord::Presence, seen_ms: u64) {
+            use crate::discord::intake::{Done, Work};
+            let change = crate::discord::PresenceChange {
+                channel: VOICE_NEWS_CHANNEL,
+                user: 100000000000000400,
+                name: Some("Ada".to_owned()),
+                presence,
+                seen_ms,
+            };
+            assert_eq!(
+                self.intake.handle(Work::Presence(change)).unwrap(),
+                Done::Stored
+            );
+        }
+
+        /// The news for the reader, presented to them.
+        fn news(&self) -> News {
+            self.runtime
+                .block_on(take_news(&self.fixture.path, &self.signer, self.reader))
+        }
+    }
+
+    /// The `News:` lines of a report, in its order.
+    fn news_lines(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|line| line.starts_with("News: "))
+            .collect()
+    }
+
+    /// Somebody coming into or leaving the voice channel is stored through
+    /// intake as a notice in that channel, and is news to the same reader
+    /// that takes what is said there for news: presented as what happened,
+    /// when it was seen, never as something the member said or wrote, and
+    /// once.
+    #[test]
+    fn a_voice_join_and_leave_are_news_like_an_utterance() {
+        use crate::discord::intake::{Done, Work};
+        use crate::discord::{Presence, Utterance};
+        let mut news = VoiceNews::new();
+        let voice = VOICE_NEWS_CHANNEL;
+        news.presence(Presence::Joined, 1_790_455_300_000);
+        let utterance = Utterance {
+            channel: voice,
+            user: 100000000000000400,
+            start_ms: 1_790_455_301_000,
+            transcript: "can you hear me?".to_owned(),
+            wav: b"RIFF and the samples".to_vec(),
+        };
+        assert_eq!(
+            news.intake.handle(Work::Utterance(utterance)).unwrap(),
+            Done::Stored
+        );
+
+        let News::Report { text, events } = news.news() else {
+            panic!("somebody joining the voice channel is news");
+        };
+        assert_eq!(events.len(), 2, "{text}");
+        assert_eq!(
+            news_lines(&text),
+            [
+                format!(
+                    "News: Discord: Ada joined the voice channel {voice} at 2026-09-26T20:41:40 UTC"
+                ),
+                format!("News: Discord message from Ada in channel {voice}: can you hear me?"),
+            ],
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "\nNew Discord messages:\n\
+                 - Ada joined the voice channel {voice} at 2026-09-26T20:41:40 UTC\n\
+                 - Ada in channel {voice}: can you hear me?\n"
+            )),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&format!("- Ada in channel {voice}: \n")),
+            "{text}"
+        );
+
+        // Leaving is news of its own; what was presented is not news again.
+        news.presence(Presence::Left, 1_790_455_302_000);
+        let News::Report { text, events } = news.news() else {
+            panic!("somebody leaving the voice channel is news");
+        };
+        assert_eq!(events.len(), 1, "{text}");
+        assert_eq!(
+            news_lines(&text),
+            [format!(
+                "News: Discord: Ada left the voice channel {voice} at 2026-09-26T20:41:42 UTC"
+            )],
+            "{text}"
+        );
+        assert!(
+            matches!(news.news(), News::Quiet),
+            "a presented change repeated"
+        );
+    }
+
+    /// A member's comings and goings that are news together are reported in
+    /// the order they happened, in the `News:` lines and in the detail
+    /// beneath them: in another order they say the opposite of whether the
+    /// member is in the channel.
+    #[test]
+    fn voice_joins_and_leaves_are_news_in_the_order_they_happened() {
+        use crate::discord::Presence;
+        let mut news = VoiceNews::new();
+        news.presence(Presence::Joined, 1_790_455_300_000);
+        assert!(matches!(news.news(), News::Report { .. }));
+        // Ada's connection drops twice while the window is busy.
+        for (presence, seen_ms) in [
+            (Presence::Left, 1_790_455_580_000),
+            (Presence::Joined, 1_790_455_585_000),
+            (Presence::Left, 1_790_455_900_000),
+            (Presence::Joined, 1_790_455_905_000),
+            (Presence::Left, 1_790_455_960_000),
+        ] {
+            news.presence(presence, seen_ms);
+        }
+        let News::Report { text, events } = news.news() else {
+            panic!("somebody coming and going is news");
+        };
+        assert_eq!(events.len(), 5, "{text}");
+        let verbs = |prefix: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|line| line.strip_prefix(prefix))
+                .map(|rest| rest.split(' ').next().unwrap().to_owned())
+                .collect()
+        };
+        let happened = ["left", "joined", "left", "joined", "left"];
+        assert_eq!(verbs("News: Discord: Ada "), happened, "{text}");
+        assert_eq!(verbs("- Ada "), happened, "{text}");
     }
 }
