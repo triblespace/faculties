@@ -199,6 +199,16 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
     for input in [source, relations] {
         grant_collection_read(&mut pile, input.handle(), &owner, writer.verifying_key()).unwrap();
     }
+    // The ungranted key resolves the persona too, so its refusal is the
+    // WRITE guard's and nothing else.
+    let ungranted = load_signer(&fixture.pile, Some(&denied_key)).unwrap();
+    grant_collection_read(
+        &mut pile,
+        relations.handle(),
+        &owner,
+        ungranted.verifying_key(),
+    )
+    .unwrap();
     let (succinct, rank9) = faculties::storage::fact_pair(&mut pile, source).unwrap();
     let status = compass::status_register_collection(&mut pile, owner.verifying_key()).unwrap();
     let snapshot = pile.snapshot().unwrap();

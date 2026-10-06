@@ -661,10 +661,12 @@ fn a_union_frontier_spans_collections_and_labels_their_rows() {
         )
         .unwrap();
 
+    // Each frontier revision is listed indented beneath its entry, which is
+    // named by its root revision.
     let listed = fixture.wiki().list(&ListOptions::default()).unwrap();
-    assert!(listed.contains(&format!("{second:x}")), "{listed}");
+    assert!(listed.contains(&format!("  {second:x}  ")), "{listed}");
     assert!(
-        !listed.contains(&format!("{first:x}")),
+        !listed.contains(&format!("  {first:x}  ")),
         "a revision superseded in another collection is not live: {listed}"
     );
     let mut pile = Pile::open(&fixture.pile).unwrap();

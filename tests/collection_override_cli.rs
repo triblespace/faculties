@@ -169,18 +169,6 @@ fn collection_environment_variables_change_nothing() {
     let other = faculties::storage::load_signer(&fixture.pile, Some(&other_key))
         .expect("load other signer");
 
-    succeeded(
-        relations(&fixture, &fixture.tenant_key)
-            .args(["add", "Ada"])
-            .output()
-            .expect("run relations"),
-    );
-    succeeded(
-        relations(&fixture, &other_key)
-            .args(["add", "Bob"])
-            .output()
-            .expect("run relations"),
-    );
     let mut pile = Pile::open(&fixture.pile).expect("open fixture pile");
     let mine = faculties::collection_names::open(
         &mut pile,
@@ -195,6 +183,20 @@ fn collection_environment_variables_change_nothing() {
     )
     .expect("the other key's relations");
     pile.close().expect("close fixture pile");
+    succeeded(
+        relations(&fixture, &fixture.tenant_key)
+            .args(["add", "Ada"])
+            .output()
+            .expect("run relations"),
+    );
+    // The tenant's collection is the only one with records now, and it is
+    // not the other key's: that key names its own to start it.
+    succeeded(
+        relations(&fixture, &other_key)
+            .args(["--target", &hex::encode(theirs.handle().raw), "add", "Bob"])
+            .output()
+            .expect("run relations"),
+    );
     let mut expected = vec![mine.handle().raw, theirs.handle().raw];
     expected.sort_unstable();
     assert_eq!(committed_to(&fixture.pile), expected);
