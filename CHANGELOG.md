@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `archive import` with several PATHS opens the pile once for every
+  `--source`, as its help already said; before, only `--source codex` shared
+  one writer and every other source opened and closed the pile per path. Each
+  path still publishes its own signed COMMIT and prints the same report, and
+  an unchanged path publishes nothing. An error stops the command at the
+  failing path, which the error names: earlier paths stay committed, the
+  failing path publishes nothing, later paths are not read. Measured on sky
+  (GB10 aarch64, shared, load ~10) into fresh scratch piles, release build,
+  Claude Code session files of 8-60 KB: 100 files took 3.1 and 3.3 s as one
+  command against 21.1 and 18.5 s as one process per path (two runs); 631
+  files took 42.7 s against 192.4 s. Both arms print identical reports. The
+  writer still does not merge its own commits: inside one command the time
+  per path grew from 0.03 s (paths 1-100) to 0.15 s (paths 501-600), and the
+  next open of the pile pays the deferred merge.
+
 ## 0.21.0 - 2026-10-01
 
 - Update the source cohort to TribleSpace 0.47.0, GORBIE 0.19.0 and
