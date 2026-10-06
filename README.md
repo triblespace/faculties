@@ -129,14 +129,16 @@ tools cannot substitute those paths. Additional launcher configuration is:
 | --- | --- |
 | Discord bot access | Optional `--discord-token` / `DISCORD_TOKEN` |
 | LinkedIn DMA pulls | Optional `--linkedin-token` / `LINKEDIN_TOKEN` |
-| Files semantic index and search | With the `wemm` feature on a GB10: `WEMM_PILE` (the dedicated WeMM model pile), `WEMM_ASSETS` (its pinned config/tokenizer/template directory) and `WEMM_ROOT` (the model root). Other machines carry the replicated index rows but cannot query them |
+| Files, Memory and Wiki semantic index and search | With the `wemm` feature on a GB10: `WEMM_PILE` (the dedicated WeMM model pile), `WEMM_ASSETS` (its pinned config/tokenizer/template directory) and `WEMM_ROOT` (the model root). Other machines carry the replicated index rows but cannot query them |
 | Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
 | Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
 
-Files search runs on **one** native WeMM model (the `wemm` feature, NVIDIA
+Semantic search runs on **one** native WeMM model (the `wemm` feature, NVIDIA
 GB10 compute 12.1 only) for text, images and documents in one 4096-D space:
-`files index` / `files similar`. `files index` derives
-NVFP4 rows keyed by content handle from the Files source collection: an
+`files index` / `files similar`, `memory index` / `memory similar`, and
+`wiki index` / `wiki similar`, plus `memory context --about/--filter/--remove`,
+which fall back to exact BM25 when no model is configured. Each `index` derives
+NVFP4 rows keyed by content handle from its faculty's source collection: an
 image whole, and text (HTML reduced to its text, a PDF's text layer) in windows
 of at most 248 framed token IDs, the first 16 per content; content the model
 cannot read gets no rows. Indexing is only ever an explicit command, resumable

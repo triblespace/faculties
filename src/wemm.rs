@@ -367,4 +367,157 @@ mod tests {
         assert!(distinct_files(&backing(&model).unwrap(), &files).is_err());
         assert!(distinct_files(&backing(&model).unwrap(), &dir.path().join("new.pile")).is_ok());
     }
+
+    /// The real model on a scratch pile: five memories (one a wordless image
+    /// of a red crab), three wiki fragments and two files, indexed through one
+    /// bound session, then found again by text queries. Needs a GB10 under
+    /// the gb10 lock, WEMM_PILE, WEMM_ASSETS, WEMM_ROOT, and WEMM_GATE_PNG
+    /// naming a PNG of a red crab.
+    #[test]
+    #[ignore = "requires a GB10, the WeMM model pile and WEMM_GATE_PNG"]
+    fn memory_wiki_and_files_answer_text_queries_on_a_scratch_pile() {
+        use crate::memory::operations::parse_time_range;
+        use crate::out::Part;
+
+        let png = std::fs::read(std::env::var("WEMM_GATE_PNG").unwrap()).unwrap();
+        crate::test_support::clear_ambient_environment();
+        let dir = tempfile::tempdir().unwrap();
+        let pile = dir.path().join("scratch.pile");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, None).unwrap();
+        let storage = crate::storage::Storage::shared(pile.clone(), None);
+        let memory = crate::memory::Memory::with_storage(storage.clone());
+        let wiki = crate::wiki::Wiki::with_storage(storage.clone());
+        let files = crate::files::Files::with_storage(storage.clone());
+
+        let day = |n: u32| {
+            parse_time_range(&format!("2026-01-0{n}T08:00:00..2026-01-0{n}T09:00:00")).unwrap()
+        };
+        let texts = [
+            "We repaired the bicycle chain in the garage and oiled the rusty gears.",
+            "The sourdough starter finally rose, and we baked two loaves of rye bread.",
+            "A thunderstorm knocked out the power, so we read by candlelight all evening.",
+            "We tuned the guitar and practised the chord progression for the new song.",
+        ];
+        let chunks: Vec<Id> = texts
+            .iter()
+            .zip(1..)
+            .map(|(text, n)| memory.create(text, Some(day(n)), None).unwrap().id)
+            .collect();
+        let crab = memory.image(&png, day(5)).unwrap().id;
+        let revisions: Vec<Id> = [
+            ("Borrowing", "= Borrowing\nThe Rust borrow checker enforces ownership: one mutable reference or many shared ones, never both."),
+            ("Tomatoes", "= Tomatoes\nTomato seedlings want full sun, deep watering and a stake once they reach knee height."),
+            ("Tides", "= Tides\nThe moon's gravity raises two bulges of ocean water, giving most coasts two high tides a day."),
+        ]
+        .into_iter()
+        .map(|(title, content)| wiki.create(title, content, &[], false).unwrap())
+        .collect();
+        // The tides revision is superseded: its rows exist, but it is not current.
+        let tides = revisions[2];
+        let volcanoes = wiki
+            .edit(
+                &format!("{tides:x}"),
+                Some("= Tides\nVolcanoes erupt molten rock and ash when magma pressure breaks the crust."),
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+        files
+            .add_bytes(
+                anybytes::Bytes::from_source(png.clone()),
+                "crab.png",
+                "image/png",
+                &[],
+            )
+            .unwrap();
+        files
+            .add_bytes(
+                anybytes::Bytes::from_source(
+                    b"Quarterly tax return: list deductions, attach receipts, file before April."
+                        .to_vec(),
+                ),
+                "taxes.txt",
+                "text/plain",
+                &[],
+            )
+            .unwrap();
+
+        let run = |operation: &mut dyn FnMut(&mut Out<'_>) -> Result<()>| {
+            let mut text = String::new();
+            let mut emit = |part: Part| {
+                if let Part::Text { text: line } = part {
+                    text.push_str(&line);
+                }
+                Ok(())
+            };
+            operation(&mut Out::new(&mut emit)).unwrap();
+            text
+        };
+        let session = Session::from_env(&pile).unwrap();
+        let started = std::time::Instant::now();
+        for report in [
+            run(&mut |out| memory.index_with(&session, out)),
+            run(&mut |out| wiki.index_with(&session, out)),
+            run(&mut |out| files.index_with(&session, out)),
+        ] {
+            eprintln!("{report}");
+            assert!(
+                report.contains(", 0 foundation(s) not derived yet"),
+                "{report}"
+            );
+        }
+        eprintln!("indexed in {:.1} s", started.elapsed().as_secs_f64());
+
+        let first = |report: String| report.lines().next().unwrap_or_default().to_owned();
+        let bread = run(&mut |out| memory.similar_with(&session, "baking bread at home", out));
+        eprintln!("{bread}");
+        assert!(first(bread).contains(&format!("{:x}", chunks[1])));
+        let crustacean =
+            run(&mut |out| memory.similar_with(&session, "a red crab with claws", out));
+        eprintln!("{crustacean}");
+        assert!(
+            first(crustacean).contains(&format!("{crab:x}")),
+            "an image chunk answers text"
+        );
+        let rust = wiki
+            .similar_with(&session, "how references and mutation are checked")
+            .unwrap();
+        eprintln!("{rust}");
+        assert!(first(rust).contains(&format!("{:x}", revisions[0])));
+        let ocean = wiki
+            .similar_with(&session, "the moon pulls the ocean into high tides")
+            .unwrap();
+        eprintln!("{ocean}");
+        assert!(
+            !ocean.contains(&format!("{tides:x}")),
+            "a superseded revision is not answered"
+        );
+        let lava = wiki
+            .similar_with(&session, "lava from an erupting volcano")
+            .unwrap();
+        eprintln!("{lava}");
+        assert!(first(lava).contains(&format!("{volcanoes:x}")));
+        let picture = run(&mut |out| {
+            files.similar_with(
+                &session,
+                &crate::files::operations::SimilarityOptions {
+                    id: None,
+                    text: Some("a red crab with claws"),
+                    floor: None,
+                    limit: 2,
+                    tags: &[],
+                },
+                out,
+            )
+        });
+        eprintln!("{picture}");
+        assert!(picture
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .contains("crab.png"));
+        storage.close().unwrap();
+    }
 }

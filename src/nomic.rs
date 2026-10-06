@@ -1,4 +1,6 @@
-//! The durable Nomic embedder seam.
+//! The durable Nomic embedder seam. Only the posture policy's semantic tier
+//! still reads nomic-embed-text; Files, Memory and Wiki search with WeMM
+//! (`crate::wemm`).
 //!
 //! The nomic models live in the working pile itself, as roots of its
 //! `mary-model-graph` collection, and replication carries them to every
@@ -26,7 +28,6 @@ use triblespace::prelude::*;
 
 /// Hugging Face model ids are provenance only; runtime never fetches them.
 pub const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
-pub const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
 
 /// The working pile: `PILE`, the path every faculty takes. The models are in
 /// it or nowhere.
@@ -103,28 +104,6 @@ fn text_embedder_from<R: BlobStoreGet>(
                 pile.display()
             )
         })
-}
-
-/// Load nomic-embed-vision-v1.5 from the working pile's model collection.
-pub fn load_vision_embedder() -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
-    let pile = working_pile()?;
-    crate::model_storage::with_snapshot(&pile, NOMIC_VISION_MODEL, |snapshot| vision_embedder_from(snapshot, &pile))
-}
-
-fn vision_embedder_from<R: BlobStoreGet>(
-    snapshot: &ModelSnapshot<R>,
-    pile: &Path,
-) -> Result<mary::embed::NomicVisionEmbedder<mary::nn::backend::B>> {
-    let keymap = select_weights(snapshot, NOMIC_VISION_MODEL, pile)?;
-
-    mary::embed::load_nomic_vision_from_keymap(keymap, mary::embed::default_device()).with_context(
-        || {
-            format!(
-                "build Nomic vision embedder from native collection {}",
-                pile.display()
-            )
-        },
-    )
 }
 
 #[cfg(test)]
@@ -315,27 +294,6 @@ mod tests {
             Ok(())
         })
         .expect("load later widened text snapshot");
-
-        let vision_file = NamedTempFile::new().expect("create vision pile");
-        publish(
-            vision_file.path(),
-            [weight_fragment(NOMIC_VISION_MODEL, "vision.weight", 2.5)],
-        );
-        crate::model_storage::with_snapshot(vision_file.path(), NOMIC_VISION_MODEL, |vision| {
-            assert_eq!(vision.support().len(), 1);
-            let vision_keymap = mary::selection::load_keymap_from_graph(
-                vision.facts(),
-                vision.store(),
-                ModelSelector::Source {
-                    source: NOMIC_VISION_MODEL,
-                    quantization: mary::persist::QUANTIZATION_NATIVE,
-                },
-            )
-            .expect("select vision weights from frozen snapshot");
-            assert_eq!(vision_keymap["vision.weight"], (vec![2.5], vec![1]));
-            Ok(())
-        })
-        .expect("load and use one vision collection snapshot with its owner alive");
     }
 
     #[test]
