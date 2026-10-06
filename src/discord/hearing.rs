@@ -42,6 +42,10 @@ const TICK: usize = RATE / 50;
 /// unknown meanwhile) ends, and what comes after begins a new one, so an
 /// utterance's time is never taken from a clock that stood still.
 const GAP_MS: u64 = 1_000;
+/// Let an ordinary conversational pause remain inside a Discord utterance.
+/// This adds 500 ms to an isolated silence close versus shared VAD defaults;
+/// retained tail, preroll, max duration and explicit close rules stay unchanged.
+const END_SILENCE_MS: usize = 1_200;
 
 /// What hearing runs with.
 pub struct Config {
@@ -268,7 +272,10 @@ struct Stream {
 impl Stream {
     fn new(origin_ms: u64) -> Self {
         Self {
-            segmenter: Segmenter::new(RATE, VadConfig::default()),
+            segmenter: Segmenter::new(
+                RATE,
+                VadConfig::default().with_end_silence_ms(END_SILENCE_MS),
+            ),
             origin_ms,
             fed: 0,
             committed: 0,
@@ -774,6 +781,100 @@ mod tests {
     const OTHER: u64 = 100000000000000500;
     const BOT: u64 = 100000000000000600;
 
+    // Uses only existing 1ead APIs, allowing a test-only baseline transplant:
+    // Listener -> advance -> fake Transcribe decides the actual boundary.
+    #[test]
+    fn ordinary_pause_stays_one_final_utterance_with_exact_pcm() {
+        let ear = Meter::default();
+        let mut active = None;
+        let mut listener = Listener::default();
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let script = [
+            (false, 600),
+            (true, 800),
+            (false, 900),
+            (true, 800),
+            (false, 1200),
+        ];
+        let moments = ticks(JP, 0, &script);
+        let all_pcm: Vec<f32> = moments
+            .iter()
+            .flat_map(|m| match &m.heard[0] {
+                Heard::Audio { samples, .. } => samples
+                    .iter()
+                    .map(|&s| f32::from(s) / 32768.0)
+                    .collect::<Vec<_>>(),
+                Heard::Silence { .. } => vec![0.0; TICK],
+                Heard::Left { .. } => unreachable!(),
+            })
+            .collect();
+        let mut captured = Vec::new();
+        let mut published = Vec::new();
+        let mut pushed_before_pause = false;
+        let mut published_early = false;
+        for moment in moments {
+            let end_ms = moment.at_ms + 20;
+            listener.hear_progress(moment, &mut |progress| {
+                if let Progress::Finished(ref spoken) = progress {
+                    captured.push((spoken.user, spoken.start_ms, spoken.samples.clone()));
+                }
+                advance(&ear, &mut active, progress, 7, &intake, directory.path());
+            });
+            if end_ms == 1400 {
+                pushed_before_pause = ear.attempts.borrow().iter().any(|p| !p.is_empty());
+            }
+            while let Ok(work) = queue.try_recv() {
+                let Work::Utterance(item) = work else {
+                    panic!("unexpected intake work")
+                };
+                published_early |= end_ms < 4300;
+                published.push(item);
+            }
+        }
+        // Expected behavioral RED on 1ead: two publications, not one. This
+        // assertion precedes the no-early-publication checks.
+        assert_eq!(published.len(), 1, "900 ms pause must not split the turn");
+        assert_eq!(captured.len(), 1);
+        assert!(
+            pushed_before_pause,
+            "recognition must stay online during speech"
+        );
+        assert!(!published_early, "no partial news before the 1200 ms close");
+        assert!(active.is_none());
+        assert_eq!(ear.peak.get(), 1);
+        assert_eq!(ear.live.get(), 0);
+        assert_eq!(*ear.finished.borrow(), [0]);
+        // Three onset frames complete at660ms; the unchanged240ms preroll
+        // begins at420ms. Second burst ends3100ms; keep exactly200ms tail.
+        let expected = &all_pcm[RATE * 420 / 1000..RATE * 3300 / 1000];
+        let (user, start, pcm) = &captured[0];
+        assert_eq!((*user, *start), (JP, 420));
+        assert_eq!(pcm, expected);
+        assert_eq!(ear.attempts.borrow().as_slice(), &[expected.to_vec()]);
+        let pause = (RATE * (1400 - 420) / 1000)..(RATE * (2300 - 420) / 1000);
+        assert!(pcm[pause].iter().all(|&s| s == 0.0));
+        assert!(pcm[pcm.len() - RATE / 5..].iter().all(|&s| s == 0.0));
+        assert!(
+            pcm[pcm.len() - RATE / 5 - TICK..pcm.len() - RATE / 5]
+                .iter()
+                .any(|&s| s != 0.0),
+            "tail must follow actual speech"
+        );
+        assert_eq!((published[0].user, published[0].start_ms), (JP, 420));
+        assert_eq!(published[0].transcript, "complete 0");
+        assert_eq!(published[0].wav, wav_pcm16(expected));
+        listener.flush_progress(&mut |p| {
+            advance(&ear, &mut active, p, 7, &intake, directory.path());
+        });
+        assert!(
+            queue.try_recv().is_err(),
+            "shutdown must not republish the turn"
+        );
+    }
+
     #[test]
     fn failed_online_owner_is_not_retried_or_lost_when_another_user_finishes() {
         let ear = Meter {
@@ -792,7 +893,7 @@ mod tests {
             listener.hear_progress(moment, &mut emit);
         }
         assert_eq!(ear.live.get(), 0, "failed session released immediately");
-        for moment in ticks(OTHER, 0, &[(false, 600), (true, 800), (false, 1000)]) {
+        for moment in ticks(OTHER, 0, &[(false, 600), (true, 800), (false, 1200)]) {
             listener.hear_progress(moment, &mut emit);
         }
         listener.hear_progress(
@@ -901,7 +1002,7 @@ mod tests {
             listener.hear_progress(moment, &mut emit);
         }
         assert!(queue.try_recv().is_err(), "no partial publication");
-        for moment in ticks(OTHER, 1400, &[(false, 1000)]) {
+        for moment in ticks(OTHER, 1400, &[(false, 1200)]) {
             listener.hear_progress(moment, &mut emit);
         }
         // The old online owner's later nonzero-offset suffix must not begin
@@ -916,7 +1017,7 @@ mod tests {
             },
             &mut emit,
         );
-        for moment in ticks(OTHER, 2400, &[(false, 600), (true, 800), (false, 1000)]) {
+        for moment in ticks(OTHER, 2600, &[(false, 600), (true, 800), (false, 1200)]) {
             listener.hear_progress(moment, &mut emit);
         }
         listener.flush_progress(&mut emit);
@@ -1044,16 +1145,16 @@ mod tests {
                     (true, 800),
                     (false, 500),
                     (true, 600),
-                    (false, 1000),
+                    (false, 1200),
                     (true, 900),
-                    (false, 1000),
+                    (false, 1200),
                 ]
             )),
             2,
             "resume keeps intervening silence; final close trims only its tail"
         );
         assert_eq!(
-            exact_progress(ticks(JP, 0, &[(false, 600), (true, 29000), (false, 1000),])),
+            exact_progress(ticks(JP, 0, &[(false, 600), (true, 29000), (false, 1200),])),
             2,
             "max-duration close starts a separate session"
         );
@@ -1080,7 +1181,7 @@ mod tests {
         let mut moments = ticks(JP, 0, &[(false, 600), (true, 600)]);
         // This ONE feed closes the already committed utterance, opens and
         // closes another, and leaves a third active. No callback-size premise.
-        let samples = [(false, 1000), (true, 900), (false, 1000), (true, 900)]
+        let samples = [(false, 1200), (true, 900), (false, 1200), (true, 900)]
             .into_iter()
             .flat_map(|(loud, ms)| {
                 if loud {
@@ -1098,12 +1199,12 @@ mod tests {
         let a = ticks(
             JP,
             0,
-            &[(false, 600), (true, 1400), (false, 1000), (true, 600)],
+            &[(false, 600), (true, 1400), (false, 1200), (true, 600)],
         );
         let b = ticks(
             OTHER,
             0,
-            &[(false, 600), (true, 800), (false, 1000), (true, 1200)],
+            &[(false, 600), (true, 800), (false, 1200), (true, 1200)],
         );
         let interleaved = a
             .into_iter()
@@ -1144,9 +1245,9 @@ mod tests {
         let script = [
             (false, 600),
             (true, 800),
-            (false, 1000),
+            (false, 1200),
             (true, 800),
-            (false, 1000),
+            (false, 1200),
         ];
         let expected = listen(ticks(JP, 0, &script));
         let directory = tempfile::tempdir().unwrap();
@@ -1214,7 +1315,7 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .is_ok();
             let partial = queue.try_recv().is_ok();
-            for moment in ticks(JP, 1800, &[(false, 1000)]) {
+            for moment in ticks(JP, 1800, &[(false, 1200)]) {
                 heard.send(moment).unwrap();
             }
             drop(heard);
@@ -1476,7 +1577,7 @@ mod tests {
         for moment in ticks(
             JP,
             1_790_000_000_000,
-            &[(false, 600), (true, 800), (false, 1000)],
+            &[(false, 600), (true, 800), (false, 1200)],
         ) {
             heard.send(moment).unwrap();
         }

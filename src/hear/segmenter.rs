@@ -28,6 +28,16 @@ impl Default for VadConfig {
     }
 }
 
+impl VadConfig {
+    /// Override only the silence needed to end a turn; retain all other VAD
+    /// and final-tail rules. Transport-specific callers can choose a pause
+    /// policy without changing the shared capture/file default.
+    pub(crate) fn with_end_silence_ms(mut self, milliseconds: usize) -> Self {
+        self.hangover_ms = milliseconds;
+        self
+    }
+}
+
 /// A finished utterance at the segmenter's native rate.
 pub(crate) struct Segment {
     pub(crate) samples: Vec<f32>,
@@ -222,6 +232,21 @@ impl Segmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_silence_override_preserves_shared_defaults() {
+        let shared = VadConfig::default();
+        let discord = shared.clone().with_end_silence_ms(1200);
+        assert_eq!(shared.hangover_ms, 700);
+        assert_eq!(discord.hangover_ms, 1200);
+        assert_eq!(discord.frame_ms, 20);
+        assert_eq!(discord.start_frames, 3);
+        assert_eq!(discord.preroll_ms, 240);
+        assert_eq!(discord.min_utt_ms, 300);
+        assert_eq!(discord.max_utt_s, 28.0);
+        assert_eq!(discord.ratio, shared.ratio);
+        assert_eq!(discord.abs_floor, shared.abs_floor);
+    }
 
     #[test]
     fn committed_prefix_never_includes_a_discarded_silence_tail() {
