@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- A faculty reads every collection of its name its signer may READ, and a
+  write goes to one target: `--target HANDLE`, else the one same-named
+  collection rooted at the signer, else the one rooted at the signer alone,
+  else an error naming the candidates. Wiki and Compass label rows from more
+  than one collection with its handle and owners. The
+  `TRIBLESPACE_COLLECTION_*` overrides are gone: nothing reads them.
+
 ## 0.21.0 - 2026-10-01
 
 - Update the source cohort to TribleSpace 0.47.0, GORBIE 0.19.0 and

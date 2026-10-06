@@ -94,7 +94,7 @@ reconciliation.
 ## CI / releases
 
 * Run temporary-pile tests without live deployment environment overrides,
-  especially `TRIBLESPACE_COLLECTION_*`, `TRIBLESPACE_KEY`, `PILE`, and
+  especially `TRIBLESPACE_KEY`, `PILE`, and
   `DRIVE_ENDPOINT`. SSH shells on the Sparks may export these automatically.
   Use a process-local clean test environment; do not change the host profile
   or loosen collection admission to make a fixture pass. On 2026-09-13,

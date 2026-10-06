@@ -726,8 +726,7 @@ Receipt history belongs to the signing zooid, not its routing alias or host.
 Ordinary `orient-receipts` facts retain event IDs and `created_at` annotations;
 a host-local attached EntityIdSet on `presentation::event` supplies fast
 membership tests. The receipt source has READ and WRITE rooted only at that
-key; its attached index has no separate policy. This is independent of the old
-`TRIBLESPACE_COLLECTION_ORIENT` override. Two selectors using the same
+key; its attached index has no separate policy. Two selectors using the same
 key share receipt history; separate zooids need separate keys. Reporting runs
 refresh that membership projection before observing it. Failed receipt upkeep
 is reported and may permit a repeat; it does not hold the waiter behind a
@@ -769,18 +768,19 @@ endorse-unsigned-equations --collection <HANDLE> --signing-key <EXISTING_KEY>`.
 That append-only operation is a new endorsement, not recovered authorship; it
 does not change domain entity IDs or existing COMMIT data and metadata.
 
-By default, a named faculty collection is rooted at the pile's durable signer.
-An operator can instead select an already-resident exact descriptor for one
-name with `TRIBLESPACE_COLLECTION_<NAME>` (64 hexadecimal digits, optionally
-prefixed by `blake3:`). Hyphens become underscores, so examples are
-`TRIBLESPACE_COLLECTION_WIKI` and
-`TRIBLESPACE_COLLECTION_MEMORY_JOURNAL`. Each name has its own variable because
-one binary may read several collections. The override changes only the
-descriptor it opens: `TRIBLESPACE_KEY` remains the local COMMIT signer, and the
-descriptor's resident policy and proof evidence decide admission. A missing,
-malformed, wrongly typed, wrongly named, or non-writable exact descriptor is an
-error before publication; Faculties never silently invents a signer-private
-replacement or appends an inert COMMIT.
+A faculty reads every collection of its name that its durable signer may READ:
+its own, and any one somebody shared with it. Where it shows a person rows
+from more than one, each row names its collection and owner (the keys the
+collection's policies are rooted at). A write goes to one collection: the one
+named with `--target` (64 hexadecimal digits, optionally prefixed by
+`blake3:`), or else the one collection of that name rooted at the signer, or
+else the one rooted at the signer alone. When none or several fit, the write
+is refused with every candidate and its owners, and the command is rerun with
+`--target`. A pile holding nothing of the name starts the signer's own
+collection. `TRIBLESPACE_KEY` remains the local COMMIT signer, and the target's
+resident policy and proof evidence decide admission: a command whose signer
+may not write its target is refused before publication. No faculty reads a
+collection from the environment.
 
 ## GORBIE viewer
 
