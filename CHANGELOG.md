@@ -22,12 +22,24 @@ All notable changes to this project will be documented in this file.
 - An `ArchiveImportWriter` that commits many times in one process now merges
   its own commits: every 16 commits and once at close it runs the same carry
   that opening the pile runs, so its frontier stays bounded and the next open
-  finds nothing to merge. After each commit it reads its known facts back
-  from the pile's own Rank9 attachments instead of keeping one in-memory
-  archive per commit. Measured on sky (GB10 aarch64, shared), one process
-  importing Codex rollouts into a fresh pile, mean wall time per rollout:
-  1,000 raw-only rollouts 8.8-9.3 ms against 38-39 ms for a writer that never
-  carries; 400 rollouts of 269 projections each 148.5 ms against 278-330 ms.
+  finds nothing to merge. It keeps its known facts as the pile's own Rank9
+  attachments instead of one in-memory archive per commit: each commit adds
+  its own attachment, and each carry reads them all back from the frontier.
+  Measured on sky (GB10 aarch64, shared), one process importing Codex
+  rollouts into a fresh pile, mean wall time per rollout: 1,000 raw-only
+  rollouts 8.8-9.3 ms against 38-39 ms for a writer that never carries; 400
+  rollouts of 269 projections each 148.5 ms against 278-330 ms. Those figures
+  read everything back after every commit. That read selects a cover over the
+  frontier at a cost that grows with every commit the collection holds, so it
+  now runs once per carry. Importing 320 synthetic 40-record Claude Code
+  sessions in one command into a pile already holding 3,000 Archive commits
+  (sky, shared, release build), it fell from 16.1% to 0.8% of the profiled
+  samples, about 36 ms to 1.3 ms per commit, and the 320 paths took 47.1 and
+  48.2 s against 54.0 and 57.3 s (two alternating rounds; three more rounds
+  timed as whole-process CPU, 55-67 s against 63-73 s, overlap on this
+  shared machine). Into a fresh pile both take 11.3-11.6 s. The attachment
+  pass after each commit still grows with the commits held: 30% of the same
+  profile.
 - `archive import --source codex` projects the 2026-09 rollout format
   (`event_msg/item_completed` with `UserMessage`, `AgentMessage` and
   `Reasoning` items) into the same content facts as the older

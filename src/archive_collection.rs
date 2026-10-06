@@ -17,18 +17,20 @@ use anybytes::Bytes;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
 };
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
-    Collection, CollectionCommit, CollectionSnapshotExt, CollectionStoreExt,
+    Collection, CollectionCommit, CollectionData, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store};
+use triblespace::core::repo::{
+    BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store, StoreRead,
+};
 use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
@@ -94,6 +96,8 @@ thread_local! {
     /// How often [`ArchiveImportWriter::open`] ran on this thread, so a test
     /// can pin how many times one command opens the pile.
     pub(crate) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How often a writer on this thread read its known facts back whole.
+    static READ_BACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl ArchiveImportWriter {
@@ -236,23 +240,40 @@ where
     /// idempotence check would re-stage facts this commit already carries —
     /// which is the whole reason resumed Codex rollouts (they replay large
     /// parent prefixes) are cheap to ingest in sequence rather than expensive.
-    /// It is read back from the frontier's Rank9 attachments, which the
-    /// commit's own attachment pass has just built, as the next open would
-    /// read it: one segment per frontier node, so carrying bounds it too. A
-    /// foundation whose bytes are not here is left out, never fetched; that
-    /// can only make a later fragment stage facts again, which the union
-    /// absorbs.
+    ///
+    /// Between carries the commit's own Rank9 attachment, which its
+    /// attachment pass has just built, joins `current` as one more zero-copy
+    /// segment, so `current` gains at most [`CARRY_EVERY`] segments before a
+    /// carry. A carry reads `current` back whole from the frontier's Rank9
+    /// attachments, as the next open would read it: one segment per frontier
+    /// node. That read selects a cover over the frontier, and its cost grows
+    /// with every commit the collection holds, not with the frontier, so it
+    /// runs once per carry rather than once per commit. A commit left without
+    /// a usable attachment here (a store whose host is another key attaches
+    /// nothing) is read back whole the same way. A foundation whose bytes are
+    /// not here is left out, never fetched; that can only make a later
+    /// fragment stage facts again, which the union absorbs.
     pub fn commit_unit(&mut self) -> Result<Option<CollectionCommit>> {
         let Some(commit) = self.publish()? else {
             return Ok(None);
         };
-        if self.uncarried < CARRY_EVERY {
-            self.ensure_downstream()?;
-        } else {
+        let carry = self.uncarried >= CARRY_EVERY;
+        if carry {
             self.carry()?;
+        } else {
+            self.ensure_downstream()?;
         }
         let (_, rank9) = crate::storage::fact_pair(&mut self.pile, self.collection)?;
-        self.current = crate::storage::FactRead::read_facts(&self.pile.snapshot()?, rank9)
+        let snapshot = self.pile.snapshot()?;
+        if !carry {
+            if let Some(segment) = attached_node_facts(&snapshot, rank9, commit.data())? {
+                self.current = self.current.with_segments([segment]);
+                return Ok(Some(commit));
+            }
+        }
+        #[cfg(test)]
+        READ_BACKS.with(|reads| reads.set(reads.get() + 1));
+        self.current = crate::storage::FactRead::read_facts(&snapshot, rank9)
             .context("read back the published Archive facts")?;
         Ok(Some(commit))
     }
@@ -376,6 +397,53 @@ fn embedded_blobs(mut blobs: triblespace::core::blob::MemoryBlobStore) -> Vec<Bl
     embedded.sort_unstable_by_key(|(store_key, _)| store_key.raw);
 
     embedded.into_iter().map(|(_, blob)| blob).collect()
+}
+
+/// One node's facts through the Rank9 attachment a believed MAP gives it in
+/// `snapshot`: one zero-copy segment, or `None` when no attachment of it is
+/// here together with the Succinct archive it accelerates.
+fn attached_node_facts<R: StoreRead>(
+    snapshot: &R,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    node: CollectionData,
+) -> Result<Option<SuccinctArchive<OrderedUniverse>>> {
+    let coverage = snapshot
+        .coverage(&BTreeSet::from([rank9.handle()]))
+        .map_err(|error| anyhow!("read the Rank9 attachments: {error}"))?;
+    for attachment in coverage.attachments(rank9.handle(), node) {
+        let root = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::from_hash(attachment);
+        if !resident(snapshot, root)? {
+            continue;
+        }
+        let root: Blob<Rank9AcceleratedSuccinctArchiveBlob> = snapshot
+            .get(root)
+            .map_err(|error| anyhow!("read a Rank9 attachment: {error}"))?;
+        let source = Rank9AcceleratedSuccinctArchiveBlob::source_handle(&root)
+            .map_err(|error| anyhow!("read a Rank9 attachment's source: {error}"))?;
+        if !resident(snapshot, source)? {
+            continue;
+        }
+        let raw: Blob<SuccinctArchiveBlob> = snapshot
+            .get(source)
+            .map_err(|error| anyhow!("read a Rank9 attachment's Succinct archive: {error}"))?;
+        return SuccinctArchive::from_accelerated_parts(raw, root)
+            .map(Some)
+            .map_err(|error| anyhow!("attach a Rank9 attachment: {error}"));
+    }
+    Ok(None)
+}
+
+fn resident<R: StoreRead, T: BlobEncoding + 'static>(
+    snapshot: &R,
+    handle: Inline<Handle<T>>,
+) -> Result<bool>
+where
+    Handle<T>: InlineEncoding,
+{
+    Ok(snapshot
+        .metadata(handle)
+        .map_err(|error| anyhow!("inspect blob residency: {error}"))?
+        .is_some())
 }
 
 /// Exact membership without rebuilding an in-memory `TribleSet` over the
@@ -1517,6 +1585,44 @@ mod tests {
             length,
             "the next open publishes no MERGE and no MAP"
         );
+    }
+
+    /// Between carries each commit's own Rank9 attachment joins what the
+    /// writer knows. The read-back that selects a cover over the whole
+    /// frontier, whose cost grows with every commit the collection holds,
+    /// runs once per carry and not once per commit. After every commit the
+    /// writer still knows every commit it made.
+    #[test]
+    fn a_writer_reads_its_facts_back_once_per_carry() {
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        std::fs::File::create(&pile).unwrap();
+        let key = directory.path().join("archive.key");
+        initialize_archive_fixture(&pile, &key);
+
+        let unit = |index: usize| projection(&format!("session:{index}"), &format!("body {index}"));
+        let commits = 2 * CARRY_EVERY + 3;
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let read_backs = || READ_BACKS.with(std::cell::Cell::get);
+        let before = read_backs();
+        for index in 0..commits {
+            writer.stage_fragment(unit(index)).unwrap();
+            assert!(writer.commit_unit().unwrap().is_some());
+            for known in 0..=index {
+                writer.stage_fragment(unit(known)).unwrap();
+            }
+            assert_eq!(
+                writer.delta_len(),
+                0,
+                "after commit {index} the writer knows every commit it made"
+            );
+        }
+        assert_eq!(
+            read_backs() - before,
+            commits / CARRY_EVERY,
+            "one read-back per carry over {commits} commits"
+        );
+        writer.close(Ok(())).unwrap();
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
