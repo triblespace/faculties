@@ -142,6 +142,8 @@ imagine = ["dep:mary", "mary/flux"]
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
 audio = ["dep:rodio"]
 voice = ["dep:mary", "mary/speak", "audio"]
+# Opt-in native Breeze backend; the existing Qwen path remains the default.
+voice-breeze = ["voice", "mary/breeze-cuda"]
 # The `hear` faculty: Soma's framed microphone -> energy VAD -> Gemma-4 audio
 # tower + multimodal embedder, handing over EMBEDDINGS (not text). `mary/gemma`
 # brings the parity-gated audio path; `tokenizers` is the decoder's BPE, needed
