@@ -12,11 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
-#[derive(Clone, Copy)]
-struct ArchiveStorage<'a> {
-    pile: &'a Path,
-    key: Option<&'a Path>,
-}
+use triblespace::core::trible::Fragment;
 #[derive(Parser)]
 #[command(
     version = crate::GIT_VERSION,
@@ -146,162 +142,20 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
     });
 }
 
-/// Import every PATH in one process, one signed COMMIT per source.
+/// Import every PATH through ONE opened writer, one signed COMMIT per path.
 ///
-/// A failure names the path that caused it and stops: the sources already
-/// committed stay committed, because each was its own atomic publication. That
-/// is the property that made per-file processes look necessary; it never was.
-fn run_import_all(
-    storage: ArchiveStorage<'_>,
-    paths: &[PathBuf],
-    source: CliImportSource,
-    out: &mut Out<'_>,
-) -> Result<()> {
-    if paths.len() == 1 {
-        return run_import(storage, &paths[0], source, out);
-    }
-    let total = paths.len();
-    if source == CliImportSource::Codex {
-        // The batch case that matters: 3,161 refused Codex rollouts, and the
-        // open is ~9.3 s against ~1 s of projection. One open, N commits.
-        let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-        let result = (|| {
-            for (index, path) in paths.iter().enumerate() {
-                eprintln!("[{}/{total}] {}", index + 1, path.display());
-                run_codex_into(&mut writer, path, out)
-                    .with_context(|| format!("import {}", path.display()))?;
-            }
-            Ok(())
-        })();
-        return writer.close(result);
-    }
-    for (index, path) in paths.iter().enumerate() {
-        eprintln!("[{}/{total}] {}", index + 1, path.display());
-        run_import(storage, path, source, out)
-            .with_context(|| format!("import {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn run_import(
-    storage: ArchiveStorage<'_>,
-    path: &Path,
-    source: CliImportSource,
-    out: &mut Out<'_>,
-) -> Result<()> {
-    match source {
-        CliImportSource::Agy => run_agy_import(storage, path, out),
-        CliImportSource::ChatGpt => run_chatgpt_import(storage, path, out),
-        CliImportSource::ClaudeCode => run_claude_code_import(storage, path, out),
-        CliImportSource::ClaudeWeb => run_claude_web_import(storage, path, out),
-        CliImportSource::Codex => run_codex_import(storage, path, out),
-        CliImportSource::Copilot => run_copilot_import(storage, path, out),
-        CliImportSource::Gemini => run_gemini_import(storage, path, out),
-    }
-}
-
-fn run_agy_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-    let projection = archive_agy::project_path(path, |projected| {
-        writer
-            .stage_fragment(projected.fragment)
-            .with_context(|| format!("stage {}", projected.source_path.display()))
-    });
-    let (summary, commit) = writer.finish(projection)?;
-    ImportSummary::Agy(summary).write(commit.is_some(), out)?;
-    Ok(())
-}
-
-fn run_chatgpt_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-    let projection = archive_chatgpt::project_path(path, |projected| {
-        writer
-            .stage_fragment(projected.fragment)
-            .with_context(|| format!("stage {}", projected.source_path.display()))
-    });
-    let (summary, commit) = writer.finish(projection)?;
-    ImportSummary::ChatGpt(summary).write(commit.is_some(), out)?;
-    Ok(())
-}
-
-fn run_claude_code_import(
-    storage: ArchiveStorage<'_>,
-    path: &Path,
-    out: &mut Out<'_>,
-) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-    let projection = archive_claude_code::project_path(path, |projected| {
-        writer
-            .stage_fragment(projected.fragment)
-            .with_context(|| format!("stage {}", projected.source_path.display()))
-    });
-    let (summary, commit) = writer.finish(projection)?;
-    ImportSummary::ClaudeCode(summary).write(commit.is_some(), out)?;
-    Ok(())
-}
-
-fn run_codex_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-    let result = run_codex_into(&mut writer, path, out);
-    writer.close(result)
-}
-
-/// Project one Codex rollout into an ALREADY-OPEN writer and commit it.
+/// The open is paid once for the whole command, whatever the source. Opening
+/// grows with the pile (~9.3 s per open on the 44 GB live pile, 2026-09-01)
+/// while a small source projects in well under a second, so one process per
+/// path spends most of its time opening. Atomicity is per path, never per
+/// process.
 ///
-/// Split out so a batch can open the pile once and still publish one signed
-/// commit per rollout — the atomicity was always per source, never per process.
-fn run_codex_into(writer: &mut ArchiveImportWriter, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let projection = archive_codex::project_path(path, |projected| {
-        writer
-            .stage_fragment(projected.fragment)
-            .with_context(|| format!("stage {}", projected.source_path.display()))
-    });
-    let summary = projection?;
-    let commit = writer.commit_unit()?;
-    ImportSummary::Codex(summary).write(commit.is_some(), out)?;
-    Ok(())
-}
-
-fn run_claude_web_import(
-    storage: ArchiveStorage<'_>,
-    path: &Path,
-    out: &mut Out<'_>,
-) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-    let projection = archive_claude_web::project_path(path, |projected| {
-        writer
-            .stage_fragment(projected.fragment)
-            .with_context(|| format!("stage {}", projected.source_path.display()))
-    });
-    let (summary, commit) = writer.finish(projection)?;
-    ImportSummary::ClaudeWeb(summary).write(commit.is_some(), out)?;
-    Ok(())
-}
-
-fn run_copilot_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-    let projection = archive_copilot::project_path(path, |projected| {
-        writer
-            .stage_fragment(projected.fragment)
-            .with_context(|| format!("stage {}", projected.source_path.display()))
-    });
-    let (summary, commit) = writer.finish(projection)?;
-    ImportSummary::Copilot(summary).write(commit.is_some(), out)?;
-    Ok(())
-}
-
-fn run_gemini_import(storage: ArchiveStorage<'_>, path: &Path, out: &mut Out<'_>) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(storage.pile, storage.key)?;
-    let projection = archive_gemini::project_path(path, |projected| {
-        writer
-            .stage_fragment(projected.fragment)
-            .with_context(|| format!("stage {}", projected.source_path.display()))
-    });
-    let (summary, commit) = writer.finish(projection)?;
-    ImportSummary::Gemini(summary).write(commit.is_some(), out)?;
-    Ok(())
-}
-
+/// A failure names the path that caused it and stops the command. Every path
+/// before it stays committed, each its own atomic publication. The failing
+/// path's staged facts are dropped unpublished: `close` commits nothing after
+/// an error, and payload bytes it already appended stay unreachable until a
+/// later COMMIT names them. Paths after it are not read; rerunning the same
+/// command republishes nothing for the paths already committed.
 pub(super) fn import_paths(
     pile: &Path,
     key: Option<&Path>,
@@ -309,8 +163,68 @@ pub(super) fn import_paths(
     source: CliImportSource,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    run_import_all(ArchiveStorage { pile, key }, paths, source, out)
+    let mut writer = ArchiveImportWriter::open(pile, key)?;
+    let total = paths.len();
+    let result = paths.iter().enumerate().try_for_each(|(index, path)| {
+        if total > 1 {
+            eprintln!("[{}/{total}] {}", index + 1, path.display());
+        }
+        import_into(&mut writer, path, source, out)
+            .with_context(|| format!("import {}", path.display()))
+    });
+    writer.close(result)
 }
+
+/// Project one source PATH into the open writer and publish it as one COMMIT.
+///
+/// `commit_unit` folds what it publishes into the writer's known facts, so a
+/// later path skips whatever an earlier one already carried, just as a fresh
+/// open would have: an unchanged source stages nothing and publishes nothing.
+fn import_into(
+    writer: &mut ArchiveImportWriter,
+    path: &Path,
+    source: CliImportSource,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    let mut stage = |fragment: Fragment, source_path: &Path| {
+        writer
+            .stage_fragment(fragment)
+            .with_context(|| format!("stage {}", source_path.display()))
+    };
+    let summary = match source {
+        CliImportSource::Agy => {
+            archive_agy::project_path(path, |p| stage(p.fragment, &p.source_path))
+                .map(ImportSummary::Agy)
+        }
+        CliImportSource::ChatGpt => {
+            archive_chatgpt::project_path(path, |p| stage(p.fragment, &p.source_path))
+                .map(ImportSummary::ChatGpt)
+        }
+        CliImportSource::ClaudeCode => {
+            archive_claude_code::project_path(path, |p| stage(p.fragment, &p.source_path))
+                .map(ImportSummary::ClaudeCode)
+        }
+        CliImportSource::ClaudeWeb => {
+            archive_claude_web::project_path(path, |p| stage(p.fragment, &p.source_path))
+                .map(ImportSummary::ClaudeWeb)
+        }
+        CliImportSource::Codex => {
+            archive_codex::project_path(path, |p| stage(p.fragment, &p.source_path))
+                .map(ImportSummary::Codex)
+        }
+        CliImportSource::Copilot => {
+            archive_copilot::project_path(path, |p| stage(p.fragment, &p.source_path))
+                .map(ImportSummary::Copilot)
+        }
+        CliImportSource::Gemini => {
+            archive_gemini::project_path(path, |p| stage(p.fragment, &p.source_path))
+                .map(ImportSummary::Gemini)
+        }
+    }?;
+    let commit = writer.commit_unit()?;
+    summary.write(commit.is_some(), out)
+}
+
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         out.line(Cli::command().render_help().to_string())?;
