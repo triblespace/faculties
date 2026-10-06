@@ -12488,7 +12488,6 @@ version = "0.47.0"
 dependencies = [
  "anybytes",
  "blake3",
- "image",
  "jerky",
  "lopdf",
  "maryml",
