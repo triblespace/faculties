@@ -2156,7 +2156,7 @@ mod tests {
     /// foundation as done, so a file whose only row had not arrived here was
     /// not counted although the index could not answer for it. A leaf counts
     /// only when its output is here.
-    #[cfg(feature = "local-embed")]
+    #[cfg(feature = "wemm")]
     #[test]
     fn a_leaf_whose_output_is_not_here_leaves_its_foundation_underived() {
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};

@@ -1,7 +1,7 @@
 //! The existing rate-local VAD; no transport, device, model, or file input.
 
 #[derive(Clone, Debug)]
-pub(super) struct VadConfig {
+pub(crate) struct VadConfig {
     frame_ms: usize,
     start_frames: usize,
     hangover_ms: usize,
@@ -28,18 +28,28 @@ impl Default for VadConfig {
     }
 }
 
+impl VadConfig {
+    /// Override only the silence needed to end a turn; retain all other VAD
+    /// and final-tail rules. Transport-specific callers can choose a pause
+    /// policy without changing the shared capture/file default.
+    pub(crate) fn with_end_silence_ms(mut self, milliseconds: usize) -> Self {
+        self.hangover_ms = milliseconds;
+        self
+    }
+}
+
 /// A finished utterance at the segmenter's native rate.
-pub(super) struct Segment {
-    pub(super) samples: Vec<f32>,
+pub(crate) struct Segment {
+    pub(crate) samples: Vec<f32>,
     /// Sample rate of `samples` — the rate the segmenter ran at, which is the
     /// capture rate live and 16 kHz for recorded clips.
-    pub(super) rate: usize,
-    pub(super) start_s: f64,
-    pub(super) end_s: f64,
+    pub(crate) rate: usize,
+    pub(crate) start_s: f64,
+    pub(crate) end_s: f64,
 }
 
 impl Segment {
-    pub(super) fn dur_s(&self) -> f64 {
+    pub(crate) fn dur_s(&self) -> f64 {
         self.end_s - self.start_s
     }
 }
@@ -47,7 +57,7 @@ impl Segment {
 /// Streaming energy-VAD segmenter. Feed arbitrary-size mono chunks at a fixed
 /// rate; complete utterances go to `emit`. The SAME code path serves the live
 /// capture and recorded files, which is what makes `hear once` a real gate.
-pub(super) struct Segmenter {
+pub(crate) struct Segmenter {
     cfg: VadConfig,
     rate: usize,
     frame: usize,
@@ -65,7 +75,7 @@ pub(super) struct Segmenter {
 }
 
 impl Segmenter {
-    pub(super) fn new(rate: usize, cfg: VadConfig) -> Self {
+    pub(crate) fn new(rate: usize, cfg: VadConfig) -> Self {
         let frame = rate * cfg.frame_ms / 1000;
         let preroll_cap = rate * cfg.preroll_ms / 1000;
         Segmenter {
@@ -86,7 +96,7 @@ impl Segmenter {
         }
     }
 
-    pub(super) fn push(&mut self, chunk: &[f32], emit: &mut impl FnMut(Segment)) {
+    pub(crate) fn push(&mut self, chunk: &[f32], emit: &mut impl FnMut(Segment)) {
         self.pending.extend_from_slice(chunk);
         while self.pending.len() >= self.frame {
             let frame: Vec<f32> = self.pending.drain(..self.frame).collect();
@@ -94,8 +104,22 @@ impl Segmenter {
         }
     }
 
+    /// The part of the current utterance that no future silence trim can remove.
+    /// Keep the same onset/preroll and minimum admission as `close`; the caller
+    /// may consume only the newly appended suffix. A completed Segment remains
+    /// the authority for its final samples (including explicit-flush tails).
+    pub(crate) fn committed_prefix(&self) -> Option<(u64, &[f32])> {
+        if !self.in_speech {
+            return None;
+        }
+        let discardable = (self.silence_run * self.frame).saturating_sub(self.rate * 200 / 1000);
+        let end = self.current.len().saturating_sub(discardable);
+        (end >= self.rate * self.cfg.min_utt_ms / 1000)
+            .then_some((self.utt_start_sample, &self.current[..end]))
+    }
+
     /// End of stream/file: close any open utterance.
-    pub(super) fn flush(&mut self, emit: &mut impl FnMut(Segment)) {
+    pub(crate) fn flush(&mut self, emit: &mut impl FnMut(Segment)) {
         if !self.pending.is_empty() {
             let rest = std::mem::take(&mut self.pending);
             if self.in_speech {
@@ -113,7 +137,7 @@ impl Segmenter {
     /// self-echo), the speech state clears, the adaptive noise floor is KEPT
     /// (no re-warm-up on every reply), and the stream clock still advances so
     /// later timestamps stay stream-relative.
-    pub(super) fn pause_skip(&mut self, n: u64) {
+    pub(crate) fn pause_skip(&mut self, n: u64) {
         self.pending.clear();
         self.preroll.clear();
         self.current.clear();
@@ -208,6 +232,58 @@ impl Segmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn end_silence_override_preserves_shared_defaults() {
+        let shared = VadConfig::default();
+        let discord = shared.clone().with_end_silence_ms(1200);
+        assert_eq!(shared.hangover_ms, 700);
+        assert_eq!(discord.hangover_ms, 1200);
+        assert_eq!(discord.frame_ms, 20);
+        assert_eq!(discord.start_frames, 3);
+        assert_eq!(discord.preroll_ms, 240);
+        assert_eq!(discord.min_utt_ms, 300);
+        assert_eq!(discord.max_utt_s, 28.0);
+        assert_eq!(discord.ratio, shared.ratio);
+        assert_eq!(discord.abs_floor, shared.abs_floor);
+    }
+
+    #[test]
+    fn committed_prefix_never_includes_a_discarded_silence_tail() {
+        let mut segmenter = Segmenter::new(16_000, VadConfig::default());
+        let mut final_segments = Vec::new();
+        let mut fed = Vec::new();
+        let mut start = None;
+        // Silence resumes once, so previously withheld silence becomes real
+        // captured PCM; the final 700 ms hangover still retains only 200 ms.
+        for (loud, frames) in [
+            (false, 30),
+            (true, 40),
+            (false, 25),
+            (true, 30),
+            (false, 35),
+        ] {
+            for _ in 0..frames {
+                segmenter.push(&vec![if loud { 0.25 } else { 0.0 }; 320], &mut |s| {
+                    final_segments.push(s)
+                });
+                if let Some((at, prefix)) = segmenter.committed_prefix() {
+                    assert_eq!(*start.get_or_insert(at), at);
+                    assert!(prefix.len() >= fed.len());
+                    assert_eq!(&prefix[..fed.len()], fed.as_slice());
+                    fed.extend_from_slice(&prefix[fed.len()..]);
+                }
+            }
+        }
+        assert_eq!(final_segments.len(), 1);
+        let final_pcm = &final_segments[0].samples;
+        assert_eq!(fed, *final_pcm);
+        assert!(final_pcm[final_pcm.len() - 3200..]
+            .iter()
+            .all(|x| *x == 0.0));
+        assert_eq!(final_pcm[final_pcm.len() - 3201], 0.25);
+        assert!(segmenter.committed_prefix().is_none());
+    }
     #[cfg(feature = "hear")]
     use crate::hear::operations::to_hear_rate;
     use crate::hear::operations::{CAPTURE_RATE, HEAR_RATE};

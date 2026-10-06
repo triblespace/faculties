@@ -100,8 +100,19 @@ pub mod turntaking;
 pub mod viewer;
 pub mod voice;
 pub mod web;
+#[cfg(feature = "wemm")]
+pub mod wemm;
 pub mod wiki;
 pub mod wiki_additive;
+
+/// What Files, Memory and Wiki semantic commands answer in a build without
+/// the WeMM model.
+#[cfg(not(feature = "wemm"))]
+pub(crate) fn wemm_unavailable<T>() -> anyhow::Result<T> {
+    anyhow::bail!(
+        "semantic index and search run on the WeMM model: rebuild with --features wemm on a GB10"
+    )
+}
 
 #[cfg(test)]
 mod attribute_id_preservation_tests;

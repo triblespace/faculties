@@ -62,6 +62,7 @@ use crate::schemas::blockdag as archive;
 use crate::schemas::compass::{board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use crate::schemas::message::{local as message_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
+use crate::storage::FactArchive;
 use crate::widgets::storage::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 
 /// Handle to a long-string blob (titles, bodies, notes).
@@ -542,20 +543,12 @@ fn collect_reason_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Eve
     }
 }
 
-/// Emit one Archive event per exact source occurrence. A receipt's genuine
-/// source timestamp wins when present; otherwise the canonical block time is
-/// used. Text parts are rendered in ordinal order and non-text-only blocks
-/// remain visible as a typed placeholder.
+/// Emit one Archive event per source projection receipt. A receipt's
+/// earliest genuine source timestamp wins when present; otherwise the
+/// canonical block time is used. Text parts are rendered in ordinal order
+/// and non-text-only blocks remain visible as a typed placeholder.
 fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let mut source_times = BTreeMap::new();
-    for (projection, timestamp) in find!(
-        (projection: Id, timestamp: Inline<NsTAIInterval>),
-        pattern!(dataset.facts, [{
-            ?projection @ archive::source_projection::source_timestamp: ?timestamp
-        }])
-    ) {
-        source_times.insert(projection, timestamp);
-    }
+    let source_times = earliest_source_times(dataset.facts);
 
     let mut block_times = BTreeMap::new();
     for (block, timestamp) in find!(
@@ -651,6 +644,35 @@ fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
             from_to: None,
         });
     }
+}
+
+/// Each receipt's earliest source timestamp, for the receipts that have one.
+///
+/// A receipt carries one timestamp per observed occurrence: a Codex fork or
+/// resume that replays its parent adds the replay's time to the parent's
+/// receipt. The earliest is when the message was first said, and it is the
+/// one `archive list` prints. A timestamp that is not a valid interval is
+/// passed over, as that typed read passes it over.
+fn earliest_source_times(facts: &FactArchive) -> BTreeMap<Id, Inline<NsTAIInterval>> {
+    let mut source_times = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
+    for (projection, timestamp) in find!(
+        (projection: Id, timestamp: Inline<NsTAIInterval>),
+        pattern!(facts, [{
+            ?projection @ archive::source_projection::source_timestamp: ?timestamp
+        }])
+    ) {
+        let Some(start) = interval_start(timestamp) else {
+            continue;
+        };
+        let earliest = source_times.entry(projection).or_insert((start, timestamp));
+        if start < earliest.0 {
+            *earliest = (start, timestamp);
+        }
+    }
+    source_times
+        .into_iter()
+        .map(|(projection, (_, timestamp))| (projection, timestamp))
+        .collect()
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -1309,5 +1331,33 @@ mod tests {
         };
 
         assert_eq!(route(&forward), route(&reverse));
+    }
+
+    /// A Codex fork replays its parent's records, and the replay's time
+    /// annotates the parent's receipt beside the original's. The timeline
+    /// shows that receipt where `archive list` does: at its earliest time.
+    #[test]
+    fn a_receipt_observed_twice_is_shown_at_its_earliest_time() {
+        use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+        use triblespace::core::trible::TribleSet;
+        use triblespace::prelude::{entity, ExclusiveId, TryToInline};
+
+        let instant = |seconds: f64| -> Inline<NsTAIInterval> {
+            let epoch = Epoch::from_unix_seconds(seconds);
+            (epoch, epoch).try_to_inline().expect("valid interval")
+        };
+        let receipt = Id::new([7; 16]).expect("non-nil");
+        let original = instant(1_000.0);
+        let replay = instant(2_000.0);
+        let mut facts = TribleSet::new();
+        for timestamp in [original, replay] {
+            facts += entity! { ExclusiveId::force_ref(&receipt) @
+                archive::source_projection::source_timestamp: timestamp,
+            }
+            .into_facts();
+        }
+        let facts = FactArchive::new(vec![SuccinctArchive::from(&facts)]);
+
+        assert_eq!(earliest_source_times(&facts).get(&receipt), Some(&original));
     }
 }

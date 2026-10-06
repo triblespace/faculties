@@ -16,6 +16,11 @@ use std::{fs, io::Read, path::PathBuf};
 const NO_VOICE: &str =
     "voice is not built into this discord binary; build it with the discord-voice feature";
 
+/// What `discord live --hear-model` answers in a build without hearing.
+#[cfg(not(feature = "discord-hearing"))]
+const NO_HEARING: &str = "hearing is not built into this discord binary; build it with the \
+     discord-hearing feature";
+
 /// What `discord live` answers when given nothing to run: only what this
 /// build can run.
 #[cfg(feature = "discord-voice")]
@@ -71,6 +76,18 @@ enum Command {
         /// What to say, spoken after everything queued before it.
         text: String,
     },
+    /// Hear a recorded clip the way `live --hear-model` hears its voice
+    /// channel, without Discord or a pile: a 16 kHz mono 16-bit WAV is cut
+    /// into utterances, and each is transcribed and printed with its timing
+    /// and words. Nothing is stored.
+    #[cfg(feature = "discord-hearing")]
+    Hear {
+        /// The Voxtral model pile, weights and tokenizer.
+        #[arg(long, value_name = "PILE")]
+        hear_model: PathBuf,
+        /// The clip.
+        wav: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -115,6 +132,14 @@ struct LiveArgs {
     /// message the process hears in it.
     #[arg(long)]
     intake_dms: bool,
+    /// Hear everybody in the voice channel but the bot, with the Voxtral
+    /// model pile (weights and tokenizer) at this path: each utterance is
+    /// transcribed and stored with its audio as a message in the voice
+    /// channel, under the user who said it, where orient finds it. Without
+    /// it nobody is heard. Needs a pile, and a build with the
+    /// discord-hearing feature.
+    #[arg(long, value_name = "PILE", requires = "voice_channel")]
+    hear_model: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +198,8 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Command::Collection(command) => command,
         Command::Live(args) => return run_live(&cli, args),
         Command::Say { state, text } => return say(state.state_dir, &text, out),
+        #[cfg(feature = "discord-hearing")]
+        Command::Hear { hear_model, wav } => return hear(&hear_model, &wav, out),
     };
     let token = require_token(&cli)?;
     let pile = cli
@@ -271,6 +298,7 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
         greeting,
         intake_channels,
         intake_dms,
+        hear_model,
     } = args;
     // clap asks for --guild and --voice-channel together.
     let voice = guild.zip(voice_channel);
@@ -281,7 +309,12 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
         }
         let _ = (announce, greeting);
     }
-    let wants_intake = !intake_channels.is_empty() || intake_dms;
+    #[cfg(not(feature = "discord-hearing"))]
+    if hear_model.is_some() {
+        bail!(NO_HEARING);
+    }
+    // What is heard is stored through intake, which hearing therefore runs.
+    let wants_intake = !intake_channels.is_empty() || intake_dms || hear_model.is_some();
     if voice.is_none() && !wants_intake {
         bail!(NOTHING_TO_RUN);
     }
@@ -333,6 +366,11 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
             channel,
             announce,
             greeting,
+            #[cfg(feature = "discord-hearing")]
+            hearing: hear_model.map(|model| super::hearing::Config {
+                model,
+                unstored: state.intake().join(intake::UNSTORED_SPEECH),
+            }),
             state,
         }),
     }));
@@ -340,6 +378,21 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
     // up past its own bounded shutdown.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     outcome
+}
+
+/// `discord hear`: a clip heard as the voice channel is.
+#[cfg(feature = "discord-hearing")]
+fn hear(model: &std::path::Path, wav: &std::path::Path, out: &mut Out<'_>) -> Result<()> {
+    // Panics on anything but a 16-bit mono WAV.
+    let (clip, rate) = mary::models::f5::wav::read_pcm16_mono(wav);
+    if rate as usize != super::hearing::RATE {
+        bail!(
+            "{} is at {rate} Hz; hearing takes {} Hz",
+            wav.display(),
+            super::hearing::RATE
+        );
+    }
+    super::hearing::hear_clip(model, &clip, out)
 }
 
 /// `discord say`: queue one line for the voice connection to speak.
@@ -459,6 +512,35 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["discord", "read", "--pile", "/p", "--token", "t"]).unwrap();
         assert_eq!(cli.pile, Some(PathBuf::from("/p")));
+    }
+
+    /// Hearing is a model, and nobody to name: whoever is in the voice
+    /// channel is heard, so it needs one. There is no list of users to hear,
+    /// and no tokenizer beside the model pile.
+    #[test]
+    fn live_hears_the_voice_channel_with_a_model() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "live",
+            "--guild",
+            "1",
+            "--voice-channel",
+            "2",
+            "--hear-model",
+            "/m/voxtral.pile",
+        ])
+        .unwrap();
+        let Some(Command::Live(live)) = cli.command else {
+            panic!("live parses as live");
+        };
+        assert_eq!(live.hear_model, Some(PathBuf::from("/m/voxtral.pile")));
+        assert!(
+            Cli::try_parse_from(["discord", "live", "--hear-model", "/m/voxtral.pile"]).is_err()
+        );
+        for gone in [["--hear-user", "3"], ["--hear-tokenizer", "/m/tekken.json"]] {
+            let args = ["discord", "live", "--guild", "1", "--voice-channel", "2"];
+            assert!(Cli::try_parse_from(args.iter().chain(&gone)).is_err());
+        }
     }
 
     /// `discord live` names only what this build can run, and a build without

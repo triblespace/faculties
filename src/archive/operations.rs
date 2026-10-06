@@ -1638,7 +1638,19 @@ mod tests {
         let archive = storage(&fixture).load().unwrap();
         let facts = archive.facts().unwrap();
         let ids = projection_ids(&facts);
-        assert_eq!(ids.len(), 2);
+        // A Codex receipt is keyed by its block, so both occurrences annotate
+        // one receipt: two locators and two timestamps.
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            find!(
+                timestamp: (i128, i128),
+                pattern!(&facts, [{
+                    _?projection @ archive_schema::source_projection::source_timestamp: ?timestamp
+                }])
+            )
+            .count(),
+            2
+        );
         let blocks: BTreeSet<_> = find!(
             block: Id,
             pattern!(&facts, [{
@@ -1697,6 +1709,133 @@ mod tests {
             run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap_err();
         assert!(format!("{error:#}").contains("conflicting semantic payloads"));
         assert_eq!(archive_root_payloads(&fixture), 0);
+    }
+
+    const PUBLISHED: &str = "one signed COMMIT published";
+    const UNCHANGED: &str = "unchanged (no novel facts)";
+
+    /// One synthetic two-record Claude Code session in its own file.
+    fn claude_code_session(directory: &Path, name: &str) -> PathBuf {
+        let path = directory.join(format!("{name}.jsonl"));
+        let question = serde_json::json!({
+            "type": "user", "sessionId": name, "uuid": format!("{name}-question"),
+            "timestamp": "2026-03-01T15:34:01Z",
+            "message": {"role": "user", "content": format!("question {name}")},
+        });
+        let answer = serde_json::json!({
+            "type": "assistant", "sessionId": name, "uuid": format!("{name}-answer"),
+            "parentUuid": format!("{name}-question"), "timestamp": "2026-03-01T15:34:02Z",
+            "message": {"role": "assistant", "content": format!("answer {name}")},
+        });
+        fs::write(&path, format!("{question}\n{answer}\n")).unwrap();
+        path
+    }
+
+    /// One `archive import` command over PATHS, with each path's reported
+    /// publication outcome in order. The command opens the pile once,
+    /// however many PATHS it has and wherever it stops.
+    fn import_outcomes(fixture: &Fixture, paths: &[PathBuf]) -> (Result<()>, Vec<String>) {
+        let opens = || archive_collection::OPENS.with(std::cell::Cell::get);
+        let opened_before = opens();
+        let mut outcomes = Vec::new();
+        let result = super::super::cli::import_paths(
+            &fixture.pile,
+            Some(&fixture.key),
+            paths,
+            CliImportSource::ClaudeCode,
+            &mut Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    if let Some(outcome) = text.strip_prefix("Archive collection: ") {
+                        outcomes.push(outcome.trim_end().to_owned());
+                    }
+                }
+                Ok(())
+            }),
+        );
+        assert_eq!(
+            opens() - opened_before,
+            1,
+            "one command over {} paths opens the pile once",
+            paths.len()
+        );
+        (result, outcomes)
+    }
+
+    #[test]
+    fn multi_path_import_reports_each_path_and_republishes_nothing() {
+        let fixture = fixture();
+        let directory = fixture._directory.path();
+        let sessions: Vec<PathBuf> = ["alpha", "beta", "gamma"]
+            .into_iter()
+            .map(|name| claude_code_session(directory, name))
+            .collect();
+
+        let (result, outcomes) = import_outcomes(&fixture, &sessions);
+        result.unwrap();
+        assert_eq!(outcomes, [PUBLISHED; 3]);
+        assert_eq!(archive_root_payloads(&fixture), 3, "one COMMIT per path");
+        let archive = storage(&fixture).load().unwrap();
+        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 6);
+        drop(archive);
+        let after_first = fs::metadata(&fixture.pile).unwrap().len();
+
+        let (result, outcomes) = import_outcomes(&fixture, &sessions);
+        result.unwrap();
+        assert_eq!(outcomes, [UNCHANGED; 3]);
+        assert_eq!(archive_root_payloads(&fixture), 3);
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
+
+        // Within one command a later path is judged against what the earlier
+        // paths of that same command committed, not only against the open.
+        let delta = claude_code_session(directory, "delta");
+        let (result, outcomes) =
+            import_outcomes(&fixture, &[sessions[0].clone(), delta.clone(), delta]);
+        result.unwrap();
+        assert_eq!(outcomes, [UNCHANGED, PUBLISHED, UNCHANGED]);
+        assert_eq!(archive_root_payloads(&fixture), 4);
+    }
+
+    #[test]
+    fn multi_path_import_failure_keeps_earlier_commits_and_stops() {
+        let fixture = fixture();
+        let directory = fixture._directory.path();
+        let first = claude_code_session(directory, "first");
+        let conflict = directory.join("conflict");
+        fs::create_dir(&conflict).unwrap();
+        fs::write(
+            conflict.join("origin.jsonl"),
+            r#"{"type":"user","sessionId":"origin","uuid":"message","message":{"role":"user","content":"origin"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            conflict.join("fork.jsonl"),
+            r#"{"type":"user","sessionId":"fork","uuid":"copy","forkedFrom":{"sessionId":"origin","messageUuid":"message"},"message":{"role":"user","content":"different"}}"#,
+        )
+        .unwrap();
+        let later = claude_code_session(directory, "later");
+
+        let (result, outcomes) =
+            import_outcomes(&fixture, &[first.clone(), conflict.clone(), later.clone()]);
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(
+            error.contains(&format!("import {}", conflict.display())),
+            "{error}"
+        );
+        assert!(error.contains("conflicting semantic payloads"), "{error}");
+        assert_eq!(outcomes, [PUBLISHED], "the failure stops the command");
+        assert_eq!(
+            archive_root_payloads(&fixture),
+            1,
+            "the earlier COMMIT stays"
+        );
+        let archive = storage(&fixture).load().unwrap();
+        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
+        drop(archive);
+
+        let (result, outcomes) = import_outcomes(&fixture, &[first, later]);
+        result.unwrap();
+        assert_eq!(outcomes, [UNCHANGED, PUBLISHED]);
+        assert_eq!(archive_root_payloads(&fixture), 2);
     }
 
     #[test]

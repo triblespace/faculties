@@ -108,10 +108,10 @@ path = "src/bin/status-capture.rs"
 required-features = ["widgets"]
 
 [features]
-# `local-embed` and `widgets` are default: semantic recall is core to knowledge
-# workflows, and the GORBIE viewer is part of the normal office surface.
+# `local-embed` and `widgets` are default: posture's semantic tier still reads
+# nomic-embed-text, and the GORBIE viewer is part of the normal office surface.
 # A stock workspace cohort build (`cargo build --release --workspace --bins`)
-# must ship both.
+# must ship both. A GB10 cohort adds `wemm` for semantic search.
 default = ["local-embed", "widgets", "audio", "hear"]
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
 widgets = [
@@ -120,11 +120,13 @@ widgets = [
 ]
 # Consumed by GORBIE's `#[notebook]` expansion to gate its export branch.
 web-export = []
-# Semantic similarity in `files` + `wiki similar` / `memory similar` (image+text
-# embeddings via mary's embedder). Default (see above).
-local-embed = ["dep:mary", "mary/embed", "mary/gemma", "triblespace-search/semantic"]
-# Explicit bounded single-model WeMM path; never a Nomic fallback. Descriptor
-# and join portability live in search's separate semantic-wemm feature.
+# nomic-embed-text for posture's semantic tier (`posture semantic`), the one
+# reader of the nomic models left. Default (see above).
+local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
+# Semantic index and search for Files, Memory and Wiki (`files index/similar`,
+# `memory index/similar`, `memory context --about/--filter/--remove`, `wiki
+# index/similar`): one native WeMM model for text, images and documents, on a
+# GB10 only. Without it those commands say so, and context falls back to BM25.
 wemm = ["dep:mary", "mary/wemm-input", "triblespace-search/semantic-wemm-cuda"]
 # Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux"]
@@ -142,6 +144,8 @@ imagine = ["dep:mary", "mary/flux"]
 # (FreeBSD build class, 2026-07-21) via --no-default-features.
 audio = ["dep:rodio"]
 voice = ["dep:mary", "mary/speak", "audio"]
+# Opt-in native Breeze backend; the existing Qwen path remains the default.
+voice-breeze = ["voice", "mary/breeze-cuda"]
 # The `hear` faculty: Soma's framed microphone -> energy VAD -> Gemma-4 audio
 # tower + multimodal embedder, handing over EMBEDDINGS (not text). `mary/gemma`
 # brings the parity-gated audio path; `tokenizers` is the decoder's BPE, needed
@@ -168,6 +172,13 @@ duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
 # hands out. Without it, `discord live` runs intake alone and `discord say`
 # says voice is not built in. Off by default: the model runtime is heavy.
 discord-voice = ["voice", "dep:songbird", "dep:symphonia", "dep:async-trait"]
+# Hearing in `discord live`'s voice channel: songbird's receive path decodes
+# what everybody but the bot says there, an energy segmenter cuts it into
+# utterances, and mary's Voxtral streaming transcriber (`mary::hear`, on CUDA)
+# turns each into text, stored with its audio as a message in the voice
+# channel under the user who said it. Off by default, like discord-voice,
+# which it builds on.
+discord-hearing = ["discord-voice", "songbird/receive", "mary/voxtral-cuda"]
 [dependencies]
 # Core: every CLI faculty depends on these.
 anyhow = "1.0"
@@ -243,9 +254,8 @@ egui = { version = "0.34", optional = true }
 # Optional, heavy: mary's Burn/Metal model ports. Activated as a bare optional
 # dep (no default features); the *consuming* faculties feature turns on exactly
 # the mary features it needs, so each build stays as lean as its job allows:
-#   local-embed → mary[embed,gemma]: CLIP/SigLIP multi-modal embedder (CLIP
-#                 image+text shared space) + nomic-embed-multimodal-7b (3584-d
-#                 dense image/text space; Qwen2.5-VL port + Metal/wgpu backend).
+#   local-embed → mary[embed,gemma]: nomic-embed-text for posture.
+#   wemm        → mary[wemm-input]: native CUDA WeMM-Embedding-9B.
 #   imagine     → mary[flux]: the ported FLUX.2 text→image pipeline.
 mary = { package = "maryml", version = "0.1.0", path = "../mary", default-features = false, optional = true }
 # Files presentation codecs; also matches the image type returned by Mary FLUX.
@@ -259,6 +269,11 @@ tempfile = "3"
 # Root patches are not inherited; this source/registry difference is deliberate.
 [patch.crates-io]
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
+# SOURCE-BUILD-ONLY: songbird 0.6.0 with its receive path fixed (branch
+# dave-receive-fix): VoiceTick decodes exactly the Opus frame (no DAVE trailer,
+# no RTP padding), loss concealment is one tick at any rate and channel count,
+# and receive builds without the gateway feature.
+songbird = { path = "../songbird" }
 
 # Debug info was 94.7% of a debug binary here: the `trible` test binary
 # measured 1.97 GB, of which only 110 MB was code. Cargo never collects old

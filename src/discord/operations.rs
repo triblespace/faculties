@@ -154,9 +154,78 @@ pub struct ObservedMessage {
     pub content: String,
     pub reply_to: Option<Id>,
     pub attachments: BTreeSet<Id>,
+    /// Somebody coming into or leaving a voice channel, when the message is
+    /// that notice: presented as the event, never as its (empty) content.
+    pub presence: Option<discord_model::Presence>,
     pub variant_index: usize,
     pub variant_count: usize,
 }
+/// Something one user said in a voice channel: what `discord live` hears,
+/// stored as a message in that channel ([`Discord::observe_utterance`]).
+///
+/// Its Debug output names the channel, the user and the sizes, never the
+/// transcript, so that a log line can never carry what was said.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Utterance {
+    pub channel: u64,
+    pub user: u64,
+    /// When it began, in milliseconds since the Unix epoch.
+    pub start_ms: u64,
+    pub transcript: String,
+    /// What was said, as a 16 kHz mono 16-bit PCM WAV.
+    pub wav: Vec<u8>,
+}
+
+impl std::fmt::Debug for Utterance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Utterance")
+            .field("channel", &self.channel)
+            .field("user", &self.user)
+            .field("start_ms", &self.start_ms)
+            .field("transcript_chars", &self.transcript.chars().count())
+            .field("wav_bytes", &self.wav.len())
+            .finish()
+    }
+}
+
+impl Utterance {
+    /// When it began, as the point interval a message's
+    /// `metadata::created_at` is.
+    pub fn started(&self) -> Inline<NsTAIInterval> {
+        unix_millisecond(self.start_ms)
+    }
+}
+
+/// Somebody coming into or leaving a voice channel, as `discord live` sees
+/// the members of its own ([`super::presence::Members`]); stored as a system
+/// notice there ([`Discord::observe_presence`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresenceChange {
+    pub channel: u64,
+    pub user: u64,
+    /// The user's name as Discord gave it with the change, when it did.
+    pub name: Option<String>,
+    pub presence: discord_model::Presence,
+    /// When it was seen, in milliseconds since the Unix epoch: Discord does
+    /// not say when a voice state changed.
+    pub seen_ms: u64,
+}
+
+impl PresenceChange {
+    /// When it was seen, as the point interval a message's
+    /// `metadata::created_at` is.
+    pub fn seen(&self) -> Inline<NsTAIInterval> {
+        unix_millisecond(self.seen_ms)
+    }
+}
+
+/// A moment in milliseconds since the Unix epoch, as a point interval.
+fn unix_millisecond(milliseconds: u64) -> Inline<NsTAIInterval> {
+    epoch_interval(Epoch::from_unix_duration(
+        hifitime::Unit::Millisecond * milliseconds as i64,
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct History {
     pub channel_id: Option<String>,
@@ -317,6 +386,61 @@ impl Discord {
         self.storage().publish(
             fragment,
             format!("discord: observed message {message_id} in channel {channel_id}"),
+        )
+    }
+    /// Store something said in a voice channel as a message there, with its
+    /// audio ([`discord_model::utterance_fragment`]). `floor` is where intake
+    /// hears the channel from: the channel is recorded as heard from there
+    /// ([`discord_model::intake_fragment`]) in the same commit, as
+    /// [`Self::observe`] records a text channel, so readers take the
+    /// utterance for news. The same utterance stored again converges on the
+    /// same observation.
+    pub fn observe_utterance(&self, utterance: &Utterance, floor: u64) -> Result<CollectionCommit> {
+        let channel = utterance.channel.to_string();
+        let mut fragment = discord_model::utterance_fragment(
+            &channel,
+            &utterance.user.to_string(),
+            utterance.started(),
+            &utterance.transcript,
+            utterance.wav.clone(),
+        )?;
+        fragment += discord_model::intake_fragment(&channel, floor)?;
+        self.storage().publish(
+            fragment,
+            format!(
+                "discord: heard user {} in voice channel {channel} at {}",
+                utterance.user,
+                format_interval(utterance.started())
+            ),
+        )
+    }
+    /// Store somebody coming into or leaving a voice channel as a system
+    /// notice there ([`discord_model::presence_fragment`]). `floor` is where
+    /// intake hears the channel from, recorded in the same commit as
+    /// [`Self::observe_utterance`] records it, so readers take the notice for
+    /// news. The same change stored again converges on the same notice.
+    pub fn observe_presence(
+        &self,
+        change: &PresenceChange,
+        floor: u64,
+    ) -> Result<CollectionCommit> {
+        let channel = change.channel.to_string();
+        let mut fragment = discord_model::presence_fragment(
+            &channel,
+            &change.user.to_string(),
+            change.name.as_deref(),
+            change.presence,
+            change.seen(),
+        )?;
+        fragment += discord_model::intake_fragment(&channel, floor)?;
+        self.storage().publish(
+            fragment,
+            format!(
+                "discord: user {} {} voice channel {channel} at {}",
+                change.user,
+                change.presence.verb(),
+                format_interval(change.seen())
+            ),
         )
     }
     /// Record the Discord user a bot token of this pile authenticates as, so
@@ -1416,6 +1540,7 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
             content,
             reply_to: message.reply_to,
             attachments: message.attachments,
+            presence: message.presence,
             variant_index: message.variant_index,
             variant_count: message.variant_count,
         });
@@ -1618,7 +1743,7 @@ fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
         .expect("point interval encodes")
 }
 
-pub(super) fn format_interval(interval: Inline<NsTAIInterval>) -> String {
+pub(crate) fn format_interval(interval: Inline<NsTAIInterval>) -> String {
     let (lower, _): (Epoch, Epoch) = interval.try_from_inline().expect("valid TAI interval");
     lower.to_gregorian_str(TimeScale::UTC)
 }

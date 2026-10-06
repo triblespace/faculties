@@ -8,7 +8,7 @@
 pub mod cli;
 pub mod mcp;
 mod operations;
-mod segmenter;
+pub(crate) mod segmenter;
 pub use operations::{
     process_pcm16k, Backend, ClipSummary, Hear, Heard, ModelConfig, Observation, Options, Outcome,
     DEFAULT_MODEL, DEFAULT_PROMPT, HEAR_RATE,

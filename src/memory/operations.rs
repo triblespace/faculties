@@ -118,11 +118,53 @@ impl Memory {
     pub fn search(&self, query: &str, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| search(storage, query, out))
     }
+    /// Rank chunks by meaning (see [`similar`]), binding the WeMM model the
+    /// environment names.
+    #[cfg(feature = "wemm")]
     pub fn similar(&self, query: &str, out: &mut Out<'_>) -> Result<()> {
-        self.with_operation(|storage| similar(storage, query, out))
+        if query.is_empty() {
+            bail!("memory similar requires a query");
+        }
+        self.similar_with(
+            &crate::wemm::Session::from_env(self.storage.path())?,
+            query,
+            out,
+        )
     }
-    pub fn embed(&self, out: &mut Out<'_>) -> Result<()> {
-        self.with_operation(|storage| embed(storage, out))
+    /// [`Self::similar`] with a model already bound.
+    #[cfg(feature = "wemm")]
+    pub fn similar_with(
+        &self,
+        session: &crate::wemm::Session,
+        query: &str,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        self.with_operation(|storage| similar(storage, session, query, out))
+    }
+    #[cfg(not(feature = "wemm"))]
+    pub fn similar(&self, _query: &str, _out: &mut Out<'_>) -> Result<()> {
+        crate::wemm_unavailable()
+    }
+    /// Derive the WeMM index over the journal's prose and images, binding the
+    /// model the environment names. Explicit only: writing a memory never
+    /// embeds.
+    #[cfg(feature = "wemm")]
+    pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
+        self.index_with(&crate::wemm::Session::from_env(self.storage.path())?, out)
+    }
+    /// [`Self::index`] with a model already bound.
+    #[cfg(feature = "wemm")]
+    pub fn index_with(&self, session: &crate::wemm::Session, out: &mut Out<'_>) -> Result<()> {
+        self.with_operation(|storage| {
+            storage.with_store(|pile, signer, runtime| {
+                let source = storage.journal(pile, signer, runtime)?;
+                session.index(pile, source, &content_attributes(), signer, runtime, out)
+            })
+        })
+    }
+    #[cfg(not(feature = "wemm"))]
+    pub fn index(&self, _out: &mut Out<'_>) -> Result<()> {
+        crate::wemm_unavailable()
     }
     pub fn lens(&self, theme: Option<&str>, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| lens(storage, theme, out))
@@ -217,11 +259,21 @@ impl Memory {
         if !options.sim_threshold.is_finite() || !(0.0..=1.0).contains(&options.sim_threshold) {
             bail!("sim_threshold must be a finite number in [0, 1]");
         }
-        let needs_embeddings = cfg!(feature = "local-embed")
-            && (options.about.is_some() || options.filter.is_some() || options.remove.is_some());
         self.with_operation(|storage| {
-            let loaded = storage.load_context(needs_embeddings)?;
-            render_context(&loaded, options)
+            let loaded = storage.load()?;
+            #[cfg(feature = "wemm")]
+            let mut session = None;
+            #[cfg(feature = "wemm")]
+            let mut semantic = |query: &str| semantic_scores(storage, &loaded, &mut session, query);
+            #[cfg(not(feature = "wemm"))]
+            let mut semantic =
+                |_: &str| -> Result<Option<std::collections::HashMap<Id, f32>>> { Ok(None) };
+            crate::memory_cover::render_cover_report(
+                &loaded.memory.facts,
+                &loaded.memory.reader,
+                options,
+                &mut semantic,
+            )
         })
     }
     pub fn consolidate_start(&self, persona: &str, edge: Epoch) -> Result<()> {
@@ -265,28 +317,10 @@ fn require_persona(persona: &str) -> Result<()> {
     Ok(())
 }
 
-fn render_context(loaded: &LoadedContext, options: &CoverOpts) -> Result<CoverReport> {
-    if let Some(embeddings) = loaded.embeddings.as_ref() {
-        crate::memory_cover::render_cover_report(
-            &loaded.memory.memory.facts,
-            &embeddings.facts,
-            &loaded.memory.memory.reader,
-            options,
-        )
-    } else {
-        crate::memory_cover::render_cover_report(
-            &loaded.memory.memory.facts,
-            &TribleSet::new(),
-            &loaded.memory.memory.reader,
-            options,
-        )
-    }
-}
-
 /// Legacy fixture seam; the report and text-only API must agree byte-for-byte.
 #[cfg(test)]
 fn build_context_cover(
-    loaded: &LoadedContext,
+    loaded: &LoadedMemory,
     budget_chars: usize,
     chunk_overhead: usize,
     about: Option<&str>,
@@ -302,7 +336,13 @@ fn build_context_cover(
         remove: remove_q.map(str::to_owned),
         sim_threshold,
     };
-    Ok(render_context(loaded, &options)?.text)
+    Ok(crate::memory_cover::render_cover_report(
+        &loaded.memory.facts,
+        &loaded.memory.reader,
+        &options,
+        &mut |_| Ok(None),
+    )?
+    .text)
 }
 
 fn emit_image(
@@ -327,9 +367,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::schemas::embeddings::DEFAULT_SCOPE_ID as EMBEDDINGS_SCOPE_ID;
-#[cfg(feature = "local-embed")]
-use crate::schemas::embeddings::{self, Embedding768};
+#[cfg(feature = "wemm")]
+use crate::schemas::memory::KIND_CHUNK_ID;
 use crate::schemas::memory::{
     archive_schema as legacy_archive_schema, ctx, DEFAULT_COMB_SCOPE_ID,
     DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
@@ -346,8 +385,6 @@ use crate::memory_cover::{
     epoch_end_from_interval, epoch_from_interval, fmt_epoch, format_time_range, interval_key,
     key_to_epoch, CoverOpts,
 };
-#[cfg(feature = "local-embed")]
-use crate::memory_cover::{chunk_embedding_handle, l2_normalize};
 use crate::{clock, cognition as cognition_model, comb as comb_model, memory as memory_model};
 use hifitime::{Duration, Epoch};
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -362,6 +399,8 @@ use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
+#[cfg(feature = "wemm")]
+use triblespace_search::nvfp4::ReconstructedCosines;
 
 type PileSnapshot = AcquiringReader<FacultySnapshot>;
 
@@ -377,11 +416,6 @@ struct CollectionView {
 
 struct LoadedMemory {
     memory: CollectionView,
-}
-
-struct LoadedContext {
-    memory: LoadedMemory,
-    embeddings: Option<CollectionView>,
 }
 
 struct LoadedComb {
@@ -491,45 +525,6 @@ impl MemoryStorage<'_> {
         })
     }
 
-    /// Freeze Memory and shared Embeddings from one snapshot for semantic or
-    /// context-cover reads.
-    fn load_context(&self, with_embeddings: bool) -> Result<LoadedContext> {
-        self.with_store(|pile, signer, runtime| {
-            let memory_sources = Self::sources(pile, MEMORY_SCOPE_ID, signer, runtime)?;
-            let embeddings_sources = if with_embeddings {
-                Some(Self::sources(pile, EMBEDDINGS_SCOPE_ID, signer, runtime)?)
-            } else {
-                None
-            };
-            let (memory_collections, embeddings_collections) = runtime.block_on(async {
-                let memory =
-                    Self::maintained_rank9(pile, &memory_sources, signer, "Memory").await?;
-                let embeddings = match &embeddings_sources {
-                    Some(sources) => Some(
-                        Self::maintained_rank9(pile, sources, signer, "shared Embeddings").await?,
-                    ),
-                    None => None,
-                };
-                Ok::<_, anyhow::Error>((memory, embeddings))
-            })?;
-            let store_snapshot = AcquiringReader::new(
-                pile.snapshot()
-                    .context("freeze maintained Memory/Embeddings snapshot")?,
-                runtime.clone(),
-            );
-            let memory = Self::load_memory_from_snapshot(&memory_collections, &store_snapshot)?;
-            let embeddings = match embeddings_collections {
-                Some(collections) => Some(Self::attach_collection(
-                    &collections,
-                    &store_snapshot,
-                    "shared Embeddings",
-                )?),
-                None => None,
-            };
-            Ok(LoadedContext { memory, embeddings })
-        })
-    }
-
     /// Freeze Memory and Comb together for cursor transitions.
     fn load_comb(&self) -> Result<LoadedComb> {
         self.with_store(|pile, signer, runtime| {
@@ -625,9 +620,34 @@ impl MemoryStorage<'_> {
         self.publish(MEMORY_SCOPE_ID, fragment, "Memory fragment")
     }
 
-    #[cfg(feature = "local-embed")]
-    fn publish_embeddings(&self, fragment: Fragment) -> Result<()> {
-        self.publish(EMBEDDINGS_SCOPE_ID, fragment, "embedding observations")
+    /// The journal this command writes to: the command's target, else the
+    /// default Memory target. Its WeMM index is the one `memory index`
+    /// derives and `memory similar` reads.
+    #[cfg(feature = "wemm")]
+    fn journal(
+        &self,
+        pile: &mut FacultyStore,
+        signer: &ed25519_dalek::SigningKey,
+        runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    ) -> Result<Collection<blobencodings::SimpleArchive>> {
+        let target = self.storage.target();
+        write_target_acquiring(
+            pile,
+            MEMORY_SCOPE_ID,
+            signer.verifying_key(),
+            target,
+            runtime,
+        )
+    }
+
+    /// Score a text query against the journal's index as it stands.
+    #[cfg(feature = "wemm")]
+    fn cosines(&self, session: &crate::wemm::Session, query: &str) -> Result<ReconstructedCosines> {
+        self.with_store(|pile, signer, runtime| {
+            let source = self.journal(pile, signer, runtime)?;
+            let query = crate::wemm::Query::Text(query);
+            session.cosines(pile, source, &content_attributes(), runtime, query)
+        })
     }
 
     fn publish_comb(&self, fragment: Fragment) -> Result<()> {
@@ -790,210 +810,120 @@ fn search(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<
     Ok(())
 }
 
-// ── semantic embedding seam (nomic shared-space observations) ───────────────
-// Unlike exact BM25, semantic retrieval needs a durable shared-space
-// observation: `memory embed` embeds each chunk summary once with
-// nomic-embed-text, store the 768-d vector as exhaust under the chunk's id),
-// `memory similar` is the query (embed the query, nearest over stored vectors).
-// Where BM25 matches tokens, this matches MEANING — a paraphrase with no shared
-// words still recalls the right memory. The vectors live in the SAME
-// `embeddings::attr::embedding` space as files/photos, so this is the memory end
-// of one cross-faculty semantic search: a text query here is directly
-// comparable to an image candidate there (nomic text+vision are co-embedded).
-//
-// Both embedders load ENTIRELY from one immutable native Mary collection
-// snapshot per model pile — weights and tokenizer — via the shared
-// `crate::nomic` seam. Import and legacy migration belong in Mary, outside
-// ordinary memory operation.
+// ── semantic index and search (WeMM) ─────────────────────────────────────
+// Where BM25 matches tokens, this matches MEANING: a paraphrase with no shared
+// words still recalls the right memory. `memory index` derives one WeMM row
+// set per journal commit from its chunk prose and wordless images, keyed by
+// content handle (`crate::wemm`); `memory similar` and `memory context
+// --about/--filter/--remove` score a query against those rows and join them
+// to the journal here, at the point of use. Text and images share the one
+// space, as Files and Wiki contents do.
 
-#[cfg(feature = "local-embed")]
-use crate::nomic;
-
-/// `memory embed` — embed every journal chunk that lacks a vector and
-/// store it as an observation in the shared Embeddings collection. Idempotent:
-/// re-running only embeds chunks absent from the frozen observation set.
-#[cfg(feature = "local-embed")]
-fn embed(storage: MemoryStorage<'_>, out: &mut Out<'_>) -> Result<()> {
-    use mary::embed::LocalEmbedder;
-
-    // What a chunk embeds FROM: its summary prose (nomic-text) or its raw image
-    // bytes (nomic-vision). Both land on the same `embeddings::attr::embedding`
-    // because nomic text+vision share one 768-d space.
-    enum Src {
-        Text(Inline<Handle<UTF8String>>),
-        Image(Inline<Handle<RawBytes>>),
-    }
-
-    let loaded = storage.load_context(true)?;
-    let space = &loaded.memory.memory.facts;
-    let mut todo: Vec<(Id, Src)> = Vec::new();
-    for chunk in all_chunk_ids(space) {
-        if chunk_embedding_handle(
-            &loaded
-                .embeddings
-                .as_ref()
-                .expect("load_context(true) attaches Embeddings")
-                .facts,
-            chunk,
-        )?
-        .is_some()
-        {
-            continue;
-        }
-        // An image chunk is wordless — route it to vision; otherwise embed
-        // its summary with text. Local writers emit one content value; an
-        // additive imported row with several remains readable through the
-        // deterministic typed accessors above.
-        if let Some(h) = chunk_image_handle(space, chunk) {
-            todo.push((chunk, Src::Image(h)));
-        } else if let Some(h) = chunk_summary_handle(space, chunk) {
-            todo.push((chunk, Src::Text(h)));
-        }
-    }
-    if todo.is_empty() {
-        out.line(format!("all journal chunks already embedded."))?;
-        return Ok(());
-    }
-    let total = todo.len();
-
-    // Load each model once, lazily — a pile with only text memories never
-    // pays for the vision weights, and vice versa.
-    let mut text_emb: Option<mary::embed::NomicTextEmbedder<_>> = None;
-    let mut vision_emb: Option<mary::embed::NomicVisionEmbedder<_>> = None;
-    let mut n_text = 0usize;
-    let mut n_image = 0usize;
-    let mut fragment = Fragment::empty();
-    for (i, (chunk, src)) in todo.into_iter().enumerate() {
-        let v = match src {
-            Src::Text(sh) => {
-                let summary: View<str> = loaded
-                    .memory
-                    .memory
-                    .reader
-                    .get(sh)
-                    .context("read chunk summary")?;
-                let emb = match &text_emb {
-                    Some(e) => e,
-                    None => {
-                        out.line(format!("memory: loading nomic-embed-text (once)…"))?;
-                        text_emb = Some(nomic::load_text_embedder()?);
-                        text_emb.as_ref().unwrap()
-                    }
-                };
-                n_text += 1;
-                l2_normalize(
-                    emb.embed_document(summary.as_ref())
-                        .map_err(|e| anyhow!("embed chunk {chunk:x}: {e:?}"))?,
-                )
-            }
-            Src::Image(ih) => {
-                let bytes: Bytes = loaded
-                    .memory
-                    .memory
-                    .reader
-                    .get(ih)
-                    .context("read image bytes")?;
-                let emb = match &vision_emb {
-                    Some(e) => e,
-                    None => {
-                        out.line(format!("memory: loading nomic-embed-vision (once)…"))?;
-                        vision_emb = Some(nomic::load_vision_embedder()?);
-                        vision_emb.as_ref().unwrap()
-                    }
-                };
-                n_image += 1;
-                l2_normalize(
-                    emb.embed_image(bytes.as_ref())
-                        .map_err(|e| anyhow!("embed image chunk {chunk:x}: {e:?}"))?,
-                )
-            }
-        };
-        let handle = fragment.put::<Embedding768, _>(v);
-        fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&chunk) @ embeddings::attr::embedding: handle };
-        if (i + 1) % 25 == 0 || i + 1 == total {
-            out.line(format!("  embedded {}/{total}", i + 1))?;
-        }
-    }
-    storage.publish_embeddings(fragment)?;
-    out.line(format!(
-        "embedded {n_text} text + {n_image} image chunk(s) into the shared nomic space."
-    ))?;
-    Ok(())
+/// The journal content the WeMM index reads: chunk prose and wordless images.
+#[cfg(feature = "wemm")]
+fn content_attributes() -> [Id; 2] {
+    [ctx::summary.id(), ctx::image.id()]
 }
 
-#[cfg(not(feature = "local-embed"))]
-fn embed(_storage: MemoryStorage<'_>, _out: &mut Out<'_>) -> Result<()> {
-    bail!("`memory embed` needs the local embedder — rebuild with `--features local-embed`");
+/// Every chunk's best WeMM cosine over its prose and image contents. The two
+/// attributes type one content differently, so the join reads both as the
+/// mapping does, as raw bytes; a chunk with several contents scores its best.
+#[cfg(feature = "wemm")]
+fn chunk_cosines<P: TriblePattern>(
+    facts: &P,
+    cosines: &ReconstructedCosines,
+) -> std::collections::HashMap<Id, f64> {
+    let summary: Inline<inlineencodings::GenId> = ctx::summary.id().to_inline();
+    let image: Inline<inlineencodings::GenId> = ctx::image.id().to_inline();
+    let mut best = std::collections::HashMap::new();
+    for (chunk, content) in find!(
+        (chunk: Id, content: Inline<Handle<RawBytes>>),
+        and!(
+            cosines.similar_to::<Handle<RawBytes>>(content, f64::NEG_INFINITY),
+            pattern!(facts, [{ ?chunk @ metadata::tag: &KIND_CHUNK_ID }]),
+            or!(
+                facts.pattern(chunk, summary, content),
+                facts.pattern(chunk, image, content),
+            ),
+        )
+    ) {
+        let cosine = cosines
+            .cosine(&content)
+            .expect("similar_to binds scored contents");
+        best.entry(chunk)
+            .and_modify(|kept: &mut f64| *kept = kept.max(cosine))
+            .or_insert(cosine);
+    }
+    best
 }
 
-/// `memory similar <query>` — nearest chunks to a free-text query in the shared
-/// nomic space. Matches by meaning, not tokens (the semantic complement to
-/// `memory search`). Reads stored vectors only; `memory embed` builds them.
-#[cfg(feature = "local-embed")]
-fn similar(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<()> {
+/// `memory context`'s scores by meaning: none unless `WEMM_PILE` names the
+/// model and the index has rows, so the cover falls back to BM25. The model is
+/// bound on the first call and kept for the rest of the cover.
+#[cfg(feature = "wemm")]
+fn semantic_scores(
+    storage: MemoryStorage<'_>,
+    loaded: &LoadedMemory,
+    session: &mut Option<crate::wemm::Session>,
+    query: &str,
+) -> Result<Option<std::collections::HashMap<Id, f32>>> {
+    if std::env::var_os("WEMM_PILE").is_none() {
+        return Ok(None);
+    }
+    if session.is_none() {
+        *session = Some(crate::wemm::Session::from_env(storage.storage.path())?);
+    }
+    let cosines = storage.cosines(session.as_ref().expect("bound above"), query)?;
+    if cosines.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        chunk_cosines(&loaded.memory.facts, &cosines)
+            .into_iter()
+            .map(|(chunk, cosine)| (chunk, cosine.max(0.0) as f32))
+            .collect(),
+    ))
+}
+
+/// `memory similar <query>`: journal chunks, prose and wordless images alike,
+/// ranked by WeMM cosine to a text query over the index as it stands.
+#[cfg(feature = "wemm")]
+fn similar(
+    storage: MemoryStorage<'_>,
+    session: &crate::wemm::Session,
+    query: &str,
+    out: &mut Out<'_>,
+) -> Result<()> {
     if query.is_empty() {
         bail!("memory similar requires a query");
     }
-    out.line(format!("memory: loading nomic-embed-text (once)…"))?;
-    let emb = nomic::load_text_embedder()?;
-    let qv = l2_normalize(
-        emb.embed_query(&query)
-            .map_err(|e| anyhow!("embed query: {e:?}"))?,
+    let cosines = storage.cosines(session, query)?;
+    anyhow::ensure!(
+        !cosines.is_empty(),
+        "the Memory WeMM index has no rows yet; run `memory index`"
     );
-
-    let loaded = storage.load_context(true)?;
-    let space = &loaded.memory.memory.facts;
-    let mut pairs: Vec<(Id, Vec<f32>)> = Vec::new();
-    for chunk in all_chunk_ids(space) {
-        let embeddings = loaded
-            .embeddings
-            .as_ref()
-            .expect("load_context(true) attaches Embeddings");
-        if let Some(h) = chunk_embedding_handle(&embeddings.facts, chunk)? {
-            let v: View<[f32]> = embeddings
-                .reader
-                .get(h)
-                .map_err(|e| anyhow!("read embedding: {e:?}"))?;
-            pairs.push((chunk, v.as_ref().to_vec()));
-        }
-    }
-    if pairs.is_empty() {
-        bail!("no chunk embeddings on this pile yet — run `memory embed` first");
-    }
-    let total = all_chunk_ids(space).len();
-    if pairs.len() < total {
-        out.line(format!(
-            "note: {} journal chunk(s) not yet embedded — run `memory embed` to refresh",
-            total - pairs.len()
-        ))?;
-    }
-    let ranked = embeddings::nearest(&pairs, &qv, 0.0).map_err(|e| anyhow!("nearest: {e:?}"))?;
+    let loaded = storage.load()?;
+    let space = &loaded.memory.facts;
+    let mut ranked: Vec<(f64, Id)> = chunk_cosines(space, &cosines)
+        .into_iter()
+        .map(|(chunk, cosine)| (cosine, chunk))
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     if ranked.is_empty() {
-        out.line(format!("no matches."))?;
+        out.line("no matches.".to_owned())?;
         return Ok(());
     }
     for (cos, chunk) in ranked.into_iter().take(10) {
-        let span = match (chunk_start_at(space, chunk), chunk_end_at(space, chunk)) {
-            (Some(s), Some(e)) => {
-                let (s, _): (Epoch, Epoch) = s.try_from_inline().unwrap();
-                let (e, _): (Epoch, Epoch) = e.try_from_inline().unwrap();
-                format_time_range(s, e)
-            }
-            _ => "?".to_string(),
-        };
-        let summary = chunk_oneline(&loaded.memory.memory.reader, space, chunk);
+        let span = chunk_span_str(space, chunk);
+        let summary = chunk_oneline(&loaded.memory.reader, space, chunk);
         out.line(format!("{cos:6.3}  {chunk:x}  {span}\n        {summary}"))?;
         if let Some(handle) = chunk_image_handle(space, chunk) {
-            emit_image(&loaded.memory.memory.reader, handle, out)?;
+            emit_image(&loaded.memory.reader, handle, out)?;
         }
     }
     Ok(())
 }
 
-#[cfg(not(feature = "local-embed"))]
-fn similar(_storage: MemoryStorage<'_>, _query: &str, _out: &mut Out<'_>) -> Result<()> {
-    bail!("`memory similar` needs the local embedder — rebuild with `--features local-embed`");
-}
 
 // ---------------------------------------------------------------------------
 // create subcommand
@@ -1357,9 +1287,9 @@ fn create_chunk(
 /// JUST a chunk (tag KIND_CHUNK_ID) whose content is a picture instead of prose:
 /// no `ctx::summary`, the image bytes live on `ctx::image`. Same time-coordinate
 /// as any chunk — `<when>` is a single `YYYY-MM-DDTHH:MM:SS` point (start==end)
-/// or a `from..to` range. Embed it into the shared 768-d nomic space with
-/// `memory embed` (via nomic-VISION, co-embedded with nomic-text), and it ranks
-/// in `memory similar` by MEANING beside text memories. Reference it from prose
+/// or a `from..to` range. `memory index` places it in the one WeMM space with
+/// text memories, so it ranks in `memory similar` by MEANING beside them.
+/// Reference it from prose
 /// like any chunk: `[caption](memory:<hex>)`.
 
 /// Store image bytes as a blob and create a wordless image chunk at `range`.
@@ -2693,6 +2623,102 @@ mod tests {
     use triblespace::core::repo::memoryrepo::MemoryRepo;
     use triblespace::core::repo::{BlobStoreList, WantRead};
 
+    /// The Memory similarity join: one `find!` over the WeMM cosines and the
+    /// journal, reading prose and images, typed differently, as the raw
+    /// content handles the index is keyed by. A chunk scores its best content
+    /// and an entity that is not a chunk is not answered. The cosines stand in
+    /// for the model's: contents that are themselves vectors under the exact
+    /// NVFP4 mapping, which keys its rows by content handle as WeMM does.
+    #[cfg(feature = "wemm")]
+    #[test]
+    fn chunk_cosines_join_prose_and_images_to_chunks() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::trible::Trible;
+        use triblespace_search::nvfp4::{
+            NvFp4CosineIndex, NvFp4CosineSet, NvFp4EmbeddingAttribute,
+        };
+        use triblespace_search::schemas::Embedding;
+
+        const DIM: usize = 768;
+        let vector = |other: usize, weight: f32| {
+            let mut v = vec![0.0f32; DIM];
+            v[0] = 1.0;
+            v[other] += weight;
+            v
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x75; 32]);
+        let root = key.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let mut store = MemoryRepo::default();
+        let mut put = |v: Vec<f32>| -> Inline<Handle<RawBytes>> {
+            store.put::<Embedding, _>(v).unwrap().transmute()
+        };
+        let (exact, near, far) = (
+            put(vector(0, 0.0)),
+            put(vector(1, 0.5)),
+            put(vector(5, 9.0)),
+        );
+
+        let entity = |byte: u8| Id::new([byte; 16]).unwrap();
+        let (prose, image, both, unrelated) = (entity(1), entity(2), entity(3), entity(4));
+        let mut facts = TribleSet::new();
+        for (holder, attribute, content) in [
+            (prose, ctx::summary.id(), near),
+            (image, ctx::image.id(), exact),
+            (both, ctx::summary.id(), far),
+            (both, ctx::image.id(), near),
+            (unrelated, ctx::summary.id(), exact),
+        ] {
+            facts.insert(&Trible::force(&holder, &attribute, &content));
+        }
+        for chunk in [prose, image, both] {
+            facts += TribleSet::from(entity! {
+                ExclusiveId::force_ref(&chunk) @ metadata::tag: &KIND_CHUNK_ID
+            });
+        }
+
+        let attribute = Id::new([0xA9; 16]).unwrap();
+        let mut rows = TribleSet::new();
+        for (holder, content) in [(11, exact), (12, near), (13, far)] {
+            rows.insert(&Trible::force(&entity(holder), &attribute, &content));
+        }
+        let source = store.collection("contents", policy.clone()).unwrap();
+        let target = store
+            .derive::<NvFp4CosineSet<Embedding>>(
+                source,
+                NvFp4EmbeddingAttribute::new(attribute, DIM).unwrap(),
+                policy,
+            )
+            .unwrap();
+        store.commit(source, &key, Fragment::from(rows)).unwrap();
+        let cosines = pollster::block_on(store.maintain(target, &key))
+            .unwrap()
+            .collection(target)
+            .unwrap()
+            .view::<NvFp4CosineIndex<Embedding>>()
+            .unwrap()
+            .reconstructed_cosines(&vector(0, 0.0))
+            .unwrap();
+
+        let scores = chunk_cosines(&facts, &cosines);
+        assert_eq!(
+            scores.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([prose, image, both])
+        );
+        assert!(
+            scores[&image] > 0.999,
+            "an image chunk answers through ctx::image"
+        );
+        assert_eq!(Some(scores[&prose]), cosines.cosine(&near));
+        assert!(scores[&prose] < scores[&image]);
+        assert_eq!(
+            Some(scores[&both]),
+            cosines.cosine(&near),
+            "a chunk scores its best content"
+        );
+    }
+
     struct TestPile {
         pile: PathBuf,
         key: PathBuf,
@@ -2955,7 +2981,6 @@ mod tests {
         let marker = ufoid();
         let scopes = [
             MEMORY_SCOPE_ID,
-            EMBEDDINGS_SCOPE_ID,
             DEFAULT_COMB_SCOPE_ID,
             cognition_schema::DEFAULT_SCOPE_ID,
             archive_schema::DEFAULT_SCOPE_ID,
@@ -2974,10 +2999,10 @@ mod tests {
                     .collect::<Result<Vec<_>>>()
             })
             .unwrap();
-        let context = storage.load_context(true).unwrap();
+        let context = storage.load().unwrap();
         let comb = storage.load_comb().unwrap();
         let provenance = storage.load_provenance().unwrap();
-        for loaded in [&context.memory, &comb.memory, &provenance.memory] {
+        for loaded in [&context, &comb.memory, &provenance.memory] {
             assert_eq!(
                 resolve_chunk_id(loaded, &format!("{warm:x}")).unwrap(),
                 warm
@@ -2989,7 +3014,6 @@ mod tests {
             vec![*marker],
         );
         for facts in [
-            &context.embeddings.as_ref().unwrap().facts,
             &provenance.cognition.facts,
             &provenance.archive.facts,
         ] {
@@ -3027,10 +3051,7 @@ mod tests {
             })
             .unwrap();
         for error in [
-            storage
-                .load_context(true)
-                .err()
-                .expect("incomplete context"),
+            storage.load().err().expect("incomplete memory view"),
             storage.load_comb().err().expect("incomplete comb view"),
             storage
                 .load_provenance()
@@ -3303,9 +3324,7 @@ mod tests {
         .expect("create day two");
 
         // The exact text `memory context --chars 10000` would print.
-        let loaded = storage
-            .load_context(false)
-            .expect("load seeded collections");
+        let loaded = storage.load().expect("load seeded collections");
         let cover =
             build_context_cover(&loaded, 10_000, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
                 .expect("build context cover");
@@ -3329,7 +3348,7 @@ mod tests {
         );
     }
 
-    fn seed_cover_cost_fixture(pile: &TestPile) -> LoadedContext {
+    fn seed_cover_cost_fixture(pile: &TestPile) -> LoadedMemory {
         let storage = pile.storage();
         publish_chunk(
             storage,
@@ -3343,7 +3362,7 @@ mod tests {
             storage,
             text_draft("two", "2026-05-02T00:00:00", "2026-05-03T00:00:00"),
         );
-        storage.load_context(false).expect("load cost fixture")
+        storage.load().expect("load cost fixture")
     }
 
     #[test]
@@ -3354,12 +3373,18 @@ mod tests {
             for overhead in [0, 2, 50] {
                 let mut options = CoverOpts::plain(budget);
                 options.chunk_overhead = overhead;
-                let report = render_context(&loaded, &options).unwrap();
-                let old_entrypoint = crate::memory_cover::render_cover(
-                    &loaded.memory.memory.facts,
-                    &TribleSet::new(),
-                    &loaded.memory.memory.reader,
+                let report = crate::memory_cover::render_cover_report(
+                    &loaded.memory.facts,
+                    &loaded.memory.reader,
                     &options,
+                    &mut |_| Ok(None),
+                )
+                .unwrap();
+                let old_entrypoint = crate::memory_cover::render_cover(
+                    &loaded.memory.facts,
+                    &loaded.memory.reader,
+                    &options,
+                    &mut |_| Ok(None),
                 )
                 .unwrap();
                 assert_eq!(report.text, old_entrypoint);
@@ -3472,7 +3497,7 @@ mod tests {
             write(&summary, start, end);
         }
 
-        let loaded = storage.load_context(false).expect("load cover fixture");
+        let loaded = storage.load().expect("load cover fixture");
         let (query, contextual_summary, plain_summary) = if amber_id < cobalt_id {
             ("cobalt", cobalt.as_str(), amber.as_str())
         } else {

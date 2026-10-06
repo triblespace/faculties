@@ -647,14 +647,6 @@ pub fn validate_known_payloads<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -
                     hex::encode(handle.raw)
                 )
             })?;
-        } else if fact.a() == &embeddings::attr_mm7b::embedding.id() {
-            let handle = *fact.v::<Handle<embeddings::Embedding3584>>();
-            let _: anybytes::View<[f32]> = reader.get(handle).map_err(|error| {
-                anyhow!(
-                    "strictly read Files 3584-d embedding {}: {error:?}",
-                    hex::encode(handle.raw)
-                )
-            })?;
         }
     }
     Ok(())

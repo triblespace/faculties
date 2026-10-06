@@ -10,6 +10,95 @@ All notable changes to this project will be documented in this file.
   else an error naming the candidates. Wiki and Compass label rows from more
   than one collection with its handle and owners. The
   `TRIBLESPACE_COLLECTION_*` overrides are gone: nothing reads them.
+- Memory and Wiki search in the same WeMM space as Files. `memory index`
+  (formerly `memory embed`) derives an index over the journal's
+  `ctx::summary` prose and `ctx::image` pictures, `wiki index` (formerly
+  `wiki embed`) one over every revision's `wiki::content`; both print the
+  commits still to derive and resume where they stopped. `memory similar`,
+  `wiki similar` and `memory context --about/--filter/--remove` read the
+  cosines at the point of use with `find!`: Wiki joins them to the current
+  frontier, so superseded revisions are not answered. Context falls back to
+  BM25 when `WEMM_PILE` is unset or the index has no rows. Removed: the
+  entity-keyed 768-d vectors in the Embeddings collection and their writers,
+  the per-query in-memory HNSW (`embeddings::nearest`), and the Nomic vision
+  embedder. Nomic text remains for posture's semantic tier only. MCP
+  `memory_embed` and `wiki_embed` are now `memory_index` and `wiki_index`.
+- Files search runs on one WeMM model. `files index` derives a single index
+  over `file::content` through the windowed WeMM mapping (an image whole;
+  text, HTML text and PDF text layers in windows of at most 248 framed IDs,
+  the first 16 per content; content the model cannot read gets no rows) and
+  prints the commits still to derive; `files similar` ranks by its cosine,
+  joined to the Files facts in one `find!`. The model is named by
+  `WEMM_PILE`, `WEMM_ASSETS` and `WEMM_ROOT`, and its collection is the model
+  pile's single collection, so `--wemm-collection` and the `--wemm` switches
+  are gone. The shared session lives in `faculties::wemm`. Removed: the Nomic
+  image and text indexes and their golden vectors (`files golden`), the 7b
+  space (`files embed7b`, `--mm7b`, MCP `files_embed7b`, the page entities and
+  3584-d encoding), and `--kind`, `--image-floor` and `--text-floor`. Their
+  rows stay in existing piles, unread.
+- `files add` no longer maintains the semantic indexes after saving. On a
+  gb10 build it embedded every file of the key that had no row before
+  returning, which on 2026-10-06 held one save for 76 minutes. Rows come
+  from `files index` only. The `files_add` and `files_fetch` tool
+  descriptions, which promised save-time indexing, now say so.
+- `archive import` with several PATHS opens the pile once for every
+  `--source`, as its help already said; before, only `--source codex` shared
+  one writer and every other source opened and closed the pile per path. Each
+  path still publishes its own signed COMMIT and prints the same report, and
+  an unchanged path publishes nothing. An error stops the command at the
+  failing path, which the error names: earlier paths stay committed, the
+  failing path publishes nothing, later paths are not read. Measured on sky
+  (GB10 aarch64, shared, load ~10) into fresh scratch piles, release build,
+  Claude Code session files of 8-60 KB: 100 files took 3.1 and 3.3 s as one
+  command against 21.1 and 18.5 s as one process per path (two runs); 631
+  files took 42.7 s against 192.4 s. Both arms print identical reports. These
+  figures predate the writer carrying its own commits (next entry): without
+  it, the time per path inside one command grew from 0.03 s (paths 1-100) to
+  0.15 s (paths 501-600), and the next open of the pile paid the deferred
+  merge.
+- An `ArchiveImportWriter` that commits many times in one process now merges
+  its own commits: every 16 commits and once at close it runs the same carry
+  that opening the pile runs, so its frontier stays bounded and the next open
+  finds nothing to merge. It keeps its known facts as the pile's own Rank9
+  attachments instead of one in-memory archive per commit: each commit adds
+  its own attachment, and each carry reads them all back from the frontier.
+  Measured on sky (GB10 aarch64, shared), one process importing Codex
+  rollouts into a fresh pile, mean wall time per rollout: 1,000 raw-only
+  rollouts 8.8-9.3 ms against 38-39 ms for a writer that never carries; 400
+  rollouts of 269 projections each 148.5 ms against 278-330 ms. Those figures
+  read everything back after every commit. That read selects a cover over the
+  frontier at a cost that grows with every commit the collection holds, so it
+  now runs once per carry. Importing 320 synthetic 40-record Claude Code
+  sessions in one command into a pile already holding 3,000 Archive commits
+  (sky, shared, release build), it fell from 16.1% to 0.8% of the profiled
+  samples, about 36 ms to 1.3 ms per commit, and the 320 paths took 47.1 and
+  48.2 s against 54.0 and 57.3 s (two alternating rounds; three more rounds
+  timed as whole-process CPU, 55-67 s against 63-73 s, overlap on this
+  shared machine). Into a fresh pile both take 11.3-11.6 s. The attachment
+  pass after each commit still grows with the commits held: 30% of the same
+  profile. Carrying inside the writer also costs pile bytes: each carry
+  attaches the merged nodes it leaves on the frontier, and those a later
+  carry joins keep attachments nothing reads until a compaction, 8.5-8.8% of
+  blob bytes in two scratch imports (1,982 and 3,000 sessions), where the
+  next open used to attach only the frontier it ended with. Those carries'
+  appends, records of several megabytes, now happen inside a long import: an
+  import killed during one (SIGKILL, Ctrl-C, OOM) leaves an incomplete last
+  record that every later open of the pile refuses until an operator
+  inspects and repairs the tail, as after any interrupted append. Before, a
+  multi-path Codex import left that merging to the next open.
+- `archive import --source codex` projects the 2026-09 rollout format
+  (`event_msg/item_completed` with `UserMessage`, `AgentMessage` and
+  `Reasoning` items) into the same content facts as the older
+  `user_message`/`agent_message`/`agent_reasoning` events; before, those
+  rollouts imported only their raw snapshot. Codex receipts are now keyed by
+  their block, with locator, raw record, timestamp and path as occurrence
+  annotations, so a fork or resume that replays its parent lands on the
+  parent's receipts. Every Codex receipt id changes: re-importing a rollout
+  that is already in a pile adds a block-keyed receipt beside each old one.
+  Measured on sky (GB10 aarch64, shared): two forks of one parent (228.6 and
+  229.6 MB) imported in one process into a fresh pile; the second grew the
+  pile by 339.0 MB against 503.0 MB with the old receipt, of which 229.6 MB is
+  the fork's own raw snapshot.
 
 ## 0.21.0 - 2026-10-01
 
