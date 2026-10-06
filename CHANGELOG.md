@@ -43,7 +43,12 @@ All notable changes to this project will be documented in this file.
   attaches the merged nodes it leaves on the frontier, and those a later
   carry joins keep attachments nothing reads until a compaction, 8.5-8.8% of
   blob bytes in two scratch imports (1,982 and 3,000 sessions), where the
-  next open used to attach only the frontier it ended with.
+  next open used to attach only the frontier it ended with. Those carries'
+  appends, records of several megabytes, now happen inside a long import: an
+  import killed during one (SIGKILL, Ctrl-C, OOM) leaves an incomplete last
+  record that every later open of the pile refuses until an operator
+  inspects and repairs the tail, as after any interrupted append. Before, a
+  multi-path Codex import left that merging to the next open.
 - `archive import --source codex` projects the 2026-09 rollout format
   (`event_msg/item_completed` with `UserMessage`, `AgentMessage` and
   `Reasoning` items) into the same content facts as the older

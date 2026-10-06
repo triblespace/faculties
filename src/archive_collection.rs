@@ -330,6 +330,13 @@ where
     /// commits made since the last carry. A store whose host is not this
     /// writer's key believes none of its merges and is left uncarried, as
     /// at open.
+    ///
+    /// A carry appends the merged nodes and their attachments, records of
+    /// several megabytes each, inside whatever process runs the writer: for
+    /// a long import, that import. A process killed during one of those
+    /// appends leaves an incomplete last record, which every later open of
+    /// the pile refuses until an operator inspects and repairs the tail, as
+    /// for any interrupted append ([`crate::storage::pile_read_error`]).
     fn carry(&mut self) -> Result<()> {
         self.runtime
             .block_on(async {
