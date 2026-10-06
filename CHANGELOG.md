@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Memory and Wiki search in the same WeMM space as Files. `memory index`
+  (formerly `memory embed`) derives an index over the journal's
+  `ctx::summary` prose and `ctx::image` pictures, `wiki index` (formerly
+  `wiki embed`) one over every revision's `wiki::content`; both print the
+  commits still to derive and resume where they stopped. `memory similar`,
+  `wiki similar` and `memory context --about/--filter/--remove` read the
+  cosines at the point of use with `find!`: Wiki joins them to the current
+  frontier, so superseded revisions are not answered. Context falls back to
+  BM25 when `WEMM_PILE` is unset or the index has no rows. Removed: the
+  entity-keyed 768-d vectors in the Embeddings collection and their writers,
+  the per-query in-memory HNSW (`embeddings::nearest`), and the Nomic vision
+  embedder. Nomic text remains for posture's semantic tier only. MCP
+  `memory_embed` and `wiki_embed` are now `memory_index` and `wiki_index`.
+- Files search runs on one WeMM model. `files index` derives a single index
+  over `file::content` through the windowed WeMM mapping (an image whole;
+  text, HTML text and PDF text layers in windows of at most 248 framed IDs,
+  the first 16 per content; content the model cannot read gets no rows) and
+  prints the commits still to derive; `files similar` ranks by its cosine,
+  joined to the Files facts in one `find!`. The model is named by
+  `WEMM_PILE`, `WEMM_ASSETS` and `WEMM_ROOT`, and its collection is the model
+  pile's single collection, so `--wemm-collection` and the `--wemm` switches
+  are gone. The shared session lives in `faculties::wemm`. Removed: the Nomic
+  image and text indexes and their golden vectors (`files golden`), the 7b
+  space (`files embed7b`, `--mm7b`, MCP `files_embed7b`, the page entities and
+  3584-d encoding), and `--kind`, `--image-floor` and `--text-floor`. Their
+  rows stay in existing piles, unread.
+- `files add` no longer maintains the semantic indexes after saving. On a
+  gb10 build it embedded every file of the key that had no row before
+  returning, which on 2026-10-06 held one save for 76 minutes. Rows come
+  from `files index` only. The `files_add` and `files_fetch` tool
+  descriptions, which promised save-time indexing, now say so.
+
 ## 0.21.0 - 2026-10-01
 
 - Update the source cohort to TribleSpace 0.47.0, GORBIE 0.19.0 and

@@ -11,14 +11,12 @@
 //! `--about` may choose one recollection among entries with the exact same
 //! temporal coverage, but cannot change which spans the cover refines.
 //!
-//! Callers hand this module maintained Memory and shared Embeddings collection
-//! views frozen from one pile snapshot, plus the Memory attachment reader and
-//! parsed [`CoverOpts`]. The result is the cover text.
+//! Callers hand this module a maintained Memory view frozen from one pile
+//! snapshot, its attachment reader, parsed [`CoverOpts`] and a [`Semantic`]
+//! scorer. The result is the cover text.
 
 use std::collections::{BTreeSet, HashMap};
 
-#[cfg(feature = "local-embed")]
-use anyhow::anyhow;
 use anyhow::{Context, Result};
 use hifitime::Epoch;
 
@@ -32,10 +30,6 @@ use triblespace::prelude::*;
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
 
-#[cfg(feature = "local-embed")]
-use crate::nomic;
-#[cfg(feature = "local-embed")]
-use crate::schemas::embeddings::{self, Embedding768};
 use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
 
 // ---------------------------------------------------------------------------
@@ -153,23 +147,6 @@ pub fn chunk_observed_at<P: TriblePattern>(space: &P, id: Id) -> Vec<Inline<NsTA
         .collect()
 }
 
-/// The stored shared-space embedding handle for a chunk, if it has been embedded.
-#[cfg(feature = "local-embed")]
-pub fn chunk_embedding_handle<P: TriblePattern>(
-    embeddings_space: &P,
-    id: Id,
-) -> Result<Option<Inline<Handle<Embedding768>>>> {
-    let handles: BTreeSet<_> = find!(
-        h: Inline<Handle<Embedding768>>,
-        pattern!(embeddings_space, [{ id @ embeddings::attr::embedding: ?h }])
-    )
-    .collect();
-    // Embeddings are additive observations. Older callers consume one vector,
-    // so arbitrate deterministically instead of imposing scalar cardinality on
-    // the open-world relation. Richer scorers may inspect every observation.
-    Ok(handles.first().copied())
-}
-
 // ---------------------------------------------------------------------------
 // time-range helpers
 // ---------------------------------------------------------------------------
@@ -204,20 +181,6 @@ pub fn interval_key(interval: Inline<NsTAIInterval>) -> i128 {
 
 pub fn key_to_epoch(key: i128) -> Epoch {
     Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(key))
-}
-
-/// L2-normalize so dot-product == cosine downstream (the shared `nearest` core
-/// and `put_embedding` both assume unit vectors; nomic's raw output is not
-/// guaranteed normalized).
-#[cfg(feature = "local-embed")]
-pub fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
-    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if n > 0.0 {
-        for x in &mut v {
-            *x /= n;
-        }
-    }
-    v
 }
 
 // ---------------------------------------------------------------------------
@@ -313,13 +276,19 @@ pub fn context_chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     Ok(c)
 }
 
-/// Default cosine cutoff for `--filter`/`--remove` eligibility. Chosen from the
-/// nomic score distribution observed on this pile: topically-matched chunks
-/// cluster ~0.62–0.73 for their query, while unrelated chunks fall to ~0.40–0.52
-/// (nomic cosines sit in a compressed high band). 0.55 lands in that natural gap
-/// — high enough to spare unrelated material, low enough to catch the whole
-/// matched cluster. Override per call with `--sim-threshold <f>`.
+/// Default cosine cutoff for `--filter`/`--remove` eligibility. It was chosen
+/// in the gap of the nomic score distribution on this pile (matched chunks
+/// ~0.62–0.73, unrelated ~0.40–0.52). WeMM cosines are not calibrated against
+/// it: in the WeMM gates relevant items scored ~0.70–0.79 and unrelated ones
+/// ~0.20–0.31, so it still falls between them there, but it is a convention,
+/// not a measured threshold. Override per call with `--sim-threshold <f>`.
 pub const DEFAULT_SIM_THRESHOLD: f32 = 0.55;
+
+/// A query's scores by meaning, per chunk that has them, or `None` when no
+/// semantic index answers and exact BM25 stands in. Asked only when a score is
+/// needed, so a scorer may bind a model on its first call. Scores are
+/// non-negative, as BM25's are.
+pub type Semantic<'a> = dyn FnMut(&str) -> Result<Option<HashMap<Id, f32>>> + 'a;
 
 /// Rebuild the exact lexical view from the frozen maintained Memory facts.
 /// BM25 is query-time machinery, not durable journal state: there is no stale
@@ -348,187 +317,72 @@ pub fn lexical_relevance_scores<B: BlobStoreGet, P: TriblePattern>(
         .collect())
 }
 
-/// Per-chunk relevance scores for `memory context --about`: SEMANTIC (nomic
-/// cosine over the stored shared-space embeddings) when they exist, else LEXICAL
-/// (BM25). Both are non-negative. The scores choose between recollections with
-/// identical temporal coverage; they never participate in structural refinement.
-pub fn about_relevance_scores<B, P, E>(
+/// Per-chunk relevance scores for `memory context --about`: by meaning when the
+/// [`Semantic`] scorer answers, else exact lexical BM25. Both are non-negative.
+/// The scores choose between recollections with identical temporal coverage;
+/// they never participate in structural refinement.
+pub fn about_relevance_scores<B, P>(
     space: &P,
-    embeddings_space: &E,
     reader: &B,
     query: &str,
+    semantic: &mut Semantic<'_>,
 ) -> Result<HashMap<Id, f32>>
 where
     B: BlobStoreGet,
     P: TriblePattern,
-    E: TriblePattern,
 {
-    #[cfg(feature = "local-embed")]
-    {
-        if let Some(scores) = semantic_about_scores(space, embeddings_space, reader, query)? {
-            return Ok(scores);
-        }
+    match semantic(query)? {
+        Some(scores) => Ok(scores),
+        None => lexical_relevance_scores(space, reader, query),
     }
-    #[cfg(not(feature = "local-embed"))]
-    let _ = embeddings_space;
-    lexical_relevance_scores(space, reader, query)
-}
-
-/// Semantic relevance via nomic: embed the query, cosine it against every stored
-/// chunk embedding. `None` if no chunk is embedded yet (caller falls back to
-/// BM25). Negative cosines clamp to 0 so "unrelated" is uniform (matching
-/// BM25's non-negative scores).
-#[cfg(feature = "local-embed")]
-pub fn semantic_about_scores<B, P, E>(
-    space: &P,
-    embeddings_space: &E,
-    reader: &B,
-    query: &str,
-) -> Result<Option<HashMap<Id, f32>>>
-where
-    B: BlobStoreGet,
-    P: TriblePattern,
-    E: TriblePattern,
-{
-    let mut handles: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
-    for chunk in all_chunk_ids(space) {
-        if let Some(h) = chunk_embedding_handle(embeddings_space, chunk)? {
-            handles.push((chunk, h));
-        }
-    }
-    if handles.is_empty() {
-        return Ok(None);
-    }
-    eprintln!("memory: loading nomic-embed-text for --about (once)…");
-    let emb = nomic::load_text_embedder()?;
-    let qv = l2_normalize(
-        emb.embed_query(query)
-            .map_err(|e| anyhow!("embed query: {e:?}"))?,
-    );
-    let mut scores = HashMap::new();
-    for (chunk, h) in handles {
-        let v: View<[f32]> = reader
-            .get(h)
-            .map_err(|e| anyhow!("read embedding: {e:?}"))?;
-        let cos: f32 = qv.iter().zip(v.as_ref().iter()).map(|(a, b)| a * b).sum();
-        scores.insert(chunk, cos.max(0.0));
-    }
-    Ok(Some(scores))
 }
 
 /// Per-chunk positive-similarity scores for `--filter`/`--remove` ELIGIBILITY,
-/// using the SAME scoring as `--about`: nomic cosine (clamped ≥0) when the chunk
-/// is embedded, else the lexical BM25 score (normalized to a fraction of the top
-/// score so the [0,1] threshold still means something). The second return value
-/// is the ids that could NOT be scored at all — no embedding AND no positive
-/// lexical score — which the caller treats fail-open (kept) and warns about, so
-/// the guardrail use of `--remove` never *silently* leaks an unassessable chunk.
+/// using the SAME scoring as `--about`. With semantic scores, a chunk the index
+/// has no row for falls back to its exact lexical score if it has text; a
+/// wordless image without a row cannot be scored at all and is returned in the
+/// second value, which the caller keeps fail-open and warns about, so the
+/// guardrail use of `--remove` never *silently* leaks an unassessable chunk.
+/// Without semantic scores every chunk gets BM25 normalized to a fraction of
+/// the top score, so the [0,1] threshold still means something; a chunk absent
+/// from the postings scored a genuine 0.
 ///
-/// Scores are POSITIVE similarity to the query (the reliable direction). `--remove`
-/// negates in the RETRIEVAL LOGIC (drop the high-match chunks), never by embedding
-/// a negated query — that is the whole point, and it sidesteps embedding-negation
-/// failure.
-/// `universe` is the exact set of chunks that can appear in the cover (all
-/// chronological, non-lens chunks selected by `collect_chunk_spans`), so the unscorable
-/// warning never lists chunks that could never surface anyway.
-pub fn eligibility_scores<B, P, E>(
+/// Scores are POSITIVE similarity to the query (the reliable direction).
+/// `--remove` negates in the RETRIEVAL LOGIC (drop the high-match chunks), never
+/// by embedding a negated query. `universe` is the exact set of chunks that can
+/// appear in the cover, so the unscorable warning never lists chunks that could
+/// never surface anyway.
+pub fn eligibility_scores<B, P>(
     space: &P,
-    embeddings_space: &E,
     reader: &B,
     query: &str,
     universe: &[Id],
+    semantic: &mut Semantic<'_>,
 ) -> Result<(HashMap<Id, f32>, Vec<Id>)>
 where
     B: BlobStoreGet,
     P: TriblePattern,
-    E: TriblePattern,
 {
-    #[cfg(feature = "local-embed")]
-    {
-        if let Some(res) =
-            semantic_eligibility_scores(space, embeddings_space, reader, query, universe)?
-        {
-            return Ok(res);
-        }
-    }
-    #[cfg(not(feature = "local-embed"))]
-    let _ = embeddings_space;
-    // Pure lexical fallback (no embeddings on the pile yet, or built without
-    // `local-embed`): BM25 normalized to a fraction of the top score. Every chunk
-    // gets an explicit score — those absent from the postings scored a genuine 0
-    // ("no match"), so nothing here is *unscorable*.
-    let raw = lexical_relevance_scores(space, reader, query)?;
-    let max = raw.values().copied().fold(0.0_f32, f32::max).max(1e-6);
-    let scores = universe
-        .iter()
-        .map(|&id| (id, raw.get(&id).copied().map(|s| s / max).unwrap_or(0.0)))
-        .collect();
-    Ok((scores, Vec::new()))
-}
-
-/// Semantic half of [`eligibility_scores`]: nomic cosine over stored chunk
-/// embeddings. Unembedded text chunks fall back to exact lexical BM25,
-/// including an explicit zero for no token match. Wordless images without an
-/// embedding remain unscorable, so the caller keeps them fail-open and warns.
-/// Returns `None` when no chunk is embedded at all (pure lexical fallback).
-#[cfg(feature = "local-embed")]
-pub fn semantic_eligibility_scores<B, P, E>(
-    space: &P,
-    embeddings_space: &E,
-    reader: &B,
-    query: &str,
-    universe: &[Id],
-) -> Result<Option<(HashMap<Id, f32>, Vec<Id>)>>
-where
-    B: BlobStoreGet,
-    P: TriblePattern,
-    E: TriblePattern,
-{
-    let mut embedded: Vec<(Id, Inline<Handle<Embedding768>>)> = Vec::new();
-    let mut unembedded: Vec<Id> = Vec::new();
-    for &chunk in universe {
-        match chunk_embedding_handle(embeddings_space, chunk)? {
-            Some(h) => embedded.push((chunk, h)),
-            None => unembedded.push(chunk),
-        }
-    }
-    if embedded.is_empty() {
-        return Ok(None);
-    }
-    eprintln!("memory: loading nomic-embed-text for --filter/--remove (once)…");
-    let emb = nomic::load_text_embedder()?;
-    let qv = l2_normalize(
-        emb.embed_query(query)
-            .map_err(|e| anyhow!("embed query: {e:?}"))?,
-    );
-    let mut scores = HashMap::new();
-    for (chunk, h) in embedded {
-        let v: View<[f32]> = reader
-            .get(h)
-            .map_err(|e| anyhow!("read embedding: {e:?}"))?;
-        let cos: f32 = qv.iter().zip(v.as_ref().iter()).map(|(a, b)| a * b).sum();
-        scores.insert(chunk, cos.max(0.0));
-    }
-    // Unembedded text chunks still have an exact lexical score. Wordless
-    // images have neither modality and remain honestly unscorable.
+    let semantic = semantic(query)?;
     let lexical = lexical_relevance_scores(space, reader, query)?;
     let lexical_max = lexical.values().copied().fold(0.0_f32, f32::max).max(1e-6);
+    let lexical_score = |chunk: &Id| lexical.get(chunk).map_or(0.0, |score| score / lexical_max);
+    let Some(semantic) = semantic else {
+        let scores = universe.iter().map(|id| (*id, lexical_score(id))).collect();
+        return Ok((scores, Vec::new()));
+    };
+    let mut scores = HashMap::new();
     let mut unscorable = Vec::new();
-    for chunk in unembedded {
-        if chunk_summary_handle(space, chunk).is_some() {
-            scores.insert(
-                chunk,
-                lexical
-                    .get(&chunk)
-                    .copied()
-                    .map(|score| score / lexical_max)
-                    .unwrap_or(0.0),
-            );
+    for &chunk in universe {
+        if let Some(&score) = semantic.get(&chunk) {
+            scores.insert(chunk, score);
+        } else if chunk_summary_handle(space, chunk).is_some() {
+            scores.insert(chunk, lexical_score(&chunk));
         } else {
             unscorable.push(chunk);
         }
     }
-    Ok(Some((scores, unscorable)))
+    Ok((scores, unscorable))
 }
 
 /// Parsed options for [`render_cover`] — the same knobs `memory context`
@@ -1045,26 +899,25 @@ fn unscorable_warning(label: &str, unscorable: &[Id]) -> Option<String> {
     }
     let ids: Vec<String> = unscorable.iter().map(|id| format!("{id:x}")).collect();
     Some(format!(
-        "memory: {} unembedded chunk(s) not scorable for {label} — kept (fail-open); \
-         run `memory embed` to make them filterable: {}",
+        "memory: {} unindexed chunk(s) not scorable for {label} — kept (fail-open); \
+         run `memory index` to make them filterable: {}",
         unscorable.len(),
         ids.join(", ")
     ))
 }
 
 /// Legacy text-only entrypoint: retain its stderr diagnostics and byte framing.
-pub fn render_cover<B, P, E>(
+pub fn render_cover<B, P>(
     space: &P,
-    embeddings_space: &E,
     reader: &B,
     opts: &CoverOpts,
+    semantic: &mut Semantic<'_>,
 ) -> Result<String>
 where
     B: BlobStoreGet,
     P: TriblePattern,
-    E: TriblePattern,
 {
-    let report = render_cover_report(space, embeddings_space, reader, opts)?;
+    let report = render_cover_report(space, reader, opts, semantic)?;
     for diagnostic in report.diagnostics {
         eprintln!("{diagnostic}");
     }
@@ -1072,16 +925,15 @@ where
 }
 
 /// Render using the same sampler, with fail-open warnings returned explicitly.
-pub fn render_cover_report<B, P, E>(
+pub fn render_cover_report<B, P>(
     space: &P,
-    embeddings_space: &E,
     reader: &B,
     opts: &CoverOpts,
+    semantic: &mut Semantic<'_>,
 ) -> Result<CoverReport>
 where
     B: BlobStoreGet,
     P: TriblePattern,
-    E: TriblePattern,
 {
     use std::fmt::Write as _;
 
@@ -1152,26 +1004,14 @@ where
     // other and with `--about`.
     let universe: Vec<Id> = raw_spans.iter().map(|s| s.2).collect();
     let filter_elig = match filter_q {
-        Some(q) => Some(eligibility_scores(
-            space,
-            embeddings_space,
-            reader,
-            q,
-            &universe,
-        )?),
+        Some(q) => Some(eligibility_scores(space, reader, q, &universe, semantic)?),
         None => None,
     };
     let remove_elig = match remove_q {
-        Some(q) => Some(eligibility_scores(
-            space,
-            embeddings_space,
-            reader,
-            q,
-            &universe,
-        )?),
+        Some(q) => Some(eligibility_scores(space, reader, q, &universe, semantic)?),
         None => None,
     };
-    // Fail-open honesty: unembedded, un-lexically-scorable chunks can't be
+    // Fail-open honesty: unindexed, un-lexically-scorable chunks can't be
     // assessed, so they are KEPT — but say so loudly, because for the
     // intimate-exclusion use of `--remove` a silent keep would LEAK.
     for (label, elig) in [("--filter", &filter_elig), ("--remove", &remove_elig)] {
@@ -1213,11 +1053,11 @@ where
     // and a context-dependent autobiography.
     let about_scores = if classes.iter().any(|class| class.len() > 1) {
         about
-            .map(|query| about_relevance_scores(space, embeddings_space, reader, query))
+            .map(|query| about_relevance_scores(space, reader, query, semantic))
             .transpose()?
     } else {
         // With no structural alternatives there is nothing context may choose.
-        // In particular, do not load an embedding model for a guaranteed no-op.
+        // In particular, do not bind a model for a guaranteed no-op.
         None
     };
     let representatives: Vec<usize> = classes
@@ -1324,7 +1164,7 @@ mod recollection_tests {
         for gate in ["--filter", "--remove"] {
             assert_eq!(
                 unscorable_warning(gate, &[B, A]).unwrap(),
-                format!("memory: 2 unembedded chunk(s) not scorable for {gate} — kept (fail-open); run `memory embed` to make them filterable: {B:x}, {A:x}")
+                format!("memory: 2 unindexed chunk(s) not scorable for {gate} — kept (fail-open); run `memory index` to make them filterable: {B:x}, {A:x}")
             );
         }
     }
@@ -1360,9 +1200,9 @@ mod recollection_tests {
         let reader = blobs.snapshot().expect("in-memory snapshot is infallible");
         let report = render_cover_report(
             facts.facts(),
-            &TribleSet::new(),
             &reader,
             &CoverOpts::plain(10_000),
+            &mut |_| Ok(None),
         )
         .expect("a missing summary must not fail the render");
         assert!(report.text.contains("the summary that arrived"));
@@ -1381,6 +1221,101 @@ mod recollection_tests {
             line.contains("1 memory(ies) skipped") && line.contains(&skipped)
         });
         assert!(named, "diagnostics: {:?}", report.diagnostics);
+    }
+
+    /// Scores by meaning reach `--about` and the eligibility gates through the
+    /// scorer, which is asked only when a score is needed: a plain cover, or
+    /// `--about` over spans that offer no choice, never binds a model.
+    #[test]
+    fn the_semantic_scorer_decides_and_is_asked_only_when_needed() {
+        use triblespace::core::blob::encodings::rawbytes::RawBytes;
+        use triblespace::core::blob::{Blob, MemoryBlobStore};
+        use triblespace::core::repo::SnapshotSource;
+        let point = |seconds: f64| {
+            let epoch = Epoch::from_tai_seconds(seconds);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let mut blobs = MemoryBlobStore::new();
+        let mut chunk = |id: Id, summary: &str, from: f64, to: f64| {
+            let handle = blobs.insert(summary.to_owned().to_blob());
+            entity! {
+                ExclusiveId::force_ref(&id) @
+                metadata::tag: &KIND_CHUNK_ID,
+                ctx::summary: handle,
+                ctx::start_at: point(from),
+                ctx::end_at: point(to),
+            }
+        };
+        let lamps = chunk(A, "amber lamps in the hall", 0.0, 100.0);
+        let reading = chunk(B, "a quiet evening reading", 0.0, 100.0);
+        let picture = blobs.insert(Blob::<RawBytes>::new(anybytes::Bytes::from_source(
+            b"\x89PNG picture".to_vec(),
+        )));
+        let image = entity! {
+            ExclusiveId::force_ref(&C) @
+            metadata::tag: &KIND_CHUNK_ID,
+            ctx::image: picture,
+            ctx::start_at: point(200.0),
+            ctx::end_at: point(300.0),
+        };
+        let mut facts = lamps.clone();
+        facts += reading;
+        facts += image.clone();
+        let reader = blobs.snapshot().expect("in-memory snapshot is infallible");
+        let options = |about: Option<&str>, remove: Option<&str>| CoverOpts {
+            about: about.map(str::to_owned),
+            remove: remove.map(str::to_owned),
+            ..CoverOpts::plain(10_000)
+        };
+        let render = |facts: &Fragment, options: &CoverOpts, semantic: &mut Semantic<'_>| {
+            render_cover_report(facts.facts(), &reader, options, semantic).unwrap()
+        };
+
+        render(&facts, &options(None, None), &mut |_| {
+            panic!("a plain cover asked")
+        });
+        let mut distinct = lamps;
+        distinct += image;
+        render(&distinct, &options(Some("amber"), None), &mut |_| {
+            panic!("--about without equal spans asked")
+        });
+
+        // Lexically "amber" is the lamps; by meaning it is the reading.
+        let mut asked = Vec::new();
+        let about = render(&facts, &options(Some("amber"), None), &mut |query| {
+            asked.push(query.to_owned());
+            Ok(Some(HashMap::from([(A, 0.1), (B, 0.9)])))
+        });
+        assert_eq!(asked, ["amber"]);
+        assert!(
+            about.text.contains("a quiet evening reading"),
+            "{}",
+            about.text
+        );
+        assert!(!about.text.contains("amber lamps"), "{}", about.text);
+        let lexical = render(&facts, &options(Some("amber"), None), &mut |_| Ok(None));
+        assert!(lexical.text.contains("amber lamps"), "{}", lexical.text);
+
+        // Indexed lamps are removed by meaning; the unindexed reading has text
+        // and keeps its lexical score; the unindexed image cannot be scored and
+        // is kept, by name.
+        let removed = render(&facts, &options(None, Some("lamps")), &mut |_| {
+            Ok(Some(HashMap::from([(A, 0.9)])))
+        });
+        assert!(!removed.text.contains("amber lamps"), "{}", removed.text);
+        assert!(
+            removed.text.contains("a quiet evening reading"),
+            "{}",
+            removed.text
+        );
+        assert!(
+            removed
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("--remove") && line.contains(&format!("{C:x}"))),
+            "{:?}",
+            removed.diagnostics
+        );
     }
 
     #[test]
@@ -1469,24 +1404,6 @@ mod recollection_tests {
             0,
             "without context the least intrinsic id is deterministic"
         );
-    }
-
-    #[cfg(feature = "local-embed")]
-    #[test]
-    fn competing_shared_embedding_observations_are_arbitrated_deterministically() {
-        let chunk = Id::new([0x61; 16]).unwrap();
-        let mut fragment = Fragment::empty();
-        let first = fragment.put::<Embedding768, _>(vec![0.0; 768]);
-        let second = fragment.put::<Embedding768, _>(vec![1.0; 768]);
-        fragment += entity! {
-            triblespace::core::id::ExclusiveId::force_ref(&chunk) @
-            embeddings::attr::embedding: first,
-            embeddings::attr::embedding: second,
-        };
-        let selected = chunk_embedding_handle(fragment.facts(), chunk)
-            .unwrap()
-            .expect("one additive observation is selected");
-        assert_eq!(selected, first.min(second));
     }
 
     fn ids(n: usize) -> Vec<Id> {

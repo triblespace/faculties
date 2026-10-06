@@ -5152,14 +5152,11 @@ async fn cmd_wake(
         .await?;
         // Prepare each independent section separately. A missing Wiki or
         // Compass attachment must not repeat memory-cover planning/diagnostics.
-        // Plain wake never consults Embeddings; these facts stay shard-backed.
+        // Plain wake never scores by meaning; these facts stay shard-backed.
         let cover = read(storage, &observation.snapshot, |reader| {
-            render_cover_report(
-                &memory_facts,
-                &TribleSet::new(),
-                reader,
-                &CoverOpts::plain(chars),
-            )
+            render_cover_report(&memory_facts, reader, &CoverOpts::plain(chars), &mut |_| {
+                Ok(None)
+            })
         })
         .await?;
         let beliefs = read(storage, &observation.snapshot, |reader| {

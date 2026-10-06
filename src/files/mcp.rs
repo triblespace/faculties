@@ -1,7 +1,7 @@
 //! Purpose-built Files MCP tools. No shell paths, stdin markers, or ambient
 //! configuration are accepted as tool arguments.
 
-use super::operations::{EmbeddingOptions, FetchOptions, Files as Operations, SimilarityOptions};
+use super::operations::{FetchOptions, Files as Operations, SimilarityOptions};
 use super::presentation::ViewOptions;
 use crate::mcp::{decode_arguments, Faculty, Tool};
 use crate::out::Out;
@@ -32,7 +32,7 @@ const EMPTY_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProper
 const TOOLS: &[Tool] = &[
     Tool {
         name: "files_add",
-        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. On a gb10 build the semantic index is maintained after the import, so an image is found by `files_similar` at once; elsewhere its rows arrive by replication and require the launcher-configured model/runtime.",
+        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. Importing never embeds; `files_index` does.",
         input_schema: r#"{"type":"object","properties":{"data":{"type":"string","description":"Base64-encoded file bytes"},"name":{"type":"string"},"mime":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"required":["data","name","mime"],"additionalProperties":false}"#,
     },
     Tool {
@@ -52,21 +52,17 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. On a gb10 build the semantic index is maintained after the import, so an image is found by `files_similar` at once; elsewhere its rows arrive by replication and require the launcher-configured model/runtime.",
+        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. Importing never embeds; `files_index` does.",
         input_schema: r#"{"type":"object","properties":{"url":{"type":"string"},"mime":{"type":"string"},"name":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]},"max_bytes":{"type":"integer","minimum":1,"default":8388608}},"required":["url"],"additionalProperties":false}"#,
     },
     Tool {
         name: "files_search", description: "Search stored file names, media types, and tags.",
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
     },
-    Tool { name: "files_index", description: "Maintain the two semantic indexes over every stored file's content: images through the nomic-vision root, PDF text layers and UTF-8 through the nomic-text root in the working pile, one row per distinct content (gb10 only; the rows replicate elsewhere).", input_schema: EMPTY_SCHEMA },
+    Tool { name: "files_index", description: "Derive the WeMM index over every stored file's content, whoever saved it: images, text, HTML text and PDF text layers through one model. Requires the wemm build on a GB10 and the WEMM_PILE, WEMM_ASSETS and WEMM_ROOT model environment; binds the model (tens of seconds) and may run for hours.", input_schema: EMPTY_SCHEMA },
     Tool {
-        name: "files_similar", description: "Semantic similarity search over the derived indexes. Supply exactly one of id or text: a text query through the nomic-text model in the working pile, a file id through the model its content asks for (image or text). Images and texts are two indexes with their own floors (image_floor and text_floor, each defaulting to floor) and rank as two groups unless kind picks one. A content held by several files is one hit.",
-        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":0,"maximum":1,"default":0},"image_floor":{"type":"number","minimum":0,"maximum":1},"text_floor":{"type":"number","minimum":0,"maximum":1},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]},"kind":{"type":"string","enum":["image","text"]},"mm7b":{"type":"boolean","default":false}},"additionalProperties":false}"#,
-    },
-    Tool {
-        name: "files_embed7b", description: "Compute stored image/PDF-page embeddings. Requires the local-embed build and a supported model/runtime.",
-        input_schema: r#"{"type":"object","properties":{"force":{"type":"boolean","default":false},"pdf":{"type":"boolean","default":false},"dpi":{"type":"integer","minimum":1,"default":150},"limit":{"type":"integer","minimum":0,"default":0},"max_pages":{"type":"integer","minimum":0,"default":0}},"additionalProperties":false}"#,
+        name: "files_similar", description: "Rank stored files by meaning in the one WeMM space for text, images and documents. Supply exactly one of id or text. Scores are reconstructed cosines, not calibrated relevance; floor is an optional cosine in [-1,1]. A content held by several files is one hit. Requires the wemm build on a GB10 and binds the model per call.",
+        input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":-1,"maximum":1},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"additionalProperties":false}"#,
     },
     Tool { name: "files_imports", description: "List stored imports.", input_schema: EMPTY_SCHEMA },
     Tool {
@@ -122,16 +118,8 @@ fn view_budget() -> usize {
 fn fetch_budget() -> usize {
     8 * 1024 * 1024
 }
-fn similarity_floor() -> f32 {
-    // Text-to-image matches in the nomic space sit near 0.06; a floor that
-    // hides them hides the reason the space is shared.
-    0.0
-}
 fn similarity_limit() -> usize {
     10
-}
-fn pdf_dpi() -> u32 {
-    150
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,34 +148,12 @@ struct Search {
 struct Similar {
     id: Option<String>,
     text: Option<String>,
-    #[serde(default = "similarity_floor")]
-    floor: f32,
     #[serde(default)]
-    image_floor: Option<f32>,
-    #[serde(default)]
-    text_floor: Option<f32>,
+    floor: Option<f64>,
     #[serde(default = "similarity_limit")]
     limit: usize,
     #[serde(default)]
     tags: Vec<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    mm7b: bool,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Embed {
-    #[serde(default)]
-    force: bool,
-    #[serde(default)]
-    pdf: bool,
-    #[serde(default = "pdf_dpi")]
-    dpi: u32,
-    #[serde(default)]
-    limit: usize,
-    #[serde(default)]
-    max_pages: usize,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,12 +241,8 @@ impl Faculty for Files {
                         id: args.id.as_deref(),
                         text: args.text.as_deref(),
                         floor: args.floor,
-                        image_floor: args.image_floor,
-                        text_floor: args.text_floor,
                         limit: args.limit,
                         tags: &args.tags,
-                        kind: args.kind.as_deref().map(str::parse).transpose()?,
-                        mm7b: args.mm7b,
                     },
                     out,
                 )
@@ -288,19 +250,6 @@ impl Faculty for Files {
             "files_index" => {
                 let _: Empty = decode_arguments(arguments)?;
                 files.index(out)
-            }
-            "files_embed7b" => {
-                let args: Embed = decode_arguments(arguments)?;
-                files.embed7b(
-                    &EmbeddingOptions {
-                        force: args.force,
-                        pdf: args.pdf,
-                        dpi: args.dpi,
-                        limit: args.limit,
-                        max_pages: args.max_pages,
-                    },
-                    out,
-                )
             }
             "files_imports" => {
                 let _: Empty = decode_arguments(arguments)?;
@@ -336,10 +285,9 @@ impl Faculty for Files {
 mod tests {
     use super::*;
 
-    /// The defaults the schema advertises are the defaults serde applies: a
-    /// client that selects the advertised floor must see the same hits as
-    /// one that omits it (the 0.15 the schema once claimed hid every
-    /// text-to-image match, which sit near 0.07).
+    /// The defaults the schema advertises are the defaults serde applies,
+    /// and there is no floor default: no WeMM relevance threshold is
+    /// calibrated, so an omitted floor ranks every content.
     #[test]
     fn similar_schema_defaults_match_the_deserializer() {
         let tool = TOOLS
@@ -348,18 +296,24 @@ mod tests {
             .expect("files_similar tool");
         let schema: serde_json::Value = serde_json::from_str(tool.input_schema).unwrap();
         let properties = &schema["properties"];
-        assert_eq!(
-            properties["floor"]["default"].as_f64().unwrap() as f32,
-            similarity_floor()
-        );
+        assert!(properties["floor"].get("default").is_none());
         assert_eq!(
             properties["limit"]["default"].as_u64().unwrap() as usize,
             similarity_limit()
         );
         let args: Similar = decode_arguments(Bytes::from(br#"{"text":"q"}"#.to_vec())).unwrap();
-        assert_eq!(args.floor, similarity_floor());
+        assert_eq!(args.floor, None);
         assert_eq!(args.limit, similarity_limit());
-        assert_eq!(args.kind, None);
-        assert_eq!((args.image_floor, args.text_floor), (None, None));
+    }
+
+    #[test]
+    fn retired_semantic_tools_and_arguments_are_gone() {
+        assert!(!TOOLS.iter().any(|tool| tool.name == "files_embed7b"));
+        for retired in [
+            r#"{"text":"q","kind":"image"}"#,
+            r#"{"text":"q","mm7b":true}"#,
+        ] {
+            assert!(decode_arguments::<Similar>(Bytes::from(retired.as_bytes().to_vec())).is_err());
+        }
     }
 }

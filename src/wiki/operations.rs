@@ -4,7 +4,7 @@
 //! boundaries. Only preparation is retried; model work, output and publication
 //! remain outside that retry. Typst validation refuses external files, but is
 //! still compiler execution: a hosted untrusted deployment needs independent
-//! CPU/memory limits. Embedding methods use the configured local model runtime.
+//! CPU/memory limits. Index and similar bind the WeMM model the environment names.
 
 #[cfg(test)]
 use crate::storage::FactRead;
@@ -19,8 +19,6 @@ use crate::clock;
 use crate::collection_names::open_configured_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_configured;
-#[cfg(feature = "local-embed")]
-use crate::schemas::embeddings::{self, Embedding768};
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use crate::schemas::wiki::{self as schema, extract_link_targets};
 use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
@@ -41,11 +39,8 @@ use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
-
-#[cfg(feature = "local-embed")]
-/// Shared embedding scope minted with trible genid on 2026-08-09 and retained
-/// from commit 4aa344f7 in the collection-port lineage.
-const EMBEDDINGS_SCOPE_ID: Id = triblespace::macros::id_hex!("F6BE4C16A56001FEA03A5927C6ED3814");
+#[cfg(feature = "wemm")]
+use triblespace_search::nvfp4::ReconstructedCosines;
 
 use crate::out::Out;
 
@@ -175,11 +170,35 @@ impl Wiki {
     pub fn search(&self, query: &str, context: bool, all: bool) -> Result<String> {
         cmd_search(self.storage(), query.into(), context, all)
     }
-    pub fn embed(&self, out: &mut Out<'_>) -> Result<()> {
-        cmd_embed(self.storage(), out)
+    /// Derive the WeMM index over every revision's text, binding the model
+    /// the environment names. Explicit only: writing a fragment never embeds.
+    #[cfg(feature = "wemm")]
+    pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
+        self.index_with(&crate::wemm::Session::from_env(self.storage.path())?, out)
     }
+    /// [`Self::index`] with a model already bound.
+    #[cfg(feature = "wemm")]
+    pub fn index_with(&self, session: &crate::wemm::Session, out: &mut Out<'_>) -> Result<()> {
+        cmd_index(self.storage(), session, out)
+    }
+    #[cfg(not(feature = "wemm"))]
+    pub fn index(&self, _out: &mut Out<'_>) -> Result<()> {
+        crate::wemm_unavailable()
+    }
+    /// Rank current revisions by meaning, binding the model the environment
+    /// names.
+    #[cfg(feature = "wemm")]
     pub fn similar(&self, query: &str) -> Result<String> {
-        cmd_similar(self.storage(), query.into())
+        self.similar_with(&crate::wemm::Session::from_env(self.storage.path())?, query)
+    }
+    /// [`Self::similar`] with a model already bound.
+    #[cfg(feature = "wemm")]
+    pub fn similar_with(&self, session: &crate::wemm::Session, query: &str) -> Result<String> {
+        cmd_similar(self.storage(), session, query.into())
+    }
+    #[cfg(not(feature = "wemm"))]
+    pub fn similar(&self, _query: &str) -> Result<String> {
+        crate::wemm_unavailable()
     }
     pub fn check(&self, compile: bool, out: &mut Out<'_>) -> Result<()> {
         cmd_check(self.storage(), compile, out)
@@ -260,24 +279,6 @@ impl WikiStorage<'_> {
         mut prepare: impl FnMut(&WikiView, &FactArchive) -> Result<T>,
     ) -> Result<T> {
         self.views(&[(scope, label)], |wiki, facts| prepare(wiki, &facts[0]))
-    }
-
-    #[cfg(feature = "local-embed")]
-    fn publish_scope(&self, scope: Id, fragment: Fragment) -> Result<CollectionCommit> {
-        self.with_pile(|pile, signer, runtime| {
-            let collection = open_configured_acquiring(
-                pile, scope, signer.verifying_key(), runtime,
-            )?;
-            let commit = pile
-                .commit(collection, signer, fragment)
-                .context("publish native collection fragment")?;
-            runtime
-                .block_on(crate::storage::ensure_downstream(pile, collection, signer))
-                .context(
-                    "Wiki auxiliary fragment was committed, but ensuring its derived views failed",
-                )?;
-            Ok(commit)
-        })
     }
 
     fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
@@ -1874,104 +1875,88 @@ fn cmd_batch_import(storage: WikiStorage<'_>, imports: Vec<(Id, String)>) -> Res
     Ok(())
 }
 
-#[cfg(feature = "local-embed")]
-fn l2_normalize(mut values: Vec<f32>) -> Vec<f32> {
-    let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for value in &mut values {
-            *value /= norm;
-        }
-    }
-    values
+/// The Wiki content the WeMM index reads: each revision's text. The index is
+/// derived per commit, so every revision ever written gets rows; which of
+/// them are current is decided when a query joins them.
+#[cfg(feature = "wemm")]
+fn content_attributes() -> [Id; 1] {
+    [schema::attrs::content.id()]
 }
 
-#[cfg(feature = "local-embed")]
-fn cmd_embed(storage: WikiStorage<'_>, out: &mut Out<'_>) -> Result<()> {
-    let documents = storage.view_with_scope(
-        EMBEDDINGS_SCOPE_ID,
-        "Embeddings",
-        |view, embedding_facts| {
-            let existing: BTreeSet<Id> = find!(
-                revision: Id,
-                pattern!(embedding_facts, [{ ?revision @ embeddings::attr::embedding: _?handle }])
-            )
-            .collect();
-            let mut documents = Vec::new();
-            for entry in wiki_model::entries(&view.facts, &view.latest)
-                .into_iter()
-                .filter(|entry| {
-                    !entry
-                        .frontier
-                        .iter()
-                        .all(|revision| revision.tags.contains(&schema::TAG_ARCHIVED_ID))
-                })
-            {
-                for head in &entry.frontier {
-                    if existing.contains(&head.id) {
-                        continue;
-                    }
-                    documents.push((head.id, revision_content(&view.reader, head)?));
-                }
-            }
-            Ok(documents)
-        },
-    )?;
-    // Blocking model loading/inference runs outside both Tokio and retries.
-    let embedder = crate::nomic::load_text_embedder()?;
-    let mut fragment = Fragment::empty();
-    for (revision, content) in documents {
-        let vector = l2_normalize(embedder.embed_document(&content)?);
-        let handle = fragment.put::<Embedding768, _>(vector);
-        fragment +=
-            entity! { ExclusiveId::force_ref(&revision) @ embeddings::attr::embedding: handle };
-    }
-    if fragment.facts().is_empty() {
-        out.line(format!("all current revisions already embedded"))?;
-    } else {
-        storage.publish_scope(EMBEDDINGS_SCOPE_ID, fragment)?;
-    }
-    Ok(())
+#[cfg(feature = "wemm")]
+fn cmd_index(
+    storage: WikiStorage<'_>,
+    session: &crate::wemm::Session,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    storage.with_pile(|pile, signer, runtime| {
+        let source = open_configured_acquiring(
+            pile,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
+        )?;
+        session.index(pile, source, &content_attributes(), signer, runtime, out)
+    })
 }
 
-#[cfg(not(feature = "local-embed"))]
-fn cmd_embed(_storage: WikiStorage<'_>, _out: &mut Out<'_>) -> Result<()> {
-    bail!("`wiki embed` needs --features local-embed")
+/// Current revisions ranked by their best WeMM cosine: the index joined at
+/// read time to the frontier, so a superseded revision's rows are simply not
+/// joined. Archived revisions stay out, as they do in `wiki list`.
+#[cfg(feature = "wemm")]
+fn similar_revisions(view: &WikiView, cosines: &ReconstructedCosines) -> Vec<(f64, Id)> {
+    type Content = inlineencodings::Handle<blobencodings::UTF8String>;
+    let mut best: HashMap<Id, f64> = HashMap::new();
+    for (revision, content) in find!(
+        (revision: Id, content: Inline<Content>),
+        and!(
+            cosines.similar_to::<Content>(content, f64::NEG_INFINITY),
+            view.latest.has(revision),
+            pattern!(&view.facts, [{ ?revision @ schema::attrs::content: ?content }]),
+        )
+    ) {
+        let cosine = cosines
+            .cosine(&content)
+            .expect("similar_to binds scored contents");
+        best.entry(revision)
+            .and_modify(|kept| *kept = kept.max(cosine))
+            .or_insert(cosine);
+    }
+    let mut ranked: Vec<(f64, Id)> = best
+        .into_iter()
+        .filter(|(revision, _)| {
+            !wiki_model::revision_records(&view.facts, *revision)
+                .iter()
+                .any(|record| record.tags.contains(&schema::TAG_ARCHIVED_ID))
+        })
+        .map(|(revision, cosine)| (cosine, revision))
+        .collect();
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    ranked
 }
 
-#[cfg(feature = "local-embed")]
-fn cmd_similar(storage: WikiStorage<'_>, query: String) -> Result<String> {
-    let embedder = crate::nomic::load_text_embedder()?;
-    let query = l2_normalize(embedder.embed_query(&query)?);
-    let report = storage.view_with_scope(
-        EMBEDDINGS_SCOPE_ID,
-        "Embeddings",
-        |view, embedding_facts| {
-            let current: BTreeSet<Id> = wiki_model::entries(&view.facts, &view.latest)
-                .into_iter()
-                .filter(|entry| {
-                    !entry
-                        .frontier
-                        .iter()
-                        .all(|revision| revision.tags.contains(&schema::TAG_ARCHIVED_ID))
-                })
-                .flat_map(|entry| entry.frontier.into_iter().map(|head| head.id))
-                .collect();
-            let mut pairs = Vec::new();
-            for (revision, handle) in find!(
-                (revision: Id, handle: Inline<inlineencodings::Handle<Embedding768>>),
-                pattern!(embedding_facts, [{ ?revision @ embeddings::attr::embedding: ?handle }])
-            ) {
-                if !current.contains(&revision) {
-                    continue;
-                }
-                let vector: anybytes::View<[f32]> = BlobStoreGet::get(&view.reader, handle)?;
-                pairs.push((revision, vector.as_ref().to_vec()));
-            }
+#[cfg(feature = "wemm")]
+fn cmd_similar(
+    storage: WikiStorage<'_>,
+    session: &crate::wemm::Session,
+    query: String,
+) -> Result<String> {
+    storage.with_pile(|pile, signer, runtime| {
+        let source = open_configured_acquiring(
+            pile,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
+        )?;
+        let query = crate::wemm::Query::Text(&query);
+        let cosines = session.cosines(pile, source, &content_attributes(), runtime, query)?;
+        anyhow::ensure!(
+            !cosines.is_empty(),
+            "the Wiki WeMM index has no rows yet; run `wiki index`"
+        );
+        views_in(pile, source, signer, &[], runtime, |view, _| {
             let mut report = String::new();
-            for (score, revision) in embeddings::nearest(&pairs, &query, 0.0)?
-                .into_iter()
-                .take(10)
-            {
+            for (score, revision) in similar_revisions(view, &cosines).into_iter().take(10) {
                 let title = wiki_model::revision_records(&view.facts, revision)
                     .first()
                     .map(|row| revision_title(&view.reader, row))
@@ -1980,14 +1965,8 @@ fn cmd_similar(storage: WikiStorage<'_>, query: String) -> Result<String> {
                 writeln!(report, "{score:6.3}  {revision:x}  {title}").unwrap();
             }
             Ok(report)
-        },
-    )?;
-    Ok(report)
-}
-
-#[cfg(not(feature = "local-embed"))]
-fn cmd_similar(_storage: WikiStorage<'_>, _query: String) -> Result<String> {
-    bail!("`wiki similar` needs --features local-embed")
+        })
+    })
 }
 
 mod typst_validate {

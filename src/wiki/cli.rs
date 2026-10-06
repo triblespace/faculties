@@ -153,9 +153,11 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Write missing vectors into the shared embedding collection.
-    Embed,
-    /// Rebuild an in-memory nearest-neighbour search from the shared collection.
+    /// Derive the WeMM index over every revision's text (wemm build on a
+    /// GB10; WEMM_PILE, WEMM_ASSETS, WEMM_ROOT). Resumable; prints the
+    /// commits still to derive.
+    Index,
+    /// Rank current revisions by meaning against the WeMM index.
     Similar {
         query: String,
     },
@@ -309,7 +311,7 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             context,
             all,
         } => out.text(wiki.search(&query, context, all)?),
-        Command::Embed => wiki.embed(out),
+        Command::Index => wiki.index(out),
         Command::Similar { query } => out.text(wiki.similar(&query)?),
         Command::Batch {
             action: BatchAction::Export { dir },

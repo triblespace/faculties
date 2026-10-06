@@ -16,14 +16,15 @@ use std::path::{Path, PathBuf};
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — density-shaped, deliberately lossy recollection over journaled time in greedy SPACE order, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, wobbling temporal centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic, via `memory embed`; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). They compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unembedded wordless images are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — density-shaped, deliberately lossy recollection over journaled time in greedy SPACE order, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, wobbling temporal centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic through the WeMM index when WEMM_PILE names the model and `memory index` has rows; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). They compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unindexed wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
              memory cover reset [--session KEY]   — rewind the cursor to 0 (does NOT regenerate the stored cover)\n  \
              memory density [<grain>]        — inspect where the stored hierarchy is bushy, balanced, or coarse (a journal diagnostic; it does not drive recollection)\n  \
              memory search <query>           — exact lexical (BM25) search rebuilt from the frozen Memory view\n  \
-             memory similar <query>           — semantic search: nearest chunks by MEANING in the shared nomic space (build/refresh with `memory embed`) [needs --features local-embed]\n  \
+             memory similar <query>           — semantic search: chunks, prose and images alike, ranked by MEANING in the one WeMM space (build/refresh with `memory index`) [needs the wemm build on a GB10 and WEMM_PILE, WEMM_ASSETS, WEMM_ROOT]\n  \
+             memory index                     — derive the WeMM index over every chunk's prose and image; resumable, prints the commits still to derive [needs the wemm build on a GB10 and WEMM_PILE, WEMM_ASSETS, WEMM_ROOT]\n  \
              memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
@@ -32,7 +33,7 @@ use std::path::{Path, PathBuf};
              memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
              memory respan-instants [--dry-run] — give every zero-length memory the span its own text names, or a moment ending at its stamp; turn inverted ranges forward; one commit\n  \
              memory respan-seams [--dry-run]    — close one-second and one-minute seams between arcs written with rounded edges (an hour or wider): a coordinate correction, one commit\n  \
-             memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (embed with `memory embed`; ranks in `memory similar` beside text) [needs --features local-embed to embed]\n  \
+             memory image <when> <image-path> — create a WORDLESS image memory at a time-coordinate (`memory index` places it beside text in `memory similar`)\n  \
              memory consolidate start <ts> | <ts> <summary> | stop — write chunks from an advancing edge ($PERSONA cursor)\n  \
              memory replay start <grain> [<from>] | [<count>] | stop — stream the memory at a zoom level ($PERSONA cursor)\n  \
              memory provenance <chunk-id>     — list cognition + archive events overlapping the chunk's time range\n\n\
@@ -99,7 +100,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
         "replay" => cmd_replay(&memory, args, out),
         "search" => memory.search(&literal_or_input(args, "query")?, out),
         "similar" => memory.similar(&literal_or_input(args, "query")?, out),
-        "embed" => memory.embed(out),
+        "index" => memory.index(out),
         "context" => out.text(report_text(memory.context(&context_options(args)?)?)),
         "cover" => return super::cli_cover::execute(&memory, args, out),
         "lens" => memory.lens(args.first().map(String::as_str), out),
@@ -247,9 +248,9 @@ fn cmd_image(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()> 
              Create a WORDLESS image memory chunk and store it in the pile.\n\
              <when> is a single TAI timestamp (YYYY-MM-DDTHH:MM:SS — a point\n\
              where start==end) or a `from..to` range. The image bytes are stored\n\
-             as a blob; embed it into the shared nomic space with `memory embed`\n\
-             (nomic-VISION-768), and it ranks in `memory similar` by meaning\n\
-             beside text memories. Reference it from prose with [caption](memory:<hex>)."
+             as a blob; `memory index` places it in the one WeMM space, where\n\
+             it ranks in `memory similar` by meaning beside text memories.\n\
+             Reference it from prose with [caption](memory:<hex>)."
         );
     }
     let when = &args[0];
@@ -268,7 +269,7 @@ fn cmd_image(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()> 
 
     memory.image(&bytes, range)?.emit(out)?;
     out.line(format!(
-        "({} image bytes stored; run `memory embed` to place it in the shared nomic space)",
+        "({} image bytes stored; run `memory index` to place it in the WeMM space)",
         bytes.len()
     ))?;
     Ok(())

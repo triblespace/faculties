@@ -108,10 +108,10 @@ path = "src/bin/status-capture.rs"
 required-features = ["widgets"]
 
 [features]
-# `local-embed` and `widgets` are default: semantic recall is core to knowledge
-# workflows, and the GORBIE viewer is part of the normal office surface.
+# `local-embed` and `widgets` are default: posture's semantic tier still reads
+# nomic-embed-text, and the GORBIE viewer is part of the normal office surface.
 # A stock workspace cohort build (`cargo build --release --workspace --bins`)
-# must ship both.
+# must ship both. A GB10 cohort adds `wemm` for semantic search.
 default = ["local-embed", "widgets", "audio", "hear"]
 # GORBIE-backed viewers for faculty branches. Enables the `widgets` module.
 widgets = [
@@ -120,11 +120,13 @@ widgets = [
 ]
 # Consumed by GORBIE's `#[notebook]` expansion to gate its export branch.
 web-export = []
-# Semantic similarity in `files` + `wiki similar` / `memory similar` (image+text
-# embeddings via mary's embedder). Default (see above).
-local-embed = ["dep:mary", "mary/embed", "mary/gemma", "triblespace-search/semantic"]
-# Explicit bounded single-model WeMM path; never a Nomic fallback. Descriptor
-# and join portability live in search's separate semantic-wemm feature.
+# nomic-embed-text for posture's semantic tier (`posture semantic`), the one
+# reader of the nomic models left. Default (see above).
+local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
+# Semantic index and search for Files, Memory and Wiki (`files index/similar`,
+# `memory index/similar`, `memory context --about/--filter/--remove`, `wiki
+# index/similar`): one native WeMM model for text, images and documents, on a
+# GB10 only. Without it those commands say so, and context falls back to BM25.
 wemm = ["dep:mary", "mary/wemm-input", "triblespace-search/semantic-wemm-cuda"]
 # Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux"]
@@ -252,9 +254,8 @@ egui = { version = "0.34", optional = true }
 # Optional, heavy: mary's Burn/Metal model ports. Activated as a bare optional
 # dep (no default features); the *consuming* faculties feature turns on exactly
 # the mary features it needs, so each build stays as lean as its job allows:
-#   local-embed → mary[embed,gemma]: CLIP/SigLIP multi-modal embedder (CLIP
-#                 image+text shared space) + nomic-embed-multimodal-7b (3584-d
-#                 dense image/text space; Qwen2.5-VL port + Metal/wgpu backend).
+#   local-embed → mary[embed,gemma]: nomic-embed-text for posture.
+#   wemm        → mary[wemm-input]: native CUDA WeMM-Embedding-9B.
 #   imagine     → mary[flux]: the ported FLUX.2 text→image pipeline.
 mary = { package = "maryml", version = "0.1.0", path = "../mary", default-features = false, optional = true }
 # Files presentation codecs; also matches the image type returned by Mary FLUX.

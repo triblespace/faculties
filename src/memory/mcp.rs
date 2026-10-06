@@ -77,13 +77,13 @@ static TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Literal query; @ has no host-file meaning."}},"required":["query"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "memory_embed",
-        description: "Embed unembedded memory text/images into the shared nomic space. Requires trusted local model configuration and local-embed; may load models and use substantial compute.",
+        name: "memory_index",
+        description: "Derive the WeMM index over every memory chunk's prose and image. Requires the wemm build on a GB10 and the WEMM_PILE, WEMM_ASSETS and WEMM_ROOT model environment; binds the model (tens of seconds) and may run for hours.",
         input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     },
     Tool {
         name: "memory_similar",
-        description: "Semantic retrieval over resident embeddings. Requires trusted local model configuration and local-embed.",
+        description: "Rank memory chunks, prose and images alike, by meaning in the one WeMM space. Requires the wemm build on a GB10 and binds the model per call; run memory_index first.",
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Literal query; @ has no host-file meaning."}},"required":["query"],"additionalProperties":false}"#,
     },
     Tool {
@@ -234,7 +234,10 @@ impl Faculty for Memory {
                     .decode(args.data)
                     .map_err(invalid_arguments)?;
                 memory.image(&bytes, range)?.emit(out)?;
-                out.line(format!("({} image bytes stored; run `memory embed` to place it in the shared nomic space)", bytes.len()))
+                out.line(format!(
+                    "({} image bytes stored; run `memory index` to place it in the WeMM space)",
+                    bytes.len()
+                ))
             }
             "memory_respan" => {
                 let args: Respan = decode_arguments(arguments)?;
@@ -257,9 +260,9 @@ impl Faculty for Memory {
                 let args: Query = decode_arguments(arguments)?;
                 memory.search(&args.query, out)
             }
-            "memory_embed" => {
+            "memory_index" => {
                 let _: Empty = decode_arguments(arguments)?;
-                memory.embed(out)
+                memory.index(out)
             }
             "memory_similar" => {
                 let args: Query = decode_arguments(arguments)?;
