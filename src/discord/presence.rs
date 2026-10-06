@@ -27,6 +27,12 @@
 //! connection's `VoiceJoin` passes it over the same way). Only the end of
 //! the session they are there with is, or an update that names none.
 //!
+//! A change is seen when it reaches the bot, which Discord's replay to a
+//! resumed session does in one burst: each change is therefore seen at
+//! least a millisecond after the one before it, so that every change is a
+//! notice of its own (a notice is who, where and when, and two alike at one
+//! time would be one) and the notices are in the order the changes were.
+//!
 //! What is known of who is there is the process's own, held only to tell
 //! the edges apart; the collection stores the changes, never a list of
 //! members ([`crate::discord::presence_fragment`]). The bot's own comings
@@ -50,6 +56,8 @@ pub struct Members {
     /// Who is in the channel, with the voice session each is there with
     /// when Discord named it, once the guild's GUILD_CREATE said who was.
     present: Option<BTreeMap<u64, Option<String>>>,
+    /// When the last change was seen, in milliseconds since the Unix epoch.
+    last_seen_ms: u64,
 }
 
 impl Members {
@@ -59,12 +67,14 @@ impl Members {
             channel: channel.get(),
             bot: None,
             present: None,
+            last_seen_ms: 0,
         }
     }
 
     /// The change of who is in the channel that `dispatch` makes, if any,
-    /// seen at `seen_ms` (milliseconds since the Unix epoch).
-    pub fn observe(&mut self, dispatch: &Value, seen_ms: u64) -> Option<PresenceChange> {
+    /// seen at `now_ms` (milliseconds since the Unix epoch), or a millisecond
+    /// after the last change when that is later.
+    pub fn observe(&mut self, dispatch: &Value, now_ms: u64) -> Option<PresenceChange> {
         let d = &dispatch["d"];
         match dispatch["t"].as_str()? {
             "READY" => {
@@ -121,6 +131,8 @@ impl Members {
                     // Still elsewhere.
                     (None, false) => return None,
                 };
+                let seen_ms = now_ms.max(self.last_seen_ms.saturating_add(1));
+                self.last_seen_ms = seen_ms;
                 Some(PresenceChange {
                     channel: self.channel,
                     user,
@@ -218,7 +230,6 @@ mod tests {
         for (index, dispatch) in dispatches.iter().enumerate() {
             if let Some(change) = members.observe(dispatch, 1_790_000_000_000) {
                 assert_eq!(change.channel, VOICE);
-                assert_eq!(change.seen_ms, 1_790_000_000_000);
                 changes.push((index, change.user, change.presence));
             }
         }
@@ -395,6 +406,39 @@ mod tests {
                 (3, ADA, Presence::Left),
                 (4, GRACE, Presence::Left),
                 (5, GRACE, Presence::Joined),
+            ]
+        );
+    }
+
+    /// Changes handled in one burst, as Discord's replay of what a resumed
+    /// session missed is, are each seen a millisecond after the one before
+    /// at least, so each is a notice of its own, in the order they happened;
+    /// so are changes seen while the clock went back.
+    #[test]
+    fn changes_in_one_burst_are_seen_in_the_order_they_happened() {
+        let mut members = members();
+        members.observe(&ready(), 0);
+        members.observe(&guild(&[]), 0);
+        let now = 1_790_000_000_000;
+        let mut seen = Vec::new();
+        for (dispatch, at) in [
+            (update(ADA, Some(VOICE), false), now),
+            (update(ADA, None, false), now),
+            (update(ADA, Some(VOICE), false), now),
+            (update(ADA, None, false), now - 5_000),
+            (update(ADA, Some(VOICE), false), now + 60_000),
+        ] {
+            let change = members.observe(&dispatch, at).unwrap();
+            seen.push((change.seen_ms, change.presence));
+        }
+        assert_eq!(
+            seen,
+            [
+                (now, Presence::Joined),
+                (now + 1, Presence::Left),
+                (now + 2, Presence::Joined),
+                (now + 3, Presence::Left),
+                (now + 60_000, Presence::Joined),
             ]
         );
     }
