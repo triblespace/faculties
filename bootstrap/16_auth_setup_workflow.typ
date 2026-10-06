@@ -2,7 +2,7 @@
 
 Collection synchronization has no ambient team or CONNECT grant. Every exact
 descriptor carries independent READ and WRITE policies, and `pile net sync`
-repairs only the handles named by its operator. The iroh transport already
+repairs only the handles its pile selects. The iroh transport already
 authenticates each endpoint key.
 
 This recipe gives a second node READ and WRITE access to one collection, seeds
@@ -48,21 +48,22 @@ consolidation afterward, and do not use a destructive source-deletion option.
 == Activate live repair
 
 ```sh
-# Founder serves and pulls this collection.
+# Founder selects this collection, then serves and pulls it.
+trible pile net select founder.pile --key root.key "$COLLECTION"
 trible pile net sync founder.pile \
-  --key root.key --collection "$COLLECTION" \
-  --peers <invitee-endpoint-ticket-or-id> --payload demand
+  --key root.key --peers <invitee-endpoint-ticket-or-id>
 
 # Invitee runs the symmetric side.
+trible pile net select invitee.pile --key invitee.key "$COLLECTION"
 trible pile net sync invitee.pile \
-  --key invitee.key --collection "$COLLECTION" \
-  --peers <founder-endpoint-ticket-or-id> --payload demand
+  --key invitee.key --peers <founder-endpoint-ticket-or-id>
 ```
 
-`--direction read-only` pulls without serving; `write-only` serves without
-pulling; the default is bidirectional. `--payload demand` exchanges semantic
+Sync peers for a collection only while both piles select it, and a running
+daemon follows `select` and `unselect`; `trible pile net selection` lists what
+a pile selects. The default `--replication demand` exchanges semantic
 collection evidence and satisfies durable collection-scoped WANTs as needed.
-Use `--payload full` only when this node deliberately mirrors the admitted
+Use `--replication full` only when this node deliberately mirrors the admitted
 resident blob closure. `--duration` and `--quiescent-for` make a rehearsal
 bounded; otherwise sync runs until interrupted.
 

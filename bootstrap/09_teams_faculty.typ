@@ -53,7 +53,7 @@ sidecar.
 Microsoft tenancy does not define TribleSpace authorization. The Teams
 collection has the same descriptor-local READ and WRITE policies as every
 other collection. To replicate it to another node, grant that node the exact
-collection capability and activate the descriptor handle in `pile net sync`;
+collection capability and select the descriptor handle with `pile net select`;
 see [Recipe: Share a Collection Between Agents](wiki:d06247b9d9183721e47a2940806e5d7f).
 
 Next stop: [Relations: People and Handle Mappings](wiki:e7e3f672a66b39e0b5b3c0eaf212b1da).
