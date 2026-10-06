@@ -1627,7 +1627,19 @@ mod tests {
         let archive = storage(&fixture).load().unwrap();
         let facts = archive.facts().unwrap();
         let ids = projection_ids(&facts);
-        assert_eq!(ids.len(), 2);
+        // A Codex receipt is keyed by its block, so both occurrences annotate
+        // one receipt: two locators and two timestamps.
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            find!(
+                timestamp: (i128, i128),
+                pattern!(&facts, [{
+                    _?projection @ archive_schema::source_projection::source_timestamp: ?timestamp
+                }])
+            )
+            .count(),
+            2
+        );
         let blocks: BTreeSet<_> = find!(
             block: Id,
             pattern!(&facts, [{

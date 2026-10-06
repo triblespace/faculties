@@ -5,7 +5,33 @@
 //! agent messages are the visible dialogue stream, while `agent_reasoning`
 //! carries usable model reasoning. `response_item/message` mirrors dialogue
 //! while also carrying harness-only context. This adapter projects the useful
-//! event stream exactly once. Everything else, including encrypted reasoning,
+//! event stream exactly once.
+//!
+//! The event stream has two spellings. Rollouts up to 2026-08 carry one
+//! `event_msg` per event: `user_message` (`message`, `images`,
+//! `local_images`), `agent_message` (`message`) and `agent_reasoning` (`text`,
+//! one record per reasoning summary part). Rollouts from 2026-09 put an
+//! `ordinal` on every record and carry the same three events as
+//! `event_msg/item_completed`, whose `item.type` is `UserMessage` (`content`:
+//! `text` parts, plus `image`/`localImage` pointers in Codex's input
+//! protocol), `AgentMessage` (`content`: `Text` parts) or `Reasoning`
+//! (`summary_text`: the summary parts, one string each). Both spellings
+//! project to the same content facts; the new one only gathers a message's
+//! parts, or a reasoning item's summary parts, into one record and so into one
+//! block. `Reasoning.raw_content` mirrors the old `agent_reasoning_raw_content`
+//! event, which was never projected either. Other `item_completed` kinds (tool
+//! executions, file changes, sub-agent activity) and every bookkeeping event
+//! (`token_count`, `task_started`, `task_complete`, ...) stay raw-only and are
+//! counted as skipped.
+//!
+//! A Codex fork or resume replays its parent's records into a new file under
+//! new timestamps. Each projected message is therefore received as a
+//! [`blockdag::block_source_projection`]: its identity is the block, which is
+//! the message's content and its place in the conversation, and the line, raw
+//! record, timestamp and path of every occurrence annotate it. A replayed
+//! message adds those few annotations and nothing else.
+//!
+//! Everything else, including encrypted reasoning,
 //! tool exhaust, and telemetry, remains losslessly available through one exact
 //! source snapshot over fixed-size content-addressed chunks. Snapshots are
 //! disjoint from dialogue projections, so later semantic interpretations do
@@ -148,6 +174,34 @@ struct CodexPayload {
     local_images: Vec<View<str>>,
     audio: Vec<View<str>>,
     local_audio: Vec<View<str>>,
+    item: Option<CodexItem>,
+}
+
+/// The `item` of a 2026-09 `event_msg/item_completed` record.
+#[derive(Default)]
+struct CodexItem {
+    item_type: Option<View<str>>,
+    content: Vec<ItemContent>,
+    summary_text: Vec<View<str>>,
+}
+
+/// One element of an item's `content` array.
+#[derive(Default)]
+struct ItemContent {
+    content_type: Option<View<str>>,
+    text: Option<View<str>>,
+    image_url: Option<View<str>>,
+    url: Option<View<str>>,
+    path: Option<View<str>>,
+}
+
+/// The two fragments one projected record yields.
+struct ProjectedRecord {
+    /// The receipt's intrinsic closure (content fact, part, block, receipt)
+    /// with the annotations a replay of the record reproduces exactly.
+    receipt: Fragment,
+    /// This occurrence of it: locator, raw record, timestamp and path.
+    occurrence: Fragment,
 }
 
 /// Project one explicit Codex rollout file.
@@ -201,15 +255,24 @@ where
     let mut fragments_emitted = 0usize;
     let projected = scan_frozen_prefix(&frozen.bytes, |line, raw| {
         let before = projector.stats;
-        if let Some(fragment) = projector.project_record(line, raw)? {
+        if let Some(record) = projector.project_record(line, raw)? {
             let mut record_stats = projector.stats.since(before);
             record_stats.records_seen = 1;
+            // Two fragments, so a writer that already holds the receipt's
+            // closure (a fork replaying its parent) skips that closure whole
+            // and stages only the occurrence. One fragment would carry the
+            // whole closure into the commit again for one new annotation.
             emit(ProjectedFile {
                 source_path: path.to_path_buf(),
-                fragment,
+                fragment: record.receipt,
                 stats: record_stats,
             })?;
-            fragments_emitted += 1;
+            emit(ProjectedFile {
+                source_path: path.to_path_buf(),
+                fragment: record.occurrence,
+                stats: ProjectionStats::default(),
+            })?;
+            fragments_emitted += 2;
         }
         Ok(())
     })?;
@@ -438,7 +501,7 @@ where
 }
 
 impl Projector<'_> {
-    fn project_record(&mut self, line: u64, raw: Bytes) -> Result<Option<Fragment>> {
+    fn project_record(&mut self, line: u64, raw: Bytes) -> Result<Option<ProjectedRecord>> {
         if contains(raw.as_ref(), b"\"turn_context\"") {
             let record = parse_record(raw.clone(), self.source_path)?;
             if record.record_type.as_deref() == Some("turn_context") {
@@ -487,6 +550,38 @@ impl Projector<'_> {
                 project_reasoning_parts(payload, &mut self.stats)?,
                 "agent_reasoning",
             ),
+            Some("item_completed") => {
+                let Some(item) = payload.item.as_ref() else {
+                    self.stats.skipped_records += 1;
+                    return Ok(None);
+                };
+                match item.item_type.as_deref() {
+                    Some("UserMessage") => (
+                        project_item_message_parts(
+                            item,
+                            schema::content_fact::direction::IN,
+                            &mut self.stats,
+                        )?,
+                        "UserMessage",
+                    ),
+                    Some("AgentMessage") => (
+                        project_item_message_parts(
+                            item,
+                            schema::content_fact::direction::OUT,
+                            &mut self.stats,
+                        )?,
+                        "AgentMessage",
+                    ),
+                    Some("Reasoning") => (
+                        project_item_reasoning_parts(item, &mut self.stats)?,
+                        "Reasoning",
+                    ),
+                    _ => {
+                        self.stats.skipped_records += 1;
+                        return Ok(None);
+                    }
+                }
+            }
             _ => {
                 self.stats.skipped_records += 1;
                 return Ok(None);
@@ -500,18 +595,49 @@ impl Projector<'_> {
 
         // Codex child rollouts replay inherited response items while rewriting
         // their top-level observation time. Time therefore belongs to the
-        // exact source receipt, not to the shared semantic block identity.
+        // occurrence, not to the shared semantic block identity.
         let block = blockdag::block(self.previous_block, None, parts)?;
         let block_id = block
             .root()
             .expect("canonical block constructor returns one root");
-        let locator = format!("{}/line/{line}", self.session_id);
-        let projection = blockdag::source_projection(
-            schema::source_projection::SOURCE_CODEX,
-            locator,
-            raw,
-            block,
+
+        // The receipt is keyed by the block alone: the message's content and
+        // its place in the conversation (its predecessor chain). A fork or a
+        // resume replays the parent's records with new timestamps on new
+        // lines of a new file, and before this the receipt's identity held
+        // the locator and the raw record (timestamp included), so every
+        // replayed record minted a fresh receipt with its own raw blob and
+        // carried the whole closure into the commit again. Now the replay
+        // lands on the parent's receipt.
+        //
+        // "Place in the conversation" is read as the predecessor chain, with
+        // no conversation id in the key, because that is the simplest key
+        // that converges whatever the fork's file layout: a fork's line
+        // numbers can shift, and its session id need not match. Its cost is
+        // the block DAG's own: two conversations that open with identical
+        // content share the opening receipt, as they already share its
+        // block, and both occurrences annotate it.
+        //
+        // Role, model and predecessor support are reproduced exactly by a
+        // replay, so they ride with the receipt and stay known.
+        let receipt =
+            blockdag::block_source_projection(schema::source_projection::SOURCE_CODEX, block)?;
+        let receipt = blockdag::annotate_source_projection(
+            receipt,
+            blockdag::ProjectionAnnotations {
+                semantic_predecessor_support: self.previous_projection.into_iter().collect(),
+                raw_role: Some(raw_role.to_owned()),
+                raw_model: self.current_model.clone(),
+                ..blockdag::ProjectionAnnotations::default()
+            },
         )?;
+        let receipt_id = receipt
+            .root()
+            .expect("canonical source-projection constructor returns one root");
+
+        // What a replay changes is this occurrence: where (line, path), when
+        // (the rewritten timestamp) and the exact bytes. Those annotate the
+        // receipt in a fragment of their own.
         let source_timestamp = record
             .timestamp
             .as_deref()
@@ -523,25 +649,102 @@ impl Projector<'_> {
                 }
             })
             .and_then(epoch_interval);
-        let projection = blockdag::annotate_source_projection(
-            projection,
+        let occurrence = blockdag::source_occurrence(
+            receipt_id,
+            format!("{}/line/{line}", self.session_id),
+            raw,
             blockdag::ProjectionAnnotations {
-                semantic_predecessor_support: self.previous_projection.into_iter().collect(),
                 source_timestamp,
-                raw_role: Some(raw_role.to_owned()),
-                raw_model: self.current_model.clone(),
                 source_path: Some(self.source_path.to_string_lossy().into_owned()),
                 ..blockdag::ProjectionAnnotations::default()
             },
         )?;
-        let projection_id = projection
-            .root()
-            .expect("canonical source-projection constructor returns one root");
         self.previous_block = Some(block_id);
-        self.previous_projection = Some(projection_id);
+        self.previous_projection = Some(receipt_id);
         self.stats.source_projections += 1;
-        Ok(Some(projection))
+        Ok(Some(ProjectedRecord {
+            receipt,
+            occurrence,
+        }))
     }
+}
+
+/// Project a 2026-09 `UserMessage` or `AgentMessage` item's content, in order.
+///
+/// User input spells a text part `text` and agent output spells it `Text`.
+/// `image` (`url`) and `localImage` (`path`) are Codex's input-protocol
+/// pointers, the same pointers the old format listed in `images` and
+/// `local_images`. Any other content kind is left to the raw snapshot.
+fn project_item_message_parts(
+    item: &CodexItem,
+    direction: Id,
+    stats: &mut ProjectionStats,
+) -> Result<Fragment> {
+    let mut parts = Fragment::empty();
+    let mut ordinal = 0u64;
+    for content in &item.content {
+        let fact = match content.content_type.as_deref() {
+            Some("text" | "Text") => match content
+                .text
+                .as_deref()
+                .filter(|text| !text.trim().is_empty())
+            {
+                Some(text) => Some(blockdag::text_fact(
+                    schema::content_fact::modality::TEXT,
+                    direction,
+                    text,
+                )?),
+                None => None,
+            },
+            Some("image") => match content.image_url.as_ref().or(content.url.as_ref()) {
+                Some(pointer) => project_asset(
+                    pointer,
+                    schema::content_fact::modality::IMAGE,
+                    direction,
+                    stats,
+                )?,
+                None => None,
+            },
+            Some("localImage" | "local_image") => match content.path.as_ref() {
+                Some(pointer) => project_asset(
+                    pointer,
+                    schema::content_fact::modality::IMAGE,
+                    direction,
+                    stats,
+                )?,
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(fact) = fact {
+            push_part(&mut parts, &mut ordinal, fact, stats)?;
+        }
+    }
+    Ok(parts)
+}
+
+/// Project a 2026-09 `Reasoning` item's summary parts, in order: each is what
+/// one old-format `agent_reasoning` event carried.
+fn project_item_reasoning_parts(item: &CodexItem, stats: &mut ProjectionStats) -> Result<Fragment> {
+    let mut parts = Fragment::empty();
+    let mut ordinal = 0u64;
+    for text in item
+        .summary_text
+        .iter()
+        .filter(|text| !text.trim().is_empty())
+    {
+        push_part(
+            &mut parts,
+            &mut ordinal,
+            blockdag::text_fact(
+                schema::content_fact::modality::THINKING,
+                schema::content_fact::direction::OUT,
+                text.as_ref(),
+            )?,
+            stats,
+        )?;
+    }
+    Ok(parts)
 }
 
 fn project_reasoning_parts(
@@ -797,11 +1000,74 @@ fn scan_payload(bytes: &mut Bytes) -> std::result::Result<Option<CodexPayload>, 
             "local_images" => payload.local_images = scan_pointers(value)?,
             "audio" => payload.audio = scan_pointers(value)?,
             "local_audio" => payload.local_audio = scan_pointers(value)?,
+            "item" => payload.item = scan_item(value)?,
             _ => sc::skip_value(value)?,
         }
         Ok(payload)
     })
     .map(Some)
+}
+
+fn scan_item(bytes: &mut Bytes) -> std::result::Result<Option<CodexItem>, sc::ScanError> {
+    if bytes.first().copied() != Some(b'{') {
+        sc::skip_value(bytes)?;
+        return Ok(None);
+    }
+    sc::object(bytes, CodexItem::default(), |mut item, key, value| {
+        let key = key
+            .view::<str>()
+            .map_err(|_| scan_syntax("JSON object key is not UTF-8"))?;
+        match key.as_ref() {
+            "type" => item.item_type = scan_string(value)?,
+            "content" => item.content = scan_item_content(value)?,
+            "summary_text" => item.summary_text = scan_strings(value)?,
+            _ => sc::skip_value(value)?,
+        }
+        Ok(item)
+    })
+    .map(Some)
+}
+
+fn scan_item_content(bytes: &mut Bytes) -> std::result::Result<Vec<ItemContent>, sc::ScanError> {
+    if bytes.first().copied() != Some(b'[') {
+        sc::skip_value(bytes)?;
+        return Ok(Vec::new());
+    }
+    sc::array(bytes, Vec::new(), |mut contents, value| {
+        if value.first().copied() != Some(b'{') {
+            sc::skip_value(value)?;
+            return Ok(contents);
+        }
+        let content = sc::object(value, ItemContent::default(), |mut content, key, member| {
+            let key = key
+                .view::<str>()
+                .map_err(|_| scan_syntax("JSON object key is not UTF-8"))?;
+            match key.as_ref() {
+                "type" => content.content_type = scan_string(member)?,
+                "text" => content.text = scan_string(member)?,
+                "image_url" => content.image_url = scan_string(member)?,
+                "url" => content.url = scan_string(member)?,
+                "path" => content.path = scan_string(member)?,
+                _ => sc::skip_value(member)?,
+            }
+            Ok(content)
+        })?;
+        contents.push(content);
+        Ok(contents)
+    })
+}
+
+fn scan_strings(bytes: &mut Bytes) -> std::result::Result<Vec<View<str>>, sc::ScanError> {
+    if bytes.first().copied() != Some(b'[') {
+        sc::skip_value(bytes)?;
+        return Ok(Vec::new());
+    }
+    sc::array(bytes, Vec::new(), |mut strings, value| {
+        if let Some(string) = scan_string(value)? {
+            strings.push(string);
+        }
+        Ok(strings)
+    })
 }
 
 fn parse_record(raw: Bytes, source_path: &Path) -> Result<CodexRecord> {
@@ -894,6 +1160,8 @@ mod tests {
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
+    use crate::archive_collection::ArchiveImportWriter;
+    use crate::storage::FactView;
 
     const ROLLOUT: &str = concat!(
         r#"{"timestamp":"2026-08-16T08:00:00.000Z","type":"session_meta","payload":{"id":"thread-1","session_id":"thread-1"}}"#,
@@ -943,6 +1211,34 @@ mod tests {
             pattern!(fragment.facts(), [{ ?entity @ metadata::tag: &tag }])
         )
         .collect()
+    }
+
+    fn raw_records(fragment: &Fragment) -> BTreeSet<Inline<Handle<RawBytes>>> {
+        find!(
+            raw: Inline<Handle<RawBytes>>,
+            pattern!(fragment.facts(), [{
+                _?receipt @ schema::source_projection::raw_record: ?raw
+            }])
+        )
+        .collect()
+    }
+
+    fn has_tag(fragment: &Fragment, tag: Id) -> bool {
+        !ids_with_tag(fragment, tag).is_empty()
+    }
+
+    /// Every fragment a rollout emits, in order.
+    fn project_fragments(text: &str, name: &str) -> (TempDir, Vec<Fragment>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(name);
+        fs::write(&path, text).unwrap();
+        let mut fragments = Vec::new();
+        project_path(&path, |projected| {
+            fragments.push(projected.fragment);
+            Ok(())
+        })
+        .unwrap();
+        (directory, fragments)
     }
 
     fn source_chunk_raws(fragment: &Fragment) -> Vec<(Id, u128, Bytes)> {
@@ -1036,7 +1332,8 @@ mod tests {
         assert_eq!(summary.stats.raw_chunks, 1);
         assert_eq!(summary.stats.content_parts, 4);
         assert_eq!(summary.stats.records_seen, 8);
-        assert_eq!(summary.fragments_emitted, 4);
+        // A receipt and an occurrence per projected record, then the snapshot.
+        assert_eq!(summary.fragments_emitted, 7);
         assert_eq!(summary.stats.skipped_records, 5);
         assert_eq!(
             ids_with_tag(&fragment, schema::source_projection::KIND).len(),
@@ -1165,9 +1462,14 @@ mod tests {
             ids_with_tag(&spaced, schema::block::KIND),
             "JSON whitespace is not semantic block identity"
         );
-        assert_ne!(
+        assert_eq!(
             ids_with_tag(&first, schema::source_projection::KIND),
             ids_with_tag(&spaced, schema::source_projection::KIND),
+            "nor receipt identity"
+        );
+        assert_ne!(
+            raw_records(&first),
+            raw_records(&spaced),
             "JSON whitespace remains exact source evidence"
         );
     }
@@ -1265,5 +1567,313 @@ mod tests {
             vec!["chosen.png", "plain.png"]
         );
         assert!(payload.local_images.is_empty());
+    }
+
+    /// The 2026-09 rollout shape: an `ordinal` on every record, and the
+    /// dialogue as `event_msg/item_completed` items. Bookkeeping, tool items,
+    /// an empty reasoning item and record kinds the old format never had are
+    /// all here to be skipped.
+    const ITEM_ROLLOUT: &str = concat!(
+        r#"{"timestamp":"2026-09-10T08:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"session_id":"thread-n","id":"thread-n"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.001Z","ordinal":1,"type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-test"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.002Z","ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.003Z","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.004Z","ordinal":4,"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-n","turn_id":"turn-1","item":{"type":"UserMessage","id":"item-1","content":[{"type":"text","text":"hello","text_elements":[]},{"type":"localImage","path":"/moved/reference.png"}]},"started_at_ms":1,"completed_at_ms":1}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.400Z","ordinal":5,"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"**Planning**"}],"encrypted_content":"opaque"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.500Z","ordinal":6,"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-n","turn_id":"turn-1","item":{"type":"Reasoning","id":"rs-1","summary_text":["**Planning**","**Answering directly**"],"raw_content":[]}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.600Z","ordinal":7,"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-n","turn_id":"turn-1","item":{"type":"Reasoning","id":"rs-2","summary_text":[],"raw_content":[]}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:00.700Z","ordinal":8,"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-n","turn_id":"turn-1","item":{"type":"CommandExecution","id":"exec-1","command":["true"],"stdout":"hi"}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:01.000Z","ordinal":9,"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-n","turn_id":"turn-1","item":{"type":"AgentMessage","id":"msg-1","content":[{"type":"Text","text":"hi"}],"phase":"final_answer"}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:01.001Z","ordinal":10,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:01.002Z","ordinal":11,"type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:01.003Z","ordinal":12,"type":"token_usage_record","payload":{"total":1}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-10T08:00:01.004Z","ordinal":13,"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"hi"}}"#,
+        "\n",
+    );
+
+    fn content_facts(fragment: &Fragment, modality: Id, direction: Id) -> BTreeSet<Id> {
+        find!(
+            fact: Id,
+            pattern!(fragment.facts(), [{
+                ?fact @
+                    schema::content_fact::modality: &modality,
+                    schema::content_fact::direction: &direction,
+            }])
+        )
+        .collect()
+    }
+
+    fn root_blocks(fragment: &Fragment) -> BTreeSet<Id> {
+        ids_with_tag(fragment, schema::block::KIND)
+            .into_iter()
+            .filter(|block| {
+                let block = *block;
+                !exists!(pattern!(fragment.facts(), [{
+                    block @ schema::block::previous: _?previous
+                }]))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn item_completed_rollouts_project_into_the_old_vocabulary() {
+        let (_directory, summary, fragment) = project_text(ITEM_ROLLOUT, "items.jsonl");
+        assert_eq!(summary.stats.records_seen, 14);
+        assert_eq!(summary.stats.source_projections, 3);
+        // text + image, two summary parts, one text.
+        assert_eq!(summary.stats.content_parts, 5);
+        assert_eq!(
+            summary.stats.skipped_records, 11,
+            "bookkeeping, tool items, the empty reasoning item and response mirrors stay raw"
+        );
+        assert_eq!(summary.fragments_emitted, 7);
+        assert_eq!(exact_source_snapshot(&fragment), ITEM_ROLLOUT.as_bytes());
+        assert_eq!(
+            ids_with_tag(&fragment, schema::source_projection::KIND).len(),
+            3
+        );
+        assert_eq!(ids_with_tag(&fragment, schema::block::KIND).len(), 3);
+        assert_eq!(root_blocks(&fragment).len(), 1, "one chain of three blocks");
+
+        let (_reader_directory, reader) = empty_reader();
+        let (_, validation) =
+            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
+        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
+
+        use schema::content_fact::{direction, modality};
+        assert_eq!(
+            content_facts(&fragment, modality::TEXT, direction::IN).len(),
+            1
+        );
+        assert_eq!(
+            content_facts(&fragment, modality::IMAGE, direction::IN).len(),
+            1
+        );
+        assert_eq!(
+            content_facts(&fragment, modality::THINKING, direction::OUT).len(),
+            2
+        );
+        assert_eq!(
+            content_facts(&fragment, modality::TEXT, direction::OUT).len(),
+            1
+        );
+
+        // Both summary parts land in one block, in their source order.
+        let mut blobs = fragment.blobs().clone();
+        let blob_reader = blobs.snapshot().unwrap();
+        let mut thinking: Vec<(u64, Inline<Handle<UTF8String>>)> = find!(
+            (ordinal: u64, payload: Inline<Handle<UTF8String>>),
+            pattern!(fragment.facts(), [
+                { _?block @ schema::block::contains: _?part },
+                { _?part @
+                    schema::content_part::ordinal: ?ordinal,
+                    schema::content_part::fact: _?fact,
+                },
+                { _?fact @
+                    schema::content_fact::modality: &modality::THINKING,
+                    schema::content_fact::payload: ?payload,
+                },
+            ])
+        )
+        .collect();
+        thinking.sort();
+        let thinking: Vec<String> = thinking
+            .into_iter()
+            .map(|(_, payload)| {
+                blob_reader
+                    .get::<View<str>, UTF8String>(payload)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(thinking, ["**Planning**", "**Answering directly**"]);
+
+        // The same words in the old spelling are the same content facts, and
+        // an opening message spelled either way is the same block.
+        let (_old_directory, _, old) = project_text(ROLLOUT, "old.jsonl");
+        for (spoken, heading) in [
+            (modality::TEXT, direction::IN),
+            (modality::IMAGE, direction::IN),
+            (modality::TEXT, direction::OUT),
+        ] {
+            assert_eq!(
+                content_facts(&fragment, spoken, heading),
+                content_facts(&old, spoken, heading)
+            );
+        }
+        assert_eq!(root_blocks(&fragment), root_blocks(&old));
+    }
+
+    const PARENT_ROLLOUT: &str = concat!(
+        r#"{"timestamp":"2026-08-01T10:00:00.000Z","type":"session_meta","payload":{"id":"parent-thread","session_id":"parent-thread"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-01T10:00:00.001Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-01T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"first question","images":[],"local_images":[]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-01T10:00:02.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"weighing the question"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-01T10:00:03.000Z","type":"event_msg","payload":{"type":"agent_message","message":"first answer"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-01T10:00:03.001Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+        "\n",
+    );
+
+    /// A fork as Codex writes one: its own session record, then every parent
+    /// record again with only the timestamp rewritten, then its own turn.
+    fn fork_rollout() -> String {
+        let mut fork = String::from(concat!(
+            r#"{"timestamp":"2026-08-03T09:00:00.000Z","type":"session_meta","payload":{"id":"fork-thread","session_id":"parent-thread","forked_from_id":"parent-thread"}}"#,
+            "\n"
+        ));
+        for line in PARENT_ROLLOUT.lines() {
+            let (_, rest) = line.split_once(r#"","type""#).unwrap();
+            fork.push_str(r#"{"timestamp":"2026-08-03T09:00:00.500Z","type""#);
+            fork.push_str(rest);
+            fork.push('\n');
+        }
+        fork.push_str(concat!(
+            r#"{"timestamp":"2026-08-03T09:00:05.000Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-03T09:00:06.000Z","type":"event_msg","payload":{"type":"user_message","message":"second question","images":[],"local_images":[]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-03T09:00:07.000Z","type":"event_msg","payload":{"type":"agent_message","message":"second answer"}}"#,
+            "\n",
+        ));
+        fork
+    }
+
+    #[test]
+    fn a_fork_adds_only_its_own_messages_and_occurrence_annotations() {
+        let fork_text = fork_rollout();
+        let (_parent_directory, parent) = project_fragments(PARENT_ROLLOUT, "parent.jsonl");
+        let (_fork_directory, fork) = project_fragments(&fork_text, "fork.jsonl");
+
+        let mut known = TribleSet::new();
+        for fragment in &parent {
+            known += fragment.facts().clone();
+        }
+        let novel = |fragment: &Fragment| fragment.facts().iter().any(|fact| !known.contains(fact));
+
+        // Every fork record but its own two projects to a receipt closure the
+        // parent already holds, block, parts, facts and receipt alike.
+        let closures: Vec<&Fragment> = fork
+            .iter()
+            .filter(|fragment| has_tag(fragment, schema::block::KIND))
+            .collect();
+        assert_eq!(closures.len(), 5);
+        assert_eq!(
+            closures.iter().filter(|fragment| novel(fragment)).count(),
+            2
+        );
+
+        // What is new for the replayed three is their occurrence: facts about
+        // a receipt and nothing else.
+        let mut union = Fragment::empty();
+        for fragment in parent.iter().chain(&fork) {
+            union += fragment.clone();
+        }
+        let receipts = ids_with_tag(&union, schema::source_projection::KIND);
+        let occurrences: Vec<&Fragment> = fork
+            .iter()
+            .filter(|fragment| {
+                fragment.root().is_some_and(|root| receipts.contains(&root))
+                    && !has_tag(fragment, schema::source_projection::KIND)
+            })
+            .collect();
+        assert_eq!(occurrences.len(), 5);
+        for occurrence in occurrences {
+            assert!(occurrence
+                .facts()
+                .iter()
+                .all(|fact| receipts.contains(fact.e())));
+        }
+
+        // The shared prefix is projected once: one receipt per block, and each
+        // replayed receipt carries both of its occurrences.
+        assert_eq!(receipts.len(), 5);
+        assert_eq!(ids_with_tag(&union, schema::block::KIND).len(), 5);
+        let observed_twice = receipts
+            .iter()
+            .filter(|receipt| {
+                let receipt = **receipt;
+                find!(
+                    timestamp: Inline<NsTAIInterval>,
+                    pattern!(union.facts(), [{
+                        receipt @ schema::source_projection::source_timestamp: ?timestamp
+                    }])
+                )
+                .count()
+                    == 2
+            })
+            .count();
+        assert_eq!(observed_twice, 3);
+        let (_reader_directory, reader) = empty_reader();
+        let (_, validation) =
+            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
+        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
+
+        // Through a real writer: after the parent's commit, the fork stages
+        // the closures of its own two messages and no other.
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let parent_path = directory.path().join("parent.jsonl");
+        let fork_path = directory.path().join("fork.jsonl");
+        fs::write(&parent_path, PARENT_ROLLOUT).unwrap();
+        fs::write(&fork_path, &fork_text).unwrap();
+
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        project_path(&parent_path, |projected| {
+            writer.stage_fragment(projected.fragment)
+        })
+        .unwrap();
+        assert!(writer.commit_unit().unwrap().is_some());
+        writer.close(Ok(())).unwrap();
+
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        let mut staged_closures = 0usize;
+        project_path(&fork_path, |projected| {
+            let closure = has_tag(&projected.fragment, schema::block::KIND);
+            let before = writer.delta_len();
+            writer.stage_fragment(projected.fragment)?;
+            if closure && writer.delta_len() > before {
+                staged_closures += 1;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(staged_closures, 2);
+        assert!(writer.commit_unit().unwrap().is_some());
+        writer.close(Ok(())).unwrap();
+
+        let archive =
+            pollster::block_on(crate::archive_collection::ensure_local(&pile, Some(&key))).unwrap();
+        let facts = archive.facts().unwrap();
+        assert_eq!(
+            find!(
+                receipt: Id,
+                pattern!(&facts, [{
+                    ?receipt @ metadata::tag: &schema::source_projection::KIND
+                }])
+            )
+            .count(),
+            5
+        );
     }
 }
