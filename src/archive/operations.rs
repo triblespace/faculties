@@ -1721,8 +1721,11 @@ mod tests {
     }
 
     /// One `archive import` command over PATHS, with each path's reported
-    /// publication outcome in order.
+    /// publication outcome in order. The command opens the pile once,
+    /// however many PATHS it has and wherever it stops.
     fn import_outcomes(fixture: &Fixture, paths: &[PathBuf]) -> (Result<()>, Vec<String>) {
+        let opens = || archive_collection::OPENS.with(std::cell::Cell::get);
+        let opened_before = opens();
         let mut outcomes = Vec::new();
         let result = super::super::cli::import_paths(
             &fixture.pile,
@@ -1737,6 +1740,12 @@ mod tests {
                 }
                 Ok(())
             }),
+        );
+        assert_eq!(
+            opens() - opened_before,
+            1,
+            "one command over {} paths opens the pile once",
+            paths.len()
         );
         (result, outcomes)
     }

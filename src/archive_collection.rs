@@ -89,6 +89,13 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
 /// pass that costs more on a larger pile.
 const CARRY_EVERY: usize = 16;
 
+#[cfg(test)]
+thread_local! {
+    /// How often [`ArchiveImportWriter::open`] ran on this thread, so a test
+    /// can pin how many times one command opens the pile.
+    pub(crate) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl ArchiveImportWriter {
     /// Open a synchronous import session. Async callers run the complete
     /// open/stage/finish lifetime on a blocking worker, not inside their runtime.
@@ -96,6 +103,8 @@ impl ArchiveImportWriter {
         pile_path: &std::path::Path,
         key_path: Option<&std::path::Path>,
     ) -> Result<Self> {
+        #[cfg(test)]
+        OPENS.with(|opens| opens.set(opens.get() + 1));
         let signer = crate::storage::load_signer(pile_path, key_path)?;
         let runtime = Arc::new(crate::storage::runtime()?);
         let mut pile = crate::storage::open_store_as(pile_path, signer.verifying_key())?;
