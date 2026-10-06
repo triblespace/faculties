@@ -70,21 +70,22 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
 
 /// Commits a writer publishes between two carries of its own source.
 ///
-/// Every commit is a frontier node of its own until a carry joins it. Each
-/// commit's attachment pass walks the whole frontier, and the writer's known
-/// facts gained one segment per commit, so a writer that never carried paid
-/// more for every commit than for the one before and left the whole carry to
-/// the next process to open the pile. The carry is the one
-/// [`ArchiveImportWriter::prepare`] runs at open.
+/// Every commit is a frontier node of its own until a carry joins it, and
+/// each commit's attachment pass and fact read-back cost grows with the
+/// frontier, so a writer that never carried paid more for every commit than
+/// for the one before and left the whole carry to the next process to open
+/// the pile. The carry is the one [`ArchiveImportWriter::prepare`] runs at
+/// open.
 ///
-/// Sixteen is measured, not derived (sky, one process importing hard-linked
-/// Codex rollouts into a fresh pile; mean wall time per rollout): over 1,000
-/// raw-only rollouts 9.7 ms at 8 and at 16, 10.5 at 32, 11.4 at 64, 14.6 at
-/// 128, against 38-39 ms never carrying; over 400 rollouts of 269
-/// projections each, 192.6 ms at 8 (one early outlier), 182.1 at 16, 183.4
-/// at 32, against 330 ms never carrying. Below the optimum a carry pass
-/// costs more than the frontier it removes; above it the frontier costs
-/// more. Sixteen sits at the measured optimum for both and leaves room for a
+/// Sixteen is measured, not derived (sky, shared GB10; one process importing
+/// hard-linked Codex rollouts into a fresh pile; mean wall time per
+/// rollout). Over 1,000 raw-only rollouts: 8.7 ms at 4, 8.6-9.3 at 8,
+/// 8.8-9.3 at 16, 10.2-10.3 at 32, 12.0 at 64, against 38-39 ms for a writer
+/// that never carries. Over 400 rollouts of 269 projections each: about 150
+/// ms at 8 (outside two stretches of interference), 148.5 at 16, 153.0 at
+/// 32, against 278-330 ms. Below the optimum a carry pass costs more than the
+/// frontier it removes; above it the frontier costs more. The optimum is
+/// flat from 4 to 16; sixteen is its upper edge, which leaves room for a
 /// pass that costs more on a larger pile.
 const CARRY_EVERY: usize = 16;
 
