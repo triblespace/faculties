@@ -14,10 +14,33 @@ All notable changes to this project will be documented in this file.
   (GB10 aarch64, shared, load ~10) into fresh scratch piles, release build,
   Claude Code session files of 8-60 KB: 100 files took 3.1 and 3.3 s as one
   command against 21.1 and 18.5 s as one process per path (two runs); 631
-  files took 42.7 s against 192.4 s. Both arms print identical reports. The
-  writer still does not merge its own commits: inside one command the time
-  per path grew from 0.03 s (paths 1-100) to 0.15 s (paths 501-600), and the
-  next open of the pile pays the deferred merge.
+  files took 42.7 s against 192.4 s. Both arms print identical reports. These
+  figures predate the writer carrying its own commits (next entry): without
+  it, the time per path inside one command grew from 0.03 s (paths 1-100) to
+  0.15 s (paths 501-600), and the next open of the pile paid the deferred
+  merge.
+- An `ArchiveImportWriter` that commits many times in one process now merges
+  its own commits: every 16 commits and once at close it runs the same carry
+  that opening the pile runs, so its frontier stays bounded and the next open
+  finds nothing to merge. After each commit it reads its known facts back
+  from the pile's own Rank9 attachments instead of keeping one in-memory
+  archive per commit. Measured on sky (GB10 aarch64, shared), one process
+  importing Codex rollouts into a fresh pile, mean wall time per rollout:
+  1,000 raw-only rollouts 8.8-9.3 ms against 38-39 ms for a writer that never
+  carries; 400 rollouts of 269 projections each 148.5 ms against 278-330 ms.
+- `archive import --source codex` projects the 2026-09 rollout format
+  (`event_msg/item_completed` with `UserMessage`, `AgentMessage` and
+  `Reasoning` items) into the same content facts as the older
+  `user_message`/`agent_message`/`agent_reasoning` events; before, those
+  rollouts imported only their raw snapshot. Codex receipts are now keyed by
+  their block, with locator, raw record, timestamp and path as occurrence
+  annotations, so a fork or resume that replays its parent lands on the
+  parent's receipts. Every Codex receipt id changes: re-importing a rollout
+  that is already in a pile adds a block-keyed receipt beside each old one.
+  Measured on sky (GB10 aarch64, shared): two forks of one parent (228.6 and
+  229.6 MB) imported in one process into a fresh pile; the second grew the
+  pile by 339.0 MB against 503.0 MB with the old receipt, of which 229.6 MB is
+  the fork's own raw snapshot.
 
 ## 0.21.0 - 2026-10-01
 
