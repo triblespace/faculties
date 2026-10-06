@@ -1737,7 +1737,7 @@ fn epoch_interval(epoch: Epoch) -> Inline<NsTAIInterval> {
         .expect("point interval encodes")
 }
 
-pub(super) fn format_interval(interval: Inline<NsTAIInterval>) -> String {
+pub(crate) fn format_interval(interval: Inline<NsTAIInterval>) -> String {
     let (lower, _): (Epoch, Epoch) = interval.try_from_inline().expect("valid TAI interval");
     lower.to_gregorian_str(TimeScale::UTC)
 }
