@@ -94,6 +94,20 @@ impl Segmenter {
         }
     }
 
+    /// The part of the current utterance that no future silence trim can remove.
+    /// Keep the same onset/preroll and minimum admission as `close`; the caller
+    /// may consume only the newly appended suffix. A completed Segment remains
+    /// the authority for its final samples (including explicit-flush tails).
+    pub(crate) fn committed_prefix(&self) -> Option<(u64, &[f32])> {
+        if !self.in_speech {
+            return None;
+        }
+        let discardable = (self.silence_run * self.frame).saturating_sub(self.rate * 200 / 1000);
+        let end = self.current.len().saturating_sub(discardable);
+        (end >= self.rate * self.cfg.min_utt_ms / 1000)
+            .then_some((self.utt_start_sample, &self.current[..end]))
+    }
+
     /// End of stream/file: close any open utterance.
     pub(crate) fn flush(&mut self, emit: &mut impl FnMut(Segment)) {
         if !self.pending.is_empty() {
@@ -208,6 +222,43 @@ impl Segmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_prefix_never_includes_a_discarded_silence_tail() {
+        let mut segmenter = Segmenter::new(16_000, VadConfig::default());
+        let mut final_segments = Vec::new();
+        let mut fed = Vec::new();
+        let mut start = None;
+        // Silence resumes once, so previously withheld silence becomes real
+        // captured PCM; the final 700 ms hangover still retains only 200 ms.
+        for (loud, frames) in [
+            (false, 30),
+            (true, 40),
+            (false, 25),
+            (true, 30),
+            (false, 35),
+        ] {
+            for _ in 0..frames {
+                segmenter.push(&vec![if loud { 0.25 } else { 0.0 }; 320], &mut |s| {
+                    final_segments.push(s)
+                });
+                if let Some((at, prefix)) = segmenter.committed_prefix() {
+                    assert_eq!(*start.get_or_insert(at), at);
+                    assert!(prefix.len() >= fed.len());
+                    assert_eq!(&prefix[..fed.len()], fed.as_slice());
+                    fed.extend_from_slice(&prefix[fed.len()..]);
+                }
+            }
+        }
+        assert_eq!(final_segments.len(), 1);
+        let final_pcm = &final_segments[0].samples;
+        assert_eq!(fed, *final_pcm);
+        assert!(final_pcm[final_pcm.len() - 3200..]
+            .iter()
+            .all(|x| *x == 0.0));
+        assert_eq!(final_pcm[final_pcm.len() - 3201], 0.25);
+        assert!(segmenter.committed_prefix().is_none());
+    }
     #[cfg(feature = "hear")]
     use crate::hear::operations::to_hear_rate;
     use crate::hear::operations::{CAPTURE_RATE, HEAR_RATE};

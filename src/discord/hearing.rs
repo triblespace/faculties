@@ -262,6 +262,7 @@ struct Stream {
     segmenter: Segmenter,
     origin_ms: u64,
     fed: u64,
+    committed: usize,
 }
 
 impl Stream {
@@ -270,6 +271,7 @@ impl Stream {
             segmenter: Segmenter::new(RATE, VadConfig::default()),
             origin_ms,
             fed: 0,
+            committed: 0,
         }
     }
 
@@ -278,19 +280,33 @@ impl Stream {
         self.origin_ms + self.fed * 1000 / RATE as u64
     }
 
-    fn push(&mut self, user: u64, samples: &[f32], emit: &mut impl FnMut(Spoken)) {
+    fn push(&mut self, user: u64, samples: &[f32], emit: &mut impl FnMut(Progress)) {
         let origin_ms = self.origin_ms;
-        self.segmenter.push(samples, &mut |segment| {
-            emit(spoken(user, origin_ms, segment))
-        });
+        let mut completed = Vec::new();
+        self.segmenter
+            .push(samples, &mut |segment| completed.push(segment));
+        for segment in completed {
+            emit(Progress::Finished(spoken(user, origin_ms, segment)));
+            self.committed = 0;
+        }
+        if let Some((start, prefix)) = self.segmenter.committed_prefix() {
+            if prefix.len() > self.committed {
+                emit(Progress::Samples {
+                    user,
+                    start_ms: origin_ms + (start as f64 / RATE as f64 * 1000.0).round() as u64,
+                    samples: prefix[self.committed..].to_vec(),
+                });
+                self.committed = prefix.len();
+            }
+        }
         self.fed += samples.len() as u64;
     }
 
     /// The stream ends: what was being said is finished.
-    fn close(mut self, user: u64, emit: &mut impl FnMut(Spoken)) {
+    fn close(mut self, user: u64, emit: &mut impl FnMut(Progress)) {
         let origin_ms = self.origin_ms;
         self.segmenter
-            .flush(&mut |segment| emit(spoken(user, origin_ms, segment)));
+            .flush(&mut |segment| emit(Progress::Finished(spoken(user, origin_ms, segment))));
     }
 }
 
@@ -302,6 +318,16 @@ fn spoken(user: u64, origin_ms: u64, segment: Segment) -> Spoken {
     }
 }
 
+/// Private handoff on the existing hearing thread; no partial intake output.
+enum Progress {
+    Samples {
+        user: u64,
+        start_ms: u64,
+        samples: Vec<f32>,
+    },
+    Finished(Spoken),
+}
+
 /// The heard users' streams, cut into utterances by the energy segmenter
 /// `hear` uses. Only what [`Ears`] let through ever reaches it.
 #[derive(Default)]
@@ -311,6 +337,14 @@ pub struct Listener {
 
 impl Listener {
     pub fn hear(&mut self, moment: Moment, emit: &mut impl FnMut(Spoken)) {
+        self.hear_progress(moment, &mut |progress| {
+            if let Progress::Finished(spoken) = progress {
+                emit(spoken);
+            }
+        });
+    }
+
+    fn hear_progress(&mut self, moment: Moment, emit: &mut impl FnMut(Progress)) {
         for heard in moment.heard {
             match heard {
                 Heard::Audio { user, samples } => {
@@ -330,7 +364,7 @@ impl Listener {
         }
     }
 
-    fn feed(&mut self, user: u64, at_ms: u64, samples: &[f32], emit: &mut impl FnMut(Spoken)) {
+    fn feed(&mut self, user: u64, at_ms: u64, samples: &[f32], emit: &mut impl FnMut(Progress)) {
         let stalled = self
             .streams
             .get(&user)
@@ -348,6 +382,14 @@ impl Listener {
 
     /// Hearing ends: everything being said is finished.
     pub fn flush(&mut self, emit: &mut impl FnMut(Spoken)) {
+        self.flush_progress(&mut |progress| {
+            if let Progress::Finished(spoken) = progress {
+                emit(spoken);
+            }
+        });
+    }
+
+    fn flush_progress(&mut self, emit: &mut impl FnMut(Progress)) {
         for (user, stream) in self.streams.drain() {
             stream.close(user, emit);
         }
@@ -358,7 +400,104 @@ impl Listener {
 /// and its backend sit behind it, so the backend can change without touching
 /// what calls it.
 pub trait Transcribe {
-    fn transcribe(&mut self, samples: &[f32]) -> Result<String>;
+    fn listen(&self) -> Result<Box<dyn Transcription + '_>>;
+
+    fn transcribe(&self, samples: &[f32]) -> Result<String> {
+        let mut session = self.listen()?;
+        session.push(samples)?;
+        session.finish()
+    }
+}
+
+/// One utterance, borrowed from a model owned outside all active sessions.
+pub trait Transcription {
+    fn push(&mut self, samples: &[f32]) -> Result<()>;
+    fn finish(self: Box<Self>) -> Result<String>;
+}
+
+struct Active<'a> {
+    start_ms: u64,
+    fed: usize,
+    compute_seconds: f64,
+    session: Result<Box<dyn Transcription + 'a>>,
+}
+
+impl<'a> Active<'a> {
+    fn new(ear: &'a dyn Transcribe, start_ms: u64) -> Self {
+        let started = Instant::now();
+        let session = ear.listen();
+        Self {
+            start_ms,
+            fed: 0,
+            compute_seconds: started.elapsed().as_secs_f64(),
+            session,
+        }
+    }
+
+    fn push(&mut self, samples: &[f32]) {
+        let started = Instant::now();
+        if let Ok(session) = &mut self.session {
+            if let Err(error) = session.push(samples) {
+                // Retain the failure until the full captured utterance closes.
+                // No partial transcript is published and no audio is dropped.
+                self.session = Err(error);
+            }
+        }
+        self.fed += samples.len();
+        self.compute_seconds += started.elapsed().as_secs_f64();
+    }
+}
+
+fn advance<'a>(
+    ear: &'a dyn Transcribe,
+    active: &mut HashMap<u64, Active<'a>>,
+    progress: Progress,
+    channel: u64,
+    intake: &Inbox,
+    unstored: &Path,
+) {
+    match progress {
+        Progress::Samples {
+            user,
+            start_ms,
+            samples,
+        } => {
+            let current = active
+                .entry(user)
+                .or_insert_with(|| Active::new(ear, start_ms));
+            if current.start_ms != start_ms {
+                current.session = Err(anyhow::anyhow!(
+                    "hearing utterance changed before finalization"
+                ));
+            }
+            current.push(&samples);
+        }
+        Progress::Finished(spoken) => {
+            let mut current = active
+                .remove(&spoken.user)
+                .unwrap_or_else(|| Active::new(ear, spoken.start_ms));
+            let result =
+                if current.start_ms != spoken.start_ms || current.fed > spoken.samples.len() {
+                    Err(anyhow::anyhow!(
+                        "hearing committed-prefix boundary mismatch"
+                    ))
+                } else {
+                    current.push(&spoken.samples[current.fed..]);
+                    let started = Instant::now();
+                    let result = current.session.and_then(|session| session.finish());
+                    current.compute_seconds += started.elapsed().as_secs_f64();
+                    result
+                };
+            store_result(
+                result,
+                spoken,
+                current.compute_seconds,
+                channel,
+                intake,
+                unstored,
+            );
+        }
+    }
 }
 
 /// The hearing thread: loads the transcriber, then cuts what comes in into
@@ -371,7 +510,7 @@ fn hear(
     unstored: &Path,
 ) {
     let started = Instant::now();
-    let mut ear = match load() {
+    let ear = match load() {
         Ok(ear) => ear,
         Err(error) => {
             eprintln!("[discord] hearing is off: the transcriber did not load: {error:#}");
@@ -382,28 +521,38 @@ fn hear(
         "[discord] hearing ready (transcriber loaded in {:.1} s)",
         started.elapsed().as_secs_f64()
     );
+    // The loaded owner is declared before its borrowed sessions. All GPU work
+    // stays on this thread; no model copies or cross-speaker KV state.
+    let mut active = HashMap::new();
     let mut listener = Listener::default();
-    let mut finished = Vec::new();
+    let mut emit = |progress| advance(&*ear, &mut active, progress, channel, intake, unstored);
     for moment in moments.iter() {
-        listener.hear(moment, &mut |spoken| finished.push(spoken));
-        for spoken in finished.drain(..) {
-            store(&mut *ear, spoken, channel, intake, unstored);
-        }
+        listener.hear_progress(moment, &mut emit);
     }
-    listener.flush(&mut |spoken| finished.push(spoken));
-    for spoken in finished {
-        store(&mut *ear, spoken, channel, intake, unstored);
-    }
+    listener.flush_progress(&mut emit);
+    debug_assert!(active.is_empty());
 }
 
 /// Transcribe one utterance and hand it to intake; keep it in `unstored`
 /// when intake is gone, and keep its audio there when it cannot be
 /// transcribed. One with no words in it is not stored.
+#[cfg(test)]
 fn store(ear: &mut dyn Transcribe, spoken: Spoken, channel: u64, intake: &Inbox, unstored: &Path) {
-    let seconds = spoken.samples.len() as f64 / RATE as f64;
     let started = Instant::now();
     let transcribed = ear.transcribe(&spoken.samples);
     let took = started.elapsed().as_secs_f64();
+    store_result(transcribed, spoken, took, channel, intake, unstored);
+}
+
+fn store_result(
+    transcribed: Result<String>,
+    spoken: Spoken,
+    took: f64,
+    channel: u64,
+    intake: &Inbox,
+    unstored: &Path,
+) {
+    let seconds = spoken.samples.len() as f64 / RATE as f64;
     let mut utterance = Utterance {
         channel,
         user: spoken.user,
@@ -518,7 +667,7 @@ fn now_ms() -> u64 {
 /// mary's Voxtral-Mini-4B-Realtime, streaming on CUDA (`mary::hear`, with
 /// mary's `voxtral-cuda`), behind [`Transcribe`].
 mod voxtral {
-    use super::Transcribe;
+    use super::{Transcribe, Transcription};
     use anyhow::{Context, Result};
     use std::path::Path;
 
@@ -539,22 +688,45 @@ mod voxtral {
         }
     }
 
+    struct Session<'a> {
+        ears: &'a mary::hear::Ears,
+        listening: Option<mary::hear::Listening<'a>>,
+        text: String,
+    }
+
     impl Transcribe for Voxtral {
-        /// One stream per utterance; what does not fit in one stream's
-        /// positions (about ten minutes) goes on in the next.
-        fn transcribe(&mut self, samples: &[f32]) -> Result<String> {
-            let mut text = String::new();
-            let mut rest = samples;
-            loop {
-                let mut listening = self.ears.listen(DELAY_MS);
-                let (now, later) = rest.split_at(rest.len().min(listening.room()));
-                text += &listening.push(now);
-                text += &listening.finish();
-                if later.is_empty() {
-                    return Ok(text);
+        fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+            Ok(Box::new(Session {
+                ears: &self.ears,
+                listening: Some(self.ears.listen(DELAY_MS)),
+                text: String::new(),
+            }))
+        }
+    }
+
+    impl Transcription for Session<'_> {
+        fn push(&mut self, mut samples: &[f32]) -> Result<()> {
+            while !samples.is_empty() {
+                let listening = self.listening.as_mut().expect("active stream");
+                anyhow::ensure!(
+                    !listening.is_finished(),
+                    "Voxtral ended before the utterance's remaining audio"
+                );
+                if listening.is_full() {
+                    self.text += &self.listening.take().unwrap().finish();
+                    self.listening = Some(self.ears.listen(DELAY_MS));
+                    continue;
                 }
-                rest = later;
+                let (now, later) = samples.split_at(samples.len().min(listening.room()));
+                self.text += &listening.push(now);
+                samples = later;
             }
+            Ok(())
+        }
+
+        fn finish(mut self: Box<Self>) -> Result<String> {
+            self.text += &self.listening.take().expect("finish once").finish();
+            Ok(self.text)
         }
     }
 }
@@ -567,6 +739,292 @@ mod tests {
     const JP: u64 = 100000000000000400;
     const OTHER: u64 = 100000000000000500;
     const BOT: u64 = 100000000000000600;
+
+    #[test]
+    fn normal_vad_maximum_fits_listening_room_without_truncation() {
+        use mary::models::voxtral::config::{
+            delay_tokens, N_FFT, N_LEFT_PAD_TOKENS, OFFLINE_BUFFER_TOKENS, SAMPLES_PER_TOK,
+        };
+        let tail =
+            (delay_tokens(480) + 1 + OFFLINE_BUFFER_TOKENS) * SAMPLES_PER_TOK + SAMPLES_PER_TOK;
+        let room =
+            (mary::hear::MAX_TOKENS - N_LEFT_PAD_TOKENS - 1) * SAMPLES_PER_TOK - tail - N_FFT;
+        assert!(
+            room > 28 * RATE + TICK,
+            "normal VAD segments must not fill Listening"
+        );
+    }
+
+    #[derive(Default)]
+    struct Recorded {
+        sessions: std::cell::RefCell<Vec<Vec<f32>>>,
+        finished: std::cell::RefCell<Vec<usize>>,
+    }
+    struct Recording<'a> {
+        owner: &'a Recorded,
+        id: usize,
+    }
+    impl Transcribe for Recorded {
+        fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+            let id = self.sessions.borrow().len();
+            self.sessions.borrow_mut().push(Vec::new());
+            Ok(Box::new(Recording { owner: self, id }))
+        }
+    }
+    impl Transcription for Recording<'_> {
+        fn push(&mut self, samples: &[f32]) -> Result<()> {
+            self.owner.sessions.borrow_mut()[self.id].extend_from_slice(samples);
+            Ok(())
+        }
+        fn finish(self: Box<Self>) -> Result<String> {
+            self.owner.finished.borrow_mut().push(self.id);
+            Ok(format!("session {}", self.id))
+        }
+    }
+
+    fn exact_progress(moments: Vec<Moment>) -> usize {
+        let owner = Recorded::default();
+        let mut active = HashMap::new();
+        let mut listener = Listener::default();
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let mut completed = Vec::new();
+        let mut emit = |progress: Progress| {
+            if let Progress::Finished(ref spoken) = progress {
+                completed.push((spoken.user, spoken.start_ms, spoken.samples.clone()));
+            }
+            advance(&owner, &mut active, progress, 7, &intake, directory.path());
+        };
+        for moment in moments {
+            listener.hear_progress(moment, &mut emit);
+        }
+        listener.flush_progress(&mut emit);
+        assert!(active.is_empty(), "borrowed session survived final flush");
+        let finished = owner.finished.borrow();
+        assert_eq!(finished.len(), completed.len());
+        for ((user, start, samples), &id) in completed.iter().zip(finished.iter()) {
+            let actual = &owner.sessions.borrow()[id];
+            assert_eq!(
+                actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                samples.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "fed PCM differs from captured segment"
+            );
+            let Ok(Work::Utterance(item)) = queue.try_recv() else {
+                panic!("missing finalized intake")
+            };
+            assert_eq!((item.user, item.start_ms), (*user, *start));
+            assert_eq!(item.transcript, format!("session {id}"));
+            assert_eq!(item.wav, wav_pcm16(samples));
+        }
+        assert!(queue.try_recv().is_err());
+        completed.len()
+    }
+
+    #[test]
+    fn committed_pcm_matches_capture_on_resume_trim_max_partial_gap_left_and_flush() {
+        assert_eq!(
+            exact_progress(ticks(
+                JP,
+                0,
+                &[
+                    (false, 600),
+                    (true, 800),
+                    (false, 500),
+                    (true, 600),
+                    (false, 1000),
+                    (true, 900),
+                    (false, 1000),
+                ]
+            )),
+            2,
+            "resume keeps intervening silence; final close trims only its tail"
+        );
+        assert_eq!(
+            exact_progress(ticks(JP, 0, &[(false, 600), (true, 29000), (false, 1000),])),
+            2,
+            "max-duration close starts a separate session"
+        );
+        let mut partial = ticks(JP, 0, &[(false, 600), (true, 800)]);
+        partial.push(Moment {
+            at_ms: 1400,
+            heard: vec![Heard::Audio {
+                user: JP,
+                samples: vec![1234; 17],
+            }],
+        });
+        assert_eq!(exact_progress(partial), 1, "flush preserves partial frame");
+        let mut gap = ticks(JP, 0, &[(false, 600), (true, 800)]);
+        gap.extend(ticks(JP, 6400, &[(false, 600), (true, 800)]));
+        gap.push(Moment {
+            at_ms: 7800,
+            heard: vec![Heard::Left { user: JP }],
+        });
+        assert_eq!(exact_progress(gap), 2, "gap and Left finalize separately");
+    }
+
+    #[test]
+    fn arbitrary_single_feed_and_interleaved_users_keep_session_order() {
+        let mut moments = ticks(JP, 0, &[(false, 600), (true, 600)]);
+        // This ONE feed closes the already committed utterance, opens and
+        // closes another, and leaves a third active. No callback-size premise.
+        let samples = [(false, 1000), (true, 900), (false, 1000), (true, 900)]
+            .into_iter()
+            .flat_map(|(loud, ms)| {
+                if loud {
+                    tone(ms).into_iter().flatten().collect::<Vec<_>>()
+                } else {
+                    vec![0; RATE * ms / 1000]
+                }
+            })
+            .collect();
+        moments.push(Moment {
+            at_ms: 1200,
+            heard: vec![Heard::Audio { user: JP, samples }],
+        });
+        assert_eq!(exact_progress(moments), 3);
+        let a = ticks(
+            JP,
+            0,
+            &[(false, 600), (true, 1400), (false, 1000), (true, 600)],
+        );
+        let b = ticks(
+            OTHER,
+            0,
+            &[(false, 600), (true, 800), (false, 1000), (true, 1200)],
+        );
+        let interleaved = a
+            .into_iter()
+            .zip(b)
+            .map(|(mut a, b)| {
+                a.heard.extend(b.heard);
+                a
+            })
+            .collect();
+        assert_eq!(
+            exact_progress(interleaved),
+            4,
+            "distinct concurrent and repeated sessions"
+        );
+    }
+
+    #[test]
+    fn online_failure_keeps_whole_audio_and_next_utterance_resets() {
+        struct FailsFirst(std::cell::Cell<bool>);
+        struct Failing;
+        impl Transcription for Failing {
+            fn push(&mut self, _: &[f32]) -> Result<()> {
+                anyhow::bail!("injected push failure")
+            }
+            fn finish(self: Box<Self>) -> Result<String> {
+                panic!("failed stream must not finish")
+            }
+        }
+        impl Transcribe for FailsFirst {
+            fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+                if !self.0.replace(true) {
+                    Ok(Box::new(Failing))
+                } else {
+                    Ok(Box::new(FixedSession(Some(Ok("next utterance".into())))))
+                }
+            }
+        }
+        let script = [
+            (false, 600),
+            (true, 800),
+            (false, 1000),
+            (true, 800),
+            (false, 1000),
+        ];
+        let expected = listen(ticks(JP, 0, &script));
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let (heard, moments) = mpsc::channel();
+        for moment in ticks(JP, 0, &script) {
+            heard.send(moment).unwrap();
+        }
+        drop(heard);
+        hear(
+            moments,
+            || Ok(Box::new(FailsFirst(std::cell::Cell::new(false)))),
+            7,
+            &intake,
+            directory.path(),
+        );
+        let path = directory
+            .path()
+            .join(format!("7-{JP}-{}.wav", expected[0].start_ms));
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            wav_pcm16(&expected[0].samples)
+        );
+        let Ok(Work::Utterance(item)) = queue.try_recv() else {
+            panic!("second utterance missing")
+        };
+        assert_eq!(item.transcript, "next utterance");
+        assert_eq!(item.wav, wav_pcm16(&expected[1].samples));
+        assert!(queue.try_recv().is_err());
+    }
+
+    // The actual owner loop must process PCM while the sender is still speaking,
+    // but it must not publish an utterance until the unchanged VAD closes it.
+    #[test]
+    fn owner_pushes_before_finalization_without_partial_intake() {
+        struct Online(mpsc::Sender<()>);
+        struct OnlineSession(mpsc::Sender<()>);
+        impl Transcribe for Online {
+            fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+                Ok(Box::new(OnlineSession(self.0.clone())))
+            }
+        }
+        impl Transcription for OnlineSession {
+            fn push(&mut self, _: &[f32]) -> Result<()> {
+                let _ = self.0.send(());
+                Ok(())
+            }
+            fn finish(self: Box<Self>) -> Result<String> {
+                Ok("complete words".into())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let (heard, moments) = mpsc::channel();
+        let (pushed, progress) = mpsc::channel();
+        let feeder = std::thread::spawn(move || {
+            for moment in ticks(JP, 0, &[(false, 600), (true, 1200)]) {
+                heard.send(moment).unwrap();
+            }
+            let online = progress
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok();
+            let partial = queue.try_recv().is_ok();
+            for moment in ticks(JP, 1800, &[(false, 1000)]) {
+                heard.send(moment).unwrap();
+            }
+            drop(heard);
+            (online, partial, queue)
+        });
+        hear(
+            moments,
+            || Ok(Box::new(Online(pushed))),
+            7,
+            &intake,
+            directory.path(),
+        );
+        let (online, partial, queue) = feeder.join().unwrap();
+        assert!(online, "no PCM reached recognition before VAD finalization");
+        assert!(!partial, "partial transcript escaped to intake");
+        let Ok(Work::Utterance(utterance)) = queue.try_recv() else {
+            panic!("final intake missing")
+        };
+        assert_eq!(utterance.transcript, "complete words");
+        assert!(queue.try_recv().is_err());
+    }
 
     /// `ms` of a 220 Hz tone, loud enough to be speech, as ticks of samples.
     fn tone(ms: usize) -> Vec<Vec<i16>> {
@@ -777,11 +1235,20 @@ mod tests {
         assert_eq!(back, heard);
     }
 
-    struct Fixed(Vec<Result<String>>);
+    struct Fixed(std::cell::RefCell<Vec<Result<String>>>);
+    struct FixedSession(Option<Result<String>>);
+    impl Transcription for FixedSession {
+        fn push(&mut self, _: &[f32]) -> Result<()> {
+            Ok(())
+        }
+        fn finish(mut self: Box<Self>) -> Result<String> {
+            self.0.take().unwrap()
+        }
+    }
 
     impl Transcribe for Fixed {
-        fn transcribe(&mut self, _: &[f32]) -> Result<String> {
-            self.0.remove(0)
+        fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+            Ok(Box::new(FixedSession(Some(self.0.borrow_mut().remove(0)))))
         }
     }
 
@@ -804,7 +1271,9 @@ mod tests {
         }
         drop(heard);
         let load = || -> Result<Box<dyn Transcribe>> {
-            Ok(Box::new(Fixed(vec![Ok(" hello there \n".to_owned())])))
+            Ok(Box::new(Fixed(std::cell::RefCell::new(vec![Ok(
+                " hello there \n".to_owned(),
+            )]))))
         };
         hear(moments, load, 7, &intake, &unstored);
         let Ok(Work::Utterance(utterance)) = queue.try_recv() else {
@@ -820,11 +1289,11 @@ mod tests {
             start_ms: 5,
             samples: vec![0.25; 800],
         };
-        let mut ear = Fixed(vec![
+        let mut ear = Fixed(std::cell::RefCell::new(vec![
             Ok("  ".to_owned()),
             Err(anyhow::anyhow!("no")),
             Ok("kept".to_owned()),
-        ]);
+        ]));
         store(&mut ear, spoken(), 7, &intake, &unstored);
         assert!(queue.try_recv().is_err(), "no words, nothing stored");
         assert!(!unstored.exists());
