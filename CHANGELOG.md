@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `files add` no longer maintains the semantic indexes after saving. On a
+  gb10 build it embedded every file of the key that had no row before
+  returning, which on 2026-10-06 held one save for 76 minutes. Rows come
+  from `files index` only. The `files_add` and `files_fetch` tool
+  descriptions, which promised save-time indexing, now say so.
+
 ## 0.21.0 - 2026-10-01
 
 - Update the source cohort to TribleSpace 0.47.0, GORBIE 0.19.0 and

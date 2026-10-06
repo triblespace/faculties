@@ -479,19 +479,14 @@ type SemanticUpkeep = (
     Vec<anyhow::Error>,
 );
 
-/// Maintain both indexes and return them, the snapshot that sees the
-/// result, and what failed.
-///
-/// With `every_file` false -- what saving a file does -- embed the Files
-/// commits this key wrote that have no row at all yet: the file just saved,
-/// and any earlier one of this key's still without one. A commit whose row's
-/// bytes are not here is left to `files index`. With it true -- `files
-/// index` -- embed every Files commit whose bytes are here and that has no
-/// row whose bytes are here or can be fetched, whoever wrote it, then carry
-/// each index's rows into this key's merges. Only a machine of the canonical
-/// compute embeds, and only after its golden vectors agree; on any other the
-/// mapping is pinned elsewhere, nothing is embedded, and `every_file` still
-/// carries the rows that arrived by replication.
+/// Maintain both indexes computed on the class `compute` and return them,
+/// the snapshot that sees the result, and what failed: embed every Files
+/// commit whose bytes are here and that has no row whose bytes are here or
+/// can be fetched, whoever wrote it, then carry each index's rows into this
+/// key's merges. Only a machine of that class embeds, and only after its
+/// golden vectors agree; on any other the mapping is pinned elsewhere,
+/// nothing is embedded, and the rows that arrived by replication are still
+/// carried.
 ///
 /// One index failing -- a file its model refuses, rows its carry cannot
 /// join -- holds back neither the other index nor what the caller reports:
@@ -500,32 +495,11 @@ type SemanticUpkeep = (
 /// ends the pass as an error; a pile that cannot be read once the indexes
 /// were maintained ends it with what they reported as well.
 #[cfg(feature = "local-embed")]
-fn maintain_semantic(
-    store: &mut FacultyStore,
-    collection: Collection<SimpleArchive>,
-    signer: &SigningKey,
-    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
-    every_file: bool,
-) -> Result<SemanticUpkeep> {
-    maintain_semantic_on(
-        store,
-        collection,
-        signer,
-        runtime,
-        every_file,
-        SEMANTIC_COMPUTE,
-    )
-}
-
-/// [`maintain_semantic`] for indexes computed on the class `compute`: the
-/// one place that decides what this machine does with them.
-#[cfg(feature = "local-embed")]
 fn maintain_semantic_on(
     store: &mut FacultyStore,
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
-    every_file: bool,
     compute: &str,
 ) -> Result<SemanticUpkeep> {
     // Golden checks and both target descriptors use the same observation.
@@ -550,17 +524,9 @@ fn maintain_semantic_on(
             }
         };
         let maintained = runtime
-            .block_on(async {
-                if every_file {
-                    store
-                        .maintain_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
-                        .await
-                } else {
-                    store
-                        .ensure_with::<SemanticIndex<embeddings::Embedding768>>(target, signer)
-                        .await
-                }
-            })
+            .block_on(
+                store.maintain_with::<SemanticIndex<embeddings::Embedding768>>(target, signer),
+            )
             .with_context(|| format!("maintain the Files {kind} index"));
         if let Err(error) = maintained {
             failures.push(error);
@@ -859,25 +825,9 @@ fn cmd_add(
 
     pile.commit(collection, signer, change)
         .context("commit Files import")?;
+    // Saving never embeds: on 2026-10-06 one save on a gb10 spent 76 minutes
+    // embedding the whole backlog. Rows come from `files index` only.
     ensure_files_after_commit(pile, collection, signer, runtime)?;
-
-    // A saved image is searchable the moment it is saved, where this machine
-    // can embed it (JP, 2026-09-12: saving an image should embed it, no skip
-    // path); elsewhere its rows arrive from a machine that can. Saving embeds
-    // every file of this key's that has no row at all, not only this one.
-    #[cfg(feature = "local-embed")]
-    if local_compute() == SEMANTIC_COMPUTE {
-        match maintain_semantic(pile, collection, signer, runtime, false) {
-            Ok((_, _, failures)) => {
-                for error in failures {
-                    out.line(format!("Semantic index not maintained: {error:#}"))?;
-                }
-            }
-            Err(error) => out.line(format!("Semantic index not maintained: {error:#}"))?,
-        }
-    }
-    #[cfg(not(feature = "local-embed"))]
-    let _ = runtime;
 
     if stats.dirs > 0 {
         out.line(format!(
@@ -1608,7 +1558,7 @@ fn index_on(
     compute: &str,
 ) -> Result<()> {
     let (targets, snapshot, mut failures) =
-        maintain_semantic_on(store, collection, signer, runtime, true, compute)?;
+        maintain_semantic_on(store, collection, signer, runtime, compute)?;
     let snapshot = AcquiringReader::new(snapshot, runtime.clone());
     for (kind, target) in targets {
         let index = snapshot
@@ -2577,8 +2527,6 @@ impl Files {
 
     /// Import resident bytes without manufacturing a temporary filesystem path.
     /// Returns the intrinsic file id; import provenance is exhaust of publication.
-    /// With `local-embed`, raster images also require the configured nomic-vision model
-    /// and runtime for the same automatic embedding used by CLI image imports.
     pub fn add_bytes(
         &self,
         bytes: anybytes::Bytes,
@@ -2984,6 +2932,28 @@ mod tests {
         let facts = observe();
         assert!(tags_of(&facts, id).contains(&"eager".to_owned()));
         assert!(!tags_of(&old_facts, id).contains(&"eager".to_owned()));
+    }
+
+    /// A gb10 build used to maintain the semantic indexes inside `files add`;
+    /// on this pile, which holds no model, that attempt printed its failure.
+    #[test]
+    fn saving_a_file_never_embeds() {
+        let fixture = TestPile::new();
+        let files = Files::with_storage(Storage::new(fixture.path.clone(), None));
+        let note = fixture.dir.join("note.txt");
+        fs::write(&note, "a saved note").unwrap();
+        let mut printed = String::new();
+        let mut emit = |part: crate::out::Part| {
+            if let crate::out::Part::Text { text } = part {
+                printed.push_str(&text);
+            }
+            Ok(())
+        };
+        files
+            .add_path(&note, None, &[], false, &mut Out::new(&mut emit))
+            .unwrap();
+        assert!(printed.contains("note.txt"), "{printed}");
+        assert!(!printed.contains("Semantic"), "{printed}");
     }
 
     struct AcquiringPile {
@@ -4100,7 +4070,7 @@ mod tests {
                 }
 
                 let (targets, _, failures) =
-                    maintain_semantic_on(store, files, signer, runtime, true, ELSEWHERE)?;
+                    maintain_semantic_on(store, files, signer, runtime, ELSEWHERE)?;
                 assert!(failures.is_empty(), "{failures:?}");
                 let signed_by_signer = |record: &CollectionRecord| match record {
                     CollectionRecord::Derive(leaf) => {
