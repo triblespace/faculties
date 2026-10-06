@@ -294,6 +294,7 @@ impl Stream {
                 emit(Progress::Samples {
                     user,
                     start_ms: origin_ms + (start as f64 / RATE as f64 * 1000.0).round() as u64,
+                    offset: self.committed,
                     samples: prefix[self.committed..].to_vec(),
                 });
                 self.committed = prefix.len();
@@ -323,6 +324,7 @@ enum Progress {
     Samples {
         user: u64,
         start_ms: u64,
+        offset: usize,
         samples: Vec<f32>,
     },
     Finished(Spoken),
@@ -450,7 +452,7 @@ impl<'a> Active<'a> {
 
 fn advance<'a>(
     ear: &'a dyn Transcribe,
-    active: &mut HashMap<u64, Active<'a>>,
+    active: &mut Option<(u64, Active<'a>)>,
     progress: Progress,
     channel: u64,
     intake: &Inbox,
@@ -460,42 +462,74 @@ fn advance<'a>(
         Progress::Samples {
             user,
             start_ms,
+            offset,
             samples,
         } => {
-            let current = active
-                .entry(user)
-                .or_insert_with(|| Active::new(ear, start_ms));
-            if current.start_ms != start_ms {
-                current.session = Err(anyhow::anyhow!(
-                    "hearing utterance changed before finalization"
-                ));
+            // A deferred/preempted utterance may never restart mid-prefix.
+            // Its authoritative complete PCM still lives in its Segmenter.
+            if active.is_none() && offset == 0 {
+                *active = Some((user, Active::new(ear, start_ms)));
             }
-            current.push(&samples);
+            if let Some((owner, current)) = active.as_mut() {
+                if *owner == user {
+                    if current.start_ms != start_ms || current.fed != offset {
+                        current.session = Err(anyhow::anyhow!(
+                            "hearing committed-prefix boundary mismatch"
+                        ));
+                    }
+                    current.push(&samples);
+                }
+            }
         }
         Progress::Finished(spoken) => {
-            let mut current = active
-                .remove(&spoken.user)
-                .unwrap_or_else(|| Active::new(ear, spoken.start_ms));
-            let result =
-                if current.start_ms != spoken.start_ms || current.fed > spoken.samples.len() {
-                    Err(anyhow::anyhow!(
-                        "hearing committed-prefix boundary mismatch"
-                    ))
-                } else {
-                    current.push(&spoken.samples[current.fed..]);
-                    let started = Instant::now();
-                    let result = current.session.and_then(|session| session.finish());
-                    current.compute_seconds += started.elapsed().as_secs_f64();
-                    result
-                };
-            store_result(
-                result,
-                spoken,
-                current.compute_seconds,
-                channel,
-                intake,
-                unstored,
-            );
+            if active
+                .as_ref()
+                .is_some_and(|(user, _)| *user == spoken.user)
+            {
+                let (_, mut current) = active.take().expect("matching owner");
+                let result =
+                    if current.start_ms != spoken.start_ms || current.fed > spoken.samples.len() {
+                        Err(anyhow::anyhow!(
+                            "hearing committed-prefix boundary mismatch"
+                        ))
+                    } else {
+                        current.push(&spoken.samples[current.fed..]);
+                        let started = Instant::now();
+                        let result = current.session.and_then(|session| session.finish());
+                        current.compute_seconds += started.elapsed().as_secs_f64();
+                        result
+                    };
+                store_result(
+                    result,
+                    spoken,
+                    current.compute_seconds,
+                    channel,
+                    intake,
+                    unstored,
+                );
+            } else {
+                // Release unpublished recognition BEFORE the batch factory.
+                // Drop only model state/text: the preempted user's full PCM is
+                // retained and will batch at its unchanged completion boundary.
+                // A failed slot holds only an error, not a Transcription: keep
+                // it until its owner closes so fallback cannot hide the error.
+                if active
+                    .as_ref()
+                    .is_some_and(|(_, current)| current.session.is_ok())
+                {
+                    *active = None;
+                }
+                let started = Instant::now();
+                let result = ear.transcribe(&spoken.samples);
+                store_result(
+                    result,
+                    spoken,
+                    started.elapsed().as_secs_f64(),
+                    channel,
+                    intake,
+                    unstored,
+                );
+            }
         }
     }
 }
@@ -521,16 +555,16 @@ fn hear(
         "[discord] hearing ready (transcriber loaded in {:.1} s)",
         started.elapsed().as_secs_f64()
     );
-    // The loaded owner is declared before its borrowed sessions. All GPU work
-    // stays on this thread; no model copies or cross-speaker KV state.
-    let mut active = HashMap::new();
+    // One loaded owner and at most one borrowed recognition session. All GPU
+    // work stays on this thread; deferred users keep their exact captured PCM.
+    let mut active = None;
     let mut listener = Listener::default();
     let mut emit = |progress| advance(&*ear, &mut active, progress, channel, intake, unstored);
     for moment in moments.iter() {
         listener.hear_progress(moment, &mut emit);
     }
     listener.flush_progress(&mut emit);
-    debug_assert!(active.is_empty());
+    debug_assert!(active.is_none());
 }
 
 /// Transcribe one utterance and hand it to intake; keep it in `unstored`
@@ -741,6 +775,183 @@ mod tests {
     const BOT: u64 = 100000000000000600;
 
     #[test]
+    fn failed_online_owner_is_not_retried_or_lost_when_another_user_finishes() {
+        let ear = Meter {
+            fail_first: true,
+            ..Meter::default()
+        };
+        let mut active = None;
+        let mut listener = Listener::default();
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let original = listen(ticks(JP, 0, &[(false, 600), (true, 800)]));
+        let mut emit = |p| advance(&ear, &mut active, p, 7, &intake, directory.path());
+        for moment in ticks(JP, 0, &[(false, 600), (true, 800)]) {
+            listener.hear_progress(moment, &mut emit);
+        }
+        assert_eq!(ear.live.get(), 0, "failed session released immediately");
+        for moment in ticks(OTHER, 0, &[(false, 600), (true, 800), (false, 1000)]) {
+            listener.hear_progress(moment, &mut emit);
+        }
+        listener.hear_progress(
+            Moment {
+                at_ms: 1400,
+                heard: vec![Heard::Left { user: JP }],
+            },
+            &mut emit,
+        );
+        listener.flush_progress(&mut emit);
+        assert!(active.is_none());
+        assert_eq!(ear.peak.get(), 1);
+        assert_eq!(ear.live.get(), 0);
+        assert_eq!(
+            ear.attempts.borrow().len(),
+            2,
+            "failed owner was not batch-retried"
+        );
+        assert_eq!(*ear.finished.borrow(), [1]);
+        let Ok(Work::Utterance(other)) = queue.try_recv() else {
+            panic!("unrelated user missing")
+        };
+        assert_eq!(other.user, OTHER);
+        assert_eq!(other.transcript, "complete 1");
+        assert!(
+            queue.try_recv().is_err(),
+            "failure cannot become invented success"
+        );
+        let path = directory
+            .path()
+            .join(format!("7-{JP}-{}.wav", original[0].start_ms));
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            wav_pcm16(&original[0].samples)
+        );
+    }
+
+    #[derive(Default)]
+    struct Meter {
+        live: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+        attempts: std::cell::RefCell<Vec<Vec<f32>>>,
+        finished: std::cell::RefCell<Vec<usize>>,
+        fail_first: bool,
+    }
+    struct MeterSession<'a> {
+        owner: &'a Meter,
+        id: usize,
+    }
+    impl Drop for MeterSession<'_> {
+        fn drop(&mut self) {
+            self.owner.live.set(self.owner.live.get() - 1);
+        }
+    }
+    impl Transcribe for Meter {
+        fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+            let id = self.attempts.borrow().len();
+            self.attempts.borrow_mut().push(Vec::new());
+            self.live.set(self.live.get() + 1);
+            self.peak.set(self.peak.get().max(self.live.get()));
+            Ok(Box::new(MeterSession { owner: self, id }))
+        }
+    }
+    impl Transcription for MeterSession<'_> {
+        fn push(&mut self, samples: &[f32]) -> Result<()> {
+            self.owner.attempts.borrow_mut()[self.id].extend_from_slice(samples);
+            if self.owner.fail_first && self.id == 0 {
+                anyhow::bail!("injected early error");
+            }
+            Ok(())
+        }
+        fn finish(self: Box<Self>) -> Result<String> {
+            self.owner.finished.borrow_mut().push(self.id);
+            Ok(format!("complete {}", self.id))
+        }
+    }
+
+    #[test]
+    fn one_live_session_even_for_stranded_users_and_nonowner_completion() {
+        let ear = Meter::default();
+        // Type inferred from the actual adapter, so this identical test also
+        // runs on f752's per-user runtime without a mechanical runtime shim.
+        let mut active = Default::default();
+        let mut listener = Listener::default();
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let mut captured = Vec::new();
+        let mut emit = |progress: Progress| {
+            if let Progress::Finished(ref s) = progress {
+                captured.push((s.user, s.start_ms, s.samples.clone()));
+            }
+            advance(&ear, &mut active, progress, 7, &intake, directory.path());
+        };
+        // JP strands an active utterance. OTHER speaks while it remains open.
+        for moment in ticks(JP, 0, &[(false, 600), (true, 800)]) {
+            listener.hear_progress(moment, &mut emit);
+        }
+        assert_eq!(ear.live.get(), 1);
+        assert!(
+            !ear.attempts.borrow()[0].is_empty(),
+            "single speaker remains online"
+        );
+        for moment in ticks(OTHER, 0, &[(false, 600), (true, 800)]) {
+            listener.hear_progress(moment, &mut emit);
+        }
+        assert!(queue.try_recv().is_err(), "no partial publication");
+        for moment in ticks(OTHER, 1400, &[(false, 1000)]) {
+            listener.hear_progress(moment, &mut emit);
+        }
+        // The old online owner's later nonzero-offset suffix must not begin
+        // a new partial session. Its final batch must start from full PCM.
+        for moment in ticks(JP, 1400, &[(true, 200)]) {
+            listener.hear_progress(moment, &mut emit);
+        }
+        listener.hear_progress(
+            Moment {
+                at_ms: 1600,
+                heard: vec![Heard::Left { user: JP }],
+            },
+            &mut emit,
+        );
+        for moment in ticks(OTHER, 2400, &[(false, 600), (true, 800), (false, 1000)]) {
+            listener.hear_progress(moment, &mut emit);
+        }
+        listener.flush_progress(&mut emit);
+        assert!(
+            ear.peak.get() <= 1,
+            "more than one Transcription object alive"
+        );
+        assert_eq!(ear.live.get(), 0);
+        assert_eq!(captured.len(), 3);
+        assert_eq!(
+            ear.attempts.borrow().len(),
+            4,
+            "one abandoned prefix, three complete attempts"
+        );
+        assert_eq!(*ear.finished.borrow(), [1, 2, 3]);
+        for ((user, start, pcm), id) in captured.iter().zip([1, 2, 3]) {
+            assert_eq!(
+                ear.attempts.borrow()[id],
+                *pcm,
+                "successful attempt must receive full exact PCM"
+            );
+            let Ok(Work::Utterance(item)) = queue.try_recv() else {
+                panic!("final utterance missing")
+            };
+            assert_eq!((item.user, item.start_ms), (*user, *start));
+            assert_eq!(item.wav, wav_pcm16(pcm));
+            assert_eq!(item.transcript, format!("complete {id}"));
+        }
+        let attempts = ear.attempts.borrow();
+        assert!(attempts[0].len() < attempts[2].len());
+        assert_eq!(attempts[0], attempts[2][..attempts[0].len()]);
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[test]
     fn normal_vad_maximum_fits_listening_room_without_truncation() {
         use mary::models::voxtral::config::{
             delay_tokens, N_FFT, N_LEFT_PAD_TOKENS, OFFLINE_BUFFER_TOKENS, SAMPLES_PER_TOK,
@@ -784,7 +995,7 @@ mod tests {
 
     fn exact_progress(moments: Vec<Moment>) -> usize {
         let owner = Recorded::default();
-        let mut active = HashMap::new();
+        let mut active = None;
         let mut listener = Listener::default();
         let directory = tempfile::tempdir().unwrap();
         let (sender, queue) = mpsc::channel();
@@ -801,7 +1012,7 @@ mod tests {
             listener.hear_progress(moment, &mut emit);
         }
         listener.flush_progress(&mut emit);
-        assert!(active.is_empty(), "borrowed session survived final flush");
+        assert!(active.is_none(), "borrowed session survived final flush");
         let finished = owner.finished.borrow();
         assert_eq!(finished.len(), completed.len());
         for ((user, start, samples), &id) in completed.iter().zip(finished.iter()) {
