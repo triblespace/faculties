@@ -20,12 +20,19 @@
 //! it is. Before the first GUILD_CREATE nobody's coming or going can be
 //! told, and nothing is a change.
 //!
+//! A member is there with one voice session, and a client of theirs that
+//! comes back under a new one takes the member's place in the channel over:
+//! the end of the older session, which can be reported after the newer one
+//! began, is not their leaving, as it is not the bot's own (the voice
+//! connection's `VoiceJoin` passes it over the same way). Only the end of
+//! the session they are there with is, or an update that names none.
+//!
 //! What is known of who is there is the process's own, held only to tell
 //! the edges apart; the collection stores the changes, never a list of
 //! members ([`crate::discord::presence_fragment`]). The bot's own comings
 //! and goings, which the voice connection handles, are never a change.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use serde_json::Value;
@@ -40,8 +47,9 @@ pub struct Members {
     channel: u64,
     /// The bot's own user, from READY.
     bot: Option<u64>,
-    /// Who is in the channel, once the guild's GUILD_CREATE said who was.
-    present: Option<BTreeSet<u64>>,
+    /// Who is in the channel, with the voice session each is there with
+    /// when Discord named it, once the guild's GUILD_CREATE said who was.
+    present: Option<BTreeMap<u64, Option<String>>>,
 }
 
 impl Members {
@@ -71,8 +79,10 @@ impl Members {
                     states
                         .iter()
                         .filter(|state| snowflake(&state["channel_id"]) == Some(self.channel))
-                        .filter_map(|state| snowflake(&state["user_id"]))
-                        .filter(|user| Some(*user) != self.bot)
+                        .filter_map(|state| {
+                            Some((snowflake(&state["user_id"])?, voice_session(state)))
+                        })
+                        .filter(|(user, _)| Some(*user) != self.bot)
                         .collect()
                 });
                 None
@@ -84,17 +94,32 @@ impl Members {
                 }
                 let present = self.present.as_mut()?;
                 let here = snowflake(&d["channel_id"]) == Some(self.channel);
-                let presence = match (present.contains(&user), here) {
-                    (false, true) => {
-                        present.insert(user);
+                let session = voice_session(d);
+                let presence = match (present.get_mut(&user), here) {
+                    (None, true) => {
+                        present.insert(user, session);
                         Presence::Joined
                     }
-                    (true, false) => {
+                    // Still there, perhaps with a new voice session.
+                    (Some(known), true) => {
+                        if session.is_some() {
+                            *known = session;
+                        }
+                        return None;
+                    }
+                    // The end of a voice session the member is not there
+                    // with: an older one, which their newer one replaced.
+                    (Some(Some(known)), false)
+                        if session.as_ref().is_some_and(|session| *session != *known) =>
+                    {
+                        return None
+                    }
+                    (Some(_), false) => {
                         present.remove(&user);
                         Presence::Left
                     }
-                    // Still there, or still elsewhere.
-                    _ => return None,
+                    // Still elsewhere.
+                    (None, false) => return None,
                 };
                 Some(PresenceChange {
                     channel: self.channel,
@@ -118,6 +143,11 @@ fn name(user: &Value) -> Option<String> {
         .or_else(|| user["username"].as_str())
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
+}
+
+/// The voice session a voice state belongs to, when it names one.
+fn voice_session(state: &Value) -> Option<String> {
+    state["session_id"].as_str().map(str::to_owned)
 }
 
 fn snowflake(value: &Value) -> Option<u64> {
@@ -173,6 +203,12 @@ mod tests {
             "session_id": "s", "self_mute": mute, "self_deaf": false,
             "member": {"user": {"id": user.to_string(), "username": "ada", "global_name": "Ada"}},
         }})
+    }
+
+    /// `update` from the voice session `session`.
+    fn in_session(mut update: Value, session: &str) -> Value {
+        update["d"]["session_id"] = json!(session);
+        update
     }
 
     /// Each dispatch in turn, as (which dispatch, user, presence) for every
@@ -329,6 +365,37 @@ mod tests {
                 ]
             ),
             [(1, ADA, Presence::Joined)]
+        );
+    }
+
+    /// A member whose client comes back under a new voice session stays in
+    /// the channel, and the end of their older session, reported after the
+    /// new one, is not their leaving (nor, for the bot's own account, is it
+    /// the voice connection's: `voice::VoiceJoin`). Their leaving with the
+    /// session they are there with is. The older session ending before the
+    /// new one begins is what Discord says happened: a leave and a join.
+    #[test]
+    fn the_end_of_an_older_voice_session_is_not_a_leave() {
+        let mut members = members();
+        members.observe(&ready(), 0);
+        members.observe(&guild(&[(ADA, VOICE), (GRACE, VOICE)]), 0);
+        assert_eq!(
+            changes(
+                &mut members,
+                &[
+                    in_session(update(ADA, Some(VOICE), false), "a2"),
+                    in_session(update(ADA, None, false), "s"),
+                    in_session(update(ADA, Some(VOICE), true), "a2"),
+                    in_session(update(ADA, None, false), "a2"),
+                    in_session(update(GRACE, None, false), "s"),
+                    in_session(update(GRACE, Some(VOICE), false), "g2"),
+                ]
+            ),
+            [
+                (3, ADA, Presence::Left),
+                (4, GRACE, Presence::Left),
+                (5, GRACE, Presence::Joined),
+            ]
         );
     }
 }
