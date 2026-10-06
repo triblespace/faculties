@@ -12,7 +12,9 @@
 //! channel, and what is said there goes into the collection through intake.
 //! Who comes into and leaves the voice channel goes there too, with intake
 //! running: the session holds every member's voice state, and
-//! [`super::presence`] tells a join and a leave from the rest.
+//! [`super::presence`] tells a join and a leave from the rest. Discord
+//! refusing the message intents stops only messages: what is heard and who
+//! comes and goes need none of them.
 //!
 //! The process runs until the gateway session ends for good, the speech model
 //! cannot load or breaks, or it is asked to stop. Nothing else ends it:
@@ -21,7 +23,7 @@
 
 #[cfg(feature = "discord-voice")]
 use super::voice;
-use super::{gateway, intake};
+use super::{gateway, intake, presence};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::ffi::OsString;
@@ -110,15 +112,6 @@ pub async fn run(live: Live) -> Result<()> {
     let voiced = live.voice.is_some();
     #[cfg(not(feature = "discord-voice"))]
     let voiced = false;
-    // Hearing stores what it hears through intake, which therefore stays
-    // when Discord refuses the message intents; only messages stop.
-    #[cfg(feature = "discord-hearing")]
-    let hears = live
-        .voice
-        .as_ref()
-        .is_some_and(|voice| voice.hearing.is_some());
-    #[cfg(not(feature = "discord-hearing"))]
-    let hears = false;
     // A voice connection needs voice's intents and goes on without intake's
     // if Discord refuses them; without one, intake's are all the session is
     // for.
@@ -147,9 +140,16 @@ pub async fn run(live: Live) -> Result<()> {
     let mut members = live
         .voice
         .as_ref()
-        .map(|config| super::presence::Members::new(config.guild, config.channel));
+        .map(|config| presence::Members::new(config.guild, config.channel));
+    #[cfg(not(feature = "discord-voice"))]
+    let mut members: Option<presence::Members> = None;
     #[cfg(feature = "discord-voice")]
     let mut voice_task = live.voice.map(|config| {
+        // What is heard is stored through intake.
+        #[cfg(feature = "discord-hearing")]
+        let hears = config.hearing.is_some();
+        #[cfg(not(feature = "discord-hearing"))]
+        let hears = false;
         let heard = hears
             .then(|| intake.as_ref().and_then(intake::Worker::inbox))
             .flatten();
@@ -179,34 +179,11 @@ pub async fn run(live: Live) -> Result<()> {
                 };
             }
             Some(event) = discord.events.recv() => {
-                let dispatch = match event {
-                    gateway::Event::Refused(_) => {
-                        if hears {
-                            if let Some(worker) = &mut intake {
-                                eprintln!(
-                                    "[discord] message intake is off: Discord refused the \
-                                     message intents; what is heard is still stored"
-                                );
-                                worker.send(intake::Work::NoMessages);
-                            }
-                        } else if let Some(worker) = intake.take() {
-                            eprintln!("[discord] intake is off: Discord refused the message intents");
-                            tokio::spawn(worker.stop(INTAKE_DRAIN));
-                        }
-                        continue;
-                    }
-                    gateway::Event::Dispatch(dispatch) => dispatch,
-                };
                 if let Some(worker) = &mut intake {
-                    route(worker, &dispatch);
-                    #[cfg(feature = "discord-voice")]
-                    if let Some(change) = members.as_mut().and_then(|members| {
-                        members.observe(&dispatch, unix_ms(std::time::SystemTime::now()))
-                    }) {
-                        worker.send(intake::Work::Presence(change));
-                    }
+                    let now_ms = unix_ms(std::time::SystemTime::now());
+                    to_intake(worker, members.as_mut(), &event, now_ms);
                 }
-                if let Some(beside) = &voice_task {
+                if let (gateway::Event::Dispatch(dispatch), Some(beside)) = (event, &voice_task) {
                     let _ = beside.dispatches.send(dispatch);
                 }
             }
@@ -237,12 +214,42 @@ async fn finished(
 }
 
 /// Milliseconds since the Unix epoch at `time`.
-#[cfg(feature = "discord-voice")]
 fn unix_ms(time: std::time::SystemTime) -> u64 {
     time.duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| {
             u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+/// Hand intake its share of a gateway event: what [`route`] takes of a
+/// dispatch, and who comes into or leaves the voice channel by it, as
+/// `members` tells (seen at `now_ms`). Discord refusing the message intents
+/// stops messages and nothing else. It refuses them only to a session that
+/// also holds a voice connection, the one place they are optional, and
+/// everything intake stores of the voice channel, who comes and goes and
+/// what is heard, needs none of them.
+fn to_intake(
+    worker: &mut intake::Worker,
+    members: Option<&mut presence::Members>,
+    event: &gateway::Event,
+    now_ms: u64,
+) {
+    match event {
+        gateway::Event::Refused(_) => {
+            eprintln!(
+                "[discord] message intake is off: Discord refused the message intents; who \
+                 comes into and leaves the voice channel, and what is heard there, is still \
+                 stored"
+            );
+            worker.send(intake::Work::NoMessages);
+        }
+        gateway::Event::Dispatch(dispatch) => {
+            route(worker, dispatch);
+            if let Some(change) = members.and_then(|members| members.observe(dispatch, now_ms)) {
+                worker.send(intake::Work::Presence(change));
+            }
+        }
+    }
 }
 
 /// Hand what intake needs of a dispatch to it: messages, the bot's own user
@@ -282,18 +289,7 @@ mod tests {
         ] {
             route(&mut worker, &dispatch);
         }
-        let routed: Vec<String> = inbox
-            .try_iter()
-            .map(|work| match work {
-                intake::Work::Message(message) => format!("message {}", message["id"]),
-                intake::Work::Update(message) => format!("update {}", message["id"]),
-                intake::Work::Account(user) => format!("account {user}"),
-                intake::Work::Backfill => "backfill".to_owned(),
-                intake::Work::Utterance(_) => "utterance".to_owned(),
-                intake::Work::Presence(_) => "presence".to_owned(),
-                intake::Work::NoMessages => "no messages".to_owned(),
-            })
-            .collect();
+        let routed: Vec<String> = inbox.try_iter().map(described).collect();
         assert_eq!(
             routed,
             [
@@ -303,6 +299,56 @@ mod tests {
                 "update \"1\"",
                 "backfill"
             ]
+        );
+    }
+
+    /// Work handed to intake, as a test compares it.
+    fn described(work: intake::Work) -> String {
+        match work {
+            intake::Work::Message(message) => format!("message {}", message["id"]),
+            intake::Work::Update(message) => format!("update {}", message["id"]),
+            intake::Work::Account(user) => format!("account {user}"),
+            intake::Work::Backfill => "backfill".to_owned(),
+            intake::Work::Utterance(_) => "utterance".to_owned(),
+            intake::Work::Presence(change) => {
+                format!(
+                    "{} {} {}",
+                    change.user,
+                    change.presence.verb(),
+                    change.channel
+                )
+            }
+            intake::Work::NoMessages => "no messages".to_owned(),
+        }
+    }
+
+    /// Discord refusing the message intents stops messages, and never who
+    /// comes into and leaves the voice channel, which needs none of them:
+    /// intake stays for that, whether or not the channel is heard.
+    #[test]
+    fn who_comes_and_goes_is_still_stored_once_the_message_intents_are_refused() {
+        use std::num::NonZeroU64;
+        let (sender, inbox) = std::sync::mpsc::channel();
+        let mut worker = intake::Worker::from_sender(sender);
+        let mut members =
+            presence::Members::new(NonZeroU64::new(300).unwrap(), NonZeroU64::new(201).unwrap());
+        for event in [
+            gateway::Event::Refused(4014),
+            gateway::Event::Dispatch(json!({"t": "READY", "d": {"user": {"id": "900"}}})),
+            gateway::Event::Dispatch(json!({"t": "GUILD_CREATE", "d": {
+                "id": "300",
+                "voice_states": [{"user_id": "900", "channel_id": "201", "session_id": "b"}],
+            }})),
+            gateway::Event::Dispatch(json!({"t": "VOICE_STATE_UPDATE", "d": {
+                "guild_id": "300", "channel_id": "201", "user_id": "400", "session_id": "s",
+            }})),
+        ] {
+            to_intake(&mut worker, Some(&mut members), &event, 7);
+        }
+        let routed: Vec<String> = inbox.try_iter().map(described).collect();
+        assert_eq!(
+            routed,
+            ["no messages", "account 900", "backfill", "400 joined 201"]
         );
     }
 
