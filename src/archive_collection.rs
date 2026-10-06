@@ -73,11 +73,11 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
 /// Commits a writer publishes between two carries of its own source.
 ///
 /// Every commit is a frontier node of its own until a carry joins it, and
-/// each commit's attachment pass and fact read-back cost grows with the
-/// frontier, so a writer that never carried paid more for every commit than
-/// for the one before and left the whole carry to the next process to open
-/// the pile. The carry is the one [`ArchiveImportWriter::prepare`] runs at
-/// open.
+/// each commit's attachment pass, and each read of the facts back, costs
+/// more the wider the frontier, so a writer that never carried paid more for
+/// every commit than for the one before and left the whole carry to the next
+/// process to open the pile. The carry is the one
+/// [`ArchiveImportWriter::prepare`] runs at open.
 ///
 /// Sixteen is measured, not derived (sky, shared GB10; one process importing
 /// hard-linked Codex rollouts into a fresh pile; mean wall time per
@@ -88,7 +88,23 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
 /// 32, against 278-330 ms. Below the optimum a carry pass costs more than the
 /// frontier it removes; above it the frontier costs more. The optimum is
 /// flat from 4 to 16; sixteen is its upper edge, which leaves room for a
-/// pass that costs more on a larger pile.
+/// pass that costs more on a larger pile. The sweep ran on fresh piles that
+/// never held more than 1,000 commits, with the facts read back whole after
+/// every commit, which [`ArchiveImportWriter::commit_unit`] now does once
+/// per carry.
+///
+/// The sweep weighed wall time only; the cadence also costs pile bytes.
+/// Each carry attaches every node it leaves on the frontier, merged nodes
+/// included, and a later carry of the same writer joins most tier-one merged
+/// nodes into a tier-two one. Their Succinct and Rank9 attachments are not
+/// read again, and they stay in the pile until a compaction. A writer that
+/// never carried left its merging to the next open, which attaches only the
+/// frontier it ends with. Measured in review (sky, shared GB10): one writer
+/// importing 3,000 synthetic Claude Code sessions into a fresh pile left 311
+/// attached merged nodes that a later carry consumed, whose attachments hold
+/// 102.8 MB of the pile's 1,171.5 MB of blob bytes (8.8%), against 74.3 MB
+/// attached to the 18 nodes of the final frontier. Two writers over 1,982
+/// real Claude Code sessions: 48.6 MB of 573.8 MB (8.5%).
 const CARRY_EVERY: usize = 16;
 
 #[cfg(test)]

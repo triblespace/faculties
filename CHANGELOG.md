@@ -39,7 +39,11 @@ All notable changes to this project will be documented in this file.
   timed as whole-process CPU, 55-67 s against 63-73 s, overlap on this
   shared machine). Into a fresh pile both take 11.3-11.6 s. The attachment
   pass after each commit still grows with the commits held: 30% of the same
-  profile.
+  profile. Carrying inside the writer also costs pile bytes: each carry
+  attaches the merged nodes it leaves on the frontier, and those a later
+  carry joins keep attachments nothing reads until a compaction, 8.5-8.8% of
+  blob bytes in two scratch imports (1,982 and 3,000 sessions), where the
+  next open used to attach only the frontier it ended with.
 - `archive import --source codex` projects the 2026-09 rollout format
   (`event_msg/item_completed` with `UserMessage`, `AgentMessage` and
   `Reasoning` items) into the same content facts as the older
