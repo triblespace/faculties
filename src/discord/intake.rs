@@ -49,12 +49,18 @@
 //! transcript) and `.wav` (the audio), and never fetched again: Discord has no
 //! copy of it.
 //!
+//! Who comes into and leaves the voice channel comes here too
+//! ([`Work::Presence`], told apart by [`super::presence`]), and is stored as a
+//! system notice in that channel, heard from the same floor as what is said
+//! there. A change whose write fails is logged and lost: Discord keeps no
+//! record of it to fetch again, and the next one stands on its own.
+//!
 //! The pile and the downloads block, so intake runs on a thread of its own,
 //! and nothing that happens there reaches the rest of the process: every
 //! failure is logged, a panic included, and the work goes on.
 
 use super::gateway::{DIRECT_MESSAGES, GUILD_MESSAGES, MESSAGE_CONTENT};
-use crate::discord::{Discord, Source, Utterance, DISCORD_EPOCH_MS};
+use crate::discord::{Discord, PresenceChange, Source, Utterance, DISCORD_EPOCH_MS};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -117,6 +123,8 @@ pub enum Work {
     Backfill,
     /// Something said in the voice channel, transcribed.
     Utterance(Utterance),
+    /// Somebody came into or left the voice channel.
+    Presence(PresenceChange),
     /// Discord refused the message intents while hearing goes on: no more
     /// messages are stored, nor channels pulled (their content would be
     /// empty); utterances still are.
@@ -205,6 +213,11 @@ impl Intake {
             }
             Work::Backfill => Ok(self.backfill()),
             Work::Utterance(utterance) => self.utterance(utterance),
+            Work::Presence(change) => {
+                let floor = self.keep_floor(VOICE, change.channel, self.floor)?;
+                self.discord.observe_presence(&change, floor)?;
+                Ok(Done::Stored)
+            }
             Work::NoMessages => {
                 self.channels.clear();
                 self.dms = false;
@@ -739,6 +752,13 @@ pub fn start(mut intake: Intake) -> Worker {
                         utterance.transcript.chars().count(),
                         utterance.wav.len()
                     ),
+                    Work::Presence(change) => format!(
+                        "that user {} {} voice channel {} at {} ms",
+                        change.user,
+                        change.presence.verb(),
+                        change.channel,
+                        change.seen_ms
+                    ),
                 };
                 // An utterance is kept should storing it panic: nothing can
                 // fetch it again.
@@ -746,6 +766,8 @@ pub fn start(mut intake: Intake) -> Worker {
                     Work::Utterance(utterance) => Some(utterance.clone()),
                     _ => None,
                 };
+                // Nothing fetches a presence change again either; it is lost.
+                let presence = matches!(work, Work::Presence(_));
                 let handled =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| intake.handle(work)));
                 match handled {
@@ -778,6 +800,9 @@ pub fn start(mut intake: Intake) -> Worker {
                              {UNSTORED_SPEECH}/"
                         );
                     }
+                    Ok(Err(error)) if presence => {
+                        eprintln!("[discord] storing {what} failed: {error:#}; it is lost");
+                    }
                     Ok(Err(error)) => {
                         eprintln!(
                             "[discord] storing {what} failed: {error:#}; a backfill fetches it \
@@ -791,6 +816,7 @@ pub fn start(mut intake: Intake) -> Worker {
                             Some(utterance) => {
                                 keep_utterance(&intake.directory.join(UNSTORED_SPEECH), &utterance)
                             }
+                            None if presence => {}
                             None => retry.soon(Instant::now()),
                         }
                     }
@@ -2353,6 +2379,85 @@ mod tests {
             std::fs::read_dir(&kept).unwrap().count(),
             2,
             "nothing half kept"
+        );
+    }
+
+    /// Somebody coming into or leaving the voice channel is stored there,
+    /// once however often it comes, heard from the floor utterances are, and
+    /// `discord read` presents it as what happened, beside what was said
+    /// there: never as something the member said or wrote.
+    #[test]
+    fn a_presence_change_is_stored_and_read_as_an_event() {
+        use crate::discord::{render, Presence, PresenceChange};
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[], false);
+        let voice = CHANNEL + 5;
+        let user = AUTHOR.parse().unwrap();
+        let change = |presence, seen_ms| PresenceChange {
+            channel: voice,
+            user,
+            name: Some("Ada".to_owned()),
+            presence,
+            seen_ms,
+        };
+        let joined = change(Presence::Joined, 1_790_000_000_000);
+        for _ in 0..2 {
+            assert_eq!(
+                intake.handle(Work::Presence(joined.clone())).unwrap(),
+                Done::Stored
+            );
+        }
+        let utterance = Utterance {
+            channel: voice,
+            user,
+            start_ms: 1_790_000_001_000,
+            transcript: "can you hear me?".to_owned(),
+            wav: b"RIFF and the rest".to_vec(),
+        };
+        assert_eq!(
+            intake.handle(Work::Utterance(utterance)).unwrap(),
+            Done::Stored
+        );
+        assert_eq!(
+            intake
+                .handle(Work::Presence(change(Presence::Left, 1_790_000_002_000)))
+                .unwrap(),
+            Done::Stored
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.state.join(VOICE).join(voice.to_string())).unwrap(),
+            FLOOR.to_string(),
+            "the voice channel is heard from where intake began"
+        );
+
+        let history = fixture
+            .discord
+            .read(ReadOptions {
+                channel_id: Some(voice.to_string()),
+                limit: 0,
+                ..ReadOptions::default()
+            })
+            .unwrap();
+        let mut rendered = String::new();
+        let mut collect = |part: crate::out::Part| -> Result<()> {
+            if let crate::out::Part::Text { text } = part {
+                rendered.push_str(&text);
+            }
+            Ok(())
+        };
+        render::history(&history, &mut crate::out::Out::new(&mut collect)).unwrap();
+        let lines: Vec<&str> = rendered
+            .lines()
+            .map(|line| line.split_once("] ").unwrap().1)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Ada joined the voice channel",
+                "Ada: can you hear me?",
+                "Ada left the voice channel",
+            ],
+            "{rendered}"
         );
     }
 

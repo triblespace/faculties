@@ -12,7 +12,9 @@
 //! joins a voice channel through the same session to speak what `discord say`
 //! queues; with the `discord-hearing` feature it also hears everybody else
 //! there ([`hearing`]), and stores what each says, transcript and audio, as
-//! messages in the voice channel ([`utterance_fragment`]).
+//! messages in the voice channel ([`utterance_fragment`]). Who comes into
+//! and leaves the voice channel ([`presence`]) is stored there too, as
+//! system notices ([`presence_fragment`]).
 
 pub mod cli;
 pub mod gateway;
@@ -22,14 +24,15 @@ pub mod intake;
 pub mod live;
 pub mod mcp;
 pub mod operations;
+pub mod presence;
 pub mod render;
 #[cfg(feature = "discord-voice")]
 pub mod voice;
 
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
-    ObservedMessage, PageRequest, PullOptions, PullReport, ReadOptions, Rest, SendReceipt, Source,
-    Utterance,
+    ObservedMessage, PageRequest, PresenceChange, PullOptions, PullReport, ReadOptions, Rest,
+    SendReceipt, Source, Utterance,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -109,6 +112,87 @@ pub fn utterance_fragment(
         archive::content: transcript.to_owned(),
         metadata::created_at: start,
         discord::utterance_audio: audio,
+    };
+    Ok(fragment)
+}
+
+/// Somebody coming into or leaving a voice channel: what a presence notice
+/// says happened ([`presence_fragment`]).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Presence {
+    Joined,
+    Left,
+}
+
+impl Presence {
+    /// The tag of the notice's anchor.
+    pub fn tag(self) -> Id {
+        match self {
+            Self::Joined => discord::kind_voice_joined,
+            Self::Left => discord::kind_voice_left,
+        }
+    }
+
+    /// What the member did, as a reader presents it: "<name> joined the
+    /// voice channel", never as something they said or wrote.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Joined => "joined",
+            Self::Left => "left",
+        }
+    }
+}
+
+/// Somebody coming into or leaving a voice channel, as a system notice
+/// there: the stable anchor of who came or went in which channel, seen when
+/// (tagged [`Presence::tag`], since no snowflake names it), the observation
+/// that makes it a message in the channel by that user with no content, and
+/// the mark that it is a notice, not something the user said or wrote
+/// ([`discord::kind_system_notice`]). `seen` is when it was seen, as the
+/// point interval a message's `metadata::created_at` is. With the user's
+/// name as Discord gave it, when it did, as a profile like a message
+/// author's, and the channel and user anchors, so the fragment stands on its
+/// own.
+pub fn presence_fragment(
+    channel_external_id: &str,
+    user_external_id: &str,
+    name: Option<&str>,
+    presence: Presence,
+    seen: Inline<NsTAIInterval>,
+) -> Result<Fragment> {
+    let mut fragment = channel_fragment(channel_external_id)?;
+    let channel = fragment.root().expect("intrinsic channel has one root");
+    let member = user_fragment(user_external_id)?;
+    let user = member.root().expect("intrinsic user anchor has one root");
+    fragment += member;
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        fragment += entity! { _ @
+            metadata::tag: discord::kind_user_profile,
+            discord::user: user,
+            archive::author_name: name.to_owned(),
+        };
+    }
+    let anchor = entity! { _ @
+        metadata::tag: presence.tag(),
+        discord::channel: channel,
+        discord::user: user,
+        metadata::created_at: seen,
+    };
+    let notice = anchor
+        .root()
+        .expect("intrinsic presence anchor has one root");
+    fragment += anchor;
+    fragment += entity! { _ @
+        metadata::tag: archive::kind_message,
+        discord::message: notice,
+        discord::channel: channel,
+        archive::author: user,
+        archive::content: String::new(),
+        metadata::created_at: seen,
+    };
+    fragment += entity! { _ @
+        metadata::tag: discord::kind_system_notice,
+        discord::message: notice,
     };
     Ok(fragment)
 }
@@ -298,8 +382,8 @@ where
             pattern!(facts, [{ anchor @ discord::message_id: ?handle }])
         )
         .collect::<BTreeSet<_>>();
-        // An anchor no snowflake names (an utterance's) has no message id to
-        // check: it is passed over, not refused.
+        // An anchor no snowflake names (an utterance's, a presence notice's)
+        // has no message id to check: it is passed over, not refused.
         if handles.is_empty() {
             continue;
         }
@@ -433,6 +517,10 @@ pub struct SelectedMessageVersion {
     pub channel: Id,
     pub reply_to: Option<Id>,
     pub attachments: BTreeSet<Id>,
+    /// Somebody coming into or leaving a voice channel, when the message is
+    /// that notice ([`presence_fragment`]): what to present instead of its
+    /// (empty) content.
+    pub presence: Option<Presence>,
     pub variant_index: usize,
     pub variant_count: usize,
 }
@@ -522,6 +610,17 @@ where
             .insert(attachment);
     }
 
+    let mut presences: BTreeMap<Id, Presence> = BTreeMap::new();
+    for presence in [Presence::Joined, Presence::Left] {
+        let tag = presence.tag();
+        for anchor in find!(
+            anchor: Id,
+            pattern!(facts, [{ ?anchor @ metadata::tag: &tag }])
+        ) {
+            presences.insert(anchor, presence);
+        }
+    }
+
     let mut by_anchor: BTreeMap<Id, BTreeMap<SemanticState, BTreeSet<Id>>> = BTreeMap::new();
     for (observation, candidates) in required {
         if candidates.len() != 1 {
@@ -590,6 +689,7 @@ where
                 channel: state.fields.channel,
                 reply_to: state.reply_to,
                 attachments: state.attachments,
+                presence: presences.get(&anchor).copied(),
                 variant_index,
                 variant_count,
             });

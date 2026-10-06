@@ -29,6 +29,11 @@
 //! carries the transcript as content and the audio beside it
 //! ([`discord::utterance_audio`]).
 //!
+//! Somebody coming into or leaving that voice channel is a system notice
+//! there: a message by them with no content, marked as a notice, whose
+//! anchor says which it is ([`discord::kind_voice_joined`],
+//! [`discord::kind_voice_left`]: who, in which channel, seen when).
+//!
 //! Coverage says what is stored, not what was heard: `discord read` brings a
 //! channel's history in with the same observations `discord live`'s intake
 //! stores. Where a channel's live intake begins is therefore a fact of its
@@ -199,4 +204,24 @@ pub mod discord {
     /// `3D20B9F91AE85C3778B71123578F1599`.
     #[allow(non_upper_case_globals)]
     pub const kind_utterance: Id = id_hex!("3D20B9F91AE85C3778B71123578F1599");
+    /// Tag for the stable anchor of somebody coming into a voice channel:
+    /// who ([`user`]) came into which [`channel`], seen when
+    /// (`metadata::created_at`). Like an utterance's, it is a message anchor
+    /// no Discord message id names. Its observation is a message by that
+    /// user with no content, marked a system notice ([`kind_system_notice`]),
+    /// so a reader that does not know this tag passes it over as it passes
+    /// over a member joining the server, and one that does presents it as
+    /// the event it is, never as something the member said or wrote.
+    ///
+    /// Minted with `trible genid` on 2026-10-06:
+    /// `F4134A58DF84885EF016676BE95925B5`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_voice_joined: Id = id_hex!("F4134A58DF84885EF016676BE95925B5");
+    /// Tag for the stable anchor of somebody leaving a voice channel, as
+    /// [`kind_voice_joined`] is for coming into one.
+    ///
+    /// Minted with `trible genid` on 2026-10-06:
+    /// `9C753182D87C69EBC51E7265358D98C3`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_voice_left: Id = id_hex!("9C753182D87C69EBC51E7265358D98C3");
 }

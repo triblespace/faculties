@@ -1877,7 +1877,9 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
 /// and `discord send` record; a message edited or observed again is the same
 /// anchor, so it is news once. As with Teams, news is somebody writing: a
 /// system notice (a pin, a member joining) is not, though Discord gives it an
-/// author.
+/// author. One notice is news all the same: somebody coming into or leaving
+/// the voice channel `discord live` is in, which a window wants to know of as
+/// it wants to know what is said there.
 ///
 /// And news is what was heard: a message sent in a channel at or after the
 /// moment `discord live`'s intake hears the channel from, which intake
@@ -1897,6 +1899,14 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
         }])
     )
     .collect();
+    let presence: BTreeSet<Id> = find!(
+        anchor: Id,
+        or!(
+            pattern!(query.discord, [{ ?anchor @ metadata::tag: discord::kind_voice_joined }]),
+            pattern!(query.discord, [{ ?anchor @ metadata::tag: discord::kind_voice_left }]),
+        )
+    )
+    .collect();
     let notices: BTreeSet<Id> = find!(
         anchor: Id,
         pattern!(query.discord, [{
@@ -1905,6 +1915,7 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
             discord::message: ?anchor,
         }])
     )
+    .filter(|anchor| !presence.contains(anchor))
     .collect();
     find!(
         (anchor: Id, author: Id, created: IntervalValue, heard: IntervalValue),
@@ -1946,6 +1957,9 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
 struct DiscordMessageDetail {
     author: String,
     channel: String,
+    /// Somebody coming into or leaving the voice channel, when the message is
+    /// that notice: presented as the event, never as its (empty) content.
+    presence: Option<discord_model::Presence>,
     versions: Vec<DiscordVersion>,
     /// The distinct attachment entities of those versions.
     attachments: usize,
@@ -2140,9 +2154,19 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
         .len();
     let mut versions: Vec<DiscordVersion> = versions.into_values().collect();
     versions.sort();
+    let presence = [
+        discord_model::Presence::Joined,
+        discord_model::Presence::Left,
+    ]
+    .into_iter()
+    .find(|presence| {
+        let tag = presence.tag();
+        exists!(pattern!(query.discord, [{ anchor @ metadata::tag: &tag }]))
+    });
     Ok(DiscordMessageDetail {
         author,
         channel,
+        presence,
         versions,
         attachments,
     })
@@ -2152,7 +2176,17 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
 /// channel and whole text, which of how many versions at the newest time it
 /// is when there are more, and per attachment the `files get` that writes its
 /// stored bytes out, or the size Discord declared for one too large to store.
+/// Somebody coming into or leaving the voice channel is printed as that
+/// event, never as text they wrote.
 fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion) -> String {
+    if let Some(presence) = detail.presence {
+        return format!(
+            "- {} {} the voice channel {}\n",
+            detail.author,
+            presence.verb(),
+            detail.channel
+        );
+    }
     let count = detail.versions.len();
     let of = if count > 1 {
         format!(" (one of {count} versions with the same time)")
@@ -2183,10 +2217,20 @@ fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion)
 
 /// `Discord message from <author> in channel <id>: <first line>`, and how
 /// many attachments come with it (and how many versions, when Discord gave
-/// more than one the same time). Best effort, like every News line: a body
-/// not yet here only shortens the line; the detail below waits for it.
+/// more than one the same time); for somebody coming into or leaving the
+/// voice channel, `Discord: <name> joined the voice channel <id>` (or left).
+/// Best effort, like every News line: a body not yet here only shortens the
+/// line; the detail below waits for it.
 fn discord_news_line(query: &OrientQuery<'_>, anchor: Id) -> Option<String> {
     let detail = discord_message_detail(query, anchor).ok()?;
+    if let Some(presence) = detail.presence {
+        return Some(format!(
+            "Discord: {} {} the voice channel {}",
+            detail.author,
+            presence.verb(),
+            detail.channel
+        ));
+    }
     let mut line = format!(
         "Discord message from {} in channel {}",
         detail.author, detail.channel
@@ -8990,5 +9034,135 @@ mod tests {
         });
         assert_eq!(handles.len(), 1, "one observation carries the audio");
         assert_eq!(audio, Some(wav));
+    }
+
+    /// Somebody coming into or leaving the voice channel is stored through
+    /// intake as a notice in that channel, and is news to the same reader
+    /// that takes what is said there for news: presented as what happened,
+    /// never as something the member said or wrote, and once.
+    #[test]
+    fn a_voice_join_and_leave_are_news_like_an_utterance() {
+        use crate::discord::intake::{floor_at, Done, Intake, Work};
+        use crate::discord::{Presence, PresenceChange, Utterance};
+        crate::test_support::clear_ambient_environment();
+        let runtime = runtime().unwrap();
+        let fixture = TestPile::new();
+        let key = fixture.dir.join("discord.key");
+        let signer = crate::storage::initialize_signer(&fixture.path, Some(&key)).unwrap();
+        let discord = crate::discord::Discord::new(fixture.path.clone(), Some(key));
+        let reader_id = id(95);
+        runtime.block_on(async {
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&mut pile, &signer, false)
+                .await
+                .unwrap();
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &signer, profile)
+                .unwrap();
+            pile.close().unwrap();
+        });
+
+        let mut intake = Intake::new(
+            discord,
+            Box::new(DiscordFake::default()),
+            Vec::new(),
+            false,
+            fixture.dir.join("intake"),
+            floor_at(UNIX_EPOCH + Duration::from_millis(1_790_455_273_191)),
+        );
+        let voice = 100000000000000201_u64;
+        let member = 100000000000000400_u64;
+        let change = |presence, seen_ms| PresenceChange {
+            channel: voice,
+            user: member,
+            name: Some("Ada".to_owned()),
+            presence,
+            seen_ms,
+        };
+        assert_eq!(
+            intake
+                .handle(Work::Presence(change(Presence::Joined, 1_790_455_300_000)))
+                .unwrap(),
+            Done::Stored
+        );
+        let utterance = Utterance {
+            channel: voice,
+            user: member,
+            start_ms: 1_790_455_301_000,
+            transcript: "can you hear me?".to_owned(),
+            wav: b"RIFF and the samples".to_vec(),
+        };
+        assert_eq!(
+            intake.handle(Work::Utterance(utterance)).unwrap(),
+            Done::Stored
+        );
+        let news_lines = |text: &str| -> Vec<String> {
+            let mut lines: Vec<String> = text
+                .lines()
+                .filter(|line| line.starts_with("News: "))
+                .map(str::to_owned)
+                .collect();
+            lines.sort();
+            lines
+        };
+
+        let News::Report { text, events } =
+            runtime.block_on(take_news(&fixture.path, &signer, reader_id))
+        else {
+            panic!("somebody joining the voice channel is news");
+        };
+        assert_eq!(events.len(), 2, "{text}");
+        assert_eq!(
+            news_lines(&text),
+            [
+                format!("News: Discord message from Ada in channel {voice}: can you hear me?"),
+                format!("News: Discord: Ada joined the voice channel {voice}"),
+            ],
+            "{text}"
+        );
+        assert!(text.contains("\nNew Discord messages:\n"), "{text}");
+        for detail in [
+            format!("\n- Ada joined the voice channel {voice}\n"),
+            format!("\n- Ada in channel {voice}: can you hear me?\n"),
+        ] {
+            assert!(text.contains(&detail), "{text}");
+        }
+        assert!(
+            !text.contains(&format!("- Ada in channel {voice}: \n")),
+            "{text}"
+        );
+
+        // Leaving is news of its own; what was presented is not news again.
+        assert_eq!(
+            intake
+                .handle(Work::Presence(change(Presence::Left, 1_790_455_302_000)))
+                .unwrap(),
+            Done::Stored
+        );
+        let News::Report { text, events } =
+            runtime.block_on(take_news(&fixture.path, &signer, reader_id))
+        else {
+            panic!("somebody leaving the voice channel is news");
+        };
+        assert_eq!(events.len(), 1, "{text}");
+        assert_eq!(
+            news_lines(&text),
+            [format!("News: Discord: Ada left the voice channel {voice}")],
+            "{text}"
+        );
+        assert!(
+            matches!(
+                runtime.block_on(take_news(&fixture.path, &signer, reader_id)),
+                News::Quiet
+            ),
+            "a presented change repeated"
+        );
     }
 }

@@ -10,6 +10,9 @@
 //! session and speaks what `discord say` queues in the state directory; with
 //! the `discord-hearing` feature and a model to hear with, it also hears the
 //! channel, and what is said there goes into the collection through intake.
+//! Who comes into and leaves the voice channel goes there too, with intake
+//! running: the session holds every member's voice state, and
+//! [`super::presence`] tells a join and a leave from the rest.
 //!
 //! The process runs until the gateway session ends for good, the speech model
 //! cannot load or breaks, or it is asked to stop. Nothing else ends it:
@@ -139,6 +142,12 @@ pub async fn run(live: Live) -> Result<()> {
         gateway: gateway::GATEWAY.to_owned(),
         backoff: gateway::BACKOFF,
     });
+    // Who is in the voice channel, to tell joins and leaves apart.
+    #[cfg(feature = "discord-voice")]
+    let mut members = live
+        .voice
+        .as_ref()
+        .map(|config| super::presence::Members::new(config.guild, config.channel));
     #[cfg(feature = "discord-voice")]
     let mut voice_task = live.voice.map(|config| {
         let heard = hears
@@ -190,6 +199,12 @@ pub async fn run(live: Live) -> Result<()> {
                 };
                 if let Some(worker) = &mut intake {
                     route(worker, &dispatch);
+                    #[cfg(feature = "discord-voice")]
+                    if let Some(change) = members.as_mut().and_then(|members| {
+                        members.observe(&dispatch, unix_ms(std::time::SystemTime::now()))
+                    }) {
+                        worker.send(intake::Work::Presence(change));
+                    }
                 }
                 if let Some(beside) = &voice_task {
                     let _ = beside.dispatches.send(dispatch);
@@ -219,6 +234,15 @@ async fn finished(
         Some(beside) => (&mut beside.task).await,
         None => std::future::pending().await,
     }
+}
+
+/// Milliseconds since the Unix epoch at `time`.
+#[cfg(feature = "discord-voice")]
+fn unix_ms(time: std::time::SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Hand what intake needs of a dispatch to it: messages, the bot's own user
@@ -266,6 +290,7 @@ mod tests {
                 intake::Work::Account(user) => format!("account {user}"),
                 intake::Work::Backfill => "backfill".to_owned(),
                 intake::Work::Utterance(_) => "utterance".to_owned(),
+                intake::Work::Presence(_) => "presence".to_owned(),
                 intake::Work::NoMessages => "no messages".to_owned(),
             })
             .collect();

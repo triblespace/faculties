@@ -157,6 +157,9 @@ pub struct ObservedMessage {
     pub content: String,
     pub reply_to: Option<Id>,
     pub attachments: BTreeSet<Id>,
+    /// Somebody coming into or leaving a voice channel, when the message is
+    /// that notice: presented as the event, never as its (empty) content.
+    pub presence: Option<discord_model::Presence>,
     pub variant_index: usize,
     pub variant_count: usize,
 }
@@ -192,9 +195,38 @@ impl Utterance {
     /// When it began, as the point interval a message's
     /// `metadata::created_at` is.
     pub fn started(&self) -> Inline<NsTAIInterval> {
-        let moment = Epoch::from_unix_duration(hifitime::Unit::Millisecond * self.start_ms as i64);
-        epoch_interval(moment)
+        unix_millisecond(self.start_ms)
     }
+}
+
+/// Somebody coming into or leaving a voice channel, as `discord live` sees
+/// the members of its own ([`super::presence::Members`]); stored as a system
+/// notice there ([`Discord::observe_presence`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PresenceChange {
+    pub channel: u64,
+    pub user: u64,
+    /// The user's name as Discord gave it with the change, when it did.
+    pub name: Option<String>,
+    pub presence: discord_model::Presence,
+    /// When it was seen, in milliseconds since the Unix epoch: Discord does
+    /// not say when a voice state changed.
+    pub seen_ms: u64,
+}
+
+impl PresenceChange {
+    /// When it was seen, as the point interval a message's
+    /// `metadata::created_at` is.
+    pub fn seen(&self) -> Inline<NsTAIInterval> {
+        unix_millisecond(self.seen_ms)
+    }
+}
+
+/// A moment in milliseconds since the Unix epoch, as a point interval.
+fn unix_millisecond(milliseconds: u64) -> Inline<NsTAIInterval> {
+    epoch_interval(Epoch::from_unix_duration(
+        hifitime::Unit::Millisecond * milliseconds as i64,
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -382,6 +414,35 @@ impl Discord {
                 "discord: heard user {} in voice channel {channel} at {}",
                 utterance.user,
                 format_interval(utterance.started())
+            ),
+        )
+    }
+    /// Store somebody coming into or leaving a voice channel as a system
+    /// notice there ([`discord_model::presence_fragment`]). `floor` is where
+    /// intake hears the channel from, recorded in the same commit as
+    /// [`Self::observe_utterance`] records it, so readers take the notice for
+    /// news. The same change stored again converges on the same notice.
+    pub fn observe_presence(
+        &self,
+        change: &PresenceChange,
+        floor: u64,
+    ) -> Result<CollectionCommit> {
+        let channel = change.channel.to_string();
+        let mut fragment = discord_model::presence_fragment(
+            &channel,
+            &change.user.to_string(),
+            change.name.as_deref(),
+            change.presence,
+            change.seen(),
+        )?;
+        fragment += discord_model::intake_fragment(&channel, floor)?;
+        self.storage().publish(
+            fragment,
+            format!(
+                "discord: user {} {} voice channel {channel} at {}",
+                change.user,
+                change.presence.verb(),
+                format_interval(change.seen())
             ),
         )
     }
@@ -1473,6 +1534,7 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
             content,
             reply_to: message.reply_to,
             attachments: message.attachments,
+            presence: message.presence,
             variant_index: message.variant_index,
             variant_count: message.variant_count,
         });

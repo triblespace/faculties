@@ -39,11 +39,16 @@ pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
         } else {
             String::new()
         };
+        // Somebody coming into or leaving a voice channel is an event, never
+        // something they said or wrote.
+        let said = match message.presence {
+            Some(presence) => format!(" {} the voice channel", presence.verb()),
+            None => format!(": {}", message.content),
+        };
         out.line(format!(
-            "[{}]{channel}{edited}{conflict} {}: {}",
+            "[{}]{channel}{edited}{conflict} {}{said}",
             format_interval(message.created_at),
             message.author,
-            message.content
         ))?;
     }
     Ok(())
