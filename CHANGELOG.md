@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient can observe saved native service failures from an explicitly admitted
+  metrics root (`--service-events-collection` or
+  `TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION`). Alerts use shared safe cause
+  codes and exact Presented receipts, not raw errors or a restart policy.
 - Memory and Wiki search in the same WeMM space as Files. `memory index`
   (formerly `memory embed`) derives an index over the journal's
   `ctx::summary` prose and `ctx::image` pictures, `wiki index` (formerly

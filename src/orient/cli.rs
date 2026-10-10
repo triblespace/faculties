@@ -8,6 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
+use triblespace::core::collection::records::CollectionHandle;
 
 #[path = "callback.rs"]
 mod callback;
@@ -39,6 +40,16 @@ pub struct Cli {
         value_name = "SECONDS"
     )]
     health_max_age: u64,
+    /// Exact admitted metrics descriptor containing native service events.
+    /// Optional: no metrics root is created or inferred when absent.
+    #[arg(
+        long,
+        global = true,
+        env = "TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION",
+        value_name = "COLLECTION",
+        value_parser = parse_service_events_collection
+    )]
+    service_events_collection: Option<CollectionHandle>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -180,6 +191,16 @@ fn parse_positive_duration(raw: &str) -> Result<Duration, String> {
     Ok(value)
 }
 
+fn parse_service_events_collection(raw: &str) -> Result<CollectionHandle, String> {
+    let raw = raw.strip_prefix("blake3:").unwrap_or(raw);
+    let mut bytes = [0_u8; 32];
+    hex::decode_to_slice(raw, &mut bytes).map_err(|_| {
+        "service-events collection must be one exact 64-digit hexadecimal descriptor handle"
+            .to_owned()
+    })?;
+    Ok(triblespace::prelude::Inline::new(bytes))
+}
+
 pub(super) fn parse_wait_target(target: Option<&WaitTarget>) -> Result<Option<Duration>> {
     let Some(target) = target else {
         return Ok(None);
@@ -290,8 +311,11 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
         out.line(Cli::command().render_help().to_string())?;
         return Ok(());
     };
-    let orient =
+    let mut orient =
         Orient::new(cli.pile, cli.key).with_health_max_age(Duration::from_secs(cli.health_max_age));
+    if let Some(collection) = cli.service_events_collection {
+        orient = orient.with_service_events_collection(collection);
+    }
     match command {
         Command::Show {
             message_limit,

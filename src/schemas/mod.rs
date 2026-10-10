@@ -25,6 +25,7 @@ pub mod posture;
 pub mod reason;
 pub mod relations;
 pub mod selfimage;
+pub mod service_events;
 pub mod status;
 /// Local daemon observations share their schema with the Core publisher.
 pub use triblespace_net::health_record as swarm_health;

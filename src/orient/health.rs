@@ -14,6 +14,7 @@ pub(super) struct HealthSources {
     health: OrientSource,
     latest: Collection<LwwRegisterBlob>,
     relations: OrientSource,
+    service_events: Option<OrientSource>,
     pub(super) presentations: ReceiptSource,
     max_age: Duration,
     // The prefix before successful health upkeep and an optional receipt
@@ -60,6 +61,7 @@ impl HealthSources {
             health,
             latest,
             relations,
+            service_events: None,
             presentations,
             max_age,
             maintained_view: None,
@@ -72,6 +74,18 @@ impl HealthSources {
         })
     }
 
+    pub(super) async fn with_service_events(
+        mut self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        handle: Option<CollectionHandle>,
+    ) -> Result<Self> {
+        if let Some(handle) = handle {
+            self.service_events = Some(service_events::open(pile, signer, handle).await?);
+        }
+        Ok(self)
+    }
+
     fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<Option<String>> {
         #[cfg(test)]
         self.maintenance_passes
@@ -81,7 +95,10 @@ impl HealthSources {
         // mapping futures to completion without yielding a Peer store guard
         // across network I/O or re-entering a Peer operation.
         pollster::block_on(async {
-            for source in [&self.health, &self.relations] {
+            for source in [&self.health, &self.relations]
+                .into_iter()
+                .chain(self.service_events.as_ref())
+            {
                 // A report left unattached is read from its own bytes.
                 crate::storage::tolerate_own_lag(
                     local.maintain_attached(source.succinct, signer).await,
@@ -135,6 +152,12 @@ impl HealthSources {
         let latest_target = self.latest;
         let presentations_target = self.presentations.rank9;
         let max_age = self.max_age;
+        // Service observations remain resident-only even for a requested
+        // health dashboard. Missing code bytes are not evidence of a cause.
+        let service_events = self
+            .service_events
+            .map(|source| source.observe(&snapshot))
+            .transpose()?;
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
@@ -170,6 +193,7 @@ impl HealthSources {
                     ]),
                 },
                 max_age,
+                service_events,
             })
         })
         .await
@@ -334,6 +358,10 @@ impl HealthSources {
         let latest = trace_refresh_call("Swarm health latest", "query", || latest_index.query())?;
         let relations = self.relations.observe(&snapshot)?;
         let presentations = self.presentations.observe(&snapshot)?;
+        let service_events = self
+            .service_events
+            .map(|source| source.observe(&snapshot))
+            .transpose()?;
         Ok(HealthObservation {
             snapshot,
             evaluated_at: now,
@@ -343,6 +371,7 @@ impl HealthSources {
             relations,
             presentations,
             max_age: self.max_age,
+            service_events,
         })
     }
 }
@@ -375,6 +404,7 @@ pub(super) struct HealthObservation {
     relations: OrientFact,
     presentations: ReceiptObservation,
     max_age: Duration,
+    service_events: Option<OrientFact>,
 }
 
 pub(super) struct HealthReport {
@@ -394,9 +424,17 @@ impl HealthObservation {
         let runtime = tokio::runtime::Handle::current();
         let now = self.evaluated_at;
         let max_age = self.max_age;
+        let service_events = self
+            .service_events
+            .as_ref()
+            .map(|source| source.view.clone());
         tokio::task::spawn_blocking(move || {
-            let reader = crate::storage::AcquiringReader::with_handle(snapshot, runtime);
-            render_health(&facts, &latest, &reader, now, max_age, Detail::Full)
+            let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+            let mut report = render_health(&facts, &latest, &reader, now, max_age, Detail::Full);
+            if let Some(facts) = service_events {
+                service_events::append_report(&mut report, &facts, &snapshot, true);
+            }
+            report
         })
         .await
         .context("join requested health report acquisition")
@@ -418,6 +456,10 @@ impl HealthObservation {
             && self.latest_collection.is_current(snapshot)
             && self.relations.is_current(snapshot)
             && self.presentations.is_current(snapshot)
+            && self
+                .service_events
+                .as_ref()
+                .is_none_or(|source| source.is_current(snapshot))
     }
 
     /// The complete dashboard, for `show`.
@@ -445,7 +487,7 @@ impl HealthObservation {
             Detail::Full => "render dashboard",
             Detail::Attention => "render attention",
         };
-        trace_refresh_call("Swarm health", stage, || {
+        let mut report = trace_refresh_call("Swarm health", stage, || {
             Ok::<_, std::convert::Infallible>(render_health(
                 self.facts.view(),
                 &self.latest,
@@ -455,7 +497,16 @@ impl HealthObservation {
                 detail,
             ))
         })
-        .unwrap_or_else(|never| match never {})
+        .unwrap_or_else(|never| match never {});
+        if let Some(source) = &self.service_events {
+            service_events::append_report(
+                &mut report,
+                source.view(),
+                &self.snapshot,
+                detail == Detail::Full,
+            );
+        }
+        report
     }
 
     pub(super) fn persona(&self, input: &str) -> Result<Id> {

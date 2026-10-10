@@ -10,11 +10,14 @@ mod health;
 use health::HealthSources;
 #[path = "receipt_import.rs"]
 mod receipt_import;
+#[path = "service_events.rs"]
+mod service_events;
 
 #[derive(Clone, Debug)]
 pub struct Orient {
     storage: Storage,
     health_max_age: Duration,
+    service_events_collection: Option<CollectionHandle>,
 }
 
 #[derive(Clone, Debug)]
@@ -76,12 +79,19 @@ impl Orient {
         Self {
             storage,
             health_max_age: crate::schemas::swarm_health::DEFAULT_MAX_AGE,
+            service_events_collection: None,
         }
     }
     /// Choose how long this reader treats the latest health observation as current.
     /// This does not change the report facts or the reporting daemon.
     pub fn with_health_max_age(mut self, max_age: Duration) -> Self {
         self.health_max_age = max_age;
+        self
+    }
+    /// Observe native service failures from one explicitly selected, admitted
+    /// metrics root. This neither creates a root nor changes service policy.
+    pub fn with_service_events_collection(mut self, collection: CollectionHandle) -> Self {
+        self.service_events_collection = Some(collection);
         self
     }
     /// Situational overview. Evaluates stored Habit conditions: trusted local execution.
@@ -103,6 +113,7 @@ impl Orient {
                 options.todo_limit,
                 options.evaluate_habits,
                 self.health_max_age,
+                self.service_events_collection,
                 out,
             ))
         })
@@ -135,6 +146,7 @@ impl Orient {
                 Some(persona),
                 peek,
                 self.health_max_age,
+                self.service_events_collection,
                 out,
             ))
         })
@@ -147,6 +159,7 @@ impl Orient {
                 signer,
                 Some(persona),
                 self.health_max_age,
+                self.service_events_collection,
             ))
         })
     }
@@ -175,6 +188,7 @@ impl Orient {
                 Some(persona),
                 options,
                 self.health_max_age,
+                self.service_events_collection,
                 out,
             ))
         })
@@ -206,7 +220,7 @@ impl Orient {
                     result = stop => result,
                     result = cmd_observe(
                         &self.storage, pile, signer, self.storage.path(), Some(persona), options,
-                        self.health_max_age, true, out,
+                        self.health_max_age, self.service_events_collection, true, out,
                     ) => result,
                 }
             })
@@ -270,6 +284,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::observed_store::{DependencyTracker, ObservedStore};
+use triblespace::core::collection::records::CollectionHandle;
 #[cfg(test)]
 use triblespace::core::collection::Support;
 use triblespace::core::collection::{
@@ -3280,6 +3295,10 @@ enum AttentionEvent {
         detail: String,
         collection_group: Option<CollectionSyncGroup>,
     },
+    ServiceFailure {
+        event: Id,
+        detail: String,
+    },
 }
 
 impl AttentionEvent {
@@ -3292,7 +3311,7 @@ impl AttentionEvent {
             | Self::StatusWindow(id) => *id,
             Self::Goal { event, .. } => *event,
             Self::Note { note, .. } => *note,
-            Self::Health { event, .. } => *event,
+            Self::Health { event, .. } | Self::ServiceFailure { event, .. } => *event,
         }
     }
 
@@ -3317,6 +3336,7 @@ impl AttentionEvent {
                 format!("new status window [{}]", fmt_id(*window))
             }
             Self::Health { detail, .. } => format!("swarm health: {detail}"),
+            Self::ServiceFailure { detail, .. } => format!("native service failure: {detail}"),
         }
     }
 }
@@ -3495,12 +3515,15 @@ async fn cmd_baseline(
     signer: &SigningKey,
     persona: Option<&str>,
     health_max_age: Duration,
+    service_events_collection: Option<CollectionHandle>,
 ) -> Result<BaselineReceipt> {
     let Some(input) = persona else {
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
         let health = HealthSources::open(routing, pile, signer, health_max_age)
+            .await?
+            .with_service_events(pile, signer, service_events_collection)
             .await?
             .observe(pile, signer)?;
         let health_events = health.attention().attention;
@@ -3546,12 +3569,16 @@ async fn cmd_show(
     todo_limit: usize,
     evaluate_habits: bool,
     health_max_age: Duration,
+    service_events_collection: Option<CollectionHandle>,
     output: &mut Out<'_>,
 ) -> Result<()> {
     use std::fmt::Write as _;
 
     async {
-        let health_sources = HealthSources::open(routing, pile, signer, health_max_age).await?;
+        let health_sources = HealthSources::open(routing, pile, signer, health_max_age)
+            .await?
+            .with_service_events(pile, signer, service_events_collection)
+            .await?;
         let health = health_sources.observe_acquiring(pile, signer).await?;
         let health_report = health.report_acquiring().await?;
         write_complete_report(output, &health_report.text, "local swarm health overview")?;
@@ -3943,9 +3970,10 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
             Some(line) => line,
             None => event.reason(),
         },
-        AttentionEvent::Mail(_) | AttentionEvent::Teams(_) | AttentionEvent::Health { .. } => {
-            event.reason()
-        }
+        AttentionEvent::Mail(_)
+        | AttentionEvent::Teams(_)
+        | AttentionEvent::Health { .. }
+        | AttentionEvent::ServiceFailure { .. } => event.reason(),
     }
 }
 
@@ -4075,13 +4103,17 @@ async fn cmd_poll(
     persona: Option<&str>,
     peek: bool,
     health_max_age: Duration,
+    service_events_collection: Option<CollectionHandle>,
     output: &mut Out<'_>,
 ) -> Result<()> {
     let Some(input) = persona else {
         bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
-        let mut health = HealthSources::open(routing, pile, signer, health_max_age).await?;
+        let mut health = HealthSources::open(routing, pile, signer, health_max_age)
+            .await?
+            .with_service_events(pile, signer, service_events_collection)
+            .await?;
         if health.poll(pile, signer, input, peek, output)?.0 {
             return Ok(());
         }
@@ -4596,6 +4628,7 @@ async fn cmd_wait(
     persona: Option<&str>,
     options: &WaitOptions,
     health_max_age: Duration,
+    service_events_collection: Option<CollectionHandle>,
     output: &mut Out<'_>,
 ) -> Result<()> {
     cmd_observe(
@@ -4606,6 +4639,7 @@ async fn cmd_wait(
         persona,
         options,
         health_max_age,
+        service_events_collection,
         false,
         output,
     )
@@ -4623,6 +4657,7 @@ async fn cmd_observe(
     persona: Option<&str>,
     options: &WaitOptions,
     health_max_age: Duration,
+    service_events_collection: Option<CollectionHandle>,
     continuous: bool,
     output: &mut Out<'_>,
 ) -> Result<()> {
@@ -4631,7 +4666,10 @@ async fn cmd_observe(
     };
     let timeout = options.timeout;
     let result: Result<WaitOutcome> = async {
-        let mut health = HealthSources::open(routing, pile, signer, health_max_age).await?;
+        let mut health = HealthSources::open(routing, pile, signer, health_max_age)
+            .await?
+            .with_service_events(pile, signer, service_events_collection)
+            .await?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let timeout_at = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
@@ -6468,6 +6506,7 @@ mod tests {
                     Some("waiting-reader"),
                     &options,
                     Duration::from_secs(180),
+                    None,
                     &mut Out::new(&mut emit),
                 ),
             )
@@ -7042,6 +7081,7 @@ mod tests {
                     Some(persona),
                     &options,
                     Duration::from_secs(180),
+                    None,
                     &mut Out::new(&mut emit),
                 ),
             )
@@ -7070,6 +7110,7 @@ mod tests {
                 Some("eager-reader"),
                 peek,
                 Duration::from_secs(180),
+                None,
                 &mut Out::new(&mut emit),
             ))
             .unwrap();
