@@ -104,18 +104,41 @@ impl Segmenter {
         }
     }
 
-    /// The part of the current utterance that no future silence trim can remove.
-    /// Keep the same onset/preroll and minimum admission as `close`; the caller
-    /// may consume only the newly appended suffix. A completed Segment remains
-    /// the authority for its final samples (including explicit-flush tails).
-    pub(crate) fn committed_prefix(&self) -> Option<(u64, &[f32])> {
+    /// Everything captured of the current utterance so far, once it is
+    /// admitted: once the part no future silence trim can remove reaches the
+    /// minimum utterance (the same onset/preroll and minimum as `close`), so
+    /// an utterance whose capture is handed out always completes as a
+    /// Segment. The capture only grows until it closes, and the Segment is a
+    /// prefix of it: a close after silence trims all but a ~200 ms tail of
+    /// the trailing silence handed out here, so a caller that consumes the
+    /// newly appended suffix hears that trailing silence as it happens,
+    /// which a streaming recognizer needs before it can say how the last
+    /// sentence ended. The Segment remains the authority for its final
+    /// samples (including explicit-flush tails).
+    pub(crate) fn captured(&self) -> Option<(u64, &[f32])> {
         if !self.in_speech {
             return None;
         }
         let discardable = (self.silence_run * self.frame).saturating_sub(self.rate * 200 / 1000);
-        let end = self.current.len().saturating_sub(discardable);
-        (end >= self.rate * self.cfg.min_utt_ms / 1000)
-            .then_some((self.utt_start_sample, &self.current[..end]))
+        let kept = self.current.len().saturating_sub(discardable);
+        (kept >= self.rate * self.cfg.min_utt_ms / 1000)
+            .then_some((self.utt_start_sample, &self.current[..]))
+    }
+
+    /// Close the open utterance if it has gone `silence_ms` without speech,
+    /// trimming its trailing silence exactly as the hangover close does. A
+    /// caller that knows more than the energy (a finished sentence) ends an
+    /// utterance sooner this way; whether it did is returned.
+    pub(crate) fn end_if_silent(
+        &mut self,
+        silence_ms: usize,
+        emit: &mut impl FnMut(Segment),
+    ) -> bool {
+        if !self.in_speech || self.silence_run * self.cfg.frame_ms < silence_ms {
+            return false;
+        }
+        self.close_after_silence(emit);
+        true
     }
 
     /// End of stream/file: close any open utterance.
@@ -192,13 +215,7 @@ impl Segmenter {
                 self.silence_run += 1;
                 let hangover_frames = self.cfg.hangover_ms / self.cfg.frame_ms;
                 if self.silence_run >= hangover_frames {
-                    // Trim most of the hangover, keep a ~200 ms tail.
-                    let keep_tail = self.rate * 200 / 1000;
-                    let hang = self.silence_run * self.frame;
-                    let cut = hang.saturating_sub(keep_tail).min(self.current.len());
-                    let newlen = self.current.len() - cut;
-                    self.current.truncate(newlen);
-                    self.close(emit);
+                    self.close_after_silence(emit);
                 }
             }
             if self.in_speech && self.current.len() as f32 >= self.cfg.max_utt_s * self.rate as f32
@@ -207,6 +224,16 @@ impl Segmenter {
             }
         }
         self.samples_seen += frame.len() as u64;
+    }
+
+    /// Trim most of the trailing silence, keep a ~200 ms tail, and close.
+    fn close_after_silence(&mut self, emit: &mut impl FnMut(Segment)) {
+        let keep_tail = self.rate * 200 / 1000;
+        let hang = self.silence_run * self.frame;
+        let cut = hang.saturating_sub(keep_tail).min(self.current.len());
+        let newlen = self.current.len() - cut;
+        self.current.truncate(newlen);
+        self.close(emit);
     }
 
     fn close(&mut self, emit: &mut impl FnMut(Segment)) {
@@ -248,14 +275,21 @@ mod tests {
         assert_eq!(discord.abs_floor, shared.abs_floor);
     }
 
+    // Was `committed_prefix_never_includes_a_discarded_silence_tail`: the
+    // capture used to withhold all trailing silence beyond the kept ~200 ms
+    // tail, so a streaming recognizer never heard enough silence after the
+    // last word to emit it (Voxtral's text runs 480 ms behind its audio).
+    // Now the trailing silence is handed out as it happens and the final
+    // Segment is a prefix of what was handed out; the rest is exactly the
+    // silence the close trimmed.
     #[test]
-    fn committed_prefix_never_includes_a_discarded_silence_tail() {
+    fn capture_is_the_segment_followed_by_only_its_trimmed_silence() {
         let mut segmenter = Segmenter::new(16_000, VadConfig::default());
         let mut final_segments = Vec::new();
         let mut fed = Vec::new();
         let mut start = None;
-        // Silence resumes once, so previously withheld silence becomes real
-        // captured PCM; the final 700 ms hangover still retains only 200 ms.
+        // Silence resumes once, so that silence becomes part of the
+        // utterance; the final 700 ms hangover still keeps only 200 ms.
         for (loud, frames) in [
             (false, 30),
             (true, 40),
@@ -267,22 +301,55 @@ mod tests {
                 segmenter.push(&vec![if loud { 0.25 } else { 0.0 }; 320], &mut |s| {
                     final_segments.push(s)
                 });
-                if let Some((at, prefix)) = segmenter.committed_prefix() {
+                if let Some((at, captured)) = segmenter.captured() {
                     assert_eq!(*start.get_or_insert(at), at);
-                    assert!(prefix.len() >= fed.len());
-                    assert_eq!(&prefix[..fed.len()], fed.as_slice());
-                    fed.extend_from_slice(&prefix[fed.len()..]);
+                    assert!(captured.len() >= fed.len());
+                    assert_eq!(&captured[..fed.len()], fed.as_slice());
+                    fed.extend_from_slice(&captured[fed.len()..]);
                 }
             }
         }
         assert_eq!(final_segments.len(), 1);
         let final_pcm = &final_segments[0].samples;
-        assert_eq!(fed, *final_pcm);
+        assert_eq!(&fed[..final_pcm.len()], final_pcm.as_slice());
+        // 34 silent frames were handed out before the 35th closed it; the
+        // Segment kept 10 of them (200 ms).
+        assert_eq!(fed.len() - final_pcm.len(), 24 * 320);
+        assert!(fed[final_pcm.len()..].iter().all(|x| *x == 0.0));
         assert!(final_pcm[final_pcm.len() - 3200..]
             .iter()
             .all(|x| *x == 0.0));
         assert_eq!(final_pcm[final_pcm.len() - 3201], 0.25);
-        assert!(segmenter.committed_prefix().is_none());
+        assert!(segmenter.captured().is_none());
+    }
+
+    #[test]
+    fn an_early_end_waits_for_its_silence_and_keeps_the_same_tail() {
+        let mut segmenter = Segmenter::new(16_000, VadConfig::default());
+        let mut segments = Vec::new();
+        let mut frames = |segmenter: &mut Segmenter, loud: bool, n: usize| {
+            for _ in 0..n {
+                segmenter.push(&vec![if loud { 0.25 } else { 0.0 }; 320], &mut |s| {
+                    segments.push(s)
+                });
+            }
+        };
+        frames(&mut segmenter, false, 30);
+        frames(&mut segmenter, true, 40);
+        frames(&mut segmenter, false, 14);
+        let mut early = Vec::new();
+        assert!(!segmenter.end_if_silent(300, &mut |s| early.push(s)));
+        frames(&mut segmenter, false, 1);
+        assert!(segmenter.end_if_silent(300, &mut |s| early.push(s)));
+        assert_eq!(early.len(), 1);
+        let pcm = &early[0].samples;
+        // The same ~200 ms tail the hangover close keeps.
+        assert!(pcm[pcm.len() - 3200..].iter().all(|x| *x == 0.0));
+        assert_eq!(pcm[pcm.len() - 3201], 0.25);
+        assert!(segmenter.captured().is_none());
+        assert!(!segmenter.end_if_silent(300, &mut |s| early.push(s)));
+        drop(frames);
+        assert!(segments.is_empty(), "the hangover never closed it as well");
     }
     #[cfg(feature = "hear")]
     use crate::hear::operations::to_hear_rate;

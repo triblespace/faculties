@@ -11,12 +11,15 @@
 //! it returns; an SSRC Discord names nobody for is never heard. A thread of
 //! its own ([`Listener`]) runs the energy segmenter `hear` uses on each heard
 //! user's stream (Discord clients stop sending during silence, and a silent
-//! tick counts as 20 ms of zeros), and transcribes every finished utterance
-//! with `mary::hear`'s Voxtral streaming transcriber on CUDA, which loads
-//! once, before the first one ([`Transcribe`] is the seam its backend changes
-//! behind). The utterance goes to intake, the one writer of the discord
-//! collection ([`super::intake::Work::Utterance`]), and is kept in the state
-//! directory, transcript and audio, when that write fails or intake is gone.
+//! tick counts as 20 ms of zeros), and transcribes every utterance with
+//! `mary::hear`'s Voxtral streaming transcriber on CUDA while it is spoken;
+//! the transcriber loads once, before the first one ([`Transcribe`] is the
+//! seam its backend changes behind). An utterance ends after
+//! [`END_SILENCE_MS`] of silence, or after [`SENTENCE_SILENCE_MS`] when the
+//! words heard so far end a sentence. The utterance goes to intake, the one
+//! writer of the discord collection ([`super::intake::Work::Utterance`]), and
+//! is kept in the state directory, transcript and audio, when that write
+//! fails or intake is gone.
 //!
 //! Logs carry who, where, when and how much, never what was said.
 //!
@@ -48,6 +51,15 @@ const GAP_MS: u64 = 1_000;
 /// right after that one, and then you get them both". Retained tail, preroll,
 /// max duration and explicit close rules stay unchanged.
 const END_SILENCE_MS: usize = 800;
+/// Silence that ends a Discord utterance whose words so far end like a
+/// finished sentence ([`ends_sentence`]). JP, 2026-10-10: publish a finished
+/// sentence after a short pause and keep waiting the full
+/// [`END_SILENCE_MS`] only for an unfinished one; a long thought then
+/// arrives as several messages, one per sentence, and the listener decides
+/// whether the speaker is done. Never sooner than the transcriber can have
+/// written the last word down ([`Transcribe::settle_ms`]), so a sentence
+/// end it wrote earlier cannot pass for the end of what was said last.
+const SENTENCE_SILENCE_MS: usize = 300;
 
 /// What hearing runs with.
 pub struct Config {
@@ -298,18 +310,35 @@ impl Stream {
             emit(Progress::Finished(spoken(user, origin_ms, segment)));
             self.committed = 0;
         }
-        if let Some((start, prefix)) = self.segmenter.committed_prefix() {
-            if prefix.len() > self.committed {
+        if let Some((start, captured)) = self.segmenter.captured() {
+            if captured.len() > self.committed {
                 emit(Progress::Samples {
                     user,
                     start_ms: origin_ms + (start as f64 / RATE as f64 * 1000.0).round() as u64,
                     offset: self.committed,
-                    samples: prefix[self.committed..].to_vec(),
+                    samples: captured[self.committed..].to_vec(),
                 });
-                self.committed = prefix.len();
+                self.committed = captured.len();
             }
         }
         self.fed += samples.len() as u64;
+    }
+
+    /// End what is being said if it has gone `silence_ms` without speech.
+    fn end_sentence(
+        &mut self,
+        user: u64,
+        silence_ms: usize,
+        emit: &mut impl FnMut(Progress),
+    ) -> bool {
+        let origin_ms = self.origin_ms;
+        let ended = self.segmenter.end_if_silent(silence_ms, &mut |segment| {
+            emit(Progress::Finished(spoken(user, origin_ms, segment)))
+        });
+        if ended {
+            self.committed = 0;
+        }
+        ended
     }
 
     /// The stream ends: what was being said is finished.
@@ -391,6 +420,19 @@ impl Listener {
             .push(user, samples, emit);
     }
 
+    /// `user`'s words so far end a sentence: end their utterance if they
+    /// have been silent `silence_ms`. Whether it ended.
+    fn end_sentence(
+        &mut self,
+        user: u64,
+        silence_ms: usize,
+        emit: &mut impl FnMut(Progress),
+    ) -> bool {
+        self.streams
+            .get_mut(&user)
+            .is_some_and(|stream| stream.end_sentence(user, silence_ms, emit))
+    }
+
     /// Hearing ends: everything being said is finished.
     pub fn flush(&mut self, emit: &mut impl FnMut(Spoken)) {
         self.flush_progress(&mut |progress| {
@@ -413,6 +455,13 @@ impl Listener {
 pub trait Transcribe {
     fn listen(&self) -> Result<Box<dyn Transcription + '_>>;
 
+    /// Audio, in milliseconds, a session must hear after a word before
+    /// [`Transcription::heard`] can include it: how far its text runs
+    /// behind its audio.
+    fn settle_ms(&self) -> usize {
+        0
+    }
+
     fn transcribe(&self, samples: &[f32]) -> Result<String> {
         let mut session = self.listen()?;
         session.push(samples)?;
@@ -424,6 +473,13 @@ pub trait Transcribe {
 pub trait Transcription {
     fn push(&mut self, samples: &[f32]) -> Result<()>;
     fn finish(self: Box<Self>) -> Result<String>;
+
+    /// The words heard so far, before [`Self::finish`]: never published,
+    /// only read to tell whether they end a sentence. Empty when the
+    /// backend cannot say.
+    fn heard(&self) -> &str {
+        ""
+    }
 }
 
 struct Active<'a> {
@@ -496,18 +552,22 @@ fn advance<'a>(
                 .is_some_and(|(user, _)| *user == spoken.user)
             {
                 let (_, mut current) = active.take().expect("matching owner");
-                let result =
-                    if current.start_ms != spoken.start_ms || current.fed > spoken.samples.len() {
-                        Err(anyhow::anyhow!(
-                            "hearing committed-prefix boundary mismatch"
-                        ))
-                    } else {
-                        current.push(&spoken.samples[current.fed..]);
-                        let started = Instant::now();
-                        let result = current.session.and_then(|session| session.finish());
-                        current.compute_seconds += started.elapsed().as_secs_f64();
-                        result
-                    };
+                // The session heard the capture, of which the utterance is a
+                // prefix: anything it heard past the utterance's end is the
+                // trailing silence its close trimmed. A flush's last partial
+                // frame may still be missing.
+                let result = if current.start_ms != spoken.start_ms {
+                    Err(anyhow::anyhow!(
+                        "hearing committed-prefix boundary mismatch"
+                    ))
+                } else {
+                    let fed = current.fed.min(spoken.samples.len());
+                    current.push(&spoken.samples[fed..]);
+                    let started = Instant::now();
+                    let result = current.session.and_then(|session| session.finish());
+                    current.compute_seconds += started.elapsed().as_secs_f64();
+                    result
+                };
                 store_result(
                     result,
                     spoken,
@@ -543,6 +603,51 @@ fn advance<'a>(
     }
 }
 
+/// Whether `words` end like a finished sentence: with `.`, `?` or `!`
+/// (or their full-width forms), perhaps inside closing quotes or brackets.
+/// A trailing ellipsis is a thought trailing off, not an end.
+fn ends_sentence(words: &str) -> bool {
+    let words = words
+        .trim_end()
+        .trim_end_matches(['"', '\'', '\u{201d}', '\u{2019}', ')', ']']);
+    !words.ends_with("..") && words.ends_with(['.', '?', '!', '\u{3002}', '\u{ff1f}', '\u{ff01}'])
+}
+
+/// One moment through the listener and the transcriber, then the early end:
+/// when the words the online session has heard end a sentence and its
+/// speaker has been silent [`SENTENCE_SILENCE_MS`] (and the transcriber's
+/// [`Transcribe::settle_ms`]), the utterance closes now instead of after
+/// [`END_SILENCE_MS`]. Only the online owner has words to judge; a deferred
+/// speaker waits for the full silence.
+fn hear_moment<'a>(
+    ear: &'a dyn Transcribe,
+    active: &mut Option<(u64, Active<'a>)>,
+    listener: &mut Listener,
+    moment: Moment,
+    channel: u64,
+    intake: &Inbox,
+    unstored: &Path,
+) {
+    listener.hear_progress(moment, &mut |progress| {
+        advance(ear, active, progress, channel, intake, unstored)
+    });
+    let Some(user) = active.as_ref().and_then(|(user, current)| {
+        let words = current.session.as_ref().ok()?.heard();
+        ends_sentence(words).then_some(*user)
+    }) else {
+        return;
+    };
+    let silence_ms = SENTENCE_SILENCE_MS.max(ear.settle_ms());
+    let ended = listener.end_sentence(user, silence_ms, &mut |progress| {
+        advance(ear, active, progress, channel, intake, unstored)
+    });
+    if ended {
+        eprintln!(
+            "[discord] user {user} ended a sentence; closed after {silence_ms} ms of silence"
+        );
+    }
+}
+
 /// The hearing thread: loads the transcriber, then cuts what comes in into
 /// utterances and stores each, until the handler lets go of the channel.
 fn hear(
@@ -568,11 +673,20 @@ fn hear(
     // work stays on this thread; deferred users keep their exact captured PCM.
     let mut active = None;
     let mut listener = Listener::default();
-    let mut emit = |progress| advance(&*ear, &mut active, progress, channel, intake, unstored);
     for moment in moments.iter() {
-        listener.hear_progress(moment, &mut emit);
+        hear_moment(
+            &*ear,
+            &mut active,
+            &mut listener,
+            moment,
+            channel,
+            intake,
+            unstored,
+        );
     }
-    listener.flush_progress(&mut emit);
+    listener.flush_progress(&mut |progress| {
+        advance(&*ear, &mut active, progress, channel, intake, unstored)
+    });
     debug_assert!(active.is_none());
 }
 
@@ -716,6 +830,12 @@ mod voxtral {
 
     /// How far the text lags the audio, mary's default for the stream.
     const DELAY_MS: usize = 480;
+    /// Audio after a word before the stream has written it: the delay, plus
+    /// up to one 80 ms audio token for the word's end to fall anywhere in
+    /// its token and the 2.5 ms window lookahead, rounded up to 20 ms ticks
+    /// with one tick to spare (mary's `StreamingTranscriber::push` encodes
+    /// token `k` once it has `1280 k + 1320` samples).
+    const SETTLE_MS: usize = DELAY_MS + 120;
 
     pub struct Voxtral {
         ears: mary::hear::Ears,
@@ -745,6 +865,10 @@ mod voxtral {
                 text: String::new(),
             }))
         }
+
+        fn settle_ms(&self) -> usize {
+            SETTLE_MS
+        }
     }
 
     impl Transcription for Session<'_> {
@@ -770,6 +894,10 @@ mod voxtral {
         fn finish(mut self: Box<Self>) -> Result<String> {
             self.text += &self.listening.take().expect("finish once").finish();
             Ok(self.text)
+        }
+
+        fn heard(&self) -> &str {
+            &self.text
         }
     }
 }
@@ -859,7 +987,11 @@ mod tests {
         let (user, start, pcm) = &captured[0];
         assert_eq!((*user, *start), (JP, 420));
         assert_eq!(pcm, expected);
-        assert_eq!(ear.attempts.borrow().as_slice(), &[expected.to_vec()]);
+        // The session heard the utterance and then the silence its close
+        // trimmed (it hears trailing silence as it happens, so that a
+        // streaming recognizer can finish writing the last word).
+        assert_eq!(ear.attempts.borrow().len(), 1);
+        heard_utterance_then_trimmed_silence(&ear.attempts.borrow()[0], expected);
         let pause = (RATE * (1400 - 420) / 1000)..(RATE * (1800 - 420) / 1000);
         assert!(pcm[pause].iter().all(|&s| s == 0.0));
         assert!(pcm[pcm.len() - RATE / 5..].iter().all(|&s| s == 0.0));
@@ -1040,11 +1172,8 @@ mod tests {
         );
         assert_eq!(*ear.finished.borrow(), [1, 2, 3]);
         for ((user, start, pcm), id) in captured.iter().zip([1, 2, 3]) {
-            assert_eq!(
-                ear.attempts.borrow()[id],
-                *pcm,
-                "successful attempt must receive full exact PCM"
-            );
+            // Full exact PCM, then only the trimmed trailing silence.
+            heard_utterance_then_trimmed_silence(&ear.attempts.borrow()[id], pcm);
             let Ok(Work::Utterance(item)) = queue.try_recv() else {
                 panic!("final utterance missing")
             };
@@ -1100,6 +1229,27 @@ mod tests {
         }
     }
 
+    /// What a session heard is the utterance, bit for bit, then nothing but
+    /// the trailing silence its close trimmed: the scripts here are silent
+    /// with zeros, and the trim keeps 200 ms of an 800 ms close.
+    fn heard_utterance_then_trimmed_silence(session: &[f32], utterance: &[f32]) {
+        assert!(session.len() >= utterance.len(), "session missed audio");
+        assert_eq!(
+            session[..utterance.len()]
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            utterance.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "fed PCM differs from captured segment"
+        );
+        let trailing = &session[utterance.len()..];
+        assert!(
+            trailing.iter().all(|&x| x == 0.0),
+            "only silence past the end"
+        );
+        assert!(trailing.len() < RATE * (END_SILENCE_MS - 200) / 1000 + 1);
+    }
+
     fn exact_progress(moments: Vec<Moment>) -> usize {
         let owner = Recorded::default();
         let mut active = None;
@@ -1123,12 +1273,7 @@ mod tests {
         let finished = owner.finished.borrow();
         assert_eq!(finished.len(), completed.len());
         for ((user, start, samples), &id) in completed.iter().zip(finished.iter()) {
-            let actual = &owner.sessions.borrow()[id];
-            assert_eq!(
-                actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                samples.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                "fed PCM differs from captured segment"
-            );
+            heard_utterance_then_trimmed_silence(&owner.sessions.borrow()[id], samples);
             let Ok(Work::Utterance(item)) = queue.try_recv() else {
                 panic!("missing finalized intake")
             };
@@ -1342,6 +1487,199 @@ mod tests {
         };
         assert_eq!(utterance.transcript, "complete words");
         assert!(queue.try_recv().is_err());
+    }
+
+    /// A transcriber whose sessions have heard `words` as soon as they hear
+    /// anything, with text running `settle_ms` behind the audio.
+    struct Says {
+        words: &'static str,
+        settle_ms: usize,
+    }
+    struct Saying(&'static str, bool);
+    impl Transcribe for Says {
+        fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+            Ok(Box::new(Saying(self.words, false)))
+        }
+        fn settle_ms(&self) -> usize {
+            self.settle_ms
+        }
+    }
+    impl Transcription for Saying {
+        fn push(&mut self, samples: &[f32]) -> Result<()> {
+            self.1 |= !samples.is_empty();
+            Ok(())
+        }
+        fn finish(self: Box<Self>) -> Result<String> {
+            Ok(self.0.to_owned())
+        }
+        fn heard(&self) -> &str {
+            if self.1 {
+                self.0
+            } else {
+                ""
+            }
+        }
+    }
+
+    /// `moments` through the hearing loop, one at a time: each utterance
+    /// published, with the end of the moment it was published after.
+    fn published_after(ear: &dyn Transcribe, moments: Vec<Moment>) -> Vec<(u64, Utterance)> {
+        let mut active = None;
+        let mut listener = Listener::default();
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let mut published = Vec::new();
+        for moment in moments {
+            let end_ms = moment.at_ms + 20;
+            hear_moment(
+                ear,
+                &mut active,
+                &mut listener,
+                moment,
+                7,
+                &intake,
+                directory.path(),
+            );
+            while let Ok(Work::Utterance(utterance)) = queue.try_recv() {
+                published.push((end_ms, utterance));
+            }
+        }
+        listener
+            .flush_progress(&mut |p| advance(ear, &mut active, p, 7, &intake, directory.path()));
+        while let Ok(Work::Utterance(utterance)) = queue.try_recv() {
+            published.push((u64::MAX, utterance));
+        }
+        assert!(active.is_none());
+        published
+    }
+
+    #[test]
+    fn a_finished_sentence_is_published_after_a_short_silence() {
+        // Speech 600..1400 ms, then silence; it ends a sentence.
+        let ear = Says {
+            words: "That is all I wanted to say.",
+            settle_ms: 0,
+        };
+        let script = [(false, 600), (true, 800), (false, 1200)];
+        let published = published_after(&ear, ticks(JP, 0, &script));
+        assert_eq!(published.len(), 1);
+        let (at, utterance) = &published[0];
+        assert_eq!(
+            *at,
+            1400 + SENTENCE_SILENCE_MS as u64,
+            "after 300 ms, not 800"
+        );
+        assert_eq!(utterance.transcript, "That is all I wanted to say.");
+        // The same utterance the 800 ms close would have kept: preroll from
+        // 420 ms, speech, and a 200 ms tail.
+        let expected = listen(ticks(JP, 0, &script));
+        assert_eq!(
+            (utterance.user, utterance.start_ms),
+            (JP, expected[0].start_ms)
+        );
+        assert_eq!(utterance.wav, wav_pcm16(&expected[0].samples));
+
+        // Questions and exclamations end sentences too, and a long thought
+        // arrives one sentence at a time.
+        let ear = Says {
+            words: "Did you hear that?",
+            settle_ms: 0,
+        };
+        let script = [
+            (false, 600),
+            (true, 800),
+            (false, 400),
+            (true, 800),
+            (false, 1200),
+        ];
+        let published = published_after(&ear, ticks(JP, 0, &script));
+        let at: Vec<u64> = published.iter().map(|(at, _)| *at).collect();
+        assert_eq!(at, [1700, 2900]);
+    }
+
+    #[test]
+    fn an_unfinished_clause_waits_for_the_full_silence() {
+        let ear = Says {
+            words: "and then I thought that maybe",
+            settle_ms: 0,
+        };
+        let script = [
+            (false, 600),
+            (true, 800),
+            (false, 400),
+            (true, 800),
+            (false, 1200),
+        ];
+        let published = published_after(&ear, ticks(JP, 0, &script));
+        // The 400 ms pause, over the 300 ms sentence silence, does not split
+        // it; the 800 ms close still ends it.
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, 2600 + END_SILENCE_MS as u64);
+        let expected = listen(ticks(JP, 0, &script));
+        assert_eq!(published[0].1.wav, wav_pcm16(&expected[0].samples));
+
+        // A trailing ellipsis is a thought trailing off.
+        let ear = Says {
+            words: "so I was wondering...",
+            settle_ms: 0,
+        };
+        let published = published_after(
+            &ear,
+            ticks(JP, 0, &[(false, 600), (true, 800), (false, 1200)]),
+        );
+        assert_eq!(published[0].0, 1400 + END_SILENCE_MS as u64);
+    }
+
+    #[test]
+    fn a_sentence_end_waits_until_the_transcriber_can_have_written_the_last_word() {
+        // Text 600 ms behind the audio: the period it shows after 300 ms may
+        // belong to an earlier sentence, so the early end waits for 600.
+        let ear = Says {
+            words: "One sentence.",
+            settle_ms: 600,
+        };
+        let published = published_after(
+            &ear,
+            ticks(JP, 0, &[(false, 600), (true, 800), (false, 1200)]),
+        );
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, 2000);
+        // A transcriber slower than the full silence changes nothing.
+        let ear = Says {
+            words: "One sentence.",
+            settle_ms: 2000,
+        };
+        let published = published_after(
+            &ear,
+            ticks(JP, 0, &[(false, 600), (true, 800), (false, 1200)]),
+        );
+        assert_eq!(published[0].0, 1400 + END_SILENCE_MS as u64);
+    }
+
+    #[test]
+    fn sentence_ends_are_read_from_the_last_words() {
+        for done in [
+            "Done.",
+            "Really?",
+            "Wow!",
+            "He said \"stop.\"",
+            "(I think so.) ",
+            "\u{305d}\u{3046}\u{3002}",
+        ] {
+            assert!(ends_sentence(done), "{done:?}");
+        }
+        for open in [
+            "",
+            "and then",
+            "Mr. Smith said",
+            "so...",
+            "well\u{2026}",
+            "I mean,",
+        ] {
+            assert!(!ends_sentence(open), "{open:?}");
+        }
     }
 
     /// `ms` of a 220 Hz tone, loud enough to be speech, as ticks of samples.
