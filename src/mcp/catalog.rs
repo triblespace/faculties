@@ -20,7 +20,6 @@ use crate::{
 pub struct Config {
     pub pile: PathBuf,
     pub key: Option<PathBuf>,
-    pub discord_token: Option<String>,
     pub linkedin_token: Option<String>,
     pub duplex_session: Option<PathBuf>,
     pub hear: Option<hear::ModelConfig>,
@@ -33,7 +32,6 @@ impl Config {
         Self {
             pile: pile.into(),
             key: None,
-            discord_token: None,
             linkedin_token: None,
             duplex_session: None,
             hear: None,
@@ -60,16 +58,11 @@ impl Catalog {
         let Config {
             pile: _,
             key: _,
-            discord_token,
             linkedin_token,
             duplex_session,
             hear: hear_config,
         } = config;
         let discord = discord::mcp::Discord::with_storage(storage.clone());
-        let discord = match discord_token {
-            Some(token) => discord.with_token(token),
-            None => discord,
-        };
         let linkedin = linkedin::mcp::LinkedIn::with_storage(storage.clone());
         let linkedin = match linkedin_token {
             Some(token) => linkedin.with_token(token),

@@ -45,7 +45,8 @@ pub struct Cli {
     /// initialize explicitly with trible pile signing-key init.
     #[arg(long, env = "TRIBLESPACE_KEY", global = true)]
     key: Option<PathBuf>,
-    /// Discord bot token. Use @path or @- to avoid exposing it in argv.
+    /// Explicit legacy token override. Without it, resolve the pile's exact
+    /// Secrets reference. Use @path or @- to avoid exposing an override in argv.
     #[arg(long, env = "DISCORD_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
     #[command(subcommand)]
@@ -139,6 +140,11 @@ struct LiveArgs {
 
 #[derive(Subcommand)]
 enum CommandMode {
+    /// Inspect or bind the pile-backed bot credential (never prints plaintext).
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Post a message and persist the returned Discord observation.
     Send {
         /// Channel id (global Discord snowflake).
@@ -175,6 +181,23 @@ enum CommandMode {
 }
 
 #[derive(Subcommand)]
+enum AuthCommand {
+    /// Show authentication revision and exact Secrets version ids only.
+    Status,
+    /// Bind an existing exact Secrets version; reconcile observed auth forks.
+    Set {
+        /// Exact immutable version id, not a credential or a secret name.
+        #[arg(value_parser = parse_secret_id)]
+        secret_version: triblespace::prelude::Id,
+    },
+}
+
+fn parse_secret_id(raw: &str) -> std::result::Result<triblespace::prelude::Id, String> {
+    triblespace::prelude::Id::from_hex(raw)
+        .ok_or_else(|| "expected an exact 32-character Secrets version id".to_owned())
+}
+
+#[derive(Subcommand)]
 enum ChannelsCommand {
     /// Print guilds and channels.
     List {
@@ -196,12 +219,32 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
         #[cfg(feature = "discord-hearing")]
         Command::Hear { hear_model, wav } => return hear(&hear_model, &wav, out),
     };
-    let token = require_token(&cli)?;
+    let token = if matches!(&command, CommandMode::Auth { .. }) {
+        None
+    } else {
+        cli.token
+            .as_deref()
+            .map(|raw| load_value_or_file_trimmed(raw, "Discord token"))
+            .transpose()?
+    };
     let pile = cli
         .pile
         .ok_or_else(|| anyhow!("missing pile; pass --pile or set PILE"))?;
-    let operations = Discord::new(pile, cli.key).with_token(token);
+    let operations = Discord::new(pile, cli.key);
+    let operations = match token {
+        Some(token) => operations.with_token(token),
+        None => operations,
+    };
     match command {
+        CommandMode::Auth { command } => match command {
+            AuthCommand::Status => render::auth(&operations.auth_status()?, out),
+            AuthCommand::Set { secret_version } => {
+                let revision = operations.auth_set(secret_version)?;
+                out.line(format!(
+                    "Discord auth revision {revision:X}; Secrets version {secret_version:X}"
+                ))
+            }
+        },
         CommandMode::Send { channel_id, text } => {
             let text = crate::text_arg(&text, "message text")?;
             render::sent(&operations.send(&channel_id, &text)?, out)
@@ -399,6 +442,14 @@ fn say(_: Option<PathBuf>, _: &str, _: &mut Out<'_>) -> Result<()> {
 }
 
 fn require_token(cli: &Cli) -> Result<String> {
+    if cli.token.is_none() {
+        let pile = cli.pile.clone().ok_or_else(|| anyhow!(
+            "pile-backed Discord authentication needs --pile or PILE; existing callers may explicitly supply --token"
+        ))?;
+        return Discord::new(pile, cli.key.clone())
+            .token()
+            .map(|token| token.to_string());
+    }
     let token = cli
         .token
         .as_deref()

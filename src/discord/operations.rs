@@ -22,9 +22,9 @@
 //! large file can never hold a channel's ingestion back. A system notice (a
 //! pin, a member joining) is stored like any message and marked as one.
 //!
-//! Bot credentials are deliberately external input. This faculty neither
-//! claims the historical shared logs branch nor stores mutable secrets in the
-//! logical Discord dataset.
+//! Bot authentication revisions name exact encrypted Secrets versions. Native
+//! operations resolve them with the same store and signing identity as the
+//! Discord collection; plaintext is never published in the Discord dataset.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -36,6 +36,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::{Epoch, TimeScale};
 use reqwest::blocking::Client;
 use serde_json::{json, Value as JsonValue};
+use zeroize::Zeroizing;
 
 use crate::collection_names::open_exact_in;
 use crate::discord as discord_model;
@@ -253,12 +254,12 @@ pub struct ChannelListing {
     pub guilds: Vec<GuildChannels>,
 }
 
-/// Direct Discord operations with explicit, host-configured bot credentials.
-/// Resident reads require no token. Neither configuration nor commands consult the environment.
+/// Direct Discord operations with pile-backed authentication. Resident reads
+/// require no credential. Native operations never consult the environment.
 #[derive(Clone)]
 pub struct Discord {
     storage: crate::storage::Storage,
-    token: Option<String>,
+    token: Option<Zeroizing<String>>,
 }
 impl std::fmt::Debug for Discord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -278,9 +279,10 @@ impl Discord {
             token: None,
         }
     }
-    /// Accept resident secret bytes from a trusted launcher, never a path or MCP tool argument.
+    /// Explicit credential override for the standalone CLI's existing callers.
+    /// MCP and app adapters use the pile-backed resolver instead.
     pub fn with_token(mut self, token: String) -> Self {
-        self.token = Some(token);
+        self.token = Some(Zeroizing::new(token));
         self
     }
     fn storage(&self) -> DiscordStorage<'_> {
@@ -289,25 +291,66 @@ impl Discord {
             collection: None,
         }
     }
-    fn token(&self) -> Result<&str> {
-        self.token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-            .ok_or_else(|| anyhow!("missing Discord bot token in trusted host configuration"))
+    /// Metadata only: this does not open a Secrets version.
+    pub fn auth_status(&self) -> Result<discord_model::AuthStatus> {
+        self.storage()
+            .with_session(|session| Ok(discord_model::auth_status(&session.facts)))
+    }
+    /// Bind one exact existing Secrets version, reconciling every observed
+    /// authentication head. No credential is imported, delivered or granted.
+    pub fn auth_set(&self, secret: Id) -> Result<Id> {
+        self.preflight_write()?;
+        // Prove that the selected signing identity can open this version.
+        // Close the operation before entering the shared store again.
+        drop(self.open_token(secret)?);
+        self.storage().with_session(|session| {
+            let status = discord_model::auth_status(&session.facts);
+            if status.selected().ok() == Some(secret) {
+                return Ok(*status.heads.first().expect("settled auth head"));
+            }
+            let fragment = discord_model::auth_fragment(secret, status.heads);
+            let revision = fragment.root().expect("authentication revision root");
+            session.commit(fragment, "discord: bind exact Secrets version".to_owned())?;
+            Ok(revision)
+        })
+    }
+    fn open_token(&self, secret: Id) -> Result<Zeroizing<String>> {
+        let bytes = crate::secrets::Secrets::with_storage(self.storage.clone())
+            .get(secret)
+            .with_context(|| format!("open configured Discord Secrets version {secret:X}"))?;
+        let token = std::str::from_utf8(&bytes)
+            .map_err(|_| anyhow!("configured Discord credential is not UTF-8"))?
+            .trim();
+        if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_control()) {
+            bail!("configured Discord credential is empty or contains control characters");
+        }
+        Ok(Zeroizing::new(token.to_owned()))
+    }
+    pub(crate) fn token(&self) -> Result<Zeroizing<String>> {
+        if let Some(token) = &self.token {
+            if token.trim().is_empty() {
+                bail!("empty Discord credential override");
+            }
+            return Ok(token.clone());
+        }
+        self.open_token(self.auth_status()?.selected()?)
     }
     /// Post literal text, after proving collection WRITE admission, then persist the returned observation.
     pub fn send(&self, channel_id: &str, text: &str) -> Result<SendReceipt> {
+        self.send_using(channel_id, text, post_message)
+    }
+    fn send_using(
+        &self,
+        channel_id: &str,
+        text: &str,
+        post: impl FnOnce(&str, &str, &str) -> Result<JsonValue>,
+    ) -> Result<SendReceipt> {
         discord_model::validate_snowflake(channel_id)?;
         if text.trim().is_empty() {
             bail!("empty message body");
         }
-        send_with(
-            self.storage(),
-            self.token()?,
-            channel_id,
-            text,
-            post_message,
-        )
+        self.preflight_write()?;
+        send_with(self.storage(), &self.token()?, channel_id, text, post)
     }
     /// Observe the resident collection; this never lists guilds, fetches messages, or opens credentials.
     pub fn read(&self, options: ReadOptions) -> Result<History> {
@@ -319,7 +362,8 @@ impl Discord {
     /// Per-channel failures in an all-visible pull are retained explicitly in the report.
     pub fn pull(&self, options: PullOptions) -> Result<PullReport> {
         options.validate()?;
-        pull(self.storage(), self.token()?, options)
+        self.preflight_write()?;
+        pull(self.storage(), &self.token()?, options)
     }
     /// Pull one channel as [`Self::pull`] does, reading Discord through
     /// `source`. `floor` is the message id intake reads the channel from:
@@ -462,7 +506,7 @@ impl Discord {
         if let Some(guild) = guild {
             discord_model::validate_snowflake(guild)?;
         }
-        list_channels(self.token()?, guild)
+        list_channels(&self.token()?, guild)
     }
 }
 
@@ -658,15 +702,14 @@ pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
     let response = client
         .post(&url)
-        .header("Authorization", format!("Bot {token}"))
+        .header("Authorization", authorization(token)?)
         .header("Content-Type", "application/json")
         .body(json!({ "content": text }).to_string())
         .send()
         .with_context(|| format!("POST {url}"))?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().unwrap_or_default();
-        bail!("discord send failed ({status}): {body}");
+        bail!("discord send failed ({status})");
     }
     response.json().context("parse send response")
 }
@@ -976,13 +1019,12 @@ fn fetch_message_page(
     }
     let response = build_client()?
         .get(&url)
-        .header("Authorization", format!("Bot {token}"))
+        .header("Authorization", authorization(token)?)
         .send()
         .with_context(|| format!("GET {url}"))?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().unwrap_or_default();
-        bail!("discord read failed ({status}): {body}");
+        bail!("discord read failed ({status})");
     }
     response.json().context("parse Discord message page")
 }
@@ -997,7 +1039,7 @@ fn fetch_message(token: &str, channel_id: &str, message_id: u64) -> Result<Optio
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}");
     let response = build_client()?
         .get(&url)
-        .header("Authorization", format!("Bot {token}"))
+        .header("Authorization", authorization(token)?)
         .send()
         .with_context(|| format!("GET {url}"))?;
     let status = response.status();
@@ -1008,7 +1050,7 @@ fn fetch_message(token: &str, channel_id: &str, message_id: u64) -> Result<Optio
     if unknown_message(status.as_u16(), &body) {
         return Ok(None);
     }
-    bail!("discord read of message {message_id} failed ({status}): {body}");
+    bail!("discord read of message {message_id} failed ({status})");
 }
 
 /// Whether an error answer is Discord saying the message does not exist.
@@ -1566,7 +1608,7 @@ fn list_visible_text_channels(token: &str) -> Result<Vec<VisibleChannel>> {
     let client = build_client()?;
     let guilds: Vec<JsonValue> = client
         .get(format!("{DISCORD_API_BASE}/users/@me/guilds"))
-        .header("Authorization", format!("Bot {token}"))
+        .header("Authorization", authorization(token)?)
         .send()
         .context("GET /users/@me/guilds")?
         .error_for_status()
@@ -1582,7 +1624,7 @@ fn list_visible_text_channels(token: &str) -> Result<Vec<VisibleChannel>> {
         }
         let channels: Vec<JsonValue> = client
             .get(format!("{DISCORD_API_BASE}/guilds/{guild_id}/channels"))
-            .header("Authorization", format!("Bot {token}"))
+            .header("Authorization", authorization(token)?)
             .send()
             .with_context(|| format!("GET /guilds/{guild_id}/channels"))?
             .error_for_status()
@@ -1622,7 +1664,7 @@ fn list_channels(token: &str, guild_filter: Option<&str>) -> Result<ChannelListi
     let client = build_client()?;
     let guilds: Vec<JsonValue> = client
         .get(format!("{DISCORD_API_BASE}/users/@me/guilds"))
-        .header("Authorization", format!("Bot {token}"))
+        .header("Authorization", authorization(token)?)
         .send()
         .context("GET /users/@me/guilds")?
         .error_for_status()
@@ -1653,7 +1695,7 @@ fn list_channels(token: &str, guild_filter: Option<&str>) -> Result<ChannelListi
 
         let channels: Vec<JsonValue> = client
             .get(format!("{DISCORD_API_BASE}/guilds/{guild_id}/channels"))
-            .header("Authorization", format!("Bot {token}"))
+            .header("Authorization", authorization(token)?)
             .send()
             .with_context(|| format!("GET /guilds/{guild_id}/channels"))?
             .error_for_status()
@@ -1728,6 +1770,13 @@ fn fetch_attachment_bytes(url: &str, limit: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn authorization(token: &str) -> Result<reqwest::header::HeaderValue> {
+    let mut header = reqwest::header::HeaderValue::from_str(&format!("Bot {token}"))
+        .map_err(|_| anyhow!("invalid Discord credential header"))?;
+    header.set_sensitive(true);
+    Ok(header)
+}
+
 fn build_client() -> Result<Client> {
     Client::builder()
         .user_agent("triblespace-discord/0.2")
@@ -1795,6 +1844,185 @@ mod tests {
             storage,
             collection: None,
         }
+    }
+
+    #[test]
+    fn secrets_auth_resolves_exact_versions_and_rotates_only_by_explicit_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = crate::storage::Storage::shared(pile.clone(), Some(key));
+        let operations = Discord::with_storage(storage.clone());
+        let secrets = crate::secrets::Secrets::with_storage(storage.clone());
+        let first = secrets.add("bot", b"synthetic-first-token").unwrap();
+        let revision = operations.auth_set(first).unwrap();
+        assert_eq!(operations.auth_set(first).unwrap(), revision);
+        assert_eq!(
+            operations.token().unwrap().as_str(),
+            "synthetic-first-token"
+        );
+        let second = secrets.add("bot", b"synthetic-second-token").unwrap();
+        assert_eq!(
+            operations.token().unwrap().as_str(),
+            "synthetic-first-token"
+        );
+        operations.auth_set(second).unwrap();
+        assert_eq!(
+            operations.auth_status().unwrap().selected().unwrap(),
+            second
+        );
+        let channel = "100000000000000002";
+        let sent = operations
+            .send_using(channel, "literal message", |token, channel, body| {
+                assert_eq!(token, "synthetic-second-token");
+                Ok(message_json(
+                    "100000000000000001",
+                    channel,
+                    body,
+                    None,
+                    json!([]),
+                ))
+            })
+            .unwrap();
+        assert_eq!(sent.channel_id, channel);
+        assert!(!format!("{operations:?}").contains("synthetic"));
+        storage.close().unwrap();
+        let bytes = std::fs::read(pile).unwrap();
+        for plaintext in [
+            b"synthetic-first-token".as_slice(),
+            b"synthetic-second-token".as_slice(),
+        ] {
+            assert!(!bytes
+                .windows(plaintext.len())
+                .any(|window| window == plaintext));
+        }
+    }
+
+    #[test]
+    fn missing_forked_unknown_and_wrong_identity_credentials_never_reach_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = crate::storage::Storage::shared(pile.clone(), Some(key));
+        let operations = Discord::with_storage(storage.clone());
+        let assert_no_post = || {
+            let error = operations
+                .send_using("1", "body", |_, _, _| {
+                    panic!("authentication failure must precede HTTP")
+                })
+                .unwrap_err();
+            assert!(!format!("{error:#}").contains("synthetic-private-token"));
+        };
+        assert_no_post();
+        let missing = ufoid();
+        operations
+            .storage()
+            .publish(
+                discord_model::auth_fragment(missing.id, []),
+                "fixture".into(),
+            )
+            .unwrap();
+        assert_no_post();
+
+        let secrets = crate::secrets::Secrets::with_storage(storage.clone());
+        let secret = secrets.add("bot", b"synthetic-private-token").unwrap();
+        let root = operations.auth_set(secret).unwrap();
+        let left = discord_model::auth_fragment(secret, [root]);
+        let left_id = left.root().unwrap();
+        operations
+            .storage()
+            .publish(left, "fixture".into())
+            .unwrap();
+        let right = discord_model::auth_fragment(missing.id, [root]);
+        let right_id = right.root().unwrap();
+        operations
+            .storage()
+            .publish(right, "fixture".into())
+            .unwrap();
+        assert_eq!(
+            operations.auth_status().unwrap().heads,
+            BTreeSet::from([left_id, right_id])
+        );
+        assert_no_post();
+        operations.auth_set(secret).unwrap();
+        assert_eq!(
+            operations.token().unwrap().as_str(),
+            "synthetic-private-token"
+        );
+
+        // Resident ciphertext is not sufficient: another signing identity has
+        // no recipient envelope. Test the same Secrets opener used by token().
+        storage
+            .with_store(|store, signer, runtime| {
+                let collection = crate::storage::open_secrets_collection_acquiring(
+                    store,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+                let snapshot = crate::secrets::storage::snapshot_acquiring(
+                    AcquiringReader::new(store.snapshot()?, runtime.clone()),
+                    collection,
+                )?;
+                let stranger = SigningKey::from_bytes(&[0x73; 32]);
+                let error = snapshot.open(secret, &stranger).unwrap_err();
+                assert!(!format!("{error:#}").contains("synthetic-private-token"));
+                Ok(())
+            })
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn nonresident_secret_payload_and_invalid_token_fail_without_exposure() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = crate::storage::Storage::shared(pile, Some(key));
+        let operations = Discord::with_storage(storage.clone());
+        let cold = storage
+            .with_store(|store, signer, runtime| {
+                let collection = crate::storage::open_secrets_collection_acquiring(
+                    store,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+                let sealed = crate::secrets::seal_version(
+                    "cold bot",
+                    b"synthetic-cold-token",
+                    [signer.verifying_key()],
+                    crate::clock::point_now()?,
+                )?;
+                // Keep the immutable facts, but not their encrypted payloads.
+                store.commit(
+                    collection.source(),
+                    signer,
+                    sealed.fragment.into_facts().into(),
+                )?;
+                Ok(sealed.secret)
+            })
+            .unwrap();
+        operations
+            .storage()
+            .publish(
+                discord_model::auth_fragment(cold, []),
+                "cold fixture".into(),
+            )
+            .unwrap();
+        let error = operations
+            .send_using("1", "body", |_, _, _| panic!("cold auth reached HTTP"))
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("synthetic-cold-token"));
+        let secrets = crate::secrets::Secrets::with_storage(storage.clone());
+        let invalid = secrets
+            .add("invalid bot", b"synthetic-invalid-token\nheader")
+            .unwrap();
+        let error = operations.auth_set(invalid).unwrap_err();
+        assert!(!format!("{error:#}").contains("synthetic-invalid-token"));
+        assert!(
+            format!("{:?}", authorization("synthetic-header-token").unwrap()).contains("Sensitive")
+        );
+        assert!(
+            !format!("{:?}", authorization("synthetic-header-token").unwrap())
+                .contains("synthetic-header-token")
+        );
+        storage.close().unwrap();
     }
 
     #[test]

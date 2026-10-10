@@ -55,6 +55,9 @@ pub mod discord {
     use super::*;
 
     attributes! {
+        /// Exact encrypted Secrets version used by an authentication revision.
+        /// Minted with `trible genid` on 2026-10-10.
+        "79C7FA989CF7A5419C3CEA7153101203" as pub auth_secret_version: GenId;
         /// Link from a channel entity to its parent guild.
         "E3022EC14FD000BB8556CD32C2C68E59" unsafe as pub guild: GenId;
         /// Link from a message entity to its channel.
@@ -132,6 +135,12 @@ pub mod discord {
     #[allow(non_upper_case_globals)]
     #[allow(dead_code)]
     pub const discord_metadata: Id = id_hex!("2D7920FB46B6821912F51371BF1FB4FE");
+
+    /// An immutable bot authentication revision. Successors explicitly name
+    /// the revisions they observed through `metadata::supersedes`.
+    /// Minted with `trible genid` on 2026-10-10.
+    #[allow(non_upper_case_globals)]
+    pub const kind_auth: Id = id_hex!("E5B4A5CD56EB07D6E02661D2C0D4D761");
 
     /// Tag for Discord guild (server) entities.
     #[allow(non_upper_case_globals)]

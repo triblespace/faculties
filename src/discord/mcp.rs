@@ -1,4 +1,4 @@
-//! Explicit finite Discord MCP operations; tokens are trusted host configuration only.
+//! Explicit finite Discord MCP operations; authentication resolves through Secrets.
 use super::{operations::*, render};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
@@ -8,13 +8,17 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 const TOOLS: &[Tool] = &[
+    Tool { name: "discord_auth_status", description: "Show the workspace's Discord authentication revision and exact encrypted Secrets references. Never opens or returns credential plaintext.",
+        input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"# },
+    Tool { name: "discord_auth_set", description: "Bind an existing exact encrypted Secrets version as this workspace's Discord bot credential, reconciling observed auth revisions. Requires access to that version and Discord collection WRITE; never imports plaintext or grants authority.",
+        input_schema: r#"{"type":"object","properties":{"secret_version":{"type":"string","description":"Exact 32-character immutable Secrets version id; never a token or secret name."}},"required":["secret_version"],"additionalProperties":false}"# },
     Tool { name: "discord_read", description: "Read resident Discord observations, including divergent latest versions. No token or network access required; call discord_pull explicitly for fresh data.",
         input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"since":{"type":"string","description":"RFC3339 timestamp."},"limit":{"type":"integer","minimum":0,"default":20,"description":"Newest N messages; 0 means unlimited."},"descending":{"type":"boolean","default":false}},"additionalProperties":false}"# },
-    Tool { name: "discord_pull", description: "Pull a complete forward interval and bounded recent edits into the archive using the host-configured bot token. Omit channel_id to visit all visible text-capable channels; partial channel failures are reported explicitly.",
+    Tool { name: "discord_pull", description: "Pull a complete forward interval and bounded recent edits into the archive using the workspace's Secrets-backed bot credential. Omit channel_id to visit all visible text-capable channels; partial channel failures are reported explicitly.",
         input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"fetch_limit":{"type":"integer","minimum":1,"maximum":100,"default":100},"reconcile_limit":{"type":"integer","minimum":1,"maximum":100,"default":50}},"additionalProperties":false}"# },
-    Tool { name: "discord_send", description: "Send literal text as the host-configured Discord bot, after checking collection WRITE admission, then store the returned observation. A post-send storage failure does not undo the external send; do not retry automatically.",
+    Tool { name: "discord_send", description: "Send literal text as the workspace's Secrets-backed Discord bot, after checking collection WRITE admission, then store the returned observation. A post-send storage failure does not undo the external send; do not retry automatically.",
         input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"text":{"type":"string","description":"Literal message body. @file and @- never expand to host input."}},"required":["channel_id","text"],"additionalProperties":false}"# },
-    Tool { name: "discord_channels_list", description: "List the guilds and channels visible to the host-configured Discord bot through a finite REST query.",
+    Tool { name: "discord_channels_list", description: "List the guilds and channels visible to the workspace's Secrets-backed Discord bot through a finite REST query.",
         input_schema: r#"{"type":"object","properties":{"guild":{"type":"string","description":"Optional exact canonical Discord guild snowflake."}},"additionalProperties":false}"# },
 ];
 fn limit() -> usize {
@@ -57,6 +61,16 @@ struct Channels {
     guild: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthSet {
+    secret_version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+
 #[derive(Clone, Debug)]
 pub struct Discord {
     operations: super::operations::Discord,
@@ -70,11 +84,6 @@ impl Discord {
             operations: super::operations::Discord::with_storage(storage),
         }
     }
-    /// Trusted launcher-only configuration; this is deliberately not an MCP argument.
-    pub fn with_token(mut self, token: String) -> Self {
-        self.operations = self.operations.with_token(token);
-        self
-    }
 }
 impl Faculty for Discord {
     fn tools(&self) -> &[Tool] {
@@ -82,6 +91,21 @@ impl Faculty for Discord {
     }
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
         match name {
+            "discord_auth_status" => {
+                let _: Empty = decode_arguments(arguments)?;
+                render::auth(&self.operations.auth_status()?, out)
+            }
+            "discord_auth_set" => {
+                let args: AuthSet = decode_arguments(arguments)?;
+                let secret =
+                    triblespace::prelude::Id::from_hex(&args.secret_version).ok_or_else(|| {
+                        invalid_arguments("expected an exact 32-character Secrets version id")
+                    })?;
+                let revision = self.operations.auth_set(secret)?;
+                out.line(format!(
+                    "Discord auth revision {revision:X}; Secrets version {secret:X}"
+                ))
+            }
             "discord_read" => {
                 let args: Read = decode_arguments(arguments)?;
                 let options = ReadOptions {

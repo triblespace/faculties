@@ -85,6 +85,55 @@ fn collect(execute: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<String> {
 fn call(faculty: &discord::mcp::Discord, tool: &str, args: Value) -> Result<String> {
     collect(|out| faculty.call(tool, Bytes::from(serde_json::to_vec(&args).unwrap()), out))
 }
+
+#[test]
+fn cli_and_mcp_bind_the_same_exact_secret_without_returning_plaintext() {
+    let fixture = Fixture::new();
+    let plaintext = b"synthetic-frontend-credential";
+    let secret = faculties::secrets::Secrets::new(fixture.pile.clone(), Some(fixture.key.clone()))
+        .add("bot", plaintext)
+        .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_discord"));
+    clean_child(&mut command);
+    let output = command
+        .arg("--pile")
+        .arg(&fixture.pile)
+        .arg("--key")
+        .arg(&fixture.key)
+        .args(["auth", "set", &format!("{secret:X}")])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = call(&fixture.mcp(), "discord_auth_status", json!({})).unwrap();
+    assert!(status.contains(&format!("{secret:X}")));
+    assert!(status.contains("settled"));
+    let response = call(
+        &fixture.mcp(),
+        "discord_auth_set",
+        json!({"secret_version": format!("{secret:X}")}),
+    )
+    .unwrap();
+    assert!(response.contains(&format!("{secret:X}")));
+    let text = std::str::from_utf8(plaintext).unwrap();
+    for rendered in [&status, &response] {
+        assert!(!rendered.contains(text));
+    }
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(text));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(text));
+    assert_eq!(
+        fixture
+            .operations()
+            .auth_status()
+            .unwrap()
+            .selected()
+            .unwrap(),
+        secret
+    );
+}
 fn clean_child(command: &mut Command) {
     for (name, _) in std::env::vars_os() {
         let text = name.to_string_lossy();
@@ -127,7 +176,8 @@ fn native_and_mcp_resident_reads_need_no_bot_token() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("missing Discord token"));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Discord authentication is not configured"));
 }
 
 #[test]
@@ -198,6 +248,8 @@ fn decoder_rejects_bad_ids_numeric_types_duplicates_and_host_fields_without_stor
             .map(|tool| tool.name)
             .collect::<Vec<_>>(),
         [
+            "discord_auth_status",
+            "discord_auth_set",
             "discord_read",
             "discord_pull",
             "discord_send",
@@ -237,10 +289,9 @@ fn decoder_rejects_bad_ids_numeric_types_duplicates_and_host_fields_without_stor
 }
 
 #[test]
-fn missing_bot_config_fails_before_storage_and_debug_never_discloses_it() {
-    let directory = tempfile::tempdir().unwrap();
-    let pile = directory.path().join("absent.pile");
-    let faculty = discord::mcp::Discord::new(pile.clone(), None);
+fn missing_bot_config_fails_before_network_and_debug_never_discloses_it() {
+    let fixture = Fixture::new();
+    let faculty = fixture.mcp();
     for (tool, args) in [
         (
             "discord_send",
@@ -251,16 +302,13 @@ fn missing_bot_config_fails_before_storage_and_debug_never_discloses_it() {
     ] {
         let error = call(&faculty, tool, args).unwrap_err();
         assert!(
-            format!("{error:#}").contains("missing Discord bot token"),
+            format!("{error:#}").contains("Discord authentication is not configured"),
             "{tool}: {error:#}"
         );
     }
-    assert!(!pile.exists());
     let token = "test-configured-bot-token";
-    let configured = faculty.with_token(token.to_owned());
-    assert!(format!("{configured:?}").contains("token_configured: true"));
-    assert!(!format!("{configured:?}").contains(token));
-    let native = Discord::new(pile.clone(), None).with_token(token.to_owned());
+    assert!(!format!("{faculty:?}").contains(token));
+    let native = fixture.operations().with_token(token.to_owned());
     assert!(!format!("{native:?}").contains(token));
     assert!(native
         .pull(PullOptions {
@@ -268,7 +316,6 @@ fn missing_bot_config_fails_before_storage_and_debug_never_discloses_it() {
             ..Default::default()
         })
         .is_err());
-    assert!(!pile.exists());
 }
 
 #[test]
@@ -289,12 +336,12 @@ fn mcp_does_not_inherit_an_ambient_bot_token_and_cli_help_redacts_it() {
         assert!(output.status.success(), "{output:?}");
         return;
     }
-    let directory = tempfile::tempdir().unwrap();
-    let faculty = discord::mcp::Discord::new(directory.path().join("absent.pile"), None);
+    let fixture = Fixture::new();
+    let faculty = fixture.mcp();
     assert!(call(&faculty, "discord_channels_list", json!({}))
         .unwrap_err()
         .to_string()
-        .contains("missing Discord bot token"));
+        .contains("Discord authentication is not configured"));
     let output = Command::new(env!("CARGO_BIN_EXE_discord"))
         .arg("--help")
         .output()

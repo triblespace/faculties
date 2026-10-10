@@ -26,9 +26,6 @@ enum Command {
         /// Existing durable signing-key path, configured by the local launcher.
         #[arg(long, env = "TRIBLESPACE_KEY")]
         key: Option<PathBuf>,
-        /// Optional bot credential owned by the launcher, never a tool input.
-        #[arg(long, env = "DISCORD_TOKEN", hide_env_values = true)]
-        discord_token: Option<String>,
         /// Optional LinkedIn DMA bearer credential, owned by the launcher.
         #[arg(long, env = "LINKEDIN_TOKEN", hide_env_values = true)]
         linkedin_token: Option<String>,
@@ -69,7 +66,6 @@ fn main() -> Result<()> {
         Command::Mcp {
             pile,
             key,
-            discord_token,
             linkedin_token,
             duplex_session,
             hear_model_pile,
@@ -95,7 +91,6 @@ fn main() -> Result<()> {
             let catalog = Catalog::new(CatalogConfig {
                 pile,
                 key,
-                discord_token,
                 linkedin_token,
                 duplex_session,
                 hear,

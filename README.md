@@ -115,7 +115,7 @@ faculties mcp --pile ./self.pile
 
 `faculties mcp` implements MCP 2025-06-18 over stdio by default, or native
 Streamable HTTP with `--http-listen`. Both transports use the same 34 adapters,
-228 tools, argument decoding, and native image/audio/resource output. The
+230 tools, argument decoding, and native image/audio/resource output. The
 library's `mcp::catalog::{Config, Catalog}` constructs the aggregate independently
 of either transport, without opening storage, keys, devices, or models.
 This server is trusted software, not a filesystem, network, or model-runtime
@@ -127,11 +127,31 @@ tools cannot substitute those paths. Additional launcher configuration is:
 
 | Capability | Launcher configuration |
 | --- | --- |
-| Discord bot access | Optional `--discord-token` / `DISCORD_TOKEN` |
+| Discord bot access | Pile-backed `discord auth set <exact-secrets-version>`; no launcher token |
 | LinkedIn DMA pulls | Optional `--linkedin-token` / `LINKEDIN_TOKEN` |
 | Files, Memory and Wiki semantic index and search | With the `wemm` feature on a GB10: `WEMM_PILE` (the dedicated WeMM model pile), `WEMM_ASSETS` (its pinned config/tokenizer/template directory) and `WEMM_ROOT` (the model root). Other machines carry the replicated index rows but cannot query them |
 | Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
 | Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
+
+Discord's native operations open the exact encrypted Secrets version named by
+the selected Discord collection's authentication revision, using the configured
+signing identity and Secrets collection. The app workspace must explicitly bind
+both Discord and Secrets roles. Replicating ciphertext alone does not provide a
+recipient envelope or authorize collection writes. No new grants are made by
+Discord. `discord auth status` and MCP `discord_auth_status` show references
+only; `discord auth set <version>` and `discord_auth_set` bind an existing,
+openable version and explicitly reconcile the auth revisions observed there.
+Concurrent revisions remain unsettled until reconciled. A newly added secret,
+even with the same name, never rotates the bot implicitly: bind its exact id.
+
+An administrator provisions credential bytes through Secrets, for example
+`secrets add --name discord-bot --value @/secure/input`, never through chat or a
+Discord tool argument. The returned version id is safe to use in `auth set`.
+The standalone `discord` CLI retains explicit `--token` / `DISCORD_TOKEN`
+overrides (including `@path` / `@-`) for existing live callers; without an
+override it uses the same native Secrets path. The aggregate MCP launcher no
+longer accepts `--discord-token` or reads `DISCORD_TOKEN`: migrate that setup by
+provisioning Secrets and binding its version before upgrading the launcher.
 
 Semantic search runs on **one** native WeMM model (the `wemm` feature, NVIDIA
 GB10 compute 12.1 only) for text, images and documents in one 4096-D space:

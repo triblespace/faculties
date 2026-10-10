@@ -3,6 +3,23 @@ use super::operations::*;
 use crate::out::Out;
 use anyhow::Result;
 
+pub fn auth(status: &super::AuthStatus, out: &mut Out<'_>) -> Result<()> {
+    out.line(if status.heads.is_empty() {
+        "Discord authentication: unset"
+    } else if status.selected().is_ok() {
+        "Discord authentication: settled"
+    } else {
+        "Discord authentication: unsettled"
+    })?;
+    for revision in &status.heads {
+        out.line(format!("auth revision: {revision:X}"))?;
+    }
+    for secret in &status.secret_versions {
+        out.line(format!("Secrets version: {secret:X}"))?;
+    }
+    Ok(())
+}
+
 pub fn sent(receipt: &SendReceipt, out: &mut Out<'_>) -> Result<()> {
     out.line(format!(
         "Sent and stored message {} in channel {}",

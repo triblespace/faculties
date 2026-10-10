@@ -53,6 +53,54 @@ use crate::schemas::discord::discord;
 
 pub type TextHandle = Inline<Handle<UTF8String>>;
 
+/// Public authentication references, never decrypted credential bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuthStatus {
+    pub heads: BTreeSet<Id>,
+    pub secret_versions: BTreeSet<Id>,
+}
+
+impl AuthStatus {
+    /// Authentication requires a settled intention, not an arbitrary winner
+    /// among concurrent revisions or alternative references.
+    pub fn selected(&self) -> Result<Id> {
+        if self.heads.is_empty() {
+            bail!("Discord authentication is not configured; bind an exact Secrets version with discord auth set");
+        }
+        if self.heads.len() != 1 || self.secret_versions.len() != 1 {
+            bail!("Discord authentication is unsettled; inspect discord auth status and reconcile with discord auth set");
+        }
+        Ok(*self.secret_versions.first().expect("one selected version"))
+    }
+}
+
+pub fn auth_status<P: TriblePattern>(facts: &P) -> AuthStatus {
+    let candidates = find!(revision: Id, pattern!(facts, [{
+        ?revision @ metadata::tag: discord::kind_auth,
+    }]));
+    let heads = latest(facts, metadata::supersedes.id(), candidates);
+    let secret_versions = heads
+        .iter()
+        .flat_map(|revision| {
+            find!(secret: Id, pattern!(facts, [{
+                *revision @ discord::auth_secret_version: ?secret,
+            }]))
+        })
+        .collect();
+    AuthStatus {
+        heads,
+        secret_versions,
+    }
+}
+
+pub fn auth_fragment(secret: Id, predecessors: impl IntoIterator<Item = Id>) -> Fragment {
+    entity! { _ @
+        metadata::tag: discord::kind_auth,
+        discord::auth_secret_version: secret,
+        metadata::supersedes*: predecessors,
+    }
+}
+
 /// Validate and decode Discord's canonical decimal representation of a
 /// snowflake. Zero is not a Discord object id; coverage boundaries may use
 /// zero internally and are stored as numeric values instead.
@@ -985,6 +1033,36 @@ pub fn coverage_fragment(channel: Id, interval: CoverageInterval) -> Fragment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_is_an_open_world_opaque_revision_frontier() {
+        let first = ufoid();
+        let next = ufoid();
+        let secret = ufoid();
+        // Authorship can use any id. Metadata annotations and split fact
+        // arrival do not change the meaning of an exact reference.
+        let mut facts = entity! { &first @
+            metadata::tag: discord::kind_auth,
+            discord::auth_secret_version: secret.id,
+            metadata::name: "an annotation".to_owned(),
+        };
+        assert_eq!(auth_status(facts.facts()).selected().unwrap(), secret.id);
+        facts += entity! { &next @
+            metadata::tag: discord::kind_auth,
+            metadata::supersedes: first.id,
+        };
+        assert!(auth_status(facts.facts()).selected().is_err());
+        facts += entity! { &next @ discord::auth_secret_version: secret.id };
+        assert_eq!(auth_status(facts.facts()).selected().unwrap(), secret.id);
+        let alternative = ufoid();
+        facts += entity! { &next @ discord::auth_secret_version: alternative.id };
+        let status = auth_status(facts.facts());
+        assert_eq!(
+            status.secret_versions,
+            BTreeSet::from([secret.id, alternative.id])
+        );
+        assert!(status.selected().is_err());
+    }
 
     /// A channel is heard from the very moment a message's own timestamp
     /// names, so a reader comparing the two needs no message id: the live
