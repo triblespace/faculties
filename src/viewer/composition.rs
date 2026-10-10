@@ -34,7 +34,7 @@ impl Target {
 pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     let storage = nb.state(
         "storage",
-        StorageState::with_storage(viewer.storage.clone(), target.sources().iter().copied()),
+        || StorageState::with_storage(viewer.storage.clone(), target.sources().iter().copied()),
         move |ctx, st| {
             if target == Target::Dashboard {
                 ctx.set_default_section_open(false);
@@ -44,7 +44,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     );
 
     if target == Target::Dashboard || target == Target::Status {
-        nb.state("status", StatusViewer::default(), move |ctx, panel| {
+        nb.state("status", StatusViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let sources = st.context();
             let Some(view) = sources.dataset(SourceKey::Status) else {
@@ -55,48 +55,46 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Headspace {
-        nb.state(
-            "headspace",
-            HeadspaceViewer::default(),
-            move |ctx, panel| {
-                let mut st = storage.read_mut(ctx);
-                let sources = st.context();
-                let Some(headspace) = sources.dataset(SourceKey::Headspace) else {
-                    return;
-                };
-                let Some(secrets) = sources.secrets() else {
-                    return;
-                };
-                panel.render(ctx, headspace, secrets);
-            },
-        );
+        nb.state("headspace", HeadspaceViewer::default, move |ctx, panel| {
+            let mut st = storage.read_mut(ctx);
+            let sources = st.context();
+            let Some(headspace) = sources.dataset(SourceKey::Headspace) else {
+                return;
+            };
+            let Some(secrets) = sources.secrets() else {
+                return;
+            };
+            panel.render(ctx, headspace, secrets);
+        });
     }
 
     if target == Target::Dashboard {
         nb.state(
             "timeline",
-            BranchTimeline::multi(vec![
-                TimelineSource::Compass {
-                    key: SourceKey::Compass,
-                    label: "goals".to_owned(),
-                },
-                TimelineSource::LocalMessages {
-                    key: SourceKey::Messages,
-                    label: "local".to_owned(),
-                },
-                TimelineSource::Wiki {
-                    key: SourceKey::Wiki,
-                    label: "wiki".to_owned(),
-                },
-                TimelineSource::Reason {
-                    key: SourceKey::Reason,
-                    label: "reason".to_owned(),
-                },
-                TimelineSource::Archive {
-                    key: SourceKey::Archive,
-                    label: "archive".to_owned(),
-                },
-            ]),
+            || {
+                BranchTimeline::multi(vec![
+                    TimelineSource::Compass {
+                        key: SourceKey::Compass,
+                        label: "goals".to_owned(),
+                    },
+                    TimelineSource::LocalMessages {
+                        key: SourceKey::Messages,
+                        label: "local".to_owned(),
+                    },
+                    TimelineSource::Wiki {
+                        key: SourceKey::Wiki,
+                        label: "wiki".to_owned(),
+                    },
+                    TimelineSource::Reason {
+                        key: SourceKey::Reason,
+                        label: "reason".to_owned(),
+                    },
+                    TimelineSource::Archive {
+                        key: SourceKey::Archive,
+                        label: "archive".to_owned(),
+                    },
+                ])
+            },
             move |ctx, tl| {
                 let mut st = storage.read_mut(ctx);
                 let sources = st.context();
@@ -106,7 +104,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Gauge {
-        nb.state("gauge", GaugeViewer::default(), move |ctx, panel| {
+        nb.state("gauge", GaugeViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Wiki) else {
                 return;
@@ -116,7 +114,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard {
-        nb.state("wiki", WikiViewer::default(), move |ctx, wiki| {
+        nb.state("wiki", WikiViewer::default, move |ctx, wiki| {
             let mut st = storage.read_mut(ctx);
             let sources = st.context();
             let Some(view) = sources.dataset(SourceKey::Wiki) else {
@@ -127,7 +125,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard {
-        nb.state("compass", CompassBoard::default(), move |ctx, compass| {
+        nb.state("compass", CompassBoard::default, move |ctx, compass| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Compass) else {
                 return;
@@ -137,7 +135,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard {
-        nb.state("decide", DecidePanel::default(), move |ctx, panel| {
+        nb.state("decide", DecidePanel::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Decide) else {
                 return;
@@ -147,7 +145,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard {
-        nb.state("mail", MailViewer::default(), move |ctx, panel| {
+        nb.state("mail", MailViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let sources = st.context();
             let Some(view) = sources.dataset(SourceKey::Mail) else {
@@ -158,7 +156,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Planner {
-        nb.state("planner", PlannerViewer::default(), move |ctx, panel| {
+        nb.state("planner", PlannerViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let sources = st.context();
             let Some(view) = sources.dataset(SourceKey::Planner) else {
@@ -169,7 +167,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Messages {
-        nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
+        nb.state("messages", MessagesPanel::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let sources = st.context();
             let Some(view) = sources.dataset(SourceKey::Messages) else {
@@ -180,7 +178,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Discord {
-        nb.state("discord", DiscordViewer::default(), move |ctx, panel| {
+        nb.state("discord", DiscordViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Discord) else {
                 return;
@@ -190,7 +188,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Teams {
-        nb.state("teams", TeamsViewer::default(), move |ctx, panel| {
+        nb.state("teams", TeamsViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Teams) else {
                 return;
@@ -200,21 +198,17 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard {
-        nb.state(
-            "relations",
-            RelationsViewer::default(),
-            move |ctx, panel| {
-                let mut st = storage.read_mut(ctx);
-                let Some(view) = st.context().dataset(SourceKey::Relations) else {
-                    return;
-                };
-                panel.render(ctx, view);
-            },
-        );
+        nb.state("relations", RelationsViewer::default, move |ctx, panel| {
+            let mut st = storage.read_mut(ctx);
+            let Some(view) = st.context().dataset(SourceKey::Relations) else {
+                return;
+            };
+            panel.render(ctx, view);
+        });
     }
 
     if target == Target::Dashboard || target == Target::Memory {
-        nb.state("memory", MemoryViewer::default(), move |ctx, panel| {
+        nb.state("memory", MemoryViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Memory) else {
                 return;
@@ -224,7 +218,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Files {
-        nb.state("files", FilesViewer::default(), move |ctx, panel| {
+        nb.state("files", FilesViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Files) else {
                 return;
@@ -234,7 +228,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Triage {
-        nb.state("triage", TriageViewer::default(), move |ctx, panel| {
+        nb.state("triage", TriageViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let sources = st.context();
             let Some(cognition) = sources.dataset(SourceKey::Triage) else {
@@ -257,7 +251,7 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
     }
 
     if target == Target::Dashboard || target == Target::Atlas {
-        nb.state("atlas", AtlasViewer::default(), move |ctx, panel| {
+        nb.state("atlas", AtlasViewer::default, move |ctx, panel| {
             let mut st = storage.read_mut(ctx);
             let Some(view) = st.context().dataset(SourceKey::Atlas) else {
                 return;
