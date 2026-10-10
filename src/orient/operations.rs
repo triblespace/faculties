@@ -9425,7 +9425,7 @@ mod tests {
         let reader_id = id(94);
         runtime.block_on(async {
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &signer, false)
                 .await
                 .unwrap();
             let (profile, _, _) = relations::person_fragment(
@@ -9480,7 +9480,7 @@ mod tests {
 
         let (handles, audio) = runtime.block_on(async {
             let mut pile = open_store_as(&fixture.path, signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &signer, false)
                 .await
                 .unwrap();
             maintain_sources(&mut pile, &signer, &sources)
@@ -9539,7 +9539,7 @@ mod tests {
             runtime.block_on(async {
                 let mut pile =
                     open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-                let sources = OrientSources::open(&mut pile, &signer, false)
+                let sources = OrientSources::open(&test_storage(), &mut pile, &signer, false)
                     .await
                     .unwrap();
                 let (profile, _, _) = relations::person_fragment(
