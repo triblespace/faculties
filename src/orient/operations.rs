@@ -7589,6 +7589,7 @@ mod tests {
                     Some("stream-reader"),
                     &options,
                     Duration::from_secs(180),
+                    None,
                     true,
                     &mut Out::new(&mut emit),
                 ),

@@ -410,6 +410,7 @@ mod tests {
             false,
             &news,
             "",
+            NewsForm::Report,
             &mut Out::new(&mut |part| {
                 failed_parts.push(part);
                 bail!("fixture callback rejected complete stdin report")
@@ -433,6 +434,7 @@ mod tests {
             false,
             &news,
             "",
+            NewsForm::Report,
             &mut Out::new(&mut |part| {
                 accepted.push(part);
                 Ok(())
@@ -505,6 +507,7 @@ mod tests {
             false,
             &news,
             "",
+            NewsForm::Report,
             &mut Out::new(&mut |part| {
                 output.push(part);
                 Ok(())
