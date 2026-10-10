@@ -64,9 +64,11 @@ const JOIN_CONFIRM: Duration = Duration::from_secs(20);
 /// Lines in a row that could not be spoken after which the process ends, so
 /// that it starts again with a fresh model and voice driver.
 const FAILED_IN_A_ROW: u32 = 3;
-/// A piece of a line shorter than this many characters is spoken together
-/// with the next one ([`sentences`]).
-const MIN_SENTENCE_CHARS: usize = 24;
+/// The longest piece of a line the synthesizer is given at once, about thirty
+/// seconds of speech ([`pieces`]). A line up to this long is one generation,
+/// so its cadence runs across its sentences; a longer one is cut between
+/// sentences, never inside one.
+const MAX_PIECE_CHARS: usize = 400;
 /// The synthesizer's PCM: 24 kHz mono.
 const SAMPLE_RATE: u32 = mary::speak::SpeakStream::SAMPLE_RATE;
 
@@ -829,14 +831,14 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
         Ok(text) => text,
         Err(error) => return Spoken::Failed(anyhow!(error).context("read the queued line")),
     };
-    // A line is spoken sentence by sentence, and a sentence while it is
-    // synthesized: it starts playing once its first hop of audio is decoded
-    // (or a little more, when synthesis is measured to run slower than
-    // playback), and the next sentence is synthesized once it is. The line is
-    // still the unit of the queue: a sentence that fails or is interrupted
-    // settles the whole line, and an interrupted line is spoken again from its
-    // start.
-    let sentences = sentences(&text);
+    // A line is spoken in pieces of whole sentences up to MAX_PIECE_CHARS,
+    // usually one piece, and a piece while it is synthesized: it starts
+    // playing once its first hop of audio is decoded (or a little more, when
+    // synthesis is measured to run slower than playback), and the next piece
+    // is synthesized once it is. The line is still the unit of the queue: a
+    // piece that fails or is interrupted settles the whole line, and an
+    // interrupted line is spoken again from its start.
+    let sentences = pieces(&text);
     let asked = std::time::Instant::now();
     let mut next = sentences.first().map(|first| speech.request(first.clone()));
     for (index, sentence) in sentences.iter().enumerate() {
@@ -1059,12 +1061,14 @@ impl symphonia::core::io::MediaSource for Growing {
     }
 }
 
-/// The sentences a line is spoken in: cut after a sentence's end mark that is
-/// followed by a space or a line break, and a piece shorter than
-/// [`MIN_SENTENCE_CHARS`] joined to the next, so that a short opening ("Yes.")
-/// does not stand alone and abbreviations rarely split a sentence. A line
-/// with no such mark is one sentence.
-fn sentences(text: &str) -> Vec<String> {
+/// The pieces a line is synthesized in: whole sentences packed in order into
+/// pieces of at most [`MAX_PIECE_CHARS`], so an ordinary reply is a single
+/// generation and its cadence is not reset at every sentence (JP, 2026-10-10,
+/// on the walk: "it feels a bit like the cadence might still be
+/// sentence-wise"). A sentence ends after an end mark followed by a space or
+/// a line break; a sentence longer than the limit is a piece of its own. A
+/// line with no such mark is one sentence.
+fn pieces(text: &str) -> Vec<String> {
     let mut pieces: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut chars = text.trim().chars().peekable();
@@ -1083,31 +1087,19 @@ fn sentences(text: &str) -> Vec<String> {
     if !rest.is_empty() {
         pieces.push(rest.to_owned());
     }
-    let mut sentences: Vec<String> = Vec::new();
-    let mut short = String::new();
-    for piece in pieces {
-        let joined = if short.is_empty() {
-            piece
-        } else {
-            format!("{short} {piece}")
-        };
-        if joined.chars().count() < MIN_SENTENCE_CHARS {
-            short = joined;
-        } else {
-            sentences.push(joined);
-            short.clear();
-        }
-    }
-    if !short.is_empty() {
-        match sentences.last_mut() {
-            Some(last) => {
+    let mut packed: Vec<String> = Vec::new();
+    for sentence in pieces {
+        match packed.last_mut() {
+            Some(last)
+                if last.chars().count() + 1 + sentence.chars().count() <= MAX_PIECE_CHARS =>
+            {
                 last.push(' ');
-                last.push_str(&short);
+                last.push_str(&sentence);
             }
-            None => sentences.push(short),
+            _ => packed.push(sentence),
         }
     }
-    sentences
+    packed
 }
 
 /// Wait for a playing line: its track's End or Error event, the time limit
@@ -1505,24 +1497,30 @@ fn snowflake(value: &Value) -> Option<u64> {
 mod tests {
 
     #[test]
-    fn a_line_is_spoken_in_sentences_with_short_pieces_joined() {
+    fn an_ordinary_line_is_one_piece_and_a_long_one_is_cut_between_sentences() {
         assert_eq!(
-            sentences("Yes. The willows really are Lovecraftian! And the lamps were just coming on.\nGood morning."),
-            [
-                "Yes. The willows really are Lovecraftian!",
-                "And the lamps were just coming on. Good morning.",
-            ]
+            pieces("Yes. The willows really are Lovecraftian! And the lamps were just coming on.\nGood morning."),
+            ["Yes. The willows really are Lovecraftian! And the lamps were just coming on. Good morning."]
         );
         assert_eq!(
-            sentences("A line with no end mark"),
+            pieces("A line with no end mark"),
             ["A line with no end mark"]
         );
         assert_eq!(
-            sentences("It costs 0.5 s, e.g. here."),
+            pieces("It costs 0.5 s, e.g. here."),
             ["It costs 0.5 s, e.g. here."]
         );
-        assert_eq!(sentences("  "), Vec::<String>::new());
-        assert_eq!(sentences("Short. Tiny."), ["Short. Tiny."]);
+        assert_eq!(pieces("  "), Vec::<String>::new());
+        let sentence = format!("{}.", "word ".repeat(30).trim_end()); // 150 characters
+        let line = [sentence.as_str(); 5].join(" ");
+        let cut = pieces(&line);
+        assert_eq!(cut.len(), 3);
+        assert!(cut
+            .iter()
+            .all(|piece| piece.chars().count() <= MAX_PIECE_CHARS));
+        assert_eq!(cut.join(" "), line);
+        let long = format!("{}.", "word ".repeat(100).trim_end());
+        assert_eq!(pieces(&long), [long.clone()]);
     }
 
     use super::*;
