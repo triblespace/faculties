@@ -47,7 +47,7 @@ const GAP_MS: u64 = 1_000;
 /// end of a sentence sooner: "worst case, we just kind of schedule a new one
 /// right after that one, and then you get them both". Retained tail, preroll,
 /// max duration and explicit close rules stay unchanged.
-const END_SILENCE_MS: usize = 600;
+const END_SILENCE_MS: usize = 800;
 
 /// What hearing runs with.
 pub struct Config {
@@ -832,7 +832,7 @@ mod tests {
                 let Work::Utterance(item) = work else {
                     panic!("unexpected intake work")
                 };
-                published_early |= end_ms < 3200;
+                published_early |= end_ms < 3400;
                 published.push(item);
             }
         }
@@ -841,14 +841,14 @@ mod tests {
         assert_eq!(
             published.len(),
             1,
-            "a 400 ms pause, under the 600 ms close, must not split the turn"
+            "a 400 ms pause, under the 800 ms close, must not split the turn"
         );
         assert_eq!(captured.len(), 1);
         assert!(
             pushed_before_pause,
             "recognition must stay online during speech"
         );
-        assert!(!published_early, "no partial news before the 600 ms close");
+        assert!(!published_early, "no partial news before the 800 ms close");
         assert!(active.is_none());
         assert_eq!(ear.peak.get(), 1);
         assert_eq!(ear.live.get(), 0);
