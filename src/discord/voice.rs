@@ -63,6 +63,9 @@ const JOIN_CONFIRM: Duration = Duration::from_secs(20);
 /// Lines in a row that could not be spoken after which the process ends, so
 /// that it starts again with a fresh model and voice driver.
 const FAILED_IN_A_ROW: u32 = 3;
+/// A piece of a line shorter than this many characters is spoken together
+/// with the next one ([`sentences`]).
+const MIN_SENTENCE_CHARS: usize = 24;
 
 /// The state directory's queue: `say/` holds queued lines, `said/` spoken
 /// ones and `failed/` the ones that could not be spoken.
@@ -823,18 +826,46 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
         Ok(text) => text,
         Err(error) => return Spoken::Failed(anyhow!(error).context("read the queued line")),
     };
-    let started = std::time::Instant::now();
-    let (pcm, sample_rate) = match speech.speak(text.clone()).await {
-        Ok(audio) => audio,
-        Err(Unspoken::Line(error)) => return Spoken::Failed(error),
-        Err(Unspoken::Synthesizer(error)) => return Spoken::Broken(error),
-    };
-    let seconds = pcm.len() as f64 / 4.0 / f64::from(sample_rate);
-    eprintln!(
-        "[discord] synthesized {seconds:.1} s of speech in {:.1} s: {}",
-        started.elapsed().as_secs_f64(),
-        text.trim()
-    );
+    // A line is spoken sentence by sentence: the first plays while the next
+    // is synthesized, so the listener waits for one sentence, not the line.
+    // The line is still the unit of the queue: a sentence that fails or is
+    // interrupted settles the whole line, and an interrupted line is spoken
+    // again from its start.
+    let sentences = sentences(&text);
+    let asked = std::time::Instant::now();
+    let mut next = sentences.first().map(|first| speech.request(first.clone()));
+    for (index, sentence) in sentences.iter().enumerate() {
+        let started = std::time::Instant::now();
+        let synthesis = next
+            .take()
+            .expect("each sentence is requested before it is spoken");
+        let (pcm, sample_rate) = match synthesis.audio().await {
+            Ok(audio) => audio,
+            Err(Unspoken::Line(error)) => return Spoken::Failed(error),
+            Err(Unspoken::Synthesizer(error)) => return Spoken::Broken(error),
+        };
+        next = sentences
+            .get(index + 1)
+            .map(|following| speech.request(following.clone()));
+        let seconds = pcm.len() as f64 / 4.0 / f64::from(sample_rate);
+        eprintln!(
+            "[discord] synthesized {seconds:.1} s of speech in {:.1} s (sentence {} of {}, {:.1} s after the line was taken): {}",
+            started.elapsed().as_secs_f64(),
+            index + 1,
+            sentences.len(),
+            asked.elapsed().as_secs_f64(),
+            sentence
+        );
+        match play(voice, pcm, sample_rate, seconds).await {
+            Spoken::Heard => {}
+            other => return other,
+        }
+    }
+    Spoken::Heard
+}
+
+/// Play one synthesized sentence and wait for it to end.
+async fn play(voice: &mut Voice, pcm: Vec<u8>, sample_rate: u32, seconds: f64) -> Spoken {
     // The count first: a loss after it is seen, whether or not the
     // connection is still down by the time the speaker looks.
     let since = voice.interruptions.load(Ordering::SeqCst);
@@ -875,6 +906,57 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
     settle(ended, interrupted, played, || {
         let _ = track.stop();
     })
+}
+
+/// The sentences a line is spoken in: cut after a sentence's end mark that is
+/// followed by a space or a line break, and a piece shorter than
+/// [`MIN_SENTENCE_CHARS`] joined to the next, so that a short opening ("Yes.")
+/// does not stand alone and abbreviations rarely split a sentence. A line
+/// with no such mark is one sentence.
+fn sentences(text: &str) -> Vec<String> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        current.push(c);
+        let ends = matches!(c, '.' | '!' | '?' | ';' | ':');
+        if c == '\n' || (ends && chars.peek().is_none_or(|next| next.is_whitespace())) {
+            let piece = current.trim();
+            if !piece.is_empty() {
+                pieces.push(piece.to_owned());
+            }
+            current.clear();
+        }
+    }
+    let rest = current.trim();
+    if !rest.is_empty() {
+        pieces.push(rest.to_owned());
+    }
+    let mut sentences: Vec<String> = Vec::new();
+    let mut short = String::new();
+    for piece in pieces {
+        let joined = if short.is_empty() {
+            piece
+        } else {
+            format!("{short} {piece}")
+        };
+        if joined.chars().count() < MIN_SENTENCE_CHARS {
+            short = joined;
+        } else {
+            sentences.push(joined);
+            short.clear();
+        }
+    }
+    if !short.is_empty() {
+        match sentences.last_mut() {
+            Some(last) => {
+                last.push(' ');
+                last.push_str(&short);
+            }
+            None => sentences.push(short),
+        }
+    }
+    sentences
 }
 
 /// Wait for a playing line: its track's End or Error event, the time limit,
@@ -1051,13 +1133,22 @@ impl SpeechWorker {
             .map_err(|_| anyhow!("the speech thread stopped"))?
     }
 
-    async fn speak(&self, text: String) -> Result<(Vec<u8>, u32), Unspoken> {
-        let stopped = || Unspoken::Synthesizer(anyhow!("the speech thread stopped"));
+    /// Ask for `text` now, without waiting: the thread synthesizes it while
+    /// the caller plays what came before.
+    fn request(&self, text: String) -> Synthesis {
         let (reply, answer) = oneshot::channel();
-        self.requests
-            .send(Request::Speak(text, reply))
-            .map_err(|_| stopped())?;
-        answer.await.map_err(|_| stopped())?
+        let sent = self.requests.send(Request::Speak(text, reply)).is_ok();
+        Synthesis(sent.then_some(answer))
+    }
+}
+
+/// One requested synthesis, to be awaited once.
+struct Synthesis(Option<oneshot::Receiver<Result<(Vec<u8>, u32), Unspoken>>>);
+
+impl Synthesis {
+    async fn audio(self) -> Result<(Vec<u8>, u32), Unspoken> {
+        let stopped = || Unspoken::Synthesizer(anyhow!("the speech thread stopped"));
+        self.0.ok_or_else(stopped)?.await.map_err(|_| stopped())?
     }
 }
 
@@ -1082,6 +1173,28 @@ fn snowflake(value: &Value) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_line_is_spoken_in_sentences_with_short_pieces_joined() {
+        assert_eq!(
+            sentences("Yes. The willows really are Lovecraftian! And the lamps were just coming on.\nGood morning."),
+            [
+                "Yes. The willows really are Lovecraftian!",
+                "And the lamps were just coming on. Good morning.",
+            ]
+        );
+        assert_eq!(
+            sentences("A line with no end mark"),
+            ["A line with no end mark"]
+        );
+        assert_eq!(
+            sentences("It costs 0.5 s, e.g. here."),
+            ["It costs 0.5 s, e.g. here."]
+        );
+        assert_eq!(sentences("  "), Vec::<String>::new());
+        assert_eq!(sentences("Short. Tiny."), ["Short. Tiny."]);
+    }
+
     use super::*;
     use serde_json::json;
 
