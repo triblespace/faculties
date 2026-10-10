@@ -50,15 +50,21 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn new(config: Config) -> Self {
+        let storage = Storage::shared(config.pile.clone(), config.key.clone());
+        Self::with_storage(config, storage)
+    }
+
+    /// Use a launcher-owned shared storage context, including its explicit
+    /// network routes. The supplied owner is also the one closed at shutdown.
+    pub fn with_storage(config: Config, storage: Storage) -> Self {
         let Config {
-            pile,
-            key,
+            pile: _,
+            key: _,
             discord_token,
             linkedin_token,
             duplex_session,
             hear: hear_config,
         } = config;
-        let storage = Storage::shared(pile, key);
         let discord = discord::mcp::Discord::with_storage(storage.clone());
         let discord = match discord_token {
             Some(token) => discord.with_token(token),

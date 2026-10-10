@@ -29,9 +29,9 @@ use triblespace::core::collection::{
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStorePut, SnapshotSource, StorageClose, Store};
-use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::prelude::*;
 
 use crate::schemas::code::DEFAULT_SCOPE_ID;
@@ -50,14 +50,11 @@ pub struct CodeImportWriter<P = FacultyStore> {
 impl CodeImportWriter {
     /// Open a synchronous import session. Async callers run the complete
     /// open/stage/close lifetime on a blocking worker, not inside their runtime.
-    pub fn open(
-        pile_path: &std::path::Path,
-        key_path: Option<&std::path::Path>,
-    ) -> Result<Self> {
+    pub fn open(pile_path: &std::path::Path, key_path: Option<&std::path::Path>) -> Result<Self> {
         let signer = crate::storage::load_signer(pile_path, key_path)?;
         let runtime = Arc::new(crate::storage::runtime()?);
         let mut pile = crate::storage::open_store_as(pile_path, signer.verifying_key())?;
-        let result = Self::prepare(&mut pile, &signer, &runtime);
+        let result = Self::prepare(&mut pile, &signer, &runtime, None);
         match result {
             Ok((collection, current)) => {
                 let mut writer = Self {
@@ -93,11 +90,30 @@ where
 {
     /// Borrow the full caller-owned store; no local-backend guard spans I/O.
     pub fn from_store(
-        mut pile: P,
+        pile: P,
         signer: &SigningKey,
         runtime: Arc<tokio::runtime::Runtime>,
     ) -> Result<Self> {
-        let (source, current) = Self::prepare(&mut pile, signer, &runtime)?;
+        Self::from_store_selected(pile, signer, runtime, None)
+    }
+
+    /// Import into the exact immutable workspace selection.
+    pub fn from_store_with_storage(
+        pile: P,
+        signer: &SigningKey,
+        runtime: Arc<tokio::runtime::Runtime>,
+        storage: &crate::storage::Storage,
+    ) -> Result<Self> {
+        Self::from_store_selected(pile, signer, runtime, Some(storage))
+    }
+
+    fn from_store_selected(
+        mut pile: P,
+        signer: &SigningKey,
+        runtime: Arc<tokio::runtime::Runtime>,
+        storage: Option<&crate::storage::Storage>,
+    ) -> Result<Self> {
+        let (source, current) = Self::prepare(&mut pile, signer, &runtime, storage)?;
         let mut writer = Self {
             pile,
             collection: source,
@@ -114,18 +130,40 @@ where
         pile: &mut P,
         signer: &SigningKey,
         runtime: &Arc<tokio::runtime::Runtime>,
+        storage: Option<&crate::storage::Storage>,
     ) -> Result<(Collection<SimpleArchive>, FactArchive)> {
-        let source = crate::collection_names::open_configured_acquiring(
-            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
-        )?;
+        let source = match storage {
+            Some(storage) => {
+                storage.open_collection_read(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+                storage.open_collection_write(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?
+            }
+            None => crate::collection_names::open_configured_acquiring(
+                pile,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
+            )?,
+        };
         let (succinct, rank9) = crate::storage::fact_pair(pile, source)?;
-        runtime.block_on(async {
-            crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
-            crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
-        }).context("maintain Code import facts")?;
+        runtime
+            .block_on(async {
+                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+            })
+            .context("maintain Code import facts")?;
         let reader = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
-        let current = crate::storage::acquire_facts(&reader, rank9)
-            .context("read Code import facts")?;
+        let current =
+            crate::storage::acquire_facts(&reader, rank9).context("read Code import facts")?;
         Ok((source, current))
     }
 
@@ -303,8 +341,11 @@ pub fn ensure_local_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>> {
     storage.with_store(|store, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = storage.open_collection_read(
+            store,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
         )?;
         let mut local = store.store();
         let pile = &mut *local;

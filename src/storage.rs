@@ -45,7 +45,7 @@
 //! `faculties-migrations` crate and depends on this module rather than the
 //! other way round.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -96,6 +96,15 @@ pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
 
 pub use triblespace::core::repo::async_store::AcquiringReader;
 
+/// Explicit application bindings from a faculty role to one exact descriptor.
+/// Roles are the schema IDs in [`crate::collection_names::table`], not names
+/// discovered from the pile. An absent role is unconfigured, never a default.
+pub type CollectionRoutes = BTreeMap<Id, CollectionHandle>;
+
+#[cfg(test)]
+#[path = "storage_workspace_tests.rs"]
+mod workspace_tests;
+
 /// Explicit storage ownership for native faculty operations.
 ///
 /// A one-shot caller uses [`Self::new`]: each operation opens and closes its
@@ -112,6 +121,10 @@ pub use triblespace::core::repo::async_store::AcquiringReader;
 pub struct Storage {
     pile: PathBuf,
     key: Option<PathBuf>,
+    peers: Option<Vec<iroh_base::EndpointAddr>>,
+    collections: Option<Arc<CollectionRoutes>>,
+    expected_signer: Option<VerifyingKey>,
+    local_only: bool,
     shared: Option<Arc<Mutex<Option<Session>>>>,
 }
 
@@ -125,11 +138,14 @@ struct Session {
 
 impl Session {
     fn close(mut self) -> Result<()> {
-        self.store
-            .take()
-            .expect("an open session owns its store")
-            .close()
-            .context("close shared faculty store")
+        let mut store = self.store.take().expect("an open session owns its store");
+        let shutdown = store
+            .shutdown_and_join()
+            .context("stop shared faculty acquisition host");
+        finish_close(
+            shutdown,
+            store.close().context("close shared faculty store"),
+        )
     }
 }
 
@@ -148,6 +164,9 @@ impl std::fmt::Debug for Storage {
         f.debug_struct("Storage")
             .field("pile", &self.pile)
             .field("key", &self.key)
+            .field("collections", &self.collections)
+            .field("expected_signer", &self.expected_signer)
+            .field("local_only", &self.local_only)
             .field("shared", &self.shared.is_some())
             .finish()
     }
@@ -161,7 +180,9 @@ impl Storage {
         if self.shared.is_some() {
             self.clone()
         } else {
-            Self::shared(self.pile.clone(), self.key.clone())
+            let mut retained = self.clone();
+            retained.shared = Some(Arc::new(Mutex::new(None)));
+            retained
         }
     }
     /// Configure operation-scoped storage, suitable for a short-lived CLI.
@@ -169,6 +190,10 @@ impl Storage {
         Self {
             pile,
             key,
+            peers: None,
+            collections: None,
+            expected_signer: None,
+            local_only: false,
             shared: None,
         }
     }
@@ -180,6 +205,29 @@ impl Storage {
         Self {
             pile,
             key,
+            peers: None,
+            collections: None,
+            expected_signer: None,
+            local_only: false,
+            shared: Some(Arc::new(Mutex::new(None))),
+        }
+    }
+
+    /// An embedded application's explicit routes. Unlike CLI storage, this
+    /// owner never consults `TRIBLESPACE_PEERS`, including when the list is empty.
+    /// Exact acquisitions still use one ephemeral, non-serving leech identity.
+    pub fn shared_with_peers(
+        pile: PathBuf,
+        key: Option<PathBuf>,
+        peers: Vec<iroh_base::EndpointAddr>,
+    ) -> Self {
+        Self {
+            pile,
+            key,
+            peers: Some(peers),
+            collections: None,
+            expected_signer: None,
+            local_only: false,
             shared: Some(Arc::new(Mutex::new(None))),
         }
     }
@@ -188,8 +236,187 @@ impl Storage {
         &self.pile
     }
 
+    /// One resident-only application owner. Exact missing bytes fail; neither
+    /// an empty peer list nor ambient discovery is treated as network consent.
+    pub fn shared_local(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        let mut storage = Self::shared_with_peers(pile, key, Vec::new());
+        storage.local_only = true;
+        storage
+    }
+
+    fn open_owned_store(&self, host: VerifyingKey) -> Result<FacultyStore> {
+        let mut store = match &self.peers {
+            Some(peers) => {
+                lazy_store_with_peers(|| open_pile_strict_as(&self.pile, host), peers.clone())?
+            }
+            None => open_store_as(&self.pile, host)?,
+        };
+        if self.local_only {
+            // Closing a dormant acquisition owner starts nothing, preserves
+            // local reads/writes, and prevents retained snapshots waking it.
+            store
+                .shutdown_and_join()
+                .context("disable workspace network acquisition")?;
+        }
+        Ok(store)
+    }
+
     pub fn key_path(&self) -> Option<&Path> {
         self.key.as_deref()
+    }
+
+    /// Bind this value to an immutable set of exact collection descriptors.
+    /// Clones may share one live store while selecting different collections;
+    /// changing this value never retargets any existing clone or observation.
+    /// An empty map deliberately leaves every role unconfigured. Explicit
+    /// routing never reads collection environment variables or creates roots.
+    pub fn with_collections(mut self, routes: CollectionRoutes) -> Self {
+        self.collections = Some(Arc::new(routes));
+        self
+    }
+
+    pub fn collection_routes(&self) -> Option<&CollectionRoutes> {
+        self.collections.as_deref()
+    }
+
+    /// Model-asset routing is not part of workspace collection bindings yet.
+    /// Refuse only operations that would otherwise discover ambient models.
+    pub(crate) fn require_ambient_models(&self, operation: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.collections.is_none(),
+            "{operation}: workspace model-asset routing is unconfigured"
+        );
+        Ok(())
+    }
+
+    /// Pin a saved workspace's signing identity even before its first open.
+    /// A replacement key at the same path is never a workspace retarget.
+    pub fn with_expected_signer(mut self, signer: VerifyingKey) -> Self {
+        self.expected_signer = Some(signer);
+        self
+    }
+
+    fn load_signer(&self) -> Result<SigningKey> {
+        let signer = load_signer(&self.pile, self.key.as_deref())?;
+        if let Some(expected) = self.expected_signer {
+            anyhow::ensure!(
+                signer.verifying_key() == expected,
+                "workspace signer changed at {}; expected {}, found {}",
+                signer_path(&self.pile, self.key.as_deref()).display(),
+                hex::encode(expected.to_bytes()),
+                hex::encode(signer.verifying_key().to_bytes())
+            );
+        }
+        Ok(signer)
+    }
+
+    /// Exact configured handle, or `None` for the standalone CLI default.
+    /// Missing explicit roles are errors before any descriptor can be written.
+    pub fn collection_handle(&self, scope: Id) -> Result<Option<CollectionHandle>> {
+        match &self.collections {
+            Some(routes) => routes.get(&scope).copied().map(Some).ok_or_else(|| {
+                anyhow!(
+                    "workspace collection role {:?} is unconfigured",
+                    crate::collection_names::require_name(scope)
+                )
+            }),
+            None => crate::collection_names::configured_handle(scope),
+        }
+    }
+
+    /// Open the exact selected root for a native read using frozen admission
+    /// evidence. CLI behavior remains the existing configured/default opener.
+    pub fn open_collection_read<S>(
+        &self,
+        store: &mut S,
+        scope: Id,
+        subject: VerifyingKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+    ) -> Result<Collection<SimpleArchive>>
+    where
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: StoreRead + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+    {
+        if self.collections.is_none() {
+            return crate::collection_names::open_configured_acquiring(
+                store, scope, subject, runtime,
+            );
+        }
+        let handle = self.collection_handle(scope)?.expect("explicit route");
+        let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+        crate::collection_names::open_workspace_read_in(&reader, subject, handle)
+    }
+
+    /// Resident counterpart for code already inside a runtime boundary.
+    /// Its acquiring preflight must happen outside that boundary.
+    pub fn open_collection_local<S>(
+        &self,
+        store: &mut S,
+        scope: Id,
+        subject: VerifyingKey,
+    ) -> Result<Collection<SimpleArchive>>
+    where
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: BlobStoreGet + CollectionRead,
+    {
+        if self.collections.is_none() {
+            return crate::collection_names::open_configured(store, scope, subject);
+        }
+        let handle = self.collection_handle(scope)?.expect("explicit route");
+        crate::collection_names::open_workspace_in(&store.snapshot()?, handle)
+    }
+
+    /// Open a publication destination. Explicit workspaces require WRITE at
+    /// the action boundary, while raw collection publication remains an
+    /// unconditional grow-only ledger operation and CLI behavior is unchanged.
+    pub fn open_collection_write<S>(
+        &self,
+        store: &mut S,
+        scope: Id,
+        subject: VerifyingKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+    ) -> Result<Collection<SimpleArchive>>
+    where
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: StoreRead + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+    {
+        if self.collections.is_none() {
+            return crate::collection_names::open_configured_acquiring(
+                store, scope, subject, runtime,
+            );
+        }
+        let handle = self.collection_handle(scope)?.expect("explicit route");
+        let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+        crate::collection_names::open_workspace_write_in(&reader, subject, handle)
+    }
+
+    /// Secrets keeps its separate key-delivery policy and local-wrap
+    /// possession semantics. Routing must not create a plain private root in
+    /// place of that policy, nor add a READ gate to an already delivered wrap.
+    pub fn open_secrets_collection<S>(
+        &self,
+        store: &mut S,
+        subject: VerifyingKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+        write: bool,
+    ) -> Result<crate::secrets::storage::SecretsCollection>
+    where
+        S: CollectionStoreExt + SnapshotSource,
+        S::Snapshot: StoreRead + triblespace::core::repo::async_store::AsyncBlobStoreGet,
+    {
+        if self.collections.is_none() {
+            return open_secrets_collection_acquiring(store, subject, runtime);
+        }
+        let scope = crate::secrets::DEFAULT_SCOPE_ID;
+        let handle = self.collection_handle(scope)?.expect("explicit route");
+        let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+        let source = if write {
+            crate::collection_names::open_workspace_write_in(&reader, subject, handle)?
+        } else {
+            crate::collection_names::open_workspace_in(&reader, handle)?
+        };
+        crate::secrets::storage::SecretsCollection::from_source(store, source)
+            .context("register maintained Secrets descriptors")
     }
 
     /// Retain one store across a compound operation without holding a borrow
@@ -200,7 +427,7 @@ impl Storage {
         if self.shared.is_some() {
             return operation(self);
         }
-        let storage = Self::shared(self.pile.clone(), self.key.clone());
+        let storage = self.retained();
         let result = operation(&storage);
         storage.finish(result)
     }
@@ -226,7 +453,7 @@ impl Storage {
             .map_err(|_| anyhow!("shared faculty store is poisoned"))?;
         if session.is_none() {
             let runtime = Arc::new(runtime()?);
-            let store = open_store_as(&self.pile, host)?;
+            let store = self.open_owned_store(host)?;
             *session = Some(Session {
                 store: Some(store),
                 runtime,
@@ -266,7 +493,7 @@ impl Storage {
             &Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(&self.pile, self.key.as_deref())?;
+        let signer = self.load_signer()?;
         if self.shared.is_some() {
             return self.with_session(signer.verifying_key(), |session| {
                 operation(
@@ -277,7 +504,7 @@ impl Storage {
             });
         }
         let runtime = Arc::new(runtime()?);
-        let mut store = open_store_as(&self.pile, signer.verifying_key())?;
+        let mut store = self.open_owned_store(signer.verifying_key())?;
         let result = operation(&mut store, &signer, &runtime);
         finish_close(result, store.close().context("close faculty store"))
     }
@@ -290,7 +517,7 @@ impl Storage {
         &self,
         operation: impl FnOnce(&mut Pile, &SigningKey) -> Result<T>,
     ) -> Result<T> {
-        let signer = load_signer(&self.pile, self.key.as_deref())?;
+        let signer = self.load_signer()?;
         if self.shared.is_some() {
             return self.with_session(signer.verifying_key(), |session| {
                 let mut pile = session.store.as_ref().expect("open store").store();
@@ -419,8 +646,6 @@ pub fn open_store_as(path: &Path, host: VerifyingKey) -> Result<FacultyStore> {
 fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
     use iroh_base::{EndpointAddr, EndpointId};
     use iroh_tickets::endpoint::EndpointTicket;
-    use rand_core::RngCore;
-    use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
 
     let routes = std::env::var("TRIBLESPACE_PEERS").or_else(|error| match error {
         std::env::VarError::NotPresent => Ok(String::new()),
@@ -440,6 +665,15 @@ fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
                 .with_context(|| format!("invalid TRIBLESPACE_PEERS endpoint {route:?}"))
         })
         .collect::<Result<Vec<_>>>()?;
+    lazy_store_with_peers(open, peers)
+}
+
+fn lazy_store_with_peers(
+    open: impl FnOnce() -> Result<Pile>,
+    peers: Vec<iroh_base::EndpointAddr>,
+) -> Result<FacultyStore> {
+    use rand_core::RngCore;
+    use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
     let mut secret = [0; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut secret)

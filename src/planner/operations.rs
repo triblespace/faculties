@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::planner::{
@@ -313,25 +312,30 @@ impl PlannerStorage<'_> {
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
             let result = (|| {
-                let source = open_configured_acquiring(
-                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+                let source = self.storage.open_collection_read(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
                 )?;
                 let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
                 let collection_rank9 = pile
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
                 // Keep the existing upkeep step, then select one observation
                 // whose missing residual bytes the foreground read can fetch.
-                runtime.block_on(async {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(collection_succinct, signer).await,
-                    )?;
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(collection_rank9, signer).await,
-                    )
-                })
-                .context("maintain Planner fact collection")?;
+                runtime
+                    .block_on(async {
+                        crate::storage::tolerate_own_lag(
+                            pile.maintain_attached(collection_succinct, signer).await,
+                        )?;
+                        crate::storage::tolerate_own_lag(
+                            pile.maintain_attached(collection_rank9, signer).await,
+                        )
+                    })
+                    .context("maintain Planner fact collection")?;
                 let store_snapshot = AcquiringReader::new(
-                    pile.snapshot().context("freeze maintained Planner fact collection")?,
+                    pile.snapshot()
+                        .context("freeze maintained Planner fact collection")?,
                     runtime.clone(),
                 );
                 let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
@@ -370,7 +374,8 @@ impl PlannerStorage<'_> {
                 pile.commit(collection, signer, fragment)
                     .context("commit authored Planner fragment")?;
                 drop(
-                    runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                    runtime
+                        .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                         .context(
                             "Planner facts were committed, but ensuring their derived views failed",
                         )?,
@@ -385,7 +390,11 @@ impl PlannerStorage<'_> {
     #[cfg(test)]
     fn payload_count(&self) -> Result<usize> {
         self.storage.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let collection = self.storage.open_collection_local(
+                pile,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )?;
             let store_snapshot = pile.snapshot()?;
             Ok(collection.admitted(&store_snapshot)?.len())
         })

@@ -17,7 +17,6 @@ use std::sync::Arc;
 use crate::clock;
 #[cfg(test)]
 use crate::collection_names::open_configured;
-use crate::collection_names::open_configured_acquiring;
 use crate::relations::{
     self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
 };
@@ -927,8 +926,20 @@ impl Relations {
         execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
-            let collection =
-                open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+            let collection = self.storage.open_collection_read(
+                pile,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
+            )?;
+            if !read_only {
+                self.storage.open_collection_write(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+            }
             with_relations_view(pile, signer, runtime, collection, read_only, execute)
         })
     }

@@ -15,7 +15,6 @@ use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::{find, pattern, Id};
 
 use super::{named_entries, named_entry, AtlasEntry};
-use crate::collection_names::open_configured_acquiring;
 use crate::schemas::atlas::DEFAULT_SCOPE_ID;
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Storage};
 
@@ -84,8 +83,11 @@ impl Store {
         operation: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
-            let source = open_configured_acquiring(
-                pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let source = self.storage.open_collection_read(
+                pile,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let collection_rank9 =

@@ -63,7 +63,8 @@ impl Archive {
         &self,
         operation: impl FnOnce(ArchiveStorage<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.storage.scope(|storage| operation(ArchiveStorage { storage }))
+        self.storage
+            .scope(|storage| operation(ArchiveStorage { storage }))
     }
     /// Publish one resident source atomically after complete successful scanning.
     /// Attachments are resident export filenames for ChatGPT and exact pointer
@@ -84,7 +85,12 @@ impl Archive {
             bail!("this Archive format accepts embedded assets, not an external attachment map");
         }
         self.storage.with_store(|store, signer, runtime| {
-            let mut writer = ArchiveImportWriter::from_store(store, signer, runtime.clone())?;
+            let mut writer = ArchiveImportWriter::from_store_with_storage(
+                store,
+                signer,
+                runtime.clone(),
+                &self.storage,
+            )?;
             let projection = match source {
                 ImportSource::Agy => archive_agy::project_bytes(source_name, bytes, |p| {
                     writer.stage_fragment(p.fragment)
@@ -252,8 +258,11 @@ impl ArchiveStorage<'_> {
 
     fn load_comb(&self) -> Result<FactArchive> {
         self.storage.with_store(|store, signer, runtime| {
-            let source = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+            let source = self.storage.open_collection_read(
+                store,
+                DEFAULT_COMB_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             let rank9 = runtime.block_on(async {
@@ -272,8 +281,7 @@ impl ArchiveStorage<'_> {
                 Ok::<_, anyhow::Error>(rank9)
             })?;
             let reader = AcquiringReader::new(pile.snapshot()?, runtime.clone());
-            crate::storage::acquire_facts(&reader, rank9)
-                .context("read Comb cursor collection")
+            crate::storage::acquire_facts(&reader, rank9).context("read Comb cursor collection")
         })
     }
 
@@ -283,11 +291,17 @@ impl ArchiveStorage<'_> {
     /// store snapshot. Later payload reads keep that same boundary.
     fn load_replay(&self) -> Result<ReplayView> {
         self.storage.with_store(|store, signer, runtime| {
-            let archive_source = crate::collection_names::open_configured_acquiring(
-                store, archive_schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let archive_source = self.storage.open_collection_read(
+                store,
+                archive_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
-            let comb_source = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+            let comb_source = self.storage.open_collection_read(
+                store,
+                DEFAULT_COMB_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             let (archive_rank9, comb_rank9) = runtime.block_on(async {
@@ -324,13 +338,19 @@ impl ArchiveStorage<'_> {
                 Ok::<_, anyhow::Error>((archive_rank9, comb_rank9))
             })?;
             let after = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Archive replay snapshot")?,
+                pile.snapshot()
+                    .context("freeze maintained Archive replay snapshot")?,
                 runtime.clone(),
             );
-            let archive = after.attached_acquiring(archive_rank9).context("attach Archive replay facts")?;
+            let archive = after
+                .attached_acquiring(archive_rank9)
+                .context("attach Archive replay facts")?;
             let comb_facts = crate::storage::acquire_facts(&after, comb_rank9)
                 .context("read Comb cursor collection")?;
-            Ok(ReplayView { archive, comb_facts })
+            Ok(ReplayView {
+                archive,
+                comb_facts,
+            })
         })
     }
 }
@@ -1204,14 +1224,18 @@ fn active_archive_cursor(
 
 fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Result<()> {
     storage.storage.with_store(|store, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
-            store, DEFAULT_COMB_SCOPE_ID, signer.verifying_key(), runtime,
+        let collection = storage.storage.open_collection_write(
+            store,
+            DEFAULT_COMB_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
         )?;
         let pile = store;
         let result = (|| {
             pile.commit(collection, signer, fragment)
                 .context("publish archive replay cursor")?;
-            runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            runtime
+                .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                 .context(
                     "Archive replay cursor was committed, but ensuring its derived views failed",
                 )
@@ -1837,11 +1861,8 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        let first = archive_collection::ensure_succinct_index(
-            &fixture.pile,
-            Some(&fixture.key),
-        )
-        .unwrap();
+        let first =
+            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
         assert_eq!(first.source_elements, 1);
         assert_ne!(first.source_collection, first.target_collection);
@@ -1858,30 +1879,20 @@ mod tests {
             1
         );
         drop(archive);
-        let repeated = archive_collection::ensure_succinct_index(
-            &fixture.pile,
-            Some(&fixture.key),
-        )
-        .unwrap();
+        let repeated =
+            archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
         assert_eq!(repeated, first);
 
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), before);
 
-        let first_bm25 = archive_collection::ensure_bm25_index(
-            &fixture.pile,
-            Some(&fixture.key),
-        )
-        .unwrap();
+        let first_bm25 =
+            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
         assert_eq!(first_bm25.source_elements, 1);
         assert_eq!(first_bm25.cover_segments, 1);
         let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(
-            archive_collection::ensure_bm25_index(
-                &fixture.pile,
-                Some(&fixture.key),
-            )
-            .unwrap(),
+            archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key),).unwrap(),
             first_bm25
         );
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_bm25);

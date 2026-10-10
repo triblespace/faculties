@@ -30,13 +30,19 @@ struct RouteSet {
 struct Empty {}
 pub struct Voice {
     operations: Operations,
-    synthesizer: Synthesizer,
+    synthesizer: Option<Synthesizer>,
 }
 impl Voice {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
         Self::with_storage(crate::storage::Storage::new(pile, key))
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        if storage.collection_routes().is_some() {
+            return Self {
+                operations: Operations::with_storage(storage),
+                synthesizer: None,
+            };
+        }
         Self::with_storage_and_sources(storage, ModelSources::from_environment())
     }
     pub fn with_sources(pile: PathBuf, key: Option<PathBuf>, sources: ModelSources) -> Self {
@@ -46,9 +52,13 @@ impl Voice {
         storage: crate::storage::Storage,
         sources: ModelSources,
     ) -> Self {
+        let synthesizer = storage
+            .collection_routes()
+            .is_none()
+            .then(|| Synthesizer::new(sources));
         Self {
             operations: Operations::with_storage(storage),
-            synthesizer: Synthesizer::new(sources),
+            synthesizer,
         }
     }
 }
@@ -61,7 +71,12 @@ impl Faculty for Voice {
             "voice_synthesize" => {
                 let args: Text = decode_arguments(arguments)?;
                 super::operations::validate_text(&args.text).map_err(invalid_arguments)?;
-                let clip = self.synthesizer.synthesize(&args.text)?;
+                let synthesizer = self.synthesizer.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "voice synthesize: workspace model-asset routing is unconfigured"
+                    )
+                })?;
+                let clip = synthesizer.synthesize(&args.text)?;
                 out.audio(clip.wav.clone(), super::AUDIO_WAV_MIME)?;
                 out.line(format!(
                     "{} Hz mono, {} samples ({:.2}s); no host playback",

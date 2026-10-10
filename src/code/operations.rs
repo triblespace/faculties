@@ -13,9 +13,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
 use triblespace::core::collection::AttachedSnapshot;
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 #[allow(unused_imports)]
 use triblespace::prelude::blobencodings::RawBytes;
 #[allow(unused_imports)]
@@ -286,8 +286,11 @@ impl Code {
 
     pub(crate) fn observe(&self) -> Result<Observed> {
         self.storage.with_store(|store, signer, runtime| {
-            let source = crate::collection_names::open_configured_acquiring(
-                store, crate::schemas::code::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let source = self.storage.open_collection_read(
+                store,
+                crate::schemas::code::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
             runtime.block_on(async {
@@ -295,13 +298,18 @@ impl Code {
                 crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
                 Ok::<_, anyhow::Error>(())
             })?;
-            AcquiringReader::new(store.snapshot()?, runtime.clone()).attached_acquiring(rank9)
+            AcquiringReader::new(store.snapshot()?, runtime.clone())
+                .attached_acquiring(rank9)
                 .context("attach Code facts from one frozen observation")
         })
     }
 
-    pub(crate) fn with_operation<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
-        self.storage.scope(|storage| operation(&Self::with_storage(storage.clone())))
+    pub(crate) fn with_operation<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        self.storage
+            .scope(|storage| operation(&Self::with_storage(storage.clone())))
     }
 
     // ── ingest ──────────────────────────────────────────────────────────
@@ -341,7 +349,12 @@ impl Code {
         }
 
         report.repos = self.storage.with_store(|store, signer, runtime| {
-            let mut writer = ingest::CodeImportWriter::from_store(store, signer, runtime.clone())?;
+            let mut writer = ingest::CodeImportWriter::from_store_with_storage(
+                store,
+                signer,
+                runtime.clone(),
+                &self.storage,
+            )?;
             let mut rows = Vec::new();
             for plan in plans {
                 rows.push(ingest_repository(&mut writer, plan)?);

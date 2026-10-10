@@ -4,7 +4,6 @@ use crate::storage::FactView;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::decide::{
@@ -342,8 +341,11 @@ impl DecideStorage<'_> {
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
             let result = (|| {
-                let collection = open_configured_acquiring(
-                    pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+                let collection = self.storage.open_collection_read(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
                 )?;
                 let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
                 let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
@@ -351,7 +353,8 @@ impl DecideStorage<'_> {
                     maintained_succinct,
                 )?;
                 let store_snapshot = AcquiringReader::new(
-                    pile.snapshot().context("freeze Decide fact collection")?, runtime.clone(),
+                    pile.snapshot().context("freeze Decide fact collection")?,
+                    runtime.clone(),
                 );
                 let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
                     .context("read maintained Decide fact collection")?;
@@ -393,7 +396,8 @@ impl DecideStorage<'_> {
             pile.commit(collection, signer, fragment)
                 .context("commit authored Decide fragment")?;
             drop(
-                runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                runtime
+                    .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context(
                         "Decide facts were committed, but ensuring their derived views failed",
                     )?,

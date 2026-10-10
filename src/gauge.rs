@@ -322,13 +322,16 @@ fn with_model<T>(
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
     };
-    use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
     use triblespace::core::collection::latest::LatestIndex;
+    use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
     use triblespace::core::repo::SnapshotSource;
 
     storage.with_store(|pile, signer, runtime| {
-        let source = crate::collection_names::open_configured_acquiring(
-            pile, crate::schemas::wiki::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let source = storage.open_collection_read(
+            pile,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
         )?;
         let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
         let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
@@ -339,7 +342,9 @@ fn with_model<T>(
         );
         let facts = crate::storage::acquire_facts(&reader, rank9)?;
         let latest = crate::storage::require_complete_attached_read(
-            reader.attached_acquiring(latest)?.read_acquiring::<LatestIndex>()?,
+            reader
+                .attached_acquiring(latest)?
+                .read_acquiring::<LatestIndex>()?,
         )?;
         let model = GaugeModel::load(&reader, &facts, &latest)?;
         operation(&model)

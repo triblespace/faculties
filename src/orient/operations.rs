@@ -93,6 +93,7 @@ impl Orient {
     ) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_show(
+                &self.storage,
                 pile,
                 signer,
                 self.storage.path(),
@@ -114,6 +115,7 @@ impl Orient {
     ) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_wake(
+                &self.storage,
                 pile,
                 signer,
                 persona,
@@ -127,6 +129,7 @@ impl Orient {
     pub fn poll(&self, persona: &str, peek: bool, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_poll(
+                &self.storage,
                 pile,
                 signer,
                 Some(persona),
@@ -139,6 +142,7 @@ impl Orient {
     pub fn baseline(&self, persona: &str) -> Result<BaselineReceipt> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_baseline(
+                &self.storage,
                 pile,
                 signer,
                 Some(persona),
@@ -147,10 +151,16 @@ impl Orient {
         })
     }
     /// Explicit additive import of one legacy persona's resident receipts into
-    /// this signing zooid's private source. It never baselines unseen events.
+    /// the selected receipt source (signer-private for CLI storage). It never
+    /// baselines unseen events. Workspaces must configure both receipt roles.
     pub fn import_receipts(&self, legacy_persona: &str) -> Result<usize> {
         self.storage.with_store(|pile, signer, runtime| {
-            runtime.block_on(receipt_import::import(pile, signer, legacy_persona))
+            runtime.block_on(receipt_import::import(
+                &self.storage,
+                pile,
+                signer,
+                legacy_persona,
+            ))
         })
     }
     /// One-shot wait. It returns after the first complete news report or timeout.
@@ -158,6 +168,7 @@ impl Orient {
     pub fn wait(&self, persona: &str, options: &WaitOptions, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_wait(
+                &self.storage,
                 pile,
                 signer,
                 self.storage.path(),
@@ -194,7 +205,7 @@ impl Orient {
                 tokio::select! {
                     result = stop => result,
                     result = cmd_observe(
-                        pile, signer, self.storage.path(), Some(persona), options,
+                        &self.storage, pile, signer, self.storage.path(), Some(persona), options,
                         self.health_max_age, true, out,
                     ) => result,
                 }
@@ -203,7 +214,7 @@ impl Orient {
     }
 }
 
-use crate::collection_names::{configured_handle, open_configured, open_exact_in};
+use crate::collection_names::{open_configured, open_exact_in, open_exact_read_in};
 use crate::memory_cover::{render_cover_report, CoverOpts};
 use crate::out::Out;
 use crate::schemas::archive::archive;
@@ -237,11 +248,11 @@ use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use crate::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
+use crate::storage::FactView;
 use crate::storage::FacultySnapshot;
 #[cfg(test)]
 use crate::storage::{open_store, open_store_as, runtime};
 use crate::storage::{read, FactArchive, FacultyStore, Storage};
-use crate::storage::FactView;
 use crate::{
     clock, compass, discord as discord_model, habits, mail as mail_model, message,
     orient as orient_model, relations, status, teams as teams_model, wiki as wiki_model,
@@ -598,16 +609,22 @@ struct OrientSource {
 
 impl OrientSource {
     async fn open(
+        routing: &Storage,
         pile: &mut FacultyStore,
         signer: &SigningKey,
         scope: Id,
         label: &'static str,
     ) -> Result<Self> {
         let authority = signer.verifying_key();
-        let source = if let Some(handle) = configured_handle(scope)? {
+        let explicit = routing.collection_routes().is_some();
+        let source = if let Some(handle) = routing.collection_handle(scope)? {
             let snapshot = pile.snapshot()?;
             read(pile, &snapshot, |reader| {
-                open_exact_in(reader, scope, handle)
+                if explicit {
+                    open_exact_read_in(reader, scope, authority, handle)
+                } else {
+                    open_exact_in(reader, scope, handle)
+                }
             })
             .await?
         } else {
@@ -680,6 +697,27 @@ struct ReceiptSource {
 }
 
 impl ReceiptSource {
+    async fn open(routing: &Storage, pile: &mut FacultyStore, signer: &SigningKey) -> Result<Self> {
+        if routing.collection_routes().is_none() {
+            return Self::register(pile, signer);
+        }
+        let source = OrientSource::open(
+            routing,
+            pile,
+            signer,
+            crate::schemas::orient::RECEIPTS_SCOPE_ID,
+            "Orient receipts",
+        )
+        .await?;
+        Ok(Self {
+            source: source.source,
+            succinct: source.succinct,
+            rank9: source.rank9,
+        })
+    }
+
+    /// The standalone CLI retains its signer-owned receipt collection.
+    /// Explicit workspaces reach their exact receipt root through `open`.
     fn register<S: CollectionStoreExt>(pile: &mut S, signer: &SigningKey) -> Result<Self> {
         let policy = crate::collection_names::private_policy(signer.verifying_key());
         let source = pile.collection(
@@ -802,25 +840,29 @@ struct OrientSources {
 
 impl OrientSources {
     async fn open(
+        routing: &Storage,
         pile: &mut FacultyStore,
         signer: &SigningKey,
         include_habits: bool,
     ) -> Result<Self> {
-        let authority = signer.verifying_key();
-        let messages = OrientSource::open(pile, signer, MESSAGE_SCOPE_ID, "Message").await?;
-        let mail = OrientSource::open(pile, signer, MAIL_SCOPE_ID, "Mail").await?;
-        let teams = OrientSource::open(pile, signer, TEAMS_SCOPE_ID, "Teams").await?;
-        let discord = OrientSource::open(pile, signer, DISCORD_SCOPE_ID, "Discord").await?;
-        let compass = OrientSource::open(pile, signer, COMPASS_SCOPE_ID, "Compass").await?;
-        let relations = OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
-        let status = OrientSource::open(pile, signer, STATUS_SCOPE_ID, "Status").await?;
+        let messages =
+            OrientSource::open(routing, pile, signer, MESSAGE_SCOPE_ID, "Message").await?;
+        let mail = OrientSource::open(routing, pile, signer, MAIL_SCOPE_ID, "Mail").await?;
+        let teams = OrientSource::open(routing, pile, signer, TEAMS_SCOPE_ID, "Teams").await?;
+        let discord =
+            OrientSource::open(routing, pile, signer, DISCORD_SCOPE_ID, "Discord").await?;
+        let compass =
+            OrientSource::open(routing, pile, signer, COMPASS_SCOPE_ID, "Compass").await?;
+        let relations =
+            OrientSource::open(routing, pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
+        let status = OrientSource::open(routing, pile, signer, STATUS_SCOPE_ID, "Status").await?;
         let habits = if include_habits {
-            Some(OrientSource::open(pile, signer, HABIT_SCOPE_ID, "Habit").await?)
+            Some(OrientSource::open(routing, pile, signer, HABIT_SCOPE_ID, "Habit").await?)
         } else {
             None
         };
-        let presentations = ReceiptSource::register(pile, signer)?;
-        let compass_status = compass::status_register_collection(pile, authority)?;
+        let presentations = ReceiptSource::open(routing, pile, signer).await?;
+        let compass_status = compass::status_register_for_source(pile, compass.source)?;
         Ok(Self {
             messages,
             mail,
@@ -1068,10 +1110,17 @@ async fn observe_snapshot_acquiring(
     receipts: bool,
 ) -> Result<OrientObservation> {
     #[cfg(test)]
-    sources.observations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sources
+        .observations
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let fact_sources = [
-        sources.messages, sources.mail, sources.teams, sources.discord,
-        sources.compass, sources.relations, sources.status,
+        sources.messages,
+        sources.mail,
+        sources.teams,
+        sources.discord,
+        sources.compass,
+        sources.relations,
+        sources.status,
     ];
     let habits = sources.habits;
     let receipts_target = sources.presentations.rank9;
@@ -1082,7 +1131,10 @@ async fn observe_snapshot_acquiring(
         let observe = |source: OrientSource| -> Result<OrientFact> {
             let collection = reader.attached_acquiring(source.rank9)?;
             let view = crate::storage::acquire_attached_facts(&collection)?;
-            Ok(OrientFact { collection: collection.into_frozen(), view })
+            Ok(OrientFact {
+                collection: collection.into_frozen(),
+                view,
+            })
         };
         let [messages, mail, teams, discord, compass, relations, status] = fact_sources;
         let presentations = reader.attached(receipts_target)?.into_frozen();
@@ -1108,18 +1160,25 @@ async fn observe_snapshot_acquiring(
             snapshot,
             payloads: DependencyTracker::default(),
             facts: OrientFacts {
-                messages: observe(messages)?, mail: observe(mail)?, teams: observe(teams)?,
-                discord: observe(discord)?, compass: observe(compass)?,
-                relations: observe(relations)?, status: observe(status)?,
+                messages: observe(messages)?,
+                mail: observe(mail)?,
+                teams: observe(teams)?,
+                discord: observe(discord)?,
+                compass: observe(compass)?,
+                relations: observe(relations)?,
+                status: observe(status)?,
                 habits: habits.map(observe).transpose()?,
                 presentations: ReceiptObservation {
-                    collection: presentations, view: presentation_view,
+                    collection: presentations,
+                    view: presentation_view,
                 },
             },
             compass_status: status_index.query()?,
             compass_status_collection: status_collection.into_frozen(),
         })
-    }).await.context("join frozen Orient input selection")?
+    })
+    .await
+    .context("join frozen Orient input selection")?
 }
 
 async fn observe_current_sources_acquiring(
@@ -3392,8 +3451,10 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
 fn presentation_collection_for_write(
     pile: &mut FacultyStore,
     signer: &SigningKey,
+    collection: Collection<SimpleArchive>,
 ) -> Result<Collection<SimpleArchive>> {
-    let collection = ReceiptSource::register(pile, signer)?.source;
+    // Retain the root selected for this observation; never re-resolve a
+    // private default at the point of presentation.
     require_presentation_write(&pile.snapshot()?, collection, signer)?;
     Ok(collection)
 }
@@ -3415,19 +3476,21 @@ fn require_presentation_write(
 fn save_presentations(
     pile: &mut FacultyStore,
     signer: &SigningKey,
+    collection: Collection<SimpleArchive>,
     events: impl IntoIterator<Item = Id>,
 ) -> Result<()> {
     let fragment = orient_model::receipt_fragment(events, clock::point_now()?);
     if fragment.facts().is_empty() {
         return Ok(());
     }
-    let collection = presentation_collection_for_write(pile, signer)?;
+    let collection = presentation_collection_for_write(pile, signer, collection)?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Orient presentation facts: {error}"))?;
     Ok(())
 }
 
 async fn cmd_baseline(
+    routing: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     persona: Option<&str>,
@@ -3437,9 +3500,11 @@ async fn cmd_baseline(
         bail!("baseline requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
-        let health = HealthSources::open(pile, signer, health_max_age).await?.observe(pile, signer)?;
+        let health = HealthSources::open(routing, pile, signer, health_max_age)
+            .await?
+            .observe(pile, signer)?;
         let health_events = health.attention().attention;
-        let sources = OrientSources::open(pile, signer, false).await?;
+        let sources = OrientSources::open(routing, pile, signer, false).await?;
         maintain_inputs(pile, signer, &sources).await?;
         let observation = observe_current_sources_acquiring(pile, &sources).await?;
         let (persona, events) = read(pile, &observation.snapshot, |reader| {
@@ -3456,7 +3521,12 @@ async fn cmd_baseline(
             ))
         })
         .await?;
-        save_presentations(pile, signer, events.iter().copied())?;
+        save_presentations(
+            pile,
+            signer,
+            sources.presentations.source,
+            events.iter().copied(),
+        )?;
         Ok(BaselineReceipt {
             persona,
             events: events.len(),
@@ -3466,6 +3536,7 @@ async fn cmd_baseline(
 }
 
 async fn cmd_show(
+    routing: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     pile_path: &Path,
@@ -3480,18 +3551,23 @@ async fn cmd_show(
     use std::fmt::Write as _;
 
     async {
-        let health_sources = HealthSources::open(pile, signer, health_max_age).await?;
+        let health_sources = HealthSources::open(routing, pile, signer, health_max_age).await?;
         let health = health_sources.observe_acquiring(pile, signer).await?;
         let health_report = health.report_acquiring().await?;
         write_complete_report(output, &health_report.text, "local swarm health overview")?;
         if let Some(input) = persona {
             match health.persona_acquiring(pile, input).await {
-                Ok(_) => save_presentations(pile, signer, health_report.attention.ids())?,
+                Ok(_) => save_presentations(
+                    pile,
+                    signer,
+                    health_sources.presentations.source,
+                    health_report.attention.ids(),
+                )?,
                 Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {}
                 Err(error) => return Err(error),
             }
         }
-        let sources = OrientSources::open(pile, signer, true).await?;
+        let sources = OrientSources::open(routing, pile, signer, true).await?;
         maintain_inputs(pile, signer, &sources).await?;
         refresh_receipts_before_observation(pile, signer, &sources, output).await?;
         let instant = clock::now()?;
@@ -3571,7 +3647,7 @@ async fn cmd_show(
         write_complete_report(output, &report, "Orient overview")?;
 
         if persona_id.is_some() {
-            save_presentations(pile, signer, shown)?;
+            save_presentations(pile, signer, sources.presentations.source, shown)?;
         }
         Ok(())
     }
@@ -3930,6 +4006,7 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
 fn commit_habit_receipts(
     pile: &mut FacultyStore,
     signer: &SigningKey,
+    collection: Collection<SimpleArchive>,
     due: &[(Id, i64)],
 ) -> Result<()> {
     if due.is_empty() {
@@ -3942,7 +4019,7 @@ fn commit_habit_receipts(
             clock::point(Epoch::from_tai_seconds(*since as f64))?,
         ));
     }
-    let collection = presentation_collection_for_write(pile, signer)?;
+    let collection = presentation_collection_for_write(pile, signer, collection)?;
     let fragment = orient_model::habit_receipt_fragment(pairs, clock::point_now()?);
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Orient habit presentation facts: {error}"))?;
@@ -3952,6 +4029,7 @@ fn commit_habit_receipts(
 fn apply_prepared_news(
     pile: &mut FacultyStore,
     signer: &SigningKey,
+    collection: Collection<SimpleArchive>,
     peek: bool,
     prepared: &News,
     prefix: &str,
@@ -3963,7 +4041,7 @@ fn apply_prepared_news(
             // Target production authority is independent and may be remote.
             let receipt = if !peek && !events.is_empty() {
                 Some((
-                    presentation_collection_for_write(pile, signer)?,
+                    presentation_collection_for_write(pile, signer, collection)?,
                     orient_model::receipt_fragment(events.iter().copied(), clock::point_now()?),
                 ))
             } else {
@@ -3991,6 +4069,7 @@ fn apply_prepared_news(
 /// tersely, and only then record presentation. No provider means quiet pending,
 /// not acknowledgment of a body the recipient never saw.
 async fn cmd_poll(
+    routing: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     persona: Option<&str>,
@@ -4002,11 +4081,11 @@ async fn cmd_poll(
         bail!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     async {
-        let mut health = HealthSources::open(pile, signer, health_max_age).await?;
+        let mut health = HealthSources::open(routing, pile, signer, health_max_age).await?;
         if health.poll(pile, signer, input, peek, output)?.0 {
             return Ok(());
         }
-        let sources = OrientSources::open(pile, signer, false).await?;
+        let sources = OrientSources::open(routing, pile, signer, false).await?;
         if let Err(error) = maintain_inputs(pile, signer, &sources).await {
             if is_preparation_pending(&error) {
                 return Ok(());
@@ -4032,7 +4111,15 @@ async fn cmd_poll(
             }
             Err(error) => return Err(error),
         };
-        apply_prepared_news(pile, signer, peek, &news, "", output)?;
+        apply_prepared_news(
+            pile,
+            signer,
+            sources.presentations.source,
+            peek,
+            &news,
+            "",
+            output,
+        )?;
         Ok(())
     }
     .await
@@ -4502,6 +4589,7 @@ async fn wait_timeout_deadline(timeout_at: Option<tokio::time::Instant>) {
 }
 
 async fn cmd_wait(
+    routing: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     pile_path: &Path,
@@ -4511,6 +4599,7 @@ async fn cmd_wait(
     output: &mut Out<'_>,
 ) -> Result<()> {
     cmd_observe(
+        routing,
         pile,
         signer,
         pile_path,
@@ -4527,6 +4616,7 @@ async fn cmd_wait(
 /// re-open the pile, re-arm already-due habits, or discard pending reads after
 /// a delivery. Successful output still precedes the existing receipt COMMIT.
 async fn cmd_observe(
+    routing: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     pile_path: &Path,
@@ -4541,7 +4631,7 @@ async fn cmd_observe(
     };
     let timeout = options.timeout;
     let result: Result<WaitOutcome> = async {
-        let mut health = HealthSources::open(pile, signer, health_max_age).await?;
+        let mut health = HealthSources::open(routing, pile, signer, health_max_age).await?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let timeout_at = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
@@ -4573,7 +4663,7 @@ async fn cmd_observe(
                     had_ready_frame: false,
                 }),
                 boundary = health::deadline(next_health_change) => { boundary?; }
-                sources = OrientSources::open(pile, signer, true) => break sources?,
+                sources = OrientSources::open(routing, pile, signer, true) => break sources?,
             }
         };
         // Keep the prefix which selected these target views as the polling
@@ -4698,7 +4788,12 @@ async fn cmd_observe(
                             last_pending_sweep = Instant::now();
                             if !due_report.is_empty() {
                                 write_complete_report(output, &due_report, "Orient habit report")?;
-                                commit_habit_receipts(pile, signer, &due_events)?;
+                                commit_habit_receipts(
+                                    pile,
+                                    signer,
+                                    sources.presentations.source,
+                                    &due_events,
+                                )?;
                                 if !continuous {
                                     return Ok(WaitOutcome {
                                         news_printed: true,
@@ -4759,7 +4854,12 @@ async fn cmd_observe(
                 if !habit_report.is_empty() {
                     // A habit-only report acknowledges no news.
                     write_complete_report(output, &habit_report, "Orient habit report")?;
-                    commit_habit_receipts(pile, signer, &swept_events)?;
+                    commit_habit_receipts(
+                        pile,
+                        signer,
+                        sources.presentations.source,
+                        &swept_events,
+                    )?;
                     if !continuous {
                         return Ok(WaitOutcome {
                             news_printed: true,
@@ -4825,8 +4925,16 @@ async fn cmd_observe(
         }
         .unwrap_or_else(|| (String::new(), Vec::new()));
         let arm_fired = !arm_report.is_empty();
-        apply_prepared_news(pile, signer, false, &news, &arm_report, output)?;
-        commit_habit_receipts(pile, signer, &arm_due_events)?;
+        apply_prepared_news(
+            pile,
+            signer,
+            sources.presentations.source,
+            false,
+            &news,
+            &arm_report,
+            output,
+        )?;
+        commit_habit_receipts(pile, signer, sources.presentations.source, &arm_due_events)?;
         if (initial_report || arm_fired) && !continuous {
             return Ok(WaitOutcome {
                 news_printed: true,
@@ -4948,12 +5056,18 @@ async fn cmd_observe(
                         apply_prepared_news(
                             pile,
                             signer,
+                            sources.presentations.source,
                             false,
                             &candidate.news,
                             &habit_report,
                             output,
                         )?;
-                        commit_habit_receipts(pile, signer, &due_events)?;
+                        commit_habit_receipts(
+                            pile,
+                            signer,
+                            sources.presentations.source,
+                            &due_events,
+                        )?;
                         if (habit_fired || ordinary_fired) && !continuous {
                             return Ok(WaitOutcome {
                                 news_printed: true,
@@ -5027,7 +5141,7 @@ async fn cmd_observe(
             let habit_fired = !habit_report.is_empty();
             if habit_fired {
                 write_complete_report(output, &habit_report, "Orient habit report")?;
-                commit_habit_receipts(pile, signer, &due_events)?;
+                commit_habit_receipts(pile, signer, sources.presentations.source, &due_events)?;
             }
             habit_seen = current_habits;
             last_habit_sweep = Instant::now();
@@ -5096,6 +5210,7 @@ fn render_tags(tags: &[String]) -> String {
 /// goals. A supplied persona records shown attention events after output
 /// acceptance; previous presentation history does not filter this overview.
 async fn cmd_wake(
+    routing: &Storage,
     storage: &mut FacultyStore,
     signer: &SigningKey,
     persona: Option<&str>,
@@ -5109,11 +5224,12 @@ async fn cmd_wake(
     async {
         // Register and maintain authorized inputs before freezing one query
         // boundary. Plain wake still never consults Embeddings.
-        let sources = OrientSources::open(storage, signer, false).await?;
+        let sources = OrientSources::open(routing, storage, signer, false).await?;
         let memory_collection =
-            OrientSource::open(storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
-        let wiki_collection = OrientSource::open(storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
-        let wiki_latest = wiki_model::latest_collection(storage, signer.verifying_key())
+            OrientSource::open(routing, storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
+        let wiki_collection =
+            OrientSource::open(routing, storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
+        let wiki_latest = wiki_model::latest_for_source(storage, wiki_collection.source)
             .context("register Wiki supersession index")?;
         maintain_inputs(storage, signer, &sources).await?;
         memory_collection.maintain(storage, signer).await?;
@@ -5138,11 +5254,15 @@ async fn cmd_wake(
             let wiki_facts = crate::storage::acquire_facts(&reader, wiki_collection.rank9)
                 .context("read selected Wiki collection")?;
             let wiki_order = crate::storage::require_complete_attached_read(
-                reader.attached_acquiring(wiki_latest)?
+                reader
+                    .attached_acquiring(wiki_latest)?
                     .read_acquiring::<triblespace::core::collection::latest::LatestIndex>()?,
-            ).context("read selected Wiki supersession index")?;
+            )
+            .context("read selected Wiki supersession index")?;
             Ok::<_, anyhow::Error>((memory_facts, wiki_facts, wiki_order))
-        }).await.context("join frozen wake input selection")??;
+        })
+        .await
+        .context("join frozen wake input selection")??;
         let persona_id = read(storage, &observation.snapshot, |reader| {
             let query = observation.query(reader);
             persona
@@ -5207,7 +5327,7 @@ async fn cmd_wake(
         }
 
         if persona_id.is_some() {
-            save_presentations(storage, signer, shown)?;
+            save_presentations(storage, signer, sources.presentations.source, shown)?;
         }
         Ok(())
     }
@@ -5216,6 +5336,22 @@ async fn cmd_wake(
 
 /// Foreground acquisition needs the same driven Tokio boundary as production.
 /// Resident fixtures use this explicit driver rather than a passive executor.
+#[cfg(test)]
+fn test_storage() -> Storage {
+    // Only the routing configuration is consumed by these store-level tests.
+    Storage::new(PathBuf::new(), None)
+}
+
+#[cfg(test)]
+fn save_test_presentations(
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    events: impl IntoIterator<Item = Id>,
+) -> Result<()> {
+    let collection = ReceiptSource::register(pile, signer)?.source;
+    save_presentations(pile, signer, collection, events)
+}
+
 #[cfg(test)]
 fn test_block_on<F: std::future::Future>(future: F) -> F::Output {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -5423,7 +5559,16 @@ mod tests {
             writer.flush()?;
             Ok(())
         };
-        apply_prepared_news(pile, signer, peek, news, prefix, &mut Out::new(&mut emit))
+        let collection = ReceiptSource::register(pile, signer)?.source;
+        apply_prepared_news(
+            pile,
+            signer,
+            collection,
+            peek,
+            news,
+            prefix,
+            &mut Out::new(&mut emit),
+        )
     }
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
@@ -5469,11 +5614,228 @@ mod tests {
     }
 
     #[test]
+    fn explicit_workspace_routes_inputs_indexes_and_receipts() {
+        use crate::schemas::orient::RECEIPTS_SCOPE_ID;
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+
+        test_block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let mut routes = crate::storage::CollectionRoutes::new();
+            // The alternate descriptors differ from all signer-private defaults.
+            for scope in [
+                MESSAGE_SCOPE_ID,
+                MAIL_SCOPE_ID,
+                TEAMS_SCOPE_ID,
+                DISCORD_SCOPE_ID,
+                COMPASS_SCOPE_ID,
+                RELATIONS_SCOPE_ID,
+                STATUS_SCOPE_ID,
+                HABIT_SCOPE_ID,
+                MEMORY_SCOPE_ID,
+                WIKI_SCOPE_ID,
+                RECEIPTS_SCOPE_ID,
+            ] {
+                let collection = pile
+                    .collection(
+                        crate::collection_names::require_name(scope),
+                        CollectionPolicy::new(
+                            AdmissionPolicy::Open,
+                            AdmissionPolicy::direct(fixture.signer.verifying_key()),
+                        ),
+                    )
+                    .unwrap();
+                routes.insert(scope, collection.handle());
+            }
+            let routing = test_storage().with_collections(routes.clone());
+            let sources = OrientSources::open(&routing, &mut pile, &fixture.signer, true)
+                .await
+                .unwrap();
+            for (scope, source) in [
+                (MESSAGE_SCOPE_ID, sources.messages),
+                (MAIL_SCOPE_ID, sources.mail),
+                (TEAMS_SCOPE_ID, sources.teams),
+                (DISCORD_SCOPE_ID, sources.discord),
+                (COMPASS_SCOPE_ID, sources.compass),
+                (RELATIONS_SCOPE_ID, sources.relations),
+                (STATUS_SCOPE_ID, sources.status),
+                (HABIT_SCOPE_ID, sources.habits.unwrap()),
+            ] {
+                assert_eq!(source.source.handle(), routes[&scope]);
+            }
+            assert_eq!(
+                sources.presentations.source.handle(),
+                routes[&RECEIPTS_SCOPE_ID]
+            );
+            assert_eq!(
+                sources.compass_status,
+                compass::status_register_for_source(&mut pile, sources.compass.source,).unwrap()
+            );
+
+            let receipts = sources.presentations.source;
+            save_presentations(&mut pile, &fixture.signer, receipts, [id(91)]).unwrap();
+            commit_habit_receipts(&mut pile, &fixture.signer, receipts, &[(id(92), 100)]).unwrap();
+            apply_prepared_news(
+                &mut pile,
+                &fixture.signer,
+                receipts,
+                false,
+                &News::Report {
+                    text: "Selected workspace news\n".to_owned(),
+                    events: vec![id(93)],
+                },
+                "",
+                &mut Out::new(&mut |_| Ok(())),
+            )
+            .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            assert!(snapshot
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .all(|record| { record.collection() == receipts.handle() }));
+
+            let wiki =
+                OrientSource::open(&routing, &mut pile, &fixture.signer, WIKI_SCOPE_ID, "Wiki")
+                    .await
+                    .unwrap();
+            let (author, author_id) = wiki_model::author_record(&fixture.signer.verifying_key());
+            let (tag, tag_id, _) = wiki_model::tag_record("cover").unwrap();
+            let (revision, _) = wiki_model::revision_record(wiki_model::RevisionDraft {
+                title: "Selected workspace belief".to_owned(),
+                content: "The selected Wiki also owns its latest index.".to_owned(),
+                tags: BTreeSet::from([tag_id]),
+                predecessors: BTreeSet::new(),
+                author: author_id,
+                authored_at: clock::point_now().unwrap(),
+            })
+            .unwrap();
+            pile.commit(wiki.source, &fixture.signer, author + tag + revision)
+                .unwrap();
+            let mut report = String::new();
+            cmd_wake(
+                &routing,
+                &mut pile,
+                &fixture.signer,
+                None,
+                0,
+                5,
+                5,
+                &mut Out::new(&mut |part| {
+                    let crate::out::Part::Text { text } = part else {
+                        bail!("expected text")
+                    };
+                    report.push_str(&text);
+                    Ok(())
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(report.contains("Selected workspace belief"), "{report}");
+            assert!(pile.health().started_at.is_none());
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
+    fn explicit_workspace_missing_roles_and_read_denial_never_fall_back() {
+        use crate::schemas::orient::RECEIPTS_SCOPE_ID;
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+
+        test_block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let foreign = SigningKey::from_bytes(&[98; 32]);
+            let read_only = pile
+                .collection(
+                    "message",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::Open,
+                        AdmissionPolicy::direct(foreign.verifying_key()),
+                    ),
+                )
+                .unwrap();
+            let denied = pile
+                .collection(
+                    "relations",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::direct(foreign.verifying_key()),
+                        AdmissionPolicy::direct(fixture.signer.verifying_key()),
+                    ),
+                )
+                .unwrap();
+            let read_only_receipts = pile
+                .collection(
+                    "orient-receipts",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::Open,
+                        AdmissionPolicy::direct(foreign.verifying_key()),
+                    ),
+                )
+                .unwrap();
+            let routing = test_storage().with_collections(BTreeMap::from([
+                (MESSAGE_SCOPE_ID, read_only.handle()),
+                (RELATIONS_SCOPE_ID, denied.handle()),
+                (RECEIPTS_SCOPE_ID, read_only_receipts.handle()),
+            ]));
+            let source = OrientSource::open(
+                &routing,
+                &mut pile,
+                &fixture.signer,
+                MESSAGE_SCOPE_ID,
+                "Message",
+            )
+            .await
+            .unwrap();
+            assert_eq!(source.source, read_only, "a read must not require WRITE");
+            let error = OrientSource::open(
+                &routing,
+                &mut pile,
+                &fixture.signer,
+                RELATIONS_SCOPE_ID,
+                "Relations",
+            )
+            .await
+            .err()
+            .expect("WRITE does not imply READ");
+            assert!(format!("{error:#}").contains("READ"));
+            let receipts = ReceiptSource::open(&routing, &mut pile, &fixture.signer)
+                .await
+                .unwrap();
+            let error = save_presentations(&mut pile, &fixture.signer, receipts.source, [id(94)])
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("WRITE"));
+            let missing = test_storage().with_collections(BTreeMap::new());
+            let before = pile.snapshot().unwrap().blobs().count();
+            let error = OrientSource::open(
+                &missing,
+                &mut pile,
+                &fixture.signer,
+                MESSAGE_SCOPE_ID,
+                "Message",
+            )
+            .await
+            .err()
+            .expect("an omitted role stays unconfigured");
+            assert!(format!("{error:#}").contains("unconfigured"));
+            let error = ReceiptSource::open(&missing, &mut pile, &fixture.signer)
+                .await
+                .err()
+                .expect("no implicit private receipt root");
+            assert!(format!("{error:#}").contains("orient-receipts"));
+            assert_eq!(pile.snapshot().unwrap().blobs().count(), before);
+            assert!(pile.snapshot().unwrap().records().unwrap().next().is_none());
+            assert!(pile.health().started_at.is_none());
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
     fn attention_excludes_every_self_attribution_but_keeps_unknown_and_other_actors() {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let persona = id(200);
@@ -5611,13 +5973,18 @@ mod tests {
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             // External Relations are owned elsewhere; notification receipts
             // remain this local writer's collection.
-            let mut sources = OrientSources::open(&mut pile, &reader_key, false)
+            let mut sources = OrientSources::open(&test_storage(), &mut pile, &reader_key, false)
                 .await
                 .unwrap();
-            sources.relations =
-                OrientSource::open(&mut pile, &fixture.signer, RELATIONS_SCOPE_ID, "Relations")
-                    .await
-                    .unwrap();
+            sources.relations = OrientSource::open(
+                &test_storage(),
+                &mut pile,
+                &fixture.signer,
+                RELATIONS_SCOPE_ID,
+                "Relations",
+            )
+            .await
+            .unwrap();
             let known = id(71);
             let pending = id(72);
             let person = |person, label: &str| {
@@ -5668,7 +6035,7 @@ mod tests {
             );
 
             let event = id(74);
-            save_presentations(&mut pile, &reader_key, [event]).unwrap();
+            save_test_presentations(&mut pile, &reader_key, [event]).unwrap();
             sources
                 .presentations
                 .maintain(&mut pile, &reader_key)
@@ -5702,7 +6069,7 @@ mod tests {
             let fixture = TestPile::new();
             let reader_key = SigningKey::from_bytes(&[73; 32]);
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let mut sources = OrientSources::open(&mut pile, &reader_key, false)
+            let mut sources = OrientSources::open(&test_storage(), &mut pile, &reader_key, false)
                 .await
                 .unwrap();
             sources.presentations = ReceiptSource::register(&mut pile, &fixture.signer).unwrap();
@@ -5746,7 +6113,7 @@ mod tests {
             let fixture = TestPile::new();
             let reader = SigningKey::from_bytes(&[73; 32]);
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &reader, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &reader, false)
                 .await
                 .unwrap();
             let persona = id(77);
@@ -5763,7 +6130,7 @@ mod tests {
             // A fresh one-shot sees the same signer-owned receipt descriptors,
             // and reads the receipt from its bytes before any upkeep attaches
             // it: nothing repeats, and observing publishes nothing.
-            let restarted = OrientSources::open(&mut pile, &reader, false)
+            let restarted = OrientSources::open(&test_storage(), &mut pile, &reader, false)
                 .await
                 .unwrap();
             assert_eq!(restarted.presentations.source, sources.presentations.source);
@@ -5788,7 +6155,7 @@ mod tests {
             );
 
             // Routing aliases do not split one zooid's receipt authority.
-            save_presentations(&mut pile, &reader, [id(80)]).unwrap();
+            save_test_presentations(&mut pile, &reader, [id(80)]).unwrap();
             let aliases = ReceiptSource::register(&mut pile, &reader).unwrap();
             assert_eq!(aliases.source, restarted.presentations.source);
             assert_eq!(aliases.rank9, restarted.presentations.rank9);
@@ -5810,7 +6177,7 @@ mod tests {
             let fixture = TestPile::new();
             let reader = SigningKey::from_bytes(&[73; 32]);
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &reader, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &reader, false)
                 .await
                 .unwrap();
             let persona = id(77);
@@ -5864,7 +6231,7 @@ mod tests {
         runtime().unwrap().block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let persona = id(86);
@@ -5909,7 +6276,7 @@ mod tests {
                 empty_metadata_handle(),
             );
             pile.insert(CollectionRecord::Commit(arriving)).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let before = sources
@@ -5926,6 +6293,7 @@ mod tests {
 
             let mut report = String::new();
             cmd_wake(
+                &test_storage(),
                 &mut pile,
                 &fixture.signer,
                 Some("wake-reader"),
@@ -5980,7 +6348,7 @@ mod tests {
             let fixture = TestPile::new();
             let copy = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let mut omitted = BTreeSet::new();
@@ -6093,6 +6461,7 @@ mod tests {
             tokio::time::timeout(
                 Duration::from_secs(2),
                 cmd_wait(
+                    &test_storage(),
                     &mut pile,
                     &fixture.signer,
                     &fixture.path,
@@ -6127,7 +6496,7 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
@@ -6211,7 +6580,9 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false).await.unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
             let cold_tag = id(122);
             let later_tag = id(123);
             let cold = entity! { metadata::tag: &cold_tag };
@@ -6222,7 +6593,8 @@ mod tests {
                 sources.messages.source.handle(),
                 inlineencodings::Handle::<SimpleArchive>::to_hash(handle),
                 empty_metadata_handle(),
-            ))).unwrap();
+            )))
+            .unwrap();
             let watermark = pile.snapshot().unwrap();
             assert!(!watermark.contains_blob(handle).unwrap());
             // Arrival and another foundation follow the frozen boundary. Exact
@@ -6230,11 +6602,14 @@ mod tests {
             // from this observation even though it is now locally available.
             pile.put::<SimpleArchive, _>(bytes).unwrap();
             pile.commit(
-                sources.messages.source, &fixture.signer,
+                sources.messages.source,
+                &fixture.signer,
                 entity! { metadata::tag: &later_tag },
-            ).unwrap();
+            )
+            .unwrap();
             let observation = observe_snapshot_acquiring(watermark.clone(), &sources, false)
-                .await.unwrap();
+                .await
+                .unwrap();
             assert!(exists!(pattern!(observation.facts.messages.view(), [
                 { metadata::tag: &cold_tag }
             ])));
@@ -6254,7 +6629,9 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false).await.unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
             let cold = entity! { metadata::tag: &id(124) };
             let bytes = IntoBlob::<SimpleArchive>::to_blob(cold.facts().clone());
             let handle = bytes.get_handle();
@@ -6263,12 +6640,17 @@ mod tests {
                 sources.messages.source.handle(),
                 inlineencodings::Handle::<SimpleArchive>::to_hash(handle),
                 empty_metadata_handle(),
-            ))).unwrap();
+            )))
+            .unwrap();
             let watermark = pile.snapshot().unwrap();
             pile.close().unwrap();
             // No fallback owner remains. Missing selected support must not
             // masquerade as a successfully observed empty source.
-            assert!(observe_snapshot_acquiring(watermark.clone(), &sources, false).await.is_err());
+            assert!(
+                observe_snapshot_acquiring(watermark.clone(), &sources, false)
+                    .await
+                    .is_err()
+            );
             assert!(!watermark.contains_blob(handle).unwrap());
         });
     }
@@ -6282,7 +6664,7 @@ mod tests {
             // Register the real sources afterward; no network mock is needed
             // because exact acquisition also handles newly resident bytes.
             let watermark = pile.snapshot().unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
             // This older application time was still cooling. Once preparation
@@ -6363,7 +6745,7 @@ mod tests {
         runtime().unwrap().block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
             let unrelated = pile
@@ -6557,7 +6939,7 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
             let gpt = id(19);
@@ -6653,6 +7035,7 @@ mod tests {
             tokio::time::timeout(
                 timeout + Duration::from_secs(5),
                 cmd_wait(
+                    &test_storage(),
                     pile,
                     &fixture.signer,
                     &fixture.path,
@@ -6681,6 +7064,7 @@ mod tests {
         runtime()
             .unwrap()
             .block_on(cmd_poll(
+                &test_storage(),
                 pile,
                 &fixture.signer,
                 Some("eager-reader"),
@@ -6696,8 +7080,13 @@ mod tests {
     fn poll_carries_raw_inputs_and_rearmed_receipts_without_a_daemon() {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let sources =
-            test_block_on(OrientSources::open(&mut pile, &fixture.signer, false)).unwrap();
+        let sources = test_block_on(OrientSources::open(
+            &test_storage(),
+            &mut pile,
+            &fixture.signer,
+            false,
+        ))
+        .unwrap();
         let reader = id(91);
         let sender = id(92);
         for (person, label) in [(reader, "eager-reader"), (sender, "eager-sender")] {
@@ -6842,8 +7231,13 @@ mod tests {
     fn an_owned_clock_falls_due_while_a_message_body_is_still_missing() {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let sources =
-            test_block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let sources = test_block_on(OrientSources::open(
+            &test_storage(),
+            &mut pile,
+            &fixture.signer,
+            true,
+        ))
+        .unwrap();
         let cc = id(22);
         let sender = id(23);
         let (person, _, _) = relations::person_fragment(
@@ -6950,8 +7344,13 @@ mod tests {
     fn a_persona_clock_already_due_at_arm_is_reported_until_completed() {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let sources =
-            test_block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let sources = test_block_on(OrientSources::open(
+            &test_storage(),
+            &mut pile,
+            &fixture.signer,
+            true,
+        ))
+        .unwrap();
         let cc = id(21);
         let (person, _, _) = relations::person_fragment(
             cc,
@@ -7024,8 +7423,13 @@ mod tests {
     fn an_owned_clock_already_due_is_reported_while_a_message_body_is_still_missing() {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let sources =
-            test_block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let sources = test_block_on(OrientSources::open(
+            &test_storage(),
+            &mut pile,
+            &fixture.signer,
+            true,
+        ))
+        .unwrap();
         let cc = id(24);
         let sender = id(25);
         let (person, _, _) = relations::person_fragment(
@@ -7108,8 +7512,13 @@ mod tests {
                 bind: None,
             },
         );
-        let sources =
-            test_block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let sources = test_block_on(OrientSources::open(
+            &test_storage(),
+            &mut pile,
+            &fixture.signer,
+            true,
+        ))
+        .unwrap();
         let cc = id(26);
         let sender_id = id(27);
         let (person, _, _) = relations::person_fragment(
@@ -7283,7 +7692,7 @@ mod tests {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
         test_block_on(async {
-            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
             let persona = id(28);
@@ -7484,8 +7893,13 @@ mod tests {
     ) {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let sources =
-            test_block_on(OrientSources::open(&mut pile, &fixture.signer, true)).unwrap();
+        let sources = test_block_on(OrientSources::open(
+            &test_storage(),
+            &mut pile,
+            &fixture.signer,
+            true,
+        ))
+        .unwrap();
         let cc = id(22);
         let sender = id(23);
         let (person, _, _) = relations::person_fragment(
@@ -7620,7 +8034,7 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let goal = id(46);
@@ -7718,7 +8132,7 @@ mod tests {
 
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+        let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
             .await
             .unwrap();
         let persona = id(42);
@@ -7952,7 +8366,7 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
                 .await
                 .unwrap();
             let persona = id(43);
@@ -8108,7 +8522,7 @@ mod tests {
     async fn a_missing_persona_preserves_the_wait_watermark_async() {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let sources = OrientSources::open(&mut pile, &fixture.signer, true)
+        let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, true)
             .await
             .unwrap();
         let watermark = pile.snapshot().unwrap();
@@ -8256,7 +8670,7 @@ mod tests {
         view.insert(AttentionEvent::Mail(second));
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
 
-        save_presentations(&mut pile, &fixture.signer, view.ids()).unwrap();
+        save_test_presentations(&mut pile, &fixture.signer, view.ids()).unwrap();
         let presented = stored_presentations(&mut pile, &fixture.signer, persona);
         assert_eq!(presented, BTreeSet::from([first, second]));
         let projected = super::tests::presented(presented);
@@ -8289,7 +8703,7 @@ mod tests {
         runtime().unwrap().block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let reader_id = id(90);
@@ -8395,7 +8809,7 @@ mod tests {
             use serde_json::json;
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let reader_id = id(90);
@@ -8534,7 +8948,7 @@ mod tests {
             use serde_json::json;
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let reader_id = id(91);
@@ -8617,7 +9031,7 @@ mod tests {
             use serde_json::json;
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &fixture.signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
                 .await
                 .unwrap();
             let reader_id = id(92);
@@ -8757,7 +9171,9 @@ mod tests {
     /// watcher takes it: reported, then presented.
     async fn take_news(path: &Path, signer: &SigningKey, reader: Id) -> News {
         let mut pile = open_store_as(path, signer.verifying_key()).unwrap();
-        let sources = OrientSources::open(&mut pile, signer, false).await.unwrap();
+        let sources = OrientSources::open(&test_storage(), &mut pile, signer, false)
+            .await
+            .unwrap();
         maintain_sources(&mut pile, signer, &sources).await.unwrap();
         let observation = observe_current_sources(&mut pile, &sources).unwrap();
         let news = read(&mut pile, &observation.snapshot, |view| {
@@ -8807,7 +9223,7 @@ mod tests {
         let reader_id = id(93);
         runtime.block_on(async {
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let sources = OrientSources::open(&mut pile, &signer, false)
+            let sources = OrientSources::open(&test_storage(), &mut pile, &signer, false)
                 .await
                 .unwrap();
             let (profile, _, _) = relations::person_fragment(

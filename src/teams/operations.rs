@@ -14,10 +14,7 @@ use crate::storage::initialize_signer;
 use crate::storage::open_secrets_collection;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{
-    open_secrets_collection_acquiring, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore,
-    Storage,
-};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use hifitime::{Epoch, TimeScale};
@@ -43,7 +40,6 @@ use triblespace::prelude::*;
 use crate::clock;
 #[cfg(test)]
 use crate::collection_names::open_configured;
-use crate::collection_names::open_configured_acquiring;
 use crate::files as file_capability;
 use crate::schemas::archive::{archive, RawBytes};
 use crate::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
@@ -711,7 +707,13 @@ impl TeamsSession {
     ) -> Result<Id> {
         let secret = self
             .storage
-            .with_store(|pile, _, _| {
+            .with_store(|pile, _, runtime| {
+                self.storage.open_secrets_collection(
+                    pile,
+                    self.signer.verifying_key(),
+                    runtime,
+                    true,
+                )?;
                 secret_storage::add_secret(
                     pile,
                     &self.signer,
@@ -734,7 +736,7 @@ impl TeamsStorage {
     fn with_session<T>(&self, operation: impl FnOnce(&mut TeamsSession) -> Result<T>) -> Result<T> {
         self.storage.scope(|storage| {
             let mut session = storage.with_store(|pile, signer, runtime| {
-                let collection = open_configured_acquiring(
+                let collection = self.storage.open_collection_read(
                     pile,
                     DEFAULT_SCOPE_ID,
                     signer.verifying_key(),
@@ -745,8 +747,12 @@ impl TeamsStorage {
                     collection,
                     maintained_succinct,
                 )?;
-                let secret_collection =
-                    open_secrets_collection_acquiring(pile, signer.verifying_key(), runtime)?;
+                let secret_collection = self.storage.open_secrets_collection(
+                    pile,
+                    signer.verifying_key(),
+                    runtime,
+                    false,
+                )?;
                 // The session carries the source and attaches the frontier
                 // the carry leaves; a commit neither attachment reaches yet
                 // is read from its own bytes, and what this key cannot

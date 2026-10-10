@@ -12,6 +12,10 @@ use triblespace::prelude::*;
 /// Minted with `trible genid` on 2026-08-11.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("F53E5FE10DC419D59973C668ACF018B4");
 
+/// Explicit routing role for the current receipt collection, distinct from
+/// the legacy mixed Orient ledger. Minted with `trible genid` on 2026-10-08.
+pub const RECEIPTS_SCOPE_ID: Id = id_hex!("13DA82B2558455D3031499CFDDBDB792");
+
 /// Key-private receipt facts. This deliberately differs from the legacy
 /// mixed-persona `orient` collection: its owner is the descriptor's authority.
 pub const RECEIPT_COLLECTION_NAME: &str = "orient-receipts";

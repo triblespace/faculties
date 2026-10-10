@@ -30,6 +30,7 @@ use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::schemas::habit::{
     attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
@@ -64,9 +65,8 @@ pub fn collection_handle_with_storage(
     storage: &Storage,
 ) -> Result<triblespace::core::collection::records::CollectionHandle> {
     storage.with_store(|pile, signer, runtime| {
-        crate::collection_names::open_configured_acquiring(
-            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
-        )
+        storage
+            .open_collection_read(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)
             .map(|collection| collection.handle())
             .context("open Habit collection")
     })
@@ -1625,11 +1625,17 @@ pub fn publish(
 /// fragment; it does not imply that publication was rolled back.
 pub fn publish_with_storage(storage: &Storage, fragment: Fragment) -> Result<CollectionCommit> {
     storage.with_store(|pile, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
-            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let collection = storage.open_collection_write(
+            pile,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
         )?;
-        let commit = pile.commit(collection, signer, fragment).context("commit Habit fragment")?;
-        runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+        let commit = pile
+            .commit(collection, signer, fragment)
+            .context("commit Habit fragment")?;
+        runtime
+            .block_on(crate::storage::ensure_downstream(pile, collection, signer))
             .context("Habit facts were committed, but ensuring their derived views failed")?;
         Ok(commit)
     })
@@ -1650,11 +1656,15 @@ pub fn read_catalog_strict(pile_path: &Path, key_path: Option<&Path>) -> Result<
 /// Run the explicit whole-collection audit without reopening a shared store.
 pub fn read_catalog_strict_with_storage(storage: &Storage) -> Result<Catalog> {
     storage.with_store(|pile, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
-            pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let collection = storage.open_collection_read(
+            pile,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
         )?;
         let store_snapshot = crate::storage::AcquiringReader::new(
-            pile.snapshot().context("freeze Habit audit snapshot")?, runtime.clone(),
+            pile.snapshot().context("freeze Habit audit snapshot")?,
+            runtime.clone(),
         );
         // Strict check includes every admitted foundation, not only the
         // resident realized cover. Bytes may arrive, but the admitted set and
@@ -1662,7 +1672,8 @@ pub fn read_catalog_strict_with_storage(storage: &Storage) -> Result<Catalog> {
         let admitted = collection.admitted(&store_snapshot)?;
         let mut facts = TribleSet::new();
         for payload in admitted.members() {
-            facts += store_snapshot.get::<TribleSet, _>(payload)
+            facts += store_snapshot
+                .get::<TribleSet, _>(payload)
                 .context("read admitted Habit audit foundation")?;
         }
         load_catalog(&store_snapshot, &facts).context("strictly validate native Habit catalog")

@@ -3,9 +3,9 @@
 //! Callers use typed operations directly; no CLI invocation or MCP value enters here.
 
 use crate::clock;
-use crate::collection_names::{configured_handle, open, open_configured_acquiring};
 #[cfg(test)]
 use crate::collection_names::open_exact_in;
+use crate::collection_names::{configured_handle, open, open_configured_acquiring};
 use crate::files as file_capability;
 use crate::out::Out;
 use crate::schemas::files::{file, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT};
@@ -216,10 +216,51 @@ fn with_files_store<T>(
         &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<T>,
 ) -> Result<T> {
+    with_files_access(storage, false, f)
+}
+
+fn with_files_write_store<T>(
+    storage: &Storage,
+    f: impl FnOnce(
+        &mut FacultyStore,
+        Collection<SimpleArchive>,
+        &SigningKey,
+        &std::sync::Arc<tokio::runtime::Runtime>,
+    ) -> Result<T>,
+) -> Result<T> {
+    with_files_access(storage, true, f)
+}
+
+fn with_files_access<T>(
+    storage: &Storage,
+    write: bool,
+    f: impl FnOnce(
+        &mut FacultyStore,
+        Collection<SimpleArchive>,
+        &SigningKey,
+        &std::sync::Arc<tokio::runtime::Runtime>,
+    ) -> Result<T>,
+) -> Result<T> {
     // Authority is durable and explicit: ordinary Files commands never mint a
     // new signer and never fall back to an ephemeral identity.
     storage.with_store(|store, signer, runtime| {
-        let collection = if configured_handle(DEFAULT_SCOPE_ID)?.is_some() {
+        let collection = if storage.collection_routes().is_some() {
+            if write {
+                storage.open_collection_write(
+                    store,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?
+            } else {
+                storage.open_collection_read(
+                    store,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?
+            }
+        } else if configured_handle(DEFAULT_SCOPE_ID)?.is_some() {
             open_configured_acquiring(store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?
         } else {
             open(store, DEFAULT_SCOPE_ID, signer.verifying_key())
@@ -1450,7 +1491,7 @@ impl Files {
         if dry_run {
             return cmd_add_dry_run(path, tags, out);
         }
-        with_files_store(&self.storage, |store, collection, signer, runtime| {
+        with_files_write_store(&self.storage, |store, collection, signer, runtime| {
             cmd_add(store, collection, signer, runtime, path, mime, tags, out)
         })
     }
@@ -1465,7 +1506,7 @@ impl Files {
         tags: &[String],
     ) -> Result<Id> {
         let (change, file_id, _) = stage_byte_import(bytes, name, mime, tags, "resident bytes")?;
-        with_files_store(&self.storage, |store, collection, signer, runtime| {
+        with_files_write_store(&self.storage, |store, collection, signer, runtime| {
             store
                 .commit(collection, signer, change)
                 .context("commit Files byte import")?;
@@ -1492,6 +1533,12 @@ impl Files {
         with_files_view(
             &self.storage,
             |store, collection, signer, facts, snapshot, rt| {
+                self.storage.open_collection_write(
+                    store,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    rt,
+                )?;
                 cmd_tag(
                     store, rt, collection, signer, facts, snapshot, id, name, out,
                 )
@@ -1501,7 +1548,7 @@ impl Files {
 
     pub fn fetch(&self, options: &FetchOptions<'_>, out: &mut Out<'_>) -> Result<()> {
         anyhow::ensure!(options.max_bytes > 0, "max_bytes must be positive");
-        with_files_store(&self.storage, |store, collection, signer, runtime| {
+        with_files_write_store(&self.storage, |store, collection, signer, runtime| {
             cmd_fetch(
                 store,
                 collection,
@@ -1530,6 +1577,7 @@ impl Files {
     #[cfg(feature = "wemm")]
     pub fn similar(&self, options: &SimilarityOptions<'_>, out: &mut Out<'_>) -> Result<()> {
         options.validate()?;
+        self.storage.require_ambient_models("files similar")?;
         self.similar_with(
             &crate::wemm::Session::from_env(self.storage.path())?,
             options,
@@ -1566,6 +1614,7 @@ impl Files {
     /// it, binding the model the environment names. Saving never embeds.
     #[cfg(feature = "wemm")]
     pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
+        self.storage.require_ambient_models("files index")?;
         self.index_with(&crate::wemm::Session::from_env(self.storage.path())?, out)
     }
 

@@ -79,6 +79,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (memory::DEFAULT_COMB_SCOPE_ID, "memory-comb"),
         (message::DEFAULT_SCOPE_ID, "message"),
         (orient::DEFAULT_SCOPE_ID, "orient"),
+        (orient::RECEIPTS_SCOPE_ID, orient::RECEIPT_COLLECTION_NAME),
         (planner::DEFAULT_SCOPE_ID, "planner"),
         (posture::DEFAULT_POLICY_SCOPE_ID, "posture-policy"),
         (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan"),
@@ -500,6 +501,33 @@ where
     Ok(collection)
 }
 
+/// Exact workspace publication destination, checked against the same frozen
+/// descriptor and proof evidence used to resolve its role. This action guard
+/// does not alter unconditional raw ledger publication.
+pub fn open_exact_write_in<S>(
+    snapshot: &S,
+    scope: Id,
+    subject: VerifyingKey,
+    handle: CollectionHandle,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+{
+    let collection = open_exact_descriptor_in(snapshot, scope, handle)?;
+    if !collection
+        .writer_is_admitted_acquiring(snapshot, subject)
+        .context("check workspace collection WRITE admission")?
+    {
+        bail!(
+            "durable signer {} is not admitted to WRITE workspace collection {:?} ({})",
+            hex::encode(subject.to_bytes()),
+            require_name(scope),
+            hex::encode(handle.raw)
+        );
+    }
+    Ok(collection)
+}
+
 fn open_exact_descriptor_in<S>(
     snapshot: &S,
     scope: Id,
@@ -510,9 +538,9 @@ where
 {
     let collection = Collection::open(snapshot, handle).with_context(|| {
         format!(
-            "open exact {} descriptor from {}",
+            "open exact {} collection descriptor {}",
             require_name(scope),
-            override_env_name(scope)
+            hex::encode(handle.raw)
         )
     })?;
     let blob: Blob<SimpleArchive> = snapshot
@@ -529,10 +557,60 @@ where
     let expected = require_name(scope);
     if &*name != expected {
         bail!(
-            "{} names collection {:?}, not expected faculty collection {:?}",
-            override_env_name(scope),
+            "descriptor {} names collection {:?}, not expected faculty collection {:?}",
+            hex::encode(handle.raw),
             &*name,
             expected,
+        );
+    }
+    Ok(collection)
+}
+
+/// An explicit role is a caller-owned mapping, not a descriptor name contract.
+/// The collection remains a typed named root with its own independent policy.
+pub fn open_workspace_in<S: BlobStoreGet>(
+    snapshot: &S,
+    handle: CollectionHandle,
+) -> anyhow::Result<Collection<SimpleArchive>> {
+    let collection = Collection::open(snapshot, handle).context("open exact workspace root")?;
+    let facts: TribleSet = snapshot.get(handle).context("read workspace descriptor")?;
+    if descriptor::name(&facts)?.is_none() {
+        bail!("workspace faculty role requires a named SimpleArchive root");
+    }
+    Ok(collection)
+}
+
+pub fn open_workspace_read_in<S>(
+    snapshot: &S,
+    subject: VerifyingKey,
+    handle: CollectionHandle,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead,
+{
+    let collection = open_workspace_in(snapshot, handle)?;
+    if !collection.reader_is_admitted_acquiring(snapshot, subject)? {
+        bail!(
+            "node signer is not admitted to READ workspace collection {}",
+            hex::encode(handle.raw)
+        );
+    }
+    Ok(collection)
+}
+
+pub fn open_workspace_write_in<S>(
+    snapshot: &S,
+    subject: VerifyingKey,
+    handle: CollectionHandle,
+) -> anyhow::Result<Collection<SimpleArchive>>
+where
+    S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+{
+    let collection = open_workspace_in(snapshot, handle)?;
+    if !collection.writer_is_admitted_acquiring(snapshot, subject)? {
+        bail!(
+            "node signer is not admitted to WRITE workspace collection {}",
+            hex::encode(handle.raw)
         );
     }
     Ok(collection)

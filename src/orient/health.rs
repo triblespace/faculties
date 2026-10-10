@@ -14,7 +14,7 @@ pub(super) struct HealthSources {
     health: OrientSource,
     latest: Collection<LwwRegisterBlob>,
     relations: OrientSource,
-    presentations: ReceiptSource,
+    pub(super) presentations: ReceiptSource,
     max_age: Duration,
     // The prefix before successful health upkeep and an optional receipt
     // attempt, not its final query snapshot: an append racing upkeep must
@@ -34,14 +34,23 @@ pub(super) struct HealthSources {
 
 impl HealthSources {
     pub(super) async fn open(
+        routing: &Storage,
         pile: &mut FacultyStore,
         signer: &SigningKey,
         max_age: Duration,
     ) -> Result<Self> {
-        let health = OrientSource::open(pile, signer, schema::DEFAULT_SCOPE_ID, "Swarm health").await?;
-        let relations = OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
+        let health = OrientSource::open(
+            routing,
+            pile,
+            signer,
+            schema::DEFAULT_SCOPE_ID,
+            "Swarm health",
+        )
+        .await?;
+        let relations =
+            OrientSource::open(routing, pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
+        let presentations = ReceiptSource::open(routing, pile, signer).await?;
         let mut local = pile.store();
-        let presentations = ReceiptSource::register(&mut *local, signer)?;
         let latest = local.attach::<LwwRegisterBlob>(
             health.source,
             (attrs::node.id(), metadata::created_at.id()),
@@ -132,12 +141,16 @@ impl HealthSources {
             let observe = |source: OrientSource| -> Result<OrientFact> {
                 let collection = reader.attached_acquiring(source.rank9)?;
                 let view = crate::storage::acquire_attached_facts(&collection)?;
-                Ok(OrientFact { collection: collection.into_frozen(), view })
+                Ok(OrientFact {
+                    collection: collection.into_frozen(),
+                    view,
+                })
             };
             let latest_collection = reader.attached_acquiring(latest_target)?;
             let latest = crate::storage::require_complete_attached_read(
                 latest_collection.read_acquiring::<LwwIndex>()?,
-            )?.query()?;
+            )?
+            .query()?;
             let presentations = reader.attached(presentations_target)?;
             Ok(HealthObservation {
                 snapshot,
@@ -158,7 +171,9 @@ impl HealthSources {
                 },
                 max_age,
             })
-        }).await.context("join frozen health input selection")?
+        })
+        .await
+        .context("join frozen health input selection")?
     }
 
     fn maintain_if_changed(
@@ -220,7 +235,15 @@ impl HealthSources {
         };
         let news = observation.news(persona, &report);
         let fired = matches!(news, News::Report { .. });
-        apply_prepared_news(pile, signer, peek, &news, "", output)?;
+        apply_prepared_news(
+            pile,
+            signer,
+            self.presentations.source,
+            peek,
+            &news,
+            "",
+            output,
+        )?;
         Ok((fired, report.next_change))
     }
 
@@ -374,13 +397,20 @@ impl HealthObservation {
         tokio::task::spawn_blocking(move || {
             let reader = crate::storage::AcquiringReader::with_handle(snapshot, runtime);
             render_health(&facts, &latest, &reader, now, max_age, Detail::Full)
-        }).await.context("join requested health report acquisition")
+        })
+        .await
+        .context("join requested health report acquisition")
     }
 
-    pub(super) async fn persona_acquiring(&self, pile: &mut FacultyStore, input: &str) -> Result<Id> {
+    pub(super) async fn persona_acquiring(
+        &self,
+        pile: &mut FacultyStore,
+        input: &str,
+    ) -> Result<Id> {
         read(pile, &self.snapshot, |reader| {
             resolve_resident_persona(self.relations.view(), reader, input)
-        }).await
+        })
+        .await
     }
 
     fn is_current(&self, snapshot: &FacultySnapshot) -> bool {
@@ -868,7 +898,66 @@ mod tests {
     use triblespace::core::collection::{
         records::empty_metadata_handle, CollectionCommit, CollectionRecord, CollectionStore,
     };
-    use triblespace::core::repo::{BlobStorePut, WantRead};
+    use triblespace::core::repo::{BlobStorePut, StorageClose, WantRead};
+
+    #[test]
+    fn explicit_workspace_health_retains_all_selected_roots() {
+        use crate::schemas::orient::RECEIPTS_SCOPE_ID;
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+
+        test_block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("workspace-health.pile");
+            std::fs::File::create(&path).unwrap();
+            let signer = SigningKey::from_bytes(&[72; 32]);
+            let mut store = open_store_as(&path, signer.verifying_key()).unwrap();
+            let mut routes = crate::storage::CollectionRoutes::new();
+            for scope in [
+                schema::DEFAULT_SCOPE_ID,
+                RELATIONS_SCOPE_ID,
+                RECEIPTS_SCOPE_ID,
+            ] {
+                let source = store
+                    .collection(
+                        crate::collection_names::require_name(scope),
+                        CollectionPolicy::new(
+                            AdmissionPolicy::Open,
+                            AdmissionPolicy::direct(signer.verifying_key()),
+                        ),
+                    )
+                    .unwrap();
+                routes.insert(scope, source.handle());
+            }
+            let routing = test_storage().with_collections(routes.clone());
+            let sources =
+                HealthSources::open(&routing, &mut store, &signer, Duration::from_secs(60))
+                    .await
+                    .unwrap();
+            assert_eq!(
+                sources.health.source.handle(),
+                routes[&schema::DEFAULT_SCOPE_ID]
+            );
+            assert_eq!(
+                sources.relations.source.handle(),
+                routes[&RELATIONS_SCOPE_ID]
+            );
+            assert_eq!(
+                sources.presentations.source.handle(),
+                routes[&RECEIPTS_SCOPE_ID]
+            );
+            assert_eq!(
+                sources.latest,
+                store
+                    .attach::<LwwRegisterBlob>(
+                        sources.health.source,
+                        (attrs::node.id(), metadata::created_at.id()),
+                    )
+                    .unwrap()
+            );
+            assert!(store.health().started_at.is_none());
+            store.close().unwrap();
+        });
+    }
 
     struct Fixture {
         store: FacultyStore,
@@ -885,8 +974,13 @@ mod tests {
             // Test-only author, never a live transport or pile identity.
             let signer = SigningKey::from_bytes(&[71; 32]);
             let mut store = open_store_as(&path, signer.verifying_key()).unwrap();
-            let sources =
-                test_block_on(HealthSources::open(&mut store, &signer, Duration::from_secs(60))).unwrap();
+            let sources = test_block_on(HealthSources::open(
+                &test_storage(),
+                &mut store,
+                &signer,
+                Duration::from_secs(60),
+            ))
+            .unwrap();
             Self {
                 store,
                 sources,
@@ -1159,7 +1253,11 @@ mod tests {
     fn foreground_dashboard_needs_no_historical_receipt_shards() {
         let mut f = Fixture::new();
         test_block_on(async {
-            let observation = f.sources.observe_acquiring(&mut f.store, &f.signer).await.unwrap();
+            let observation = f
+                .sources
+                .observe_acquiring(&mut f.store, &f.signer)
+                .await
+                .unwrap();
             let report = observation.report_acquiring().await.unwrap();
             assert!(report.text.contains("not observed / not configured"));
             assert!(report.attention.is_empty());
@@ -1375,8 +1473,13 @@ mod tests {
 
         // A new watcher has no process-local receipt state to lean on. Its
         // first poll carries the committed receipt through the ordinary set.
-        let mut rearmed =
-            test_block_on(HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60))).unwrap();
+        let mut rearmed = test_block_on(HealthSources::open(
+            &test_storage(),
+            &mut f.store,
+            &f.signer,
+            Duration::from_secs(60),
+        ))
+        .unwrap();
         parts.clear();
         let mut emit = |part| {
             parts.push(part);
@@ -1451,8 +1554,13 @@ mod tests {
         assert!(fired);
         assert!(!text.contains("not refreshed"), "{text}");
 
-        let mut rearmed =
-            test_block_on(HealthSources::open(&mut f.store, &f.signer, Duration::from_secs(60))).unwrap();
+        let mut rearmed = test_block_on(HealthSources::open(
+            &test_storage(),
+            &mut f.store,
+            &f.signer,
+            Duration::from_secs(60),
+        ))
+        .unwrap();
         let (fired, text) = poll(&mut rearmed, &mut f.store);
         assert!(!fired, "a delivered report must not repeat: {text}");
         assert!(text.is_empty(), "{text}");
@@ -1580,7 +1688,7 @@ mod tests {
         assert!(after.text.contains("last sample only"));
         assert_eq!(after.next_change, None);
         let persona = *fucid();
-        save_presentations(&mut f.store, &f.signer, [report_id]).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, [report_id]).unwrap();
         let next = f.observe_at(at(100.0));
         assert!(matches!(next.news(persona, &next.report()), News::Quiet));
         assert!(next.snapshot.wants().unwrap().next().is_none());
@@ -1909,7 +2017,7 @@ mod tests {
         );
         let failure = f.observe_at(at(1.0)).report();
         assert_eq!(failure.attention.ids().len(), 1);
-        save_presentations(&mut f.store, &f.signer, failure.attention.ids()).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, failure.attention.ids()).unwrap();
         f.publish(
             recorder
                 .record(at(10.0), [store_condition(State::Stalled, true)])
@@ -1935,7 +2043,7 @@ mod tests {
         assert!(
             matches!(&recovery_news, News::Report { text, .. } if text.contains("recovered; current"))
         );
-        save_presentations(&mut f.store, &f.signer, recovery_ids).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, recovery_ids).unwrap();
         f.publish(
             recorder
                 .record(at(30.0), [store_condition(State::Current, false)])
@@ -1984,7 +2092,7 @@ mod tests {
         let first_report = first.report();
         let first_ids: Vec<_> = first_report.attention.ids().collect();
         assert_eq!(first_ids.len(), 1);
-        save_presentations(&mut f.store, &f.signer, first_ids.clone()).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, first_ids.clone()).unwrap();
 
         f.publish(
             recorder
@@ -2017,7 +2125,7 @@ mod tests {
             recovered.news(persona, &recovered_report),
             News::Report { .. }
         ));
-        save_presentations(&mut f.store, &f.signer, recovered_ids).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, recovered_ids).unwrap();
 
         f.publish(
             recorder

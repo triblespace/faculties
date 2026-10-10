@@ -9,6 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::clock;
+#[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::files;
 use crate::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
@@ -21,7 +22,7 @@ use crate::schemas::{
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
-use crate::storage::{open_secrets_collection, open_secrets_collection_read, AcquiringReader, FactArchive, FacultySnapshot};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -304,25 +305,21 @@ impl Storage {
     fn views(&self) -> Result<Views> {
         self.storage.with_store(|store, _, runtime| {
             for scope in [self.scopes.mail, self.scopes.files, self.scopes.decide, self.scopes.relations] {
-                crate::collection_names::open_configured_acquiring(
+                self.storage.open_collection_read(
                     store, scope, self.signer.verifying_key(), runtime,
                 )?;
             }
-            crate::storage::open_secrets_collection_acquiring(
-                store, self.signer.verifying_key(), runtime,
-            )?;
+            let secrets_collection = self.storage.open_secrets_collection(store, self.signer.verifying_key(), runtime, false)?;
             let pile = store;
             let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot, secrets) = {
                 let mail_collection =
-                    open_configured(pile, self.scopes.mail, self.signer.verifying_key())?;
+                    self.storage.open_collection_local(pile, self.scopes.mail, self.signer.verifying_key())?;
                 let files_collection =
-                    open_configured(pile, self.scopes.files, self.signer.verifying_key())?;
+                    self.storage.open_collection_local(pile, self.scopes.files, self.signer.verifying_key())?;
                 let decide_collection =
-                    open_configured(pile, self.scopes.decide, self.signer.verifying_key())?;
+                    self.storage.open_collection_local(pile, self.scopes.decide, self.signer.verifying_key())?;
                 let relations_collection =
-                    open_configured(pile, self.scopes.relations, self.signer.verifying_key())?;
-                let secrets_collection =
-                    open_secrets_collection_read(pile, self.signer.verifying_key())?;
+                    self.storage.open_collection_local(pile, self.scopes.relations, self.signer.verifying_key())?;
                 let mail_succinct =
                     pile.attach::<SuccinctArchiveBlob>(mail_collection, ())?;
                 let mail_rank9 =
@@ -401,11 +398,13 @@ impl Storage {
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         self.storage.with_store(|store, _, runtime| {
-            crate::storage::open_secrets_collection_acquiring(
-                store, self.signer.verifying_key(), runtime,
+            let collection = self.storage.open_secrets_collection(
+                store,
+                self.signer.verifying_key(),
+                runtime,
+                true,
             )?;
             let pile = store;
-            let collection = open_secrets_collection(&mut *pile, self.signer.verifying_key())?;
             secret_storage::add_secret(
                 &mut *pile,
                 &self.signer,
@@ -420,8 +419,11 @@ impl Storage {
 
     fn publish(&self, scope: Id, fragment: Fragment, description: &str) -> Result<()> {
         self.storage.with_store(|store, _, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, scope, self.signer.verifying_key(), runtime,
+            let collection = self.storage.open_collection_write(
+                store,
+                scope,
+                self.signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             let mut fragment = fragment;
@@ -430,12 +432,15 @@ impl Storage {
                 .with_context(|| format!("commit collection {scope:x}"))?;
             self.published.set(true);
             drop(
-                runtime.block_on(crate::storage::ensure_downstream(
-                    pile,
-                    collection,
-                    &self.signer,
-                ))
-                .context("Mail facts were committed, but ensuring their derived views failed")?,
+                runtime
+                    .block_on(crate::storage::ensure_downstream(
+                        pile,
+                        collection,
+                        &self.signer,
+                    ))
+                    .context(
+                        "Mail facts were committed, but ensuring their derived views failed",
+                    )?,
             );
             Ok(())
         })
@@ -1228,6 +1233,7 @@ mod tests {
     use std::rc::Rc;
 
     use crate::secrets::secret_rows;
+    use crate::storage::open_secrets_collection;
     use crate::storage::{initialize_signer, publish_fragment};
     use triblespace::core::repo::StoreSnapshot;
 

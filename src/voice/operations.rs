@@ -6,9 +6,9 @@ use crate::collection_names::open_configured;
 use crate::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
 #[cfg(test)]
 use crate::storage::open_pile_strict_as;
-use crate::storage::{AcquiringReader, FactArchive, FacultyStore};
 #[cfg(test)]
 use crate::storage::FacultySnapshot;
+use crate::storage::{AcquiringReader, FactArchive, FacultyStore};
 use crate::voice as voice_model;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -212,12 +212,13 @@ impl VoiceSession<'_> {
             .commit(self.collection, self.signer, fragment)
             .context("commit Voice fragment")?;
         drop(
-            self.runtime.block_on(crate::storage::ensure_downstream(
-                self.pile,
-                self.collection,
-                self.signer,
-            ))
-            .context("Voice facts were committed, but ensuring their derived views failed")?,
+            self.runtime
+                .block_on(crate::storage::ensure_downstream(
+                    self.pile,
+                    self.collection,
+                    self.signer,
+                ))
+                .context("Voice facts were committed, but ensuring their derived views failed")?,
         );
         Ok(commit)
     }
@@ -229,8 +230,11 @@ impl VoiceStorage<'_> {
         operation: impl FnOnce(&mut VoiceSession<'_>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|store, signer, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, COLLECTION_SCOPE_ID, signer.verifying_key(), runtime,
+            let collection = self.storage.open_collection_read(
+                store,
+                COLLECTION_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             let result = (|| {
@@ -241,17 +245,19 @@ impl VoiceStorage<'_> {
                 )?;
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
-                runtime.block_on(async {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(maintained_succinct, signer).await,
-                    )?;
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(maintained_rank9, signer).await,
-                    )
-                })
-                .context("maintain Voice fact collection")?;
+                runtime
+                    .block_on(async {
+                        crate::storage::tolerate_own_lag(
+                            pile.maintain_attached(maintained_succinct, signer).await,
+                        )?;
+                        crate::storage::tolerate_own_lag(
+                            pile.maintain_attached(maintained_rank9, signer).await,
+                        )
+                    })
+                    .context("maintain Voice fact collection")?;
                 let store_snapshot = AcquiringReader::new(
-                    pile.snapshot().context("freeze maintained Voice fact collection")?,
+                    pile.snapshot()
+                        .context("freeze maintained Voice fact collection")?,
                     runtime.clone(),
                 );
                 let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)

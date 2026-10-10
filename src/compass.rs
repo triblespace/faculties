@@ -93,7 +93,7 @@ where
     status_register_for_source(store, source)
 }
 
-fn status_register_for_source<S>(
+pub(crate) fn status_register_for_source<S>(
     store: &mut S,
     source: Collection<blobencodings::SimpleArchive>,
 ) -> Result<Collection<LwwRegisterBlob>>

@@ -143,7 +143,6 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::headspace::{self, ConfigValue, OpenedSecrets, ProfileValue, Resolution};
@@ -151,9 +150,9 @@ use crate::schemas::headspace::DEFAULT_SCOPE_ID;
 use crate::secrets::{self as secrets_model, storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::load_signer;
-use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FacultySnapshot, FactArchive};
 #[cfg(test)]
 use crate::storage::open_secrets_collection;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -196,14 +195,21 @@ impl Storage {
 
     fn views(&self) -> Result<Views> {
         self.storage.with_store(|pile, _, runtime| {
-            let source = open_configured_acquiring(
-                pile, DEFAULT_SCOPE_ID, self.signer.verifying_key(), runtime,
+            let source = self.storage.open_collection_read(
+                pile,
+                DEFAULT_SCOPE_ID,
+                self.signer.verifying_key(),
+                runtime,
             )?;
             let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let collection_rank9 =
                 pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
-            let secrets_collection =
-                open_secrets_collection_acquiring(pile, self.signer.verifying_key(), runtime)?;
+            let secrets_collection = self.storage.open_secrets_collection(
+                pile,
+                self.signer.verifying_key(),
+                runtime,
+                false,
+            )?;
             // The source is carried and its frontier attached; a commit left
             // unattached is read from its own bytes.
             let snapshot = runtime.block_on(async {
@@ -216,9 +222,10 @@ impl Storage {
                     pile.maintain_attached(collection_rank9, &self.signer).await,
                 )
                 .context("maintain Headspace fact collection")?;
-                let snapshot = secrets_collection.ensure(pile, &self.signer)
-                        .await
-                        .context("observe configured Secrets collection")?;
+                let snapshot = secrets_collection
+                    .ensure(pile, &self.signer)
+                    .await
+                    .context("observe configured Secrets collection")?;
                 Ok::<_, anyhow::Error>(snapshot)
             })?;
             let reader = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
@@ -234,8 +241,11 @@ impl Storage {
 
     fn add_secret(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         self.storage.with_store(|pile, _, runtime| {
-            let collection = open_secrets_collection_acquiring(
-                pile, self.signer.verifying_key(), runtime,
+            let collection = self.storage.open_secrets_collection(
+                pile,
+                self.signer.verifying_key(),
+                runtime,
+                true,
             )?;
             secret_storage::add_secret(
                 pile,
@@ -252,8 +262,11 @@ impl Storage {
     fn publish(&self, scope: Id, mut fragment: Fragment, description: &str) -> Result<()> {
         self.storage.with_store(|pile, _, runtime| {
             fragment.describe_with(entity! { metadata::description: description.to_owned() });
-            let collection = open_configured_acquiring(
-                pile, scope, self.signer.verifying_key(), runtime,
+            let collection = self.storage.open_collection_write(
+                pile,
+                scope,
+                self.signer.verifying_key(),
+                runtime,
             )?;
             crate::collection_names::require_command_write_admission_acquiring(
                 pile,
@@ -266,12 +279,13 @@ impl Storage {
             pile.commit(collection, &self.signer, fragment)
                 .with_context(|| format!("commit collection {scope:x}"))?;
             drop(
-                runtime.block_on(crate::storage::ensure_downstream(
-                    pile,
-                    collection,
-                    &self.signer,
-                ))
-                .context(HeadspaceCommitted)?,
+                runtime
+                    .block_on(crate::storage::ensure_downstream(
+                        pile,
+                        collection,
+                        &self.signer,
+                    ))
+                    .context(HeadspaceCommitted)?,
             );
             Ok(())
         })

@@ -298,11 +298,17 @@ impl WebStorage<'_> {
     /// names. Labels and timestamps never participate in runtime selection.
     fn open_web_secrets(&self) -> Result<ApiKeys> {
         self.storage.with_store(|store, signer, runtime| {
-            let source = crate::collection_names::open_configured_acquiring(
-                store, HEADSPACE_SCOPE_ID, signer.verifying_key(), runtime,
+            let source = self.storage.open_collection_read(
+                store,
+                HEADSPACE_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
-            let secrets_collection = crate::storage::open_secrets_collection_acquiring(
-                store, signer.verifying_key(), runtime,
+            let secrets_collection = self.storage.open_secrets_collection(
+                store,
+                signer.verifying_key(),
+                runtime,
+                false,
             )?;
             let pile = store;
             let (headspace_rank9, secrets) = runtime.block_on(async {
@@ -330,7 +336,8 @@ impl WebStorage<'_> {
             // Every query shares one frozen prefix. Only exact payload reads
             // acquire bytes; no key or message selection is retried.
             let reader = crate::storage::AcquiringReader::new(
-                secrets.store_snapshot().clone(), runtime.clone(),
+                secrets.store_snapshot().clone(),
+                runtime.clone(),
             );
             let facts = crate::storage::acquire_facts(&reader, headspace_rank9)
                 .context("read maintained Headspace collection")?;
@@ -345,15 +352,19 @@ impl WebStorage<'_> {
 
     fn store(&self, mut fragment: Fragment, description: &'static str) -> Result<()> {
         self.storage.with_store(|store, signer, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let collection = self.storage.open_collection_write(
+                store,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             fragment.describe_with(entity! { metadata::description: description });
             pile.commit(collection, signer, fragment)
                 .context("commit Web observation")?;
             drop(
-                runtime.block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                runtime
+                    .block_on(crate::storage::ensure_downstream(pile, collection, signer))
                     .context("Web facts were committed, but ensuring their derived views failed")?,
             );
             Ok(())

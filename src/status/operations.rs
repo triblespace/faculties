@@ -13,7 +13,6 @@ use std::sync::Arc;
 use crate::clock;
 #[cfg(test)]
 use crate::collection_names::open_configured;
-use crate::collection_names::open_configured_acquiring;
 use crate::relations::{self, Head, SelectorOutcome};
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::status::DEFAULT_SCOPE_ID;
@@ -109,7 +108,7 @@ impl Status {
     /// Load only the current event text for each window, from one frozen view.
     pub fn list(&self) -> Result<Vec<WindowStatus>> {
         self.storage().with_store(|pile, signer, runtime| {
-            let observation = maintain_and_observe_status(pile, signer, runtime)?;
+            let observation = maintain_and_observe_status(&self.storage, pile, signer, runtime)?;
             let latest = status::latest_per_window(status::load_status_rows(&observation.status)?)?;
             let mut rows: Vec<WindowStatus> = latest
                 .into_values()
@@ -140,7 +139,7 @@ impl Status {
     /// the header/count while acquiring no event text.
     pub fn show(&self, selector: &str, limit: usize) -> Result<StatusHistory> {
         self.storage().with_store(|pile, signer, runtime| {
-            let observation = maintain_and_observe_status(pile, signer, runtime)?;
+            let observation = maintain_and_observe_status(&self.storage, pile, signer, runtime)?;
             let window =
                 resolve_window_id(&observation.snapshot, &observation.relations, selector)?;
             let label = window_label(&observation.snapshot, &observation.relations, window)?;
@@ -215,18 +214,19 @@ impl StatusStorage<'_> {
 }
 
 fn maintain_and_observe_status(
+    storage: &crate::storage::Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<StatusObservation> {
     // Register every descriptor before advancing the two fact chains.
     let status_source =
-        open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+        storage.open_collection_read(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
     let status_succinct = pile.attach::<SuccinctArchiveBlob>(status_source, ())?;
     let status_rank9 =
         pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(status_source, status_succinct)?;
     let relations_source =
-        open_configured_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
+        storage.open_collection_read(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
     let relations_succinct = pile.attach::<SuccinctArchiveBlob>(relations_source, ())?;
     let relations_rank9 =
         pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(relations_source, relations_succinct)?;
@@ -273,12 +273,13 @@ fn maintain_and_observe_status(
 }
 
 fn maintain_and_observe_relations(
+    storage: &crate::storage::Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<RelationsObservation> {
     let source =
-        open_configured_acquiring(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
+        storage.open_collection_read(pile, RELATIONS_SCOPE_ID, signer.verifying_key(), runtime)?;
     let collection_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
     let collection_rank9 =
         pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, collection_succinct)?;
@@ -307,13 +308,14 @@ fn maintain_and_observe_relations(
 }
 
 fn commit_status(
+    storage: &crate::storage::Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     fragment: Fragment,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<CollectionCommit> {
     let collection =
-        open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+        storage.open_collection_write(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
     crate::collection_names::require_command_write_admission_acquiring(
         pile,
         collection,
@@ -402,14 +404,14 @@ fn store_status_at(
     at: status::IntervalValue,
 ) -> Result<SetStatus> {
     storage.with_store(|pile, signer, runtime| {
-        let observation = maintain_and_observe_relations(pile, signer, runtime)?;
+        let observation = maintain_and_observe_relations(storage.storage, pile, signer, runtime)?;
         let window = resolve_window_id(&observation.snapshot, &observation.relations, selector)?;
         drop(observation);
         let fragment = status::status_fragment(window, text, at)?;
         let event = fragment
             .root()
             .expect("Status event has one intrinsic root");
-        let commit = commit_status(pile, signer, fragment, runtime)?;
+        let commit = commit_status(storage.storage, pile, signer, fragment, runtime)?;
         Ok(SetStatus {
             event,
             commit,
@@ -517,7 +519,8 @@ mod tests {
 
         storage(&fixture)
             .with_store(|pile, signer, runtime| {
-                let observation = maintain_and_observe_status(pile, signer, runtime)?;
+                let observation =
+                    maintain_and_observe_status(storage(&fixture).storage, pile, signer, runtime)?;
                 assert_eq!(status::load_status_rows(&observation.status)?.len(), 1);
                 Ok(())
             })
@@ -532,7 +535,8 @@ mod tests {
         store_status_at(storage(&fixture), &fmt_id(window), "second", at(21.0)).unwrap();
         storage(&fixture)
             .with_store(|pile, signer, runtime| {
-                let observation = maintain_and_observe_status(pile, signer, runtime)?;
+                let observation =
+                    maintain_and_observe_status(storage(&fixture).storage, pile, signer, runtime)?;
                 assert_eq!(status::load_status_rows(&observation.status)?.len(), 2);
                 Ok(())
             })
@@ -542,7 +546,8 @@ mod tests {
 
         storage(&fixture)
             .with_store(|pile, signer, runtime| {
-                let observation = maintain_and_observe_status(pile, signer, runtime)?;
+                let observation =
+                    maintain_and_observe_status(storage(&fixture).storage, pile, signer, runtime)?;
                 assert_eq!(status::load_status_rows(&observation.status)?.len(), 2);
                 Ok(())
             })
@@ -570,7 +575,8 @@ mod tests {
 
         storage(&fixture)
             .with_store(|pile, signer, runtime| {
-                let observation = maintain_and_observe_status(pile, signer, runtime)?;
+                let observation =
+                    maintain_and_observe_status(storage(&fixture).storage, pile, signer, runtime)?;
                 let rows = status::load_status_rows(&observation.status)?;
                 assert!(rows.is_empty());
 
@@ -611,7 +617,12 @@ mod tests {
 
         storage(&fixture)
             .with_store(|pile, signer, runtime| {
-                let observation = maintain_and_observe_relations(pile, signer, runtime)?;
+                let observation = maintain_and_observe_relations(
+                    storage(&fixture).storage,
+                    pile,
+                    signer,
+                    runtime,
+                )?;
                 assert_eq!(
                     resolve_window_id(&observation.snapshot, &observation.relations, "example")?,
                     person
@@ -644,7 +655,12 @@ mod tests {
 
         storage(&fixture)
             .with_store(|pile, signer, runtime| {
-                let observation = maintain_and_observe_relations(pile, signer, runtime)?;
+                let observation = maintain_and_observe_relations(
+                    storage(&fixture).storage,
+                    pile,
+                    signer,
+                    runtime,
+                )?;
                 assert_eq!(
                     resolve_window_id(
                         &observation.snapshot,
@@ -671,7 +687,12 @@ mod tests {
         );
         storage(&fixture)
             .with_store(|pile, signer, runtime| {
-                let observation = maintain_and_observe_relations(pile, signer, runtime)?;
+                let observation = maintain_and_observe_relations(
+                    storage(&fixture).storage,
+                    pile,
+                    signer,
+                    runtime,
+                )?;
                 assert!(
                     resolve_window_id(&observation.snapshot, &observation.relations, "fork-a")
                         .is_err()

@@ -148,7 +148,7 @@ pub fn publish_events_with_storage(
         validate_fragment(fragment).context("validate self-contained Cognition event")?;
     }
     storage.with_store(|pile, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
+        let collection = storage.open_collection_write(
             pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
         )?;
         crate::collection_names::require_command_write_admission_acquiring(

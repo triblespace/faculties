@@ -6,18 +6,22 @@
 use super::*;
 
 pub(super) async fn import(
+    routing: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     legacy_persona: &str,
 ) -> Result<usize> {
     let legacy = OrientSource::open(
+        routing,
         pile,
         signer,
         crate::schemas::orient::DEFAULT_SCOPE_ID,
         "Legacy Orient",
     )
     .await?;
-    let relations = OrientSource::open(pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
+    let relations =
+        OrientSource::open(routing, pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
+    let destination = ReceiptSource::open(routing, pile, signer).await?;
     let snapshot = pile.snapshot().context("freeze legacy receipt import")?;
     let relations = relations.observe(&snapshot)?;
     let persona = resolve_resident_persona(relations.view(), &snapshot, legacy_persona)
@@ -51,7 +55,6 @@ pub(super) async fn import(
         return Ok(0);
     }
 
-    let destination = ReceiptSource::register(pile, signer)?;
     require_presentation_write(&pile.snapshot()?, destination.source, signer)?;
     pile.commit(destination.source, signer, fragment)
         .context("commit imported legacy receipt facts")?;
@@ -79,6 +82,7 @@ mod tests {
             let signer = SigningKey::from_bytes(&[79; 32]);
             let mut store = crate::storage::open_store_as(&path, signer.verifying_key()).unwrap();
             let legacy = OrientSource::open(
+                &test_storage(),
                 &mut store,
                 &signer,
                 crate::schemas::orient::DEFAULT_SCOPE_ID,
@@ -86,10 +90,15 @@ mod tests {
             )
             .await
             .unwrap();
-            let relations =
-                OrientSource::open(&mut store, &signer, RELATIONS_SCOPE_ID, "Relations")
-                    .await
-                    .unwrap();
+            let relations = OrientSource::open(
+                &test_storage(),
+                &mut store,
+                &signer,
+                RELATIONS_SCOPE_ID,
+                "Relations",
+            )
+            .await
+            .unwrap();
             let destination = ReceiptSource::register(&mut store, &signer).unwrap();
             Self {
                 store,
@@ -120,6 +129,71 @@ mod tests {
                 .view::<TribleSet>()
                 .unwrap()
         }
+    }
+
+    #[test]
+    fn explicit_workspace_import_keeps_legacy_and_current_receipt_roles_distinct() {
+        use crate::schemas::orient::{DEFAULT_SCOPE_ID, RECEIPTS_SCOPE_ID};
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+
+        test_block_on(async {
+            let mut f = Fixture::new().await;
+            let persona = fucid();
+            let event = fucid();
+            let selected = f
+                .store
+                .collection(
+                    "orient-receipts",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::Open,
+                        AdmissionPolicy::direct(f.signer.verifying_key()),
+                    ),
+                )
+                .unwrap();
+            f.publish_legacy(orient_model::presented_fragment(*persona, [*event]))
+                .await;
+            let routes = BTreeMap::from([
+                (DEFAULT_SCOPE_ID, f.legacy.source.handle()),
+                (RELATIONS_SCOPE_ID, f.relations.source.handle()),
+                (RECEIPTS_SCOPE_ID, selected.handle()),
+            ]);
+            let routing = test_storage().with_collections(routes.clone());
+            assert_eq!(
+                import(&routing, &mut f.store, &f.signer, &fmt_id(*persona))
+                    .await
+                    .unwrap(),
+                1
+            );
+            let facts = f
+                .store
+                .snapshot()
+                .unwrap()
+                .collection(selected)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap();
+            let facts = FactArchive::new(vec![
+                triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(&facts),
+            ]);
+            assert!(event_presented(&facts, *event));
+            assert!(
+                f.imported().is_empty(),
+                "the private CLI destination remains untouched"
+            );
+
+            let mut missing_legacy = routes;
+            missing_legacy.remove(&DEFAULT_SCOPE_ID);
+            let error = import(
+                &test_storage().with_collections(missing_legacy),
+                &mut f.store,
+                &f.signer,
+                &fmt_id(*persona),
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("unconfigured"));
+            assert!(f.store.health().started_at.is_none());
+        });
     }
 
     #[test]
@@ -183,7 +257,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                import(&mut f.store, &f.signer, "legacy-alias")
+                import(&test_storage(), &mut f.store, &f.signer, "legacy-alias")
                     .await
                     .unwrap(),
                 2
@@ -237,10 +311,20 @@ mod tests {
             })
             .await;
             let selector = fmt_id(*persona);
-            assert_eq!(import(&mut f.store, &f.signer, &selector).await.unwrap(), 1);
+            assert_eq!(
+                import(&test_storage(), &mut f.store, &f.signer, &selector)
+                    .await
+                    .unwrap(),
+                1
+            );
             let once = f.imported();
             let before = f.store.snapshot().unwrap();
-            assert_eq!(import(&mut f.store, &f.signer, &selector).await.unwrap(), 1);
+            assert_eq!(
+                import(&test_storage(), &mut f.store, &f.signer, &selector)
+                    .await
+                    .unwrap(),
+                1
+            );
             assert_eq!(f.imported(), once);
             assert!(f
                 .store
@@ -283,7 +367,7 @@ mod tests {
             .unwrap();
             let before = f.store.snapshot().unwrap();
             assert_eq!(
-                import(&mut f.store, &f.signer, &fmt_id(*persona))
+                import(&test_storage(), &mut f.store, &f.signer, &fmt_id(*persona))
                     .await
                     .unwrap(),
                 0

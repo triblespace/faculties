@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_exact_in;
 use crate::message::{self, IntervalValue};
@@ -713,14 +712,18 @@ fn with_storage<T>(
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     capability.storage.with_store(|pile, signer, runtime| {
-        let relations_source = open_configured_acquiring(
+        let relations_source = capability.storage.open_collection_read(
             pile,
             DEFAULT_RELATIONS_SCOPE_ID,
             signer.verifying_key(),
             runtime,
         )?;
-        let message_source =
-            open_configured_acquiring(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+        let message_source = capability.storage.open_collection_read(
+            pile,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
+        )?;
         let (reader, relation_facts, message_facts) = runtime.block_on(message_views(
             pile,
             signer,

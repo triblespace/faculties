@@ -30,7 +30,7 @@ impl Triage {
     }
     fn with_snapshot(&self, operation: impl FnOnce(&TriageSnapshot) -> Result<()>) -> Result<()> {
         self.storage.with_store(|store, signer, runtime| {
-            let snapshot = TriageSnapshot::load(store, signer, runtime)?;
+            let snapshot = TriageSnapshot::load(&self.storage, store, signer, runtime)?;
             operation(&snapshot)
         })
     }
@@ -86,7 +86,7 @@ use crate::schemas::triage::cog;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{open_secrets_collection_acquiring, AcquiringReader, FacultySnapshot, FacultyStore, FactArchive};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use crate::triage::{
     self as triage_model, build_loop_report, collect_exec_state, collect_model_chat_state,
     collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
@@ -134,6 +134,7 @@ struct TriageSnapshot {
 
 impl TriageSnapshot {
     fn load(
+        storage: &crate::storage::Storage,
         pile: &mut FacultyStore,
         signer: &ed25519_dalek::SigningKey,
         runtime: &std::sync::Arc<tokio::runtime::Runtime>,
@@ -150,9 +151,9 @@ impl TriageSnapshot {
             (RELATIONS_SCOPE_ID, "Relations"),
             (MESSAGE_SCOPE_ID, "Message"),
         ] {
-            let source =
-                crate::collection_names::open_configured_acquiring(pile, scope, signer.verifying_key(), runtime)
-                    .with_context(|| format!("register {label} collection"))?;
+            let source = storage
+                .open_collection_read(pile, scope, signer.verifying_key(), runtime)
+                .with_context(|| format!("register {label} collection"))?;
             let succinct_collection = pile
                 .attach::<SuccinctArchiveBlob>(source, ())
                 .with_context(|| format!("register succinct {label} collection"))?;
@@ -164,7 +165,8 @@ impl TriageSnapshot {
             rank9.push(rank9_collection);
         }
 
-        let secrets_collection = open_secrets_collection_acquiring(pile, signer.verifying_key(), runtime)?;
+        let secrets_collection =
+            storage.open_secrets_collection(pile, signer.verifying_key(), runtime, false)?;
         // Carry each root and attach its frontier; a commit left unattached
         // is read from its own bytes.
         let snapshot = runtime.block_on(async {
@@ -178,7 +180,8 @@ impl TriageSnapshot {
                 )
                 .with_context(|| format!("maintain {label} fact archive"))?;
             }
-            let snapshot = secrets_collection.ensure(pile, signer)
+            let snapshot = secrets_collection
+                .ensure(pile, signer)
                 .await
                 .context("observe configured Secrets collection")?;
             Ok::<_, anyhow::Error>(snapshot)
@@ -188,7 +191,8 @@ impl TriageSnapshot {
         // Reuse it so facts, attachments, and credentials inhabit literally
         // the same known-prefix observation.
         let store_snapshot = AcquiringReader::new(snapshot, std::sync::Arc::clone(runtime));
-        let secrets = secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
+        let secrets =
+            secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
         let mut collections = BTreeMap::new();
         for ((scope, label), collection) in registered.iter().zip(&rank9) {
             let archive = crate::storage::acquire_facts(&store_snapshot, *collection)
@@ -205,8 +209,8 @@ impl TriageSnapshot {
 
     #[cfg(test)]
     fn open(pile_path: &Path, key: Option<&Path>) -> Result<Self> {
-        crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned))
-            .with_store(Self::load)
+        let storage = crate::storage::Storage::new(pile_path.to_owned(), key.map(Path::to_owned));
+        storage.with_store(|pile, signer, runtime| Self::load(&storage, pile, signer, runtime))
     }
 
     fn view(&self, scope: Id, label: &str) -> Result<CollectionView> {

@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
 
-use anybytes::Bytes;
+pub use anybytes::Bytes;
 use anyhow::{anyhow, bail, Result};
 use base64::Engine as _;
 use serde::de::DeserializeOwned;
@@ -48,6 +48,11 @@ pub struct Tool {
 /// all arguments before performing an operation or emitting output.
 pub trait Faculty {
     fn tools(&self) -> &[Tool];
+    /// A launcher may add explicit request context without leaking a dynamic
+    /// schema into static storage. Ordinary faculty schemas stay unchanged.
+    fn input_schema<'a>(&'a self, tool: &'a Tool) -> &'a str {
+        tool.input_schema
+    }
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()>;
 }
 
@@ -157,7 +162,7 @@ impl<'a> Server<'a> {
                 }
                 tools.push(RegisteredTool {
                     name: tool.name,
-                    descriptor: tool_descriptor(tool)?,
+                    descriptor: tool_descriptor(tool, faculty.input_schema(tool))?,
                     faculty,
                 });
             }
@@ -617,8 +622,8 @@ fn fields<const N: usize>(
     .map_err(|_| RpcError::params("Expected an object without duplicate parameters"))
 }
 
-fn tool_descriptor(tool: &Tool) -> Result<String> {
-    let schema: serde_json::Value = serde_json::from_str(tool.input_schema)
+fn tool_descriptor(tool: &Tool, input_schema: &str) -> Result<String> {
+    let schema: serde_json::Value = serde_json::from_str(input_schema)
         .map_err(|error| anyhow!("invalid input schema for MCP tool {:?}: {error}", tool.name))?;
     if !schema.is_object()
         || schema.get("type").and_then(serde_json::Value::as_str) != Some("object")

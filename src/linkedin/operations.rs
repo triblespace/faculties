@@ -43,9 +43,9 @@ use crate::schemas::linkedin;
 use crate::schemas::relations::DEFAULT_SCOPE_ID;
 #[cfg(test)]
 use crate::storage;
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 #[cfg(test)]
 use crate::storage::FactView;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -53,7 +53,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::macros::entity;
@@ -310,8 +310,11 @@ impl RelationsStorage<'_> {
         ) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|store, signer, runtime| {
-            let collection = crate::collection_names::open_configured_acquiring(
-                store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let collection = self.storage.open_collection_read(
+                store,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let pile = store;
             let maintained_rank9 = runtime.block_on(async {
@@ -333,7 +336,8 @@ impl RelationsStorage<'_> {
                 Ok::<_, anyhow::Error>(maintained_rank9)
             })?;
             let reader = AcquiringReader::new(
-                pile.snapshot().context("freeze maintained Relations fact collection")?,
+                pile.snapshot()
+                    .context("freeze maintained Relations fact collection")?,
                 runtime.clone(),
             );
             let facts = crate::storage::acquire_facts(&reader, maintained_rank9)
@@ -393,7 +397,11 @@ impl RelationsStorage<'_> {
     #[cfg(test)]
     fn payload_count(&self) -> Result<usize> {
         self.storage.with_pile(|pile, signer| {
-            let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let collection = self.storage.open_collection_local(
+                pile,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )?;
             let store_snapshot = pile.snapshot()?;
             Ok(collection.admitted(&store_snapshot)?.len())
         })

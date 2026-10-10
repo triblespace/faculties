@@ -37,7 +37,7 @@ fn guidance() -> f32 {
     4.0
 }
 pub struct Imagine {
-    operations: Operations,
+    operations: Option<Operations>,
     memory: crate::memory::Memory,
 }
 impl Imagine {
@@ -45,6 +45,12 @@ impl Imagine {
         Self::with_storage(crate::storage::Storage::new(pile, key))
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        if storage.collection_routes().is_some() {
+            return Self {
+                operations: None,
+                memory: crate::memory::Memory::with_storage(storage),
+            };
+        }
         Self::with_storage_and_sources(storage, ModelSources::from_environment())
     }
     pub fn with_sources(pile: PathBuf, key: Option<PathBuf>, sources: ModelSources) -> Self {
@@ -55,7 +61,10 @@ impl Imagine {
         sources: ModelSources,
     ) -> Self {
         Self {
-            operations: Operations::new(sources),
+            operations: storage
+                .collection_routes()
+                .is_none()
+                .then(|| Operations::new(sources)),
             memory: crate::memory::Memory::with_storage(storage),
         }
     }
@@ -85,7 +94,10 @@ impl Faculty for Imagine {
             .map(remember_range)
             .transpose()
             .map_err(invalid_arguments)?;
-        let generated = self.operations.generate(&options)?;
+        let operations = self.operations.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("imagine generate: workspace model-asset routing is unconfigured")
+        })?;
+        let generated = operations.generate(&options)?;
         out.image(generated.png.clone(), "image/png")?;
         out.line(generated.diagnostic())?;
         if let Some(range) = range {

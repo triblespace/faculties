@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::clock;
-use crate::collection_names::open_configured_acquiring;
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
@@ -174,6 +173,7 @@ impl Wiki {
     /// the environment names. Explicit only: writing a fragment never embeds.
     #[cfg(feature = "wemm")]
     pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
+        self.storage.require_ambient_models("wiki index")?;
         self.index_with(&crate::wemm::Session::from_env(self.storage.path())?, out)
     }
     /// [`Self::index`] with a model already bound.
@@ -189,6 +189,7 @@ impl Wiki {
     /// names.
     #[cfg(feature = "wemm")]
     pub fn similar(&self, query: &str) -> Result<String> {
+        self.storage.require_ambient_models("wiki similar")?;
         self.similar_with(&crate::wemm::Session::from_env(self.storage.path())?, query)
     }
     /// [`Self::similar`] with a model already bound.
@@ -254,13 +255,19 @@ impl WikiStorage<'_> {
         prepare: impl FnMut(&WikiView, &[FactArchive]) -> Result<T>,
     ) -> Result<T> {
         self.with_pile(|pile, signer, runtime| {
-            let source = open_configured_acquiring(
-                pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            let source = self.storage.open_collection_read(
+                pile,
+                schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
             let mut auxiliaries = Vec::with_capacity(scopes.len());
             for &(scope, label) in scopes {
-                let collection = open_configured_acquiring(
-                    pile, scope, signer.verifying_key(), runtime,
+                let collection = self.storage.open_collection_read(
+                    pile,
+                    scope,
+                    signer.verifying_key(),
+                    runtime,
                 )?;
                 auxiliaries.push((collection, label));
             }
@@ -283,14 +290,19 @@ impl WikiStorage<'_> {
 
     fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
         self.with_pile(|pile, signer, runtime| {
-            let collection = open_configured_acquiring(
+            let collection = self.storage.open_collection_write(
                 pile,
                 schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
                 runtime,
             )?;
             crate::collection_names::require_command_write_admission_acquiring(
-                pile, collection, signer, "Wiki", "wiki show", runtime,
+                pile,
+                collection,
+                signer,
+                "Wiki",
+                "wiki show",
+                runtime,
             )?;
             let commit = pile
                 .commit(collection, signer, fragment)
@@ -1890,7 +1902,7 @@ fn cmd_index(
     out: &mut Out<'_>,
 ) -> Result<()> {
     storage.with_pile(|pile, signer, runtime| {
-        let source = open_configured_acquiring(
+        let source = storage.storage.open_collection_read(
             pile,
             schema::DEFAULT_SCOPE_ID,
             signer.verifying_key(),
@@ -1942,7 +1954,7 @@ fn cmd_similar(
     query: String,
 ) -> Result<String> {
     storage.with_pile(|pile, signer, runtime| {
-        let source = open_configured_acquiring(
+        let source = storage.storage.open_collection_read(
             pile,
             schema::DEFAULT_SCOPE_ID,
             signer.verifying_key(),
@@ -2406,7 +2418,9 @@ mod tests {
                         signer,
                         later,
                     )?;
-                    pile.insert(triblespace::core::collection::CollectionRecord::Commit(arriving))?;
+                    pile.insert(triblespace::core::collection::CollectionRecord::Commit(
+                        arriving,
+                    ))?;
                     let cold = inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(
                         arriving.data(),
                     );

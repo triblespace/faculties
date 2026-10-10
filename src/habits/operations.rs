@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::clock;
-use crate::collection_names::open_configured;
 use crate::habits::{self, DeclaredState, Habit, State};
 use crate::schemas::habit::{Condition, DEFAULT_SCOPE_ID};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
@@ -105,7 +104,7 @@ impl Habits {
                         .filter_map(|input| Id::from_hex(input.trim())),
                 );
             } else {
-                let source = open_configured(
+                let source = self.storage.open_collection_local(
                     session.pile,
                     crate::schemas::relations::DEFAULT_SCOPE_ID,
                     session.signer.verifying_key(),
@@ -127,7 +126,8 @@ impl Habits {
                         session.pile.maintain_attached(rank9, session.signer).await,
                     )
                 })?;
-                let snapshot = AcquiringReader::new(session.pile.snapshot()?, session.runtime.clone());
+                let snapshot =
+                    AcquiringReader::new(session.pile.snapshot()?, session.runtime.clone());
                 let facts = crate::storage::acquire_facts(&snapshot, rank9)?;
                 for input in personas {
                     let input = input.trim();
@@ -292,12 +292,17 @@ impl HabitSession<'_> {
             "habit list",
             self.runtime,
         )?;
-        let commit = self.pile.commit(self.collection, self.signer, fragment)
+        let commit = self
+            .pile
+            .commit(self.collection, self.signer, fragment)
             .context("commit Habit fragment")?;
-        self.runtime.block_on(crate::storage::ensure_downstream(
-            self.pile, self.collection, self.signer,
-        ))
-        .context("Habit facts were committed, but ensuring their derived views failed")?;
+        self.runtime
+            .block_on(crate::storage::ensure_downstream(
+                self.pile,
+                self.collection,
+                self.signer,
+            ))
+            .context("Habit facts were committed, but ensuring their derived views failed")?;
         Ok(commit)
     }
 }
@@ -330,12 +335,18 @@ fn with_habits<T>(
     operation: impl FnOnce(&mut HabitSession<'_>) -> Result<T>,
 ) -> Result<T> {
     storage.with_store(|store, signer, runtime| {
-        let collection = crate::collection_names::open_configured_acquiring(
-            store, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+        let collection = storage.open_collection_read(
+            store,
+            DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
         )?;
         if needs_relations {
-            crate::collection_names::open_configured_acquiring(
-                store, crate::schemas::relations::DEFAULT_SCOPE_ID, signer.verifying_key(), runtime,
+            storage.open_collection_read(
+                store,
+                crate::schemas::relations::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
             )?;
         }
         let pile = store;

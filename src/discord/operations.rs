@@ -506,15 +506,18 @@ impl DiscordSession<'_> {
         // views, and refuse to call the commit done if no reader can see it.
         // Merges are the maintenance daemon's.
         drop(
-            self.runtime.block_on(crate::storage::ensure_downstream(
-                self.pile,
-                self.collection,
-                &self.signer,
-            ))
-            .context("Discord fragment was committed, but ensuring its derived views failed")?,
+            self.runtime
+                .block_on(crate::storage::ensure_downstream(
+                    self.pile,
+                    self.collection,
+                    &self.signer,
+                ))
+                .context("Discord fragment was committed, but ensuring its derived views failed")?,
         );
         self.reader = AcquiringReader::new(
-            self.pile.snapshot().context("freeze Discord fact collection after commit")?,
+            self.pile
+                .snapshot()
+                .context("freeze Discord fact collection after commit")?,
             self.runtime.clone(),
         );
         self.facts = crate::storage::acquire_facts(&self.reader, self.rank9)
@@ -530,9 +533,17 @@ impl DiscordStorage<'_> {
         authority: VerifyingKey,
         runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     ) -> Result<Collection<SimpleArchive>> {
+        if self.storage.collection_routes().is_some() {
+            return self
+                .storage
+                .open_collection_read(pile, DEFAULT_SCOPE_ID, authority, runtime);
+        }
         let Some(handle) = self.collection else {
             return crate::collection_names::open_configured_acquiring(
-                pile, DEFAULT_SCOPE_ID, authority, runtime,
+                pile,
+                DEFAULT_SCOPE_ID,
+                authority,
+                runtime,
             );
         };
         let snapshot = pile
