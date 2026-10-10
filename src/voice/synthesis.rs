@@ -276,7 +276,7 @@ impl Synthesizer {
         }
     }
     #[cfg(feature = "voice")]
-    pub(super) fn start(&self, text: &str) -> Result<PreparedSpeech> {
+    pub(crate) fn start(&self, text: &str) -> Result<PreparedSpeech> {
         super::operations::validate_text(text)?;
         self.prime()?;
         let resident = self
@@ -394,7 +394,7 @@ impl Synthesizer {
     }
 }
 #[cfg(feature = "voice")]
-pub(super) struct PreparedSpeech {
+pub(crate) struct PreparedSpeech {
     pub stream: mary::speak::SpeakStream,
     pub sample_rate: u32,
     pub estimated_seconds: f32,
@@ -526,7 +526,7 @@ pub(super) fn estimate_audio_secs(gen_chars: usize, ref_secs: f32, ref_chars: us
 /// point); the floor keeps the queue from starting starved even when there
 /// is no deficit at all.
 #[cfg_attr(not(feature = "voice"), allow(dead_code))]
-pub(super) fn prebuffer_target_secs(total_est_secs: f32, production_rate: f32) -> f32 {
+pub(crate) fn prebuffer_target_secs(total_est_secs: f32, production_rate: f32) -> f32 {
     const MARGIN_SECS: f32 = 0.5;
     const FLOOR_SECS: f32 = 0.15;
     let deficit = total_est_secs * (1.0 - production_rate).max(0.0);

@@ -16,9 +16,11 @@
 //! `discord say` queues a line by writing one file into the state
 //! directory's `say/`; the speaker speaks the queue in order and moves each
 //! file to `said/` once it has played, or to `failed/` when it cannot be
-//! spoken. The queue is files so that any process, including a shell with
-//! nothing but the discord binary, can speak, and so that a line survives a
-//! restart of the resident process instead of vanishing with it. Speaking
+//! spoken. A line is spoken sentence by sentence, and each sentence plays
+//! while it is synthesized, from its first decoded hop of audio on. The
+//! queue is files so that any process, including a shell with nothing but
+//! the discord binary, can speak, and so that a line survives a restart of
+//! the resident process instead of vanishing with it. Speaking
 //! runs beside the gateway, never in its way: a voice server update is
 //! handled while a line plays. A line during which the voice connection was
 //! lost in any way that was observed (the bot leaving the channel, the voice
@@ -39,14 +41,13 @@
 use super::gateway;
 use super::intake::Inbox;
 use super::live::{Beside, StateDir};
-use crate::voice::synthesis::{ModelSources, Synthesizer};
+use crate::voice::synthesis::{prebuffer_target_secs, ModelSources, Synthesizer};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::input::RawAdapter;
 use songbird::tracks::PlayMode;
 use songbird::{ConnectionInfo, CoreEvent, Driver};
-use std::io::Cursor;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,6 +67,8 @@ const FAILED_IN_A_ROW: u32 = 3;
 /// A piece of a line shorter than this many characters is spoken together
 /// with the next one ([`sentences`]).
 const MIN_SENTENCE_CHARS: usize = 24;
+/// The synthesizer's PCM: 24 kHz mono.
+const SAMPLE_RATE: u32 = mary::speak::SpeakStream::SAMPLE_RATE;
 
 /// The state directory's queue: `say/` holds queued lines, `said/` spoken
 /// ones and `failed/` the ones that could not be spoken.
@@ -826,37 +829,38 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
         Ok(text) => text,
         Err(error) => return Spoken::Failed(anyhow!(error).context("read the queued line")),
     };
-    // A line is spoken sentence by sentence: the first plays while the next
-    // is synthesized, so the listener waits for one sentence, not the line.
-    // The line is still the unit of the queue: a sentence that fails or is
-    // interrupted settles the whole line, and an interrupted line is spoken
-    // again from its start.
+    // A line is spoken sentence by sentence, and a sentence while it is
+    // synthesized: it starts playing once its first hop of audio is decoded
+    // (or a little more, when synthesis is measured to run slower than
+    // playback), and the next sentence is synthesized once it is. The line is
+    // still the unit of the queue: a sentence that fails or is interrupted
+    // settles the whole line, and an interrupted line is spoken again from its
+    // start.
     let sentences = sentences(&text);
     let asked = std::time::Instant::now();
     let mut next = sentences.first().map(|first| speech.request(first.clone()));
     for (index, sentence) in sentences.iter().enumerate() {
         let started = std::time::Instant::now();
-        let synthesis = next
+        let mut synthesis = next
             .take()
             .expect("each sentence is requested before it is spoken");
-        let (pcm, sample_rate) = match synthesis.audio().await {
-            Ok(audio) => audio,
-            Err(Unspoken::Line(error)) => return Spoken::Failed(error),
-            Err(Unspoken::Synthesizer(error)) => return Spoken::Broken(error),
+        let buffered = match synthesis.prebuffer().await {
+            Ok(buffered) => buffered,
+            Err(unspoken) => return unspoken.into(),
         };
         next = sentences
             .get(index + 1)
             .map(|following| speech.request(following.clone()));
-        let seconds = pcm.len() as f64 / 4.0 / f64::from(sample_rate);
         eprintln!(
-            "[discord] synthesized {seconds:.1} s of speech in {:.1} s (sentence {} of {}, {:.1} s after the line was taken): {}",
+            "[discord] the first {:.1} s of speech came in {:.1} s (sentence {} of {}, {:.1} s after the line was taken): {}",
+            buffered.len() as f64 / f64::from(SAMPLE_RATE),
             started.elapsed().as_secs_f64(),
             index + 1,
             sentences.len(),
             asked.elapsed().as_secs_f64(),
             sentence
         );
-        match play(voice, pcm, sample_rate, seconds).await {
+        match play(voice, buffered, synthesis).await {
             Spoken::Heard => {}
             other => return other,
         }
@@ -864,19 +868,25 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
     Spoken::Heard
 }
 
-/// Play one synthesized sentence and wait for it to end.
-async fn play(voice: &mut Voice, pcm: Vec<u8>, sample_rate: u32, seconds: f64) -> Spoken {
+/// Play one sentence while the rest of it is synthesized, and wait for it to
+/// end: the track starts with what is `buffered`, the rest is appended as it
+/// is decoded, and the track ends once all of it has played. A synthesis
+/// that fails part way settles the line as the failure it is, however much
+/// of it was heard.
+async fn play(voice: &mut Voice, buffered: Vec<f32>, mut synthesis: Synthesis) -> Spoken {
     // The count first: a loss after it is seen, whether or not the
     // connection is still down by the time the speaker looks.
     let since = voice.interruptions.load(Ordering::SeqCst);
     if !*voice.connected.borrow_and_update() {
         return Spoken::Interrupted;
     }
+    let pcm = Growing::default();
+    pcm.push(&buffered);
     let track = voice
         .driver
         .lock()
         .await
-        .play_input(RawAdapter::new(Cursor::new(pcm), sample_rate, 1).into());
+        .play_input(RawAdapter::new(pcm.clone(), SAMPLE_RATE, 1).into());
     let started = std::time::Instant::now();
     // How the line ended is part of what happened: a track that errored or
     // was stopped is not a line that was heard. songbird drops a track the
@@ -893,19 +903,160 @@ async fn play(voice: &mut Voice, pcm: Vec<u8>, sample_rate: u32, seconds: f64) -
             return Spoken::Failed(anyhow!("watch the spoken line: {error}"));
         }
     }
-    let limit = Duration::from_secs_f64(seconds) + Duration::from_secs(30);
-    let (ended, interrupted) = wait_line(
+    // The time limit counts from the sentence's length, known once the last
+    // of it is synthesized; a synthesis that fails before then ends the wait
+    // itself.
+    let (length, known) = oneshot::channel::<f64>();
+    let limit = async move {
+        match known.await {
+            Ok(seconds) => {
+                let length = Duration::from_secs_f64(seconds) + Duration::from_secs(30);
+                tokio::time::sleep_until(Instant::from_std(started) + length).await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    let waiting = wait_line(
         outcome,
         limit,
         &mut voice.connected,
         &voice.interruptions,
         since,
-    )
-    .await;
+    );
+    let feeding = feed(&mut synthesis, &pcm, length);
+    tokio::pin!(waiting, feeding);
+    let mut fed = false;
+    let (ended, interrupted) = loop {
+        tokio::select! {
+            ended = &mut waiting => break ended,
+            result = &mut feeding, if !fed => match result {
+                Ok(()) => fed = true,
+                Err(unspoken) => {
+                    let _ = track.stop();
+                    return unspoken.into();
+                }
+            },
+        }
+    };
     let played = started.elapsed().as_secs_f64();
+    let underruns = pcm.underruns();
+    if underruns > 0 {
+        eprintln!(
+            "[discord] playback caught up with synthesis {underruns} times; each added {UNDERRUN_MS} ms of silence"
+        );
+    }
     settle(ended, interrupted, played, || {
         let _ = track.stop();
     })
+}
+
+/// Append the rest of a sentence to its playing track as it is synthesized,
+/// mark the track's audio complete, and send the sentence's length in
+/// seconds.
+async fn feed(
+    synthesis: &mut Synthesis,
+    pcm: &Growing,
+    length: oneshot::Sender<f64>,
+) -> Result<(), Unspoken> {
+    while let Some(chunk) = synthesis.next().await? {
+        pcm.push(&chunk);
+    }
+    let seconds = pcm.end();
+    eprintln!(
+        "[discord] synthesized {seconds:.1} s of speech in {:.1} s",
+        synthesis.requested.elapsed().as_secs_f64()
+    );
+    let _ = length.send(seconds);
+    Ok(())
+}
+
+/// Silence the mixer reads when it has played everything synthesized so far:
+/// one mixer tick.
+const UNDERRUN_MS: usize = 20;
+const UNDERRUN_BYTES: usize = SAMPLE_RATE as usize / 1000 * UNDERRUN_MS * 4;
+
+/// A sentence's PCM as songbird's mixer reads it while synthesis still
+/// appends to it: mono f32 little-endian bytes behind a [`RawAdapter`].
+/// Reading never blocks the mixer thread and never ends the track early:
+/// when the mixer has read everything synthesized so far it reads one tick
+/// of silence and comes back, and only once the sentence is complete and
+/// read does reading end, which ends the track.
+#[derive(Clone, Default)]
+struct Growing(Arc<std::sync::Mutex<Unread>>);
+
+#[derive(Default)]
+struct Unread {
+    bytes: std::collections::VecDeque<u8>,
+    /// Bytes of an underrun's silence still to read before `bytes`.
+    silence: usize,
+    complete: bool,
+    samples: usize,
+    underruns: usize,
+}
+
+impl Growing {
+    fn unread(&self) -> std::sync::MutexGuard<'_, Unread> {
+        // Bytes left by a panicking holder are still bytes to play.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn push(&self, samples: &[f32]) {
+        let mut unread = self.unread();
+        unread.samples += samples.len();
+        for sample in samples {
+            unread.bytes.extend(sample.clamp(-1.0, 1.0).to_le_bytes());
+        }
+    }
+
+    /// No more is coming: once what is here is read, the track ends. The
+    /// sentence's length in seconds.
+    fn end(&self) -> f64 {
+        let mut unread = self.unread();
+        unread.complete = true;
+        unread.samples as f64 / f64::from(SAMPLE_RATE)
+    }
+
+    fn underruns(&self) -> usize {
+        self.unread().underruns
+    }
+}
+
+impl std::io::Read for Growing {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut unread = self.unread();
+        if unread.silence == 0 && unread.bytes.is_empty() {
+            if unread.complete || buf.is_empty() {
+                return Ok(0);
+            }
+            unread.silence = UNDERRUN_BYTES;
+            unread.underruns += 1;
+        }
+        if unread.silence > 0 {
+            let count = buf.len().min(unread.silence);
+            buf[..count].fill(0);
+            unread.silence -= count;
+            return Ok(count);
+        }
+        unread.bytes.read(buf)
+    }
+}
+
+impl std::io::Seek for Growing {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+impl symphonia::core::io::MediaSource for Growing {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The sentences a line is spoken in: cut after a sentence's end mark that is
@@ -959,8 +1110,9 @@ fn sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-/// Wait for a playing line: its track's End or Error event, the time limit,
-/// or the voice connection lost. Also whether any loss was counted since
+/// Wait for a playing line: its track's End or Error event, the time limit
+/// (`limit` completes once the line has played well past its length), or
+/// the voice connection lost. Also whether any loss was counted since
 /// `since`, the count before the line began to play, whichever of those came
 /// first: a loss the task handled at the moment the track ended is ready
 /// beside that end, and a connection lost and made again before the speaker
@@ -971,18 +1123,25 @@ fn sentences(text: &str) -> Vec<String> {
 /// has the line spoken again.
 async fn wait_line(
     outcome: oneshot::Receiver<PlayMode>,
-    limit: Duration,
+    limit: impl std::future::Future<Output = ()>,
     connected: &mut watch::Receiver<bool>,
     interruptions: &AtomicU64,
     since: u64,
 ) -> (Ended, bool) {
     let lost = || interruptions.load(Ordering::SeqCst) != since;
+    // The track's own report first when the limit is due at the same time.
+    let reported = async {
+        tokio::select! {
+            biased;
+            ended = outcome => match ended {
+                Ok(state) => Ended::Reported(state),
+                Err(_) => Ended::Unreported,
+            },
+            () = limit => Ended::TimedOut,
+        }
+    };
     let ended = tokio::select! {
-        ended = tokio::time::timeout(limit, outcome) => match ended {
-            Ok(Ok(state)) => Ended::Reported(state),
-            Ok(Err(_)) => Ended::Unreported,
-            Err(_) => Ended::TimedOut,
-        },
+        ended = reported => ended,
         // songbird pauses a track whose connection is gone rather than
         // ending it.
         _ = connected.wait_for(|up| !*up || lost()) => Ended::Disconnected,
@@ -1056,15 +1215,28 @@ async fn announce(token: String, channel: NonZeroU64, text: String) -> Result<()
     Ok(())
 }
 
-/// The resident Qwen3-TTS synthesizer, on a thread of its own: the model is
-/// loaded once, before the first line, and never crosses a thread.
+/// The resident synthesizer, on a thread of its own: the model is loaded
+/// once, before the first line, and never crosses a thread. A sentence's PCM
+/// leaves the thread as it is decoded.
 struct SpeechWorker {
     requests: std::sync::mpsc::Sender<Request>,
+    /// The rate the last complete sentence was synthesized at, in seconds of
+    /// audio per second, once one was measured.
+    rate: Arc<std::sync::Mutex<Option<f64>>>,
 }
 
 enum Request {
     Ready(oneshot::Sender<Result<()>>),
-    Speak(String, oneshot::Sender<Result<(Vec<u8>, u32), Unspoken>>),
+    Speak(String, mpsc::UnboundedSender<Piece>),
+}
+
+/// What the speech thread sends of one sentence, in order: its estimated
+/// length in seconds, its PCM as it is decoded with when it was, and how its
+/// synthesis ended.
+enum Piece {
+    Estimate(f32),
+    Pcm(Vec<f32>, std::time::Instant),
+    End(Result<(), Unspoken>),
 }
 
 /// Why a line was not synthesized.
@@ -1077,14 +1249,69 @@ enum Unspoken {
     Synthesizer(anyhow::Error),
 }
 
+impl From<Unspoken> for Spoken {
+    fn from(unspoken: Unspoken) -> Self {
+        match unspoken {
+            Unspoken::Line(error) => Spoken::Failed(error),
+            Unspoken::Synthesizer(error) => Spoken::Broken(error),
+        }
+    }
+}
+
+/// What the speech thread speaks with: the resident synthesizer, or a
+/// stand-in in the tests.
+trait Voicing {
+    type Utterance: Utterance;
+    /// Load the model, before the first line.
+    fn prime(&self) -> Result<()>;
+    /// Start synthesizing `text`: its estimated length in seconds, and its
+    /// PCM to come.
+    fn start(&self, text: &str) -> Result<(f32, Self::Utterance)>;
+}
+
+/// One sentence's PCM as it is decoded.
+trait Utterance {
+    fn next_chunk(&mut self) -> Option<Vec<f32>>;
+    /// How synthesis ended, once every chunk is read.
+    fn finish(self) -> Result<()>;
+}
+
+impl Voicing for Synthesizer {
+    type Utterance = mary::speak::SpeakStream;
+
+    fn prime(&self) -> Result<()> {
+        Synthesizer::prime(self)
+    }
+
+    fn start(&self, text: &str) -> Result<(f32, Self::Utterance)> {
+        let prepared = Synthesizer::start(self, text)?;
+        Ok((prepared.estimated_seconds, prepared.stream))
+    }
+}
+
+impl Utterance for mary::speak::SpeakStream {
+    fn next_chunk(&mut self) -> Option<Vec<f32>> {
+        self.next()
+    }
+
+    fn finish(self) -> Result<()> {
+        mary::speak::SpeakStream::finish(self)
+    }
+}
+
 impl SpeechWorker {
     fn start(sources: ModelSources) -> Self {
+        Self::spawn(move || Synthesizer::new(sources))
+    }
+
+    /// The speech thread, speaking with what `make` builds on it.
+    fn spawn<V: Voicing>(make: impl FnOnce() -> V + Send + 'static) -> Self {
         let (requests, inbox) = std::sync::mpsc::channel::<Request>();
         std::thread::Builder::new()
             .name("discord-speech".to_owned())
             .spawn(move || {
-                let synthesizer = Synthesizer::new(sources);
-                let primed = synthesizer.prime();
+                let voicing = make();
+                let primed = voicing.prime();
                 let primed_error = primed.as_ref().err().map(|error| format!("{error:#}"));
                 for request in inbox {
                     match request {
@@ -1094,33 +1321,30 @@ impl SpeechWorker {
                                 Some(error) => Err(anyhow!("load the voice model: {error}")),
                             });
                         }
-                        Request::Speak(text, reply) => {
+                        Request::Speak(text, pieces) => {
                             let spoken =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    synthesizer.synthesize(&text)
+                                    synthesize(&voicing, &text, &pieces)
                                 }));
                             let Ok(spoken) = spoken else {
                                 // A panic can leave the resident synthesizer
                                 // half updated and its lock poisoned: it
                                 // speaks no more.
-                                let _ = reply.send(Err(Unspoken::Synthesizer(anyhow!(
-                                    "synthesis panicked"
+                                let _ = pieces.send(Piece::End(Err(Unspoken::Synthesizer(
+                                    anyhow!("synthesis panicked"),
                                 ))));
                                 return;
                             };
-                            let _ = reply.send(
-                                spoken
-                                    .and_then(|clip| {
-                                        wav_to_f32le(clip.wav.as_ref(), clip.sample_rate)
-                                    })
-                                    .map_err(Unspoken::Line),
-                            );
+                            let _ = pieces.send(Piece::End(spoken.map_err(Unspoken::Line)));
                         }
                     }
                 }
             })
             .expect("spawn the speech thread");
-        Self { requests }
+        Self {
+            requests,
+            rate: Arc::default(),
+        }
     }
 
     async fn ready(&self) -> Result<()> {
@@ -1133,38 +1357,144 @@ impl SpeechWorker {
             .map_err(|_| anyhow!("the speech thread stopped"))?
     }
 
-    /// Ask for `text` now, without waiting: the thread synthesizes it while
-    /// the caller plays what came before.
+    /// Ask for `text` now, without waiting: the thread synthesizes it after
+    /// what was asked for before, while the caller plays.
     fn request(&self, text: String) -> Synthesis {
-        let (reply, answer) = oneshot::channel();
-        let sent = self.requests.send(Request::Speak(text, reply)).is_ok();
-        Synthesis(sent.then_some(answer))
+        let (pieces, receiver) = mpsc::unbounded_channel();
+        let sent = self.requests.send(Request::Speak(text, pieces)).is_ok();
+        Synthesis {
+            pieces: sent.then_some(receiver),
+            requested: std::time::Instant::now(),
+            estimate: 0.0,
+            production: Production::default(),
+            rate: self.rate.clone(),
+            ended: false,
+        }
     }
 }
 
-/// One requested synthesis, to be awaited once.
-struct Synthesis(Option<oneshot::Receiver<Result<(Vec<u8>, u32), Unspoken>>>);
+/// Synthesize `text` into `pieces` as it is decoded.
+fn synthesize<V: Voicing>(
+    voicing: &V,
+    text: &str,
+    pieces: &mpsc::UnboundedSender<Piece>,
+) -> Result<()> {
+    let (estimate, mut utterance) = voicing.start(text)?;
+    let _ = pieces.send(Piece::Estimate(estimate));
+    let mut samples = 0;
+    while let Some(chunk) = utterance.next_chunk() {
+        if chunk.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(
+            chunk.iter().all(|sample| sample.is_finite()),
+            "synthesis returned a non-finite sample"
+        );
+        samples += chunk.len();
+        if pieces
+            .send(Piece::Pcm(chunk, std::time::Instant::now()))
+            .is_err()
+        {
+            // Nobody listens any more, the line has ended: dropping the
+            // utterance stops its synthesis at its next hop.
+            return Ok(());
+        }
+    }
+    utterance.finish()?;
+    anyhow::ensure!(samples > 0, "synthesis returned no audio samples");
+    Ok(())
+}
+
+/// One requested sentence, read as its PCM arrives.
+struct Synthesis {
+    pieces: Option<mpsc::UnboundedReceiver<Piece>>,
+    requested: std::time::Instant,
+    /// Its estimated length in seconds, once the speech thread has begun it.
+    estimate: f32,
+    production: Production,
+    /// The speaker's last measured synthesis rate, shared by its sentences.
+    rate: Arc<std::sync::Mutex<Option<f64>>>,
+    ended: bool,
+}
 
 impl Synthesis {
-    async fn audio(self) -> Result<(Vec<u8>, u32), Unspoken> {
+    /// The sentence's next PCM as it is decoded; `None` once all of it came.
+    async fn next(&mut self) -> Result<Option<Vec<f32>>, Unspoken> {
         let stopped = || Unspoken::Synthesizer(anyhow!("the speech thread stopped"));
-        self.0.ok_or_else(stopped)?.await.map_err(|_| stopped())?
+        if self.ended {
+            return Ok(None);
+        }
+        let pieces = self.pieces.as_mut().ok_or_else(stopped)?;
+        loop {
+            match pieces.recv().await.ok_or_else(stopped)? {
+                Piece::Estimate(seconds) => self.estimate = seconds,
+                Piece::Pcm(pcm, at) => {
+                    self.production.observe(pcm.len(), at);
+                    return Ok(Some(pcm));
+                }
+                Piece::End(result) => {
+                    result?;
+                    self.ended = true;
+                    if let Some(rate) = self.production.rate() {
+                        *self
+                            .rate
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(rate);
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    /// Wait for enough of the sentence to start playing it: its first hop,
+    /// and more while the synthesis rate says playback would catch up with
+    /// synthesis before the end ([`prebuffer_target_secs`]). The rate is this
+    /// sentence's own once two hops have come, before that the last
+    /// sentence's; with none measured yet, the first hop starts it.
+    async fn prebuffer(&mut self) -> Result<Vec<f32>, Unspoken> {
+        let mut buffered = Vec::new();
+        while let Some(pcm) = self.next().await? {
+            buffered.extend_from_slice(&pcm);
+            let known = *self
+                .rate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(rate) = self.production.rate().or(known) else {
+                break;
+            };
+            let seconds = buffered.len() as f32 / SAMPLE_RATE as f32;
+            if seconds >= prebuffer_target_secs(self.estimate, rate as f32) {
+                break;
+            }
+        }
+        Ok(buffered)
     }
 }
 
-/// The synthesizer's 16-bit mono WAV as the interleaved f32 bytes songbird's
-/// raw adapter reads; songbird resamples to Discord's 48 kHz itself.
-fn wav_to_f32le(wav: &[u8], sample_rate: u32) -> Result<(Vec<u8>, u32)> {
-    let samples = wav
-        .get(44..)
-        .filter(|_| wav.get(..4) == Some(b"RIFF"))
-        .context("synthesis returned no 16-bit WAV body")?;
-    let mut pcm = Vec::with_capacity(samples.len() * 2);
-    for sample in samples.chunks_exact(2) {
-        let value = f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0;
-        pcm.extend_from_slice(&value.to_le_bytes());
+/// How fast a sentence's PCM was produced: seconds of audio per second, from
+/// its first chunk to its latest.
+#[derive(Default)]
+struct Production {
+    first: Option<std::time::Instant>,
+    latest: Option<std::time::Instant>,
+    samples_after_first: usize,
+}
+
+impl Production {
+    fn observe(&mut self, samples: usize, at: std::time::Instant) {
+        if self.first.is_none() {
+            self.first = Some(at);
+        } else {
+            self.samples_after_first += samples;
+            self.latest = Some(at);
+        }
     }
-    Ok((pcm, sample_rate))
+
+    fn rate(&self) -> Option<f64> {
+        let wall = self.latest?.duration_since(self.first?).as_secs_f64();
+        (wall > 0.0).then(|| self.samples_after_first as f64 / f64::from(SAMPLE_RATE) / wall)
+    }
 }
 
 fn snowflake(value: &Value) -> Option<u64> {
@@ -1197,6 +1527,7 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+    use std::io::Read;
 
     fn join() -> VoiceJoin {
         VoiceJoin::new(NonZeroU64::new(7).unwrap(), NonZeroU64::new(8).unwrap())
@@ -1535,8 +1866,14 @@ mod tests {
                 let (ends, outcome) = oneshot::channel();
                 ends.send(PlayMode::End).unwrap();
                 lose(&mut link, Instant::now());
-                let (ended, interrupted) =
-                    wait_line(outcome, limit, &mut connected, &interruptions, since).await;
+                let (ended, interrupted) = wait_line(
+                    outcome,
+                    tokio::time::sleep(limit),
+                    &mut connected,
+                    &interruptions,
+                    since,
+                )
+                .await;
                 assert!(interrupted, "{what}, round {round}: the loss is counted");
                 assert!(
                     !heard(settle(ended, interrupted, 1.0, || {})),
@@ -1563,7 +1900,13 @@ mod tests {
             };
             let (ended, interrupted) = tokio::time::timeout(
                 Duration::from_secs(5),
-                wait_line(outcome, limit, &mut connected, &interruptions, since),
+                wait_line(
+                    outcome,
+                    tokio::time::sleep(limit),
+                    &mut connected,
+                    &interruptions,
+                    since,
+                ),
             )
             .await
             .expect("a loss ends the wait, however briefly the connection was down");
@@ -1575,8 +1918,14 @@ mod tests {
         let (_link, mut connected, interruptions, since) = playing();
         let (ends, outcome) = oneshot::channel();
         ends.send(PlayMode::End).unwrap();
-        let (ended, interrupted) =
-            wait_line(outcome, limit, &mut connected, &interruptions, since).await;
+        let (ended, interrupted) = wait_line(
+            outcome,
+            tokio::time::sleep(limit),
+            &mut connected,
+            &interruptions,
+            since,
+        )
+        .await;
         assert!(heard(settle(ended, interrupted, 1.0, || {})));
     }
 
@@ -1672,5 +2021,296 @@ mod tests {
             assert!(join.take(at, false));
         }
         assert_eq!(waits, [5, 10, 20, 40, 60, 60]);
+    }
+
+    /// A sentence's PCM read as the mixer reads it: what synthesis has
+    /// appended, a tick of silence whenever it has not caught up (never the
+    /// end), and the end only once the sentence is complete and read.
+    #[test]
+    fn a_growing_sentence_reads_silence_until_it_is_complete() {
+        let mut pcm = Growing::default();
+        let mut buf = [7u8; 4096];
+        pcm.push(&[0.5, -2.0]);
+        assert_eq!(pcm.read(&mut buf).unwrap(), 8);
+        assert_eq!(
+            buf[..8],
+            [0.5f32.to_le_bytes(), (-1.0f32).to_le_bytes()].concat()
+        );
+        // Synthesis is behind: one tick of silence, as often as asked.
+        for underrun in 1..=2 {
+            assert_eq!(pcm.read(&mut buf).unwrap(), UNDERRUN_BYTES);
+            assert!(buf[..UNDERRUN_BYTES].iter().all(|byte| *byte == 0));
+            assert_eq!(pcm.underruns(), underrun);
+        }
+        // A tick of silence begun is finished before what came meanwhile,
+        // so samples stay aligned whatever the reads' sizes.
+        assert_eq!(pcm.read(&mut buf[..100]).unwrap(), 100);
+        pcm.push(&[0.25]);
+        assert_eq!(pcm.read(&mut buf).unwrap(), UNDERRUN_BYTES - 100);
+        assert_eq!(pcm.end(), 3.0 / f64::from(SAMPLE_RATE));
+        assert_eq!(pcm.read(&mut buf).unwrap(), 4);
+        assert_eq!(buf[..4], 0.25f32.to_le_bytes());
+        assert_eq!(pcm.read(&mut buf).unwrap(), 0, "complete and read: the end");
+        assert_eq!(pcm.underruns(), 3);
+    }
+
+    /// The mixer's own read path, songbird's probe and raw reader over
+    /// symphonia's buffered stream, then `next_packet` as its mixer calls it:
+    /// a sentence that synthesis has not caught up with plays silence instead
+    /// of ending its track, and every sample arrives in order.
+    #[test]
+    fn a_growing_sentence_reads_through_songbird_without_ending_early() {
+        use songbird::input::codecs::{get_codec_registry, get_probe};
+        use songbird::input::{AudioStream, LiveInput};
+        use symphonia::core::audio::{AudioBufferRef, Signal};
+
+        let pcm = Growing::default();
+        let hop = |offset: f32| -> Vec<f32> {
+            (0..4800)
+                .map(|i| offset + (i % 97) as f32 / 400.0)
+                .collect()
+        };
+        pcm.push(&hop(0.0));
+        let raw = LiveInput::Raw(AudioStream {
+            input: Box::new(RawAdapter::new(pcm.clone(), SAMPLE_RATE, 1)),
+        });
+        let Ok(LiveInput::Parsed(mut parsed)) = raw.promote(get_codec_registry(), get_probe())
+        else {
+            panic!("songbird parses the raw f32 stream");
+        };
+        let packet = |parsed: &mut songbird::input::Parsed| -> Option<Vec<f32>> {
+            let packet = parsed.format.next_packet().ok()?;
+            match parsed.decoder.decode(&packet).unwrap() {
+                AudioBufferRef::F32(audio) => Some(audio.chan(0).to_vec()),
+                _ => panic!("raw f32 decodes to f32"),
+            }
+        };
+        let mut heard = Vec::new();
+        while heard.len() < 4800 {
+            heard.extend(packet(&mut parsed).expect("the first hop plays"));
+        }
+        for _ in 0..50 {
+            let silence = packet(&mut parsed).expect("an underrun does not end the track");
+            assert!(silence.iter().all(|sample| *sample == 0.0));
+        }
+        let underruns = pcm.underruns();
+        pcm.push(&hop(0.5));
+        pcm.end();
+        while let Some(samples) = packet(&mut parsed) {
+            heard.extend(samples);
+        }
+        assert_eq!(heard[..4800], hop(0.0));
+        assert_eq!(
+            heard[4800..],
+            hop(0.5),
+            "after {underruns} ticks of silence"
+        );
+        assert_eq!(underruns, 50);
+    }
+
+    /// A speech thread stand-in: fixed chunks per sentence, a pause before
+    /// each, and what became of each utterance in `log`.
+    struct FakeVoice {
+        chunks: Vec<Vec<f32>>,
+        pause: Duration,
+        fail: Option<&'static str>,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct FakeUtterance {
+        text: String,
+        chunks: std::collections::VecDeque<Vec<f32>>,
+        pause: Duration,
+        fail: Option<&'static str>,
+        read: usize,
+        finished: bool,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeVoice {
+        fn new(chunks: Vec<Vec<f32>>, log: &Arc<std::sync::Mutex<Vec<String>>>) -> Self {
+            Self {
+                chunks,
+                pause: Duration::from_millis(2),
+                fail: None,
+                log: log.clone(),
+            }
+        }
+    }
+
+    impl Voicing for FakeVoice {
+        type Utterance = FakeUtterance;
+
+        fn prime(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn start(&self, text: &str) -> Result<(f32, FakeUtterance)> {
+            assert_ne!(text, "panic", "a synthesis that panics");
+            Ok((
+                2.0,
+                FakeUtterance {
+                    text: text.to_owned(),
+                    chunks: self.chunks.clone().into(),
+                    pause: self.pause,
+                    fail: self.fail,
+                    read: 0,
+                    finished: false,
+                    log: self.log.clone(),
+                },
+            ))
+        }
+    }
+
+    impl Utterance for FakeUtterance {
+        fn next_chunk(&mut self) -> Option<Vec<f32>> {
+            std::thread::sleep(self.pause);
+            let chunk = self.chunks.pop_front()?;
+            self.read += 1;
+            Some(chunk)
+        }
+
+        fn finish(mut self) -> Result<()> {
+            self.finished = true;
+            match self.fail {
+                Some(error) => Err(anyhow!(error)),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Drop for FakeUtterance {
+        fn drop(&mut self) {
+            let ended = if self.finished { "finished" } else { "dropped" };
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{}: {} chunks, {ended}", self.text, self.read));
+        }
+    }
+
+    async fn drain(synthesis: &mut Synthesis) -> Result<Vec<Vec<f32>>, Unspoken> {
+        let mut chunks = Vec::new();
+        while let Some(chunk) = synthesis.next().await? {
+            chunks.push(chunk);
+        }
+        Ok(chunks)
+    }
+
+    #[tokio::test]
+    async fn a_sentence_s_pcm_leaves_the_speech_thread_chunk_by_chunk() {
+        let log = Arc::default();
+        let chunks = vec![vec![0.25; 4], vec![0.5; 4], vec![-0.5; 2]];
+        let voice = FakeVoice::new(chunks.clone(), &log);
+        let speech = SpeechWorker::spawn(move || voice);
+        speech.ready().await.unwrap();
+        // Both asked at once, as a line asks for its next sentence while
+        // one plays: each comes whole and in order.
+        let mut one = speech.request("one".into());
+        let mut two = speech.request("two".into());
+        assert_eq!(
+            one.prebuffer().await.unwrap(),
+            chunks[0],
+            "nothing measured: one hop"
+        );
+        assert_eq!(one.estimate, 2.0);
+        assert_eq!(drain(&mut one).await.unwrap(), chunks[1..]);
+        assert!(
+            one.next().await.unwrap().is_none(),
+            "an ended sentence stays ended"
+        );
+        assert!(
+            speech.rate.lock().unwrap().is_some(),
+            "its rate is measured"
+        );
+        assert_eq!(drain(&mut two).await.unwrap(), chunks);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["one: 3 chunks, finished", "two: 3 chunks, finished"]
+        );
+    }
+
+    /// Playing starts after one hop unless the rate measured so far says the
+    /// buffer would run dry; then it waits for more.
+    #[tokio::test]
+    async fn a_slow_synthesis_buffers_another_hop_before_playing() {
+        let log = Arc::default();
+        // A hop of 8 frames, two thirds of a second; sentences of two seconds.
+        let hop = vec![0.0; SAMPLE_RATE as usize * 2 / 3];
+        let voice = FakeVoice::new(vec![hop.clone(); 4], &log);
+        let speech = SpeechWorker::spawn(move || voice);
+        for (known, hops) in [(None, 1), (Some(0.5), 2), (Some(2.0), 1)] {
+            *speech.rate.lock().unwrap() = known;
+            let buffered = speech.request("sentence".into()).prebuffer().await.unwrap();
+            assert_eq!(buffered.len(), hops * hop.len(), "known rate {known:?}");
+        }
+    }
+
+    /// A sentence the line stops listening to stops being synthesized, and
+    /// the thread goes on with the next.
+    #[tokio::test]
+    async fn a_dropped_sentence_stops_its_synthesis() {
+        let log = Arc::default();
+        let voice = FakeVoice::new(vec![vec![0.1; 4]; 50], &log);
+        let speech = SpeechWorker::spawn(move || voice);
+        let mut one = speech.request("one".into());
+        assert!(one.next().await.unwrap().is_some());
+        drop(one);
+        let mut two = speech.request("two".into());
+        assert_eq!(drain(&mut two).await.unwrap().len(), 50);
+        let log = log.lock().unwrap();
+        assert!(
+            log[0].starts_with("one: ") && log[0].ends_with(", dropped"),
+            "{log:?}"
+        );
+        assert_eq!(log[1], "two: 50 chunks, finished");
+    }
+
+    /// A synthesis that fails part way fails its line, however much of it
+    /// has been read; one that panics breaks the synthesizer for good.
+    #[tokio::test]
+    async fn a_synthesis_failing_part_way_settles_as_before() {
+        let log = Arc::default();
+        let mut voice = FakeVoice::new(vec![vec![0.1; 4]], &log);
+        voice.fail = Some("ended at FrameLimit");
+        let speech = SpeechWorker::spawn(move || voice);
+        let mut capped = speech.request("capped".into());
+        assert!(capped.next().await.unwrap().is_some());
+        let failed = capped.next().await.unwrap_err();
+        assert!(
+            matches!(&failed, Unspoken::Line(error) if error.to_string().contains("FrameLimit"))
+        );
+        assert!(matches!(Spoken::from(failed), Spoken::Failed(_)));
+
+        let speech = SpeechWorker::spawn({
+            let log = log.clone();
+            move || FakeVoice::new(vec![vec![f32::NAN]], &log)
+        });
+        let unheard = drain(&mut speech.request("nan".into())).await.unwrap_err();
+        assert!(
+            matches!(&unheard, Unspoken::Line(error) if error.to_string().contains("non-finite"))
+        );
+
+        let speech = SpeechWorker::spawn({
+            let log = log.clone();
+            move || FakeVoice::new(Vec::new(), &log)
+        });
+        let silent = drain(&mut speech.request("empty".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(&silent, Unspoken::Line(error) if error.to_string().contains("no audio")));
+        assert!(matches!(
+            drain(&mut speech.request("panic".into()))
+                .await
+                .unwrap_err(),
+            Unspoken::Synthesizer(_)
+        ));
+        let gone = drain(&mut speech.request("after".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&gone, Unspoken::Synthesizer(error) if error.to_string().contains("stopped"))
+        );
+        assert!(matches!(Spoken::from(gone), Spoken::Broken(_)));
     }
 }
