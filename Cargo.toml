@@ -207,6 +207,7 @@ comemo = "0.5.1"            # wiki
 ctrlc = "3.5"               # body (graceful close for kept touch loops)
 dirs = "5"                  # wiki
 hex = "0.4"                 # gauge
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }  # code (local Git reads, no subprocess or network transports)
 zeroize = "1.9"             # secrets CLI plaintext lifetime
 humantime = "2.3.0"         # orient, patience
 pollster = "0.4"            # explicit blocking boundary for local CLI/UI collection maintenance

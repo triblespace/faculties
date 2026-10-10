@@ -1,0 +1,20 @@
+[package]
+name = "code-git-native-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Exercise the exact production module without linking the full Faculty cohort.
+[workspace]
+
+[lib]
+path = "../../src/code/git.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4.39", default-features = false, features = ["std"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+memchr = "2"
+
+[dev-dependencies]
+tempfile = "3"

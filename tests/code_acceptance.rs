@@ -5,8 +5,10 @@
 //! acceptance questions themselves, answered over a fixture repository.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
+
+#[path = "support/code_git.rs"]
+mod code_git;
 
 use faculties::code::operations::{Code, Filter, IngestOptions, Revision};
 use faculties::out::{Out, Part};
@@ -17,20 +19,6 @@ struct Fixture {
     repo: PathBuf,
     pile: PathBuf,
     key: PathBuf,
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "fixture")
-        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-        .env("GIT_COMMITTER_NAME", "fixture")
-        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .status()
-        .expect("run git");
-    assert!(status.success(), "git {args:?} failed");
 }
 
 /// Two files with one byte-identical function between them, one documented
@@ -76,9 +64,7 @@ impl Fixture {
         fs::write(repo.join("src/lattice.rs"), LATTICE).unwrap();
         fs::write(repo.join("src/broken.rs"), BROKEN).unwrap();
         fs::write(repo.join("README.md"), README).unwrap();
-        git(&repo, &["init", "--quiet"]);
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "--quiet", "-m", "fixture"]);
+        code_git::initialize(&repo);
 
         let pile = directory.path().join("code.pile");
         let key = directory.path().join("code.key");
@@ -338,18 +324,14 @@ fn a_dirty_tree_is_a_different_revision_from_its_head() {
 #[test]
 fn a_named_revision_can_be_ingested_from_git_objects() {
     let fixture = Fixture::new();
-    let head = String::from_utf8(
-        Command::new("git")
-            .arg("-C")
-            .arg(&fixture.repo)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_owned();
+    let head = git2::Repository::open(&fixture.repo)
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
 
     fixture
         .code()

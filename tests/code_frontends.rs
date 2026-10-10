@@ -6,8 +6,10 @@
 //! collection override, key, pile and endpoint is removed before a fixture runs.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
+
+#[path = "support/code_git.rs"]
+mod code_git;
 
 use anybytes::Bytes;
 use clap::Parser;
@@ -33,20 +35,6 @@ struct Fixture {
     key: PathBuf,
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "fixture")
-        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
-        .env("GIT_COMMITTER_NAME", "fixture")
-        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
-        .status()
-        .expect("run git");
-    assert!(status.success(), "git {args:?} failed");
-}
-
 impl Fixture {
     fn new() -> Self {
         // Ambient deployment state must never reach a fixture.
@@ -65,9 +53,7 @@ impl Fixture {
         let repo = directory.path().join("fixture-repo");
         fs::create_dir_all(repo.join("src")).unwrap();
         fs::write(repo.join("src/lattice.rs"), SOURCE).unwrap();
-        git(&repo, &["init", "--quiet"]);
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "--quiet", "-m", "fixture"]);
+        code_git::initialize(&repo);
 
         let pile = directory.path().join("code.pile");
         let key = directory.path().join("code.key");
@@ -199,4 +185,48 @@ fn an_mcp_tool_refuses_an_argument_it_does_not_model() {
 fn the_adapter_declares_one_tool_per_verb() {
     let fixture = Fixture::new();
     assert_eq!(fixture.adapter().tools().len(), 9);
+}
+
+#[test]
+fn named_revision_ingest_uses_native_git_on_both_frontends() {
+    let fixture = Fixture::new();
+    let dir = fixture.repo.to_str().unwrap();
+    let cli_text = render_to_string(|out| {
+        cli::execute(
+            fixture.cli(&["ingest", dir, "--commit", "HEAD", "--dry-run"]),
+            out,
+        )
+    });
+    let arguments = serde_json::to_vec(&serde_json::json!({
+        "dirs": [dir], "commit": "HEAD", "dry_run": true,
+    }))
+    .unwrap();
+    let mcp_text = render_to_string(|out| {
+        fixture
+            .adapter()
+            .call("code_ingest", Bytes::from_source(arguments), out)
+    });
+    assert_eq!(cli_text, mcp_text);
+    assert!(!cli_text.is_empty());
+}
+
+#[test]
+fn history_uses_native_git_on_both_frontends() {
+    let fixture = Fixture::new();
+    let dir = fixture.repo.to_str().unwrap();
+    let cli_text = render_to_string(|out| {
+        cli::execute(fixture.cli(&["blame", "force_step_kernel", dir]), out)
+    });
+    let arguments = serde_json::to_vec(&serde_json::json!({
+        "identifier": "force_step_kernel", "dirs": [dir],
+    }))
+    .unwrap();
+    let mcp_text = render_to_string(|out| {
+        fixture
+            .adapter()
+            .call("code_blame", Bytes::from_source(arguments), out)
+    });
+    assert_eq!(cli_text, mcp_text);
+    assert!(cli_text.contains("src/lattice.rs"), "{cli_text}");
+    assert!(cli_text.contains("fixture"), "{cli_text}");
 }
