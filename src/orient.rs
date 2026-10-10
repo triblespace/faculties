@@ -18,7 +18,7 @@ use crate::schemas::orient::{presentation, KIND_PRESENTED};
 pub mod cli;
 pub mod mcp;
 mod operations;
-pub use operations::{BaselineReceipt, Orient, ShowOptions, WaitOptions, WakeOptions};
+pub use operations::{BaselineReceipt, NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions};
 
 /// Receipt facts for a key-private source collection. Event identity is stable
 /// across retries; observation times annotate that identity, never qualify the

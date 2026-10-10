@@ -21,12 +21,20 @@
 //! is kept in the state directory, transcript and audio, when that write
 //! fails or intake is gone.
 //!
+//! A sentence does not wait for the silence: once the words heard so far go
+//! on past its end, it goes to intake at once, text only
+//! ([`super::intake::Work::Sentence`]), while the utterance it belongs to
+//! goes on and is stored whole when it closes, that sentence included. A
+//! listener therefore has everything but the last sentence when the speaker
+//! stops. The transcriber says when it wrote a word, not where in the audio
+//! the word was, so the utterance is never cut at a sentence.
+//!
 //! Logs carry who, where, when and how much, never what was said.
 //!
 //! Built with the `discord-hearing` feature.
 
 use super::intake::{self, Inbox, Work};
-use crate::discord::Utterance;
+use crate::discord::{Sentence, Utterance};
 use crate::hear::segmenter::{Segment, Segmenter, VadConfig};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -485,6 +493,9 @@ pub trait Transcription {
 struct Active<'a> {
     start_ms: u64,
     fed: usize,
+    /// How much of the session's words has gone to intake as finished
+    /// sentences, in bytes.
+    published: usize,
     compute_seconds: f64,
     session: Result<Box<dyn Transcription + 'a>>,
 }
@@ -496,6 +507,7 @@ impl<'a> Active<'a> {
         Self {
             start_ms,
             fed: 0,
+            published: 0,
             compute_seconds: started.elapsed().as_secs_f64(),
             session,
         }
@@ -603,17 +615,97 @@ fn advance<'a>(
     }
 }
 
-/// Whether `words` end like a finished sentence: with `.`, `?` or `!`
-/// (or their full-width forms), perhaps inside closing quotes or brackets.
-/// A trailing ellipsis is a thought trailing off, not an end.
+/// What ends a sentence: `.`, `?` or `!`, or their full-width forms.
+const SENTENCE_MARKS: [char; 6] = ['.', '?', '!', '\u{3002}', '\u{ff1f}', '\u{ff01}'];
+/// Closing quotes and brackets a sentence's mark may sit inside.
+const CLOSERS: [char; 6] = ['"', '\'', '\u{201d}', '\u{2019}', ')', ']'];
+
+/// Whether `words` end like a finished sentence: with one of the
+/// [`SENTENCE_MARKS`], perhaps inside [`CLOSERS`]. A trailing ellipsis is a
+/// thought trailing off, not an end.
 fn ends_sentence(words: &str) -> bool {
-    let words = words
-        .trim_end()
-        .trim_end_matches(['"', '\'', '\u{201d}', '\u{2019}', ')', ']']);
-    !words.ends_with("..") && words.ends_with(['.', '?', '!', '\u{3002}', '\u{ff1f}', '\u{ff01}'])
+    let words = words.trim_end().trim_end_matches(CLOSERS);
+    !words.ends_with("..") && words.ends_with(SENTENCE_MARKS)
 }
 
-/// One moment through the listener and the transcriber, then the early end:
+/// Where each sentence in `words` that more words follow ends, in bytes:
+/// after its mark and any [`CLOSERS`], where whitespace and then a word
+/// come next (a full-width mark needs no whitespace). The words have gone on
+/// past such a sentence, so it is finished. An ellipsis ends none, nor does
+/// a mark inside a word (`3.5`); an abbreviation (`Mr. Smith`) does.
+fn passed_sentence_ends(words: &str) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut chars = words.char_indices().peekable();
+    let mut previous = None;
+    while let Some((at, mark)) = chars.next() {
+        let ellipsis =
+            mark == '.' && (previous == Some('.') || chars.peek().is_some_and(|&(_, c)| c == '.'));
+        previous = Some(mark);
+        if !SENTENCE_MARKS.contains(&mark) || ellipsis {
+            continue;
+        }
+        let after = &words[at + mark.len_utf8()..];
+        let after = after.trim_start_matches(CLOSERS);
+        let end = words.len() - after.len();
+        let next = after.trim_start();
+        let spaced = next.len() < after.len() || !mark.is_ascii();
+        if spaced
+            && next
+                .chars()
+                .next()
+                .is_some_and(|c| !SENTENCE_MARKS.contains(&c) && !CLOSERS.contains(&c))
+        {
+            ends.push(end);
+        }
+    }
+    ends
+}
+
+/// Every sentence the online session's words have gone on past that has not
+/// gone to intake yet, to intake: text only, news before the utterance
+/// closes ([`Work::Sentence`]). The utterance keeps them all.
+fn publish_sentences(active: &mut Option<(u64, Active<'_>)>, channel: u64, intake: &Inbox) {
+    let Some((user, current)) = active.as_mut() else {
+        return;
+    };
+    let Ok(session) = &current.session else {
+        return;
+    };
+    let words = session.heard();
+    for end in passed_sentence_ends(words) {
+        if end <= current.published {
+            continue;
+        }
+        let text = words[current.published..end].trim();
+        current.published = end;
+        if text.is_empty() {
+            continue;
+        }
+        let sentence = Sentence {
+            channel,
+            user: *user,
+            start_ms: current.start_ms,
+            heard_ms: current.start_ms + (current.fed * 1000 / RATE) as u64,
+            text: text.to_owned(),
+        };
+        let characters = sentence.text.chars().count();
+        if intake.send(Work::Sentence(sentence)).is_err() {
+            eprintln!(
+                "[discord] intake has stopped; a sentence of user {user} is not published \
+                 (its utterance keeps it)"
+            );
+        } else {
+            eprintln!(
+                "[discord] user {user} finished a sentence while speaking ({characters} \
+                 characters)"
+            );
+        }
+    }
+}
+
+/// One moment through the listener and the transcriber, then the sentences
+/// the words have gone on past to intake ([`publish_sentences`]), then the
+/// early end:
 /// when the words the online session has heard end a sentence and its
 /// speaker has been silent [`SENTENCE_SILENCE_MS`] (and the transcriber's
 /// [`Transcribe::settle_ms`]), the utterance closes now instead of after
@@ -631,6 +723,7 @@ fn hear_moment<'a>(
     listener.hear_progress(moment, &mut |progress| {
         advance(ear, active, progress, channel, intake, unstored)
     });
+    publish_sentences(active, channel, intake);
     let Some(user) = active.as_ref().and_then(|(user, current)| {
         let words = current.session.as_ref().ok()?.heard();
         ends_sentence(words).then_some(*user)
@@ -1542,17 +1635,206 @@ mod tests {
                 &intake,
                 directory.path(),
             );
-            while let Ok(Work::Utterance(utterance)) = queue.try_recv() {
-                published.push((end_ms, utterance));
+            while let Ok(work) = queue.try_recv() {
+                if let Work::Utterance(utterance) = work {
+                    published.push((end_ms, utterance));
+                }
             }
         }
         listener
             .flush_progress(&mut |p| advance(ear, &mut active, p, 7, &intake, directory.path()));
-        while let Ok(Work::Utterance(utterance)) = queue.try_recv() {
-            published.push((u64::MAX, utterance));
+        while let Ok(work) = queue.try_recv() {
+            if let Work::Utterance(utterance) = work {
+                published.push((u64::MAX, utterance));
+            }
         }
         assert!(active.is_none());
         published
+    }
+
+    /// A transcriber whose sessions write each of `words` once they have
+    /// heard its many milliseconds of audio: text that grows as the speaker
+    /// goes on.
+    struct Speaks {
+        words: &'static [(usize, &'static str)],
+    }
+    struct Speaking {
+        words: &'static [(usize, &'static str)],
+        fed: usize,
+        text: String,
+    }
+    impl Transcribe for Speaks {
+        fn listen(&self) -> Result<Box<dyn Transcription + '_>> {
+            Ok(Box::new(Speaking {
+                words: self.words,
+                fed: 0,
+                text: String::new(),
+            }))
+        }
+    }
+    impl Transcription for Speaking {
+        fn push(&mut self, samples: &[f32]) -> Result<()> {
+            let before = self.fed * 1000 / RATE;
+            self.fed += samples.len();
+            let now = self.fed * 1000 / RATE;
+            for (at, words) in self.words {
+                if before < *at && *at <= now {
+                    self.text += words;
+                }
+            }
+            Ok(())
+        }
+        fn finish(self: Box<Self>) -> Result<String> {
+            Ok(self.words.iter().map(|(_, words)| *words).collect())
+        }
+        fn heard(&self) -> &str {
+            &self.text
+        }
+    }
+
+    /// `moments` through the hearing loop, one at a time: everything that
+    /// went to intake, with the end of the moment it went after.
+    fn intake_after(ear: &dyn Transcribe, moments: Vec<Moment>) -> Vec<(u64, Work)> {
+        let mut active = None;
+        let mut listener = Listener::default();
+        let directory = tempfile::tempdir().unwrap();
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let mut sent = Vec::new();
+        for moment in moments {
+            let end_ms = moment.at_ms + 20;
+            hear_moment(
+                ear,
+                &mut active,
+                &mut listener,
+                moment,
+                7,
+                &intake,
+                directory.path(),
+            );
+            sent.extend(queue.try_iter().map(|work| (end_ms, work)));
+        }
+        listener
+            .flush_progress(&mut |p| advance(ear, &mut active, p, 7, &intake, directory.path()));
+        sent.extend(queue.try_iter().map(|work| (u64::MAX, work)));
+        assert!(active.is_none());
+        sent
+    }
+
+    /// JP, 2026-10-10: a finished sentence does not wait for silence. Two
+    /// sentences without a pause between them: the first goes to intake as
+    /// soon as the words go on past it, while the speaker is still talking,
+    /// text only; the utterance closes after the second as before and holds
+    /// both, transcript and audio, whole.
+    #[test]
+    fn a_sentence_the_speaker_talks_past_is_published_before_they_stop() {
+        // Speech 600..3000 ms with no pause; the utterance begins at 420 ms
+        // (preroll), so the session has heard `ms` of audio at 420 + ms.
+        let ear = Speaks {
+            words: &[(1000, "Hello there."), (1300, " How"), (2200, " are you?")],
+        };
+        let script = [(false, 600), (true, 2400), (false, 1200)];
+        let sent = intake_after(&ear, ticks(JP, 0, &script));
+        let expected = listen(ticks(JP, 0, &script));
+        assert_eq!(expected.len(), 1);
+        assert_eq!(sent.len(), 2, "one sentence, then the utterance");
+
+        let (at, Work::Sentence(sentence)) = &sent[0] else {
+            panic!("the first sentence did not go first")
+        };
+        assert_eq!(sentence.text, "Hello there.");
+        assert_eq!(
+            *at,
+            420 + 1300,
+            "as soon as the words went on past it, while the speaker talks"
+        );
+        assert!(*at < 3000, "before the speaker stopped");
+        assert_eq!(
+            (sentence.channel, sentence.user, sentence.start_ms),
+            (7, JP, expected[0].start_ms)
+        );
+        assert_eq!(sentence.heard_ms, expected[0].start_ms + 1300);
+
+        let (at, Work::Utterance(utterance)) = &sent[1] else {
+            panic!("the utterance did not close")
+        };
+        // The last sentence closes with the sentence silence, as before.
+        assert_eq!(*at, 3000 + SENTENCE_SILENCE_MS as u64);
+        assert_eq!(utterance.transcript, "Hello there. How are you?");
+        assert_eq!(
+            (utterance.user, utterance.start_ms),
+            (JP, expected[0].start_ms)
+        );
+        assert_eq!(utterance.wav, wav_pcm16(&expected[0].samples));
+    }
+
+    /// Several sentences, each published once and in order; nothing the
+    /// words have not gone on past, and nothing again after the utterance.
+    #[test]
+    fn each_sentence_goes_once_in_order_and_the_last_waits() {
+        let ear = Speaks {
+            words: &[
+                (500, "One."),
+                (700, " Two!"),
+                (900, " Three? Four"),
+                (1500, " five."),
+            ],
+        };
+        let script = [(false, 600), (true, 2000), (false, 1200)];
+        let sent = intake_after(&ear, ticks(JP, 0, &script));
+        let sentences: Vec<(u64, &str)> = sent
+            .iter()
+            .filter_map(|(at, work)| match work {
+                Work::Sentence(sentence) => Some((*at, sentence.text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sentences,
+            [
+                (420 + 700, "One."),
+                (420 + 900, "Two!"),
+                (420 + 900, "Three?")
+            ]
+        );
+        let utterances: Vec<&str> = sent
+            .iter()
+            .filter_map(|(_, work)| match work {
+                Work::Utterance(utterance) => Some(utterance.transcript.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(utterances, ["One. Two! Three? Four five."]);
+        assert!(matches!(sent.last(), Some((_, Work::Utterance(_)))));
+    }
+
+    #[test]
+    fn a_sentence_is_passed_once_more_words_follow_it() {
+        let ends = |words: &str| -> Vec<String> {
+            passed_sentence_ends(words)
+                .into_iter()
+                .map(|end| words[..end].to_owned())
+                .collect()
+        };
+        assert_eq!(ends("Done. And"), ["Done."]);
+        assert_eq!(
+            ends("Really? Yes! Good. Then"),
+            ["Really?", "Really? Yes!", "Really? Yes! Good."]
+        );
+        assert_eq!(ends("He said \"stop.\" Then"), ["He said \"stop.\""]);
+        assert_eq!(
+            ends("\u{305d}\u{3046}\u{3002}\u{306f}\u{3044}"),
+            ["\u{305d}\u{3046}\u{3002}"]
+        );
+        // Not yet: nothing after it, or only space so far.
+        assert!(ends("Done.").is_empty());
+        assert!(ends("Done. ").is_empty());
+        // Not an end: an ellipsis, or a mark inside a word.
+        assert!(ends("so... then").is_empty());
+        assert!(ends("it is 3.5 metres").is_empty());
+        // A doubled mark ends once, after the last.
+        assert_eq!(ends("What?! No"), ["What?!"]);
     }
 
     #[test]

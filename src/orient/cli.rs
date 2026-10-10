@@ -1,5 +1,5 @@
 //! Shell syntax and local wall-clock parsing for Orient.
-use super::{Orient, ShowOptions, WaitOptions, WakeOptions};
+use super::{NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions};
 use anyhow::{anyhow, bail, Result};
 use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
@@ -118,6 +118,17 @@ enum Command {
         /// Poll interval for the append-only pile growth gate
         #[arg(long, default_value_t = 1000)]
         poll_ms: u64,
+        /// Never exit: print each batch of news as it comes and wait again,
+        /// stdout flushed after every batch, so the output IS the news
+        /// stream. One line per item, every body whole (`<sender>: <text>`,
+        /// `[voice|text] <speaker>: <text>`), no `News:` reasons or detail
+        /// blocks. What counts as news and when it is recorded as presented
+        /// are exactly those of repeated `wait` calls; diagnostics go to
+        /// stderr. A `for`/`until` target bounds the stream instead of
+        /// ending it at the first batch. Ends on SIGINT/SIGTERM, or when
+        /// stdout closes (that batch is then not recorded as presented).
+        #[arg(long)]
+        stream: bool,
     },
     /// Keep the pile open and deliver each news report to one executable's stdin.
     /// Callback success records presentation, not completion of the reported work.
@@ -369,16 +380,52 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                 "Imported {events} distinct resident legacy event(s) for {persona} into this key's receipt source. Projection maintenance remains separate."
             ))
         }
-        Command::Wait { target, poll_ms } => orient.wait(
+        Command::Wait {
+            target,
+            poll_ms,
+            stream: false,
+        } => orient.wait(
             cli.persona.as_deref().ok_or_else(|| {
                 anyhow!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)")
             })?,
             &WaitOptions {
                 timeout: parse_wait_target(target.as_ref())?,
                 poll_interval: Duration::from_millis(poll_ms.max(1)),
+                form: NewsForm::Report,
             },
             out,
         ),
+        Command::Wait {
+            target,
+            poll_ms,
+            stream: true,
+        } => {
+            let persona = cli.persona.as_deref().ok_or_else(|| {
+                anyhow!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)")
+            })?;
+            // The daemon's one continuous observation, writing each report
+            // to stdout instead of a callback: the same state machine that
+            // repeated one-shot waits run, without re-opening the pile.
+            let mut deliver = |part| match part {
+                crate::out::Part::Text { text } if text.starts_with("note: ") => {
+                    // Maintenance diagnostics are not news and must not
+                    // become a line of the stream.
+                    use std::io::Write;
+                    std::io::stderr().lock().write_all(text.as_bytes())?;
+                    Ok(())
+                }
+                part => out.emit(part),
+            };
+            orient.daemon(
+                persona,
+                &WaitOptions {
+                    timeout: parse_wait_target(target.as_ref())?,
+                    poll_interval: Duration::from_millis(poll_ms.max(1)),
+                    form: NewsForm::Stream,
+                },
+                &mut crate::out::Out::new(&mut deliver),
+            )
+        }
         Command::Daemon {
             callback,
             callback_args,
@@ -407,6 +454,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                 &WaitOptions {
                     timeout: run_for,
                     poll_interval: Duration::from_millis(poll_ms.max(1)),
+                    form: NewsForm::Report,
                 },
                 &mut crate::out::Out::new(&mut deliver),
             )
@@ -427,6 +475,55 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_stream_is_a_flag_that_keeps_an_optional_bound() {
+        let cli = Cli::try_parse_from([
+            "orient",
+            "--pile",
+            "unused.pile",
+            "--persona",
+            "agent",
+            "wait",
+            "--stream",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Wait {
+                target: None,
+                stream: true,
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "orient",
+            "--pile",
+            "unused.pile",
+            "wait",
+            "--stream",
+            "for",
+            "10s",
+        ])
+        .unwrap();
+        let Some(Command::Wait {
+            target: Some(target),
+            stream: true,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected a bounded stream");
+        };
+        assert_eq!(
+            parse_wait_target(Some(&target)).unwrap(),
+            Some(Duration::from_secs(10))
+        );
+        let cli = Cli::try_parse_from(["orient", "--pile", "unused.pile", "wait"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Wait { stream: false, .. })
+        ));
+    }
 
     #[test]
     fn daemon_requires_a_callback() {

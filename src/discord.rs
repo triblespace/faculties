@@ -32,7 +32,7 @@ pub mod voice;
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,
     ObservedMessage, PageRequest, PresenceChange, PullOptions, PullReport, ReadOptions, Rest,
-    SendReceipt, Source, Utterance,
+    SendReceipt, Sentence, Source, Utterance,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -136,6 +136,54 @@ pub fn utterance_fragment(
     transcript: &str,
     wav: Vec<u8>,
 ) -> Result<Fragment> {
+    let (mut fragment, channel, user, utterance) =
+        utterance_anchor(channel_external_id, user_external_id, start)?;
+    let audio = fragment.put::<RawBytes, _>(wav);
+    fragment += entity! { _ @
+        metadata::tag: archive::kind_message,
+        discord::message: utterance,
+        discord::channel: channel,
+        archive::author: user,
+        archive::content: transcript.to_owned(),
+        metadata::created_at: start,
+        discord::utterance_audio: audio,
+    };
+    Ok(fragment)
+}
+
+/// A sentence somebody finished in a voice channel while they went on
+/// speaking ([`discord::kind_heard_sentence`]): linked to the anchor of the
+/// utterance that began at `start`, the one [`utterance_fragment`] stores
+/// once it closes, and dated `heard` (when the hearing had heard it). No
+/// audio and no message: the utterance keeps both. With the channel, user
+/// and utterance anchors, so the fragment stands on its own.
+pub fn sentence_fragment(
+    channel_external_id: &str,
+    user_external_id: &str,
+    start: Inline<NsTAIInterval>,
+    heard: Inline<NsTAIInterval>,
+    sentence: &str,
+) -> Result<Fragment> {
+    let (mut fragment, channel, user, utterance) =
+        utterance_anchor(channel_external_id, user_external_id, start)?;
+    fragment += entity! { _ @
+        metadata::tag: discord::kind_heard_sentence,
+        discord::message: utterance,
+        discord::channel: channel,
+        archive::author: user,
+        archive::content: sentence.to_owned(),
+        metadata::created_at: heard,
+    };
+    Ok(fragment)
+}
+
+/// The channel and user anchors and the stable anchor of the utterance
+/// `user` began in `channel` at `start`, and their ids.
+fn utterance_anchor(
+    channel_external_id: &str,
+    user_external_id: &str,
+    start: Inline<NsTAIInterval>,
+) -> Result<(Fragment, Id, Id, Id)> {
     let mut fragment = channel_fragment(channel_external_id)?;
     let channel = fragment.root().expect("intrinsic channel has one root");
     let author = user_fragment(user_external_id)?;
@@ -151,17 +199,7 @@ pub fn utterance_fragment(
         .root()
         .expect("intrinsic utterance anchor has one root");
     fragment += anchor;
-    let audio = fragment.put::<RawBytes, _>(wav);
-    fragment += entity! { _ @
-        metadata::tag: archive::kind_message,
-        discord::message: utterance,
-        discord::channel: channel,
-        archive::author: user,
-        archive::content: transcript.to_owned(),
-        metadata::created_at: start,
-        discord::utterance_audio: audio,
-    };
-    Ok(fragment)
+    Ok((fragment, channel, user, utterance))
 }
 
 /// Somebody coming into or leaving a voice channel: what a presence notice

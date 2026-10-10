@@ -49,6 +49,12 @@
 //! transcript) and `.wav` (the audio), and never fetched again: Discord has no
 //! copy of it.
 //!
+//! A sentence its speaker finished while they went on talking comes here
+//! before its utterance closes ([`Work::Sentence`]), and is stored as a
+//! record of its own that links the utterance and is no message, so that a
+//! window hears it as news before the speaker stops. One whose write fails is
+//! logged and lost: the utterance, once stored, holds it with the rest.
+//!
 //! Who comes into and leaves the voice channel comes here too
 //! ([`Work::Presence`], told apart by [`super::presence`]), and is stored as a
 //! system notice in that channel, heard from the same floor as what is said
@@ -60,7 +66,7 @@
 //! failure is logged, a panic included, and the work goes on.
 
 use super::gateway::{DIRECT_MESSAGES, GUILD_MESSAGES, MESSAGE_CONTENT};
-use crate::discord::{Discord, PresenceChange, Source, Utterance, DISCORD_EPOCH_MS};
+use crate::discord::{Discord, PresenceChange, Sentence, Source, Utterance, DISCORD_EPOCH_MS};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -123,6 +129,10 @@ pub enum Work {
     Backfill,
     /// Something said in the voice channel, transcribed.
     Utterance(Utterance),
+    /// A sentence finished in the voice channel while its speaker went on:
+    /// news before the utterance closes. One whose write fails is lost; the
+    /// utterance keeps it.
+    Sentence(Sentence),
     /// Somebody came into or left the voice channel.
     Presence(PresenceChange),
     /// Discord refused the message intents while hearing goes on: no more
@@ -213,6 +223,11 @@ impl Intake {
             }
             Work::Backfill => Ok(self.backfill()),
             Work::Utterance(utterance) => self.utterance(utterance),
+            Work::Sentence(sentence) => {
+                let floor = self.keep_floor(VOICE, sentence.channel, self.floor)?;
+                self.discord.observe_sentence(&sentence, floor)?;
+                Ok(Done::Stored)
+            }
             Work::Presence(change) => {
                 let floor = self.keep_floor(VOICE, change.channel, self.floor)?;
                 self.discord.observe_presence(&change, floor)?;
@@ -752,6 +767,14 @@ pub fn start(mut intake: Intake) -> Worker {
                         utterance.transcript.chars().count(),
                         utterance.wav.len()
                     ),
+                    Work::Sentence(sentence) => format!(
+                        "the sentence user {} finished in voice channel {} at {} ms ({} \
+                         characters)",
+                        sentence.user,
+                        sentence.channel,
+                        sentence.heard_ms,
+                        sentence.text.chars().count()
+                    ),
                     Work::Presence(change) => format!(
                         "that user {} {} voice channel {} at {} ms",
                         change.user,
@@ -766,8 +789,9 @@ pub fn start(mut intake: Intake) -> Worker {
                     Work::Utterance(utterance) => Some(utterance.clone()),
                     _ => None,
                 };
-                // Nothing fetches a presence change again either; it is lost.
-                let presence = matches!(work, Work::Presence(_));
+                // Nothing fetches a presence change again either; it is lost,
+                // and so is a sentence, which its utterance keeps.
+                let lost = matches!(work, Work::Presence(_) | Work::Sentence(_));
                 let handled =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| intake.handle(work)));
                 match handled {
@@ -800,7 +824,7 @@ pub fn start(mut intake: Intake) -> Worker {
                              {UNSTORED_SPEECH}/"
                         );
                     }
-                    Ok(Err(error)) if presence => {
+                    Ok(Err(error)) if lost => {
                         eprintln!("[discord] storing {what} failed: {error:#}; it is lost");
                     }
                     Ok(Err(error)) => {
@@ -816,7 +840,7 @@ pub fn start(mut intake: Intake) -> Worker {
                             Some(utterance) => {
                                 keep_utterance(&intake.directory.join(UNSTORED_SPEECH), &utterance)
                             }
-                            None if presence => {}
+                            None if lost => {}
                             None => retry.soon(Instant::now()),
                         }
                     }

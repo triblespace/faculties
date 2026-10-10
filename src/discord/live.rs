@@ -312,6 +312,7 @@ mod tests {
             intake::Work::Account(user) => format!("account {user}"),
             intake::Work::Backfill => "backfill".to_owned(),
             intake::Work::Utterance(_) => "utterance".to_owned(),
+            intake::Work::Sentence(_) => "sentence".to_owned(),
             intake::Work::Presence(change) => {
                 format!(
                     "{} {} {}",

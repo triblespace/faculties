@@ -56,14 +56,31 @@ impl Default for WakeOptions {
 pub struct WaitOptions {
     pub timeout: Option<Duration>,
     pub poll_interval: Duration,
+    /// How each report is written. What is news, and when it is recorded as
+    /// presented, is the same in either form.
+    pub form: NewsForm,
 }
 impl Default for WaitOptions {
     fn default() -> Self {
         Self {
             timeout: None,
             poll_interval: Duration::from_secs(1),
+            form: NewsForm::Report,
         }
     }
+}
+/// The two ways a news report is written.
+///
+/// `Report` is what `wait`, `poll` and the daemon have always printed: a
+/// `News:` reason line per event (bodies clipped to their first line), then
+/// the detail beneath them. `Stream` is for a reader that takes each line of
+/// stdout as one message (`wait --stream`): one line per item and nothing
+/// else, every body whole, no ids where a name says who.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NewsForm {
+    #[default]
+    Report,
+    Stream,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaselineReceipt {
@@ -1963,6 +1980,11 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
 /// stores it just as intake stores what it hears, and neither is a channel
 /// intake never heard: reading history wakes no window, then or when a
 /// window first reads Discord.
+///
+/// A sentence somebody finished in the voice channel while they went on
+/// speaking ([`discord::kind_heard_sentence`]) is news by its own id, heard
+/// as a message is, until the utterance it belongs to is stored: that holds
+/// the sentence with the rest, and is news itself.
 fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
     let own: BTreeSet<Id> = find!(
         user: Id,
@@ -2016,6 +2038,37 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
             && !notices.contains(anchor)
     })
     .map(|(anchor, ..)| anchor)
+    .chain(
+        find!(
+            (sentence: Id, utterance: Id, author: Id, created: IntervalValue, heard: IntervalValue),
+            pattern!(query.discord, [
+                {
+                    ?sentence @
+                    metadata::tag: discord::kind_heard_sentence,
+                    discord::message: ?utterance,
+                    discord::channel: _?channel,
+                    archive::author: ?author,
+                    metadata::created_at: ?created,
+                },
+                {
+                    _?intake @
+                    metadata::tag: discord::kind_intake,
+                    discord::channel: _?channel,
+                    discord::heard_from: ?heard,
+                },
+            ])
+        )
+        .filter(|&(_, utterance, author, created, heard)| {
+            interval_key(created) >= interval_key(heard)
+                && !own.contains(&author)
+                && !exists!(pattern!(query.discord, [{
+                    _?observation @
+                    metadata::tag: archive::kind_message,
+                    discord::message: utterance,
+                }]))
+        })
+        .map(|(sentence, ..)| sentence),
+    )
     .collect()
 }
 
@@ -2034,9 +2087,17 @@ struct DiscordMessageDetail {
     /// Somebody coming into or leaving the voice channel, when the message is
     /// that notice: presented as the event, never as its (empty) content.
     presence: Option<discord_model::Presence>,
+    /// A sentence finished while its speaker went on
+    /// ([`discord::kind_heard_sentence`]), not a message: presented as said
+    /// by somebody still speaking.
+    still_speaking: bool,
     /// When the newest observation says the message was created: for a
-    /// presence notice, when the change was seen.
+    /// presence notice, when the change was seen; for a sentence, when it
+    /// was heard.
     created: Option<IntervalValue>,
+    /// Whether it was said in a voice channel (an utterance) or is somebody
+    /// coming into or leaving one, rather than written.
+    voice: bool,
     versions: Vec<DiscordVersion>,
     /// The distinct attachment entities of those versions.
     attachments: usize,
@@ -2071,26 +2132,39 @@ struct DiscordState {
 }
 
 fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<DiscordMessageDetail> {
+    // A sentence heard while its speaker went on is its own one observation.
+    let still_speaking = exists!(pattern!(query.discord, [{
+        anchor @ metadata::tag: discord::kind_heard_sentence,
+    }]));
     // Newest by Discord's own version time: the edit, else the creation.
-    let observations: Vec<(i128, Id)> = find!(
-        (observation: Id, created: IntervalValue),
-        pattern!(query.discord, [{
-            ?observation @
-            metadata::tag: archive::kind_message,
-            discord::message: anchor,
-            metadata::created_at: ?created,
-        }])
-    )
-    .map(|(observation, created)| {
-        let edited = find!(
-            edited: IntervalValue,
-            pattern!(query.discord, [{ observation @ archive::edited_at: ?edited }])
+    let observations: Vec<(i128, Id)> = if still_speaking {
+        find!(
+            created: IntervalValue,
+            pattern!(query.discord, [{ anchor @ metadata::created_at: ?created }])
         )
-        .map(interval_key)
-        .max();
-        (edited.unwrap_or(interval_key(created)), observation)
-    })
-    .collect();
+        .map(|created| (interval_key(created), anchor))
+        .collect()
+    } else {
+        find!(
+            (observation: Id, created: IntervalValue),
+            pattern!(query.discord, [{
+                ?observation @
+                metadata::tag: archive::kind_message,
+                discord::message: anchor,
+                metadata::created_at: ?created,
+            }])
+        )
+        .map(|(observation, created)| {
+            let edited = find!(
+                edited: IntervalValue,
+                pattern!(query.discord, [{ observation @ archive::edited_at: ?edited }])
+            )
+            .map(interval_key)
+            .max();
+            (edited.unwrap_or(interval_key(created)), observation)
+        })
+        .collect()
+    };
     let latest = observations
         .iter()
         .map(|(time, _)| *time)
@@ -2245,14 +2319,63 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
         let tag = presence.tag();
         exists!(pattern!(query.discord, [{ anchor @ metadata::tag: &tag }]))
     });
+    let voice = presence.is_some()
+        || exists!(pattern!(query.discord, [{ anchor @ metadata::tag: discord::kind_utterance }]));
     Ok(DiscordMessageDetail {
         author,
         channel,
         presence,
+        still_speaking,
         created,
+        voice,
         versions,
         attachments,
     })
+}
+
+/// The [`NewsForm::Stream`] form of one version of a Discord message:
+/// `[voice] <speaker>: <whole text>` for something said in a voice channel,
+/// `[text] <author>: <whole text>` for something written, each stored
+/// attachment with the `files get` that writes its bytes out. Somebody coming
+/// into or leaving the voice channel is `[voice] <name> joined the voice
+/// channel` (or left). The channel's numeric id is left out: the window acts
+/// on who said what, not where Discord files it.
+///
+/// A direct message reads as `[text]` too: the pile does not record whether
+/// a channel belongs to a guild (intake knows, from the gateway's
+/// `guild_id`, and does not store it), so a DM cannot be told apart here.
+fn discord_stream_text(detail: &DiscordMessageDetail, version: &DiscordVersion) -> String {
+    let place = if detail.voice { "voice" } else { "text" };
+    if let Some(presence) = detail.presence {
+        return format!(
+            "[{place}] {} {} the voice channel",
+            detail.author,
+            presence.verb()
+        );
+    }
+    let mut text = format!("[{place}] {}:", detail.author);
+    let content = version.content.trim();
+    if !content.is_empty() {
+        text.push(' ');
+        text.push_str(content);
+    }
+    for attachment in &version.attachments {
+        let name = &attachment.name;
+        let what = match (attachment.stored, attachment.size) {
+            (Some(content), _) => format!(
+                "files get files:{} @-",
+                crate::files::content_hash_hex(content)
+            ),
+            (None, Some(size)) => format!("{size} bytes, too large to store"),
+            (None, None) => "not stored".to_owned(),
+        };
+        text.push_str(&format!(" (attachment {name}: {what})"));
+    }
+    let count = detail.versions.len();
+    if count > 1 {
+        text.push_str(&format!(" (one of {count} versions with the same time)"));
+    }
+    text
 }
 
 /// What `orient` prints of one version of a Discord message: its author,
@@ -2271,8 +2394,13 @@ fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion)
     } else {
         String::new()
     };
+    let speaking = if detail.still_speaking {
+        " (still speaking)"
+    } else {
+        ""
+    };
     let mut text = format!(
-        "- {} in channel {}{of}: {}\n",
+        "- {} in channel {}{of}{speaking}: {}\n",
         detail.author, detail.channel, version.content
     );
     // The bytes are in the pile, stored with the message; `files get` with
@@ -2332,6 +2460,9 @@ fn discord_news_line(query: &OrientQuery<'_>, anchor: Id) -> Option<String> {
         "Discord message from {} in channel {}",
         detail.author, detail.channel
     );
+    if detail.still_speaking {
+        line.push_str(" (still speaking)");
+    }
     let first = detail.versions.first()?;
     if let Some(preview) = clip_line(&first.content, NEWS_PREVIEW_CHARS) {
         line.push_str(": ");
@@ -2369,6 +2500,14 @@ fn discord_in_order(query: &OrientQuery<'_>, anchors: impl IntoIterator<Item = I
                     metadata::created_at: ?created,
                 }])
             )
+            .chain(find!(
+                created: IntervalValue,
+                pattern!(query.discord, [{
+                    anchor @
+                    metadata::tag: discord::kind_heard_sentence,
+                    metadata::created_at: ?created,
+                }])
+            ))
             .map(interval_key)
             .min();
             (created, anchor)
@@ -2971,21 +3110,25 @@ fn render_habit_transitions(
     previous: &HabitObservation,
     current: &HabitObservation,
     presented: &FactArchive,
-) -> Option<(String, Vec<(Id, i64)>)> {
+) -> Option<(Rendered, Vec<(Id, i64)>)> {
     use std::fmt::Write as _;
-    let (due_text, events) = render_due_habits_unreceipted(current, presented)
-        .unwrap_or_else(|| (String::new(), Vec::new()));
+    let (due, events) = render_due_habits_unreceipted(current, presented).unwrap_or_default();
     let attention = newly_needing_attention(previous, current);
-    if due_text.is_empty() && attention.is_empty() {
+    if due.is_empty() && attention.is_empty() {
         return None;
     }
-    let mut out = String::new();
+    let mut out = Rendered::default();
     // The warning already names the habit and its id, so it *is* the reason;
     // the separate attention block below it only repeated the same string.
     for (_, warning) in &attention {
-        writeln!(out, "News: habit needs attention: {warning}").unwrap();
+        writeln!(out.text, "News: habit needs attention: {warning}").unwrap();
+        push_stream_line(
+            &mut out.stream,
+            &format!("habit needs attention: {warning}"),
+        );
     }
-    out.push_str(&due_text);
+    out.text.push_str(&due.text);
+    out.stream.push_str(&due.stream);
     Some((out, events))
 }
 
@@ -3012,7 +3155,7 @@ fn render_habit_transitions(
 fn render_due_habits_unreceipted(
     current: &HabitObservation,
     presented: &FactArchive,
-) -> Option<(String, Vec<(Id, i64)>)> {
+) -> Option<(Rendered, Vec<(Id, i64)>)> {
     let due: Vec<(Id, DueHabit)> = current
         .due
         .iter()
@@ -3023,9 +3166,15 @@ fn render_due_habits_unreceipted(
         return None;
     }
     let presented_now = due.iter().map(|(id, habit)| (*id, habit.since)).collect();
-    let mut out = String::new();
-    push_due_news(&mut out, &due);
-    push_due_detail(&mut out, &due);
+    let mut out = Rendered::default();
+    push_due_news(&mut out.text, &due);
+    push_due_detail(&mut out.text, &due);
+    for (_, habit) in &due {
+        push_stream_line(
+            &mut out.stream,
+            &format!("habit became due: {}: {}", habit.label, habit.nudge),
+        );
+    }
     Some((out, presented_now))
 }
 
@@ -3979,7 +4128,129 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
 
 enum News {
     Quiet,
-    Report { text: String, events: Vec<Id> },
+    /// `text` is the [`NewsForm::Report`] form, `stream` the
+    /// [`NewsForm::Stream`] form of the same events.
+    Report {
+        text: String,
+        stream: String,
+        events: Vec<Id>,
+    },
+}
+
+/// A habit report in both forms ([`NewsForm`]). Empty when there is nothing
+/// to say, in both at once.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct Rendered {
+    text: String,
+    stream: String,
+}
+
+impl Rendered {
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn form(&self, form: NewsForm) -> &str {
+        match form {
+            NewsForm::Report => &self.text,
+            NewsForm::Stream => &self.stream,
+        }
+    }
+}
+
+/// Append `item` to a stream as exactly one line: a body's own line breaks
+/// become ` ¶ `, so a reader that takes each line as one message gets the
+/// item whole and in one piece.
+fn push_stream_line(out: &mut String, item: &str) {
+    let mut first = true;
+    for line in item.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if !first {
+            out.push_str(" ¶ ");
+        }
+        out.push_str(line);
+        first = false;
+    }
+    if !first {
+        out.push('\n');
+    }
+}
+
+/// The [`NewsForm::Stream`] form of directed news, in the order the report
+/// form gives it: one line per item, every body whole. A Message-faculty message is
+/// `<sender>: <text>`; a Discord message `[voice|text] <speaker>: <text>`,
+/// with the `files get` command for each stored attachment; Mail and Teams
+/// carry their sender and subject or text; every other event its `News:`
+/// reason, without the prefix.
+///
+/// It reads exactly what the report's detail reads, with the same strictness,
+/// so a body not yet here withholds both forms alike.
+fn render_news_stream(
+    query: &OrientQuery<'_>,
+    events: &[AttentionEvent],
+    persona_id: Id,
+) -> Result<String> {
+    let mut out = String::new();
+    let mut mail: Option<BTreeMap<Id, MailSummary>> = None;
+    for event in events {
+        match event {
+            AttentionEvent::Message(id) => {
+                let id = *id;
+                let row = find!(
+                    (from: Id, body: message::TextHandle),
+                    pattern!(query.messages, [{ id @
+                        local_message::from: ?from,
+                        local_message::body: ?body,
+                    }])
+                )
+                .next();
+                match row {
+                    Some((from, body)) => {
+                        let from = read_native_person_label(query, from)?;
+                        let body = read_utf8(&query.payloads, body, "Message body")?;
+                        push_stream_line(&mut out, &format!("{from}: {body}"));
+                    }
+                    None => push_stream_line(&mut out, &news_line(query, event)),
+                }
+            }
+            AttentionEvent::Mail(wire) => {
+                if mail.is_none() {
+                    mail = Some(native_unread_mail(query, persona_id)?);
+                }
+                let summary = mail
+                    .as_ref()
+                    .and_then(|summaries| summaries.get(wire))
+                    .ok_or_else(|| {
+                        anyhow!("new Mail wire {} vanished from current view", fmt_id(*wire))
+                    })?;
+                let from = summary
+                    .from
+                    .map(|handle| read_utf8(&query.payloads, handle, "Mail From"))
+                    .transpose()?
+                    .unwrap_or_else(|| "(no From)".to_owned());
+                let subject = read_utf8(&query.payloads, summary.subject, "Mail subject")?;
+                push_stream_line(
+                    &mut out,
+                    &format!("{} from {from} — {subject}", event.reason()),
+                );
+            }
+            AttentionEvent::Teams(message) => {
+                let (author, content) = teams_message_detail(query, *message)?;
+                push_stream_line(&mut out, &format!("Teams {author}: {content}"));
+            }
+            AttentionEvent::Discord(anchor) => {
+                let detail = discord_message_detail(query, *anchor)?;
+                let mut printed = BTreeSet::new();
+                for version in &detail.versions {
+                    let line = discord_stream_text(&detail, version);
+                    if printed.insert(line.clone()) {
+                        push_stream_line(&mut out, &line);
+                    }
+                }
+            }
+            _ => push_stream_line(&mut out, &news_line(query, event)),
+        }
+    }
+    Ok(out)
 }
 
 fn write_complete_report(output: &mut Out<'_>, report: &str, description: &str) -> Result<()> {
@@ -4008,19 +4279,22 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
             _ => None,
         }),
     );
-    let mut text = String::new();
-    for event in pending
+    let ordered: Vec<AttentionEvent> = pending
         .events
         .values()
         .filter(|event| !matches!(event, AttentionEvent::Discord(_)))
         .cloned()
         .chain(discord.into_iter().map(AttentionEvent::Discord))
-    {
-        writeln!(text, "News: {}", news_line(query, &event)).unwrap();
+        .collect();
+    let mut text = String::new();
+    for event in &ordered {
+        writeln!(text, "News: {}", news_line(query, event)).unwrap();
     }
     text.push_str(&render_news_detail(query, &pending, persona_id)?);
+    let stream = render_news_stream(query, &ordered, persona_id)?;
     Ok(News::Report {
         text,
+        stream,
         events: pending.ids().collect(),
     })
 }
@@ -4061,10 +4335,19 @@ fn apply_prepared_news(
     peek: bool,
     prepared: &News,
     prefix: &str,
+    form: NewsForm,
     output: &mut Out<'_>,
 ) -> Result<()> {
     match prepared {
-        News::Report { text, events } => {
+        News::Report {
+            text,
+            stream,
+            events,
+        } => {
+            let text = match form {
+                NewsForm::Report => text,
+                NewsForm::Stream => stream,
+            };
             // Do not deliver consuming news that this principal cannot record.
             // Target production authority is independent and may be remote.
             let receipt = if !peek && !events.is_empty() {
@@ -4150,6 +4433,7 @@ async fn cmd_poll(
             peek,
             &news,
             "",
+            NewsForm::Report,
             output,
         )?;
         Ok(())
@@ -4665,6 +4949,7 @@ async fn cmd_observe(
         bail!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
     let timeout = options.timeout;
+    let form = options.form;
     let result: Result<WaitOutcome> = async {
         let mut health = HealthSources::open(routing, pile, signer, health_max_age)
             .await?
@@ -4685,7 +4970,8 @@ async fn cmd_observe(
         let mut last_pending_sweep = Instant::now();
 
         let sources = loop {
-            let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
+            let (fired, deadline) =
+                health.poll_in(pile, signer, persona_input, false, form, output)?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -4707,7 +4993,8 @@ async fn cmd_observe(
         // Keep the prefix which selected these target views as the polling
         // watermark, including while their lazy payload reads are pending.
         let initial = loop {
-            let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
+            let (fired, deadline) =
+                health.poll_in(pile, signer, persona_input, false, form, output)?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -4803,7 +5090,7 @@ async fn cmd_observe(
             }
             // Whether the read returned pending or was cut at the boundary,
             // the retained frame is what the persona's clocks run against.
-            let mut swept: Option<(HabitObservation, String, Vec<(Id, i64)>)> = None;
+            let mut swept: Option<(HabitObservation, Rendered, Vec<(Id, i64)>)> = None;
             if let Some(pending) = pending_frame.as_ref() {
                 if let (Some(persona), Some(habits), Some(observation)) = (
                     pending.persona,
@@ -4821,11 +5108,15 @@ async fn cmd_observe(
                                 habits,
                                 observation.facts.presentations.view(),
                             )
-                            .unwrap_or_else(|| (String::new(), Vec::new()));
+                            .unwrap_or_default();
                             pending_habits_seen = Some(habits.clone());
                             last_pending_sweep = Instant::now();
                             if !due_report.is_empty() {
-                                write_complete_report(output, &due_report, "Orient habit report")?;
+                                write_complete_report(
+                                    output,
+                                    due_report.form(form),
+                                    "Orient habit report",
+                                )?;
                                 commit_habit_receipts(
                                     pile,
                                     signer,
@@ -4860,7 +5151,7 @@ async fn cmd_observe(
                                     &current_habits,
                                     observation.facts.presentations.view(),
                                 )
-                                .unwrap_or_else(|| (String::new(), Vec::new()));
+                                .unwrap_or_default();
                                 swept = Some((current_habits, habit_report, due_events));
                             } else if continuous {
                                 // A newly readable pending frame may contain
@@ -4871,7 +5162,7 @@ async fn cmd_observe(
                                     habits,
                                     observation.facts.presentations.view(),
                                 )
-                                .unwrap_or_else(|| (String::new(), Vec::new()));
+                                .unwrap_or_default();
                                 if seen != habits {
                                     swept = Some((habits.clone(), report, due_events));
                                 }
@@ -4891,7 +5182,7 @@ async fn cmd_observe(
                 last_pending_sweep = Instant::now();
                 if !habit_report.is_empty() {
                     // A habit-only report acknowledges no news.
-                    write_complete_report(output, &habit_report, "Orient habit report")?;
+                    write_complete_report(output, habit_report.form(form), "Orient habit report")?;
                     commit_habit_receipts(
                         pile,
                         signer,
@@ -4961,7 +5252,7 @@ async fn cmd_observe(
             Some(seen) => render_habit_transitions(&seen, &habit_seen, presented),
             None => render_due_habits_unreceipted(&habit_seen, presented),
         }
-        .unwrap_or_else(|| (String::new(), Vec::new()));
+        .unwrap_or_default();
         let arm_fired = !arm_report.is_empty();
         apply_prepared_news(
             pile,
@@ -4969,7 +5260,8 @@ async fn cmd_observe(
             sources.presentations.source,
             false,
             &news,
-            &arm_report,
+            arm_report.form(form),
+            form,
             output,
         )?;
         commit_habit_receipts(pile, signer, sources.presentations.source, &arm_due_events)?;
@@ -4997,7 +5289,8 @@ async fn cmd_observe(
                 sleep.min(timeout.saturating_sub(start.elapsed()))
             });
             tokio::time::sleep(sleep).await;
-            let (fired, deadline) = health.poll(pile, signer, persona_input, false, output)?;
+            let (fired, deadline) =
+                health.poll_in(pile, signer, persona_input, false, form, output)?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -5088,7 +5381,7 @@ async fn cmd_observe(
                             &candidate.habits,
                             candidate.observation.facts.presentations.view(),
                         )
-                        .unwrap_or_else(|| (String::new(), Vec::new()));
+                        .unwrap_or_default();
                         let habit_fired = !habit_report.is_empty();
                         let ordinary_fired = matches!(candidate.news, News::Report { .. });
                         apply_prepared_news(
@@ -5097,7 +5390,8 @@ async fn cmd_observe(
                             sources.presentations.source,
                             false,
                             &candidate.news,
-                            &habit_report,
+                            habit_report.form(form),
+                            form,
                             output,
                         )?;
                         commit_habit_receipts(
@@ -5175,10 +5469,10 @@ async fn cmd_observe(
                 &current_habits,
                 current.facts.presentations.view(),
             )
-            .unwrap_or_else(|| (String::new(), Vec::new()));
+            .unwrap_or_default();
             let habit_fired = !habit_report.is_empty();
             if habit_fired {
-                write_complete_report(output, &habit_report, "Orient habit report")?;
+                write_complete_report(output, habit_report.form(form), "Orient habit report")?;
                 commit_habit_receipts(pile, signer, sources.presentations.source, &due_events)?;
             }
             habit_seen = current_habits;
@@ -5517,14 +5811,20 @@ mod tests {
         let (shared_report, shared_events) =
             render_due_habits_unreceipted(&armed, &nothing_presented())
                 .expect("a shared due occurrence is reported");
-        assert!(shared_report.contains("work-ledger-grooming"));
+        assert!(shared_report.text.contains("work-ledger-grooming"));
         assert_eq!(shared_events, vec![(shared, 700)]);
 
         armed.due.insert(owned, due_habit("cc-tick", 1300, true));
         let (both, events) = render_due_habits_unreceipted(&armed, &nothing_presented())
             .expect("both due occurrences are reported");
-        assert!(both.contains("News: habit became due: cc-tick"));
-        assert!(both.contains("work-ledger-grooming"));
+        assert!(both.text.contains("News: habit became due: cc-tick"));
+        assert!(both.text.contains("work-ledger-grooming"));
+        // The stream form: one line per due occurrence, its nudge on it.
+        assert_eq!(both.stream.lines().count(), 2, "{}", both.stream);
+        assert!(both
+            .stream
+            .lines()
+            .any(|line| line.starts_with("habit became due: cc-tick: ")));
         assert_eq!(events.len(), 2);
 
         // Receipting ONE occurrence silences exactly that one. Targeting has
@@ -5532,8 +5832,8 @@ mod tests {
         let seen_shared = presented_habit_due([(shared, 700)]);
         let (only_owned, owned_events) = render_due_habits_unreceipted(&armed, &seen_shared)
             .expect("the unreceipted occurrence is still reported");
-        assert!(only_owned.contains("cc-tick"));
-        assert!(!only_owned.contains("work-ledger-grooming"));
+        assert!(only_owned.text.contains("cc-tick"));
+        assert!(!only_owned.text.contains("work-ledger-grooming"));
         assert_eq!(owned_events, vec![(owned, 1300)]);
 
         // Receipt both and the watcher is quiet, however often it rearms.
@@ -5547,7 +5847,7 @@ mod tests {
         again.due.insert(owned, due_habit("cc-tick", 1900, true));
         let (recurred, _) = render_due_habits_unreceipted(&again, &seen_both)
             .expect("a later due occurrence is presented again");
-        assert!(recurred.contains("cc-tick"));
+        assert!(recurred.text.contains("cc-tick"));
     }
 
     use super::super::cli::{parse_wait_target, WaitTarget};
@@ -5605,6 +5905,7 @@ mod tests {
             peek,
             news,
             prefix,
+            NewsForm::Report,
             &mut Out::new(&mut emit),
         )
     }
@@ -5720,9 +6021,11 @@ mod tests {
                 false,
                 &News::Report {
                     text: "Selected workspace news\n".to_owned(),
+                    stream: "Selected workspace news\n".to_owned(),
                     events: vec![id(93)],
                 },
                 "",
+                NewsForm::Report,
                 &mut Out::new(&mut |_| Ok(())),
             )
             .unwrap();
@@ -6158,6 +6461,7 @@ mod tests {
             let event = id(78);
             let news = News::Report {
                 text: "News: one delivery\n".to_owned(),
+                stream: "News: one delivery\n".to_owned(),
                 events: vec![event],
             };
             let mut output = Vec::new();
@@ -6222,6 +6526,7 @@ mod tests {
             let event = id(78);
             let news = News::Report {
                 text: "News: one delivery\n".to_owned(),
+                stream: "News: one delivery\n".to_owned(),
                 events: vec![event],
             };
             let mut output = Vec::new();
@@ -6485,6 +6790,7 @@ mod tests {
         let options = WaitOptions {
             timeout: Some(Duration::from_millis(25)),
             poll_interval: Duration::from_secs(1),
+            form: NewsForm::Report,
         };
         let mut text = String::new();
         let mut emit = |part| {
@@ -7061,6 +7367,7 @@ mod tests {
         let options = WaitOptions {
             timeout: Some(timeout),
             poll_interval: poll,
+            form: NewsForm::Report,
         };
         let mut text = String::new();
         let mut emit = |part| {
@@ -7188,6 +7495,122 @@ mod tests {
             .unwrap()
             .contains(event));
         assert!(pile.snapshot().unwrap().wants().unwrap().next().is_none());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn a_stream_item_is_exactly_one_line() {
+        let mut out = String::new();
+        push_stream_line(&mut out, "ada: one\r\n\n  two  \nthree");
+        push_stream_line(&mut out, "");
+        push_stream_line(&mut out, "\n \n");
+        push_stream_line(&mut out, "bo: short");
+        assert_eq!(out, "ada: one ¶ two ¶ three\nbo: short\n");
+    }
+
+    /// `wait --stream`: each batch is written as it comes, one line per item
+
+    /// with the body whole, and the observation waits again. What it wrote is
+    /// presented as repeated one-shot waits would present it, and nothing is
+    /// written twice.
+    #[test]
+    fn a_stream_writes_each_batch_once_and_waits_again() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let sources = test_block_on(OrientSources::open(
+            &test_storage(),
+            &mut pile,
+            &fixture.signer,
+            false,
+        ))
+        .unwrap();
+        let reader = id(96);
+        let sender = id(97);
+        for (person, label) in [(reader, "stream-reader"), (sender, "stream-sender")] {
+            let (fragment, _, _) = relations::person_fragment(
+                person,
+                crate::relations::ProfileInput {
+                    label: label.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, fragment)
+                .unwrap();
+        }
+        let (fragment, first) = message::message_fragment(
+            sender,
+            &message::Recipient::Person(reader),
+            "first, with\na second line",
+            clock::point_now().unwrap(),
+        );
+        pile.commit(sources.messages.source, &fixture.signer, fragment)
+            .unwrap();
+
+        let messages = sources.messages.source;
+        let path = fixture.path.clone();
+        let signer = fixture.signer.clone();
+        let mut batches: Vec<String> = Vec::new();
+        let mut second = None;
+        let mut emit = |part| {
+            let crate::out::Part::Text { text } = part else {
+                bail!("expected text")
+            };
+            batches.push(text);
+            if second.is_none() {
+                // More news arrives while the stream is open, from another
+                // writer on the same pile.
+                let mut other = open_store_as(&path, signer.verifying_key()).unwrap();
+                let (fragment, event) = message::message_fragment(
+                    sender,
+                    &message::Recipient::Person(reader),
+                    "second",
+                    clock::point_now().unwrap(),
+                );
+                other.commit(messages, &signer, fragment).unwrap();
+                other.close().unwrap();
+                second = Some(event);
+            }
+            Ok(())
+        };
+        let options = WaitOptions {
+            timeout: Some(Duration::from_secs(3)),
+            poll_interval: Duration::from_millis(20),
+            form: NewsForm::Stream,
+        };
+        runtime().unwrap().block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                cmd_observe(
+                    &test_storage(),
+                    &mut pile,
+                    &fixture.signer,
+                    &fixture.path,
+                    Some("stream-reader"),
+                    &options,
+                    Duration::from_secs(180),
+                    true,
+                    &mut Out::new(&mut emit),
+                ),
+            )
+            .await
+            .expect("a bounded stream ends")
+            .unwrap();
+        });
+        let second = second.expect("the first batch was written");
+        assert_eq!(
+            batches,
+            [
+                "stream-sender: first, with ¶ a second line\n",
+                "stream-sender: second\n"
+            ]
+        );
+        let presented = sources
+            .presentations
+            .observe(&pile.snapshot().unwrap())
+            .unwrap();
+        assert!(presented.contains(first));
+        assert!(presented.contains(second));
         pile.close().unwrap();
     }
 
@@ -8526,7 +8949,7 @@ mod tests {
             assert_eq!(frame.observation.facts.messages.support(), &support);
             assert_ne!(reader.attached(supply.rank9).unwrap().support(), &support);
             assert!(reader.wants().unwrap().next().is_none());
-            let News::Report { text, events } = &news else {
+            let News::Report { text, events, .. } = &news else {
                 panic!("the acquired body must make the selected message readable")
             };
             assert!(text.contains("newly synced message body"));
@@ -8638,6 +9061,7 @@ mod tests {
         let event = id(4);
         let news = News::Report {
             text: "News: retry me\n".to_owned(),
+            stream: "News: retry me\n".to_owned(),
             events: vec![event],
         };
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
@@ -8680,6 +9104,7 @@ mod tests {
         let event = id(6);
         let news = News::Report {
             text: "News: peek\n".to_owned(),
+            stream: "News: peek\n".to_owned(),
             events: vec![event],
         };
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
@@ -8916,7 +9341,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let News::Report { text, events } = &news else {
+            let News::Report { text, events, .. } = &news else {
                 panic!("a Discord message from somebody else is news");
             };
             assert_eq!(events.len(), 1, "{text}");
@@ -8936,6 +9361,17 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains("my own reply"), "{text}");
+            // The stream form: the one item on one line, the body whole, the
+            // attachment's command kept, no channel id.
+            let News::Report { stream, .. } = &news else {
+                unreachable!()
+            };
+            assert_eq!(
+                stream,
+                &format!(
+                    "[text] Ada: look at this ¶ second line (attachment photo.png: files get files:{photo} @-)\n"
+                ),
+            );
 
             // Presented, it is not news again, and neither is its edit.
             let mut output = Vec::new();
@@ -8974,6 +9410,125 @@ mod tests {
                 matches!(again, News::Quiet),
                 "a presented Discord message repeated"
             );
+            pile.close().unwrap();
+        });
+    }
+
+    /// A sentence somebody finished in the voice channel while they went on
+    /// speaking is news at once, marked as said by somebody still speaking;
+    /// the utterance it belongs to, once stored, is news of its own with the
+    /// whole transcript, and the sentence, presented or not, is news no more.
+    #[test]
+    fn a_sentence_heard_while_speaking_is_news_until_its_utterance_is_stored() {
+        crate::test_support::clear_ambient_environment();
+        runtime().unwrap().block_on(async {
+            use crate::discord::operations::unix_millisecond;
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let reader_id = id(90);
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "reader".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, profile)
+                .unwrap();
+
+            let channel = "100000000000000200";
+            let speaker = "100000000000000400";
+            let start = unix_millisecond(1_791_000_000_000);
+            let mut facts = crate::discord::intake_fragment(channel, 100000000000000000).unwrap();
+            facts += crate::discord::sentence_fragment(
+                channel,
+                speaker,
+                start,
+                unix_millisecond(1_791_000_001_300),
+                "Hello there.",
+            )
+            .unwrap();
+            pile.commit(sources.discord.source, &fixture.signer, facts)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let first = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { text, events, .. } = &first else {
+                panic!("a sentence heard while speaking is news");
+            };
+            assert_eq!(events.len(), 1, "{text}");
+            assert!(
+                text.contains(&format!(
+                    "News: Discord message from {speaker} in channel {channel} (still speaking): \
+                     Hello there."
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "New Discord messages:\n- {speaker} in channel {channel} (still speaking): \
+                     Hello there.\n"
+                )),
+                "{text}"
+            );
+            let mut output = Vec::new();
+            apply_news_to_writer(
+                &mut pile,
+                &fixture.signer,
+                reader_id,
+                false,
+                &first,
+                "",
+                &mut output,
+            )
+            .unwrap();
+
+            pile.commit(
+                sources.discord.source,
+                &fixture.signer,
+                crate::discord::utterance_fragment(
+                    channel,
+                    speaker,
+                    start,
+                    "Hello there. How are you?",
+                    b"RIFF".to_vec(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let second = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { text, events, .. } = &second else {
+                panic!("the utterance is news of its own");
+            };
+            assert_eq!(events.len(), 1, "{text}");
+            assert!(
+                text.contains(&format!(
+                    "New Discord messages:\n- {speaker} in channel {channel}: Hello there. How \
+                     are you?\n"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("still speaking"), "{text}");
             pile.close().unwrap();
         });
     }
@@ -9034,7 +9589,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let News::Report { text, events } = &news else {
+            let News::Report { text, events, .. } = &news else {
                 panic!("a Discord message from somebody else is news");
             };
             assert_eq!(events.len(), 1, "{text}");
@@ -9123,7 +9678,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let News::Report { text, events } = &news else {
+            let News::Report { text, events, .. } = &news else {
                 panic!("Discord messages from somebody else are news");
             };
             assert_eq!(events.len(), 2, "{text}");
@@ -9388,7 +9943,7 @@ mod tests {
             read.observations, 5,
             "the one read forward, and the recent page reconciled"
         );
-        let News::Report { text, events } =
+        let News::Report { text, events, .. } =
             runtime.block_on(take_news(&fixture.path, &signer, reader_id))
         else {
             panic!("a message sent while intake was down is news");
@@ -9436,7 +9991,7 @@ mod tests {
         let mut gateway = heard;
         gateway["guild_id"] = json!("1553078565199683675");
         assert_eq!(intake.handle(Work::Message(gateway)).unwrap(), Done::Stored);
-        let News::Report { text, events } =
+        let News::Report { text, events, .. } =
             runtime.block_on(take_news(&fixture.path, &signer, reader_id))
         else {
             panic!("a message sent after intake began is news");
@@ -9506,7 +10061,7 @@ mod tests {
             Done::Stored
         );
 
-        let News::Report { text, events } =
+        let News::Report { text, events, .. } =
             runtime.block_on(take_news(&fixture.path, &signer, reader_id))
         else {
             panic!("what somebody said in voice is news");
@@ -9667,10 +10222,20 @@ mod tests {
             Done::Stored
         );
 
-        let News::Report { text, events } = news.news() else {
+        let News::Report {
+            text,
+            stream,
+            events,
+        } = news.news()
+        else {
             panic!("somebody joining the voice channel is news");
         };
         assert_eq!(events.len(), 2, "{text}");
+        assert_eq!(
+            stream,
+            "[voice] Ada joined the voice channel\n[voice] Ada: can you hear me?\n"
+        );
+
         assert_eq!(
             news_lines(&text),
             [
@@ -9696,7 +10261,7 @@ mod tests {
 
         // Leaving is news of its own; what was presented is not news again.
         news.presence(Presence::Left, 1_790_455_302_000);
-        let News::Report { text, events } = news.news() else {
+        let News::Report { text, events, .. } = news.news() else {
             panic!("somebody leaving the voice channel is news");
         };
         assert_eq!(events.len(), 1, "{text}");
@@ -9733,7 +10298,7 @@ mod tests {
         ] {
             news.presence(presence, seen_ms);
         }
-        let News::Report { text, events } = news.news() else {
+        let News::Report { text, events, .. } = news.news() else {
             panic!("somebody coming and going is news");
         };
         assert_eq!(events.len(), 5, "{text}");

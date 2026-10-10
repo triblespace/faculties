@@ -27,7 +27,9 @@
 //! the utterance itself ([`discord::kind_utterance`]: who spoke, in which
 //! channel, from when), since no snowflake names it, and its observation
 //! carries the transcript as content and the audio beside it
-//! ([`discord::utterance_audio`]).
+//! ([`discord::utterance_audio`]). A sentence finished while the speaker
+//! went on is published before the utterance closes, as a record of its own
+//! that links the utterance and is no message ([`discord::kind_heard_sentence`]).
 //!
 //! Somebody coming into or leaving that voice channel is a system notice
 //! there: a message by them with no content, marked as a notice, whose
@@ -213,6 +215,23 @@ pub mod discord {
     /// `3D20B9F91AE85C3778B71123578F1599`.
     #[allow(non_upper_case_globals)]
     pub const kind_utterance: Id = id_hex!("3D20B9F91AE85C3778B71123578F1599");
+    /// Tag for a sentence somebody finished in a voice channel while they
+    /// went on speaking: the hearing's transcript had moved past its end,
+    /// so it is published before the utterance it belongs to closes. It
+    /// links that utterance's anchor through [`message`] and carries the
+    /// sentence as `archive::content`, its speaker as `archive::author`, its
+    /// [`channel`], and as `metadata::created_at` when the hearing had heard
+    /// it (the end of the audio whose transcript showed it finished; not
+    /// when the sentence itself ended, which the transcriber does not say).
+    /// It is not a message: no audio, no `archive::kind_message`, so a
+    /// reader of messages never sees it. The utterance, once stored, holds
+    /// the whole transcript and audio, this sentence included; a reader
+    /// looking for news takes the sentence for news only until then.
+    ///
+    /// Minted with `trible genid` on 2026-10-10:
+    /// `1990A670956927EEC6C9C45D53B96B47`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_heard_sentence: Id = id_hex!("1990A670956927EEC6C9C45D53B96B47");
     /// Tag for the stable anchor of somebody coming into a voice channel:
     /// who ([`user`]) came into which [`channel`], seen when
     /// (`metadata::created_at`). Like an utterance's, it is a message anchor

@@ -235,6 +235,19 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
+        self.poll_in(pile, signer, input, peek, NewsForm::Report, output)
+    }
+
+    /// [`Self::poll`], writing any report in `form`.
+    pub(super) fn poll_in(
+        &mut self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        input: &str,
+        peek: bool,
+        form: NewsForm,
+        output: &mut Out<'_>,
+    ) -> Result<(bool, Option<Epoch>)> {
         self.maintain_if_changed(pile, signer)?;
         if let Some(note) = &self.receipt_maintenance_note {
             output.line(note)?;
@@ -266,6 +279,7 @@ impl HealthSources {
             peek,
             &news,
             "",
+            form,
             output,
         )?;
         Ok((fired, report.next_change))
@@ -522,6 +536,7 @@ impl HealthObservation {
         }
         use std::fmt::Write as _;
         let mut text = String::new();
+        let mut stream = String::new();
         // Wait/poll are an attention channel, not a health dashboard. Each
         // reason already identifies the changed subject and actionable state;
         // the complete resident snapshot remains available through `show`.
@@ -536,18 +551,24 @@ impl HealthObservation {
                     .entry(group.clone())
                     .or_default()
                     .push(event),
-                _ => writeln!(text, "News: {}", event.reason()).unwrap(),
+                _ => {
+                    writeln!(text, "News: {}", event.reason()).unwrap();
+                    push_stream_line(&mut stream, &event.reason());
+                }
             }
         }
         for (group, events) in collection_groups {
-            if events.len() == 1 {
-                writeln!(text, "News: {}", events[0].reason()).unwrap();
+            let reason = if events.len() == 1 {
+                events[0].reason()
             } else {
-                writeln!(text, "News: {}", group.reason(events.len())).unwrap();
-            }
+                group.reason(events.len())
+            };
+            writeln!(text, "News: {reason}").unwrap();
+            push_stream_line(&mut stream, &reason);
         }
         News::Report {
             text,
+            stream,
             events: pending.ids().collect(),
         }
     }
@@ -2230,7 +2251,8 @@ mod tests {
         };
         let observation = f.observe_at(at(1.0));
         let (text, events) = match observation.news(persona, &report) {
-            News::Report { text, events } => (text, events),
+            News::Report { text, events, .. } => (text, events),
+
             News::Quiet => panic!("grouped alerts must remain actionable"),
         };
         assert_eq!(text.lines().count(), 1);

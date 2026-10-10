@@ -200,6 +200,39 @@ impl Utterance {
     }
 }
 
+/// A sentence somebody finished in a voice channel while they went on
+/// speaking: what `discord live` publishes before the utterance it belongs
+/// to closes, stored as a `kind_heard_sentence` record
+/// ([`Discord::observe_sentence`]), never as an utterance of its own. The
+/// utterance, once it closes, holds the whole transcript and audio.
+///
+/// Its Debug output, like an [`Utterance`]'s, never carries the text.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Sentence {
+    pub channel: u64,
+    pub user: u64,
+    /// When the utterance it belongs to began, in milliseconds since the
+    /// Unix epoch: that utterance's [`Utterance::start_ms`].
+    pub start_ms: u64,
+    /// When the hearing had heard it finished, in milliseconds since the
+    /// Unix epoch: the end of the audio whose transcript showed more words
+    /// after it.
+    pub heard_ms: u64,
+    pub text: String,
+}
+
+impl std::fmt::Debug for Sentence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sentence")
+            .field("channel", &self.channel)
+            .field("user", &self.user)
+            .field("start_ms", &self.start_ms)
+            .field("heard_ms", &self.heard_ms)
+            .field("text_chars", &self.text.chars().count())
+            .finish()
+    }
+}
+
 /// Somebody coming into or leaving a voice channel, as `discord live` sees
 /// the members of its own ([`super::presence::Members`]); stored as a system
 /// notice there ([`Discord::observe_presence`]).
@@ -224,7 +257,7 @@ impl PresenceChange {
 }
 
 /// A moment in milliseconds since the Unix epoch, as a point interval.
-fn unix_millisecond(milliseconds: u64) -> Inline<NsTAIInterval> {
+pub(crate) fn unix_millisecond(milliseconds: u64) -> Inline<NsTAIInterval> {
     epoch_interval(Epoch::from_unix_duration(
         hifitime::Unit::Millisecond * milliseconds as i64,
     ))
@@ -458,6 +491,28 @@ impl Discord {
                 "discord: heard user {} in voice channel {channel} at {}",
                 utterance.user,
                 format_interval(utterance.started())
+            ),
+        )
+    }
+    /// Store a sentence somebody finished in a voice channel while they went
+    /// on speaking ([`discord_model::sentence_fragment`]), with where intake
+    /// hears the channel from, as [`Self::observe_utterance`] does.
+    pub fn observe_sentence(&self, sentence: &Sentence, floor: u64) -> Result<CollectionCommit> {
+        let channel = sentence.channel.to_string();
+        let mut fragment = discord_model::sentence_fragment(
+            &channel,
+            &sentence.user.to_string(),
+            unix_millisecond(sentence.start_ms),
+            unix_millisecond(sentence.heard_ms),
+            &sentence.text,
+        )?;
+        fragment += discord_model::intake_fragment(&channel, floor)?;
+        self.storage().publish(
+            fragment,
+            format!(
+                "discord: heard user {} finish a sentence in voice channel {channel} at {}",
+                sentence.user,
+                format_interval(unix_millisecond(sentence.heard_ms))
             ),
         )
     }
