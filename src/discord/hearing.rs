@@ -42,10 +42,12 @@ const TICK: usize = RATE / 50;
 /// unknown meanwhile) ends, and what comes after begins a new one, so an
 /// utterance's time is never taken from a clock that stood still.
 const GAP_MS: u64 = 1_000;
-/// Let an ordinary conversational pause remain inside a Discord utterance.
-/// This adds 500 ms to an isolated silence close versus shared VAD defaults;
-/// retained tail, preroll, max duration and explicit close rules stay unchanged.
-const END_SILENCE_MS: usize = 1_200;
+/// Silence that ends a Discord utterance. It was 1 200 ms so that ordinary
+/// pauses stayed inside one utterance; JP, 2026-10-10, preferred hearing the
+/// end of a sentence sooner: "worst case, we just kind of schedule a new one
+/// right after that one, and then you get them both". Retained tail, preroll,
+/// max duration and explicit close rules stay unchanged.
+const END_SILENCE_MS: usize = 600;
 
 /// What hearing runs with.
 pub struct Config {
@@ -795,7 +797,7 @@ mod tests {
         let script = [
             (false, 600),
             (true, 800),
-            (false, 900),
+            (false, 400),
             (true, 800),
             (false, 1200),
         ];
@@ -830,31 +832,35 @@ mod tests {
                 let Work::Utterance(item) = work else {
                     panic!("unexpected intake work")
                 };
-                published_early |= end_ms < 4300;
+                published_early |= end_ms < 3200;
                 published.push(item);
             }
         }
         // Expected behavioral RED on 1ead: two publications, not one. This
         // assertion precedes the no-early-publication checks.
-        assert_eq!(published.len(), 1, "900 ms pause must not split the turn");
+        assert_eq!(
+            published.len(),
+            1,
+            "a 400 ms pause, under the 600 ms close, must not split the turn"
+        );
         assert_eq!(captured.len(), 1);
         assert!(
             pushed_before_pause,
             "recognition must stay online during speech"
         );
-        assert!(!published_early, "no partial news before the 1200 ms close");
+        assert!(!published_early, "no partial news before the 600 ms close");
         assert!(active.is_none());
         assert_eq!(ear.peak.get(), 1);
         assert_eq!(ear.live.get(), 0);
         assert_eq!(*ear.finished.borrow(), [0]);
         // Three onset frames complete at660ms; the unchanged240ms preroll
-        // begins at420ms. Second burst ends3100ms; keep exactly200ms tail.
-        let expected = &all_pcm[RATE * 420 / 1000..RATE * 3300 / 1000];
+        // begins at420ms. Second burst ends 2600 ms; keep exactly200ms tail.
+        let expected = &all_pcm[RATE * 420 / 1000..RATE * 2800 / 1000];
         let (user, start, pcm) = &captured[0];
         assert_eq!((*user, *start), (JP, 420));
         assert_eq!(pcm, expected);
         assert_eq!(ear.attempts.borrow().as_slice(), &[expected.to_vec()]);
-        let pause = (RATE * (1400 - 420) / 1000)..(RATE * (2300 - 420) / 1000);
+        let pause = (RATE * (1400 - 420) / 1000)..(RATE * (1800 - 420) / 1000);
         assert!(pcm[pause].iter().all(|&s| s == 0.0));
         assert!(pcm[pcm.len() - RATE / 5..].iter().all(|&s| s == 0.0));
         assert!(
