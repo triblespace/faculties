@@ -25,9 +25,9 @@ A trible is exactly 64 bytes:
     (`compass status`, `wiki title`, …). Minted once,
     never guessed.
   - *Value*: 32 bytes. Small values (timestamps, weights,
-    short strings, other entity ids) live inline. Anything
-    bigger (a document, an image) lives as a blob addressed
-    by its 32-byte hash — the trible holds the hash.
+    other entity ids) live inline. Text, however short, and
+    anything bigger (a document, an image) lives as a blob
+    addressed by its 32-byte hash — the trible holds the hash.
 
 == Why fixed-width matters
 
