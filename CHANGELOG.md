@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Build against the triblespace sync redesign (transport generation 30), which
+  removed `PeerConfig::peers`. `TRIBLESPACE_PEERS` is gone: nothing reads it.
+  A command's first network contact is the pile's sync daemon, named by the key
+  the command signs with, or by the pile's key file for a command that signs
+  nothing; it is dialled at the sockets the daemon recorded in the pile's
+  configuration, or found by key. `Storage::shared_with_peers` becomes
+  `Storage::shared_with_daemon`, whose explicit contact is a daemon key (or
+  none) instead of a list of routes. The `iroh-tickets` dependency goes.
+
 - Text attributes no longer use the 32-byte inline `ShortString`. Compass
   tag and status, Files tag, Habit label and state, the Comb cursor's
   stream, persona and grain, Planner summary, RRULE, location, status and

@@ -191,7 +191,6 @@ triblespace-paths = { version = "0.47.0", path = "../triblespace-rs/triblespace-
 triblespace-search = { version = "0.47.0", path = "../triblespace-rs/triblespace-search" }
 triblespace-net = { version = "0.47.0", path = "../triblespace-rs/triblespace-net" }
 iroh-base = "1.0"
-iroh-tickets = "1.0"
 iroh = "1.0"  # CLI output to Drive's existing organ endpoint
 framed-stream = { package = "faculties-framed-stream", version = "0.1.0", path = "framed-stream" }  # native ordered media framing
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "net", "sync", "signal", "macros"] }

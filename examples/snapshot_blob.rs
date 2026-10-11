@@ -2,12 +2,13 @@
 //!
 //! `cargo run --release --example snapshot_blob -- --pile /path/to/self.pile <64-hex-handle>`
 //!
-//! Uses the existing `TRIBLESPACE_PEERS` bootstrap configuration. Missing bytes
-//! may be fetched and cached, but this example does not select a collection,
-//! load a signing key, or publish a WANT. Standard output contains only the byte
-//! count. Diagnostics go to standard error; `RUST_LOG` overrides the default
-//! `warn,triblespace_net::host=debug` filter, including exact-fetch misses,
-//! errors, and end-to-end deadlines.
+//! Reaches the network through the pile's sync daemon, named by the pile's key
+//! file when one resolves (`TRIBLESPACE_KEY`, else `self.key` beside the pile).
+//! Missing bytes may be fetched and cached, but this example does not select a
+//! collection, sign anything, or publish a WANT. Standard output contains only
+//! the byte count. Diagnostics go to standard error; `RUST_LOG` overrides the
+//! default `warn,triblespace_net::host=debug` filter, including exact-fetch
+//! misses, errors, and end-to-end deadlines.
 
 use std::path::PathBuf;
 

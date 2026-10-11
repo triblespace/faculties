@@ -121,7 +121,9 @@ mod workspace_tests;
 pub struct Storage {
     pile: PathBuf,
     key: Option<PathBuf>,
-    peers: Option<Vec<iroh_base::EndpointAddr>>,
+    /// An application's explicit first contact, which replaces the CLI's
+    /// pile-key default: `Some(None)` is no contact at all.
+    daemon: Option<Option<VerifyingKey>>,
     collections: Option<Arc<CollectionRoutes>>,
     expected_signer: Option<VerifyingKey>,
     local_only: bool,
@@ -190,7 +192,7 @@ impl Storage {
         Self {
             pile,
             key,
-            peers: None,
+            daemon: None,
             collections: None,
             expected_signer: None,
             local_only: false,
@@ -205,7 +207,7 @@ impl Storage {
         Self {
             pile,
             key,
-            peers: None,
+            daemon: None,
             collections: None,
             expected_signer: None,
             local_only: false,
@@ -213,18 +215,20 @@ impl Storage {
         }
     }
 
-    /// An embedded application's explicit routes. Unlike CLI storage, this
-    /// owner never consults `TRIBLESPACE_PEERS`, including when the list is empty.
+    /// An embedded application's explicit first contact: the key of the sync
+    /// daemon its leech dials, at the addresses that daemon recorded in the
+    /// pile's configuration, or none. Unlike CLI storage, this owner never
+    /// derives the contact from the host key, including when it is `None`.
     /// Exact acquisitions still use one ephemeral, non-serving leech identity.
-    pub fn shared_with_peers(
+    pub fn shared_with_daemon(
         pile: PathBuf,
         key: Option<PathBuf>,
-        peers: Vec<iroh_base::EndpointAddr>,
+        daemon: Option<VerifyingKey>,
     ) -> Self {
         Self {
             pile,
             key,
-            peers: Some(peers),
+            daemon: Some(daemon),
             collections: None,
             expected_signer: None,
             local_only: false,
@@ -237,18 +241,16 @@ impl Storage {
     }
 
     /// One resident-only application owner. Exact missing bytes fail; neither
-    /// an empty peer list nor ambient discovery is treated as network consent.
+    /// an absent daemon nor ambient discovery is treated as network consent.
     pub fn shared_local(pile: PathBuf, key: Option<PathBuf>) -> Self {
-        let mut storage = Self::shared_with_peers(pile, key, Vec::new());
+        let mut storage = Self::shared_with_daemon(pile, key, None);
         storage.local_only = true;
         storage
     }
 
     fn open_owned_store(&self, host: VerifyingKey) -> Result<FacultyStore> {
-        let mut store = match &self.peers {
-            Some(peers) => {
-                lazy_store_with_peers(|| open_pile_strict_as(&self.pile, host), peers.clone())?
-            }
+        let mut store = match self.daemon {
+            Some(daemon) => lazy_store(|| open_pile_strict_as(&self.pile, host), daemon)?,
             None => open_store_as(&self.pile, host)?,
         };
         if self.local_only {
@@ -624,56 +626,37 @@ where
 /// frontier node. Right for a reader that holds no key; anything that
 /// publishes or reads through merges opens with [`open_store_as`].
 ///
-/// `TRIBLESPACE_PEERS` supplies comma-separated bootstrap endpoint tickets or
-/// endpoint ids, not blob providers to probe in order. The DHT finds providers.
-/// This foreground client joins no collection gossip topics and announces no
-/// providers. Its ephemeral transport identity is deliberately separate from
-/// both the durable author and any already-running replication daemon.
+/// The leech's first contact is the pile's sync daemon, which runs as the
+/// pile's own key, when that key's file resolves (`TRIBLESPACE_KEY`, else
+/// `self.key` beside the pile); without one it has no contact.
 pub fn open_store(path: &Path) -> Result<FacultyStore> {
-    lazy_store(|| open_pile_strict(path))
+    let daemon = signing_key_file::load_existing(&signing_key_file::resolve_path(None, path))
+        .ok()
+        .map(|key| key.verifying_key());
+    lazy_store(|| open_pile_strict(path), daemon)
 }
 
 /// [`open_store`] as `host`, the durable key the caller signs with: the fold
 /// believes the MERGEs `host` signed and no other key's, so the caller's own
-/// carries are believed and its reads attach its own merges.
+/// carries are believed and its reads attach its own merges. The leech's
+/// first contact is the sync daemon that runs as `host`.
 pub fn open_store_as(path: &Path, host: VerifyingKey) -> Result<FacultyStore> {
-    lazy_store(|| open_pile_strict_as(path, host))
+    lazy_store(|| open_pile_strict_as(path, host), Some(host))
 }
 
-/// Wrap the pile `open` returns in the foreground leech. The pile is opened
-/// only once the peer configuration has parsed, so a bad route leaves it
-/// untouched.
-fn lazy_store(open: impl FnOnce() -> Result<Pile>) -> Result<FacultyStore> {
-    use iroh_base::{EndpointAddr, EndpointId};
-    use iroh_tickets::endpoint::EndpointTicket;
-
-    let routes = std::env::var("TRIBLESPACE_PEERS").or_else(|error| match error {
-        std::env::VarError::NotPresent => Ok(String::new()),
-        error => Err(error),
-    })?;
-    let peers = routes
-        .split(',')
-        .map(str::trim)
-        .filter(|route| !route.is_empty())
-        .map(|route| {
-            if let Ok(ticket) = route.parse::<EndpointTicket>() {
-                return Ok(EndpointAddr::from(ticket));
-            }
-            route
-                .parse::<EndpointId>()
-                .map(EndpointAddr::from)
-                .with_context(|| format!("invalid TRIBLESPACE_PEERS endpoint {route:?}"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    lazy_store_with_peers(open, peers)
-}
-
-fn lazy_store_with_peers(
+/// Wrap the pile `open` returns in the foreground leech, whose one first
+/// contact is `daemon`, the key the pile's sync daemon runs as. The leech
+/// dials it at the addresses the daemon recorded in the pile's
+/// configuration, or finds it by key when there are none, and the daemon's
+/// DHT replies lead on to the providers. The leech syncs no collection and
+/// announces no providers. Its transport identity is a fresh key per process,
+/// separate from both the durable author and the daemon's endpoint.
+fn lazy_store(
     open: impl FnOnce() -> Result<Pile>,
-    peers: Vec<iroh_base::EndpointAddr>,
+    daemon: Option<VerifyingKey>,
 ) -> Result<FacultyStore> {
     use rand_core::RngCore;
-    use triblespace_net::peer::{PeerConfig, ReconcileDirection, ReconcileQos};
+    use triblespace_net::peer::PeerConfig;
     let mut secret = [0; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut secret)
@@ -685,10 +668,7 @@ fn lazy_store_with_peers(
         open()?,
         key,
         PeerConfig {
-            peers,
-            qos: ReconcileQos {
-                direction: ReconcileDirection::ReadOnly,
-            },
+            daemon,
             provider_publication_budget: Some(0),
             bind: None,
         },
