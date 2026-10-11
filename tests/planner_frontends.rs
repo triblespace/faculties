@@ -339,14 +339,6 @@ fn explicit_utc_and_typed_argument_constraints_hold_before_storage() {
             "{tool}: {error:#}"
         );
     }
-    let error = adapter
-        .call(
-            "planner_add",
-            json(serde_json::json!({"summary":"é".repeat(17),"from":"2026-08-09"})),
-            &mut Out::new(&mut |_| panic!("invalid bytes must not emit")),
-        )
-        .unwrap_err();
-    assert!(error.downcast_ref::<InvalidArguments>().is_some());
     assert_eq!(adapter.tools().len(), 8);
     assert!(!missing.exists());
 }

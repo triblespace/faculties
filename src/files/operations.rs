@@ -194,14 +194,27 @@ fn source_path_of<P: TriblePattern, R: BlobStoreGet>(
         .map(|view| view.as_ref().to_string()))
 }
 
-/// The entity's tags as text. A tag whose text is not in the reader is left
-/// out, like any value a typed read cannot decode.
-fn tags_of<P: TriblePattern, R: BlobStoreGet>(space: &P, reader: &R, eid: Id) -> Vec<String> {
+/// The entity's tags as text. A tag whose handle is that of one of `known`
+/// takes that text without fetching its blob; any other is read, and one the
+/// reader does not hold is left out, like any value a typed read cannot
+/// decode.
+fn tags_of<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
+    reader: &R,
+    eid: Id,
+    known: &[String],
+) -> Vec<String> {
     find!(
         t: TextHandle,
         pattern!(space, [{ eid @ file::tag: ?t }])
     )
     .filter_map(|t| {
+        if let Some(word) = known
+            .iter()
+            .find(|word| word.as_str().to_owned().to_blob().get_handle() == t)
+        {
+            return Some(word.clone());
+        }
         let tag: View<str> = reader.get(t).ok()?;
         Some(tag.to_string())
     })
@@ -685,8 +698,11 @@ fn cmd_list<P: TriblePattern>(
         (eid: Id, h: FileHandle),
         pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
-        let tags = tags_of(space, reader, eid);
-        if !filter_tags.is_empty() && !filter_tags.iter().all(|ft| tags.iter().any(|t| t == ft)) {
+        // Filter by content handle, so a file the filter drops costs no fetch.
+        if !filter_tags
+            .iter()
+            .all(|ft| exists!(pattern!(space, [{ eid @ file::tag: ft.as_str() }])))
+        {
             continue;
         }
         let mime = read_mime(space, reader, eid)?.unwrap_or_else(|| "?".into());
@@ -697,6 +713,7 @@ fn cmd_list<P: TriblePattern>(
             }
         }
         let fname = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
+        let tags = tags_of(space, reader, eid, filter_tags);
 
         let hash = handle_hex(h);
         entries.push((hash, fname, mime, tags));
@@ -774,7 +791,7 @@ fn cmd_show<P: TriblePattern>(space: &P, reader: &PileSnapshot, id: &str) -> Res
         bail!("unknown entity kind for '{id}'");
     }
 
-    let tags = tags_of(space, reader, eid);
+    let tags = tags_of(space, reader, eid, &[]);
     if !tags.is_empty() {
         writeln!(output, "Tags:     {}", tags.join(", "))?;
     }
@@ -827,8 +844,7 @@ fn cmd_tag<P: TriblePattern>(
 ) -> Result<()> {
     let eid = file_capability::resolve_selector(space, id)?;
 
-    let existing = tags_of(space, reader, eid);
-    if existing.iter().any(|t| t == tag_name) {
+    if exists!(pattern!(space, [{ eid @ file::tag: tag_name }])) {
         out.line(format!("Tag '{tag_name}' already present."))?;
         return Ok(());
     }
@@ -855,7 +871,7 @@ fn cmd_search<P: TriblePattern>(space: &P, reader: &PileSnapshot, query: &str) -
     ) {
         let fname = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
         let mime = read_mime(space, reader, eid)?.unwrap_or_else(|| "?".into());
-        let tags = tags_of(space, reader, eid);
+        let tags = tags_of(space, reader, eid, &[]);
 
         let fname_match = fname.to_lowercase().contains(&needle);
         let tag_match = tags.iter().any(|t| t.to_lowercase().contains(&needle));
@@ -894,7 +910,7 @@ fn cmd_imports<P: TriblePattern>(space: &P, reader: &PileSnapshot) -> Result<Str
     ) {
         let ts = imported_at_of(space, eid).unwrap_or(0);
         let src = source_path_of(space, reader, eid)?;
-        let tags = tags_of(space, reader, eid);
+        let tags = tags_of(space, reader, eid, &[]);
         imports.push((ts, eid, src, tags));
     }
 
@@ -1349,7 +1365,7 @@ fn cmd_similar<P: TriblePattern>(
         let name = read_name(space, &reader, eid)?.unwrap_or_else(|| "?".into());
         let mime = read_mime(space, &reader, eid)?.unwrap_or_else(|| "?".into());
         let hash = handle_hex(content);
-        let tags = tags_of(space, &reader, eid);
+        let tags = tags_of(space, &reader, eid, &[]);
         let tagstr = if tags.is_empty() {
             String::new()
         } else {

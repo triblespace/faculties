@@ -413,16 +413,30 @@ fn task_title<P: TriblePattern>(
         .map(Option::unwrap_or_default)
 }
 
+/// The text of a status or tag word. A word whose handle is that of one of
+/// `known` (the default statuses, and whatever a filter named) takes that text
+/// without fetching its blob; any other is read.
+fn word(reader: &impl BlobStoreGet, handle: TextHandle, known: &[&str]) -> Result<String> {
+    match known
+        .iter()
+        .find(|word| crate::schemas::compass::text_handle(word) == handle)
+    {
+        Some(word) => Ok((*word).to_owned()),
+        None => read_text(reader, handle),
+    }
+}
+
 fn task_tags<P: TriblePattern>(
     reader: &impl BlobStoreGet,
     space: &P,
     task_id: Id,
+    known: &[&str],
 ) -> Result<Vec<String>> {
     let mut tags: Vec<String> = find!(
         tag: TextHandle,
         pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
     )
-    .map(|tag| read_text(reader, tag))
+    .map(|tag| word(reader, tag, known))
     .collect::<Result<_>>()?;
     tags.sort();
     tags.dedup();
@@ -445,7 +459,7 @@ fn task_latest_status<P: TriblePattern>(
     task_id: Id,
 ) -> Result<Option<(String, IntervalValue)>> {
     latest_status_event(space, status_register, task_id)
-        .map(|(_, status, at)| Ok((read_text(reader, status)?, at)))
+        .map(|(_, status, at)| Ok((word(reader, status, &DEFAULT_STATUSES)?, at)))
         .transpose()
 }
 
@@ -588,24 +602,40 @@ fn render_board<P: TriblePattern>(
     );
 
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
+    let text_handle = crate::schemas::compass::text_handle;
+    let mut known: Vec<&str> = DEFAULT_STATUSES.to_vec();
+    known.extend(status_filter.iter().map(String::as_str));
+    known.extend(tag_filter.iter().map(String::as_str));
 
     for &task_id in &goal_ids {
-        let (status, status_at) = task_latest_status(reader, space, status_register, task_id)?
-            .map(|(s, at)| (s, Some(at)))
-            .unwrap_or_else(|| ("todo".to_string(), None));
-
+        // Filter by content handle, so a goal the filters drop costs no fetch.
+        let latest = latest_status_event(space, status_register, task_id);
+        let status_handle = latest
+            .map(|(_, status, _)| status)
+            .unwrap_or_else(|| text_handle("todo"));
         if status_filter.is_empty() {
-            if !show_done && status == "done" {
+            if !show_done && status_handle == text_handle("done") {
                 continue;
             }
-        } else if !status_filter.iter().any(|s| s == &status) {
+        } else if !status_filter
+            .iter()
+            .any(|s| text_handle(s) == status_handle)
+        {
+            continue;
+        }
+        if !tag_filter.is_empty()
+            && !tag_filter.iter().any(|t| {
+                exists!(pattern!(space, [{
+                    task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: t.as_str()
+                }]))
+            })
+        {
             continue;
         }
 
-        let tags = task_tags(reader, space, task_id)?;
-        if !tag_filter.is_empty() && !tags.iter().any(|t| tag_filter.contains(t)) {
-            continue;
-        }
+        let status = word(reader, status_handle, &known)?;
+        let status_at = latest.map(|(_, _, at)| at);
+        let tags = task_tags(reader, space, task_id, &known)?;
 
         let title = task_title(reader, space, task_id)?;
         let created_at = task_created_at(space, task_id);
@@ -983,7 +1013,7 @@ fn render_goal<P: TriblePattern>(
         writeln!(output, "Status: {} (since {})", status, format_interval(at))?;
     }
 
-    let tags = task_tags(reader, space, task_id)?;
+    let tags = task_tags(reader, space, task_id, &[])?;
     if !tags.is_empty() {
         writeln!(output, "Tags: {}", tags.join(", "))?;
     }
@@ -1014,7 +1044,7 @@ fn render_goal<P: TriblePattern>(
             interval_key(at),
             event,
             format_interval(at),
-            read_text(reader, status)?,
+            word(reader, status, &DEFAULT_STATUSES)?,
             event_actor(space, event),
         ))
     })
@@ -1523,6 +1553,12 @@ mod tests {
         expected.extend(
             find!(handle: TextHandle,
             pattern!(fragment.facts(), [{ note_id @ board::note: ?handle }]))
+            .map(|handle| handle.transmute()),
+        );
+        // The note's tag is shown, and a tag is text read from its blob.
+        expected.extend(
+            find!(handle: TextHandle,
+            pattern!(fragment.facts(), [{ note_id @ board::tag: ?handle }]))
             .map(|handle| handle.transmute()),
         );
         expected.extend(

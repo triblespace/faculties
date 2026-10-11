@@ -184,9 +184,13 @@ impl Body {
                         .map(|text| text.to_string())
                         .map_err(|error| anyhow::anyhow!("read note for capture {id:X}: {error}")))
                     .transpose()?.unwrap_or_default();
-                let modality = reader.get::<View<str>, _>(modality)
-                    .map(|text| text.to_string())
-                    .map_err(|error| anyhow::anyhow!("read modality for capture {id:X}: {error}"))?;
+                // A closed word: named by its handle, read only if unknown.
+                let modality = match super::modality_name(modality) {
+                    Some(name) => name.to_owned(),
+                    None => reader.get::<View<str>, _>(modality)
+                        .map(|text| text.to_string())
+                        .map_err(|error| anyhow::anyhow!("read modality for capture {id:X}: {error}"))?,
+                };
                 rows.push(CaptureSummary { id, tai_ns: interval_key(created), modality, note });
             }
             rows.sort_by(|a, b| (b.tai_ns, b.id).cmp(&(a.tai_ns, a.id)));
