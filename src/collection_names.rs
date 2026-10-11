@@ -35,7 +35,7 @@ use triblespace::core::trible::TribleSet;
 
 use crate::schemas::{
     atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings, files,
-    habit, headspace, mail, memory, message, orient, planner, posture, relations, status,
+    habit, headspace, mail, memory, message, models, orient, planner, posture, relations, status,
     swarm_health, teams, voice, web, wiki,
 };
 use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
@@ -54,6 +54,10 @@ use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
 /// The ones worth naming individually:
 ///
 /// - `memory` and `memory-comb` are the journal, first-person and personal.
+/// - `models` is the exception to the signer-private default: it is the
+///   model collection several hosts share, whose descriptor names its own
+///   multi-root policy. It is only ever opened by the exact handle the
+///   launcher configures (`model_storage::models`), never registered here.
 /// - `compass` and `wiki` are the two JP has floated sharing. Neither becomes
 ///   public here: his own design for compass is a collection that shares its
 ///   goals but not the personal notes attached to them, which is *two*
@@ -78,6 +82,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (memory::DEFAULT_SCOPE_ID, "memory-journal"),
         (memory::DEFAULT_COMB_SCOPE_ID, "memory-comb"),
         (message::DEFAULT_SCOPE_ID, "message"),
+        (models::COLLECTION_SCOPE_ID, models::COLLECTION_NAME),
         (orient::DEFAULT_SCOPE_ID, "orient"),
         (orient::RECEIPTS_SCOPE_ID, orient::RECEIPT_COLLECTION_NAME),
         (planner::DEFAULT_SCOPE_ID, "planner"),

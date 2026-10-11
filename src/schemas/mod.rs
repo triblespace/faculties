@@ -18,6 +18,7 @@ pub mod linkedin;
 pub mod mail;
 pub mod memory;
 pub mod message;
+pub mod models;
 pub mod orient;
 pub mod patience;
 pub mod planner;
