@@ -909,9 +909,14 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
         let semantic = shape.is_some();
         let turn_duration =
             record.record_type == "system" && record.subtype.as_deref() == Some("turn_duration");
+        // A compaction boundary starts a new physical chain. Its
+        // `logicalParentUuid` is not used as an edge: in live files it can
+        // name a record that itself descends from the boundary (observed in
+        // f03d61a4, 2026-10-11), which would close a cycle.
         let raw_parent = record
-            .effective_parent()
-            .map(|parent| SourceKey::new(key.session.clone(), parent.to_owned()));
+            .parent_uuid
+            .as_ref()
+            .map(|parent| SourceKey::new(key.session.clone(), parent.clone()));
         let fork_origin = record.fork_origin_key()?;
         if let Some(origin) = &fork_origin {
             scan.aliases.insert((key.clone(), origin.clone()));
@@ -1412,7 +1417,6 @@ struct RawRecord {
     session_id: Option<String>,
     uuid: Option<String>,
     parent_uuid: Option<String>,
-    logical_parent_uuid: Option<String>,
     attachment_type: Option<String>,
     title: Option<String>,
     forked_from: Option<ForkedFrom>,
@@ -1430,16 +1434,6 @@ struct ForkedFrom {
 }
 
 impl RawRecord {
-    /// The record's parent: `parentUuid`, or for a compaction boundary,
-    /// which starts a new physical chain, its `logicalParentUuid`.
-    fn effective_parent(&self) -> Option<&str> {
-        self.parent_uuid.as_deref().or_else(|| {
-            (self.record_type == "system" && self.subtype.as_deref() == Some("compact_boundary"))
-                .then_some(self.logical_parent_uuid.as_deref())
-                .flatten()
-        })
-    }
-
     fn source_key(&self) -> Option<SourceKey> {
         Some(SourceKey::new(self.session_id.clone()?, self.uuid.clone()?))
     }
@@ -1613,7 +1607,6 @@ fn scan_record(bytes: &mut Bytes) -> std::result::Result<RawRecord, sc::ScanErro
             "sessionId" => record.session_id = parse_optional_string(value)?,
             "uuid" => record.uuid = parse_optional_string(value)?,
             "parentUuid" => record.parent_uuid = parse_optional_string(value)?,
-            "logicalParentUuid" => record.logical_parent_uuid = parse_optional_string(value)?,
             "aiTitle" | "customTitle" => record.title = parse_optional_string(value)?,
             "attachment" => record.attachment_type = scan_attachment_type(value)?,
             "forkedFrom" => record.forked_from = scan_optional_forked_from(value)?,
