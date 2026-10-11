@@ -17,10 +17,11 @@ use {
 /// descriptor `TRIBLESPACE_COLLECTION_MODELS` names, read through a read-only
 /// file descriptor of the local pile.
 ///
-/// Local only, on purpose. Speech and hearing alias the selected tensors'
-/// pile bytes onto the GPU, and only bytes this pile holds can be aliased: a
-/// model that has not finished replicating here fails to load, naming the
-/// tensor, rather than loading partly or from the network.
+/// Local only, on purpose. Speech aliases Breeze's 16-bit tensors' pile bytes
+/// onto the GPU, and only bytes this pile holds can be aliased; a model that
+/// has not finished replicating here fails to load rather than loading partly
+/// or from the network. (Every four-bit projection, and all of hearing's
+/// tensors, are copied to the device.)
 #[cfg(any(feature = "voice-breeze", feature = "discord-hearing"))]
 pub(crate) fn models(path: &Path) -> Result<mary::model_collection::ModelPileSnapshot> {
     use crate::schemas::models::COLLECTION_SCOPE_ID;

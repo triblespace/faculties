@@ -25,9 +25,10 @@ pub enum ModelSources {
 #[derive(Clone, Debug)]
 pub struct BreezeSources {
     /// The pile whose model collection (`TRIBLESPACE_COLLECTION_MODELS`)
-    /// holds Breeze's `nvfp4` root. Its bytes are aliased onto the GPU, which
-    /// the pile allows: it is append-only, and compaction writes a new file
-    /// and renames it, leaving the mapped one untouched.
+    /// holds Breeze's `nvfp4` root. Its 16-bit tensors (embeddings, heads,
+    /// norms) are aliased onto the GPU, which the pile allows: it is
+    /// append-only, and compaction writes a new file and renames it, leaving
+    /// the mapped one untouched. Its four-bit projections are copied.
     pub pile: PathBuf,
     pub reference_wav: PathBuf,
     pub reference_text: PathBuf,
@@ -357,7 +358,7 @@ impl Synthesizer {
         };
         config.validate()?;
         let models = crate::model_storage::models(&source.pile)?;
-        // SAFETY: the selected tensors are aliased from the pile's mapping
+        // SAFETY: the 16-bit tensors are aliased from the pile's mapping
         // through CUDA storage teardown. The pile is append-only and is only
         // ever compacted into a new file that is then renamed over it, so the
         // mapped bytes, page prefixes included, never change under the alias.

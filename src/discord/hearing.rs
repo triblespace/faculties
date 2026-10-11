@@ -941,11 +941,8 @@ mod voxtral {
         /// utterance.
         pub fn load(pile: &Path) -> Result<Self> {
             let models = crate::model_storage::models(pile)?;
-            // SAFETY: the stored projections are aliased from the pile's
-            // mapping through CUDA teardown. The pile is append-only and is
-            // only ever compacted into a new file that is then renamed over
-            // it, so the mapped bytes, page prefixes included, never change.
-            let ears = unsafe { mary::hear::Ears::load(&models, Default::default()) }
+            // Every tensor is copied to the device; nothing stays aliased.
+            let ears = mary::hear::Ears::load(&models, Default::default())
                 .with_context(|| format!("load Voxtral from the models of {}", pile.display()))?;
             Ok(Self { ears })
         }
