@@ -69,6 +69,10 @@ const FAILED_IN_A_ROW: u32 = 3;
 /// so its cadence runs across its sentences; a longer one is cut between
 /// sentences, never inside one.
 const MAX_PIECE_CHARS: usize = 400;
+/// A measured synthesis rate (seconds of audio per second) at or above which
+/// a sentence starts playing on its first hop. Breeze in four-bit runs at about
+/// 2; below this the prebuffer keeps its margin, e.g. when hearing shares the GPU.
+const FAST_ENOUGH_RATE: f64 = 1.5;
 /// The synthesizer's PCM: 24 kHz mono.
 const SAMPLE_RATE: u32 = mary::speak::SpeakStream::SAMPLE_RATE;
 
@@ -1455,6 +1459,14 @@ impl Synthesis {
             let Some(rate) = self.production.rate().or(known) else {
                 break;
             };
+            // Comfortably faster than real time: the first hop is enough.
+            // Breeze ramps its first hops (2, 2, 3, 5 frames, then 8) so the
+            // next one lands before the first runs out at about twice real
+            // time (2026-10-11, mary breeze/early-hop); the half-second floor
+            // of prebuffer_target_secs is for slower synthesis.
+            if rate >= FAST_ENOUGH_RATE {
+                break;
+            }
             let seconds = buffered.len() as f32 / SAMPLE_RATE as f32;
             if seconds >= prebuffer_target_secs(self.estimate, rate as f32) {
                 break;
