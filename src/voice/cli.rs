@@ -160,9 +160,9 @@ fn execute_stream(cli: Cli) -> Result<()> {
         eprintln!("  [half-duplex] holding {}", path.display());
         crate::turntaking::PauseGuard::hold(path)
     });
+    let synthesizer = Synthesizer::new(ModelSources::from_environment(Some(&pile)));
     let storage = crate::storage::Storage::shared(pile, key);
     let voice = Voice::with_storage(storage.clone());
-    let synthesizer = Synthesizer::new(ModelSources::from_environment());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let result = super::stream::run(
@@ -178,8 +178,8 @@ fn execute_stream(cli: Cli) -> Result<()> {
 }
 
 pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
+    let synthesizer = Synthesizer::new(ModelSources::from_environment(Some(&cli.pile)));
     let voice = Voice::new(cli.pile, cli.key);
-    let synthesizer = Synthesizer::new(ModelSources::from_environment());
     let device = Device::new(voice.clone(), cli.daemon, cli.soma, synthesizer.clone());
     match cli.command {
         None => anyhow::bail!("Voice requires an explicit command"),

@@ -36,12 +36,17 @@ pub struct BreezeSources {
 }
 impl ModelSources {
     /// Capture launcher configuration without opening any file or device.
-    pub fn from_environment() -> Self {
-        Self::from_lookup(&|name| std::env::var_os(name), &crate::model_dir())
+    /// `pile` is the faculty's own pile, whose model collection Breeze reads.
+    pub fn from_environment(pile: Option<&Path>) -> Self {
+        Self::from_lookup(&|name| std::env::var_os(name), &crate::model_dir(), pile)
             .unwrap_or_else(|error| Self::Invalid(error.to_string()))
     }
 
-    fn from_lookup(get: &impl Fn(&str) -> Option<OsString>, directory: &Path) -> Result<Self> {
+    fn from_lookup(
+        get: &impl Fn(&str) -> Option<OsString>,
+        directory: &Path,
+        pile: Option<&Path>,
+    ) -> Result<Self> {
         let backend = get("FACULTIES_VOICE_BACKEND").unwrap_or_else(|| "qwen3tts".into());
         match backend.to_str() {
             Some("qwen3tts") => Ok(Self::Qwen3Tts {
@@ -92,8 +97,13 @@ impl ModelSources {
                     cfg_scale == 1.0 || direction.is_some(),
                     "non-unit Breeze CFG requires an explicit direction"
                 );
+                let pile = pile
+                    .context(
+                        "Breeze reads its model from the pile's model collection; it needs a pile",
+                    )?
+                    .to_path_buf();
                 Ok(Self::Breeze(BreezeSources {
-                    pile: path("PILE")?,
+                    pile,
                     reference_wav: path("FACULTIES_BREEZE_REFERENCE_WAV")?,
                     reference_text: path("FACULTIES_BREEZE_REFERENCE_TEXT")?,
                     direction,
@@ -506,7 +516,6 @@ mod tests {
     fn breeze_settings() -> Vec<(&'static str, OsString)> {
         vec![
             ("FACULTIES_VOICE_BACKEND", "breeze".into()),
-            ("PILE", "/explicit/self.pile".into()),
             (
                 "FACULTIES_BREEZE_REFERENCE_WAV",
                 "/explicit/preferred-float.wav".into(),
@@ -527,6 +536,7 @@ mod tests {
                     .map(|(_, value)| value.clone())
             },
             Path::new("/qwen-only-model-directory"),
+            Some(Path::new("/explicit/self.pile")),
         )
     }
 
@@ -633,7 +643,6 @@ mod tests {
     #[test]
     fn breeze_rejects_missing_paths_without_io() {
         for key in [
-            "PILE",
             "FACULTIES_BREEZE_REFERENCE_WAV",
             "FACULTIES_BREEZE_REFERENCE_TEXT",
         ] {
@@ -641,6 +650,18 @@ mod tests {
             settings.retain(|(name, _)| *name != key);
             assert!(parse_settings(&settings).is_err(), "{key}");
         }
+        let settings = breeze_settings();
+        let without_pile = ModelSources::from_lookup(
+            &|key| {
+                settings
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.clone())
+            },
+            Path::new("/qwen-only-model-directory"),
+            None,
+        );
+        assert!(without_pile.is_err(), "Breeze without a pile");
     }
 
     #[test]

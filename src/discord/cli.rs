@@ -418,6 +418,7 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
             #[cfg(feature = "discord-hearing")]
             hearing,
             state,
+            pile: cli.pile.clone(),
         }),
     }));
     // Whatever is still running (a download, say) does not hold the process

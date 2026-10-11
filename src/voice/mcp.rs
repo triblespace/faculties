@@ -43,7 +43,8 @@ impl Voice {
                 synthesizer: None,
             };
         }
-        Self::with_storage_and_sources(storage, ModelSources::from_environment())
+        let sources = ModelSources::from_environment(Some(storage.path()));
+        Self::with_storage_and_sources(storage, sources)
     }
     pub fn with_sources(pile: PathBuf, key: Option<PathBuf>, sources: ModelSources) -> Self {
         Self::with_storage_and_sources(crate::storage::Storage::new(pile, key), sources)

@@ -151,6 +151,8 @@ pub struct Config {
     pub greeting: String,
     /// The state directory whose queue is spoken.
     pub state: StateDir,
+    /// The bot's pile, whose model collection the Breeze voice reads.
+    pub pile: Option<std::path::PathBuf>,
     /// What the channel is heard with; nobody is heard without it.
     #[cfg(feature = "discord-hearing")]
     pub hearing: Option<super::hearing::Config>,
@@ -191,6 +193,7 @@ async fn run(
         announce,
         greeting,
         state,
+        pile,
         #[cfg(feature = "discord-hearing")]
         hearing,
     } = config;
@@ -215,7 +218,7 @@ async fn run(
     let mut link = Link::new(connected, interruptions.clone());
     let greet = announce.map(|channel| (token, channel, greeting));
     let mut speaker = tokio::spawn(speak_queue(
-        SpeechWorker::start(ModelSources::from_environment()),
+        SpeechWorker::start(ModelSources::from_environment(pile.as_deref())),
         state,
         Voice {
             driver: driver.clone(),
