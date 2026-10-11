@@ -127,9 +127,11 @@ enum Command {
     /// review by the normal mechanism — and it is written in the register you
     /// use for your own notes, moments after the work, to a reader you imagine
     /// as yourself. That combination is how internal vocabulary reaches a public
-    /// remote. It also checks added and removed Rust lines for changes to
-    /// literal-pinned `unsafe as` attribute declarations, independently of
-    /// channel vocabulary.
+    /// remote. It also reports added literal-pinned `unsafe as` attribute
+    /// declarations (a new pin, or a pin whose hex, name or encoding changed),
+    /// independently of channel vocabulary. Removing a pin is not reported:
+    /// the id is then derived from anchor plus encoding, so old data cannot be
+    /// reinterpreted.
     Git {
         /// Revision arguments, passed to `git log` as written. Usually a range
         /// (`origin/main..HEAD`), but any git revision selection works — and
@@ -150,6 +152,10 @@ enum Command {
 #[derive(Subcommand)]
 enum VocabCommand {
     /// Protect a term from a channel
+    ///
+    /// Writes a protected state superseding the term's released state, or
+    /// the term's first state. Protecting an already protected term writes
+    /// nothing; its existing reason stays.
     Add {
         term: String,
         #[arg(long, default_value = "github-public")]
@@ -159,7 +165,20 @@ enum VocabCommand {
         #[arg(long)]
         why: Option<String>,
     },
-    /// List protected terms
+    /// Release a protected term on a channel, so it is no longer checked
+    ///
+    /// Writes a released state superseding the term's current protected
+    /// state. Releasing a term that is already released writes nothing;
+    /// `vocab add` protects it again.
+    Release {
+        term: String,
+        #[arg(long, default_value = "github-public")]
+        channel: String,
+        /// Why the term may now appear on this channel.
+        #[arg(long)]
+        why: Option<String>,
+    },
+    /// List protected terms, and separately the released ones
     List {
         #[arg(long)]
         channel: Option<String>,
@@ -214,6 +233,10 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             VocabCommand::Add { term, channel, why } => {
                 presentation::policy(&posture.vocab_add(&term, &channel, why.as_deref())?, out)
             }
+            VocabCommand::Release { term, channel, why } => presentation::policy(
+                &posture.vocab_release(&term, &channel, why.as_deref())?,
+                out,
+            ),
             VocabCommand::List { channel } => {
                 presentation::vocabulary(&posture.vocab_list(channel.as_deref())?, out)
             }

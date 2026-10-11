@@ -17,7 +17,7 @@ use crate::schemas::posture::{
     modality, posture, DEFAULT_POLICY_SCOPE_ID, DEFAULT_SCAN_SCOPE_ID, DOC_UNSUPPORTED,
     EXEMPLAR_PROTECTED, KIND_CHANNEL, KIND_DOCUMENT, KIND_FINDING, KIND_LEGACY_BRIDGE,
     KIND_OMISSION, KIND_POLICY_REVISION, KIND_SCAN, KIND_SIGHTING, KIND_TERM, OUTCOME_EXAMINED,
-    OUTCOME_PARSE_FAILED,
+    OUTCOME_PARSE_FAILED, TERM_RELEASED,
 };
 #[cfg(test)]
 use crate::schemas::posture::{CARRIER_CONTAINER_MEMBER, CARRIER_GIT_BLOB, CARRIER_GIT_COMMIT};
@@ -41,6 +41,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
+use triblespace::core::query::register::{maximal, ObservationOrder};
 type PileSnapshot = AcquiringReader<FacultySnapshot>;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
@@ -124,32 +125,75 @@ pub struct ScanRecord {
     pub findings: usize,
     pub target: String,
 }
-#[derive(Debug)]
-pub enum VocabularyState {
-    Missing,
-    Forked(Vec<Id>),
-    Ready {
-        revision: Id,
-        terms: Vec<(String, String)>,
-    },
+/// One head of a term's protection register.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TermState {
+    pub id: Id,
+    pub protected: bool,
+    /// Every rationale annotating the state, sorted. Concurrent writers of
+    /// the same transition each leave theirs on the one shared state.
+    pub why: Vec<String>,
+}
+/// A term's register on one channel, reduced to its heads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TermRegister {
+    pub term: String,
+    /// The states nothing supersedes, sorted. Never empty.
+    pub heads: Vec<TermState>,
+}
+impl TermRegister {
+    /// Fail closed: protected while ANY head protects.
+    pub fn protected(&self) -> bool {
+        self.heads.iter().any(|head| head.protected)
+    }
+    /// More than one head. Protect and release strictly alternate and the
+    /// reason is an annotation, so writers on one head collapse into one
+    /// successor and the register is a chain. Several heads can only come
+    /// from records older than the register (or a bug); they are reported,
+    /// never resolved, and the next write supersedes them all.
+    pub fn divergent(&self) -> bool {
+        self.heads.len() > 1
+    }
+    /// The rationale of the current value (of the protecting heads when the
+    /// term is protected), joined for display.
+    pub fn why(&self) -> String {
+        let protected = self.protected();
+        self.heads
+            .iter()
+            .filter(|head| head.protected == protected)
+            .flat_map(|head| head.why.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 #[derive(Debug)]
 pub struct VocabularyChannel {
     pub id: Id,
     pub name: String,
-    pub state: VocabularyState,
+    /// Every term ever written on this channel, sorted by term.
+    pub terms: Vec<TermRegister>,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum PolicyMemberKind {
-    Term,
-    Exemplar { benign: bool, words: usize },
+    /// A term register state. `superseded` counts the heads it replaced.
+    Term {
+        released: bool,
+        superseded: usize,
+    },
+    Exemplar {
+        benign: bool,
+        words: usize,
+    },
 }
 #[derive(Debug)]
 pub struct PolicyReceipt {
     pub channel_id: Id,
     pub channel: String,
     pub member: Id,
-    /// None when no new policy revision was needed.
+    /// The new exemplar policy revision; None when none was needed, and
+    /// always None for a term state, which is its own register.
     pub revision: Option<Id>,
     pub published: bool,
     pub kind: PolicyMemberKind,
@@ -317,6 +361,14 @@ impl Posture {
     }
     pub fn vocab_add(&self, term: &str, channel: &str, why: Option<&str>) -> Result<PolicyReceipt> {
         self.with_operation(|storage| cmd_vocab_add(storage, term, channel, why))
+    }
+    pub fn vocab_release(
+        &self,
+        term: &str,
+        channel: &str,
+        why: Option<&str>,
+    ) -> Result<PolicyReceipt> {
+        self.with_operation(|storage| cmd_vocab_release(storage, term, channel, why))
     }
     pub fn vocab_list(&self, channel: Option<&str>) -> Result<Vec<VocabularyChannel>> {
         self.with_operation(|storage| cmd_vocab_list(storage, channel))
@@ -3834,48 +3886,169 @@ fn take_exemplars_with_body(
     Ok(replaced)
 }
 
-fn channel_terms(
-    reader: &PileSnapshot,
-    space: &impl TriblePattern,
-    channel: Id,
-) -> Result<Vec<(String, String)>> {
-    let (_, members) = policy_members(space, channel)?;
-    let mut terms = Vec::new();
-    for member in members {
-        if !exists!(pattern!(space, [{ (member) @ metadata::tag: (&KIND_TERM) }])) {
-            continue;
+/// Term records the channel's older policy-snapshot DAG retired: members of
+/// some snapshot that no current snapshot carries. Before terms had their own
+/// register, re-adding a term with a new reason replaced its member in the
+/// next snapshot; that replacement is supersession evidence the record itself
+/// cannot carry, so it is honoured here rather than reported as a divergence.
+fn retired_by_policy<P: TriblePattern>(space: &P, channel: Id) -> BTreeSet<Id> {
+    let order = ObservationOrder::new(space, metadata::supersedes.id());
+    let mut ever = BTreeSet::new();
+    let mut current = BTreeSet::new();
+    for (revision, member) in find!(
+        (revision: Id, member: Id),
+        pattern!(space, [{
+            ?revision @
+            metadata::tag: (&KIND_POLICY_REVISION),
+            posture::in_channel: (channel),
+            posture::policy_member: ?member
+        }])
+    ) {
+        ever.insert(member);
+        if !order.dominated(revision) {
+            current.insert(member);
         }
-        let term = one_required(
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ (member) @ posture::term: ?value }])
-            )
-            .collect(),
-            "term text",
-        )?;
-        let why = one_optional(
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ (member) @ posture::why: ?value }])
-            )
-            .collect(),
-            "term rationale",
-        )?;
-        terms.push((
-            read_text(reader, term, "term text")?,
-            why.map(|handle| read_text(reader, handle, "term rationale"))
-                .transpose()?
-                .unwrap_or_default(),
-        ));
     }
-    terms.sort();
-    Ok(terms)
+    ever.difference(&current).copied().collect()
 }
 
-fn cmd_vocab_add(
+/// Every term register on `channel`, reduced to its heads.
+///
+/// The register's subject is the term on the channel; its order is the
+/// `metadata::supersedes` DAG between states. Heads are read in the frame of
+/// `space`; concurrent heads are all returned, never arbitrated.
+fn term_registers<P: TriblePattern + Sync>(
+    reader: &PileSnapshot,
+    space: &P,
+    channel: Id,
+) -> Result<Vec<TermRegister>> {
+    let order = ObservationOrder::new(space, metadata::supersedes.id());
+    let retired = retired_by_policy(space, channel);
+    let mut registers: BTreeMap<String, Vec<TermState>> = BTreeMap::new();
+    for (state, text) in find!(
+        (state: Id, text: TextHandle),
+        and!(
+            pattern!(space, [{
+                ?state @
+                metadata::tag: (&KIND_TERM),
+                posture::in_channel: (channel),
+                posture::term: ?text
+            }]),
+            maximal(state, &order),
+        )
+    ) {
+        if retired.contains(&state) {
+            continue;
+        }
+        let roles = find!(
+            role: Id,
+            pattern!(space, [{ (state) @ posture::role: ?role }])
+        )
+        .collect::<BTreeSet<_>>();
+        // A role-less record predates explicit roles and meant "protected".
+        // A role this reader does not know is skipped, not refused.
+        let protected = if roles.is_empty() || roles.contains(&EXEMPLAR_PROTECTED) {
+            true
+        } else if roles.contains(&TERM_RELEASED) {
+            false
+        } else {
+            continue;
+        };
+        let mut why = find!(
+            value: TextHandle,
+            pattern!(space, [{ (state) @ posture::why: ?value }])
+        )
+        .map(|handle| read_text(reader, handle, "term rationale"))
+        .collect::<Result<Vec<_>>>()?;
+        why.sort();
+        why.dedup();
+        registers
+            .entry(read_text(reader, text, "term text")?)
+            .or_default()
+            .push(TermState {
+                id: state,
+                protected,
+                why,
+            });
+    }
+    Ok(registers
+        .into_iter()
+        .map(|(term, mut heads)| {
+            heads.sort();
+            heads.dedup();
+            TermRegister { term, heads }
+        })
+        .collect())
+}
+
+/// The active vocabulary: every term whose register currently protects it,
+/// with its rationale.
+fn channel_terms(
+    reader: &PileSnapshot,
+    space: &(impl TriblePattern + Sync),
+    channel: Id,
+) -> Result<Vec<(String, String)>> {
+    Ok(term_registers(reader, space, channel)?
+        .into_iter()
+        .filter(TermRegister::protected)
+        .map(|register| {
+            let why = register.why();
+            (register.term, why)
+        })
+        .collect())
+}
+
+/// The one state that follows `heads` with value `protected`, and its
+/// rationale annotation.
+///
+/// The identity core is the subject (term on channel), the value, and the
+/// superseded heads — nothing else. Protect and release strictly alternate,
+/// so every head has exactly one possible successor: two writers acting on
+/// the same head, including a stale writer acting on an older one, produce
+/// the SAME entity and collapse. The reason is an annotation hung on that
+/// entity, never part of its core, so concurrent writers keep both reasons
+/// instead of forking the register.
+fn term_state_fragment(
+    channel: Id,
+    term: &str,
+    protected: bool,
+    why: Option<&str>,
+    heads: &[Id],
+) -> (Fragment, Id) {
+    let mut fragment = Fragment::empty();
+    let term_handle: TextHandle = fragment.put(term.to_owned());
+    let role = if protected {
+        EXEMPLAR_PROTECTED
+    } else {
+        TERM_RELEASED
+    };
+    let state = entity! {
+        metadata::tag: KIND_TERM,
+        posture::in_channel: channel,
+        posture::term: term_handle,
+        posture::role: role,
+        metadata::supersedes*: heads.to_vec(),
+    };
+    let id = state.root().expect("intrinsic term state has one root");
+    fragment += state;
+    if let Some(why) = why {
+        let why: TextHandle = fragment.put(why.to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&id) @ posture::why: why };
+    }
+    (fragment, id)
+}
+
+/// Move a term's register to `protected`, or report that it already is.
+///
+/// Writing the value the head already has is a no-op: nothing is written and
+/// the receipt says so. A register with several heads is not a state this
+/// design can reach (see [`term_state_fragment`]); it can only come from
+/// records older than the register, and a write supersedes all of them.
+fn write_term_state(
     storage: PostureStorage<'_>,
     term: &str,
     channel: &str,
+    protected: bool,
     why: Option<&str>,
 ) -> Result<PolicyReceipt> {
     let channel_name = canonical_channel(channel)?;
@@ -3890,65 +4063,61 @@ fn cmd_vocab_add(
             bail!("canonical channel identity disagrees with stored channel");
         }
     }
-    let (head, mut members) = policy_members(&view.facts, channel_id)?;
-
-    let mut replaced = BTreeSet::new();
-    for member in &members {
-        if !exists!(pattern!(&view.facts, [{ (*member) @ metadata::tag: (&KIND_TERM) }])) {
-            continue;
-        }
-        let handle = one_required(
-            find!(
-                value: TextHandle,
-                pattern!(&view.facts, [{ (*member) @ posture::term: ?value }])
-            )
-            .collect(),
-            "term text",
-        )?;
-        if read_text(&view.reader, handle, "term text")? == term_text {
-            replaced.insert(*member);
-        }
+    let heads = term_registers(&view.reader, &view.facts, channel_id)?
+        .into_iter()
+        .find(|register| register.term == term_text)
+        .map(|register| register.heads)
+        .unwrap_or_default();
+    if !protected && heads.is_empty() {
+        bail!("{term_text:?} has never been protected on channel {channel_name:?}; nothing to release");
     }
-    for member in &replaced {
-        members.remove(member);
-    }
-
-    let term_handle: TextHandle = fragment.put(term_text.clone());
-    let why_handle: Option<TextHandle> = why_text.map(|text| fragment.put(text.to_owned()));
-    let term = entity! {
-        metadata::tag: KIND_TERM,
-        posture::in_channel: channel_id,
-        posture::term: term_handle,
-        posture::role: EXEMPLAR_PROTECTED,
-        posture::why?: why_handle,
-    };
-    let term_id = term.root().expect("intrinsic term has one root");
-    fragment += term;
-    members.insert(term_id);
-
-    if replaced == BTreeSet::from([term_id]) {
-        return Ok(PolicyReceipt {
-            channel_id,
-            channel: channel_name,
-            member: term_id,
-            revision: None,
-            published: false,
-            kind: PolicyMemberKind::Term,
-            text: term_text,
-        });
-    }
-    let predecessors = head.into_iter().collect();
-    let revision = append_policy_revision(&mut fragment, channel_id, &members, &predecessors);
-    storage.publish_policy(fragment, "posture policy term")?;
-    Ok(PolicyReceipt {
+    let receipt = |member: Id, published: bool, superseded: usize| PolicyReceipt {
         channel_id,
-        channel: channel_name,
-        member: term_id,
-        revision: Some(revision),
-        published: true,
-        kind: PolicyMemberKind::Term,
-        text: term_text,
-    })
+        channel: channel_name.clone(),
+        member,
+        revision: None,
+        published,
+        kind: PolicyMemberKind::Term {
+            released: !protected,
+            superseded,
+        },
+        text: term_text.clone(),
+    };
+    if let [head] = heads.as_slice() {
+        if head.protected == protected {
+            return Ok(receipt(head.id, false, 0));
+        }
+    }
+
+    let head_ids = heads.iter().map(|head| head.id).collect::<Vec<_>>();
+    let (state, state_id) =
+        term_state_fragment(channel_id, &term_text, protected, why_text, &head_ids);
+    fragment += state;
+    let description = if protected {
+        "posture term protected"
+    } else {
+        "posture term released"
+    };
+    storage.publish_policy(fragment, description)?;
+    Ok(receipt(state_id, true, head_ids.len()))
+}
+
+fn cmd_vocab_add(
+    storage: PostureStorage<'_>,
+    term: &str,
+    channel: &str,
+    why: Option<&str>,
+) -> Result<PolicyReceipt> {
+    write_term_state(storage, term, channel, true, why)
+}
+
+fn cmd_vocab_release(
+    storage: PostureStorage<'_>,
+    term: &str,
+    channel: &str,
+    why: Option<&str>,
+) -> Result<PolicyReceipt> {
+    write_term_state(storage, term, channel, false, why)
 }
 
 fn cmd_vocab_list(
@@ -3981,39 +4150,13 @@ fn cmd_vocab_list(
         .into_iter()
         .filter(|(name, _)| wanted.as_ref().is_none_or(|wanted| wanted == name))
         .map(|(name, id)| {
-            let state = match resolve_policy_head(&view.facts, id)? {
-                PolicyHead::Missing => VocabularyState::Missing,
-                PolicyHead::Forked(heads) => VocabularyState::Forked(heads),
-                PolicyHead::Unique { revision, .. } => VocabularyState::Ready {
-                    revision,
-                    terms: channel_terms(&view.reader, &view.facts, id)?,
-                },
-            };
-            Ok(VocabularyChannel { id, name, state })
+            Ok(VocabularyChannel {
+                id,
+                name,
+                terms: term_registers(&view.reader, &view.facts, id)?,
+            })
         })
         .collect()
-}
-
-/// Collect every protected-term hit in a commit range: messages, file paths,
-/// and per-commit patches. The returned repository root and every locator are
-/// canonical identity coordinates; abbreviated hashes exist only in display.
-///
-/// ONE implementation, used by both `posture git` and `posture sweep`. Two
-/// copies of a security check drift, and the copy that drifts is the one that
-/// quietly stops looking.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum UnsafeAttributeChange {
-    Added,
-    Removed,
-}
-
-impl UnsafeAttributeChange {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Added => "added",
-            Self::Removed => "removed",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -4025,9 +4168,6 @@ pub struct GitHit {
     /// The commit the material was seen in — the rebuildable locator cache.
     pub seen_in: String,
     pub display: String,
-    /// Unsafe-attribute hits only: the pin claim without its direction, so an
-    /// add/remove pair that leaves the claim unchanged cancels.
-    pub claim: Option<(UnsafeAttributeChange, String)>,
 }
 
 fn canonical_git_root(repo_path: &Path) -> Result<PathBuf> {
@@ -4050,7 +4190,7 @@ struct GitAudit {
 }
 
 const UNSAFE_ATTRIBUTE_FINDING: &str =
-    "literal-pinned attribute identity (`unsafe as`) change requires justification";
+    "added literal-pinned attribute declaration (`unsafe as`) requires justification";
 
 fn abbreviated_object_id(object_id: &str) -> &str {
     &object_id[..object_id.len().min(8)]
@@ -4073,10 +4213,17 @@ fn git_hit(
             abbreviated_object_id(sha),
             text.trim()
         ),
-        claim: None,
     }
 }
 
+/// Only ADDED literal pins are findings. A literal pin promises that its
+/// encoding never changes; removing `unsafe` turns the hex into an anchor, so
+/// the attribute id is derived anew from anchor plus encoding and old data can
+/// no longer be reinterpreted, and deleting a pinned declaration cannot
+/// reinterpret data either. The risky edits are a new pin and a changed pin's
+/// hex, name or encoding, and in a diff both appear as an added pinned
+/// declaration text (JP, 2026-10-11).
+///
 /// Unlike a protected-text hit, the policy judgement here belongs to the
 /// source DECLARATION — its pinned id, name and encoding — not to a byte range
 /// in one blob. So the carrier is the declaration posture normalized out of
@@ -4088,37 +4235,33 @@ fn unsafe_attribute_hit(
     object_id: &str,
     position: &str,
     source_path: &str,
-    change: UnsafeAttributeChange,
     declaration: &UnsafeAttributeDeclaration,
 ) -> GitHit {
     let carrier = Carrier::member(declaration.text.as_bytes());
-    let claim = format!(
-        "{}\u{0}{source_path}#{}",
-        carrier.address(),
-        declaration.same_text_ordinal
-    );
-    let coordinate = format!(
-        "{} {source_path}#{}",
-        change.label(),
-        declaration.same_text_ordinal
-    );
+    // "added" stays in the coordinate: it is part of every published
+    // unsafe-attribute finding id, and their Decide justifications.
+    let coordinate = format!("added {source_path}#{}", declaration.same_text_ordinal);
     GitHit {
         location: Location::field(carrier, coordinate),
         evidence: format!(
-            "rust-attribute-{} {source_path}#{}  {}",
-            change.label(),
-            declaration.same_text_ordinal,
-            declaration.text
+            "rust-attribute-added {source_path}#{}  {}",
+            declaration.same_text_ordinal, declaration.text
         ),
         seen_in: object_id.to_owned(),
         display: format!(
-            "unsafe-attribute-{} {}:{position}  {}",
-            change.label(),
+            "unsafe-attribute-added {}:{position}  {}",
             abbreviated_object_id(object_id),
             declaration.text.trim()
         ),
-        claim: Some((change, claim)),
     }
+}
+
+fn unsafe_attribute_claim(source_path: &str, declaration: &UnsafeAttributeDeclaration) -> String {
+    format!(
+        "{}\u{0}{source_path}#{}",
+        Carrier::member(declaration.text.as_bytes()).address(),
+        declaration.same_text_ordinal
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -4252,14 +4395,14 @@ fn hunk_start(line: &str, prefix: char) -> Option<u64> {
     })
 }
 
-fn append_changed_unsafe_attributes(
+/// Every literal-pinned declaration in `treeish` that overlaps a changed line,
+/// with its source path and display position.
+fn changed_unsafe_attributes(
     repo_root: &Path,
-    display_commit: &str,
     treeish: &str,
-    change: UnsafeAttributeChange,
     changed_lines: BTreeMap<String, BTreeSet<u64>>,
-    hits: &mut Vec<GitHit>,
-) -> Result<()> {
+) -> Result<Vec<(String, String, UnsafeAttributeDeclaration)>> {
+    let mut changed = Vec::new();
     for (patch_path, changed_lines) in changed_lines {
         if patch_path == "/dev/null" {
             continue;
@@ -4284,38 +4427,10 @@ fn append_changed_unsafe_attributes(
                     declaration.start_line, declaration.end_line
                 )
             };
-            hits.push(unsafe_attribute_hit(
-                display_commit,
-                &position,
-                source_path,
-                change,
-                &declaration,
-            ));
+            changed.push((source_path.to_owned(), position, declaration));
         }
     }
-    Ok(())
-}
-
-fn unsafe_attribute_claims(hits: &[GitHit], direction: UnsafeAttributeChange) -> BTreeSet<String> {
-    hits.iter()
-        .filter_map(|hit| hit.claim.as_ref())
-        .filter(|(change, _)| *change == direction)
-        .map(|(_, claim)| claim.clone())
-        .collect()
-}
-
-fn cancel_unchanged_unsafe_attributes(hits: &mut Vec<GitHit>) {
-    let added = unsafe_attribute_claims(hits, UnsafeAttributeChange::Added);
-    let removed = unsafe_attribute_claims(hits, UnsafeAttributeChange::Removed);
-    let unchanged = added
-        .intersection(&removed)
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    hits.retain(|hit| {
-        hit.claim
-            .as_ref()
-            .is_none_or(|(_, claim)| !unchanged.contains(claim))
-    });
+    Ok(changed)
 }
 
 /// Audit one ordinary two-way commit edge. Merge commits are deliberately
@@ -4421,32 +4536,34 @@ fn collect_parent_unsafe_hits(
         }
     }
 
-    let mut edge_unsafe_hits = Vec::new();
-    append_changed_unsafe_attributes(
-        repo_root,
-        sha,
-        sha,
-        UnsafeAttributeChange::Added,
-        added_rust_lines,
-        &mut edge_unsafe_hits,
-    )?;
+    // Removed declarations are never findings (see `unsafe_attribute_hit`).
+    // They are still read, because a formatter may remove and add
+    // differently-spaced source lines while leaving the normalized
+    // path/name/encoding claim unchanged. That is not a pin lifecycle event
+    // and must retain its existing justification.
+    let mut removed_claims = BTreeSet::new();
     if !removed_rust_lines.is_empty() {
         let parent =
             parent.ok_or_else(|| anyhow!("root commit {sha} unexpectedly removes source lines"))?;
-        append_changed_unsafe_attributes(
-            repo_root,
-            sha,
-            parent,
-            UnsafeAttributeChange::Removed,
-            removed_rust_lines,
-            &mut edge_unsafe_hits,
-        )?;
+        for (source_path, _, declaration) in
+            changed_unsafe_attributes(repo_root, parent, removed_rust_lines)?
+        {
+            removed_claims.insert(unsafe_attribute_claim(&source_path, &declaration));
+        }
     }
-    // A formatter may remove and add differently-spaced source lines while
-    // leaving the normalized path/name/encoding claim unchanged. That is not a
-    // pin lifecycle event and must retain its existing justification.
-    cancel_unchanged_unsafe_attributes(&mut edge_unsafe_hits);
-    unsafe_attribute_hits.extend(edge_unsafe_hits);
+    for (source_path, position, declaration) in
+        changed_unsafe_attributes(repo_root, sha, added_rust_lines)?
+    {
+        if removed_claims.contains(&unsafe_attribute_claim(&source_path, &declaration)) {
+            continue;
+        }
+        unsafe_attribute_hits.push(unsafe_attribute_hit(
+            sha,
+            &position,
+            &source_path,
+            &declaration,
+        ));
+    }
     Ok(n_removed)
 }
 
@@ -4525,6 +4642,13 @@ fn collect_commit_patch_term_hits(
     Ok(n_added)
 }
 
+/// Collect every protected-term hit in a commit range: messages, file paths,
+/// and per-commit patches. The returned repository root and every locator are
+/// canonical identity coordinates; abbreviated hashes exist only in display.
+///
+/// ONE implementation, used by both `posture git` and `posture sweep`. Two
+/// copies of a security check drift, and the copy that drifts is the one that
+/// quietly stops looking.
 fn collect_hits(
     repo_path: &Path,
     revisions: &[String],

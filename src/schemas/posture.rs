@@ -106,6 +106,10 @@ pub const CARRIER_GIT_COMMIT: Id = id_hex!("06A6BAAF9D4DC2B6A4EACA0B7A15125D");
 /// predecessor snapshots are part of its intrinsic identity. Concurrent
 /// children remain visible as multiple DAG heads; consumers never choose one
 /// by clock or iterator order.
+///
+/// Since 2026-10-11 snapshots carry EXEMPLARS only. Terms moved to one
+/// register per term (see [`KIND_TERM`]); term members of older snapshots are
+/// still read, as the supersession evidence of that earlier design.
 pub const KIND_POLICY_REVISION: Id = id_hex!("716EFBC6B1E9619F713E3CC839ED00AD");
 
 /// A path the walker deliberately or accidentally could not descend into.
@@ -234,7 +238,33 @@ pub mod modality {
 // precise index of what is being protected, which is the argument for it never
 // leaving the machine.
 pub const KIND_CHANNEL: Id = id_hex!("25EEC04882BAFDB8077C692EF069BE5F");
+/// One STATE of a term's protection register on one channel (JP, 2026-10-11).
+///
+/// The register is anchored by the term on a channel: `posture::in_channel`
+/// plus `posture::term`. Each state's intrinsic identity is its value —
+/// `posture::role` ([`EXEMPLAR_PROTECTED`] or [`TERM_RELEASED`]) and the
+/// optional `posture::why` — together with the `metadata::supersedes` edges to
+/// the states it replaces. Supersession is part of identity, so protecting a
+/// released term again mints a new state rather than closing a cycle.
+///
+/// The current value is the head: the state nothing supersedes. Concurrent
+/// heads with different values are the only ambiguity, and readers report
+/// them instead of choosing by clock or order; while any head protects, the
+/// term is protected. Every write supersedes every head it saw.
+///
+/// A term record written before the register existed has exactly this shape
+/// with no supersedes edge, i.e. it IS an initial protected state, and nothing
+/// is migrated. The one thing the old design knew that this shape does not
+/// say is which records a later channel snapshot dropped (re-adding a term
+/// with a new reason replaced its member); readers honour that as
+/// supersession, so an old replacement does not resurface as a divergence.
 pub const KIND_TERM: Id = id_hex!("8FAB4029F0BC57F2184E8C491631CB88");
+
+/// Register value for a term that is no longer protected on its channel.
+///
+/// Minted with `trible genid` on 2026-10-11:
+/// `7C439597C57306BE061331682D59D0E8`.
+pub const TERM_RELEASED: Id = id_hex!("7C439597C57306BE061331682D59D0E8");
 
 /// An EXEMPLAR is a passage of the protected material itself, stored with its
 /// embedding, so the semantic tier can match content that spells none of the
@@ -273,15 +303,18 @@ pub mod posture {
         "2618BF2D4418EA1D006815517CA41927" unsafe as term: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Term → the channel it is protected FROM.
         "6860CCB7DCCEA0BE95BC07A35DCD5CBE" unsafe as in_channel: inlineencodings::GenId;
-        /// Term → why it is protected. Carried because a bare wordlist rots:
-        /// nobody dares remove an entry whose reason nobody recorded.
+        /// Term state → why it is protected, or why it was released. Carried
+        /// because a bare wordlist rots: nobody dares remove an entry whose
+        /// reason nobody recorded.
         "0B86BA9EB3A1B6FD0C70AC7B75A24E06" unsafe as why: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// Policy revision → one exact term or exemplar member. Repeated.
+        /// Policy revision → one exact exemplar member (older revisions also
+        /// list terms). Repeated.
         ///
         /// Minted with `trible genid` on 2026-08-08:
         /// `245EFCA76A6AAA2A17F512548C87A7E7`.
         "245EFCA76A6AAA2A17F512548C87A7E7" unsafe as policy_member: inlineencodings::GenId;
-        /// Term/exemplar → its explicit policy role.
+        /// Term/exemplar → its explicit policy role. A term state's role is
+        /// its register value: protected or [`TERM_RELEASED`].
         ///
         /// Minted with `trible genid` on 2026-08-08:
         /// `50DCC5C0FB746CC15772710DEBB65B1E`.

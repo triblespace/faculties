@@ -48,12 +48,17 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "posture_vocab_add",
-        description: "Add or replace a protected term's rationale in an explicit channel policy snapshot. Term and rationale are literal, with normal term/channel canonicalization. Existing policy forks require reconciliation; no arbitrary winner is selected.",
+        description: "Protect a term on a channel: write a protected state to the term's register, superseding its released state. Protecting an already protected term writes nothing. Term and rationale are literal, with normal term/channel canonicalization; the rationale annotates the state.",
+        input_schema: r#"{"type":"object","properties":{"term":{"type":"string","minLength":1},"channel":{"type":"string","minLength":1},"why":{"type":"string"}},"required":["term","channel"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "posture_vocab_release",
+        description: "Release a protected term on a channel: write a released state superseding its protected state, so audits stop checking it. Releasing an already released term writes nothing; a never-protected term is refused.",
         input_schema: r#"{"type":"object","properties":{"term":{"type":"string","minLength":1},"channel":{"type":"string","minLength":1},"why":{"type":"string"}},"required":["term","channel"],"additionalProperties":false}"#,
     },
     Tool {
         name: "posture_vocab_list",
-        description: "List protected channel vocabulary. Missing and forked policy snapshots stay visible; a fork is a failed operation, never resolved by time.",
+        description: "List channel vocabulary: protected terms, and separately released ones. A term register with several heads is reported as an error, never resolved by time.",
         input_schema: r#"{"type":"object","properties":{"channel":{"type":"string","minLength":1}},"additionalProperties":false}"#,
     },
     Tool {
@@ -225,6 +230,18 @@ impl Faculty for Posture {
                     &self
                         .operations
                         .vocab_add(&args.term, &args.channel, args.why.as_deref())?,
+                    out,
+                )
+            }
+            "posture_vocab_release" => {
+                let args: Add = decode_arguments(arguments)?;
+                super::validate_vocab(&args.term, &args.channel).map_err(invalid_arguments)?;
+                presentation::policy(
+                    &self.operations.vocab_release(
+                        &args.term,
+                        &args.channel,
+                        args.why.as_deref(),
+                    )?,
                     out,
                 )
             }

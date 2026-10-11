@@ -203,35 +203,58 @@ pub fn vocabulary(channels: &[VocabularyChannel], out: &mut Out<'_>) -> Result<(
     if channels.is_empty() {
         out.line("no channels defined (add one with posture vocab add <term> --channel <name>)")?;
     }
-    let mut forks = 0;
+    let mut divergent = 0;
+    let entry = |register: &TermRegister| {
+        let why = register.why();
+        if why.is_empty() {
+            format!("  {}", register.term)
+        } else {
+            format!("  {}  — {why}", register.term)
+        }
+    };
     for channel in channels {
         let name = &channel.name;
-        match &channel.state {
-            VocabularyState::Missing => out.line(format!("{name}  (!! no policy revision)"))?,
-            VocabularyState::Forked(heads) => {
-                forks += 1;
-                out.line(format!(
-                    "{name}  (!! FORKED across {} policy heads)",
-                    heads.len()
-                ))?;
-                for head in heads {
-                    out.line(format!("  {}", fmt_id(*head)))?;
-                }
+        let (protected, released): (Vec<_>, Vec<_>) = channel
+            .terms
+            .iter()
+            .partition(|register| register.protected());
+        out.line(format!("{name}  ({} protected term(s))", protected.len()))?;
+        for register in &protected {
+            out.line(entry(register))?;
+        }
+        if !released.is_empty() {
+            out.line(format!(
+                "{name}  released ({} term(s), not checked)",
+                released.len()
+            ))?;
+            for register in &released {
+                out.line(entry(register))?;
             }
-            VocabularyState::Ready { terms, .. } => {
-                out.line(format!("{name}  ({} term(s))", terms.len()))?;
-                for (term, why) in terms {
-                    if why.is_empty() {
-                        out.line(format!("  {term}"))?;
+        }
+        for register in channel.terms.iter().filter(|register| register.divergent()) {
+            divergent += 1;
+            out.line(format!(
+                "!! {name}: {:?} has {} register heads; the register is a chain, so this is a bug or pre-register data. Counted as {}.",
+                register.term,
+                register.heads.len(),
+                if register.protected() { "protected" } else { "released" }
+            ))?;
+            for head in &register.heads {
+                out.line(format!(
+                    "     {}  {}  {}",
+                    fmt_id(head.id),
+                    if head.protected {
+                        "protected"
                     } else {
-                        out.line(format!("  {term}  — {why}"))?;
-                    }
-                }
+                        "released"
+                    },
+                    head.why.join("; ")
+                ))?;
             }
         }
     }
-    if forks > 0 {
-        bail!("{forks} channel policy fork(s) require explicit reconciliation");
+    if divergent > 0 {
+        bail!("{divergent} term register(s) have several heads; one vocab add or vocab release supersedes them all");
     }
     Ok(())
 }
@@ -239,16 +262,23 @@ pub fn vocabulary(channels: &[VocabularyChannel], out: &mut Out<'_>) -> Result<(
 pub fn policy(receipt: &PolicyReceipt, out: &mut Out<'_>) -> Result<()> {
     let channel = &receipt.channel;
     match receipt.kind {
-        PolicyMemberKind::Term => {
-            let state = if receipt.published {
-                "protecting"
+        PolicyMemberKind::Term {
+            released,
+            superseded,
+        } => {
+            let verb = if released { "released" } else { "protecting" };
+            if receipt.published {
+                out.line(format!(
+                    "{verb} {:?} on channel {channel:?}  (state {}, superseding {superseded})",
+                    receipt.text,
+                    fmt_id(receipt.member)
+                ))
             } else {
-                "already protecting"
-            };
-            out.line(format!(
-                "{state} {:?} from channel {channel:?}",
-                receipt.text
-            ))
+                out.line(format!(
+                    "already {verb} {:?} on channel {channel:?}; nothing written",
+                    receipt.text
+                ))
+            }
         }
         PolicyMemberKind::Exemplar { benign, words } => {
             let role = if benign { "BENIGN" } else { "protected" };
@@ -313,7 +343,7 @@ pub fn git(report: &GitReport, out: &mut Out<'_>) -> Result<()> {
     }
     if !unsafe_attribute_hits.is_empty() {
         out.line(format!(
-            "{} literal-pinned Rust attribute declaration change(s) require justification:\n",
+            "{} added literal-pinned Rust attribute declaration(s) require justification:\n",
             unsafe_attribute_hits.len()
         ))?;
         for hit in unsafe_attribute_hits {
@@ -334,7 +364,7 @@ pub fn git(report: &GitReport, out: &mut Out<'_>) -> Result<()> {
         out.line(format!(
             "\nA finding stops blocking only after a Decide decision about its exact id \
              resolves with `--result benign`; the outcome text is free prose and stays yours \
-             to write. An unsafe-attribute change additionally requires a nonempty \
+             to write. An added unsafe-attribute pin additionally requires a nonempty \
              `decide propose --context` justification."
         ))?;
     }
@@ -347,7 +377,7 @@ pub fn git(report: &GitReport, out: &mut Out<'_>) -> Result<()> {
         "  - file contents outside this range's added lines"
     ))?;
     out.line(format!(
-        "  - removed-line protected terms (literal-pinned attribute declarations ARE checked)"
+        "  - removed-line protected terms, and removed literal pins (removing a pin cannot reinterpret data)"
     ))?;
     out.line(format!("  - author names, emails and commit dates"))?;
     out.line(format!(

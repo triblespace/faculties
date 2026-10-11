@@ -310,7 +310,7 @@ fn canonical_policy_write_and_registered_reads_are_idempotent() {
 }
 
 #[test]
-fn sibling_policy_revisions_remain_visible_and_block_consumers() {
+fn a_forked_policy_snapshot_blocks_exemplars_but_not_term_registers() {
     let store = TestStore::new();
     let mut fragment = Fragment::empty();
     let channel = append_channel(&mut fragment, "public-release");
@@ -336,13 +336,21 @@ fn sibling_policy_revisions_remain_visible_and_block_consumers() {
         PolicyHead::Forked(heads) => assert_eq!(heads.len(), 2),
         other => panic!("expected visible policy fork, got {other:?}"),
     }
-    drop(view);
-    let error = load_terms(store.storage(), "public-release").unwrap_err();
+    let error = policy_members(&view.facts, channel).unwrap_err();
     assert!(error.to_string().contains("FORKED"));
+    drop(view);
+    // Each term is its own register; neither snapshot retired either record.
+    assert_eq!(
+        load_terms(store.storage(), "public-release").unwrap(),
+        vec![
+            ("alpha".to_owned(), String::new()),
+            ("beta".to_owned(), String::new()),
+        ]
+    );
 }
 
 #[test]
-fn one_revision_preserves_parallel_annotations_of_the_same_term() {
+fn pre_register_parallel_annotations_are_two_heads_still_protected() {
     let store = TestStore::new();
     let mut fragment = Fragment::empty();
     let channel = append_channel(&mut fragment, "public-release");
@@ -361,16 +369,204 @@ fn one_revision_preserves_parallel_annotations_of_the_same_term() {
     );
 
     let view = store.storage().policy_view().unwrap();
+    let registers = term_registers(&view.reader, &view.facts, channel).unwrap();
+    assert_eq!(registers.len(), 1);
+    assert!(registers[0].divergent(), "reported, never resolved");
+    assert!(registers[0].protected());
     assert_eq!(
-        channel_terms(&view.reader, &view.facts, channel)
-            .unwrap()
-            .into_iter()
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([
-            ("alpha".to_owned(), "old rationale".to_owned()),
-            ("alpha".to_owned(), "new rationale".to_owned()),
-        ])
+        channel_terms(&view.reader, &view.facts, channel).unwrap(),
+        vec![(
+            "alpha".to_owned(),
+            "new rationale; old rationale".to_owned()
+        )]
     );
+    drop(view);
+
+    // One write supersedes both heads, and the register is a chain again.
+    let receipt = cmd_vocab_release(store.storage(), "alpha", "public-release", None).unwrap();
+    assert!(receipt.published);
+    assert!(matches!(
+        receipt.kind,
+        PolicyMemberKind::Term {
+            released: true,
+            superseded: 2
+        }
+    ));
+    let view = store.storage().policy_view().unwrap();
+    let registers = term_registers(&view.reader, &view.facts, channel).unwrap();
+    assert_eq!(registers[0].heads.len(), 1);
+    assert!(!registers[0].protected());
+}
+
+#[test]
+fn a_term_replaced_by_an_older_policy_snapshot_is_not_a_head() {
+    let store = TestStore::new();
+    let mut fragment = Fragment::empty();
+    let channel = append_channel(&mut fragment, "public-release");
+    let old = append_test_term(&mut fragment, channel, "alpha", Some("old rationale"));
+    let new = append_test_term(&mut fragment, channel, "alpha", Some("new rationale"));
+    let first = append_policy_revision(
+        &mut fragment,
+        channel,
+        &BTreeSet::from([old]),
+        &BTreeSet::new(),
+    );
+    append_policy_revision(
+        &mut fragment,
+        channel,
+        &BTreeSet::from([new]),
+        &BTreeSet::from([first]),
+    );
+    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, fragment, "replaced term fixture");
+
+    let view = store.storage().policy_view().unwrap();
+    let registers = term_registers(&view.reader, &view.facts, channel).unwrap();
+    assert_eq!(registers.len(), 1);
+    assert_eq!(registers[0].heads.len(), 1);
+    assert_eq!(registers[0].heads[0].id, new);
+    assert!(!registers[0].divergent());
+}
+
+#[test]
+fn release_stops_checking_a_term_and_protecting_again_mints_a_new_state() {
+    let store = TestStore::new();
+    let storage = store.storage();
+    let protected = cmd_vocab_add(
+        storage,
+        "Project-Sunrise",
+        "github-public",
+        Some("internal name"),
+    )
+    .unwrap();
+    assert!(protected.published);
+
+    let error = cmd_vocab_release(storage, "never-added", "github-public", None).unwrap_err();
+    assert!(error.to_string().contains("nothing to release"));
+
+    let released = cmd_vocab_release(
+        storage,
+        "project-sunrise",
+        "github-public",
+        Some("now public"),
+    )
+    .unwrap();
+    assert!(released.published);
+    assert_ne!(released.member, protected.member);
+    assert!(load_terms(storage, "github-public").unwrap().is_empty());
+
+    let channels = cmd_vocab_list(storage, Some("github-public")).unwrap();
+    assert_eq!(channels.len(), 1);
+    let register = &channels[0].terms[0];
+    assert_eq!(register.term, "project-sunrise");
+    assert!(!register.protected());
+    assert_eq!(register.why(), "now public");
+    assert_eq!(register.heads[0].id, released.member);
+
+    let length = std::fs::metadata(&store.pile).unwrap().len();
+    let again =
+        cmd_vocab_release(storage, "project-sunrise", "github-public", Some("other")).unwrap();
+    assert!(!again.published, "releasing a released term writes nothing");
+    assert_eq!(again.member, released.member);
+    assert_eq!(std::fs::metadata(&store.pile).unwrap().len(), length);
+
+    let reprotected = cmd_vocab_add(storage, "project-sunrise", "github-public", None).unwrap();
+    assert!(reprotected.published);
+    assert_ne!(
+        reprotected.member, protected.member,
+        "supersession is identity: protecting again is a new state, not a cycle"
+    );
+    assert_eq!(
+        load_terms(storage, "github-public").unwrap(),
+        vec![("project-sunrise".to_owned(), String::new())]
+    );
+}
+
+#[test]
+fn protecting_an_already_protected_term_writes_nothing() {
+    let store = TestStore::new();
+    let storage = store.storage();
+    let first = cmd_vocab_add(storage, "project-dawn", "github-public", Some("first")).unwrap();
+    storage.scan_view().unwrap();
+    let length = std::fs::metadata(&store.pile).unwrap().len();
+    let again = cmd_vocab_add(storage, "project-dawn", "github-public", Some("second")).unwrap();
+    assert!(!again.published);
+    assert_eq!(again.member, first.member);
+    assert_eq!(std::fs::metadata(&store.pile).unwrap().len(), length);
+    assert_eq!(
+        load_terms(storage, "github-public").unwrap(),
+        vec![("project-dawn".to_owned(), "first".to_owned())]
+    );
+}
+
+#[test]
+fn concurrent_releases_of_one_head_collapse_into_one_state_with_both_reasons() {
+    let store = TestStore::new();
+    let protected = cmd_vocab_add(store.storage(), "project-dusk", "github-public", None).unwrap();
+    let channel = protected.channel_id;
+
+    let (left, left_id) = term_state_fragment(
+        channel,
+        "project-dusk",
+        false,
+        Some("left reason"),
+        &[protected.member],
+    );
+    let (right, right_id) = term_state_fragment(
+        channel,
+        "project-dusk",
+        false,
+        Some("right reason"),
+        &[protected.member],
+    );
+    assert_eq!(left_id, right_id, "the reason is not part of the core");
+    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, left, "left release");
+    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, right, "right release");
+
+    let view = store.storage().policy_view().unwrap();
+    let registers = term_registers(&view.reader, &view.facts, channel).unwrap();
+    assert_eq!(registers.len(), 1);
+    assert_eq!(registers[0].heads.len(), 1);
+    assert_eq!(registers[0].heads[0].id, left_id);
+    assert!(!registers[0].protected());
+    assert_eq!(
+        registers[0].heads[0].why,
+        vec!["left reason".to_owned(), "right reason".to_owned()]
+    );
+}
+
+#[test]
+fn a_stale_writer_reproduces_the_existing_successor() {
+    let store = TestStore::new();
+    let storage = store.storage();
+    let initial = cmd_vocab_add(storage, "project-sunrise", "github-public", None).unwrap();
+    let released = cmd_vocab_release(storage, "project-sunrise", "github-public", None).unwrap();
+    let current = cmd_vocab_add(storage, "project-sunrise", "github-public", None).unwrap();
+
+    // A writer that only saw the initial state and releases it.
+    let (stale, stale_id) = term_state_fragment(
+        initial.channel_id,
+        "project-sunrise",
+        false,
+        Some("stale reason"),
+        &[initial.member],
+    );
+    assert_eq!(stale_id, released.member);
+    store.publish_raw(DEFAULT_POLICY_SCOPE_ID, stale, "stale release");
+    let view = store.storage().policy_view().unwrap();
+    let registers = term_registers(&view.reader, &view.facts, initial.channel_id).unwrap();
+    assert_eq!(registers[0].heads.len(), 1, "the chain does not fork");
+    assert_eq!(registers[0].heads[0].id, current.member);
+    assert!(registers[0].protected());
+
+    // The initial state is the same for every writer of the term and channel.
+    let (_, initial_id) = term_state_fragment(
+        initial.channel_id,
+        "project-sunrise",
+        true,
+        Some("any reason"),
+        &[],
+    );
+    assert_eq!(initial_id, initial.member);
 }
 
 #[test]
@@ -1302,19 +1498,14 @@ fn multiline_encoding_only_change_is_a_new_unsafe_attribute_occurrence() {
     );
 
     let after = collect_hits(directory.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
-    assert_eq!(after.unsafe_attribute_hits.len(), 2);
-    let added = after
-        .unsafe_attribute_hits
-        .iter()
-        .find(|hit| hit.evidence.starts_with("rust-attribute-added"))
-        .unwrap();
-    let removed = after
-        .unsafe_attribute_hits
-        .iter()
-        .find(|hit| hit.evidence.starts_with("rust-attribute-removed"))
-        .unwrap();
+    assert_eq!(
+        after.unsafe_attribute_hits.len(),
+        1,
+        "only the added pin is a finding; the removed old declaration is not"
+    );
+    let added = &after.unsafe_attribute_hits[0];
+    assert!(added.evidence.starts_with("rust-attribute-added"));
     assert!(added.evidence.contains("inlineencodings::GenId;"));
-    assert!(removed.evidence.contains("ShortString;"));
     assert_ne!(
         before_id,
         finding_id(modality::UNSAFE_ATTRIBUTE_ID, &added.location),
@@ -1323,7 +1514,7 @@ fn multiline_encoding_only_change_is_a_new_unsafe_attribute_occurrence() {
 }
 
 #[test]
-fn unsafe_attribute_removal_unpinning_and_renaming_are_reviewed() {
+fn unpinning_and_deleting_are_not_findings_but_renaming_is() {
     let unpinned = git_unsafe_attribute_fixture();
     let path = unpinned.path().join("schema.rs");
     let source = std::fs::read_to_string(&path).unwrap();
@@ -1338,13 +1529,24 @@ fn unsafe_attribute_removal_unpinning_and_renaming_are_reviewed() {
         &["commit", "--quiet", "-m", "use safe attribute anchor"],
     );
     let audit = collect_hits(unpinned.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
-    assert_eq!(audit.unsafe_attribute_hits.len(), 1);
-    assert!(audit.unsafe_attribute_hits[0]
-        .evidence
-        .starts_with("rust-attribute-removed"));
-    assert!(audit.unsafe_attribute_hits[0]
-        .evidence
-        .contains("pub migrated"));
+    assert!(
+        audit.unsafe_attribute_hits.is_empty(),
+        "pinned-to-anchored derives a new id from anchor plus encoding; nothing old is reinterpreted"
+    );
+
+    let deleted = git_unsafe_attribute_fixture();
+    let path = deleted.path().join("schema.rs");
+    std::fs::write(&path, "attributes! {}\n").unwrap();
+    git_fixture(deleted.path(), &["add", "schema.rs"]);
+    git_fixture(
+        deleted.path(),
+        &["commit", "--quiet", "-m", "delete pinned attribute"],
+    );
+    let audit = collect_hits(deleted.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
+    assert!(
+        audit.unsafe_attribute_hits.is_empty(),
+        "deleting a pinned declaration cannot reinterpret data"
+    );
 
     let renamed = git_unsafe_attribute_fixture();
     let path = renamed.path().join("schema.rs");
@@ -1356,17 +1558,13 @@ fn unsafe_attribute_removal_unpinning_and_renaming_are_reviewed() {
         &["commit", "--quiet", "-m", "rename pinned attribute"],
     );
     let audit = collect_hits(renamed.path(), &revs("HEAD^..HEAD"), &[]).unwrap();
-    assert_eq!(audit.unsafe_attribute_hits.len(), 2);
-    assert!(audit
-        .unsafe_attribute_hits
-        .iter()
-        .any(|hit| hit.evidence.starts_with("rust-attribute-added")
-            && hit.evidence.contains("pub renamed")));
-    assert!(audit
-        .unsafe_attribute_hits
-        .iter()
-        .any(|hit| hit.evidence.starts_with("rust-attribute-removed")
-            && hit.evidence.contains("pub migrated")));
+    assert_eq!(audit.unsafe_attribute_hits.len(), 1);
+    assert!(audit.unsafe_attribute_hits[0]
+        .evidence
+        .starts_with("rust-attribute-added"));
+    assert!(audit.unsafe_attribute_hits[0]
+        .evidence
+        .contains("pub renamed"));
 }
 
 #[test]
@@ -1395,7 +1593,7 @@ fn whitespace_only_unsafe_attribute_rewrite_reuses_justification() {
 }
 
 #[test]
-fn merge_audits_removal_relative_only_to_non_first_parent() {
+fn merge_dropping_a_side_pin_is_not_a_finding() {
     let directory = tempfile::tempdir().unwrap();
     git_fixture(directory.path(), &["init", "--quiet"]);
     std::fs::write(directory.path().join("schema.rs"), "attributes! {}\n").unwrap();
@@ -1447,10 +1645,10 @@ fn merge_audits_removal_relative_only_to_non_first_parent() {
     let mut unsafe_hits = Vec::new();
     collect_parent_unsafe_hits(directory.path(), &merge, Some(parents[1]), &mut unsafe_hits)
         .unwrap();
-    assert_eq!(unsafe_hits.len(), 1);
-    let hit = &unsafe_hits[0];
-    assert!(hit.evidence.starts_with("rust-attribute-removed"));
-    assert!(hit.evidence.contains("side_pin: ShortString;"));
+    assert!(
+        unsafe_hits.is_empty(),
+        "a merge that drops the side's pin removes a declaration, which reinterprets nothing"
+    );
 }
 
 #[test]

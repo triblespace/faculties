@@ -10,9 +10,7 @@ use clap::Parser;
 use faculties::collection_names::open_configured;
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
-use faculties::posture::{
-    self, cli, mcp, DocumentInput, FileOutcome, ListOptions, Posture, VocabularyState,
-};
+use faculties::posture::{self, cli, mcp, DocumentInput, FileOutcome, ListOptions, Posture};
 use faculties::schemas::posture::{
     modality, DEFAULT_POLICY_SCOPE_ID, DEFAULT_SCAN_SCOPE_ID, DOC_UNSUPPORTED, OUTCOME_EXAMINED,
     OUTCOME_PARSE_FAILED,
@@ -251,9 +249,9 @@ fn vocabulary_receipts_are_typed_idempotent_and_mcp_prose_is_literal() {
         .vocab_add("@-", " Public-Release ", Some("@/literal-rationale"))
         .unwrap();
     assert!(first.published);
-    assert!(first.revision.is_some());
+    assert!(first.revision.is_none(), "a term state is its own register");
     let again = posture
-        .vocab_add("@-", "public-release", Some("@/literal-rationale"))
+        .vocab_add("@-", "public-release", Some("another rationale"))
         .unwrap();
     assert!(!again.published);
     assert_eq!(first.member, again.member);
@@ -270,9 +268,12 @@ fn vocabulary_receipts_are_typed_idempotent_and_mcp_prose_is_literal() {
     .unwrap();
     assert!(response.contains("@/literal-protected-term"));
     let channels = posture.vocab_list(Some("public-release")).unwrap();
-    let VocabularyState::Ready { terms, .. } = &channels[0].state else {
-        panic!("one policy");
-    };
+    let terms = channels[0]
+        .terms
+        .iter()
+        .filter(|register| register.protected())
+        .map(|register| (register.term.clone(), register.why()))
+        .collect::<Vec<_>>();
     assert!(terms.contains(&("@-".into(), "@/literal-rationale".into())));
     assert!(terms.contains(&("@/literal-protected-term".into(), "@-".into())));
     let mcp = collect(|out| {
@@ -374,13 +375,14 @@ fn discovery_exposes_resident_tools_not_host_git_hooks_or_model_side_effects() {
         .iter()
         .map(|tool| tool.name)
         .collect::<Vec<_>>();
-    assert_eq!(names.len(), 8);
+    assert_eq!(names.len(), 9);
     for expected in [
         "posture_scan",
         "posture_list",
         "posture_coverage",
         "posture_scans",
         "posture_vocab_add",
+        "posture_vocab_release",
         "posture_vocab_list",
         "posture_exemplar",
         "posture_semantic",
