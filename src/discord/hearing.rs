@@ -71,8 +71,9 @@ const SENTENCE_SILENCE_MS: usize = 300;
 
 /// What hearing runs with.
 pub struct Config {
-    /// The Voxtral model pile, weights and tokenizer.
-    pub model: PathBuf,
+    /// The pile whose model collection (`TRIBLESPACE_COLLECTION_MODELS`)
+    /// holds Voxtral's `nvfp4` root and its tokenizer.
+    pub pile: PathBuf,
     /// Where an utterance intake cannot take is kept.
     pub unstored: PathBuf,
 }
@@ -109,12 +110,12 @@ pub fn start(
     ] {
         driver.add_global_event(songbird::Event::Core(event), receiver.clone());
     }
-    let (model, unstored) = (config.model, config.unstored);
+    let (pile, unstored) = (config.pile, config.unstored);
     std::thread::Builder::new()
         .name("discord-hearing".to_owned())
         .spawn(move || {
             let load = move || -> Result<Box<dyn Transcribe>> {
-                Ok(Box::new(voxtral::Voxtral::load(&model)?))
+                Ok(Box::new(voxtral::Voxtral::load(&pile)?))
             };
             hear(moments, load, channel, &intake, &unstored);
         })
@@ -852,9 +853,9 @@ fn store_result(
 /// to `out` with where it began in the clip, how long it is, how long it took
 /// to transcribe, and its words, since the clip is the caller's own. Nothing
 /// is stored.
-pub fn hear_clip(model: &Path, clip: &[f32], out: &mut crate::out::Out<'_>) -> Result<()> {
+pub fn hear_clip(pile: &Path, clip: &[f32], out: &mut crate::out::Out<'_>) -> Result<()> {
     let started = Instant::now();
-    let mut ear = voxtral::Voxtral::load(model)?;
+    let mut ear = voxtral::Voxtral::load(pile)?;
     out.line(format!(
         "transcriber loaded in {:.1} s",
         started.elapsed().as_secs_f64()
@@ -935,11 +936,17 @@ mod voxtral {
     }
 
     impl Voxtral {
-        /// Load the weights and the tokenizer from the model pile, and
-        /// compile the stream's kernels before the first utterance.
-        pub fn load(model: &Path) -> Result<Self> {
-            let ears = mary::hear::Ears::load(model)
-                .with_context(|| format!("load Voxtral from {}", model.display()))?;
+        /// Load the weights and the tokenizer from the pile's model
+        /// collection, and compile the stream's kernels before the first
+        /// utterance.
+        pub fn load(pile: &Path) -> Result<Self> {
+            let models = crate::model_storage::models(pile)?;
+            // SAFETY: the stored projections are aliased from the pile's
+            // mapping through CUDA teardown. The pile is append-only and is
+            // only ever compacted into a new file that is then renamed over
+            // it, so the mapped bytes, page prefixes included, never change.
+            let ears = unsafe { mary::hear::Ears::load(&models, Default::default()) }
+                .with_context(|| format!("load Voxtral from the models of {}", pile.display()))?;
             Ok(Self { ears })
         }
     }

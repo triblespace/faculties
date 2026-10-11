@@ -31,7 +31,7 @@
 //! several times in a row, end the process, so that its supervisor starts it
 //! again with a fresh model.
 //!
-//! With the `discord-hearing` feature and `--hear-model`, the bot also hears
+//! With the `discord-hearing` feature and `--hear`, the bot also hears
 //! everybody else in the channel ([`super::hearing`]): songbird then decodes
 //! what it receives to 16 kHz mono, and what each says is stored as a message
 //! in the voice channel through intake.
