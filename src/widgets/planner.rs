@@ -329,17 +329,35 @@ fn collect_events(view: DatasetView<'_>) -> (Vec<EventRow>, Vec<String>) {
             )
             .collect();
 
+        let mut text = |handle| match planner_model::read_text(view.reader, handle) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                diagnostics.push(format!(
+                    "Planner event {:x} text is unavailable: {error:#}",
+                    row.id
+                ));
+                None
+            }
+        };
+        let Some(summary) = text(row.summary) else {
+            continue;
+        };
+        let Some(status) = text(row.status) else {
+            continue;
+        };
+        let location = row.location.and_then(&mut text);
+        let rrule = row.rrule.and_then(&mut text);
         events.push(EventRow {
-            summary: row.summary.clone(),
+            summary,
             start,
             end,
-            location: row.location.clone(),
+            location,
             status: if planner_model::event_is_cancelled(view.facts, row.id) {
                 EventStatus::Cancelled
             } else {
-                EventStatus::parse(&row.status)
+                EventStatus::parse(&status)
             },
-            rrule: row.rrule.clone(),
+            rrule,
             attendees: row.attendees.iter().copied().collect(),
             organizer: row.organizer,
             notes,

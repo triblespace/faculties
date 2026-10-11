@@ -19,7 +19,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, U256BE};
 use triblespace::prelude::*;
 
 /// Stable extrinsic scope for deliberate body captures and intents.
@@ -63,13 +63,13 @@ pub mod capture {
         /// Absent on touch captures (the signature lives in `pose`).
         "FC033C3E4E74105D83E8C44004AD8EB7" unsafe as pub frame: Handle<RawBytes>;
         /// MIME type of the payload (e.g. "image/png", "audio/wav").
-        "ACB762F023B9AF391D914A4F00163192" unsafe as pub mime: ShortString;
+        "ACB762F023B9AF391D914A4F00163192" as pub mime: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Pixel width (vision captures).
         "C5251A43428C595C36A276828ECDD232" unsafe as pub width: U256BE;
         /// Pixel height (vision captures).
         "D2CE800163450CE0A34AA164AE66E8FF" unsafe as pub height: U256BE;
         /// "vision" | "audio" | "touch" — the sense that produced this capture.
-        "11487C7943FB2ED6A675A0E35477A966" unsafe as pub modality: ShortString;
+        "11487C7943FB2ED6A675A0E35477A966" as pub modality: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Optional deliberate note: why this moment was kept.
         "4E12AEBAB07830F8EEEF997957EA27D4" unsafe as pub note: Handle<UTF8String>;
         /// Proprioceptive context at capture (JSON: head pose / joints, or the

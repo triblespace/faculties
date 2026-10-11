@@ -31,7 +31,7 @@ use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 use triblespace_search::schemas::Embedding;
 
@@ -884,13 +884,10 @@ pub fn load_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<Fi
             anyhow::bail!("Files import {id:x} points at unknown root {root:x}");
         }
         let tags = find!(
-            value: Inline<ShortString>,
+            value: NameHandle,
             pattern!(facts, [{ id @ file::tag: ?value }])
         )
-        .map(|value| {
-            String::try_from_inline(&value)
-                .map_err(|error| anyhow!("decode Files tag for {id:x}: {error:?}"))
-        })
+        .map(|value| read_catalog_text(reader, value, "tag", id))
         .collect::<Result<BTreeSet<_>>>()?
         .into_iter()
         .collect();

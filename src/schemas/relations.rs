@@ -363,16 +363,9 @@ pub fn person_ids(space: &TribleSet) -> HashSet<Id> {
 pub mod relations {
     use super::*;
     attributes! {
-        "8F162B593D390E1424394DBF6883A72C" unsafe as alias: inlineencodings::ShortString;
-        "299E28A10114DC8C3B1661CD90CB8DF6" unsafe as label_norm: inlineencodings::ShortString;
-        "3E8812F6D22B2C93E2BCF0CE3C8C1979" unsafe as alias_norm: inlineencodings::ShortString;
-        "32B22FBA3EC2ADC3FFEB48483FE8961F" unsafe as affinity: inlineencodings::ShortString;
         "F0AD0BBFAC4C4C899637573DC965622E" unsafe as first_name: inlineencodings::Handle<blobencodings::UTF8String>;
         "764DD765142B3F4725B614BD3B9118EC" unsafe as last_name: inlineencodings::Handle<blobencodings::UTF8String>;
         "DC0916CB5F640984EFE359A33105CA9A" unsafe as display_name: inlineencodings::Handle<blobencodings::UTF8String>;
-        "9B3329149D54CB9A8E8075E4AA862649" unsafe as teams_user_id: inlineencodings::ShortString;
-        "B563A063474CBE62ED25A8D0E9A1853C" unsafe as email: inlineencodings::ShortString;
-        "9C2B10C740FCF7064A46F9B43D1FE278" unsafe as phone: inlineencodings::ShortString;
         // Generic contact facts (enrich every person, any source — booth leads,
         // mail senders, LinkedIn connections). LinkedIn-specific data stays in
         // the linkedin faculty; these are first-class here.
@@ -380,7 +373,7 @@ pub mod relations {
         "173B771D35FEE90B83F2731DD3C59EF8" unsafe as position: inlineencodings::Handle<blobencodings::UTF8String>;
         "5A71C103E026FC1AC01E35EDAC274A5C" unsafe as profile_url: inlineencodings::Handle<blobencodings::UTF8String>;
         // Provenance: where this person came from ("linkedin" | "mail" | "summit" | …).
-        "686FD344CD64C3F9C981C4028B1B6B9E" unsafe as source: inlineencodings::ShortString;
+        "686FD344CD64C3F9C981C4028B1B6B9E" as source: inlineencodings::Handle<blobencodings::UTF8String>;
         // Identity resolution (non-destructive). Append-only stores can't
         // merge entities irreversibly, so a person's true identity is the
         // connected component under `same_as`. Imports auto-assert `same_as`

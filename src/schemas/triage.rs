@@ -48,13 +48,6 @@ pub mod local {
     }
 }
 
-pub mod relations {
-    use super::*;
-    attributes! {
-        "8F162B593D390E1424394DBF6883A72C" unsafe as alias: inlineencodings::ShortString;
-    }
-}
-
 pub mod exec {
     use super::*;
     attributes! {

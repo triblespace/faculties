@@ -26,8 +26,8 @@ impl Body {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "body_capture",
-        description: "Keep an already acquired resident signal and literal pose/note in one immutable capture. No camera, microphone or robot is contacted. Vision needs bytes, an image MIME and positive width/height; audio needs bytes and an audio MIME without image dimensions; touch has only pose/note. Bytes and declared metadata are stored exactly, not decoded or normalized; use body_view for bounded perception. The existing MIME field holds at most 32 UTF-8 bytes.",
-        input_schema: r#"{"type":"object","properties":{"modality":{"type":"string","enum":["vision","audio","touch"]},"data_base64":{"type":"string"},"mime":{"type":"string","maxLength":32},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"pose":{"type":"string"},"note":{"type":"string"}},"required":["modality","pose"],"additionalProperties":false}"#,
+        description: "Keep an already acquired resident signal and literal pose/note in one immutable capture. No camera, microphone or robot is contacted. Vision needs bytes, an image MIME and positive width/height; audio needs bytes and an audio MIME without image dimensions; touch has only pose/note. Bytes and declared metadata are stored exactly, not decoded or normalized; use body_view for bounded perception.",
+        input_schema: r#"{"type":"object","properties":{"modality":{"type":"string","enum":["vision","audio","touch"]},"data_base64":{"type":"string"},"mime":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"pose":{"type":"string"},"note":{"type":"string"}},"required":["modality","pose"],"additionalProperties":false}"#,
     },
     Tool {
         name: "body_list",

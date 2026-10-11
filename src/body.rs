@@ -44,10 +44,10 @@ pub struct CaptureRow {
     pub id: Id,
     pub created_at: IntervalValue,
     pub frame: Option<RawHandle>,
-    pub mime: Option<String>,
+    pub mime: Option<TextHandle>,
     pub width: Option<DimensionValue>,
     pub height: Option<DimensionValue>,
-    pub modality: String,
+    pub modality: TextHandle,
     pub note: Option<TextHandle>,
     pub pose: TextHandle,
 }
@@ -192,10 +192,10 @@ pub fn capture_record(row: &CaptureRow) -> Fragment {
         metadata::tag: &KIND_CAPTURE,
         metadata::created_at: row.created_at,
         capture::frame?: row.frame.as_ref(),
-        capture::mime?: row.mime.as_deref(),
+        capture::mime?: row.mime.as_ref(),
         capture::width?: row.width.as_ref(),
         capture::height?: row.height.as_ref(),
-        capture::modality: row.modality.as_str(),
+        capture::modality: row.modality,
         capture::note?: row.note.as_ref(),
         capture::pose: row.pose,
     }
@@ -210,10 +210,24 @@ pub fn intent_record(row: &IntentRow) -> Fragment {
     }
 }
 
+/// The content handle of `value` as text, which is how a closed word is
+/// compared against a stored one without reading the stored blob.
+pub fn text_handle(value: &str) -> TextHandle {
+    value.to_owned().to_blob().get_handle()
+}
+
+/// The capture modality word whose text has this handle, if it is one of the
+/// three this faculty knows.
+pub fn modality_name(handle: TextHandle) -> Option<&'static str> {
+    ["vision", "audio", "touch"]
+        .into_iter()
+        .find(|name| text_handle(name) == handle)
+}
+
 fn validate_capture_shape(row: &CaptureRow) -> Result<()> {
     validate_point("capture creation time", row.created_at)?;
-    match row.modality.as_str() {
-        "vision" => {
+    match modality_name(row.modality) {
+        Some("vision") => {
             if row.frame.is_none()
                 || row.mime.is_none()
                 || row.width.is_none()
@@ -225,7 +239,7 @@ fn validate_capture_shape(row: &CaptureRow) -> Result<()> {
                 );
             }
         }
-        "audio" => {
+        Some("audio") => {
             if row.frame.is_none() || row.mime.is_none() {
                 bail!("audio capture {} requires frame and MIME", fmt_id(row.id));
             }
@@ -236,7 +250,7 @@ fn validate_capture_shape(row: &CaptureRow) -> Result<()> {
                 );
             }
         }
-        "touch" => {
+        Some("touch") => {
             if row.frame.is_some()
                 || row.mime.is_some()
                 || row.width.is_some()
@@ -248,7 +262,7 @@ fn validate_capture_shape(row: &CaptureRow) -> Result<()> {
                 );
             }
         }
-        other => bail!("capture {} has unknown modality {other:?}", fmt_id(row.id)),
+        _ => bail!("capture {} has unknown modality", fmt_id(row.id)),
     }
     Ok(())
 }
@@ -278,7 +292,7 @@ pub fn decode_capture<P: TriblePattern>(space: &P, id: Id) -> Result<CaptureRow>
             id,
             "capture::mime",
             find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ capture::mime: ?value }])
             )
             .collect(),
@@ -305,7 +319,7 @@ pub fn decode_capture<P: TriblePattern>(space: &P, id: Id) -> Result<CaptureRow>
             id,
             "capture::modality",
             find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ capture::modality: ?value }])
             )
             .collect(),
@@ -607,14 +621,16 @@ mod tests {
         let frame = fragment.put::<blobencodings::RawBytes, _>(vec![1, 2, 3]);
         let pose = fragment.put::<blobencodings::UTF8String, _>("{}".to_owned());
         let note = fragment.put::<blobencodings::UTF8String, _>("kept".to_owned());
+        let mime = fragment.put::<blobencodings::UTF8String, _>("image/png".to_owned());
+        let modality = fragment.put::<blobencodings::UTF8String, _>("vision".to_owned());
         fragment += capture_record(&CaptureRow {
             id: KIND_CAPTURE,
             created_at: at(1.0),
             frame: Some(frame),
-            mime: Some("image/png".to_owned()),
+            mime: Some(mime),
             width: Some(640_u64.to_inline()),
             height: Some(480_u64.to_inline()),
-            modality: "vision".to_owned(),
+            modality,
             note: Some(note),
             pose,
         });
@@ -753,7 +769,7 @@ mod tests {
             mime: None,
             width: None,
             height: None,
-            modality: "touch".to_owned(),
+            modality: text_handle("touch"),
             note: None,
             pose,
         });
@@ -763,10 +779,10 @@ mod tests {
             id: KIND_CAPTURE,
             created_at: at(3.0),
             frame: Some(audio),
-            mime: Some("audio/wav".to_owned()),
+            mime: Some(text_handle("audio/wav")),
             width: None,
             height: None,
-            modality: "audio".to_owned(),
+            modality: text_handle("audio"),
             note: None,
             pose,
         });

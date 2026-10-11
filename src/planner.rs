@@ -57,20 +57,21 @@ pub struct EventDraft {
     pub sequence: Option<SequenceValue>,
 }
 
-/// One exact event projected from a Planner collection.
+/// One exact event projected from a Planner collection. Text fields are the
+/// handles of their UTF-8 blobs; equal handles are equal text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventRow {
     pub id: Id,
     pub uid: TextHandle,
-    pub summary: String,
+    pub summary: TextHandle,
     pub description: Option<TextHandle>,
     pub time: IntervalValue,
-    pub rrule: Option<String>,
+    pub rrule: Option<TextHandle>,
     pub rdates: BTreeSet<IntervalValue>,
     pub exdates: BTreeSet<IntervalValue>,
-    pub location: Option<String>,
-    pub status: String,
-    pub transp: String,
+    pub location: Option<TextHandle>,
+    pub status: TextHandle,
+    pub transp: TextHandle,
     pub attendees: BTreeSet<Id>,
     pub organizer: Option<Id>,
     pub sequence: Option<SequenceValue>,
@@ -105,7 +106,7 @@ impl PlannerCatalog {
     pub fn is_cancelled(&self, event: Id) -> bool {
         self.events
             .get(&event)
-            .is_some_and(|row| row.status == STATUS_CANCELLED)
+            .is_some_and(|row| row.status == text_handle(STATUS_CANCELLED))
             || self
                 .cancellations
                 .values()
@@ -143,10 +144,7 @@ fn at_most_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<Option<
     Ok(values.pop())
 }
 
-fn validate_short(field: &str, value: &str) -> Result<()> {
-    if value.len() > 32 {
-        bail!("{field} exceeds 32 UTF-8 bytes");
-    }
+fn validate_label(field: &str, value: &str) -> Result<()> {
     if value.as_bytes().contains(&0) {
         bail!("{field} contains a NUL byte");
     }
@@ -200,25 +198,47 @@ fn validate_transp(transp: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_event_values(row: &EventRow) -> Result<()> {
-    validate_short("event summary", &row.summary)?;
-    validate_interval("event time", row.time)?;
-    if let Some(rule) = &row.rrule {
-        validate_short("event RRULE", rule)?;
+/// The content handle of `value` as text. Closed words (status,
+/// transparency) are compared by it without reading the stored blob.
+pub fn text_handle(value: &str) -> TextHandle {
+    value.to_owned().to_blob().get_handle()
+}
+
+fn validate_draft_values(draft: &EventDraft) -> Result<()> {
+    validate_label("event summary", &draft.summary)?;
+    if let Some(rule) = &draft.rrule {
+        validate_label("event RRULE", rule)?;
     }
+    if let Some(location) = &draft.location {
+        validate_label("event location", location)?;
+    }
+    validate_label("event status", &draft.status)?;
+    validate_status(&draft.status)?;
+    validate_label("event transparency", &draft.transp)?;
+    validate_transp(&draft.transp)
+}
+
+fn validate_event_values(row: &EventRow) -> Result<()> {
+    validate_interval("event time", row.time)?;
     for interval in &row.rdates {
         validate_interval("event RDATE", *interval)?;
     }
     for interval in &row.exdates {
         validate_interval("event EXDATE", *interval)?;
     }
-    if let Some(location) = &row.location {
-        validate_short("event location", location)?;
+    if ![STATUS_CONFIRMED, STATUS_TENTATIVE, STATUS_CANCELLED]
+        .into_iter()
+        .any(|status| text_handle(status) == row.status)
+    {
+        bail!("event status must be CONFIRMED, TENTATIVE, or CANCELLED");
     }
-    validate_short("event status", &row.status)?;
-    validate_status(&row.status)?;
-    validate_short("event transparency", &row.transp)?;
-    validate_transp(&row.transp)
+    if ![TRANSP_OPAQUE, TRANSP_TRANSPARENT]
+        .into_iter()
+        .any(|transp| text_handle(transp) == row.transp)
+    {
+        bail!("event transparency must be OPAQUE or TRANSPARENT");
+    }
+    Ok(())
 }
 
 fn event_identity(uid: TextHandle) -> Fragment {
@@ -231,15 +251,15 @@ fn event_identity(uid: TextHandle) -> Fragment {
 #[allow(clippy::too_many_arguments)]
 fn event_record(
     uid: TextHandle,
-    summary: &str,
+    summary: TextHandle,
     description: Option<TextHandle>,
     time: IntervalValue,
-    rrule: Option<&str>,
+    rrule: Option<TextHandle>,
     rdates: &BTreeSet<IntervalValue>,
     exdates: &BTreeSet<IntervalValue>,
-    location: Option<&str>,
-    status: &str,
-    transp: &str,
+    location: Option<TextHandle>,
+    status: TextHandle,
+    transp: TextHandle,
     attendees: &BTreeSet<Id>,
     organizer: Option<Id>,
     sequence: Option<SequenceValue>,
@@ -252,8 +272,8 @@ fn event_record(
         event::summary: summary,
         event::description?: description.as_ref(),
         event::time: time,
-        event::rrule?: rrule,
-        event::location?: location,
+        event::rrule?: rrule.as_ref(),
+        event::location?: location.as_ref(),
         event::status: status,
         event::transp: transp,
         event::organizer?: organizer.as_ref(),
@@ -293,23 +313,32 @@ fn cancellation_record(event_id: Id) -> Fragment {
 /// therefore names the same event even across processes and machines.
 pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
     validate_uid(&draft.uid)?;
+    validate_draft_values(draft)?;
     let mut fragment = Fragment::empty();
     let uid = fragment.put(draft.uid.clone());
+    let summary = fragment.put(draft.summary.clone());
     let description = draft
         .description
         .as_ref()
         .map(|description| fragment.put(description.clone()));
+    let rrule = draft.rrule.as_ref().map(|rule| fragment.put(rule.clone()));
+    let location = draft
+        .location
+        .as_ref()
+        .map(|location| fragment.put(location.clone()));
+    let status = fragment.put(draft.status.clone());
+    let transp = fragment.put(draft.transp.clone());
     let record = event_record(
         uid,
-        &draft.summary,
+        summary,
         description,
         draft.time,
-        draft.rrule.as_deref(),
+        rrule,
         &draft.rdates,
         &draft.exdates,
-        draft.location.as_deref(),
-        &draft.status,
-        &draft.transp,
+        location,
+        status,
+        transp,
         &draft.attendees,
         draft.organizer,
         draft.sequence,
@@ -317,15 +346,15 @@ pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
     let row = EventRow {
         id: record.root().expect("event record has one root"),
         uid,
-        summary: draft.summary.clone(),
+        summary,
         description,
         time: draft.time,
-        rrule: draft.rrule.clone(),
+        rrule,
         rdates: draft.rdates.clone(),
         exdates: draft.exdates.clone(),
-        location: draft.location.clone(),
-        status: draft.status.clone(),
-        transp: draft.transp.clone(),
+        location,
+        status,
+        transp,
         attendees: draft.attendees.clone(),
         organizer: draft.organizer,
         sequence: draft.sequence,
@@ -431,24 +460,24 @@ fn legacy_event_fact_is_inert(space: &TribleSet, event_id: Id, fact: &Trible) ->
         return false;
     }
     let status_count = find!(
-        value: String,
+        value: TextHandle,
         pattern!(space, [{ event_id @ event::status: ?value }])
     )
     .count();
     status_count > 1
-        && (*fact.v::<inlineencodings::ShortString>())
-            .try_from_inline::<String>()
-            .is_ok_and(|value| value == STATUS_CANCELLED)
+        && *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>()
+            == text_handle(STATUS_CANCELLED)
 }
 
-fn native_event_status(space: &TribleSet, id: Id) -> Result<String> {
-    let mut values: Vec<String> = find!(
-        value: String,
+fn native_event_status(space: &TribleSet, id: Id) -> Result<TextHandle> {
+    let mut values: Vec<TextHandle> = find!(
+        value: TextHandle,
         pattern!(space, [{ id @ event::status: ?value }])
     )
     .collect();
     if values.len() == 2 && has_canonical_cancellation(space, id) {
-        values.retain(|value| value != STATUS_CANCELLED);
+        let cancelled = text_handle(STATUS_CANCELLED);
+        values.retain(|value| *value != cancelled);
     }
     exactly_one(id, "event::status", values)
 }
@@ -469,7 +498,7 @@ fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
             id,
             "event::summary",
             find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ event::summary: ?value }])
             )
             .collect(),
@@ -496,7 +525,7 @@ fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
             id,
             "event::rrule",
             find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ event::rrule: ?value }])
             )
             .collect(),
@@ -515,7 +544,7 @@ fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
             id,
             "event::location",
             find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ event::location: ?value }])
             )
             .collect(),
@@ -525,7 +554,7 @@ fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
             id,
             "event::transp",
             find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ event::transp: ?value }])
             )
             .collect(),
@@ -553,15 +582,15 @@ fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
     validate_event_values(&row)?;
     let expected = event_record(
         row.uid,
-        &row.summary,
+        row.summary,
         row.description,
         row.time,
-        row.rrule.as_deref(),
+        row.rrule,
         &row.rdates,
         &row.exdates,
-        row.location.as_deref(),
-        &row.status,
-        &row.transp,
+        row.location,
+        row.status,
+        row.transp,
         &row.attendees,
         row.organizer,
         row.sequence,
@@ -751,10 +780,10 @@ where
     find!(
         (
             uid: TextHandle,
-            summary: String,
+            summary: TextHandle,
             time: IntervalValue,
-            status: String,
-            transp: String,
+            status: TextHandle,
+            transp: TextHandle,
         ),
         pattern!(space, [{ id @
             metadata::tag: &KIND_EVENT_ID,
@@ -777,7 +806,7 @@ where
             .next(),
             time,
             rrule: find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ event::rrule: ?value }])
             )
             .next(),
@@ -792,7 +821,7 @@ where
             )
             .collect(),
             location: find!(
-                value: String,
+                value: TextHandle,
                 pattern!(space, [{ id @ event::location: ?value }])
             )
             .next(),

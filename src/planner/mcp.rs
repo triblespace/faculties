@@ -24,8 +24,8 @@ impl Planner {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "planner_add",
-        description: "Add an event and optional initial note in one publication. ISO dates and timezone-free datetimes are interpreted as UTC; timezone-bearing RFC3339 is respected. Missing end means one day for a date or one hour otherwise. All prose, including @ strings, is literal. Summary/location/RRULE use the current 32-UTF8-byte fields.",
-        input_schema: r#"{"type":"object","properties":{"summary":{"type":"string","maxLength":32},"from":{"type":"string"},"to":{"type":"string"},"rrule":{"type":"string","maxLength":32},"location":{"type":"string","maxLength":32},"status":{"type":"string","enum":["tentative","confirmed","cancelled"]},"transp":{"type":"string","enum":["opaque","transparent"]},"description":{"type":"string"},"note":{"type":"string"}},"required":["summary","from"],"additionalProperties":false}"#,
+        description: "Add an event and optional initial note in one publication. ISO dates and timezone-free datetimes are interpreted as UTC; timezone-bearing RFC3339 is respected. Missing end means one day for a date or one hour otherwise. All prose, including @ strings, is literal.",
+        input_schema: r#"{"type":"object","properties":{"summary":{"type":"string"},"from":{"type":"string"},"to":{"type":"string"},"rrule":{"type":"string"},"location":{"type":"string"},"status":{"type":"string","enum":["tentative","confirmed","cancelled"]},"transp":{"type":"string","enum":["opaque","transparent"]},"description":{"type":"string"},"note":{"type":"string"}},"required":["summary","from"],"additionalProperties":false}"#,
     },
     Tool {
         name: "planner_list",

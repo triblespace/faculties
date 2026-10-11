@@ -487,7 +487,7 @@ fn show_person(storage: &mut RelationsStorage<'_>, selector: String) -> Result<S
         print_values(
             &mut output,
             "source",
-            &relations::person_sources(facts, person)?,
+            &relations::person_sources(reader, facts, person)?,
         )?;
         let observations = relations::creation_observations(facts, person);
         if !observations.is_empty() {

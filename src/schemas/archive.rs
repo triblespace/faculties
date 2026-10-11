@@ -7,7 +7,7 @@
 use triblespace::macros::id_hex;
 pub use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 /// Tag for BM25 search-index entities on the archive branch. Each
@@ -50,7 +50,6 @@ pub mod archive {
         "4FE6A8A43658BC2F61FEDF5CFB29EEFC" unsafe as pub author_model: Handle<UTF8String>;
         "1F127324384335D12ECFE0CB84840925" unsafe as pub author_provider: Handle<UTF8String>;
         "ACF09FF3D62B73983A222313FF0C52D2" unsafe as pub content: Handle<UTF8String>;
-        "D8A469EAC2518D1A85692E0BEBF20D6C" unsafe as pub content_type: ShortString;
         "8334E282F24A4C7779C8899191B29E00" unsafe as pub attachment: GenId;
 
         "C9132D7400892F65B637BCBE92E230FB" unsafe as pub attachment_source_id: Handle<UTF8String>;
@@ -61,7 +60,6 @@ pub mod archive {
         "983BE64C7663D4DFBF7F227BA6D32634" unsafe as pub attachment_file: GenId;
         "A8F6CF04A9B2391A26F04BC84B77217D" unsafe as pub attachment_source_pointer: Handle<UTF8String>;
         "9ADD88D3FFD9E4F91E0DC08126D9180A" unsafe as pub attachment_name: Handle<UTF8String>;
-        "EEFDB32D37B7B2834D99ACCF159B6507" unsafe as pub attachment_mime: ShortString;
         "D233E7BE0E973B09BD51E768E528ACA5" unsafe as pub attachment_size_bytes: U256BE;
         "5937E1072AF2F8E493321811B483C57B" unsafe as pub attachment_width_px: U256BE;
         "B252F4F77929E54FF8472027B7603EE9" unsafe as pub attachment_height_px: U256BE;
@@ -84,7 +82,6 @@ pub mod import_schema {
 
     attributes! {
         "891508CAD6E1430B221ADA937EFBD982" unsafe as pub conversation: GenId;
-        "E997DCAAF43BAA04790FCB0FA0FBFE3A" unsafe as pub source_format: ShortString;
         "973FB59D3452D3A8276172F8E3272324" unsafe as pub source_raw_root: GenId;
         "87B587A3906056038FD767F4225274F9" unsafe as pub source_conversation_id: Handle<UTF8String>;
         "1B2A09FF44D2A5736FA320AB255026C1" unsafe as pub source_message_id: Handle<UTF8String>;

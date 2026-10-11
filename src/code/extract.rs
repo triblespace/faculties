@@ -568,8 +568,8 @@ fn last_type_ident(ty: &syn::Type) -> Option<String> {
 
 /// Normalize a declared visibility into the closed vocabulary.
 ///
-/// `pub(in crate::a::b::c)` is a real spelling here and would overflow
-/// `ShortString`, which panics the encoder rather than truncating.
+/// `pub(in crate::a::b::c)` is a real spelling here; the exact path stays in
+/// the signature, and the attribute carries the part a query filters on.
 fn visibility_of(vis: &syn::Visibility) -> Visibility {
     match vis {
         syn::Visibility::Public(_) => Visibility::Public,
@@ -1063,9 +1063,6 @@ mod tests {
         let extracted = rust("pub(in crate::a::b::c) fn deep() {}\npub(crate) fn near() {}\n");
         assert_eq!(named(&extracted, "deep").visibility, Visibility::Restricted);
         assert_eq!(named(&extracted, "near").visibility, Visibility::Crate);
-        for item in &extracted.items {
-            assert!(item.visibility.name().len() <= 32);
-        }
     }
 
     #[test]

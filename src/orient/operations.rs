@@ -586,20 +586,25 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn entity_tags<P: TriblePattern>(space: &P, entity_id: Id) -> Vec<String> {
-    let mut tags: Vec<String> =
-        find!(tag: String, pattern!(space, [{ entity_id @ board::tag: ?tag }])).collect();
+fn entity_tags(query: &OrientQuery<'_>, entity_id: Id) -> Result<Vec<String>> {
+    let mut tags: Vec<String> = find!(
+        tag: compass::TextHandle,
+        pattern!(query.compass, [{ entity_id @ board::tag: ?tag }])
+    )
+    .map(|tag| read_utf8(&query.payloads, tag, "Compass tag"))
+    .collect::<Result<_>>()?;
     tags.sort();
     tags.dedup();
-    tags
+    Ok(tags)
 }
 
-fn visible_notes<P: TriblePattern>(
-    space: &P,
+fn visible_notes(
+    query: &OrientQuery<'_>,
     own_identities: &HashSet<Id>,
     attention_keys: &HashSet<String>,
     relevant_goals: &HashSet<Id>,
-) -> BTreeMap<Id, Id> {
+) -> Result<BTreeMap<Id, Id>> {
+    let space = query.compass;
     let mut notes = BTreeMap::new();
     for (note_id, goal_id) in find!(
         (note_id: Id, goal_id: Id),
@@ -620,14 +625,14 @@ fn visible_notes<P: TriblePattern>(
         if own_note {
             continue;
         }
-        let directly_addressed = entity_tags(space, note_id)
+        let directly_addressed = entity_tags(query, note_id)?
             .iter()
             .any(|tag| attention_keys.contains(&tag.to_ascii_lowercase()));
         if directly_addressed || relevant_goals.contains(&goal_id) {
             insert_note_goal(&mut notes, note_id, goal_id);
         }
     }
-    notes
+    Ok(notes)
 }
 
 /// One Orient input's authored collection and explicit query projections.
@@ -1828,12 +1833,10 @@ fn native_teams_messages(query: &OrientQuery<'_>) -> Result<BTreeSet<Id>> {
     )
     .collect();
 
-    let present_state: Inline<inlineencodings::ShortString> = "present"
-        .try_to_inline()
-        .expect("Teams present state fits ShortString");
-    let deleted_state: Inline<inlineencodings::ShortString> = "deleted"
-        .try_to_inline()
-        .expect("Teams deleted state fits ShortString");
+    let present_state: Inline<inlineencodings::Handle<blobencodings::UTF8String>> =
+        "present".to_owned().to_blob().get_handle();
+    let deleted_state: Inline<inlineencodings::Handle<blobencodings::UTF8String>> =
+        "deleted".to_owned().to_blob().get_handle();
     let mut present: BTreeSet<Id> = find!(
         message: Id,
         pattern!(query.teams, [{
@@ -1909,9 +1912,8 @@ fn teams_message_detail_handles(
     query: &OrientQuery<'_>,
     message: Id,
 ) -> Result<TeamsMessageDetailHandles> {
-    let present_state: Inline<inlineencodings::ShortString> = "present"
-        .try_to_inline()
-        .expect("Teams present state fits ShortString");
+    let present_state: Inline<inlineencodings::Handle<blobencodings::UTF8String>> =
+        "present".to_owned().to_blob().get_handle();
     let newest = find!(
         (modified: IntervalValue, observation: Id),
         pattern!(query.teams, [{
@@ -2575,9 +2577,12 @@ fn render_native_mail(
     Ok((out, shown))
 }
 
-fn latest_goal_status(query: &OrientQuery<'_>, goal: Id) -> Option<(Id, String, IntervalValue)> {
+fn latest_goal_status(
+    query: &OrientQuery<'_>,
+    goal: Id,
+) -> Result<Option<(Id, String, IntervalValue)>> {
     find!(
-        (event: Id, status: String, at: IntervalValue),
+        (event: Id, status: compass::TextHandle, at: IntervalValue),
         and!(
             pattern!(query.compass, [{ ?event @
                 metadata::tag: &KIND_STATUS_ID,
@@ -2589,6 +2594,14 @@ fn latest_goal_status(query: &OrientQuery<'_>, goal: Id) -> Option<(Id, String, 
         )
     )
     .next()
+    .map(|(event, status, at)| {
+        Ok((
+            event,
+            read_utf8(&query.payloads, status, "Compass status")?,
+            at,
+        ))
+    })
+    .transpose()
 }
 
 fn goal_priority_edges(query: &OrientQuery<'_>, goals: &BTreeSet<Id>) -> BTreeSet<(Id, Id)> {
@@ -2652,7 +2665,7 @@ fn render_native_compass_goals(
     let mut doing = Vec::<(usize, i128, Id, Option<Id>)>::new();
     let mut todo = Vec::<(usize, i128, Id, Option<Id>)>::new();
     for task in goals {
-        let (status_event, status, status_at) = latest_goal_status(query, task)
+        let (status_event, status, status_at) = latest_goal_status(query, task)?
             .map(|(event, value, at)| {
                 (
                     Some(event),
@@ -2704,7 +2717,7 @@ fn render_native_compass_goals(
                 "- [{}] {}{}",
                 fmt_id(task),
                 native_task_title(query, task)?,
-                render_tags(&entity_tags(query.compass, task)),
+                render_tags(&entity_tags(query, task)?),
             )
             .unwrap();
         }
@@ -2721,7 +2734,7 @@ fn render_native_compass_goals(
                 "- [{}] {}{}",
                 fmt_id(task),
                 native_task_title(query, task)?,
-                render_tags(&entity_tags(query.compass, task)),
+                render_tags(&entity_tags(query, task)?),
             )
             .unwrap();
         }
@@ -2798,8 +2811,8 @@ fn prepare_habits(
 ) -> Result<(Vec<habits::HabitRow>, HabitObservation)> {
     let mut rows = Vec::new();
     let mut observation = HabitObservation::default();
-    let definitions: Vec<(Id, String, habits::TextHandle, habits::TextHandle)> = find!(
-        (habit: Id, label: String, condition: habits::TextHandle, nudge: habits::TextHandle),
+    let definitions: Vec<(Id, habits::TextHandle, habits::TextHandle, habits::TextHandle)> = find!(
+        (habit: Id, label: habits::TextHandle, condition: habits::TextHandle, nudge: habits::TextHandle),
         pattern!(facts, [{ ?habit @
             metadata::tag: &KIND_HABIT_ID,
             habit_attrs::label: ?label,
@@ -2835,6 +2848,7 @@ fn prepare_habits(
         if targeted {
             observation.targeted.insert(habit);
         }
+        let label = read_utf8(snapshot, label, "Habit label")?;
         let condition = read_utf8(snapshot, condition_handle, "Habit condition")?;
         let nudge = read_utf8(snapshot, nudge_handle, "Habit nudge")?;
         let script_handle = find!(
@@ -2863,8 +2877,8 @@ fn prepare_habits(
         completed_at.sort_unstable();
         completed_at.dedup();
 
-        let state_rows: Vec<(Id, String, IntervalValue)> = find!(
-            (id: Id, state: String, at: IntervalValue),
+        let state_rows: Vec<(Id, habits::TextHandle, IntervalValue)> = find!(
+            (id: Id, state: habits::TextHandle, at: IntervalValue),
             pattern!(facts, [{ ?id @
                 metadata::tag: &KIND_HABIT_STATE_ID,
                 habit_attrs::of: &habit,
@@ -2887,7 +2901,7 @@ fn prepare_habits(
             if state_superseded.contains(&id) {
                 continue;
             }
-            let state = match state.as_str() {
+            let state = match read_utf8(snapshot, state, "Habit state")?.as_str() {
                 STATE_ACTIVE => habits::DeclaredState::Active,
                 STATE_PAUSED => habits::DeclaredState::Paused,
                 other => {
@@ -3004,13 +3018,19 @@ fn observe_habits(
     Ok(observation)
 }
 
-fn render_passive_habits(facts: &FactArchive, persona: Option<Id>) -> String {
+fn render_passive_habits<R: BlobStoreList + BlobStoreGet>(
+    reader: &R,
+    facts: &FactArchive,
+    persona: Option<Id>,
+) -> String {
     use std::fmt::Write as _;
     let superseded: BTreeSet<Id> = find!(old: Id, pattern!(facts, [{ _?new @ metadata::tag: &KIND_HABIT_ID, metadata::supersedes: ?old }])).collect();
     let mut text = String::from("Habits (passive; conditions not evaluated):\n");
     let mut count = 0;
-    for (habit, label) in find!((habit: Id, label: String), pattern!(facts, [{ ?habit @ metadata::tag: &KIND_HABIT_ID, habit_attrs::label: ?label }]))
+    for (habit, label) in find!((habit: Id, label: habits::TextHandle), pattern!(facts, [{ ?habit @ metadata::tag: &KIND_HABIT_ID, habit_attrs::label: ?label }]))
     {
+        let label = read_utf8(reader, label, "Habit label")
+            .unwrap_or_else(|_| "(label unavailable)".to_owned());
         let targeted = exists!(pattern!(facts, [{ habit @ habit_attrs::persona: _?target }]));
         if targeted
             && !persona.is_some_and(|persona| {
@@ -3569,13 +3589,13 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
             board::by: ?by,
         }])));
         let involved = authored_status || authored_note;
-        let tags = entity_tags(query.compass, id);
+        let tags = entity_tags(query, id)?;
         let addressed = tags
             .iter()
             .any(|tag| attention_keys.contains(&tag.to_ascii_lowercase()));
         if involved || addressed {
             relevant_goals.insert(id);
-            match latest_goal_status(query, id) {
+            match latest_goal_status(query, id)? {
                 Some((event, status, _)) => {
                     let authored = exists!((by: Id), and!(
                         own_identities.has(by),
@@ -3599,12 +3619,7 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
         }
     }
 
-    for (note, goal) in visible_notes(
-        query.compass,
-        &own_identities,
-        &attention_keys,
-        &relevant_goals,
-    ) {
+    for (note, goal) in visible_notes(query, &own_identities, &attention_keys, &relevant_goals)? {
         view.insert(AttentionEvent::Note { note, goal });
     }
 
@@ -3801,6 +3816,7 @@ async fn cmd_show(
                 render_native_habits(&observe_habits(habits, pile_path, epoch_seconds(instant))?)
             }
             None => render_passive_habits(
+                &observation.snapshot,
                 observation
                     .facts
                     .habits
@@ -4026,8 +4042,8 @@ fn news_actor(query: &OrientQuery<'_>, event: Id) -> String {
 /// named here is the state the winning event replaced. `None` for a goal whose
 /// first status this is.
 fn previous_goal_status(query: &OrientQuery<'_>, goal: Id, current: Id) -> Option<String> {
-    let mut events: Vec<(i128, Id, String)> = find!(
-        (event: Id, status: String, at: IntervalValue),
+    let mut events: Vec<(i128, Id, compass::TextHandle)> = find!(
+        (event: Id, status: compass::TextHandle, at: IntervalValue),
         pattern!(query.compass, [{ ?event @
             metadata::tag: &KIND_STATUS_ID,
             board::status_of: &goal,
@@ -4037,11 +4053,11 @@ fn previous_goal_status(query: &OrientQuery<'_>, goal: Id, current: Id) -> Optio
     )
     .map(|(event, status, at)| (interval_key(at), event, status))
     .collect();
-    events.sort();
+    events.sort_by_key(|(at, event, _)| (*at, *event));
     let position = events.iter().position(|(_, event, _)| *event == current)?;
     events[..position]
         .last()
-        .map(|(_, _, status)| status.clone())
+        .and_then(|(_, _, status)| read_utf8(&query.payloads, *status, "Compass status").ok())
 }
 
 /// The `News:` line for one attention event, carrying the content the reader
@@ -7209,15 +7225,18 @@ mod tests {
     fn habit_targets_select_before_loading_payloads() {
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let snapshot = pile.snapshot().unwrap();
         let habit = id(11); // An opaque, not intrinsically derived entity id.
         let owner = id(12);
         let other = id(13);
         let absent = habits::TextHandle::new([14; 32]);
         let absent_script = habits::ScriptHandle::new([15; 32]);
+        let label = pile
+            .put::<blobencodings::UTF8String, _>("other-persona-clock".to_owned())
+            .unwrap();
+        let snapshot = pile.snapshot().unwrap();
         let fragment = entity! { ExclusiveId::force_ref(&habit) @
             metadata::tag: &KIND_HABIT_ID,
-            habit_attrs::label: "other-persona-clock",
+            habit_attrs::label: label,
             habit_attrs::condition: absent,
             habit_attrs::nudge: absent,
             habit_attrs::script: absent_script,
@@ -7228,10 +7247,14 @@ mod tests {
             let (rows, attention) = prepare_habits(&snapshot, &facts, observer).unwrap();
             assert!(rows.is_empty());
             assert!(attention.attention.is_empty());
-            assert!(!render_passive_habits(&facts, observer).contains("other-persona-clock"));
+            assert!(
+                !render_passive_habits(&snapshot, &facts, observer).contains("other-persona-clock")
+            );
         }
         assert!(prepare_habits(&snapshot, &facts, Some(owner)).is_err());
-        assert!(render_passive_habits(&facts, Some(owner)).contains("other-persona-clock"));
+        assert!(
+            render_passive_habits(&snapshot, &facts, Some(owner)).contains("other-persona-clock")
+        );
         pile.close().unwrap();
     }
 
@@ -8554,9 +8577,12 @@ mod tests {
             assert_eq!(status.residual().len(), 1);
             drop(status);
             let query = lagging.query(&lagging.snapshot);
-            assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
             assert_eq!(
-                latest_goal_status(&query, unseen_goal).unwrap().0,
+                latest_goal_status(&query, goal).unwrap().unwrap().0,
+                next_id
+            );
+            assert_eq!(
+                latest_goal_status(&query, unseen_goal).unwrap().unwrap().0,
                 unseen_id
             );
 
@@ -8566,19 +8592,26 @@ mod tests {
                 .unwrap();
             let advanced = observe_sources(ready, &sources).unwrap();
             let query = advanced.query(&advanced.snapshot);
-            assert_eq!(latest_goal_status(&query, goal).unwrap().0, next_id);
             assert_eq!(
-                latest_goal_status(&query, unseen_goal).unwrap().0,
+                latest_goal_status(&query, goal).unwrap().unwrap().0,
+                next_id
+            );
+            assert_eq!(
+                latest_goal_status(&query, unseen_goal).unwrap().unwrap().0,
                 unseen_id
             );
             let frozen = lagging.query(&lagging.snapshot);
-            assert_eq!(latest_goal_status(&frozen, goal).unwrap().0, next_id);
             assert_eq!(
-                latest_goal_status(&frozen, unseen_goal).unwrap().0,
+                latest_goal_status(&frozen, goal).unwrap().unwrap().0,
+                next_id
+            );
+            assert_eq!(
+                latest_goal_status(&frozen, unseen_goal).unwrap().unwrap().0,
                 unseen_id
             );
             assert_eq!(
                 latest_goal_status(&observation.query(&observation.snapshot), goal)
+                    .unwrap()
                     .unwrap()
                     .0,
                 initial_id,

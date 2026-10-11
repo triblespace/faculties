@@ -47,8 +47,8 @@ pub mod board {
         "EE18CEC15C18438A2FAB670E2E46E00C" unsafe as title: inlineencodings::Handle<blobencodings::UTF8String>;
         // TODO: migrate to metadata::tag (GenId) — tags should be entities with
         // their own ID + metadata::name, not inline strings. See wiki.rs TagIndex
-        // for the correct pattern. This ShortString tag is a legacy design mistake.
-        "5FF4941DCC3F6C35E9B3FD57216F69ED" unsafe as tag: inlineencodings::ShortString;
+        // for the correct pattern. A text tag is a legacy design mistake.
+        "5FF4941DCC3F6C35E9B3FD57216F69ED" as tag: inlineencodings::Handle<blobencodings::UTF8String>;
         "9D2B6EBDA67E9BB6BE6215959D182041" unsafe as parent: inlineencodings::GenId;
 
         "C1EAAA039DA7F486E4A54CC87D42E72C" unsafe as task: inlineencodings::GenId;
@@ -62,7 +62,7 @@ pub mod board {
         // a note retire a status on 778 of 2939 live goals. Minted with
         // `trible genid` on 2026-08-19.
         "9EB26577A63788E805B2C2F7792EF307" as status_of: inlineencodings::GenId;
-        "61C44E0F8A73443ED592A713151E99A4" unsafe as status: inlineencodings::ShortString;
+        "61C44E0F8A73443ED592A713151E99A4" as status: inlineencodings::Handle<blobencodings::UTF8String>;
         // Optional acting persona (relations person id) on status and note
         // events. This is attribution only; it has no workflow semantics.
         "34718CDC13D0E3D8750DB58105390AB3" unsafe as by: inlineencodings::GenId;
@@ -85,6 +85,12 @@ pub fn interval_key(interval: IntervalValue) -> i128 {
     lower
 }
 
+/// The content handle of `value` as text, which is how a status or tag word
+/// is compared against a stored one without reading the stored blob.
+pub fn text_handle(value: &str) -> Inline<inlineencodings::Handle<blobencodings::UTF8String>> {
+    value.to_owned().to_blob().get_handle()
+}
+
 /// Deterministic latest status event for one goal.
 ///
 /// `register` is the maintained LWW index for `board::status_of` ordered by
@@ -95,9 +101,13 @@ pub fn latest_status_event<P: TriblePattern>(
     space: &P,
     register: &LwwQuery,
     goal_id: Id,
-) -> Option<(Id, String, IntervalValue)> {
+) -> Option<(
+    Id,
+    Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+    IntervalValue,
+)> {
     let current = find!(
-        (event: Id, status: String, at: IntervalValue),
+        (event: Id, status: Inline<inlineencodings::Handle<blobencodings::UTF8String>>, at: IntervalValue),
         and!(
             pattern!(space, [{ ?event @
                 metadata::tag: &KIND_STATUS_ID,

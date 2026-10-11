@@ -196,10 +196,7 @@ fn format_interval(interval: IntervalValue) -> String {
     format!("{}", lower)
 }
 
-fn validate_short(label: &str, value: &str) -> Result<()> {
-    if value.as_bytes().len() > 32 {
-        bail!("{label} exceeds 32 bytes: {value}");
-    }
+fn validate_label(label: &str, value: &str) -> Result<()> {
     if value.as_bytes().iter().any(|b| *b == 0) {
         bail!("{label} contains NUL bytes: {value}");
     }
@@ -416,15 +413,20 @@ fn task_title<P: TriblePattern>(
         .map(Option::unwrap_or_default)
 }
 
-fn task_tags<P: TriblePattern>(space: &P, task_id: Id) -> Vec<String> {
+fn task_tags<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    task_id: Id,
+) -> Result<Vec<String>> {
     let mut tags: Vec<String> = find!(
-        tag: String,
+        tag: TextHandle,
         pattern!(space, [{ task_id @ metadata::tag: &KIND_GOAL_ID, board::tag: ?tag }])
     )
-    .collect();
+    .map(|tag| read_text(reader, tag))
+    .collect::<Result<_>>()?;
     tags.sort();
     tags.dedup();
-    tags
+    Ok(tags)
 }
 
 fn task_parent<P: TriblePattern>(space: &P, task_id: Id) -> Option<Id> {
@@ -437,11 +439,14 @@ fn task_created_at<P: TriblePattern>(space: &P, task_id: Id) -> Option<IntervalV
 
 /// Latest status for a task.
 fn task_latest_status<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
     space: &P,
     status_register: &LwwQuery,
     task_id: Id,
-) -> Option<(String, IntervalValue)> {
-    latest_status_event(space, status_register, task_id).map(|(_, status, at)| (status, at))
+) -> Result<Option<(String, IntervalValue)>> {
+    latest_status_event(space, status_register, task_id)
+        .map(|(_, status, at)| Ok((read_text(reader, status)?, at)))
+        .transpose()
 }
 
 /// All goal IDs.
@@ -527,12 +532,18 @@ fn event_actor<P: TriblePattern>(space: &P, event_id: Id) -> Option<Id> {
     find!(by: Id, pattern!(space, [{ event_id @ board::by: ?by }])).next()
 }
 
-fn note_tags<P: TriblePattern>(space: &P, note_id: Id) -> Vec<String> {
+fn note_tags<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    note_id: Id,
+) -> Result<Vec<String>> {
     let mut tags: Vec<String> =
-        find!(tag: String, pattern!(space, [{ note_id @ board::tag: ?tag }])).collect();
+        find!(tag: TextHandle, pattern!(space, [{ note_id @ board::tag: ?tag }]))
+            .map(|tag| read_text(reader, tag))
+            .collect::<Result<_>>()?;
     tags.sort();
     tags.dedup();
-    tags
+    Ok(tags)
 }
 
 fn note_references<P: TriblePattern>(
@@ -579,7 +590,7 @@ fn render_board<P: TriblePattern>(
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
 
     for &task_id in &goal_ids {
-        let (status, status_at) = task_latest_status(space, status_register, task_id)
+        let (status, status_at) = task_latest_status(reader, space, status_register, task_id)?
             .map(|(s, at)| (s, Some(at)))
             .unwrap_or_else(|| ("todo".to_string(), None));
 
@@ -591,7 +602,7 @@ fn render_board<P: TriblePattern>(
             continue;
         }
 
-        let tags = task_tags(space, task_id);
+        let tags = task_tags(reader, space, task_id)?;
         if !tag_filter.is_empty() && !tags.iter().any(|t| tag_filter.contains(t)) {
             continue;
         }
@@ -853,7 +864,7 @@ fn list(
 ) -> Result<String> {
     let status_filter: Vec<String> = status_filter.into_iter().map(normalize_status).collect();
     for status in &status_filter {
-        validate_short("status", status)?;
+        validate_label("status", status)?;
     }
 
     storage.with_view(|space, reader, status_register| {
@@ -968,11 +979,11 @@ fn render_goal<P: TriblePattern>(
         writeln!(output, "Created: {}", format_interval(created))?;
     }
 
-    if let Some((status, at)) = task_latest_status(space, status_register, task_id) {
+    if let Some((status, at)) = task_latest_status(reader, space, status_register, task_id)? {
         writeln!(output, "Status: {} (since {})", status, format_interval(at))?;
     }
 
-    let tags = task_tags(space, task_id);
+    let tags = task_tags(reader, space, task_id)?;
     if !tags.is_empty() {
         writeln!(output, "Tags: {}", tags.join(", "))?;
     }
@@ -989,7 +1000,7 @@ fn render_goal<P: TriblePattern>(
 
     // Status history for this task.
     let mut history: Vec<(i128, Id, String, String, Option<Id>)> = find!(
-        (event: Id, status: String, at: IntervalValue),
+        (event: Id, status: TextHandle, at: IntervalValue),
         pattern!(space, [{
             ?event @
             metadata::tag: &KIND_STATUS_ID,
@@ -999,15 +1010,15 @@ fn render_goal<P: TriblePattern>(
         }])
     )
     .map(|(event, status, at)| {
-        (
+        Ok((
             interval_key(at),
             event,
             format_interval(at),
-            status,
+            read_text(reader, status)?,
             event_actor(space, event),
-        )
+        ))
     })
-    .collect();
+    .collect::<Result<_>>()?;
     if !history.is_empty() {
         history.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
         writeln!(output)?;
@@ -1038,7 +1049,7 @@ fn render_goal<P: TriblePattern>(
             sort_key: interval_key(at),
             at: format_interval(at),
             by: event_actor(space, note_id),
-            tags: note_tags(space, note_id),
+            tags: note_tags(reader, space, note_id)?,
             references: note_references(reader, space, note_id)?,
             supersedes: note_supersedes(space, note_id),
         })
@@ -1712,7 +1723,7 @@ mod tests {
             latest_status_event(&first_facts, &first_status, added.goal)
                 .unwrap()
                 .1,
-            "todo"
+            crate::schemas::compass::text_handle("todo")
         );
         faculty
             .move_goal(&format!("{:x}", added.goal), "doing", None)
@@ -1720,13 +1731,13 @@ mod tests {
         let (facts, status) = observe();
         assert_eq!(
             latest_status_event(&facts, &status, added.goal).unwrap().1,
-            "doing"
+            crate::schemas::compass::text_handle("doing")
         );
         assert_eq!(
             latest_status_event(&first_facts, &first_status, added.goal)
                 .unwrap()
                 .1,
-            "todo",
+            crate::schemas::compass::text_handle("todo"),
             "previously selected views remain immutable"
         );
     }
@@ -1782,10 +1793,8 @@ mod tests {
         storage
             .with_view(|facts, _, status_register| {
                 assert_eq!(
-                    latest_status_event(facts, status_register, goal)
-                        .map(|(_, value, _)| value)
-                        .as_deref(),
-                    Some("todo")
+                    latest_status_event(facts, status_register, goal).map(|(_, value, _)| value),
+                    Some(crate::schemas::compass::text_handle("todo"))
                 );
                 Ok(())
             })
@@ -1799,10 +1808,8 @@ mod tests {
         storage
             .with_view(|facts, _, status_register| {
                 assert_eq!(
-                    latest_status_event(facts, status_register, goal)
-                        .map(|(_, value, _)| value)
-                        .as_deref(),
-                    Some("doing")
+                    latest_status_event(facts, status_register, goal).map(|(_, value, _)| value),
+                    Some(crate::schemas::compass::text_handle("doing"))
                 );
                 Ok(())
             })

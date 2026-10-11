@@ -39,7 +39,7 @@ use triblespace::core::id::Id;
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use crate::files::{ContentHandle, NameHandle};
@@ -126,10 +126,13 @@ impl FilesLive {
                 continue;
             };
             let tags = find!(
-                value: Inline<ShortString>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(dataset.facts, [{ id @ file::tag: ?value }])
             )
-            .filter_map(|value| String::try_from_inline(&value).ok())
+            .filter_map(|value| {
+                let tag: anybytes::View<str> = dataset.reader.get(value).ok()?;
+                Some(tag.to_string())
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();

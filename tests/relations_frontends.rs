@@ -140,9 +140,9 @@ fn native_write_receipts_and_true_noops_do_not_require_text_parsing() {
         .unwrap();
     assert_eq!(provenance.current, None);
     assert!(provenance.provenance_added);
-    let (facts, _) = fixture.snapshot();
+    let (facts, snapshot) = fixture.snapshot();
     assert_eq!(
-        relations::person_sources(&facts, added.person).unwrap(),
+        relations::person_sources(&snapshot, &facts, added.person).unwrap(),
         ["another-source", "native"]
     );
 }

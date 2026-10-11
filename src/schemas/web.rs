@@ -6,7 +6,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
+use triblespace::prelude::inlineencodings::{GenId, Handle};
 use triblespace::prelude::*;
 
 /// Stable extrinsic scope of the Web observation collection.
@@ -21,7 +21,7 @@ pub mod web_schema {
     // Attribute IDs minted with: `trible genid`
     attributes! {
         "0CA16690DE44435B773224C275FD4E76" unsafe as query: Handle<UTF8String>;
-        "D0A6B39F715FE17935540232656CE0A3" unsafe as provider: ShortString;
+        "D0A6B39F715FE17935540232656CE0A3" as provider: inlineencodings::Handle<blobencodings::UTF8String>;
         "D50E38414AB7068C78602DD56C785634" unsafe as result: GenId;
 
         "099BE36C62777693D66A5F6183ABE9F2" unsafe as url: Handle<UTF8String>;

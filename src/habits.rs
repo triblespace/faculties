@@ -33,8 +33,8 @@ use triblespace::prelude::*;
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::schemas::habit::{
-    attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID,
-    MAX_LABEL_BYTES, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
+    attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID, SCRIPT_TOKEN,
+    STATE_ACTIVE, STATE_PAUSED,
 };
 use crate::storage::Storage;
 
@@ -155,12 +155,12 @@ impl DeclaredState {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            STATE_ACTIVE => Ok(Self::Active),
-            STATE_PAUSED => Ok(Self::Paused),
-            other => bail!("unknown Habit state {other:?}; expected `active` or `paused`"),
-        }
+    /// The state whose text has this content handle, if any. A state word
+    /// this reader does not know is not a `DeclaredState`.
+    fn from_handle(value: TextHandle) -> Option<Self> {
+        [Self::Active, Self::Paused]
+            .into_iter()
+            .find(|state| state.as_str().to_owned().to_blob().get_handle() == value)
     }
 }
 
@@ -399,14 +399,7 @@ fn canonical_required(value: impl Into<String>, field: &str) -> Result<String> {
 }
 
 fn canonical_label(value: impl Into<String>) -> Result<String> {
-    let value = canonical_required(value, "Habit label")?;
-    if value.len() > MAX_LABEL_BYTES {
-        bail!(
-            "Habit label must be at most {MAX_LABEL_BYTES} bytes, got {}",
-            value.len()
-        );
-    }
-    Ok(value)
+    canonical_required(value, "Habit label")
 }
 
 fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
@@ -436,7 +429,7 @@ fn interval_seconds(value: IntervalValue, field: &str) -> Result<i64> {
 }
 
 fn habit_record(
-    label: &str,
+    label: TextHandle,
     condition: TextHandle,
     nudge: TextHandle,
     script: Option<ScriptHandle>,
@@ -536,10 +529,11 @@ pub fn habit_fragment(
     let supersedes = sorted_ids(supersedes.iter().copied());
     let personas = sorted_ids(personas.iter().copied());
     let mut fragment = Fragment::empty();
+    let label = fragment.put(label);
     let condition = fragment.put(condition);
     let nudge = fragment.put(nudge);
     let script = script.map(|bytes| fragment.put::<blobencodings::RawBytes, _>(bytes));
-    let record = habit_record(&label, condition, nudge, script, &supersedes, &personas);
+    let record = habit_record(label, condition, nudge, script, &supersedes, &personas);
     let id = record
         .root()
         .expect("Habit definition has one intrinsic root");
@@ -623,7 +617,7 @@ fn ensure_exact_entity(facts: &TribleSet, id: Id, expected: &TribleSet, label: &
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RawHabit {
     id: Id,
-    label: String,
+    label: TextHandle,
     condition: TextHandle,
     nudge: TextHandle,
     script: Option<ScriptHandle>,
@@ -666,7 +660,7 @@ fn parse_habit(facts: &TribleSet, id: Id) -> Result<RawHabit> {
     Ok(RawHabit {
         id,
         label: exactly_one(
-            find!(value: String, pattern!(facts, [{ id @ attrs::label: ?value }])).collect(),
+            find!(value: TextHandle, pattern!(facts, [{ id @ attrs::label: ?value }])).collect(),
             id,
             "habit::label",
         )?,
@@ -716,7 +710,7 @@ fn parse_completion(facts: &TribleSet, id: Id) -> Result<Completion> {
 
 fn parse_assertion(facts: &TribleSet, id: Id) -> Result<StateAssertion> {
     let state = exactly_one(
-        find!(value: String, pattern!(facts, [{ id @ attrs::state: ?value }])).collect(),
+        find!(value: TextHandle, pattern!(facts, [{ id @ attrs::state: ?value }])).collect(),
         id,
         "habit::state",
     )?;
@@ -727,7 +721,8 @@ fn parse_assertion(facts: &TribleSet, id: Id) -> Result<StateAssertion> {
             id,
             "habit::of",
         )?,
-        state: DeclaredState::parse(&state)?,
+        state: DeclaredState::from_handle(state)
+            .ok_or_else(|| anyhow!("Habit state assertion {id:x} has an unknown state"))?,
         predecessors: sorted_ids(find!(
             value: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?value }])
@@ -760,14 +755,16 @@ fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
     }
 
     let mut habits = BTreeMap::new();
-    for id in habit_ids {
-        let raw = parse_habit(facts, id)?;
-        let canonical = canonical_label(raw.label.clone())?;
-        if canonical != raw.label {
-            bail!("Habit {id:x} label is not canonical");
+    for &id in &habit_ids {
+        // A definition with no text label was written under the retired
+        // 32-byte label attribute. This reader cannot read it, so it is not
+        // part of the view (and nor is what names it, below).
+        if !exists!(pattern!(facts, [{ id @ attrs::label: _?label }])) {
+            continue;
         }
+        let raw = parse_habit(facts, id)?;
         let expected = habit_record(
-            &raw.label,
+            raw.label,
             raw.condition,
             raw.nudge,
             raw.script,
@@ -802,6 +799,10 @@ fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
         if expected.root() != Some(id) {
             continue;
         }
+        if habit_ids.contains(&completion.habit) && !habits.contains_key(&completion.habit) {
+            // Names a definition this reader does not take into the view.
+            continue;
+        }
         if !habits.contains_key(&completion.habit) {
             bail!(
                 "Habit completion {id:x} names missing definition {:x}",
@@ -815,6 +816,10 @@ fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
 
     let mut assertions = BTreeMap::new();
     for id in assertion_ids {
+        // As for definitions: an assertion with no text state predates it.
+        if !exists!(pattern!(facts, [{ id @ attrs::state: _?state }])) {
+            continue;
+        }
         let assertion = parse_assertion(facts, id)?;
         let expected = state_record(
             assertion.habit,
@@ -823,6 +828,9 @@ fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
             assertion.asserted_at,
         );
         if expected.root() != Some(id) {
+            continue;
+        }
+        if habit_ids.contains(&assertion.habit) && !habits.contains_key(&assertion.habit) {
             continue;
         }
         if !habits.contains_key(&assertion.habit) {
@@ -963,7 +971,7 @@ where
 {
     let mut definitions = Vec::new();
     for (id, label, condition, nudge) in find!(
-        (id: Id, label: String, condition: TextHandle, nudge: TextHandle),
+        (id: Id, label: TextHandle, condition: TextHandle, nudge: TextHandle),
         pattern!(facts, [{ ?id @
             metadata::tag: &KIND_HABIT_ID,
             attrs::label: ?label,
@@ -1000,7 +1008,7 @@ where
         } else {
             definitions.extend(scripts.into_iter().map(|script| RawHabit {
                 id,
-                label: label.clone(),
+                label,
                 condition,
                 nudge,
                 script: Some(script),
@@ -1013,7 +1021,7 @@ where
     definitions.sort_by(|left, right| {
         (
             left.id,
-            &left.label,
+            left.label.raw,
             left.condition.raw,
             left.nudge.raw,
             left.script.map(|script| script.raw),
@@ -1021,7 +1029,7 @@ where
         )
             .cmp(&(
                 right.id,
-                &right.label,
+                right.label.raw,
                 right.condition.raw,
                 right.nudge.raw,
                 right.script.map(|script| script.raw),
@@ -1089,6 +1097,14 @@ where
     let mut texts = HashMap::<[u8; 32], String>::new();
     let mut definitions = Vec::new();
     for raw in projected {
+        let label = match texts.get(&raw.label.raw) {
+            Some(value) => value.clone(),
+            None => {
+                let value = load_text(reader, raw.label, "label")?;
+                texts.insert(raw.label.raw, value.clone());
+                value
+            }
+        };
         let condition = match texts.get(&raw.condition.raw) {
             Some(value) => value.clone(),
             None => {
@@ -1111,7 +1127,7 @@ where
             .transpose()?;
         definitions.push(Habit {
             id: raw.id,
-            label: raw.label,
+            label,
             condition,
             nudge,
             script,
@@ -1170,7 +1186,7 @@ where
 {
     let mut assertions = Vec::new();
     for (id, state, asserted_at) in find!(
-        (id: Id, state: String, asserted_at: IntervalValue),
+        (id: Id, state: TextHandle, asserted_at: IntervalValue),
         pattern!(facts, [{ ?id @
             metadata::tag: &KIND_STATE_ID,
             attrs::of: &habit,
@@ -1178,7 +1194,7 @@ where
             metadata::created_at: ?asserted_at,
         }])
     ) {
-        let Ok(state) = DeclaredState::parse(&state) else {
+        let Some(state) = DeclaredState::from_handle(state) else {
             continue;
         };
         assertions.push(StateAssertion {
@@ -1376,6 +1392,16 @@ where
     let mut texts = HashMap::<[u8; 32], String>::new();
     let mut habits = BTreeMap::new();
     for raw_habit in raw.habits.values() {
+        let label = if let Some(value) = texts.get(&raw_habit.label.raw) {
+            value.clone()
+        } else {
+            let value = load_text_overlay(reader, overlay, raw_habit.label, "label")?;
+            texts.insert(raw_habit.label.raw, value.clone());
+            value
+        };
+        if canonical_label(label.clone())? != label {
+            bail!("Habit {} label is not canonical", raw_habit.id);
+        }
         let condition = if let Some(value) = texts.get(&raw_habit.condition.raw) {
             value.clone()
         } else {
@@ -1417,7 +1443,7 @@ where
             raw_habit.id,
             Habit {
                 id: raw_habit.id,
-                label: raw_habit.label.clone(),
+                label,
                 condition,
                 nudge,
                 script,
@@ -1513,17 +1539,13 @@ pub fn validate_publication_fragment(fragment: &Fragment) -> Result<()> {
 
     let expected = if is_habit {
         let raw = parse_habit(facts, id)?;
-        let label = canonical_label(raw.label.clone())?;
-        if label != raw.label {
-            bail!("Habit {id:x} label is not canonical");
-        }
         if raw.supersedes.contains(&id) {
             bail!("Habit {id:x} supersedes itself");
         }
         let expected = ensure_intrinsic(
             id,
             habit_record(
-                &raw.label,
+                raw.label,
                 raw.condition,
                 raw.nudge,
                 raw.script,
@@ -1571,6 +1593,15 @@ pub fn validate_publication_fragment(fragment: &Fragment) -> Result<()> {
         let nudge = canonical_required(nudge_source.clone(), "Habit nudge payload")?;
         if nudge != nudge_source {
             bail!("Habit {id:x} nudge payload is not canonical");
+        }
+        let label: View<str> = reader.get(raw.label).map_err(|_| {
+            anyhow!(
+                "complete Habit definition {id:x} is missing label payload {}",
+                hex::encode(raw.label.raw)
+            )
+        })?;
+        if canonical_label(label.to_string())? != *label {
+            bail!("Habit {id:x} label is not canonical");
         }
         expected
     } else if is_completion {
@@ -2475,7 +2506,7 @@ mod tests {
         assert_ne!(legacy, native);
         fragment += entity! { ExclusiveId::force_ref(&legacy) @
             metadata::tag: &KIND_HABIT_ID,
-            attrs::label: raw.label.as_str(),
+            attrs::label: raw.label,
             attrs::condition: raw.condition,
             attrs::nudge: raw.nudge,
             metadata::created_at: at(1.0),
@@ -2497,7 +2528,15 @@ mod tests {
     fn publication_definition_must_carry_its_own_payloads() {
         let missing_condition = TextHandle::new([3; 32]);
         let missing_nudge = TextHandle::new([4; 32]);
-        let bare = habit_record("journal", missing_condition, missing_nudge, None, &[], &[]);
+        let unstored_label = "journal".to_owned().to_blob().get_handle();
+        let bare = habit_record(
+            unstored_label,
+            missing_condition,
+            missing_nudge,
+            None,
+            &[],
+            &[],
+        );
         let error = validate_publication_fragment(&bare).unwrap_err();
         assert!(format!("{error:#}").contains("missing condition payload"));
     }
@@ -2656,7 +2695,8 @@ mod tests {
         let mut fragment = Fragment::empty();
         let condition = fragment.put("when @script --due".to_owned());
         let nudge = fragment.put("sweep".to_owned());
-        let record = habit_record("sweep", condition, nudge, None, &[], &[]);
+        let label = fragment.put("sweep".to_owned());
+        let record = habit_record(label, condition, nudge, None, &[], &[]);
         fragment += record;
         let error = validate_publication_fragment(&fragment).unwrap_err();
         assert!(format!("{error:#}").contains("carries no script"));
@@ -2670,7 +2710,8 @@ mod tests {
         let condition = fragment.put("when @script --due".to_owned());
         let nudge = fragment.put("sweep".to_owned());
         let absent = ScriptHandle::new([7; 32]);
-        let record = habit_record("sweep", condition, nudge, Some(absent), &[], &[]);
+        let label = fragment.put("sweep".to_owned());
+        let record = habit_record(label, condition, nudge, Some(absent), &[], &[]);
         let id = record.root().unwrap();
         fragment += record;
 

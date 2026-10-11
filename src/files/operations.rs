@@ -194,11 +194,17 @@ fn source_path_of<P: TriblePattern, R: BlobStoreGet>(
         .map(|view| view.as_ref().to_string()))
 }
 
-fn tags_of<P: TriblePattern>(space: &P, eid: Id) -> Vec<String> {
+/// The entity's tags as text. A tag whose text is not in the reader is left
+/// out, like any value a typed read cannot decode.
+fn tags_of<P: TriblePattern, R: BlobStoreGet>(space: &P, reader: &R, eid: Id) -> Vec<String> {
     find!(
-        t: String,
+        t: TextHandle,
         pattern!(space, [{ eid @ file::tag: ?t }])
     )
+    .filter_map(|t| {
+        let tag: View<str> = reader.get(t).ok()?;
+        Some(tag.to_string())
+    })
     .collect()
 }
 
@@ -679,7 +685,7 @@ fn cmd_list<P: TriblePattern>(
         (eid: Id, h: FileHandle),
         pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
-        let tags = tags_of(space, eid);
+        let tags = tags_of(space, reader, eid);
         if !filter_tags.is_empty() && !filter_tags.iter().all(|ft| tags.iter().any(|t| t == ft)) {
             continue;
         }
@@ -768,7 +774,7 @@ fn cmd_show<P: TriblePattern>(space: &P, reader: &PileSnapshot, id: &str) -> Res
         bail!("unknown entity kind for '{id}'");
     }
 
-    let tags = tags_of(space, eid);
+    let tags = tags_of(space, reader, eid);
     if !tags.is_empty() {
         writeln!(output, "Tags:     {}", tags.join(", "))?;
     }
@@ -821,7 +827,7 @@ fn cmd_tag<P: TriblePattern>(
 ) -> Result<()> {
     let eid = file_capability::resolve_selector(space, id)?;
 
-    let existing = tags_of(space, eid);
+    let existing = tags_of(space, reader, eid);
     if existing.iter().any(|t| t == tag_name) {
         out.line(format!("Tag '{tag_name}' already present."))?;
         return Ok(());
@@ -849,7 +855,7 @@ fn cmd_search<P: TriblePattern>(space: &P, reader: &PileSnapshot, query: &str) -
     ) {
         let fname = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
         let mime = read_mime(space, reader, eid)?.unwrap_or_else(|| "?".into());
-        let tags = tags_of(space, eid);
+        let tags = tags_of(space, reader, eid);
 
         let fname_match = fname.to_lowercase().contains(&needle);
         let tag_match = tags.iter().any(|t| t.to_lowercase().contains(&needle));
@@ -888,7 +894,7 @@ fn cmd_imports<P: TriblePattern>(space: &P, reader: &PileSnapshot) -> Result<Str
     ) {
         let ts = imported_at_of(space, eid).unwrap_or(0);
         let src = source_path_of(space, reader, eid)?;
-        let tags = tags_of(space, eid);
+        let tags = tags_of(space, reader, eid);
         imports.push((ts, eid, src, tags));
     }
 
@@ -1232,7 +1238,7 @@ fn similar_contents<P: TriblePattern>(
     space: &P,
     cosines: &ReconstructedCosines,
     floor: f64,
-    tags: &[Inline<inlineencodings::ShortString>],
+    tags: &[Inline<inlineencodings::Handle<blobencodings::UTF8String>>],
 ) -> BTreeMap<FileHandle, std::collections::BTreeSet<Id>> {
     use triblespace::core::query::Constraint;
 
@@ -1278,16 +1284,12 @@ fn cmd_similar<P: TriblePattern>(
     use crate::wemm::Query;
 
     let reader = AcquiringReader::new(snapshot.clone(), runtime.clone());
-    // A tag longer than a short string is carried by no file.
-    let tags: Vec<Inline<inlineencodings::ShortString>> = options
+    // A tag is asked of the holders by its text's content handle.
+    let tags: Vec<Inline<inlineencodings::Handle<blobencodings::UTF8String>>> = options
         .tags
         .iter()
-        .map(|tag| {
-            tag.as_str()
-                .try_to_inline()
-                .map_err(|_| anyhow::anyhow!("{tag:?} cannot be a Files tag"))
-        })
-        .collect::<Result<_>>()?;
+        .map(|tag| tag.clone().to_blob().get_handle())
+        .collect();
     let attributes = content_attributes();
     let (cosines, own, label) = match (options.text, options.id) {
         (Some(text), None) => (
@@ -1347,7 +1349,7 @@ fn cmd_similar<P: TriblePattern>(
         let name = read_name(space, &reader, eid)?.unwrap_or_else(|| "?".into());
         let mime = read_mime(space, &reader, eid)?.unwrap_or_else(|| "?".into());
         let hash = handle_hex(content);
-        let tags = tags_of(space, eid);
+        let tags = tags_of(space, &reader, eid);
         let tagstr = if tags.is_empty() {
             String::new()
         } else {
@@ -1892,8 +1894,10 @@ mod tests {
             .tag(&format!("{id:x}"), "eager", &mut Out::new(&mut discard))
             .unwrap();
         let facts = observe();
-        assert!(tags_of(&facts, id).contains(&"eager".to_owned()));
-        assert!(!tags_of(&old_facts, id).contains(&"eager".to_owned()));
+        assert!(exists!(pattern!(&facts, [{ id @ file::tag: "eager" }])));
+        assert!(!exists!(
+            pattern!(&old_facts, [{ id @ file::tag: "eager" }])
+        ));
     }
 
     /// A gb10 build used to maintain the semantic indexes inside `files add`;
@@ -2415,9 +2419,9 @@ mod tests {
             .unwrap();
 
         let holders = |floor: f64, tags: &[&str]| {
-            let tags: Vec<Inline<inlineencodings::ShortString>> = tags
+            let tags: Vec<Inline<inlineencodings::Handle<blobencodings::UTF8String>>> = tags
                 .iter()
-                .map(|tag| tag.try_to_inline().unwrap())
+                .map(|tag| tag.to_string().to_blob().get_handle())
                 .collect();
             similar_contents(&facts, &cosines, floor, &tags)
         };

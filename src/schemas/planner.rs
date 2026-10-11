@@ -50,7 +50,7 @@ pub mod event {
             inlineencodings::Handle<blobencodings::UTF8String>;
         // Short title — fits the column width of `planner list`
         // and `orient` views without truncation.
-        "8E91381379F0567B9E318E253A1D19E6" unsafe as summary: inlineencodings::ShortString;
+        "8E91381379F0567B9E318E253A1D19E6" as summary: inlineencodings::Handle<blobencodings::UTF8String>;
         // Long-form description / agenda / minutes — stored as a
         // blob handle so multi-paragraph descriptions don't
         // bloat the trible store.
@@ -65,7 +65,7 @@ pub mod event {
         // `FREQ=WEEKLY;BYDAY=MO,WE,FR;UNTIL=20271231T235959Z`).
         // Materialised by the `rrule` crate at query time — we
         // store the rule, never the expanded occurrence set.
-        "5D8D78E60807B241039E69A49DE8C4E8" unsafe as rrule: inlineencodings::ShortString;
+        "5D8D78E60807B241039E69A49DE8C4E8" as rrule: inlineencodings::Handle<blobencodings::UTF8String>;
         // RDATE: extra one-off occurrence dates outside the RRULE
         // pattern. Repeated.
         "15EBFFA245CF255F2550C8670A544D58" unsafe as rdate: inlineencodings::NsTAIInterval;
@@ -74,17 +74,17 @@ pub mod event {
         "38E77BDD78C7C3C86B2C7EC48CF5CC1E" unsafe as exdate: inlineencodings::NsTAIInterval;
         // Free-text location (RFC 5545's LOCATION property) —
         // physical room, video-call URL, etc.
-        "A487B9784985D0E285A5CC9C6B053B94" unsafe as location: inlineencodings::ShortString;
+        "A487B9784985D0E285A5CC9C6B053B94" as location: inlineencodings::Handle<blobencodings::UTF8String>;
         // Baseline RFC 5545 STATUS — one of `TENTATIVE` / `CONFIRMED` /
         // `CANCELLED`. A later local cancellation is represented by a
         // separate intrinsic cancellation assertion; status is never appended
         // again as a competing scalar value.
-        "BDE09DF9E0DF0A0738727348037EFA84" unsafe as status: inlineencodings::ShortString;
+        "BDE09DF9E0DF0A0738727348037EFA84" as status: inlineencodings::Handle<blobencodings::UTF8String>;
         // RFC 5545 TRANSP — `OPAQUE` (blocks the time slot;
         // counts toward "busy") or `TRANSPARENT` (informational,
         // doesn't block — e.g. a deadline reminder). Defaults to
         // `OPAQUE` since "occupies a time slot" is the use case.
-        "48AB5C7B026CAFDA33A5FD2699C90C2F" unsafe as transp: inlineencodings::ShortString;
+        "48AB5C7B026CAFDA33A5FD2699C90C2F" as transp: inlineencodings::Handle<blobencodings::UTF8String>;
         // ATTENDEE: pointer to a `relations` entry. Repeated.
         "B67EF51577844872CB2D1A11B85399B0" unsafe as attendee: inlineencodings::GenId;
         // ORGANIZER: pointer to a single `relations` entry.

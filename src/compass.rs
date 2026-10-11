@@ -105,10 +105,7 @@ where
         .attach::<LwwRegisterBlob>(source, (board::status_of.id(), metadata::created_at.id()))?)
 }
 
-fn validate_short(label: &str, value: &str) -> Result<()> {
-    if value.len() > 32 {
-        bail!("{label} exceeds 32 UTF-8 bytes: {value}");
-    }
+fn validate_label(label: &str, value: &str) -> Result<()> {
     if value.bytes().any(|byte| byte == 0) {
         bail!("{label} contains a NUL byte: {value}");
     }
@@ -117,7 +114,7 @@ fn validate_short(label: &str, value: &str) -> Result<()> {
 
 pub fn canonical_status(value: impl Into<String>) -> Result<String> {
     let value = value.into().trim().to_ascii_lowercase();
-    validate_short("status", &value)?;
+    validate_label("status", &value)?;
     Ok(value)
 }
 
@@ -127,7 +124,7 @@ pub fn canonical_tags(values: impl IntoIterator<Item = String>) -> Result<Vec<St
         .map(|value| value.trim().to_owned())
         .collect();
     for value in &values {
-        validate_short("tag", value)?;
+        validate_label("tag", value)?;
     }
     values.sort();
     values.dedup();
@@ -614,10 +611,13 @@ fn validate_status(facts: &TribleSet, event: Id) -> Result<()> {
         "board::task",
         find!(value: Id, pattern!(facts, [{ event @ board::task: ?value }])).collect(),
     )?;
-    let _status = exactly_one(
+    // At most one, for the same reason: an event written before status
+    // became text carries its word under the retired 32-byte attribute, which
+    // this reader does not model, until a backfill gives it its text twin.
+    let _status = at_most_one(
         event,
         "board::status",
-        find!(value: String, pattern!(facts, [{ event @ board::status: ?value }])).collect(),
+        find!(value: TextHandle, pattern!(facts, [{ event @ board::status: ?value }])).collect(),
     )?;
     let _by = at_most_one(
         event,
@@ -753,15 +753,13 @@ fn require_current_status_shape(facts: &TribleSet, event: Id) -> Result<()> {
         "board::status_of",
         find!(value: Id, pattern!(facts, [{ event @ board::status_of: ?value }])).collect(),
     )?;
-    let status = exactly_one(
+    // The word itself is checked against its staged text in
+    // `validate_candidate`; here only its presence.
+    let _status = exactly_one(
         event,
         "board::status",
-        find!(value: String, pattern!(facts, [{ event @ board::status: ?value }])).collect(),
+        find!(value: TextHandle, pattern!(facts, [{ event @ board::status: ?value }])).collect(),
     )?;
-    let canonical = canonical_status(status.clone())?;
-    if canonical != status {
-        bail!("new Compass status event {event:x} has non-canonical status {status:?}");
-    }
     require_complete_occurrence(facts, event, "status event")
 }
 
@@ -997,6 +995,8 @@ pub fn validate_known_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) ->
         if fact.a() == &board::title.id()
             || fact.a() == &board::note.id()
             || fact.a() == &board::reference.id()
+            || fact.a() == &board::tag.id()
+            || fact.a() == &board::status.id()
         {
             let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
@@ -1034,14 +1034,23 @@ pub fn validate_candidate(
         if fact.a() == &board::title.id()
             || fact.a() == &board::note.id()
             || fact.a() == &board::reference.id()
+            || fact.a() == &board::tag.id()
+            || fact.a() == &board::status.id()
         {
             let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
-            let _: View<str> = overlay.get(handle).with_context(|| {
+            let text: View<str> = overlay.get(handle).with_context(|| {
                 format!(
                     "read staged Compass text payload {}",
                     hex::encode_upper(handle.raw)
                 )
             })?;
+            if fact.a() == &board::status.id() && canonical_status(text.to_string())? != *text {
+                bail!(
+                    "new Compass status event {:x} has non-canonical status {:?}",
+                    fact.e(),
+                    &*text
+                );
+            }
         }
     }
     Ok(())
@@ -1205,7 +1214,7 @@ mod tests {
                 )
                 .unwrap()
                 .1,
-                "doing",
+                crate::schemas::compass::text_handle("doing"),
             );
         });
     }
@@ -1234,7 +1243,7 @@ mod tests {
                 )
                 .unwrap()
                 .1,
-                "todo",
+                crate::schemas::compass::text_handle("todo"),
             );
 
             let (mut later, new_goal) = goal_fragment("later", vec![], None, at(2)).unwrap();
@@ -1272,7 +1281,7 @@ mod tests {
                     )
                     .unwrap()
                     .1,
-                    "done",
+                    crate::schemas::compass::text_handle("done"),
                 );
                 assert_eq!(
                     crate::schemas::compass::latest_status_event(
@@ -1282,7 +1291,7 @@ mod tests {
                     )
                     .unwrap()
                     .1,
-                    "todo",
+                    crate::schemas::compass::text_handle("todo"),
                 );
                 assert_eq!(
                     resident
@@ -1313,7 +1322,7 @@ mod tests {
                 )
                 .unwrap()
                 .1,
-                "done",
+                crate::schemas::compass::text_handle("done"),
             );
         });
     }
@@ -1363,7 +1372,7 @@ mod tests {
                 )
                 .unwrap()
                 .1,
-                "todo",
+                crate::schemas::compass::text_handle("todo"),
             );
             assert!(!resident.store_snapshot().contains_blob(cold).unwrap());
             assert_eq!(
@@ -1393,7 +1402,7 @@ mod tests {
                 )
                 .unwrap()
                 .1,
-                "done",
+                crate::schemas::compass::text_handle("done"),
             );
         });
     }

@@ -382,8 +382,8 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
         });
     }
 
-    let status_rows: Vec<(Id, Id, String, (i128, i128))> = find!(
-        (event_id: Id, gid: Id, status: String, ts: (i128, i128)),
+    let status_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
+        (event_id: Id, gid: Id, status: TextHandle, ts: (i128, i128)),
         pattern!(dataset.facts, [{
             ?event_id @
             metadata::tag: &KIND_STATUS_ID,
@@ -405,7 +405,7 @@ fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
             entity_id: event_id,
             ts_ns: ts.0,
             summary: preview(&title, 80),
-            status: Some(status),
+            status: Some(read_text(dataset, status)),
             from_to: None,
         });
     }

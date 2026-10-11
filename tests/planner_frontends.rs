@@ -107,7 +107,7 @@ fn direct_add_and_initial_note_are_one_publication_and_cancel_is_monotone() {
     assert!(planner.cancel(&id).unwrap().already_cancelled);
     assert_eq!(fixture.commits(), 2);
     let detail = planner.show(&id).unwrap();
-    assert_eq!(detail.event.status, STATUS_CONFIRMED);
+    assert_eq!(detail.status, STATUS_CONFIRMED);
     assert!(detail.cancelled);
     assert!(planner.list(window(), false).unwrap().is_empty());
     assert_eq!(

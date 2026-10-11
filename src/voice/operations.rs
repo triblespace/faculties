@@ -6,7 +6,6 @@ use crate::collection_names::open_configured;
 use crate::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
 #[cfg(test)]
 use crate::storage::open_pile_strict_as;
-#[cfg(test)]
 use crate::storage::FacultySnapshot;
 use crate::storage::{AcquiringReader, FactArchive, FacultyStore};
 use crate::voice as voice_model;
@@ -18,7 +17,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::SnapshotSource;
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
 use super::routing::{classify, DeviceClass};
@@ -106,7 +105,7 @@ impl Voice {
                 .map(|channel| {
                     Ok(RoutePolicy {
                         channel,
-                        devices: load_route(&session.facts, channel.name())?,
+                        devices: load_route(&session.reader, &session.facts, channel.name())?,
                     })
                 })
                 .collect()
@@ -114,7 +113,7 @@ impl Voice {
     }
     pub fn route(&self, channel: Channel) -> Result<Vec<String>> {
         self.storage()
-            .with_session(|session| load_route(&session.facts, channel.name()))
+            .with_session(|session| load_route(&session.reader, &session.facts, channel.name()))
     }
     pub fn set_route(&self, channel: Channel, devices: &[String]) -> Result<RouteReceipt> {
         validate_devices(devices)?;
@@ -187,7 +186,6 @@ struct VoiceSession<'a> {
     collection: Collection<SimpleArchive>,
     signer: &'a ed25519_dalek::SigningKey,
     facts: FactArchive,
-    #[cfg(test)]
     reader: AcquiringReader<FacultySnapshot>,
 }
 
@@ -268,7 +266,6 @@ impl VoiceStorage<'_> {
                     collection,
                     signer,
                     facts,
-                    #[cfg(test)]
                     reader: store_snapshot,
                 })
             })();
@@ -282,11 +279,19 @@ impl VoiceStorage<'_> {
 /// is the LATEST generation only (a set replaces, it doesn't accumulate).
 /// Exact timestamp ties are unioned. Falls back to the baked-in defaults when
 /// the live projection holds no policy for the channel.
-fn load_route<P: TriblePattern>(space: &P, channel: &str) -> Result<Vec<String>> {
-    // (set-generation key, priority, device) for this channel.
+fn load_route<R: BlobStoreGet, P: TriblePattern>(
+    reader: &R,
+    space: &P,
+    channel: &str,
+) -> Result<Vec<String>> {
+    // (set-generation key, priority, device) for this channel. A device whose
+    // text this reader does not hold is not part of the projection.
     let rows: Vec<(i128, u64, String)> = voice_model::route_rows(space, channel)
         .into_iter()
-        .map(|row| (row.updated_at.0, row.priority, row.device))
+        .filter_map(|row| {
+            let device: anybytes::View<str> = reader.get(row.device).ok()?;
+            Some((row.updated_at.0, row.priority, device.to_string()))
+        })
         .collect();
     let Some(latest_gen) = rows.iter().map(|(k, _, _)| *k).max() else {
         let defaults = match channel {
@@ -388,7 +393,10 @@ mod tests {
 
         storage
             .with_session(|session| {
-                assert_eq!(load_route(&session.facts, CHANNEL_SAY)?, route);
+                assert_eq!(
+                    load_route(&session.reader, &session.facts, CHANNEL_SAY)?,
+                    route
+                );
                 let (text, audio) = find!(
                     (text: voice_model::TextHandle, audio: voice_model::AudioHandle),
                     pattern!(&session.facts, [{
@@ -460,7 +468,16 @@ mod tests {
         let devices = vec!["Private test headphones".to_owned()];
         capability.set_route(Channel::Say, &devices).unwrap();
         let routing = resident_facts(&capability);
-        assert_eq!(load_route(&routing, CHANNEL_SAY).unwrap(), devices);
+        assert_eq!(
+            voice_model::route_rows(&routing, CHANNEL_SAY)
+                .into_iter()
+                .map(|row| row.device)
+                .collect::<Vec<_>>(),
+            devices
+                .iter()
+                .map(|device| voice_model::text_handle(device))
+                .collect::<Vec<_>>()
+        );
 
         let recorded = capability
             .record(Channel::Say, "A recorded attempt", None, "test attempt")

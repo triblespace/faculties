@@ -81,6 +81,7 @@ fn event_and_initial_note_publish_as_one_signed_mutation() {
                 1
             );
             let occurrences = collect_occurrences(
+                &loaded.reader,
                 &loaded.facts,
                 (
                     Epoch::from_unix_seconds(0.0),
@@ -216,7 +217,7 @@ fn cancel_adds_one_assertion_without_mutating_baseline_status() {
                 planner_model::event(&loaded.facts, event_id)
                     .expect("published event remains readable")
                     .status,
-                STATUS_CONFIRMED
+                planner_model::text_handle(STATUS_CONFIRMED)
             );
             assert!(planner_model::event_is_cancelled(&loaded.facts, event_id));
             Ok(())
@@ -231,8 +232,9 @@ fn opaque_repeated_cancellation_edges_cancel_every_occurrence_target() {
     let second = event_fragment(&fixture_draft("second@example", "second")).unwrap();
     let second_id = second.root().unwrap();
     let assertion = fixture_id(7);
-    let mut facts = first.into_facts();
-    facts += second.into_facts();
+    let mut payloads = first + second;
+    let mut facts = payloads.facts().clone();
+    let reader = payloads.blobs_mut().snapshot().unwrap();
     facts += entity! { ExclusiveId::force_ref(&assertion) @
         metadata::tag: &KIND_CANCELLATION_ID,
         cancellation::event: &first_id,
@@ -245,9 +247,9 @@ fn opaque_repeated_cancellation_edges_cancel_every_occurrence_target() {
         Epoch::from_unix_seconds(0.0),
         Epoch::from_unix_seconds(30.0),
     );
-    assert!(collect_occurrences(&facts, window, false).is_empty());
+    assert!(collect_occurrences(&reader, &facts, window, false).is_empty());
 
-    let all = collect_occurrences(&facts, window, true);
+    let all = collect_occurrences(&reader, &facts, window, true);
     assert_eq!(all.len(), 2);
     assert!(all
         .iter()
@@ -273,9 +275,9 @@ fn occurrence_reads_ignore_notes_and_skip_unsupported_event_rows() {
         point_interval(Epoch::from_unix_seconds(30.0)),
     )
     .unwrap();
-    let mut facts = event.into_facts();
-    facts += unsupported.into_facts();
-    facts += note.into_facts();
+    let mut payloads = event + unsupported + note;
+    let mut facts = payloads.facts().clone();
+    let reader = payloads.blobs_mut().snapshot().unwrap();
     let incomplete_note = fixture_id(8);
     facts += entity! { ExclusiveId::force_ref(&incomplete_note) @
         metadata::tag: &KIND_NOTE_ID,
@@ -285,11 +287,11 @@ fn occurrence_reads_ignore_notes_and_skip_unsupported_event_rows() {
         Epoch::from_unix_seconds(0.0),
         Epoch::from_unix_seconds(30.0),
     );
-    let occurrences = collect_occurrences(&facts, window, false);
+    let occurrences = collect_occurrences(&reader, &facts, window, false);
     assert_eq!(occurrences.len(), 1);
     assert_eq!(occurrences[0].event_id, event_id);
     assert_eq!(
-        next_occurrence(&facts, window)
+        next_occurrence(&reader, &facts, window)
             .expect("readable event remains the next occurrence")
             .event_id,
         event_id
@@ -330,13 +332,15 @@ fn next_compares_rrule_and_every_rdate_after_applying_exdates() {
         Epoch::from_unix_seconds(100_010.0),
     );
     let later = event_fragment(&later).unwrap();
-    let mut facts = recurring.into_facts();
-    facts += later.into_facts();
+    let mut payloads = recurring + later;
+    let facts = payloads.facts().clone();
+    let reader = payloads.blobs_mut().snapshot().unwrap();
 
     // EXDATE must be inside the recurrence set before `all(1)`: otherwise
     // it yields the excluded DTSTART and the later RDATE wins after the
     // exact filter. The next unexcluded RRULE occurrence is one day later.
     let next = next_occurrence(
+        &reader,
         &facts,
         (
             Epoch::from_unix_seconds(-1.0),
@@ -350,7 +354,7 @@ fn next_compares_rrule_and_every_rdate_after_applying_exdates() {
 
     // The RDATE fold must inspect every value rather than assume query
     // order. Put the winning value after a later one deliberately.
-    let mut row = occurrence_event(&facts, recurring_id).unwrap();
+    let mut row = occurrence_event(&reader, &facts, recurring_id).unwrap();
     row.rdates = vec![
         (
             Epoch::from_unix_seconds(90_000.0),

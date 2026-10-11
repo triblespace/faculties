@@ -42,8 +42,8 @@ pub mod file {
         // import timestamp; preserved legacy file provenance outside identity
         "3765160CC1A96BE38302B344718E4C49" unsafe as imported_at: inlineencodings::NsTAIInterval;
         // TODO: migrate to metadata::tag (GenId) — should use canonical tag
-        // entities with metadata::name, not inline ShortString. See wiki.rs TagIndex.
-        "CDA941A27F86A7551779CF9524DE1D0F" unsafe as tag: inlineencodings::ShortString;
+        // entities with metadata::name, not text. See wiki.rs TagIndex.
+        "CDA941A27F86A7551779CF9524DE1D0F" as tag: inlineencodings::Handle<blobencodings::UTF8String>;
         // directory: children (multi-valued, files or subdirectories)
         "0AC1D962B6E8170FDD73AE3743E16578" unsafe as children: inlineencodings::GenId;
         // import: root directory or file entity

@@ -72,13 +72,3 @@ pub mod local {
 pub fn is_inbox_message(from: Id, to: Id, reader: Id, reader_groups: &HashSet<Id>) -> bool {
     from != reader && (to == reader || reader_groups.contains(&to))
 }
-
-/// Legacy normalized lookup vocabulary retained until its remaining branch
-/// consumers move to the native Relations resolver.
-pub mod relations_schema {
-    use super::*;
-    attributes! {
-        "299E28A10114DC8C3B1661CD90CB8DF6" unsafe as label_norm: inlineencodings::ShortString;
-        "3E8812F6D22B2C93E2BCF0CE3C8C1979" unsafe as alias_norm: inlineencodings::ShortString;
-    }
-}

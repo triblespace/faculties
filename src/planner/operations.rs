@@ -26,7 +26,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::CollectionSnapshotExt;
 use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
-use triblespace::core::repo::SnapshotSource;
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
 /// Explicit observation window; never a sequence of CLI arguments.
@@ -59,12 +59,12 @@ impl AddOptions {
     }
     pub fn validate(&self) -> Result<()> {
         validate_window((self.start, self.end))?;
-        planner_model::validate_short("event summary", &self.summary)?;
+        planner_model::validate_label("event summary", &self.summary)?;
         if let Some(rule) = &self.rrule {
-            planner_model::validate_short("event RRULE", rule)?;
+            planner_model::validate_label("event RRULE", rule)?;
         }
         if let Some(location) = &self.location {
-            planner_model::validate_short("event location", location)?;
+            planner_model::validate_label("event location", location)?;
         }
         planner_model::validate_status(&self.status)?;
         planner_model::validate_transp(&self.transp)
@@ -94,6 +94,10 @@ pub struct NoteDetail {
 #[derive(Clone, Debug)]
 pub struct EventDetail {
     pub event: EventRow,
+    pub summary: String,
+    pub rrule: Option<String>,
+    pub location: Option<String>,
+    pub status: String,
     pub uid: String,
     pub description: Option<String>,
     pub cancelled: bool,
@@ -194,6 +198,7 @@ impl Planner {
         validate_window(window)?;
         self.storage().with_view(|loaded| {
             Ok(collect_occurrences(
+                &loaded.reader,
                 &loaded.facts,
                 window,
                 include_cancelled,
@@ -209,7 +214,7 @@ impl Planner {
         let window = (start, default_window().1);
         validate_window(window)?;
         self.storage()
-            .with_view(|loaded| Ok(next_occurrence(&loaded.facts, window)))
+            .with_view(|loaded| Ok(next_occurrence(&loaded.reader, &loaded.facts, window)))
     }
     pub fn note(&self, id: &str, text: &str) -> Result<AddedNote> {
         self.storage().update("add event note", |loaded| {
@@ -229,6 +234,16 @@ impl Planner {
                 )
             })?;
             let uid = read_text(&loaded.reader, event.uid)?;
+            let summary = read_text(&loaded.reader, event.summary)?;
+            let rrule = event
+                .rrule
+                .map(|handle| read_text(&loaded.reader, handle))
+                .transpose()?;
+            let location = event
+                .location
+                .map(|handle| read_text(&loaded.reader, handle))
+                .transpose()?;
+            let status = read_text(&loaded.reader, event.status)?;
             let description = event
                 .description
                 .map(|handle| read_text(&loaded.reader, handle))
@@ -247,6 +262,10 @@ impl Planner {
                 .collect::<Result<Vec<_>>>()?;
             Ok(EventDetail {
                 event,
+                summary,
+                rrule,
+                location,
+                status,
                 uid,
                 description,
                 cancelled,
@@ -555,15 +574,16 @@ struct OccurrenceEvent {
     status: String,
 }
 
-fn occurrence_event<P>(space: &P, id: Id) -> Option<OccurrenceEvent>
+fn occurrence_event<R, P>(reader: &R, space: &P, id: Id) -> Option<OccurrenceEvent>
 where
+    R: BlobStoreGet,
     P: TriblePattern + ?Sized,
 {
     find!(
         (
-            summary: String,
+            summary: TextHandle,
             time: EpochInterval,
-            status: String,
+            status: TextHandle,
         ),
         pattern!(space, [{ id @
             metadata::tag: &KIND_EVENT_ID,
@@ -573,6 +593,8 @@ where
         }])
     )
     .find_map(|(summary, time, status)| {
+        let summary = read_text(reader, summary).ok()?;
+        let status = read_text(reader, status).ok()?;
         if !matches!(
             status.as_str(),
             STATUS_CONFIRMED | STATUS_TENTATIVE | STATUS_CANCELLED
@@ -601,18 +623,26 @@ where
             id,
             summary,
             time,
-            rrule: find!(
-                value: String,
+            rrule: match find!(
+                value: TextHandle,
                 pattern!(space, [{ id @ event::rrule: ?value }])
             )
-            .next(),
+            .next()
+            {
+                Some(handle) => Some(read_text(reader, handle).ok()?),
+                None => None,
+            },
             rdates,
             exdates,
-            location: find!(
-                value: String,
+            location: match find!(
+                value: TextHandle,
                 pattern!(space, [{ id @ event::location: ?value }])
             )
-            .next(),
+            .next()
+            {
+                Some(handle) => Some(read_text(reader, handle).ok()?),
+                None => None,
+            },
             status,
         })
     })
@@ -716,8 +746,14 @@ fn occurrence_key(occurrence: &Occurrence) -> ([u8; 32], Id) {
     )
 }
 
-fn collect_occurrences<P>(space: &P, window: EpochInterval, show_cancelled: bool) -> Vec<Occurrence>
+fn collect_occurrences<R, P>(
+    reader: &R,
+    space: &P,
+    window: EpochInterval,
+    show_cancelled: bool,
+) -> Vec<Occurrence>
 where
+    R: BlobStoreGet,
     P: TriblePattern + ?Sized,
 {
     let mut occurrences = Vec::new();
@@ -725,7 +761,7 @@ where
         id: Id,
         pattern!(space, [{ ?id @ metadata::tag: &KIND_EVENT_ID }])
     ) {
-        let Some(row) = occurrence_event(space, event_id) else {
+        let Some(row) = occurrence_event(reader, space, event_id) else {
             continue;
         };
         let cancelled = planner_model::event_is_cancelled(space, row.id);
@@ -786,8 +822,9 @@ fn next_event_occurrence(row: &OccurrenceEvent, window: EpochInterval) -> Option
     next
 }
 
-fn next_occurrence<P>(space: &P, window: EpochInterval) -> Option<Occurrence>
+fn next_occurrence<R, P>(reader: &R, space: &P, window: EpochInterval) -> Option<Occurrence>
 where
+    R: BlobStoreGet,
     P: TriblePattern + ?Sized,
 {
     let mut next = None;
@@ -795,7 +832,7 @@ where
         id: Id,
         pattern!(space, [{ ?id @ metadata::tag: &KIND_EVENT_ID }])
     ) {
-        let Some(row) = occurrence_event(space, event_id) else {
+        let Some(row) = occurrence_event(reader, space, event_id) else {
             continue;
         };
         if planner_model::event_is_cancelled(space, row.id) {
@@ -937,12 +974,8 @@ fn parse_ical_datetime(input: &str, is_date: bool) -> Result<DateTime<Utc>> {
     Ok(Utc.from_utc_datetime(&datetime))
 }
 
-fn truncate_short(value: &str) -> String {
-    let mut value = value.replace('\n', " ");
-    while value.len() > 32 {
-        value.pop();
-    }
-    value
+fn single_line(value: &str) -> String {
+    value.replace('\n', " ")
 }
 
 /// Stage one UID-derived import into a deterministic map. Identical records
@@ -1019,7 +1052,7 @@ fn ingest(storage: PlannerStorage<'_>, documents: &[CalendarInput<'_>]) -> Resul
                         .with_context(|| format!("parse VEVENT in {}", document.name))?;
                     let mut draft = empty_event_draft(
                         source.uid.clone(),
-                        truncate_short(source.summary.as_deref().unwrap_or("(untitled)")),
+                        single_line(source.summary.as_deref().unwrap_or("(untitled)")),
                         make_interval(
                             chrono_to_epoch(source.dtstart),
                             chrono_to_epoch(source.dtend),
@@ -1028,7 +1061,7 @@ fn ingest(storage: PlannerStorage<'_>, documents: &[CalendarInput<'_>]) -> Resul
                         normalized_transp(source.transp.as_deref()),
                     );
                     draft.description = source.description;
-                    draft.location = source.location.as_deref().map(truncate_short);
+                    draft.location = source.location.as_deref().map(single_line);
                     draft.rrule = source.rrule;
                     let fragment = event_fragment(&draft)?;
                     if !stage_import_event(loaded, &mut staged, &source.uid, fragment)? {

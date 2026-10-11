@@ -235,16 +235,11 @@ fn text_set(values: Vec<String>, field: &str) -> Result<Vec<String>> {
 }
 
 fn source_set(mut values: Vec<String>) -> Result<Vec<String>> {
-    for value in &values {
-        if value.len() > 32 {
-            bail!(
-                "source is {} bytes but the published ShortString schema holds at most 32",
-                value.len()
-            );
-        }
-        if value.bytes().any(|byte| byte == 0) {
-            bail!("source contains a NUL byte");
-        }
+    if values
+        .iter()
+        .any(|value| value.bytes().any(|byte| byte == 0))
+    {
+        bail!("source contains a NUL byte");
     }
     values.sort();
     values.dedup();
@@ -685,14 +680,19 @@ where
 /// Every exact source label asserted for a stable person anchor, sorted and
 /// deduplicated. No scalar winner is selected when several systems observed
 /// the same person.
-pub fn person_sources<P>(facts: &P, person: Id) -> Result<Vec<String>>
+pub fn person_sources<Store, P>(reader: &Store, facts: &P, person: Id) -> Result<Vec<String>>
 where
+    Store: BlobStoreGet + ?Sized,
     P: TriblePattern,
 {
-    Ok(sorted_strings(find!(
-        value: String,
-        pattern!(facts, [{ person @ legacy::source: ?value }])
-    )))
+    Ok(sorted_strings(
+        find!(
+            value: TextHandle,
+            pattern!(facts, [{ person @ legacy::source: ?value }])
+        )
+        .map(|value| read_text(reader, value))
+        .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
 /// Every creation-time observation attached to a stable person or group
@@ -1020,10 +1020,6 @@ fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
     let lifecycle_ids = ids_of_kind(facts, KIND_PERSON_LIFECYCLE);
     let group_ids = ids_of_kind(facts, KIND_GROUP_SNAPSHOT);
     let verdict_ids = ids_of_kind(facts, KIND_IDENTITY_VERDICT);
-
-    for &person in &people {
-        let _ = person_sources(facts, person)?;
-    }
 
     let mut text_handles = Vec::new();
     for &id in &profile_ids {
@@ -2044,7 +2040,7 @@ mod tests {
         );
         assert_eq!(group_head(&after.facts, group).unwrap(), group_before);
         assert_eq!(
-            person_sources(&after.facts, person).unwrap(),
+            person_sources(&after.reader, &after.facts, person).unwrap(),
             vec!["crm", "linkedin", "mail"]
         );
     }
@@ -2147,7 +2143,6 @@ mod tests {
         legacy += entity! { ExclusiveId::force_ref(&person) @
             metadata::name: old_group_name,
             metadata::description: missing_legacy_note,
-            legacy::alias: "countess",
             legacy::same_as: &other,
         };
         legacy += entity! { ExclusiveId::force_ref(&old_group_snapshot) @

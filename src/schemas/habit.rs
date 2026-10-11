@@ -38,7 +38,7 @@ pub mod attrs {
 
     attributes! {
         /// Short command-facing label for a standing intention.
-        "4AB58053472C4163C39C9A4047F8111E" unsafe as label: inlineencodings::ShortString;
+        "4AB58053472C4163C39C9A4047F8111E" as label: inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Text shown when the intention is due.
         "1E82BD7E8EFEA00FD3FAB3ECEFD0BA33" unsafe as nudge:
@@ -52,7 +52,7 @@ pub mod attrs {
         "F00FAA4B44DB1E79E36055410B476C42" unsafe as of: inlineencodings::GenId;
 
         /// `active` or `paused` on a state assertion.
-        "5C1E4BD13E8FA4633F286CD5B33BCAC7" unsafe as state: inlineencodings::ShortString;
+        "5C1E4BD13E8FA4633F286CD5B33BCAC7" as state: inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Executable the standing intention carries with it, addressed by
         /// content hash. A habit whose predicate lives in the pile is the same
@@ -85,10 +85,6 @@ pub mod attrs {
 /// named `script` (BSD's terminal recorder) keeps working because it carries
 /// no `@`.
 pub const SCRIPT_TOKEN: &str = "@script";
-
-/// Labels are inline values and command addresses. Refuse overflow explicitly
-/// instead of allowing the encoder to panic.
-pub const MAX_LABEL_BYTES: usize = 30;
 
 /// Default cooldown for an open shell predicate.
 pub const DEFAULT_COOLDOWN_SECS: i64 = 60 * 60;

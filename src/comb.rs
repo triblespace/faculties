@@ -17,6 +17,7 @@ use crate::schemas::memory::comb::{
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CursorTrack {
@@ -30,8 +31,9 @@ pub struct CursorState {
     pub position: Option<IntervalValue>,
     /// Exact item consumed at `position` when timestamp alone is ambiguous.
     pub anchor: Option<Id>,
-    /// Present only for active practices whose next read needs a grain.
-    pub grain: Option<String>,
+    /// Present only for active practices whose next read needs a grain: the
+    /// handle of its text as typed ("2h"), read through the cursor's store.
+    pub grain: Option<TextHandle>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,8 +97,8 @@ pub fn resolution<P: TriblePattern>(
         let anchors: BTreeSet<Id> =
             find!(value: Id, pattern!(facts, [{ id @ cursor_anchor: ?value }])).collect();
         let has_grain = exists!(pattern!(facts, [{ id @ cursor_grain: _?grain }]));
-        let grains: BTreeSet<String> =
-            find!(value: String, pattern!(facts, [{ id @ cursor_grain: ?value }])).collect();
+        let grains: BTreeSet<TextHandle> =
+            find!(value: TextHandle, pattern!(facts, [{ id @ cursor_grain: ?value }])).collect();
         let predecessors: BTreeSet<Id> = find!(
             value: Id,
             pattern!(facts, [{ id @ metadata::supersedes: ?value }])
@@ -138,7 +140,7 @@ pub fn resolution<P: TriblePattern>(
         } else {
             anchors.into_iter().map(Some).collect()
         };
-        let grains: Vec<Option<String>> = if grains.is_empty() {
+        let grains: Vec<Option<TextHandle>> = if grains.is_empty() {
             vec![None]
         } else {
             grains.into_iter().map(Some).collect()
@@ -152,7 +154,7 @@ pub fn resolution<P: TriblePattern>(
                         state: CursorState {
                             position: Some(position),
                             anchor: *anchor,
-                            grain: grain.clone(),
+                            grain: *grain,
                         },
                         predecessors: predecessors.clone(),
                         observed_at: observed_at.clone(),
@@ -185,7 +187,12 @@ pub fn resolution<P: TriblePattern>(
                     .cmp(&right.state.position.map(|value| value.raw))
             })
             .then_with(|| left.state.anchor.cmp(&right.state.anchor))
-            .then_with(|| left.state.grain.cmp(&right.state.grain))
+            .then_with(|| {
+                left.state
+                    .grain
+                    .map(|value| value.raw)
+                    .cmp(&right.state.grain.map(|value| value.raw))
+            })
     });
     let resolution = match heads.as_slice() {
         [] => bail!("Comb cursor track ({stream}, {persona}) has no typed live head"),
@@ -232,12 +239,9 @@ pub struct CursorDraft {
     pub observed_at: BTreeSet<IntervalValue>,
 }
 
-fn validate_short(field: &str, value: &str) -> Result<()> {
+fn validate_label(field: &str, value: &str) -> Result<()> {
     if value.is_empty() || value.trim() != value {
         bail!("{field} must be non-empty and have no surrounding whitespace");
-    }
-    if value.len() > 32 {
-        bail!("{field} exceeds 32 UTF-8 bytes");
     }
     if value.as_bytes().contains(&0) {
         bail!("{field} contains a NUL byte");
@@ -262,21 +266,21 @@ fn cursor_core(track: &CursorTrack, state: &CursorState, predecessors: &BTreeSet
         cursor_persona: track.persona.as_str(),
         cursor_position?: state.position.as_ref(),
         cursor_anchor?: state.anchor.as_ref(),
-        cursor_grain?: state.grain.as_deref(),
+        cursor_grain?: state.grain.as_ref(),
         metadata::supersedes*: predecessors.iter(),
     }
 }
 
 pub fn cursor_fragment(draft: CursorDraft) -> Result<(Fragment, Id)> {
-    validate_short("cursor stream", &draft.stream)?;
-    validate_short("cursor persona", &draft.persona)?;
+    validate_label("cursor stream", &draft.stream)?;
+    validate_label("cursor persona", &draft.persona)?;
     if let Some(position) = draft.position {
         point("cursor position", position)?;
     } else if draft.grain.is_some() || draft.anchor.is_some() {
         bail!("a stopped cursor cannot retain a grain or anchor");
     }
     if let Some(grain) = &draft.grain {
-        validate_short("cursor grain", grain)?;
+        validate_label("cursor grain", grain)?;
     }
     for at in &draft.observed_at {
         point("cursor observation time", *at)?;
@@ -285,15 +289,20 @@ pub fn cursor_fragment(draft: CursorDraft) -> Result<(Fragment, Id)> {
         stream: draft.stream,
         persona: draft.persona,
     };
+    let mut fragment = Fragment::empty();
+    let grain = draft
+        .grain
+        .map(|grain| fragment.put::<blobencodings::UTF8String, _>(grain));
     let state = CursorState {
         position: draft.position,
         anchor: draft.anchor,
-        grain: draft.grain,
+        grain,
     };
-    let mut fragment = cursor_core(&track, &state, &draft.predecessors);
-    let id = fragment
+    let core = cursor_core(&track, &state, &draft.predecessors);
+    let id = core
         .root()
         .ok_or_else(|| anyhow!("comb cursor fragment has no unique intrinsic root"))?;
+    fragment += core;
     for at in &draft.observed_at {
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: at };
     }

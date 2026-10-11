@@ -305,15 +305,17 @@ fn goal_matches_search(
         }
     }
     for (tag,) in find!(
-        (tag: String),
+        (tag: Inline<Handle<UTF8String>>),
         pattern!(space, [{
             goal_id @
             metadata::tag: &KIND_GOAL_ID,
             compass::tag: ?tag,
         }])
     ) {
-        if tag.to_lowercase().contains(needle) {
-            return true;
+        if let Ok(tag) = dataset.reader.get::<View<str>, UTF8String>(tag) {
+            if tag.as_ref().to_lowercase().contains(needle) {
+                return true;
+            }
         }
     }
     false
@@ -485,7 +487,10 @@ impl CompassBoard {
             }])
         ) {
             let (status, sort_at) = latest_status_event(space, status_register, gid)
-                .map(|(_, status, at)| (status, interval_key(at)))
+                .and_then(|(_, status, at)| {
+                    let status = dataset.reader.get::<View<str>, UTF8String>(status).ok()?;
+                    Some((status.to_string(), interval_key(at)))
+                })
                 .unwrap_or_else(|| ("todo".to_string(), created.0));
             goals.push((gid, status, sort_at));
         }
@@ -862,13 +867,17 @@ fn render_goal_card(
                     );
                 }
                 for (tag,) in find!(
-                    (tag: String),
+                    (tag: Inline<Handle<UTF8String>>),
                     pattern!(space, [{
                         goal_id @
                         metadata::tag: &KIND_GOAL_ID,
                         compass::tag: ?tag,
                     }])
                 ) {
+                    let Ok(tag) = dataset.reader.get::<View<str>, UTF8String>(tag) else {
+                        continue;
+                    };
+                    let tag = tag.to_string();
                     let tag_label = truncate_inline(&tag, 18);
                     render_chip(ui, &format!("#{tag_label}"), tag_color(&tag));
                 }

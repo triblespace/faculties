@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Text attributes no longer use the 32-byte inline `ShortString`. Compass
+  tag and status, Files tag, Habit label and state, the Comb cursor's
+  stream, persona and grain, Planner summary, RRULE, location, status and
+  transparency, Relations source, Teams attachment kind, coverage kind and
+  message state, Voice channels, MIME and device, Web provider, Body MIME
+  and modality, and Code language, kind and visibility now store
+  `Handle<UTF8String>`. Each declaration keeps its hex as an anchor, so each
+  attribute id changes: facts written before stay under their old ids and
+  these readers do not see them until `trible pile migrate <PILE>
+  shortstring-to-utf8 <COLLECTION>` appends their text twins. The 32-byte
+  limits on these fields are gone, and iCalendar import keeps whole
+  summaries and locations. Removed, with no producer: archive
+  `content_type`, `attachment_mime` and `source_format`, the Relations
+  `alias`, `label_norm`, `alias_norm`, `affinity`, `teams_user_id`, `email`
+  and `phone` attributes, and the `selfimage` schema.
 - Orient can observe saved native service failures from an explicitly admitted
   metrics root (`--service-events-collection` or
   `TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION`). Alerts use shared safe cause

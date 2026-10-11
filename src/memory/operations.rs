@@ -2583,14 +2583,23 @@ impl Memory {
                 );
             };
             let state = resolution.settled_state()?;
-            let (Some(position), Some(grain_raw)) = (state.position, state.grain.as_deref()) else {
+            let (Some(position), Some(grain)) = (state.position, state.grain) else {
                 bail!(
                     "no active memory replay for persona {persona}: \
                          use `memory replay start <grain> [<from>]`"
                 );
             };
+            // The Comb lives in the same pile, so its grain text is in the
+            // snapshot Memory was read from.
+            let grain_raw: View<str> = loaded
+                .memory
+                .memory
+                .reader
+                .get(grain)
+                .map_err(|error| anyhow!("read memory replay grain: {error:?}"))?;
+            let grain_raw = grain_raw.to_string();
             let position_key = interval_key(position);
-            let grain_ns = parse_grain(grain_raw)?;
+            let grain_ns = parse_grain(&grain_raw)?;
             let space = &loaded.memory.memory.facts;
 
             // Chunks at this zoom: width fits the grain and is maximal among
@@ -2661,7 +2670,7 @@ impl Memory {
                 MEMORY_REPLAY_STREAM,
                 persona,
                 Some(key_to_epoch(last_start)),
-                Some(grain_raw),
+                Some(grain_raw.as_str()),
             )?;
             out.line(format!(
                 "— batch: {take} chunk(s) at grain {grain_raw}; {} remaining",

@@ -19,6 +19,9 @@
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
 
+/// A text attribute's value: the content handle of a UTF-8 blob.
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
+
 /// Stable extrinsic scope of the authored Code collection.
 ///
 /// Minted with `trible genid` on 2026-09-17:
@@ -97,10 +100,10 @@ pub mod attrs {
             inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Closed vocabulary: `rust`, `toml`, `markdown`, `shell`, `typst`,
-        /// `text`. Closed, so `ShortString` cannot overflow.
+        /// `text`.
         ///
         /// Minted with `trible genid` on 2026-09-17.
-        "35F62EB70939951867305D9D986AE68C" as language: inlineencodings::ShortString;
+        "35F62EB70939951867305D9D986AE68C" as language: inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Human prose about this entity. On a UNIT: `//!` module docs, or the
         /// whole text for prose languages. On an ITEM: its `///` docs plus any
@@ -133,14 +136,14 @@ pub mod attrs {
         /// `use`, `const`, `static`, `type`, `macro`, `union`, `extern`.
         ///
         /// Minted with `trible genid` on 2026-09-17.
-        "A0ED33675DF3B92867FD68177794BEDD" as kind: inlineencodings::ShortString;
+        "A0ED33675DF3B92867FD68177794BEDD" as kind: inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Normalized to a closed vocabulary — `pub`, `crate`, `super`,
-        /// `restricted`, `private` — because `pub(in crate::a::b::c)` would
-        /// overflow `ShortString`, and overflow is a panic.
+        /// `restricted`, `private` — so a query can filter on it; the exact
+        /// restriction path stays in `signature`.
         ///
         /// Minted with `trible genid` on 2026-09-17.
-        "41DAF4F9B5A081674E272996B89D818F" as visibility: inlineencodings::ShortString;
+        "41DAF4F9B5A081674E272996B89D818F" as visibility: inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Declaration head, SLICED from the source by byte range rather than
         /// re-printed through `quote`, which mangles spacing. This string is
@@ -334,12 +337,35 @@ impl ItemKind {
             _ => None,
         }
     }
+
+    pub const ALL: [Self; 13] = [
+        Self::Fn,
+        Self::Struct,
+        Self::Enum,
+        Self::Union,
+        Self::Trait,
+        Self::Impl,
+        Self::Mod,
+        Self::Use,
+        Self::Const,
+        Self::Static,
+        Self::Type,
+        Self::Macro,
+        Self::Extern,
+    ];
+
+    /// The kind whose name has this text handle; `None` for a word this
+    /// build does not know.
+    pub fn from_text(text: TextHandle) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.name().to_owned().to_blob().get_handle() == text)
+    }
 }
 
 /// Visibility normalized to a closed vocabulary.
 ///
-/// `pub(in crate::a::b::c)` is a real spelling in this corpus and would
-/// overflow a 32-byte `ShortString`, which panics the encoder. The exact
+/// `pub(in crate::a::b::c)` is a real spelling in this corpus. The exact
 /// restriction path stays recoverable from `signature`; what this attribute
 /// carries is the part a query can filter on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -372,57 +398,27 @@ impl Visibility {
             _ => None,
         }
     }
+
+    pub const ALL: [Self; 5] = [
+        Self::Public,
+        Self::Crate,
+        Self::Super,
+        Self::Restricted,
+        Self::Private,
+    ];
+
+    /// The visibility whose name has this text handle; `None` for a word
+    /// this build does not know.
+    pub fn from_text(text: TextHandle) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|visibility| visibility.name().to_owned().to_blob().get_handle() == text)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_closed_vocabulary_value_fits_a_short_string() {
-        // ShortString is 32 bytes and overflow panics the encoder, so a closed
-        // vocabulary is only safe while it stays closed AND short.
-        for name in [
-            Language::Rust.name(),
-            Language::Toml.name(),
-            Language::Markdown.name(),
-            Language::Shell.name(),
-            Language::Typst.name(),
-            Language::Text.name(),
-        ] {
-            assert!(name.len() <= 32, "{name} overflows ShortString");
-        }
-        for kind in [
-            ItemKind::Fn,
-            ItemKind::Struct,
-            ItemKind::Enum,
-            ItemKind::Union,
-            ItemKind::Trait,
-            ItemKind::Impl,
-            ItemKind::Mod,
-            ItemKind::Use,
-            ItemKind::Const,
-            ItemKind::Static,
-            ItemKind::Type,
-            ItemKind::Macro,
-            ItemKind::Extern,
-        ] {
-            assert!(
-                kind.name().len() <= 32,
-                "{} overflows ShortString",
-                kind.name()
-            );
-        }
-        for visibility in [
-            Visibility::Public,
-            Visibility::Crate,
-            Visibility::Super,
-            Visibility::Restricted,
-            Visibility::Private,
-        ] {
-            assert!(visibility.name().len() <= 32);
-        }
-    }
 
     #[test]
     fn a_language_name_round_trips() {

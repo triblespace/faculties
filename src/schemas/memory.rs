@@ -7,7 +7,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 /// Stable extrinsic scope of the immutable episodic Memory journal.
@@ -70,7 +70,6 @@ pub mod archive_schema {
 pub mod archive_import_schema {
     use super::*;
     attributes! {
-        "E997DCAAF43BAA04790FCB0FA0FBFE3A" unsafe as source_format: ShortString;
         "87B587A3906056038FD767F4225274F9" unsafe as source_conversation_id: Handle<UTF8String>;
     }
 }
@@ -95,15 +94,15 @@ pub mod comb {
     attributes! {
         /// Which practice stream this cursor belongs to:
         /// "archive-replay", "memory-replay", or "consolidate-edge".
-        "E095C3752346D4FC73841BC8A975368F" unsafe as cursor_stream: ShortString;
+        "E095C3752346D4FC73841BC8A975368F" as cursor_stream: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Persona label owning this cursor (from $PERSONA; never defaulted).
-        "E5BB54261818A75DB8DA622450EAC97E" unsafe as cursor_persona: ShortString;
+        "E5BB54261818A75DB8DA622450EAC97E" as cursor_persona: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Position: the timestamp up to which this stream has been consumed
         /// (exclusive); for the consolidation edge, where the next chunk opens.
         "79F4E916807654A5A8DDFAE5F402D21D" unsafe as cursor_position: NsTAIInterval;
         /// Replay granularity as typed (e.g. "2h", "1d", "30d") — stored on
         /// memory-replay cursors so a bare `memory replay` knows its zoom.
-        "AEF10362CC939FA43CBED29D84CCAC13" unsafe as cursor_grain: ShortString;
+        "AEF10362CC939FA43CBED29D84CCAC13" as cursor_grain: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Exact content identity at `cursor_position`. Streams with several
         /// items at one position use this anchor to resume after one item
         /// without skipping the rest. Minted 2026-08-28 with `trible genid`.

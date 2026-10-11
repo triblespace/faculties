@@ -25,11 +25,6 @@ fn durable_faculty_attributes_keep_their_published_ids() {
         "C1E3A12230595280F22ABEB8733D082C",
     );
     assert_id(
-        "relations::alias",
-        format!("{:X}", crate::schemas::relations::relations::alias.id()),
-        "8F162B593D390E1424394DBF6883A72C",
-    );
-    assert_id(
         "relations::group::member",
         format!("{:X}", crate::schemas::relations::group::member.id()),
         "EF5B6F8429FA30D503BA8B8F3ABD5FD9",
@@ -65,10 +60,12 @@ fn durable_faculty_attributes_keep_their_published_ids() {
         "8CAEF4617646F8C9E90BC9A3ED3D0496",
     );
     for (path, got, expected) in [
+        // Anchored text since the ShortString retirement: derived from
+        // anchor 4AB58053472C4163C39C9A4047F8111E and Handle<UTF8String>.
         (
             "habit::label",
             format!("{:X}", crate::schemas::habit::attrs::label.id()),
-            "4AB58053472C4163C39C9A4047F8111E",
+            "5F6655CE0010D8271647F34319FDB318",
         ),
         (
             "habit::nudge",
@@ -85,10 +82,12 @@ fn durable_faculty_attributes_keep_their_published_ids() {
             format!("{:X}", crate::schemas::habit::attrs::of.id()),
             "F00FAA4B44DB1E79E36055410B476C42",
         ),
+        // Anchored text since the ShortString retirement: derived from
+        // anchor 5C1E4BD13E8FA4633F286CD5B33BCAC7 and Handle<UTF8String>.
         (
             "habit::state",
             format!("{:X}", crate::schemas::habit::attrs::state.id()),
-            "5C1E4BD13E8FA4633F286CD5B33BCAC7",
+            "66049DE2A50C6B0BAF3B1B5EF29470A2",
         ),
         // Anchored, not pinned: the recorded id is the value derived from
         // anchor 96EC24A8226E9D848A4905D982485678 and the

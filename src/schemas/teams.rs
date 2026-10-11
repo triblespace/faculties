@@ -16,7 +16,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 /// Stable extrinsic scope for Teams observations and coverage receipts.
@@ -46,7 +46,7 @@ pub mod teams {
         /// Logical message which owns an attachment observation.
         "617A66047DCBBDDED1BC5167336FADE0" unsafe as pub attachment_message: GenId;
         /// Graph attachment collection (`attachment` or `hosted-content`).
-        "E0FC3B5C541A7DA9C56158D41B322623" unsafe as pub attachment_kind: ShortString;
+        "E0FC3B5C541A7DA9C56158D41B322623" as pub attachment_kind: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Microsoft-local user id. The entity is globally scoped by `source`.
         "5820C49A7A8B4ADBCA4637E3AE2499EB" unsafe as pub user_id: Handle<UTF8String>;
 
@@ -71,7 +71,7 @@ pub mod teams {
         /// Opaque next/delta URL produced by one Graph page.
         "6E435B4201F7E8487EBBE60EFD724079" unsafe as pub coverage_cursor: Handle<UTF8String>;
         /// `next` for an incomplete round, `delta` for a completed round.
-        "CCDB0B26489A4AE7C7FD3385F7489AD8" unsafe as pub coverage_kind: ShortString;
+        "CCDB0B26489A4AE7C7FD3385F7489AD8" as pub coverage_kind: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Message observation or source tombstone carried by a page.
         "CCF3BCE0AA5D8D7CA79A69E0E769F2A0" unsafe as pub coverage_observation: GenId;
         /// Exact frozen legacy source coordinate consumed by a generation-0 snapshot.
@@ -80,7 +80,7 @@ pub mod teams {
         /// `6E52C046D67BF9446A161A1E3068917E`.
         "6E52C046D67BF9446A161A1E3068917E" unsafe as pub snapshot_source_coordinate: Handle<UTF8String>;
         /// `present` or `deleted`; every message observation has exactly one.
-        "F8164FF23A7A499756F9A150CA1F587E" unsafe as pub message_state: ShortString;
+        "F8164FF23A7A499756F9A150CA1F587E" as pub message_state: inlineencodings::Handle<blobencodings::UTF8String>;
 
         /// Microsoft application/client id in an auth-profile snapshot.
         ///

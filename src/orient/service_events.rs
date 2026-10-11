@@ -30,7 +30,8 @@ pub(super) fn append_report(
     // Opaque event/attempt ids, unfamiliar facts and undecodable rows remain
     // ordinary open-world evidence; no hash lookup or cardinality validation.
     for (event, attempt, created, phase, code_handle) in find!(
-        (event: Id, attempt: Id, created: (Epoch, Epoch), phase: String,
+        (event: Id, attempt: Id, created: (Epoch, Epoch),
+         phase: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
          code_handle: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
         pattern!(facts, [
             { ?event @
@@ -47,6 +48,9 @@ pub(super) fn append_report(
             }
         ])
     ) {
+        let Ok(phase) = snapshot.get::<View<str>, blobencodings::UTF8String>(phase) else {
+            continue;
+        };
         let Some(phase) = ServicePhase::parse(&phase) else {
             continue;
         };

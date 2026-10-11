@@ -80,20 +80,20 @@ pub fn ingested(receipt: &IngestReceipt, out: &mut Out<'_>) -> Result<()> {
 }
 pub fn show(detail: &EventDetail, out: &mut Out<'_>) -> Result<()> {
     let row = &detail.event;
-    out.line(format!("event {}  {}", fmt_id(row.id), row.summary))?;
+    out.line(format!("event {}  {}", fmt_id(row.id), detail.summary))?;
     out.line(format!("  time:     {}", fmt_interval(row.time)?))?;
-    if let Some(location) = &row.location {
+    if let Some(location) = &detail.location {
         out.line(format!("  location: {location}"))?;
     }
     let status = if detail.cancelled {
         STATUS_CANCELLED
     } else {
-        &row.status
+        &detail.status
     };
     if status != STATUS_CONFIRMED {
         out.line(format!("  status:   {status}"))?;
     }
-    if let Some(rrule) = &row.rrule {
+    if let Some(rrule) = &detail.rrule {
         out.line(format!("  rrule:    {rrule}"))?;
     }
     out.line(format!("  uid:      {}", detail.uid))?;

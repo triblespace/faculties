@@ -33,7 +33,7 @@ use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use crate::files;
@@ -157,6 +157,12 @@ pub fn context_fragment(
         metadata::description: boundary,
     };
     Ok(fragment)
+}
+
+/// The content handle of `value` as text: how a closed word is compared
+/// against a stored one without reading the stored blob.
+fn text_handle(value: &str) -> Inline<Handle<UTF8String>> {
+    value.to_owned().to_blob().get_handle()
 }
 
 fn canonical_nonempty(value: &str, field: &str) -> Result<String> {
@@ -746,6 +752,7 @@ where
     let head = one_required(heads, "Teams coverage head")?;
 
     let mut observations = BTreeMap::new();
+    let mut unreadable = BTreeSet::new();
     for (observation, message, modified) in find!(
         (
             observation: Id,
@@ -759,22 +766,27 @@ where
             teams::modified_at: ?modified,
         }])
     ) {
-        let state = one_required(
+        // An observation written before the state became text carries it
+        // under the retired 32-byte attribute, which this reader does not
+        // model; until a backfill gives it its twin it is not in the view.
+        let Some(state) = one_optional(
             find!(
-                value: Inline<ShortString>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ observation @ teams::message_state: ?value }])
             )
             .collect(),
             "Teams observation state",
-        )?;
-        let state = String::try_from_inline(&state)
-            .map_err(|error| anyhow::anyhow!("decode Teams observation state: {error:?}"))?;
+        )?
+        else {
+            unreadable.insert(observation);
+            continue;
+        };
         observations.insert(
             observation,
             ObservationOrder {
                 message,
                 modified: interval_key(modified),
-                deleted: state == "deleted",
+                deleted: state == text_handle("deleted"),
             },
         );
     }
@@ -879,6 +891,8 @@ where
                     .insert(*event);
             } else if let Some(message) = tombstones.get(event) {
                 page_tombstones.insert(*message);
+            } else if unreadable.contains(event) {
+                continue;
             } else {
                 bail!(
                     "Teams coverage {:x} carries unknown event {event:x}",
@@ -1689,7 +1703,7 @@ fn validate_receipt_shape(facts: &TribleSet, receipt: Id) -> Result<()> {
     )?;
     let kind = one_optional(
         find!(
-            value: Inline<ShortString>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(facts, [{ receipt @ teams::coverage_kind: ?value }])
         )
         .collect(),
@@ -1713,10 +1727,8 @@ fn validate_receipt_shape(facts: &TribleSet, receipt: Id) -> Result<()> {
         request.ok_or_else(|| anyhow::anyhow!("Teams coverage request is missing"))?;
         cursor.ok_or_else(|| anyhow::anyhow!("Teams coverage cursor is missing"))?;
         let kind = kind.ok_or_else(|| anyhow::anyhow!("Teams coverage kind is missing"))?;
-        let kind_text = String::try_from_inline(&kind)
-            .map_err(|error| anyhow::anyhow!("decode Teams coverage kind: {error:?}"))?;
-        if kind_text != "next" && kind_text != "delta" {
-            bail!("invalid Teams coverage kind {kind_text:?}");
+        if kind != text_handle("next") && kind != text_handle("delta") {
+            bail!("invalid Teams coverage kind");
         }
         if coordinate.is_some() {
             bail!("Graph Teams coverage receipt carries a legacy source coordinate");
@@ -2228,16 +2240,14 @@ fn validate_attachment(catalog: &TribleSet, attachment: Id, messages: &BTreeSet<
     )?;
     let kind = one_required(
         find!(
-            value: Inline<ShortString>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ attachment @ teams::attachment_kind: ?value }])
         )
         .collect(),
         "Teams attachment kind",
     )?;
-    let kind_text = String::try_from_inline(&kind)
-        .map_err(|error| anyhow::anyhow!("decode Teams attachment kind: {error:?}"))?;
-    if kind_text != "attachment" && kind_text != "hosted-content" {
-        bail!("invalid Teams attachment kind {kind_text:?}");
+    if kind != text_handle("attachment") && kind != text_handle("hosted-content") {
+        bail!("invalid Teams attachment kind");
     }
     let _name = one_optional(
         find!(
@@ -2290,17 +2300,19 @@ fn validate_observation(
     }
     let state = one_required(
         find!(
-            value: Inline<ShortString>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ observation @ teams::message_state: ?value }])
         )
         .collect(),
         "Teams observation state",
     )?;
-    let state_text = String::try_from_inline(&state)
-        .map_err(|error| anyhow::anyhow!("decode Teams observation state: {error:?}"))?;
-    if state_text != "present" && state_text != "deleted" {
-        bail!("invalid Teams observation state {state_text:?}");
-    }
+    let state_text = if state == text_handle("present") {
+        "present"
+    } else if state == text_handle("deleted") {
+        "deleted"
+    } else {
+        bail!("invalid Teams observation state");
+    };
     let created = one_optional(
         find!(
             value: Inline<NsTAIInterval>,
@@ -2404,16 +2416,14 @@ fn validate_tombstone(catalog: &TribleSet, tombstone: Id, messages: &BTreeSet<Id
     }
     let state = one_required(
         find!(
-            value: Inline<ShortString>,
+            value: Inline<Handle<UTF8String>>,
             pattern!(catalog, [{ tombstone @ teams::message_state: ?value }])
         )
         .collect(),
         "Teams tombstone state",
     )?;
-    let state = String::try_from_inline(&state)
-        .map_err(|error| anyhow::anyhow!("decode Teams tombstone state: {error:?}"))?;
-    if state != "deleted" {
-        bail!("invalid Teams tombstone state {state:?}");
+    if state != text_handle("deleted") {
+        bail!("invalid Teams tombstone state");
     }
     if find!(
         value: Inline<Handle<UTF8String>>,
@@ -2483,7 +2493,7 @@ fn validate_coverage(
         )?;
         let kind = one_optional(
             find!(
-                value: Inline<ShortString>,
+                value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ receipt @ teams::coverage_kind: ?value }])
             )
             .collect(),
@@ -2560,10 +2570,8 @@ fn validate_coverage(
                 .ok_or_else(|| anyhow::anyhow!("Teams coverage {receipt:x} lacks its cursor"))?;
             let kind =
                 kind.ok_or_else(|| anyhow::anyhow!("Teams coverage {receipt:x} lacks its kind"))?;
-            let kind_text = String::try_from_inline(&kind)
-                .map_err(|error| anyhow::anyhow!("decode Teams coverage kind: {error:?}"))?;
-            if kind_text != "next" && kind_text != "delta" {
-                bail!("invalid Teams coverage kind {kind_text:?}");
+            if kind != text_handle("next") && kind != text_handle("delta") {
+                bail!("invalid Teams coverage kind");
             }
             if coordinate.is_some() {
                 bail!("Graph Teams coverage {receipt:x} carries a legacy source coordinate");

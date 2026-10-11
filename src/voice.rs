@@ -43,13 +43,19 @@ pub const AUDIO_WAV_MIME: &str = "audio/wav";
 pub struct RouteRow {
     pub id: Id,
     pub channel: String,
-    pub device: String,
+    /// The handle of the device pattern's text.
+    pub device: TextHandle,
     pub priority: u64,
     pub updated_at: (i128, i128),
 }
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
+}
+
+/// The content handle of `value` as text.
+pub fn text_handle(value: &str) -> TextHandle {
+    value.to_owned().to_blob().get_handle()
 }
 
 /// Construct one live route preference.
@@ -130,7 +136,7 @@ where
     find!(
         (
             id: Id,
-            device: String,
+            device: TextHandle,
             priority: u64,
             updated_at: (i128, i128)
         ),
@@ -249,8 +255,8 @@ mod tests {
         let mut rows = route_rows(generation.facts(), CHANNEL_SHOUT);
         rows.sort_by_key(|row| row.priority);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].device, "Reachy");
-        assert_eq!(rows[1].device, "MacBook");
+        assert_eq!(rows[0].device, text_handle("Reachy"));
+        assert_eq!(rows[1].device, text_handle("MacBook"));
 
         let non_point = (Epoch::from_tai_seconds(4.0), Epoch::from_tai_seconds(5.0))
             .try_to_inline()

@@ -34,7 +34,7 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use crate::clock;
@@ -2369,7 +2369,7 @@ struct AttachmentRow {
     created_at: Inline<NsTAIInterval>,
     created_at_key: i128,
     source_id: Option<Inline<Handle<UTF8String>>>,
-    source_kind: Option<Inline<ShortString>>,
+    source_kind: Option<Inline<Handle<UTF8String>>>,
     source_pointers: BTreeSet<Inline<Handle<UTF8String>>>,
     name: Option<Inline<Handle<UTF8String>>>,
     media_type: Option<Inline<Handle<UTF8String>>>,
@@ -2664,9 +2664,8 @@ fn list_attachments(
             .unwrap_or_default();
         let source_kind = row
             .source_kind
-            .map(|value| String::try_from_inline(&value))
-            .transpose()
-            .map_err(|error| anyhow::anyhow!("decode attachment kind: {error:?}"))?;
+            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment kind"))
+            .transpose()?;
         let mut source_pointers = row
             .source_pointers
             .into_iter()
@@ -2727,9 +2726,11 @@ where
                 .collect(),
                 "Teams attachment source id",
             )?;
-            let source_kind = one_required(
+            // Absent on occurrences written before the kind became text,
+            // until a backfill gives them its twin.
+            let source_kind = one_optional(
                 find!(
-                    value: Inline<ShortString>,
+                    value: Inline<Handle<UTF8String>>,
                     pattern!(catalog, [{ attachment_id @ teams::attachment_kind: ?value }])
                 )
                 .collect(),
@@ -2779,7 +2780,7 @@ where
                 created_at: message.created_at,
                 created_at_key: message.created_at_key,
                 source_id: Some(source_id),
-                source_kind: Some(source_kind),
+                source_kind,
                 source_pointers,
                 name: occurrence_name.or(file_name),
                 media_type,
@@ -2820,10 +2821,13 @@ fn get_attachment(
             row.source_id.expect("attachment row has source id"),
             "Teams attachment source id",
         )?;
-        let kind_inline = row.source_kind.expect("attachment row has source kind");
-        let kind = String::try_from_inline(&kind_inline)
-            .map_err(|error| anyhow::anyhow!("decode attachment kind: {error:?}"))?;
-        if source != wanted_source || wanted_kind.is_some_and(|wanted| wanted != kind) {
+        let kind = row
+            .source_kind
+            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment kind"))
+            .transpose()?;
+        if source != wanted_source
+            || wanted_kind.is_some_and(|wanted| Some(wanted) != kind.as_deref())
+        {
             continue;
         }
         let file_id = one_optional(
@@ -2844,7 +2848,7 @@ fn get_attachment(
             message_id: row.message_id,
             chat_id: row.chat_id,
             source_id: source,
-            source_kind: Some(kind),
+            source_kind: kind,
             data_handle,
             name: row.name,
             media_type: row.media_type,

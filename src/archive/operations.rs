@@ -1191,7 +1191,7 @@ fn plan_cursor_update(
         persona: persona.to_owned(),
         position: state.position,
         anchor: state.anchor,
-        grain: state.grain,
+        grain: None,
         predecessors,
         observed_at: BTreeSet::new(),
     })?;

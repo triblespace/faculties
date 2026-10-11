@@ -26,7 +26,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Handle, ShortString, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, U256BE};
 use triblespace::prelude::*;
 
 /// Stable extrinsic scope of the one canonical Voice collection.
@@ -58,11 +58,11 @@ pub mod utterance {
         /// The words spoken.
         "F38AD7DD14F63E61BEE1E036FC74FBEA" unsafe as pub text: Handle<UTF8String>;
         /// Channel: "say" (private) | "shout" (aloud).
-        "4BD1230C0AA831B3A53D2FB4E5A53583" unsafe as pub channel: ShortString;
+        "4BD1230C0AA831B3A53D2FB4E5A53583" as pub channel: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The synthesized audio, content-addressed.
         "7C45F21BDF9EEDD6887F860471327F3B" unsafe as pub audio: Handle<RawBytes>;
         /// MIME type of the audio (e.g. "audio/wav").
-        "0F013F9C63960A9693B2264E703ED5D6" unsafe as pub mime: ShortString;
+        "0F013F9C63960A9693B2264E703ED5D6" as pub mime: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -77,10 +77,10 @@ pub mod route {
     use super::*;
     attributes! {
         /// Which channel this preference belongs to ("say" | "shout").
-        "065384592943F9FF9FF3F88BE7538FEC" unsafe as pub channel: ShortString;
+        "065384592943F9FF9FF3F88BE7538FEC" as pub channel: inlineencodings::Handle<blobencodings::UTF8String>;
         /// A case-insensitive substring matched against a connected device's
         /// name ("AirPods", "Reachy Mini Audio", "MacBook Pro Speakers", …).
-        "AF7D8DB4D88A097A4DDA0DD1FF0755A8" unsafe as pub device: ShortString;
+        "AF7D8DB4D88A097A4DDA0DD1FF0755A8" as pub device: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Preference order — lower is tried first.
         "F377C84B75C50B5B11FDE856F4C29B5F" unsafe as pub priority: U256BE;
     }

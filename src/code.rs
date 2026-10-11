@@ -497,13 +497,13 @@ where
     P: TriblePattern + ?Sized,
 {
     find!(
-        (kind: String, visibility: String),
+        (kind: TextHandle, visibility: TextHandle),
         pattern!(facts, [{ item @ attrs::kind: ?kind, attrs::visibility: ?visibility }])
     )
     .filter_map(|(kind, visibility)| {
         Some(ItemRow {
-            kind: ItemKind::from_name(&kind)?,
-            visibility: Visibility::from_name(&visibility)?,
+            kind: ItemKind::from_text(kind)?,
+            visibility: Visibility::from_text(visibility)?,
         })
     })
     .collect()

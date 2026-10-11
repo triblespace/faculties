@@ -66,9 +66,9 @@ impl CaptureInput {
             Signal::Audio { mime, .. } => (mime, "audio"),
             Signal::Touch => return Ok(()),
         };
-        // Body's published MIME field is ShortString, not the Files MIME model.
-        if mime.len() > 32 || mime.contains('\0') {
-            bail!("Body MIME must fit 32 UTF-8 bytes and contain no NUL");
+        // Body's published MIME field is text, not the Files MIME model.
+        if mime.contains('\0') {
+            bail!("Body MIME must contain no NUL");
         }
         let parsed: mime::Mime = mime.parse().context("invalid capture MIME type")?;
         if parsed.type_().as_str() != kind || parsed.essence_str().contains('*') {
@@ -176,7 +176,7 @@ impl Body {
         self.storage().with_view(|space, reader| {
             let mut rows = Vec::new();
             for (id, modality, created) in find!(
-                (c: Id, m: String, t: IntervalValue),
+                (c: Id, m: TextHandle, t: IntervalValue),
                 pattern!(space, [{ ?c @ metadata::tag: KIND_CAPTURE, capture::modality: ?m, metadata::created_at: ?t }])
             ) {
                 let note = find!(h: TextHandle, pattern!(space, [{ id @ capture::note: ?h }]))
@@ -184,6 +184,9 @@ impl Body {
                         .map(|text| text.to_string())
                         .map_err(|error| anyhow::anyhow!("read note for capture {id:X}: {error}")))
                     .transpose()?.unwrap_or_default();
+                let modality = reader.get::<View<str>, _>(modality)
+                    .map(|text| text.to_string())
+                    .map_err(|error| anyhow::anyhow!("read modality for capture {id:X}: {error}"))?;
                 rows.push(CaptureSummary { id, tai_ns: interval_key(created), modality, note });
             }
             rows.sort_by(|a, b| (b.tai_ns, b.id).cmp(&(a.tai_ns, a.id)));
@@ -208,7 +211,15 @@ impl Body {
             let handle = find!(h: RawHandle, pattern!(space, [{ id @ capture::frame: ?h }]))
                 .next()
                 .context("capture has no frame payload (a touch capture has no file)")?;
-            let mime = find!(m: String, pattern!(space, [{ id @ capture::mime: ?m }])).next();
+            let mime = find!(m: TextHandle, pattern!(space, [{ id @ capture::mime: ?m }]))
+                .next()
+                .map(|handle| {
+                    reader
+                        .get::<View<str>, _>(handle)
+                        .map(|text| text.to_string())
+                        .map_err(|error| anyhow::anyhow!("read MIME for capture {id:X}: {error}"))
+                })
+                .transpose()?;
             let bytes = reader
                 .get(handle)
                 .map_err(|error| anyhow::anyhow!("read frame for capture {id:X}: {error}"))?;
@@ -252,19 +263,20 @@ pub fn capture_fragment(input: &CaptureInput, created: IntervalValue) -> Result<
         } => (
             "vision",
             Some(fragment.put::<blobencodings::RawBytes, _>(bytes.clone())),
-            Some(mime.clone()),
+            Some(fragment.put::<blobencodings::UTF8String, _>(mime.clone())),
             Some((*width).to_inline()),
             Some((*height).to_inline()),
         ),
         Signal::Audio { bytes, mime } => (
             "audio",
             Some(fragment.put::<blobencodings::RawBytes, _>(bytes.clone())),
-            Some(mime.clone()),
+            Some(fragment.put::<blobencodings::UTF8String, _>(mime.clone())),
             None,
             None,
         ),
         Signal::Touch => ("touch", None, None, None, None),
     };
+    let modality = fragment.put::<blobencodings::UTF8String, _>(modality.to_owned());
     let pose = fragment.put::<blobencodings::UTF8String, _>(input.pose.clone());
     let note = input
         .note
@@ -277,7 +289,7 @@ pub fn capture_fragment(input: &CaptureInput, created: IntervalValue) -> Result<
         mime,
         width,
         height,
-        modality: modality.to_owned(),
+        modality,
         note,
         pose,
     });
