@@ -12,22 +12,77 @@
 //!
 //! Directory projection first scans the complete semantic source graph. Exact
 //! `forkedFrom` aliases are quotiented first. Only non-fork parent assertions
-//! enter the semantic graph; known transparent records are contracted, and
-//! narrowly classified reciprocal `system/turn_duration` telemetry backlinks
-//! are removed before any intrinsic block identity is constructed. Blocks and
-//! source-receipt identities are then planned over the complete record DAG, so
-//! cross-file references and Rayon completion order cannot affect identity.
-//! Each receipt additively cites every known receipt supporting its canonical
-//! predecessor classes; this is semantic support, not a transcription of that
-//! receipt's raw `parentUuid`, which remains preserved in `raw_record`.
-//! Missing corpus-external references are accounted but do not block otherwise
-//! useful definitions. Projection first freezes each live JSONL file into one
-//! immutable, disk-backed snapshot and verifies it against the pre-scan. It
-//! then emits semantic receipts one record at a time plus one exact source
-//! snapshot over reusable fixed-size byte chunks. Snapshots are disjoint from
-//! dialogue projections: they retain everything contracted out of the
-//! semantic graph without creating a fake bottom-block message. Both passes
-//! are line-streaming and materialize only canonical fields.
+//! enter the semantic graph; contentless records are contracted, and narrowly
+//! classified reciprocal `system/turn_duration` telemetry backlinks are
+//! removed before any intrinsic block identity is constructed. Blocks are then
+//! planned over the complete record DAG, so cross-file references and Rayon
+//! completion order cannot affect identity. Provider uuids thread that graph
+//! while projecting and are never stored: a block is its predecessors and its
+//! content, and its receipt is the source namespace and the block.
+//!
+//! Dialogue (`user`/`assistant` records) threads the DAG. Harness context the
+//! model saw (`attachment` records) and `system` records project as side
+//! branches: their blocks follow the nearest dialogue ancestors, but children
+//! contract through them, so a copy of the session that lacks them still
+//! threads the same dialogue blocks. The session id, title and file path
+//! annotate the receipts of the file's leaves only. No source bytes are
+//! stored; [`SKIPPED_KINDS`] lists what is not projected and why.
+
+/// Record kinds and fields that project to nothing, with the reason. Anything
+/// else of consequence is a block.
+pub const SKIPPED_KINDS: &[(&str, &str)] = &[
+    ("attachment/total_tokens_reminder", "token-count bookkeeping"),
+    ("system/turn_duration", "turn timing bookkeeping"),
+    (
+        "progress",
+        "streaming tool and hook states the final result supersedes; agent_progress copies subagent transcripts",
+    ),
+    ("queue-operation", "duplicates the queued_command attachment"),
+    (
+        "file-history-snapshot, file-history-delta",
+        "pointers into the local file-history backup directory",
+    ),
+    (
+        "last-prompt, mode, permission-mode, atis-latch, frame-link, agent-setting, cost-state, agent-name, started, launched, result, continued-in, fork-context-ref, pr-link",
+        "UI and session state",
+    ),
+    ("ai-title, custom-title", "kept as the session title on the leaves"),
+    (
+        "message.content[].signature",
+        "sealed reasoning token only the provider can decrypt",
+    ),
+    (
+        "toolUseResult",
+        "client-side structured mirror of the tool_result content block",
+    ),
+    (
+        "record envelope (cwd, gitBranch, version, slug, userType, entrypoint, requestId, ...)",
+        "per-record client state",
+    ),
+];
+
+/// Top-level fields of a side-branch record that are envelope, not content.
+const ENVELOPE_KEYS: &[&str] = &[
+    "parentUuid",
+    "logicalParentUuid",
+    "isSidechain",
+    "type",
+    "uuid",
+    "timestamp",
+    "sessionId",
+    "session_id",
+    "userType",
+    "entrypoint",
+    "cwd",
+    "version",
+    "gitBranch",
+    "slug",
+    "sessionKind",
+    "agentId",
+    "requestId",
+    "promptId",
+    "forkedFrom",
+];
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
@@ -41,8 +96,7 @@ use hifitime::Epoch;
 use rayon::prelude::*;
 use triblespace::core::blob::Bytes;
 use triblespace::core::import::scanner as sc;
-use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Blake3, Handle, NsTAIInterval};
+use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
 use crate::schemas::blockdag as schema;
@@ -56,16 +110,16 @@ const TOOL_RESULT_STATUS_ERROR: &str = "urn:triblespace:archive:tool-result-stat
 pub struct ProjectionStats {
     /// Non-empty JSONL records scanned.
     pub records_seen: usize,
-    /// Canonical source projections emitted for semantic occurrences.
+    /// Canonical source projections emitted for dialogue records.
     pub source_projections: usize,
-    /// Reusable content-addressed byte ranges in exact source snapshots.
-    pub raw_chunks: usize,
-    /// Exact frozen source versions retained independently of semantic rows.
-    pub source_snapshots: usize,
+    /// Side-branch projections of harness context (`attachment`) and
+    /// `system` records.
+    pub side_projections: usize,
     /// Ordered content parts emitted before set-level deduplication.
     pub content_parts: usize,
-    /// Non-dialogue, contentless, or identity-less records retained only in
-    /// the exact source snapshot rather than semantic dialogue blocks.
+    /// Records projected to nothing: bookkeeping kinds, contentless records,
+    /// and records without a `(sessionId, uuid)` identity. See
+    /// [`SKIPPED_KINDS`].
     pub skipped_records: usize,
     /// Dialogue records lacking either `sessionId` or `uuid`.
     pub missing_source_identity: usize,
@@ -86,8 +140,7 @@ impl ProjectionStats {
     fn absorb(&mut self, other: Self) {
         self.records_seen += other.records_seen;
         self.source_projections += other.source_projections;
-        self.raw_chunks += other.raw_chunks;
-        self.source_snapshots += other.source_snapshots;
+        self.side_projections += other.side_projections;
         self.content_parts += other.content_parts;
         self.skipped_records += other.skipped_records;
         self.missing_source_identity += other.missing_source_identity;
@@ -123,9 +176,9 @@ pub struct ProjectionSummary {
 
 /// Project one Claude Code JSONL file or a recursively scanned directory.
 ///
-/// Files are discovered and emitted deterministically. Each semantic source
-/// occurrence is emitted immediately as a bounded fragment, followed by one
-/// exact source snapshot over offset-addressed chunks. The caller must stage every supplied
+/// Files are discovered and emitted deterministically. Each projected record
+/// is emitted immediately as a bounded fragment, followed by the file's leaf
+/// annotations. The caller must stage every supplied
 /// fragment into one `ArchiveImportWriter` and publish (`commit_unit` or
 /// `finish`) only after projection succeeds; publishing fragments independently can expose an
 /// invalid partial catalog. The projector itself performs no pile writes.
@@ -141,18 +194,11 @@ where
     let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan))
         .context("plan canonical Claude Code lineage")?;
     let snapshot = archive_source::freeze_file(path)?;
-    project_snapshot(
-        path,
-        snapshot,
-        prescan.digest,
-        prescan.file_anchor.as_ref(),
-        &plan,
-        &mut emit,
-    )
+    project_snapshot(path, snapshot, prescan.digest, &plan, &mut emit)
 }
 
 /// Project an immutable resident JSONL stream with the same canonical lineage
-/// plan and exact source snapshot as a single CLI file. The name is provenance
+/// plan as a single CLI file. The name is provenance
 /// only; all scans use the supplied allocation and never open host paths.
 pub fn project_bytes<F>(source_name: &str, bytes: Bytes, mut emit: F) -> Result<ProjectionSummary>
 where
@@ -166,14 +212,7 @@ where
         digest: *blake3::hash(bytes.as_ref()).as_bytes(),
         bytes,
     };
-    project_snapshot(
-        path,
-        snapshot,
-        prescan.digest,
-        prescan.file_anchor.as_ref(),
-        &plan,
-        &mut emit,
-    )
+    project_snapshot(path, snapshot, prescan.digest, &plan, &mut emit)
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -199,8 +238,6 @@ impl SourceKey {
 struct PreScan {
     sources: HashMap<SourceKey, SourceObservation>,
     aliases: BTreeSet<(SourceKey, SourceKey)>,
-    /// First native `(sessionId, uuid)` observed in this physical file.
-    file_anchor: Option<SourceKey>,
     digest: [u8; 32],
 }
 
@@ -209,9 +246,10 @@ struct SourceObservation {
     semantic: bool,
     turn_duration: bool,
     non_turn_duration: bool,
+    /// A side-branch record (harness context or system event).
+    side: bool,
     parents: BTreeSet<SourceKey>,
     shapes: Vec<RecordShape>,
-    raw_records: BTreeSet<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,7 +289,10 @@ struct SourcePlan {
     blocks: HashMap<SourceKey, Id>,
     tool_parts: HashMap<(SourceKey, String), Id>,
     session_tool_parts: HashMap<(String, String), Id>,
-    projection_ids: HashMap<SourceKey, BTreeSet<Id>>,
+    /// Nearest dialogue ancestors of every side-branch class.
+    side_parents: HashMap<SourceKey, BTreeSet<SourceKey>>,
+    /// Dialogue classes that some dialogue class follows.
+    followed: HashSet<SourceKey>,
 }
 
 impl SourcePlan {
@@ -272,10 +313,8 @@ impl SourcePlan {
                 observation.semantic |= incoming.semantic;
                 observation.turn_duration |= incoming.turn_duration;
                 observation.non_turn_duration |= incoming.non_turn_duration;
+                observation.side |= incoming.side;
                 observation.parents.extend(incoming.parents.iter().cloned());
-                observation
-                    .raw_records
-                    .extend(incoming.raw_records.iter().copied());
                 for shape in &incoming.shapes {
                     if !observation.shapes.contains(shape) {
                         observation.shapes.push(shape.clone());
@@ -297,6 +336,7 @@ impl SourcePlan {
             observation.semantic |= incoming.semantic;
             observation.turn_duration |= incoming.turn_duration;
             observation.non_turn_duration |= incoming.non_turn_duration;
+            observation.side |= incoming.side;
             observation
                 .parents
                 .extend(incoming.parents.iter().map(&canonical_key));
@@ -365,6 +405,26 @@ impl SourcePlan {
             }
             parents.insert(key, frontier);
         }
+        let mut side_parents = HashMap::new();
+        let mut side_keys: Vec<_> = observed
+            .iter()
+            .filter(|(key, observation)| observation.side && !semantic.contains(*key))
+            .map(|(key, _)| key.clone())
+            .collect();
+        side_keys.sort();
+        for key in side_keys {
+            let mut frontier = BTreeSet::new();
+            for parent in normalized.get(&key).into_iter().flatten() {
+                frontier.extend(semantic_frontier(
+                    parent,
+                    &semantic,
+                    &normalized,
+                    &mut memo,
+                )?);
+            }
+            side_parents.insert(key, frontier);
+        }
+        let followed = parents.values().flatten().cloned().collect();
 
         // Full-corpus evidence for this quotient (2026-08-09): 126,058
         // explicit aliases collapse into 796,984 classes; unioning every
@@ -415,7 +475,8 @@ impl SourcePlan {
             blocks: HashMap::new(),
             tool_parts,
             session_tool_parts,
-            projection_ids: HashMap::new(),
+            side_parents,
+            followed,
         };
 
         let mut shapes = HashMap::new();
@@ -435,25 +496,6 @@ impl SourcePlan {
             }
         }
         plan.blocks = build_block_ids(&plan.semantic, &plan.parents, &shapes)?;
-
-        for (key, observation) in &raw {
-            if !observation.semantic {
-                continue;
-            }
-            let class = plan.canonical_key(key);
-            let block = *plan.blocks.get(&class).ok_or_else(|| {
-                anyhow!(
-                    "semantic Claude Code alias class {} has no block",
-                    class.locator()
-                )
-            })?;
-            for raw_digest in &observation.raw_records {
-                plan.projection_ids
-                    .entry(class.clone())
-                    .or_default()
-                    .insert(source_projection_id(key, *raw_digest, block));
-            }
-        }
         Ok(plan)
     }
 
@@ -651,21 +693,6 @@ fn build_block_ids(
     Ok(blocks)
 }
 
-fn source_projection_id(source: &SourceKey, raw_digest: [u8; 32], block: Id) -> Id {
-    let locator: Inline<Handle<UTF8String>> =
-        Handle::from_hash(Inline::new(Blake3::digest(source.locator().as_bytes())));
-    let raw_record: Inline<Handle<RawBytes>> = Handle::from_hash(Inline::new(raw_digest));
-    entity! { _ @
-        schema::source_projection::source_namespace:
-            &schema::source_projection::SOURCE_CLAUDE_CODE,
-        schema::source_projection::source_locator: locator,
-        schema::source_projection::raw_record: raw_record,
-        schema::source_projection::projects_to: &block,
-    }
-    .root()
-    .expect("intrinsic source projection exports one root")
-}
-
 fn sorted_source_keys(keys: &HashSet<SourceKey>) -> Vec<SourceKey> {
     let mut keys = keys.iter().cloned().collect::<Vec<_>>();
     keys.sort();
@@ -828,15 +855,8 @@ where
     // per-file fragment unions concurrently.
     for (path, prescan) in paths.iter().zip(&prescans) {
         let snapshot = archive_source::freeze_file(path)?;
-        let projected = project_snapshot(
-            path,
-            snapshot,
-            prescan.digest,
-            prescan.file_anchor.as_ref(),
-            &plan,
-            emit,
-        )
-        .with_context(|| format!("project Claude Code file {}", path.display()))?;
+        let projected = project_snapshot(path, snapshot, prescan.digest, &plan, emit)
+            .with_context(|| format!("project Claude Code file {}", path.display()))?;
         summary.fragments_emitted += projected.fragments_emitted;
         summary.stats.absorb(projected.stats);
     }
@@ -884,15 +904,14 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
         let Some(key) = record.source_key() else {
             return Ok(());
         };
-        scan.file_anchor.get_or_insert_with(|| key.clone());
         let shape = record_shape(&record, &key)?;
+        let side = shape.is_none() && is_side_record(&record);
         let semantic = shape.is_some();
         let turn_duration =
             record.record_type == "system" && record.subtype.as_deref() == Some("turn_duration");
         let raw_parent = record
-            .parent_uuid
-            .as_ref()
-            .map(|parent| SourceKey::new(key.session.clone(), parent.clone()));
+            .effective_parent()
+            .map(|parent| SourceKey::new(key.session.clone(), parent.to_owned()));
         let fork_origin = record.fork_origin_key()?;
         if let Some(origin) = &fork_origin {
             scan.aliases.insert((key.clone(), origin.clone()));
@@ -909,6 +928,7 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
         observation.semantic |= semantic;
         observation.turn_duration |= turn_duration;
         observation.non_turn_duration |= !turn_duration;
+        observation.side |= side;
         if observation.semantic && observation.turn_duration {
             bail!(
                 "Claude Code source key {}/{} is both semantic dialogue and turn-duration telemetry",
@@ -923,9 +943,6 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
             if !observation.shapes.contains(&shape) {
                 observation.shapes.push(shape);
             }
-            observation
-                .raw_records
-                .insert(*blake3::hash(raw).as_bytes());
         }
         Ok(())
     })?;
@@ -937,7 +954,6 @@ fn project_snapshot<F>(
     source_path: &Path,
     snapshot: archive_source::FrozenSource,
     expected_digest: [u8; 32],
-    native_anchor: Option<&SourceKey>,
     plan: &SourcePlan,
     emit: &mut F,
 ) -> Result<ProjectionSummary>
@@ -956,6 +972,10 @@ where
         ..ProjectionSummary::default()
     };
     let mut reader = std::io::Cursor::new(snapshot.bytes.as_ref());
+    let mut leaves = Vec::<(SourceKey, Id)>::new();
+    let mut session = None::<String>;
+    let mut ai_title = None::<String>;
+    let mut custom_title = None::<String>;
 
     for_each_jsonl_line(&mut reader, None, |line_number, raw| {
         let mut row_stats = ProjectionStats {
@@ -970,22 +990,28 @@ where
                 line_number
             )
         })?;
+        match record.record_type.as_str() {
+            "ai-title" => ai_title = record.title.clone().or(ai_title.take()),
+            "custom-title" => custom_title = record.title.clone().or(custom_title.take()),
+            _ => {}
+        }
+        if session.is_none() {
+            session = record.session_id.clone();
+        }
         let mut fragment = Fragment::empty();
-        project_record(
-            record,
-            raw,
-            source_path,
-            plan,
-            &mut fragment,
-            &mut row_stats,
-        )
-        .with_context(|| {
-            format!(
-                "project Claude Code record at {}:{}",
-                source_path.display(),
-                line_number
-            )
-        })?;
+        let projected = project_record(record, raw, plan, &mut fragment, &mut row_stats)
+            .with_context(|| {
+                format!(
+                    "project Claude Code record at {}:{}",
+                    source_path.display(),
+                    line_number
+                )
+            })?;
+        if let Some((class, receipt)) = projected {
+            if !plan.followed.contains(&class) {
+                leaves.push((class, receipt));
+            }
+        }
         summary.stats.absorb(row_stats);
         if !fragment.facts().is_empty() {
             emit(ProjectedFile {
@@ -998,40 +1024,30 @@ where
         Ok(())
     })?;
 
-    let anchor = native_anchor.map_or_else(
-        || {
-            let first = snapshot.bytes.slice(
-                0..snapshot
-                    .bytes
-                    .len()
-                    .min(schema::source_chunk::CANONICAL_BYTES),
-            );
-            format!("digest/{}", blake3::hash(first.as_ref()).to_hex())
-        },
-        |key| format!("native/{}", key.locator()),
-    );
-    // Chunks are reusable content-addressed values, while the snapshot root
-    // records which exact ordered sequence and length coexisted. They are not
-    // dialogue projections and therefore never pollute projection queries.
-    let (fragment, raw_chunks) = archive_source::source_snapshot_fragment(
-        schema::source_projection::SOURCE_CLAUDE_CODE,
-        &anchor,
-        source_path,
-        &snapshot.bytes,
-    )?;
-    let snapshot_stats = ProjectionStats {
-        raw_chunks,
-        source_snapshots: 1,
-        ..ProjectionStats::default()
-    };
-    emit(ProjectedFile {
-        source_path: source_path.to_path_buf(),
-        fragment,
-        stats: snapshot_stats,
-    })?;
-    summary.fragments_emitted += 1;
-    summary.stats.absorb(snapshot_stats);
-
+    // The session id, its title and this file's path annotate the leaves the
+    // file projects, never every message.
+    let name = custom_title.or(ai_title);
+    let mut annotated = BTreeSet::new();
+    for (_, receipt) in leaves {
+        if !annotated.insert(receipt) {
+            continue;
+        }
+        let fragment = blockdag::source_occurrence(
+            receipt,
+            blockdag::ProjectionAnnotations {
+                source_path: Some(source_path.to_string_lossy().into_owned()),
+                source_locator: session.as_ref().map(|id| format!("session/{id}")),
+                name: name.clone(),
+                ..blockdag::ProjectionAnnotations::default()
+            },
+        )?;
+        emit(ProjectedFile {
+            source_path: source_path.to_path_buf(),
+            fragment,
+            stats: ProjectionStats::default(),
+        })?;
+        summary.fragments_emitted += 1;
+    }
     Ok(summary)
 }
 
@@ -1088,27 +1104,41 @@ fn scanner_bytes(raw: &[u8]) -> Result<Bytes> {
     Ok(Bytes::from_source(raw[first..=last].to_vec()))
 }
 
+/// Whether a record without dialogue content projects as a side branch.
+fn is_side_record(record: &RawRecord) -> bool {
+    match record.record_type.as_str() {
+        "attachment" => record.attachment_type.as_deref() != Some("total_tokens_reminder"),
+        "system" => record.subtype.as_deref() != Some("turn_duration"),
+        _ => false,
+    }
+}
+
+/// Project one record. Returns the dialogue class and receipt it projected,
+/// so the caller can annotate the file's leaves.
 fn project_record(
     record: RawRecord,
     raw_record: &[u8],
-    source_path: &Path,
     plan: &SourcePlan,
     corpus: &mut Fragment,
     stats: &mut ProjectionStats,
-) -> Result<()> {
+) -> Result<Option<(SourceKey, Id)>> {
     let direction = match record.record_type.as_str() {
         "user" => schema::content_fact::direction::IN,
         "assistant" => schema::content_fact::direction::OUT,
+        _ if is_side_record(&record) => {
+            project_side_record(&record, raw_record, plan, corpus, stats)?;
+            return Ok(None);
+        }
         _ => {
             stats.skipped_records += 1;
-            return Ok(());
+            return Ok(None);
         }
     };
 
     let Some(key) = record.source_key() else {
         stats.missing_source_identity += 1;
         stats.skipped_records += 1;
-        return Ok(());
+        return Ok(None);
     };
     let class = plan.canonical_key(&key);
     let mut parts = Fragment::empty();
@@ -1148,7 +1178,7 @@ fn project_record(
 
     if parts.exports().next().is_none() {
         stats.skipped_records += 1;
-        return Ok(());
+        return Ok(None);
     }
 
     let planned_parents = plan.parents.get(&class).ok_or_else(|| {
@@ -1164,17 +1194,9 @@ fn project_record(
         stats.skipped_parents += 1;
     }
     let mut predecessors = BTreeSet::new();
-    let mut semantic_predecessor_support = BTreeSet::new();
     for parent_key in planned_parents {
         if let Some(block) = plan.blocks.get(parent_key) {
             predecessors.insert(*block);
-            semantic_predecessor_support.extend(
-                plan.projection_ids
-                    .get(parent_key)
-                    .into_iter()
-                    .flatten()
-                    .copied(),
-            );
         } else {
             stats.unresolved_parents += 1;
         }
@@ -1198,36 +1220,76 @@ fn project_record(
         );
     }
 
-    let projection = blockdag::source_projection(
-        schema::source_projection::SOURCE_CLAUDE_CODE,
-        key.locator(),
-        raw_record.to_vec(),
-        block,
+    let receipt =
+        blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, block)?;
+    let receipt = blockdag::annotate_source_projection(
+        receipt,
+        blockdag::ProjectionAnnotations {
+            source_timestamp: timestamp,
+            raw_role: record.role,
+            raw_model: record.model,
+            ..blockdag::ProjectionAnnotations::default()
+        },
     )?;
-    let annotations = blockdag::ProjectionAnnotations {
-        semantic_predecessor_support: semantic_predecessor_support.into_iter().collect(),
-        source_timestamp: timestamp,
-        raw_role: record.role,
-        raw_model: record.model,
-        source_path: Some(source_path.to_string_lossy().into_owned()),
-        ..blockdag::ProjectionAnnotations::default()
-    };
-    let projection = blockdag::annotate_source_projection(projection, annotations)?;
-    let projection_id = projection
+    let receipt_id = receipt
         .root()
         .expect("canonical source-projection constructor returns one root");
-    if !plan
-        .projection_ids
-        .get(&class)
-        .is_some_and(|ids| ids.contains(&projection_id))
-    {
-        bail!(
-            "Claude Code source {} materialized an unplanned projection identity",
-            key.locator()
-        );
-    }
-    *corpus += projection;
+    *corpus += receipt;
     stats.source_projections += 1;
+    Ok(Some((class, receipt_id)))
+}
+
+/// Project one `attachment` or `system` record as a side branch: one EVENT
+/// part holding the canonical JSON of the record without its envelope, on a
+/// block that follows the record's nearest dialogue ancestors.
+fn project_side_record(
+    record: &RawRecord,
+    raw_record: &[u8],
+    plan: &SourcePlan,
+    corpus: &mut Fragment,
+    stats: &mut ProjectionStats,
+) -> Result<()> {
+    let Some(key) = record.source_key() else {
+        stats.missing_source_identity += 1;
+        stats.skipped_records += 1;
+        return Ok(());
+    };
+    let body = archive_source::canonical_json_without(scanner_bytes(raw_record)?, ENVELOPE_KEYS)
+        .map_err(|error| anyhow!("canonicalize Claude Code side record: {error}"))?;
+    if body == "{}" {
+        stats.skipped_records += 1;
+        return Ok(());
+    }
+    let direction = if record.record_type == "attachment" {
+        schema::content_fact::direction::IN
+    } else {
+        schema::content_fact::direction::AMBIENT
+    };
+    let fact = blockdag::text_fact(schema::content_fact::modality::EVENT, direction, body)?;
+    let parts = blockdag::content_part(0, fact, None)?;
+    stats.content_parts += 1;
+    let class = plan.canonical_key(&key);
+    let mut predecessors = BTreeSet::new();
+    for parent in plan.side_parents.get(&class).into_iter().flatten() {
+        match plan.blocks.get(parent) {
+            Some(block) => {
+                predecessors.insert(*block);
+            }
+            None => stats.unresolved_parents += 1,
+        }
+    }
+    let timestamp = record.timestamp.and_then(epoch_interval);
+    let block = blockdag::block(predecessors, timestamp, parts)?;
+    let receipt =
+        blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, block)?;
+    *corpus += blockdag::annotate_source_projection(
+        receipt,
+        blockdag::ProjectionAnnotations {
+            source_timestamp: timestamp,
+            ..blockdag::ProjectionAnnotations::default()
+        },
+    )?;
+    stats.side_projections += 1;
     Ok(())
 }
 
@@ -1350,6 +1412,9 @@ struct RawRecord {
     session_id: Option<String>,
     uuid: Option<String>,
     parent_uuid: Option<String>,
+    logical_parent_uuid: Option<String>,
+    attachment_type: Option<String>,
+    title: Option<String>,
     forked_from: Option<ForkedFrom>,
     source_tool_assistant_uuid: Option<String>,
     timestamp: Option<Epoch>,
@@ -1365,6 +1430,16 @@ struct ForkedFrom {
 }
 
 impl RawRecord {
+    /// The record's parent: `parentUuid`, or for a compaction boundary,
+    /// which starts a new physical chain, its `logicalParentUuid`.
+    fn effective_parent(&self) -> Option<&str> {
+        self.parent_uuid.as_deref().or_else(|| {
+            (self.record_type == "system" && self.subtype.as_deref() == Some("compact_boundary"))
+                .then_some(self.logical_parent_uuid.as_deref())
+                .flatten()
+        })
+    }
+
     fn source_key(&self) -> Option<SourceKey> {
         Some(SourceKey::new(self.session_id.clone()?, self.uuid.clone()?))
     }
@@ -1538,6 +1613,9 @@ fn scan_record(bytes: &mut Bytes) -> std::result::Result<RawRecord, sc::ScanErro
             "sessionId" => record.session_id = parse_optional_string(value)?,
             "uuid" => record.uuid = parse_optional_string(value)?,
             "parentUuid" => record.parent_uuid = parse_optional_string(value)?,
+            "logicalParentUuid" => record.logical_parent_uuid = parse_optional_string(value)?,
+            "aiTitle" | "customTitle" => record.title = parse_optional_string(value)?,
+            "attachment" => record.attachment_type = scan_attachment_type(value)?,
             "forkedFrom" => record.forked_from = scan_optional_forked_from(value)?,
             "sourceToolAssistantUUID" => {
                 record.source_tool_assistant_uuid = parse_optional_string(value)?
@@ -1558,6 +1636,25 @@ fn scan_record(bytes: &mut Bytes) -> std::result::Result<RawRecord, sc::ScanErro
         Ok(record)
     })?;
     Ok(record)
+}
+
+fn scan_attachment_type(bytes: &mut Bytes) -> std::result::Result<Option<String>, sc::ScanError> {
+    if bytes.first().copied() != Some(b'{') {
+        sc::skip_value(bytes)?;
+        return Ok(None);
+    }
+    let mut kind = None;
+    sc::object(bytes, &mut kind, |kind, key, value| {
+        let key = key
+            .view::<str>()
+            .map_err(|_| scan_syntax("invalid UTF-8 object key"))?;
+        match key.as_ref() {
+            "type" => *kind = parse_optional_string(value)?,
+            _ => sc::skip_value(value)?,
+        }
+        Ok(kind)
+    })?;
+    Ok(kind)
 }
 
 fn scan_optional_forked_from(
@@ -1820,7 +1917,7 @@ mod tests {
     use triblespace::core::metadata;
     use triblespace::core::repo::pile::{Pile, PileSnapshot};
     use triblespace::core::repo::BlobStoreGet;
-    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
@@ -1842,17 +1939,10 @@ mod tests {
             bytes,
         };
         let mut fragment = Fragment::empty();
-        let summary = project_snapshot(
-            path,
-            snapshot,
-            prescan.digest,
-            prescan.file_anchor.as_ref(),
-            &plan,
-            &mut |projected| {
-                fragment += projected.fragment;
-                Ok(())
-            },
-        )
+        let summary = project_snapshot(path, snapshot, prescan.digest, &plan, &mut |projected| {
+            fragment += projected.fragment;
+            Ok(())
+        })
         .unwrap();
         Projected {
             fragment,
@@ -1918,92 +2008,10 @@ mod tests {
         .collect()
     }
 
-    fn raw_projection_record(fragment: &Fragment, projection: Id) -> Vec<u8> {
-        let handle = find!(
-            raw: Inline<Handle<RawBytes>>,
-            pattern!(fragment.facts(), [{
-                projection @ schema::source_projection::raw_record: ?raw
-            }])
-        )
-        .next()
-        .expect("projection has one exact raw record");
-        let mut fragment = fragment.clone();
-        let reader = fragment.blobs_mut().snapshot().unwrap();
-        let raw: anybytes::Bytes = reader.get(handle).unwrap();
-        raw.as_ref().to_vec()
-    }
-
-    fn source_chunk_raws(fragment: &Fragment) -> Vec<(Id, u128, Bytes)> {
-        let mut blobs = fragment.blobs().clone();
-        let reader = blobs.snapshot().unwrap();
-        find!(
-            (
-                chunk: Id,
-                offset: Inline<triblespace::prelude::inlineencodings::U256BE>,
-                raw: Inline<Handle<RawBytes>>
-            ),
-            pattern!(fragment.facts(), [
-                { ?chunk @ metadata::tag: &schema::source_chunk::KIND },
-                { ?chunk @ schema::source_chunk::offset: ?offset },
-                { ?chunk @ schema::source_chunk::bytes: ?raw },
-            ])
-        )
-        .map(|(chunk, offset, raw)| {
-            let offset = u128::try_from_inline(&offset).unwrap();
-            let raw = reader.get::<Bytes, RawBytes>(raw).unwrap();
-            (chunk, offset, raw)
-        })
-        .collect()
-    }
-
-    fn exact_source_snapshot(fragment: &Fragment) -> Vec<u8> {
-        let snapshots = ids_with_tag(fragment, schema::source_snapshot::KIND);
-        assert_eq!(snapshots.len(), 1, "expected exactly one source snapshot");
-        let snapshot = *snapshots.first().unwrap();
-        let selected: BTreeSet<_> = find!(
-            chunk: Id,
-            pattern!(fragment.facts(), [{
-                snapshot @ schema::source_snapshot::contains: ?chunk
-            }])
-        )
-        .collect();
-        let mut chunks = source_chunk_raws(fragment)
-            .into_iter()
-            .filter(|(chunk, _, _)| selected.contains(chunk))
-            .collect::<Vec<_>>();
-        chunks.sort_by_key(|(_, offset, _)| *offset);
-        chunks
-            .into_iter()
-            .flat_map(|(_, _, bytes)| bytes.as_ref().to_vec())
-            .collect()
-    }
-
-    #[test]
-    fn precomputed_projection_identity_matches_the_canonical_constructor() {
-        let source = SourceKey::new("identity-session", "identity-record");
-        let raw = br#"{"exact":true}"#;
-        let block = Id::from_hex("11111111111111111111111111111111").unwrap();
-        let expected = blockdag::source_projection(
-            schema::source_projection::SOURCE_CLAUDE_CODE,
-            source.locator(),
-            raw.to_vec(),
-            Fragment::rooted(block, TribleSet::new()),
-        )
-        .unwrap()
-        .root()
-        .unwrap();
-        assert_eq!(
-            source_projection_id(&source, *blake3::hash(raw).as_bytes(), block),
-            expected
-        );
-    }
-
     #[test]
     fn projection_is_canonical_and_does_not_fabricate_missing_time_or_actors() {
         let projected = project_text(SINGLE_FILE, Path::new("/imports/session.jsonl"));
         assert_eq!(projected.stats.source_projections, 3);
-        assert_eq!(projected.stats.source_snapshots, 1);
-        assert_eq!(projected.stats.raw_chunks, 1);
         assert_eq!(projected.stats.content_parts, 6);
         assert_eq!(projected.stats.unresolved_tool_results, 0);
         assert_eq!(projected.stats.undecodable_images, 0);
@@ -2052,18 +2060,21 @@ mod tests {
     }
 
     #[test]
-    fn skipped_source_nodes_transparently_contract_to_the_nearest_projected_ancestor() {
-        let child_raw = r#"{"type":"assistant","sessionId":"contract","uuid":"child","parentUuid":"empty","message":{"role":"assistant","model":"claude","content":"after metadata"}}"#;
+    fn harness_and_system_records_are_side_branches_off_the_dialogue() {
         let source = format!(
-            "{}\n{}\n{}\n{}\n{child_raw}",
+            "{}\n{}\n{}\n{}\n{}",
             r#"{"type":"user","sessionId":"contract","uuid":"root","parentUuid":null,"message":{"role":"user","content":"before metadata"}}"#,
-            r#"{"type":"attachment","sessionId":"contract","uuid":"attachment","parentUuid":"root","attachment":{"type":"skill_listing"}}"#,
-            r#"{"type":"system","sessionId":"contract","uuid":"system","parentUuid":"attachment","content":"metadata"}"#,
+            r#"{"type":"attachment","sessionId":"contract","uuid":"attachment","parentUuid":"root","cwd":"/a","attachment":{"type":"skill_listing","content":"skills"}}"#,
+            r#"{"type":"system","sessionId":"contract","uuid":"system","parentUuid":"attachment","content":"metadata","timestamp":"2026-03-01T15:34:01.542Z"}"#,
             r#"{"type":"user","sessionId":"contract","uuid":"empty","parentUuid":"system","message":{"role":"user","content":[]}}"#,
+            r#"{"type":"assistant","sessionId":"contract","uuid":"child","parentUuid":"empty","message":{"role":"assistant","model":"claude","content":"after metadata"}}"#,
         );
         let projected = project_text(&source, Path::new("contract.jsonl"));
-        assert_eq!(projected.stats.skipped_records, 3);
-        assert_eq!(projected.stats.skipped_parents, 0);
+        assert_eq!(
+            projected.stats.skipped_records, 1,
+            "only the empty user record"
+        );
+        assert_eq!(projected.stats.side_projections, 2);
         assert_eq!(projected.stats.unresolved_parents, 0);
 
         let parent = block_with_payload(&projected.fragment, "before metadata");
@@ -2071,86 +2082,91 @@ mod tests {
         assert!(exists!(pattern!(&projected.fragment, [{
             child @ schema::block::previous: &parent
         }])));
-        let parent_projection = projection_for_block(&projected.fragment, parent);
-        let child_projection = projection_for_block(&projected.fragment, child);
-        assert!(exists!(pattern!(&projected.fragment, [{
-            child_projection @ schema::source_projection::semantic_predecessor_support: &parent_projection
-        }])));
-        assert_eq!(
-            raw_projection_record(&projected.fragment, child_projection),
-            child_raw.as_bytes(),
-            "the exact receipt retains direct vendor adjacency while the semantic graph contracts it"
+        // The attachment is the content without its envelope (`cwd`, ids).
+        let attachment = block_with_payload(
+            &projected.fragment,
+            r#"{"attachment":{"content":"skills","type":"skill_listing"}}"#,
         );
+        let system = block_with_payload(&projected.fragment, r#"{"content":"metadata"}"#);
+        for side in [attachment, system] {
+            assert!(exists!(pattern!(&projected.fragment, [{
+                side @ schema::block::previous: &parent
+            }])));
+        }
+
+        // The same dialogue without the side records threads the same blocks.
+        let lean = project_text(
+            concat!(
+                r#"{"type":"user","sessionId":"contract","uuid":"root","parentUuid":null,"message":{"role":"user","content":"before metadata"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"contract","uuid":"child","parentUuid":"root","message":{"role":"assistant","model":"claude","content":"after metadata"}}"#,
+            ),
+            Path::new("lean.jsonl"),
+        );
+        assert_eq!(block_with_payload(&lean.fragment, "after metadata"), child);
     }
 
     #[test]
-    fn nonsemantic_rows_live_only_in_the_exact_source_snapshot() {
-        let semantic = r#"{"type":"user","sessionId":"raw-cover","uuid":"root","message":{"role":"user","content":"hello"}}"#;
-        let telemetry = r#"{"type":"progress","sessionId":"raw-cover","uuid":"progress","parentUuid":"root","data":{"type":"agent_progress"}}"#;
-        let empty = r#"{"type":"user","sessionId":"raw-cover","uuid":"empty","parentUuid":"progress","message":{"role":"user","content":[]}}"#;
-        let source = format!("{semantic}\n{telemetry}\n{empty}\n");
-        let projected = project_text(&source, Path::new("raw-cover.jsonl"));
+    fn no_source_bytes_are_stored_and_bookkeeping_is_skipped() {
+        let semantic = r#"{"type":"user","sessionId":"raw-free","uuid":"root","message":{"role":"user","content":"hello"}}"#;
+        let telemetry = r#"{"type":"progress","sessionId":"raw-free","uuid":"progress","parentUuid":"root","data":{"type":"agent_progress"}}"#;
+        let tokens = r#"{"type":"attachment","sessionId":"raw-free","uuid":"tokens","parentUuid":"progress","attachment":{"type":"total_tokens_reminder","text":"<total_tokens>9 tokens left</total_tokens>"}}"#;
+        let empty = r#"{"type":"user","sessionId":"raw-free","uuid":"empty","parentUuid":"tokens","message":{"role":"user","content":[]}}"#;
+        let source = format!("{semantic}\n{telemetry}\n{tokens}\n{empty}\n");
+        let projected = project_text(&source, Path::new("raw-free.jsonl"));
 
-        assert_eq!(projected.stats.records_seen, 3);
-        assert_eq!(projected.stats.skipped_records, 2);
-        assert_eq!(projected.stats.raw_chunks, 1);
+        assert_eq!(projected.stats.records_seen, 4);
+        assert_eq!(projected.stats.skipped_records, 3);
         assert_eq!(projected.stats.source_projections, 1);
-        assert_eq!(projected.stats.source_snapshots, 1);
-        assert_eq!(
-            exact_source_snapshot(&projected.fragment),
-            source.as_bytes()
-        );
-
-        let raw_records = ids_with_tag(&projected.fragment, schema::source_projection::KIND)
-            .into_iter()
-            .map(|projection| raw_projection_record(&projected.fragment, projection))
-            .collect::<Vec<_>>();
-        assert!(raw_records.iter().any(|raw| raw == semantic.as_bytes()));
-        assert!(!raw_records.iter().any(|raw| raw == telemetry.as_bytes()));
-        assert!(!raw_records.iter().any(|raw| raw == empty.as_bytes()));
+        assert!(!exists!(pattern!(&projected.fragment, [{
+            _?receipt @ schema::source_projection::raw_record: _?raw
+        }])));
+        let mut blobs = projected.fragment.blobs().clone();
+        let reader = blobs.snapshot().unwrap();
+        for line in [semantic, telemetry, tokens, empty] {
+            let mut probe = Fragment::empty();
+            let handle = probe.put::<schema::RawBytes, _>(line.as_bytes().to_vec());
+            assert!(
+                !reader.contains_blob(handle).unwrap(),
+                "a source line is stored verbatim"
+            );
+        }
     }
 
     #[test]
-    fn append_reuses_complete_raw_chunks_and_replaces_only_the_bounded_tail() {
+    fn append_adds_only_the_new_record_and_its_leaf_annotation() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("growing.jsonl");
         let root = r#"{"type":"user","sessionId":"growing","uuid":"root","message":{"role":"user","content":"hello"}}"#;
-        let large_progress = format!(
-            r#"{{"type":"progress","sessionId":"growing","uuid":"progress","parentUuid":"root","data":"{}"}}"#,
-            "x".repeat(schema::source_chunk::CANONICAL_BYTES)
-        );
-        let first_source = format!("{root}\n{large_progress}\n");
-        fs::write(&path, &first_source).unwrap();
-
+        fs::write(&path, format!("{root}\n")).unwrap();
         let mut first = Fragment::empty();
-        let first_summary = project_path(&path, |projected| {
+        project_path(&path, |projected| {
             first += projected.fragment;
             Ok(())
         })
         .unwrap();
-        assert_eq!(first_summary.stats.raw_chunks, 2);
-        let first_chunks = ids_with_tag(&first, schema::source_chunk::KIND);
-        assert_eq!(first_chunks.len(), 2);
 
-        let appended = format!(
-            "{first_source}{}\n",
-            r#"{"type":"progress","sessionId":"growing","uuid":"later","parentUuid":"progress","data":"more"}"#
-        );
-        fs::write(&path, appended).unwrap();
+        let reply = r#"{"type":"assistant","sessionId":"growing","uuid":"reply","parentUuid":"root","message":{"role":"assistant","content":"hi"}}"#;
+        fs::write(&path, format!("{root}\n{reply}\n")).unwrap();
         let mut second = Fragment::empty();
-        let second_summary = project_path(&path, |projected| {
+        project_path(&path, |projected| {
             second += projected.fragment;
             Ok(())
         })
         .unwrap();
-        assert_eq!(second_summary.stats.raw_chunks, 2);
-        let second_chunks = ids_with_tag(&second, schema::source_chunk::KIND);
-        assert_eq!(second_chunks.len(), 2);
-        assert_eq!(
-            first_chunks.intersection(&second_chunks).count(),
-            1,
-            "the complete prefix chunk is stable while only the bounded tail changes"
-        );
+        let reply_block = block_with_payload(&second, "hi");
+        // Everything the first import wrote is part of the second, except
+        // that the old leaf is no longer a leaf.
+        let new: Vec<_> = second
+            .facts()
+            .iter()
+            .filter(|trible| !first.facts().contains(trible))
+            .collect();
+        assert!(!new.is_empty());
+        let leaf_receipt = projection_for_block(&second, reply_block);
+        assert!(exists!(pattern!(&second, [{
+            leaf_receipt @ schema::source_projection::source_locator: _?locator
+        }])));
     }
 
     #[test]
@@ -2171,17 +2187,10 @@ mod tests {
         .unwrap();
         let snapshot = archive_source::freeze_file(&path).unwrap();
         let mut emitted = 0usize;
-        let error = project_snapshot(
-            &path,
-            snapshot,
-            prescan.digest,
-            prescan.file_anchor.as_ref(),
-            &plan,
-            &mut |_| {
-                emitted += 1;
-                Ok(())
-            },
-        )
+        let error = project_snapshot(&path, snapshot, prescan.digest, &plan, &mut |_| {
+            emitted += 1;
+            Ok(())
+        })
         .unwrap_err();
         assert_eq!(emitted, 0);
         assert!(format!("{error:#}").contains("changed between dependency pre-scan"));
@@ -2240,16 +2249,11 @@ mod tests {
             }])
         )
         .collect();
-        assert_eq!(answer_receipts.len(), 2);
-        let next_projection = projection_for_block(&projected.fragment, next);
-        let previous_receipts: BTreeSet<_> = find!(
-            previous: Id,
-            pattern!(&projected.fragment, [{
-                next_projection @ schema::source_projection::semantic_predecessor_support: ?previous
-            }])
-        )
-        .collect();
-        assert_eq!(previous_receipts, answer_receipts);
+        assert_eq!(
+            answer_receipts.len(),
+            1,
+            "both occurrences of the answer land on one receipt"
+        );
     }
 
     #[test]
@@ -2299,20 +2303,10 @@ mod tests {
             call @ schema::block::previous: &result
         }])));
 
-        let call_receipts = projections_for_block(&projected.fragment, call);
-        let result_receipts = projections_for_block(&projected.fragment, result);
-        assert_eq!(call_receipts.len(), 3);
-        assert_eq!(result_receipts.len(), 3);
-        for receipt in result_receipts {
-            let previous: BTreeSet<_> = find!(
-                previous: Id,
-                pattern!(&projected.fragment, [{
-                    receipt @ schema::source_projection::semantic_predecessor_support: ?previous
-                }])
-            )
-            .collect();
-            assert_eq!(previous, call_receipts);
-        }
+        // The origin, the fork's replay and the fork's native copy are one
+        // message: one block and one receipt each.
+        assert_eq!(projections_for_block(&projected.fragment, call).len(), 1);
+        assert_eq!(projections_for_block(&projected.fragment, result).len(), 1);
     }
 
     #[test]
@@ -2330,7 +2324,7 @@ mod tests {
 
         let projected = project_text(source, Path::new("different-uuid.jsonl"));
         let block = block_with_payload(&projected.fragment, "same payload");
-        assert_eq!(projections_for_block(&projected.fragment, block).len(), 2);
+        assert_eq!(projections_for_block(&projected.fragment, block).len(), 1);
     }
 
     #[test]
@@ -2474,10 +2468,10 @@ mod tests {
             block_with_payload(&read.fragment, r#"{"name":"Read","input":{"a":2,"z":1}}"#);
         assert_eq!(bash_a_block, bash_b_block);
         assert_ne!(bash_a_block, read_block);
-        assert_ne!(
+        assert_eq!(
             projection_for_block(&bash_a.fragment, bash_a_block),
             projection_for_block(&bash_b.fragment, bash_b_block),
-            "vendor correlators remain exact receipt evidence, not semantic identity"
+            "vendor correlators are never identity"
         );
 
         let missing = project_text(
@@ -2640,7 +2634,7 @@ mod tests {
         let projected = project_text(source, Path::new("alias-tool-sources.jsonl"));
         assert_eq!(projected.stats.unresolved_tool_results, 0);
         let result = block_with_payload(&projected.fragment, "same result");
-        assert_eq!(projections_for_block(&projected.fragment, result).len(), 2);
+        assert_eq!(projections_for_block(&projected.fragment, result).len(), 1);
     }
 
     #[test]
@@ -2777,11 +2771,6 @@ mod tests {
         assert!(exists!(pattern!(&union, [{
             child @ schema::block::previous: &root
         }])));
-        let root_projection = projection_for_block(&union, root);
-        let child_projection = projection_for_block(&union, child);
-        assert!(exists!(pattern!(&union, [{
-            child_projection @ schema::source_projection::semantic_predecessor_support: &root_projection
-        }])));
     }
 
     #[test]
@@ -2890,23 +2879,6 @@ mod tests {
             child_block @ schema::block::previous: &parent
         }])));
 
-        let child_projection = find!(
-            projection: Id,
-            pattern!(&union, [{
-                ?projection @ schema::source_projection::projects_to: &child_block
-            }])
-        )
-        .next()
-        .unwrap();
-        let previous_receipts: BTreeSet<Id> = find!(
-            previous: Id,
-            pattern!(&union, [{
-                child_projection @ schema::source_projection::semantic_predecessor_support: ?previous
-            }])
-        )
-        .collect();
-        assert_eq!(previous_receipts.len(), 2);
-
         let (_empty, reader) = empty_reader();
         let (_, validation) =
             blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
@@ -2937,17 +2909,12 @@ mod tests {
     }
 
     #[test]
-    fn dialogue_without_vendor_identity_is_retained_only_in_the_exact_snapshot() {
+    fn dialogue_without_vendor_identity_is_counted_not_threaded() {
         let source = r#"{"type":"user","message":{"role":"user","content":"anonymous"}}"#;
         let projected = project_text(source, Path::new("anonymous.jsonl"));
         let receipts = ids_with_tag(&projected.fragment, schema::source_projection::KIND);
         assert!(receipts.is_empty());
         assert_eq!(projected.stats.source_projections, 0);
-        assert_eq!(projected.stats.source_snapshots, 1);
-        assert_eq!(
-            exact_source_snapshot(&projected.fragment),
-            source.as_bytes()
-        );
         assert_eq!(projected.stats.missing_source_identity, 1);
         assert_eq!(projected.stats.skipped_records, 1);
     }

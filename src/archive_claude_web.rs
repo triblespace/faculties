@@ -53,7 +53,7 @@ impl ProjectionStats {
         self.common.projections_emitted += other.common.projections_emitted;
         self.common.content_parts += other.common.content_parts;
         self.common.transparent_records += other.common.transparent_records;
-        self.common.raw_only_records += other.common.raw_only_records;
+        self.common.contentless_records += other.common.contentless_records;
         self.common.missing_predecessors += other.common.missing_predecessors;
     }
 }
@@ -121,6 +121,7 @@ fn project_content(path: &Path, bytes: Bytes) -> Result<(Fragment, ProjectionSta
         schema::source_projection::SOURCE_CLAUDE_WEB,
         path,
         records,
+        archive_source::UnitAnnotations::default(),
         |projected: ProjectedSource| {
             fragment += projected.fragment;
             Ok(())
@@ -890,7 +891,6 @@ fn records_from_conversations(
             };
             records.push(SourceRecord {
                 locator: locator.clone(),
-                raw_record: message.raw,
                 predecessors: predecessor.into_iter().collect(),
                 block_timestamp: timestamp,
                 threading,
@@ -914,7 +914,6 @@ fn records_from_conversations(
         // of the message DAG rather than inventing an ambient EVENT.
         records.push(SourceRecord {
             locator: conversation_envelope_locator(&conversation_uuid),
-            raw_record: raw,
             predecessors: Vec::new(),
             block_timestamp: None,
             threading: Threading::Transparent,
@@ -1072,7 +1071,7 @@ mod tests {
     use tempfile::TempDir;
     use triblespace::core::repo::BlobStoreGet;
     use triblespace::macros::{exists, pattern};
-    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
+    use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
@@ -1145,7 +1144,6 @@ mod tests {
     struct Receipt {
         projection: Id,
         block: Id,
-        raw: Vec<u8>,
         has_content: bool,
         has_block_timestamp: bool,
         has_source_timestamp: bool,
@@ -1161,22 +1159,19 @@ mod tests {
             schema::source_projection::SOURCE_CLAUDE_WEB,
             Path::new("conversations.json"),
             records,
-            |mut projected| {
+            archive_source::UnitAnnotations::default(),
+            |projected| {
+                let Some(record) = projected.record.clone() else {
+                    return Ok(());
+                };
                 let projection = projected
                     .fragment
                     .root()
                     .expect("source projection has one root");
-                let (locator, raw, block) = find!(
-                    (
-                        locator: Inline<Handle<UTF8String>>,
-                        raw: Inline<Handle<RawBytes>>,
-                        block: Id
-                    ),
+                let block = find!(
+                    block: Id,
                     pattern!(&projected.fragment, [{
-                        projection @
-                            schema::source_projection::source_locator: ?locator,
-                            schema::source_projection::raw_record: ?raw,
-                            schema::source_projection::projects_to: ?block
+                        projection @ schema::source_projection::projects_to: ?block
                     }])
                 )
                 .next()
@@ -1190,19 +1185,11 @@ mod tests {
                 let has_source_timestamp = exists!(pattern!(&projected.fragment, [{
                     projection @ schema::source_projection::source_timestamp: _?timestamp
                 }]));
-                let reader = projected
-                    .fragment
-                    .blobs_mut()
-                    .snapshot()
-                    .expect("memory blob reader construction is infallible");
-                let locator: View<str> = reader.get(locator).unwrap();
-                let raw: Bytes = reader.get(raw).unwrap();
                 receipts.insert(
-                    locator.as_ref().to_owned(),
+                    record.as_ref().to_owned(),
                     Receipt {
                         projection,
                         block,
-                        raw: raw.as_ref().to_vec(),
                         has_content,
                         has_block_timestamp,
                         has_source_timestamp,
@@ -1221,10 +1208,6 @@ mod tests {
         assert_eq!(stats.conversations, 1);
         assert_eq!(stats.messages, 3);
         assert_eq!(records[0].locator.as_ref(), "conversation-1/m1");
-        assert!(records[0]
-            .raw_record
-            .as_ref()
-            .starts_with(b"{ \"uuid\":\"m1\""));
         assert_eq!(records[1].predecessors[0].as_ref(), "conversation-1/m1");
         assert_eq!(
             records[2].predecessors[0].as_ref(),
@@ -1327,42 +1310,27 @@ mod tests {
     }
 
     #[test]
-    fn exact_conversation_envelope_is_lossless_but_not_semantic() {
+    fn conversation_envelope_state_does_not_reach_the_messages() {
         const FIRST: &str = r#"{"uuid":"conversation-envelope","name":"First name","summary":"private summary","account":{"uuid":"account-1","plan":"pro"},"future_vendor_field":{"kept":true},"chat_messages":[{"uuid":"m1","sender":"human","text":"same message"}]}"#;
         const SECOND: &str = r#"{"uuid":"conversation-envelope","name":"Renamed","summary":"different summary","account":{"uuid":"account-2","plan":"team"},"future_vendor_field":{"kept":false},"chat_messages":[{"uuid":"m1","sender":"human","text":"same message"}]}"#;
         let (first, first_stats) = projected_receipts(&format!("[{FIRST}]"));
         let (second, second_stats) = projected_receipts(&format!("[{SECOND}]"));
         let conversation = archive_source::owned_text("conversation-envelope".to_owned());
-        let envelope_locator = conversation_envelope_locator(&conversation);
-        let first_envelope = &first[envelope_locator.as_ref()];
-        let second_envelope = &second[envelope_locator.as_ref()];
-
-        assert_eq!(first_envelope.raw, FIRST.as_bytes());
-        assert_eq!(second_envelope.raw, SECOND.as_bytes());
-        assert_ne!(
-            first_envelope.projection, second_envelope.projection,
-            "changing unmodeled envelope evidence changes its receipt identity"
-        );
-        assert_eq!(
-            first_envelope.block, second_envelope.block,
-            "both envelopes project to the same canonical bottom block"
-        );
-        assert!(!first_envelope.has_content);
-        assert!(!second_envelope.has_content);
+        assert!(!first.contains_key(conversation_envelope_locator(&conversation).as_ref()));
 
         let message_locator = qualified_locator(&conversation, &archive_source::owned_text("m1"));
         assert_eq!(
             first[message_locator.as_ref()].projection,
             second[message_locator.as_ref()].projection,
-            "envelope metadata cannot perturb the message occurrence"
+            "envelope metadata cannot perturb the message receipt"
         );
         assert_eq!(
             first[message_locator.as_ref()].block,
             second[message_locator.as_ref()].block,
             "envelope metadata cannot perturb semantic block identity"
         );
-        assert_eq!(first_stats.raw_only_records, 1);
-        assert_eq!(second_stats.raw_only_records, 1);
+        assert_eq!(first_stats.contentless_records, 1);
+        assert_eq!(second_stats.contentless_records, 1);
         assert_eq!(first_stats.transparent_records, 1);
         assert_eq!(second_stats.transparent_records, 1);
     }
@@ -1390,16 +1358,10 @@ mod tests {
             without_time[message_locator.as_ref()].projection,
             "conversation metadata cannot alter the message source receipt"
         );
-
-        let envelope_locator = conversation_envelope_locator(&conversation);
-        let envelope = &with_time[envelope_locator.as_ref()];
-        assert_eq!(envelope.raw, WITH_CONVERSATION_TIME.as_bytes());
-        assert!(!envelope.has_block_timestamp);
-        assert!(!envelope.has_source_timestamp);
     }
 
     #[test]
-    fn message_alias_priority_is_member_order_independent_and_raw_stays_exact() {
+    fn message_alias_priority_is_member_order_independent() {
         const PRIMARY_FIRST: &str = r#"{"uuid":"m1","parent_message_uuid":"canonical-parent","parent_uuid":"legacy-parent","sender":"assistant","role":"human","model":"canonical-model","model_slug":"legacy-model","created_at":"2026-08-17T08:00:00Z","timestamp":"2025-01-01T00:00:00Z","text":"same"}"#;
         const PRIMARY_LAST: &str = r#"{"uuid":"m1","parent_uuid":"legacy-parent","parent_message_uuid":"canonical-parent","role":"human","sender":"assistant","model_slug":"legacy-model","model":"canonical-model","timestamp":"2025-01-01T00:00:00Z","created_at":"2026-08-17T08:00:00Z","text":"same"}"#;
 
@@ -1431,11 +1393,9 @@ mod tests {
         let (last_receipts, _) = projected_receipts(&last_export);
         let first_receipt = &first_receipts["alias-order/m1"];
         let last_receipt = &last_receipts["alias-order/m1"];
-        assert_eq!(first_receipt.raw, PRIMARY_FIRST.as_bytes());
-        assert_eq!(last_receipt.raw, PRIMARY_LAST.as_bytes());
-        assert_ne!(
+        assert_eq!(
             first_receipt.projection, last_receipt.projection,
-            "exactly different source envelopes remain different occurrences"
+            "member order cannot alter the receipt"
         );
         assert_eq!(
             first_receipt.block, last_receipt.block,
@@ -1483,23 +1443,20 @@ mod tests {
             schema::source_projection::SOURCE_CLAUDE_WEB,
             Path::new("conversations.json"),
             records,
-            |mut projected| {
+            archive_source::UnitAnnotations::default(),
+            |projected| {
+                let Some(locator) = projected.record.clone() else {
+                    return Ok(());
+                };
                 let projection = projected.fragment.root().unwrap();
-                let (locator, block) = find!(
-                    (
-                        locator: Inline<Handle<UTF8String>>,
-                        block: Id
-                    ),
+                let block = find!(
+                    block: Id,
                     pattern!(&projected.fragment, [{
-                        projection @
-                            schema::source_projection::source_locator: ?locator,
-                            schema::source_projection::projects_to: ?block
+                        projection @ schema::source_projection::projects_to: ?block
                     }])
                 )
                 .next()
                 .unwrap();
-                let reader = projected.fragment.blobs_mut().snapshot().unwrap();
-                let locator: View<str> = reader.get(locator).unwrap();
                 if locator.as_ref() == "explicit-root/m2" {
                     second_has_predecessor = Some(exists!(pattern!(&projected.fragment, [{
                         block @ schema::block::previous: _?previous
@@ -1549,10 +1506,11 @@ mod tests {
             schema::source_projection::SOURCE_CLAUDE_WEB,
             Path::new("conversations.json"),
             before,
+            archive_source::UnitAnnotations::default(),
             |_| Ok(()),
         )
         .unwrap();
-        assert_eq!(stats.projections_emitted, 4);
+        assert_eq!(stats.projections_emitted, 3, "the envelope stores nothing");
     }
 
     #[test]

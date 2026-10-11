@@ -3,14 +3,20 @@
 //! ChatGPT exports are immutable JSON arrays, sometimes sharded as
 //! `conversations-000.json`, with each conversation represented by a mapping
 //! DAG.  This adapter mmaps those arrays and uses TribleSpace's scanner rather
-//! than materializing a dynamic JSON value tree. Unescaped strings and exact
-//! mapping-node and conversation-envelope receipts therefore remain views of
-//! the source mapping.
+//! than materializing a dynamic JSON value tree. Unescaped strings remain views
+//! of the source mapping while projecting; no source bytes are stored.
 //!
-//! A mapping node with a null `message` is retained as exact source evidence
-//! but marked transparent, so it does not invent a semantic turn between its
-//! nearest message-bearing ancestors and descendants.  The complete mapping
-//! DAG is handed to `archive_source` before anything is emitted.
+//! A mapping node with a null `message` stores nothing and is contracted, so
+//! it does not invent a semantic turn between its nearest message-bearing
+//! ancestors and descendants. Visible user and assistant messages thread the
+//! dialogue; tool calls (assistant messages to a recipient other than `all`),
+//! tool results, system and hidden messages are side branches, so an export
+//! that drops them threads the same dialogue blocks as one that kept them.
+//! Node and conversation ids only thread the graph while projecting; the
+//! conversation id and title annotate the conversation's leaves. Envelope UI
+//! and export state (`current_node`, `update_time`, `safe_urls`, plugin ids,
+//! moderation results) is not kept. The complete mapping DAG is handed to
+//! `archive_source` before anything is emitted.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -20,15 +26,12 @@ use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::import::scanner as sc;
-use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
+use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
 use crate::archive_source::{
     self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, Threading,
 };
-use crate::blockdag::{self, ProjectionAnnotations};
 use crate::files;
 use crate::schemas::blockdag as schema;
 
@@ -54,7 +57,7 @@ impl ProjectionSummary {
         self.stats.projections_emitted += other.stats.projections_emitted;
         self.stats.content_parts += other.stats.content_parts;
         self.stats.transparent_records += other.stats.transparent_records;
-        self.stats.raw_only_records += other.stats.raw_only_records;
+        self.stats.contentless_records += other.stats.contentless_records;
         self.stats.missing_predecessors += other.stats.missing_predecessors;
     }
 }
@@ -63,9 +66,9 @@ impl ProjectionSummary {
 /// one or more shards.
 ///
 /// Files and conversations are visited deterministically. The callback sees
-/// one source-projection fragment per mapping node plus one exact conversation
-/// envelope receipt; callers may stage their union and publish it only after
-/// this function succeeds.
+/// one receipt per message-bearing mapping node, then the conversation's leaf
+/// annotations; callers may stage their union and publish it only after this
+/// function succeeds.
 pub fn project_path<F>(path: &Path, mut emit: F) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedSource) -> Result<()>,
@@ -135,72 +138,35 @@ where
         ..ProjectionSummary::default()
     };
     for conversation in conversations {
-        let (records, envelope, attachments_seen, attachments_resolved) =
+        let unit = archive_source::UnitAnnotations {
+            source_locator: Some(format!("conversation/{}", conversation.id.as_ref())),
+            name: conversation
+                .title
+                .as_ref()
+                .map(|title| title.as_ref().to_owned())
+                .filter(|title| !title.trim().is_empty()),
+        };
+        let (records, attachments_seen, attachments_resolved) =
             conversation.into_records(sidecars)?;
         summary.mapping_nodes_seen += records.len();
         summary.attachments_seen += attachments_seen;
         summary.attachments_resolved += attachments_resolved;
-        let expected_tip = envelope.current_locator.clone();
-        let mut projected_tip = None;
+        // The conversation id and title annotate the conversation's leaves;
+        // UI and export state of the envelope (current_node, update_time,
+        // safe_urls, plugin ids, ...) is not kept.
         let stats = archive_source::project_records(
             schema::source_projection::SOURCE_CHATGPT,
             source_path,
             records,
-            |mut projected| {
-                if expected_tip.is_some() {
-                    let (_, locator, block) = projected_identity(&mut projected.fragment)?;
-                    if expected_tip.as_ref() == Some(&locator) {
-                        projected_tip = Some(block);
-                    }
-                }
-                emit(projected)
-            },
+            unit,
+            &mut *emit,
         )?;
         summary.stats.records_seen += stats.records_seen;
         summary.stats.projections_emitted += stats.projections_emitted;
         summary.stats.content_parts += stats.content_parts;
         summary.stats.transparent_records += stats.transparent_records;
-        summary.stats.raw_only_records += stats.raw_only_records;
+        summary.stats.contentless_records += stats.contentless_records;
         summary.stats.missing_predecessors += stats.missing_predecessors;
-
-        let target = match envelope.current_locator.as_ref() {
-            Some(current_locator) => {
-                let tip_block = projected_tip.ok_or_else(|| {
-                    anyhow!(
-                        "ChatGPT current_node {:?} has no projected mapping node",
-                        current_locator.as_ref()
-                    )
-                })?;
-                Fragment::rooted(tip_block, TribleSet::new())
-            }
-            None => blockdag::block(std::iter::empty::<Id>(), None, Fragment::empty())?,
-        };
-        // The complete conversation envelope is another exact source
-        // occurrence projecting onto the selected canonical tip. Source UI
-        // state (title, account, plugins, timestamps, and the mapping wrapper)
-        // therefore remains lossless without entering semantic block identity
-        // or searchable content. Without an active tip it projects to the
-        // canonical bottom rather than inventing a branch.
-        let projection = blockdag::source_projection_view(
-            schema::source_projection::SOURCE_CHATGPT,
-            envelope.locator,
-            envelope.raw_record,
-            target,
-        )?;
-        let projection = blockdag::annotate_source_projection(
-            projection,
-            ProjectionAnnotations {
-                source_path: Some(source_path.display().to_string()),
-                ..ProjectionAnnotations::default()
-            },
-        )?;
-        emit(ProjectedSource {
-            source_path: source_path.to_path_buf(),
-            fragment: projection,
-        })?;
-        summary.stats.records_seen += 1;
-        summary.stats.projections_emitted += 1;
-        summary.stats.raw_only_records += 1;
     }
     Ok(summary)
 }
@@ -230,23 +196,12 @@ where
 #[derive(Debug)]
 struct Conversation {
     id: View<str>,
-    current_node: Option<View<str>>,
-    raw_record: Bytes,
+    title: Option<View<str>>,
     nodes: Vec<MappingNode>,
 }
 
-#[derive(Debug)]
-struct EnvelopeProjection {
-    locator: View<str>,
-    raw_record: Bytes,
-    current_locator: Option<View<str>>,
-}
-
 impl Conversation {
-    fn into_records(
-        self,
-        sidecars: &ExportFiles,
-    ) -> Result<(Vec<SourceRecord>, EnvelopeProjection, usize, usize)> {
+    fn into_records(self, sidecars: &ExportFiles) -> Result<(Vec<SourceRecord>, usize, usize)> {
         let mut locators = HashMap::<View<str>, View<str>>::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let locator = node_locator(
@@ -264,25 +219,6 @@ impl Conversation {
                 );
             }
         }
-
-        let current_locator = self
-            .current_node
-            .as_ref()
-            .map(|current| {
-                locators.get(current).cloned().ok_or_else(|| {
-                    anyhow!(
-                        "conversation {:?} current_node {:?} is absent from mapping",
-                        self.id.as_ref(),
-                        current.as_ref()
-                    )
-                })
-            })
-            .transpose()?;
-        let envelope = EnvelopeProjection {
-            locator: envelope_locator(self.id.as_ref()),
-            raw_record: self.raw_record,
-            current_locator,
-        };
 
         let mut attachments_seen = 0usize;
         let mut attachments_resolved = 0usize;
@@ -307,8 +243,29 @@ impl Conversation {
                 Some(message) => {
                     let timestamp = message.timestamp.and_then(epoch_interval);
                     let direction = direction_for_role(message.role.as_deref());
-                    let text_modality =
-                        text_modality(message.role.as_deref(), message.content_type.as_deref());
+                    let to_tool = message.role.as_deref() == Some("assistant")
+                        && message
+                            .recipient
+                            .as_deref()
+                            .is_some_and(|recipient| recipient != "all");
+                    let text_modality = if to_tool {
+                        schema::content_fact::modality::TOOL_CALL
+                    } else {
+                        text_modality(message.role.as_deref(), message.content_type.as_deref())
+                    };
+                    // Only visible user and assistant turns thread the
+                    // dialogue. Tool calls, tool results, system and hidden
+                    // context hang off it as side branches, so an export
+                    // format that drops them (2026-05-30 onwards) threads
+                    // the same dialogue blocks as one that kept them.
+                    let threading = if !message.hidden
+                        && !to_tool
+                        && matches!(message.role.as_deref(), Some("user" | "assistant"))
+                    {
+                        Threading::Semantic
+                    } else {
+                        Threading::Transparent
+                    };
                     let mut parts = Vec::new();
                     let mut represented_attachments = HashSet::<String>::new();
 
@@ -362,7 +319,7 @@ impl Conversation {
                         raw_model: message.model,
                         ..SourceClaims::default()
                     };
-                    (Threading::Semantic, timestamp, parts, claims)
+                    (threading, timestamp, parts, claims)
                 }
                 None => (
                     Threading::Transparent,
@@ -374,7 +331,6 @@ impl Conversation {
 
             records.push(SourceRecord {
                 locator,
-                raw_record: node.raw_record,
                 predecessors,
                 block_timestamp,
                 threading,
@@ -382,14 +338,13 @@ impl Conversation {
                 claims,
             });
         }
-        Ok((records, envelope, attachments_seen, attachments_resolved))
+        Ok((records, attachments_seen, attachments_resolved))
     }
 }
 
 #[derive(Debug)]
 struct MappingNode {
     id: View<str>,
-    raw_record: Bytes,
     parent: Option<View<str>>,
     message: Option<Message>,
 }
@@ -402,6 +357,10 @@ struct Message {
     model: Option<View<str>>,
     timestamp: Option<Epoch>,
     content_type: Option<View<str>>,
+    /// Tool addressed by an assistant message; `all` is the user.
+    recipient: Option<View<str>>,
+    /// `metadata.is_visually_hidden_from_conversation`.
+    hidden: bool,
     content: Vec<ContentItem>,
     attachments: Vec<Attachment>,
 }
@@ -624,16 +583,16 @@ fn scan_export(mut bytes: Bytes) -> std::result::Result<Vec<Conversation>, sc::S
 }
 
 fn scan_conversation(raw: Bytes) -> std::result::Result<Conversation, sc::ScanError> {
-    let mut cursor = raw.clone();
+    let mut cursor = raw;
     let mut id = None;
     let mut conversation_id = None;
-    let mut current_node = None;
+    let mut title = None;
     let mut nodes = Vec::new();
     sc::object(&mut cursor, (), |(), key, value| {
         match key_text(key)?.as_ref() {
             "id" => id = Some(optional_string(value)?),
             "conversation_id" => conversation_id = Some(optional_string(value)?),
-            "current_node" => current_node = optional_string(value)?,
+            "title" => title = optional_string(value)?,
             "mapping" => nodes = scan_mapping(value)?,
             _ => sc::skip_value(value)?,
         }
@@ -641,22 +600,15 @@ fn scan_conversation(raw: Bytes) -> std::result::Result<Conversation, sc::ScanEr
     })?;
     let id = preferred_alias([id, conversation_id])
         .ok_or_else(|| syntax("ChatGPT conversation has no stable id"))?;
-    Ok(Conversation {
-        id,
-        current_node,
-        raw_record: raw,
-        nodes,
-    })
+    Ok(Conversation { id, title, nodes })
 }
 
 fn scan_mapping(bytes: &mut Bytes) -> std::result::Result<Vec<MappingNode>, sc::ScanError> {
     sc::object(bytes, Vec::new(), |mut nodes, node_id, value| {
         let id = key_text(node_id)?;
-        let raw_record = archive_source::raw_value(value)?;
-        let (parent, message) = scan_mapping_node(raw_record.clone())?;
+        let (parent, message) = scan_mapping_node(archive_source::raw_value(value)?)?;
         nodes.push(MappingNode {
             id,
-            raw_record,
             parent,
             message,
         });
@@ -695,6 +647,7 @@ fn scan_message(bytes: &mut Bytes) -> std::result::Result<Message, sc::ScanError
             "create_time" => message.timestamp = optional_epoch(value)?,
             "content" => scan_content(value, message)?,
             "metadata" => scan_metadata(value, message)?,
+            "recipient" => message.recipient = optional_string(value)?,
             _ => sc::skip_value(value)?,
         }
         Ok(message)
@@ -968,6 +921,9 @@ fn scan_metadata(
         match key_text(key)?.as_ref() {
             "model_slug" => model_slug = Some(optional_string(value)?),
             "model" => model = Some(optional_string(value)?),
+            "is_visually_hidden_from_conversation" => {
+                message.hidden = sc::take_value(value)?.as_ref() == b"true";
+            }
             "attachments" => {
                 message.attachments = sc::array(value, Vec::new(), |mut attachments, item| {
                     if item.first().copied() == Some(b'{') {
@@ -1082,45 +1038,6 @@ fn consume_null(bytes: &mut Bytes) -> std::result::Result<bool, sc::ScanError> {
 
 fn syntax(message: &str) -> sc::ScanError {
     sc::ScanError::Syntax(message.to_owned())
-}
-
-fn projected_identity(fragment: &mut Fragment) -> Result<(Id, View<str>, Id)> {
-    let projection = fragment
-        .root()
-        .ok_or_else(|| anyhow!("projected source fragment is not singly rooted"))?;
-    let locator = find!(
-        (locator: Inline<Handle<UTF8String>>),
-        pattern!(&*fragment, [{
-            projection @ schema::source_projection::source_locator: ?locator
-        }])
-    )
-    .next()
-    .map(|(locator,)| locator)
-    .ok_or_else(|| anyhow!("source projection {projection:x} has no locator"))?;
-    let block = find!(
-        (block: Id),
-        pattern!(&*fragment, [{
-            projection @ schema::source_projection::projects_to: ?block
-        }])
-    )
-    .next()
-    .map(|(block,)| block)
-    .ok_or_else(|| anyhow!("source projection {projection:x} has no projected block"))?;
-    let reader = fragment
-        .blobs_mut()
-        .snapshot()
-        .expect("MemoryBlobStore reader construction is infallible");
-    let locator: View<str> = reader
-        .get(locator)
-        .map_err(|error| anyhow!("read source locator for {projection:x}: {error}"))?;
-    Ok((projection, locator, block))
-}
-
-fn envelope_locator(conversation: &str) -> View<str> {
-    archive_source::owned_text(format!(
-        "conversation:{}:{conversation}/envelope",
-        conversation.len()
-    ))
 }
 
 fn node_locator(conversation: &str, node: &str, message: Option<&View<str>>) -> View<str> {
@@ -1314,7 +1231,8 @@ mod tests {
     use std::fs;
 
     use tempfile::TempDir;
-    use triblespace::prelude::blobencodings::RawBytes;
+    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
+    use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
 
@@ -1418,60 +1336,37 @@ mod tests {
       }
     ]"#;
 
-    #[derive(Debug)]
-    struct Snapshot {
-        receipt: Id,
-        locator: String,
-        block: Id,
-        raw: Vec<u8>,
-    }
-
-    fn snapshots(path: &Path, export: &str) -> Vec<Snapshot> {
+    fn project_export(path: &Path, export: &str) -> Fragment {
         fs::write(path, export).unwrap();
-        let mut projections = Vec::new();
+        let mut union = Fragment::empty();
         project_path(path, |projection| {
-            projections.push(projection);
+            union += projection.fragment;
             Ok(())
         })
         .unwrap();
-
-        projections
-            .iter_mut()
-            .map(|projection| {
-                let (receipt, locator, block) =
-                    projected_identity(&mut projection.fragment).unwrap();
-                let raw: Inline<Handle<RawBytes>> = find!(
-                    raw: Inline<Handle<RawBytes>>,
-                    pattern!(&projection.fragment, [{
-                        receipt @ schema::source_projection::raw_record: ?raw
-                    }])
-                )
-                .next()
-                .unwrap();
-                let reader = projection
-                    .fragment
-                    .blobs_mut()
-                    .snapshot()
-                    .expect("MemoryBlobStore reader construction is infallible");
-                let raw: Bytes = reader.get(raw).unwrap();
-                Snapshot {
-                    receipt,
-                    locator: locator.as_ref().to_owned(),
-                    block,
-                    raw: raw.as_ref().to_vec(),
-                }
-            })
-            .collect()
+        union
     }
 
-    fn semantic_blocks(snapshots: &[Snapshot]) -> Vec<(String, Id)> {
-        let mut blocks: Vec<_> = snapshots
-            .iter()
-            .filter(|snapshot| snapshot.locator.contains("/node:"))
-            .map(|snapshot| (snapshot.locator.clone(), snapshot.block))
-            .collect();
-        blocks.sort_by(|left, right| left.0.cmp(&right.0));
-        blocks
+    fn blocks(fragment: &Fragment) -> std::collections::BTreeSet<Id> {
+        find!(
+            block: Id,
+            pattern!(fragment, [{ _?receipt @ schema::source_projection::projects_to: ?block }])
+        )
+        .collect()
+    }
+
+    fn block_with_text(fragment: &mut Fragment, text: &str) -> Id {
+        let handle = fragment.put::<UTF8String, _>(text.to_owned());
+        find!(
+            block: Id,
+            pattern!(&*fragment, [
+                { ?block @ schema::block::contains: _?part },
+                { _?part @ schema::content_part::fact: _?fact },
+                { _?fact @ schema::content_fact::payload: handle },
+            ])
+        )
+        .next()
+        .unwrap_or_else(|| panic!("no block carries {text:?}"))
     }
 
     #[test]
@@ -1481,13 +1376,6 @@ mod tests {
         assert_eq!(conversations.len(), 1);
         let conversation = &conversations[0];
         assert_eq!(conversation.id.as_ref(), "conversation-1");
-        assert_eq!(conversation.current_node.as_deref(), Some("assistant-node"));
-        let envelope = conversation.raw_record.clone().view::<str>().unwrap();
-        assert!(envelope.as_ref().starts_with('{'));
-        assert!(envelope
-            .as_ref()
-            .contains(r#""current_node": "assistant-node""#));
-        assert!(envelope.as_ref().contains(r#""mapping": {"#));
         assert_eq!(conversation.nodes.len(), 3);
         assert!(conversation.nodes[0].message.is_none());
         assert_eq!(conversation.nodes[1].parent.as_deref(), Some("root"));
@@ -1498,18 +1386,10 @@ mod tests {
                 .and_then(|message| message.id.as_deref()),
             Some("message-user")
         );
-        let raw = conversation.nodes[1]
-            .raw_record
-            .clone()
-            .view::<str>()
-            .unwrap();
-        assert!(raw.as_ref().starts_with('{'));
-        assert!(raw.as_ref().contains("\"message-user\""));
-        assert!(!raw.as_ref().starts_with("{\""));
     }
 
     #[test]
-    fn semantic_alias_priority_is_member_order_independent_and_raw_stays_exact() {
+    fn semantic_alias_priority_is_member_order_independent() {
         const PRIMARY_FIRST_NODE: &str = r#"{"parent":null,"message":{"id":"message","author":{"role":"assistant"},"content":{"text":"preferred-text","content":"fallback-text","parts":[{"id":"preferred-part","file_id":"fallback-part","name":"preferred.png","filename":"fallback.txt","content_type":"image_asset_pointer","type":"file","size":7,"size_bytes":99,"asset_pointer":"https://example.invalid/part"}],"content_type":"multimodal_text"},"metadata":{"model_slug":"preferred-model","model":"fallback-model","attachments":[{"id":"preferred-meta","file_id":"fallback-meta","name":"preferred.pdf","filename":"fallback.bin","content_type":"file","type":"image","size":11,"size_bytes":101}]}}}"#;
         const PRIMARY_LAST_NODE: &str = r#"{"message":{"metadata":{"attachments":[{"size_bytes":101,"size":11,"type":"image","content_type":"file","filename":"fallback.bin","name":"preferred.pdf","file_id":"fallback-meta","id":"preferred-meta"}],"model":"fallback-model","model_slug":"preferred-model"},"content":{"content_type":"multimodal_text","parts":[{"asset_pointer":"https://example.invalid/part","size_bytes":99,"size":7,"type":"file","content_type":"image_asset_pointer","filename":"fallback.txt","name":"preferred.png","file_id":"fallback-part","id":"preferred-part"}],"content":"fallback-text","text":"preferred-text"},"author":{"role":"assistant"},"id":"message"},"parent":null}"#;
 
@@ -1569,24 +1449,13 @@ mod tests {
             assert_eq!(metadata_attachment.size, Some(11));
         }
 
-        assert_eq!(first.raw_record.as_ref(), first_object.as_bytes());
-        assert_eq!(last.raw_record.as_ref(), last_object.as_bytes());
-        assert_eq!(
-            first.nodes[0].raw_record.as_ref(),
-            PRIMARY_FIRST_NODE.as_bytes()
-        );
-        assert_eq!(
-            last.nodes[0].raw_record.as_ref(),
-            PRIMARY_LAST_NODE.as_bytes()
-        );
-
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("conversations.json");
         let first_export = format!("[{first_object}]");
         let last_export = format!("[{last_object}]");
         assert_eq!(
-            semantic_blocks(&snapshots(&path, &first_export)),
-            semantic_blocks(&snapshots(&path, &last_export)),
+            blocks(&project_export(&path, &first_export)),
+            blocks(&project_export(&path, &last_export)),
             "JSON member order and lower-priority aliases cannot alter semantic blocks"
         );
     }
@@ -1686,26 +1555,21 @@ mod tests {
         assert_eq!(summary.attachments_seen, 1);
         assert_eq!(summary.attachments_resolved, 1);
         assert_eq!(summary.stats.transparent_records, 1);
-        assert_eq!(summary.stats.raw_only_records, 2);
-        assert_eq!(summary.stats.projections_emitted, 4);
+        assert_eq!(summary.stats.contentless_records, 1);
+        assert_eq!(summary.stats.projections_emitted, 2);
         assert_eq!(summary.stats.content_parts, 4);
-        assert_eq!(projected.len(), 4);
-
-        let mut identities = Vec::new();
-        for projection in &mut projected {
-            identities.push(projected_identity(&mut projection.fragment).unwrap());
+        // Two receipts, then the conversation id on the leaf.
+        assert_eq!(projected.len(), 3);
+        let mut union = Fragment::empty();
+        for projection in projected {
+            union += projection.fragment;
         }
-        let (_, _, tip_block) = identities
-            .iter()
-            .find(|(_, locator, _)| locator.as_ref().contains("node:14:assistant-node"))
-            .cloned()
-            .unwrap();
-        let (_, _, envelope_block) = identities
-            .iter()
-            .find(|(_, locator, _)| locator.as_ref().ends_with("/envelope"))
-            .cloned()
-            .unwrap();
-        assert_eq!(envelope_block, tip_block);
+        let tip = block_with_text(&mut union, "hi!");
+        let locator = union.put::<UTF8String, _>("conversation/conversation-1".to_owned());
+        assert!(exists!(pattern!(&union, [{
+            _?receipt @ schema::source_projection::projects_to: tip,
+            schema::source_projection::source_locator: locator
+        }])));
     }
 
     #[test]
@@ -1715,34 +1579,17 @@ mod tests {
             sidecars: &ExportFiles,
         ) -> (ProjectionSummary, TribleSet, bool) {
             let mut facts = TribleSet::new();
-            let mut retained_exact_pointer = false;
-            let mut emit = |mut projection: ProjectedSource| {
-                let (receipt, locator, _) = projected_identity(&mut projection.fragment)?;
-                if locator.as_ref().contains("/node:") {
-                    let raw: Inline<Handle<RawBytes>> = find!(
-                        raw: Inline<Handle<RawBytes>>,
-                        pattern!(&projection.fragment, [{
-                            receipt @ schema::source_projection::raw_record: ?raw
-                        }])
-                    )
-                    .next()
-                    .expect("mapping-node projection retains its exact source receipt");
-                    let reader = projection
-                        .fragment
-                        .blobs_mut()
-                        .snapshot()
-                        .expect("MemoryBlobStore reader construction is infallible");
-                    let raw: Bytes = reader.get(raw).unwrap();
-                    retained_exact_pointer = raw.view::<str>().is_ok_and(|raw| {
-                        raw.as_ref().contains("file-service://file-abc")
-                            && raw.as_ref().contains("https://example.invalid/asset")
-                    });
-                }
+            let mut emit = |projection: ProjectedSource| {
                 facts += projection.fragment.facts().clone();
                 Ok(())
             };
             let summary = project_file(export, sidecars, &mut emit).unwrap();
-            (summary, facts, retained_exact_pointer)
+            let pointers = find!(
+                pointer: Inline<Handle<UTF8String>>,
+                pattern!(&facts, [{ _?fact @ schema::content_fact::asset_pointer: ?pointer }])
+            )
+            .count();
+            (summary, facts, pointers == 2)
         }
 
         const AMBIGUOUS_SIDECARS: &str = r#"[
@@ -1800,7 +1647,7 @@ mod tests {
         assert_eq!(reverse_summary.attachments_resolved, 0);
         assert!(
             forward_raw && reverse_raw,
-            "exact pointer evidence was lost"
+            "both pointers stay as unresolved pointer facts"
         );
         assert_eq!(forward_facts, reverse_facts);
         assert_eq!(
@@ -1817,15 +1664,14 @@ mod tests {
     }
 
     #[test]
-    fn exact_envelope_changes_receipt_but_not_semantic_blocks() {
+    fn envelope_state_is_dropped_and_the_title_names_the_leaf() {
         const ENVELOPE: &str = r#"[
   {
-    "id": "envelope-lossless",
+    "id": "envelope-state",
     "title": "A retained title",
     "create_time": 1772382841,
     "update_time": 1772382842,
     "plugin_ids": ["plugin-one"],
-    "account": {"id": "account-one"},
     "future_vendor_field" : { "opaque" : [1, 2, 3] },
     "current_node": "assistant-node",
     "mapping": {
@@ -1850,67 +1696,101 @@ mod tests {
 ]"#;
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("conversations.json");
-        let changed_envelope = ENVELOPE.replace("[1, 2, 3]", "[1, 2, 4]");
-        let first = snapshots(&path, ENVELOPE);
-        let second = snapshots(&path, &changed_envelope);
-
-        assert_eq!(semantic_blocks(&first), semantic_blocks(&second));
-        let first_envelope = first
-            .iter()
-            .find(|snapshot| snapshot.locator.ends_with("/envelope"))
-            .unwrap();
-        let second_envelope = second
-            .iter()
-            .find(|snapshot| snapshot.locator.ends_with("/envelope"))
-            .unwrap();
-        assert_ne!(first_envelope.receipt, second_envelope.receipt);
-        assert_eq!(first_envelope.block, second_envelope.block);
-
-        let exact = std::str::from_utf8(&first_envelope.raw).unwrap();
-        assert!(exact.starts_with("{\n    \"id\": \"envelope-lossless\""));
-        assert!(exact.contains(r#""future_vendor_field" : { "opaque" : [1, 2, 3] }"#));
-        assert!(exact.contains(r#""mapping": {"#));
-        assert!(exact.ends_with("\n  }"));
+        let changed = ENVELOPE
+            .replace("[1, 2, 3]", "[1, 2, 4]")
+            .replace("1772382842", "1772382999");
+        let mut first = project_export(&path, ENVELOPE);
+        let second = project_export(&path, &changed);
+        assert_eq!(
+            first.facts(),
+            second.facts(),
+            "UI and export state is not kept"
+        );
+        let tip = block_with_text(&mut first, "hi");
+        let title = first.put::<UTF8String, _>("A retained title".to_owned());
+        assert!(exists!(pattern!(&first, [{
+            _?receipt @ schema::source_projection::projects_to: tip,
+            triblespace::core::metadata::name: title
+        }])));
     }
 
-    #[test]
-    fn envelope_without_active_branch_projects_to_canonical_bottom() {
-        const NO_CURRENT_NODE: &str = r#"[
+    const OLD_FORMAT: &str = r#"[
   {
-    "id": "no-current-node",
-    "title": "Still lossless",
-    "current_node": null,
+    "id": "6800a1b2-0000-8002-aaaa-000000000001",
+    "title": "Weather",
     "mapping": {
-      "node": {
-        "parent": null,
-        "message": {
-          "id": "message",
-          "author": {"role": "user"},
-          "content": {"content_type": "text", "parts": ["hello"]}
-        }
-      }
+      "root": {"parent": null, "message": null},
+      "system": {"parent": "root", "message": {"id": "system", "author": {"role": "system"},
+        "content": {"content_type": "text", "parts": ["hidden instructions"]},
+        "metadata": {"is_visually_hidden_from_conversation": true}}},
+      "user": {"parent": "system", "message": {"id": "user", "author": {"role": "user"},
+        "create_time": 1772382841.5,
+        "content": {"content_type": "text", "parts": ["weather in Bremen?"]}}},
+      "call": {"parent": "user", "message": {"id": "call", "author": {"role": "assistant"},
+        "recipient": "web", "content": {"content_type": "code", "text": "search(Bremen weather)"}}},
+      "tool": {"parent": "call", "message": {"id": "tool", "author": {"role": "tool", "name": "web"},
+        "content": {"content_type": "text", "parts": ["12 degrees, rain"]}}},
+      "answer": {"parent": "tool", "message": {"id": "answer", "author": {"role": "assistant"},
+        "recipient": "all", "create_time": 1772382850,
+        "content": {"content_type": "text", "parts": ["Rainy, 12 degrees."]}}}
     }
   }
 ]"#;
 
+    /// The same conversation as a later export spells it: new conversation
+    /// and node ids, hidden and tool nodes dropped, the answer re-parented.
+    const NEW_FORMAT: &str = r#"[
+  {
+    "id": "69aa0000-1111-83ab-bbbb-000000000002",
+    "title": "Weather",
+    "mapping": {
+      "client-created-root": {"parent": null, "message": null},
+      "u-2": {"parent": "client-created-root", "message": {"id": "u-2", "author": {"role": "user"},
+        "create_time": 1772382841.5,
+        "content": {"content_type": "text", "parts": ["weather in Bremen?"]}}},
+      "a-2": {"parent": "u-2", "message": {"id": "a-2", "author": {"role": "assistant"},
+        "create_time": 1772382850,
+        "content": {"content_type": "text", "parts": ["Rainy, 12 degrees."]}}}
+    }
+  }
+]"#;
+
+    #[test]
+    fn a_re_export_under_new_ids_and_a_new_format_lands_on_the_same_dialogue() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("conversations.json");
-        let projected = snapshots(&path, NO_CURRENT_NODE);
-        assert_eq!(projected.len(), 2);
+        let mut old = project_export(&path, OLD_FORMAT);
+        let mut new = project_export(&path, NEW_FORMAT);
+        for text in ["weather in Bremen?", "Rainy, 12 degrees."] {
+            assert_eq!(
+                block_with_text(&mut old, text),
+                block_with_text(&mut new, text)
+            );
+        }
+        assert!(blocks(&new).is_subset(&blocks(&old)));
+        // The tool call, its result and the hidden context hang off the
+        // dialogue in the old export.
+        let call = block_with_text(&mut old, "search(Bremen weather)");
+        let user = block_with_text(&mut old, "weather in Bremen?");
+        assert!(exists!(
+            pattern!(&old, [{ call @ schema::block::previous: user }])
+        ));
+        use schema::content_fact::modality;
+        assert!(exists!(pattern!(&old, [{
+            _?fact @ schema::content_fact::modality: &modality::TOOL_CALL
+        }])));
 
-        let envelope = projected
+        // Importing the new export after the old one adds nothing but its
+        // own conversation id on the leaf.
+        let novel: Vec<_> = new
+            .facts()
             .iter()
-            .find(|snapshot| snapshot.locator.ends_with("/envelope"))
-            .unwrap();
-        let bottom = blockdag::block(std::iter::empty::<Id>(), None, Fragment::empty())
-            .unwrap()
-            .root()
-            .unwrap();
-        assert_eq!(envelope.block, bottom);
-        let exact = std::str::from_utf8(&envelope.raw).unwrap();
-        assert!(exact.contains(r#""title": "Still lossless""#));
-        assert!(exact.contains(r#""current_node": null"#));
-        assert!(exact.contains(r#""mapping": {"#));
+            .filter(|trible| !old.facts().contains(trible))
+            .collect();
+        assert!(novel
+            .iter()
+            .all(|trible| *trible.a() == schema::source_projection::source_locator.id()));
+        assert_eq!(novel.len(), 1);
     }
 
     #[test]

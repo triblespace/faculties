@@ -933,62 +933,6 @@ pub(crate) fn ensure_search_acquiring_with_storage(
     })
 }
 
-/// Stream the byte geometry selected by one source snapshot. Only lightweight
-/// chunk coordinates are sorted; each payload is fetched and hash-checked on
-/// demand. Geometry errors affect this export, never ordinary archive reads.
-///
-/// The queried entity ids are opaque. Equal offset/handle rows deduplicate even
-/// when different chunk ids witness them, and unrelated annotations are inert.
-pub fn write_source_snapshot<P, R, W>(
-    facts: &P,
-    reader: &R,
-    id: Id,
-    destination: &mut W,
-) -> Result<u128>
-where
-    P: TriblePattern,
-    R: BlobStoreGet,
-    W: std::io::Write,
-{
-    let lengths: BTreeSet<u128> = find!(
-        length: u128,
-        pattern!(facts, [{
-            id @ metadata::tag: &schema::source_snapshot::KIND,
-            schema::source_snapshot::byte_length: ?length
-        }])
-    )
-    .collect();
-    if lengths.is_empty() {
-        bail!("Archive source snapshot {id:X} has no readable byte length");
-    }
-    let chunks: BTreeSet<(u128, RawHandle)> = find!(
-        (offset: u128, bytes: RawHandle),
-        pattern!(facts, [
-            { id @ schema::source_snapshot::contains: _?chunk },
-            { _?chunk @ schema::source_chunk::offset: ?offset,
-                schema::source_chunk::bytes: ?bytes },
-        ])
-    )
-    .collect();
-    let mut written = 0u128;
-    for (offset, handle) in chunks {
-        if offset != written {
-            bail!("Archive source snapshot {id:X} has a chunk at {offset}, expected {written}");
-        }
-        let bytes: Bytes = reader.get(handle).context("read Archive source chunk")?;
-        destination
-            .write_all(bytes.as_ref())
-            .with_context(|| format!("write Archive source snapshot {id:X}"))?;
-        written = written
-            .checked_add(bytes.len() as u128)
-            .ok_or_else(|| anyhow!("Archive source snapshot {id:X} length overflows u128"))?;
-    }
-    if !lengths.contains(&written) {
-        bail!("Archive source snapshot {id:X} yielded {written} bytes, outside its stated lengths");
-    }
-    Ok(written)
-}
-
 /// Exact continuation point for the causal-temporal view.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveTimelineCursor {
@@ -1185,7 +1129,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::schemas::files as files_schema;
     use anybytes::View;
     use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::inlineencodings::NsTAIInterval;
@@ -1807,75 +1750,6 @@ mod tests {
         assert_eq!(snapshot.support().len(), 1);
         assert!(facts_stand_on(&snapshot, &admitted));
         assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 1);
-    }
-
-    #[test]
-    fn exact_source_snapshots_are_listed_lazily_and_stream_reconstructible() {
-        let directory = TempDir::new().unwrap();
-        let pile = directory.path().join("archive.pile");
-        std::fs::File::create(&pile).unwrap();
-        let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile, &key);
-
-        let source = b"opaque telemetry and encrypted reasoning\n";
-        let chunks = blockdag::source_chunk(0, Bytes::from_source(source.to_vec())).unwrap();
-        let fragment = blockdag::source_snapshot(
-            schema::source_projection::SOURCE_CODEX,
-            "snapshot/v1/session:exact",
-            source.len() as u128,
-            chunks,
-            Some("/moved/rollout.jsonl".to_owned()),
-        )
-        .unwrap();
-        let expected = fragment.root().unwrap();
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        writer.stage_fragment(fragment).unwrap();
-        writer.finish(Ok(())).unwrap();
-
-        let archive = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        let facts = archive.facts().unwrap();
-        let snapshots: BTreeSet<_> = find!(
-            snapshot: Id,
-            pattern!(&facts, [{ ?snapshot @ metadata::tag: &schema::source_snapshot::KIND }])
-        )
-        .collect();
-        assert_eq!(snapshots, BTreeSet::from([expected]));
-        let (namespace, locator, length, path) = find!(
-            (namespace: Id, locator: Inline<Handle<UTF8String>>, length: u128,
-                path: Inline<Handle<UTF8String>>),
-            pattern!(&facts, [{
-                expected @ schema::source_projection::source_namespace: ?namespace,
-                schema::source_projection::source_locator: ?locator,
-                schema::source_snapshot::byte_length: ?length,
-                files_schema::file::source_path: ?path
-            }])
-        )
-        .next()
-        .unwrap();
-        assert_eq!(namespace, schema::source_projection::SOURCE_CODEX);
-        assert_eq!(length, source.len() as u128);
-        let locator: View<str> = archive.snapshot().get(locator).unwrap();
-        let path: View<str> = archive.snapshot().get(path).unwrap();
-        assert_eq!(locator.as_ref(), "snapshot/v1/session:exact");
-        assert_eq!(path.as_ref(), "/moved/rollout.jsonl");
-        let chunks: Vec<_> = find!(
-            (offset: u128, bytes: RawHandle),
-            pattern!(&facts, [
-                { expected @ schema::source_snapshot::contains: _?chunk },
-                { _?chunk @ schema::source_chunk::offset: ?offset,
-                    schema::source_chunk::bytes: ?bytes },
-            ])
-        )
-        .collect();
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].0, 0);
-        let mut reconstructed = Vec::new();
-        assert_eq!(
-            write_source_snapshot(&facts, archive.snapshot(), expected, &mut reconstructed)
-                .unwrap(),
-            source.len() as u128
-        );
-        assert_eq!(reconstructed, source);
     }
 
     #[test]
@@ -2584,7 +2458,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_fact_cover_and_raw_export_need_no_outer_commits() {
+    fn exact_fact_cover_needs_no_outer_commits() {
         use triblespace::core::collection::CollectionAttachment;
 
         let directory = TempDir::new().unwrap();
@@ -2593,31 +2467,12 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        // Chunk and snapshot ids are deliberately extrinsic. Two different
-        // witnesses of identical byte geometry must not duplicate the output.
-        let chunk_a = fucid();
-        let chunk_b = fucid();
-        let snapshot_id = fucid();
         let block = fucid();
         let timestamp = crate::clock::point(hifitime::Epoch::from_tai_duration(
             hifitime::Duration::from_total_nanoseconds(1),
         ))
         .unwrap();
-        let mut fragment = entity! { &chunk_a @
-            schema::source_chunk::offset: 0u128,
-            schema::source_chunk::bytes: b"raw".to_vec(),
-        };
-        fragment += entity! { &chunk_b @
-            schema::source_chunk::offset: 0u128,
-            schema::source_chunk::bytes: b"raw".to_vec(),
-        };
-        fragment += entity! { &snapshot_id @
-            metadata::tag: &schema::source_snapshot::KIND,
-            metadata::name*: ["first annotation", "another annotation"],
-            schema::source_snapshot::byte_length*: [3u128, 9u128],
-            schema::source_snapshot::contains*: [&chunk_a, &chunk_b],
-        };
-        fragment += entity! { &block @
+        let fragment = entity! { &block @
             metadata::tag: &schema::block::KIND,
             schema::block::timestamp: timestamp,
         };
@@ -2662,12 +2517,6 @@ mod tests {
                 &after,
             )
             .unwrap();
-        let mut output = Vec::new();
-        assert_eq!(
-            write_source_snapshot(&facts, &after, snapshot_id.id, &mut output).unwrap(),
-            3,
-        );
-        assert_eq!(output, b"raw");
         let timeline = timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN)).unwrap();
         assert_eq!(
             timeline,
@@ -2677,32 +2526,6 @@ mod tests {
             }]
         );
         pile.close().unwrap();
-    }
-
-    #[test]
-    fn export_geometry_failure_does_not_reject_other_fact_queries() {
-        let source = fucid();
-        let chunk = fucid();
-        let mut fragment = entity! { &chunk @
-            schema::source_chunk::offset: 1u128,
-            schema::source_chunk::bytes: b"gap".to_vec(),
-        };
-        fragment += entity! { &source @
-            metadata::tag: &schema::source_snapshot::KIND,
-            schema::source_snapshot::contains: &chunk,
-            schema::source_snapshot::byte_length: 3u128,
-            metadata::name: "still queryable",
-        };
-        let reader = fragment.blobs().clone().snapshot().unwrap();
-        let names: Vec<_> = find!(
-            name: Inline<Handle<UTF8String>>,
-            pattern!(fragment.facts(), [{ source.id @ metadata::name: ?name }])
-        )
-        .collect();
-        assert_eq!(names.len(), 1);
-        let error = write_source_snapshot(fragment.facts(), &reader, source.id, &mut Vec::new())
-            .unwrap_err();
-        assert!(error.to_string().contains("expected 0"));
     }
 
     #[test]

@@ -371,7 +371,7 @@ fn print_agy_import_summary(
         "records={} transparent={} raw_only={} missing_predecessors={}",
         summary.stats.records_seen,
         summary.stats.transparent_records,
-        summary.stats.raw_only_records,
+        summary.stats.contentless_records,
         summary.stats.missing_predecessors,
     ))?;
     print_collection_publication(published, out)?;
@@ -396,7 +396,7 @@ fn print_chatgpt_import_summary(
         summary.attachments_seen,
         summary.attachments_resolved,
         summary.stats.transparent_records,
-        summary.stats.raw_only_records,
+        summary.stats.contentless_records,
         summary.stats.missing_predecessors,
     ))?;
     print_collection_publication(published, out)?;
@@ -496,7 +496,7 @@ fn print_copilot_import_summary(
         "records={} transparent={} raw_only={} missing_predecessors={}",
         summary.stats.records_seen,
         summary.stats.transparent_records,
-        summary.stats.raw_only_records,
+        summary.stats.contentless_records,
         summary.stats.missing_predecessors,
     ))?;
     print_collection_publication(published, out)?;
@@ -521,7 +521,7 @@ fn print_gemini_import_summary(
         summary.assets_seen,
         summary.assets_resolved,
         summary.stats.transparent_records,
-        summary.stats.raw_only_records,
+        summary.stats.contentless_records,
         summary.stats.missing_predecessors,
     ))?;
     print_collection_publication(published, out)?;
@@ -818,6 +818,7 @@ fn render_projection(facts: &FactArchive, reader: &PileSnapshot, projection: Id)
         ("raw_role", &*archive_schema::source_projection::raw_role),
         ("raw_model", &*archive_schema::source_projection::raw_model),
         ("source_path", &*crate::schemas::files::file::source_path),
+        ("name", &*metadata::name),
     ] {
         for value in find!(
             value: TextHandle,
@@ -1042,19 +1043,29 @@ fn render_block(
     ) {
         writeln!(out, "previous: {previous:X}")?;
     }
+    // A receipt names its conversation only on a leaf, so the locator is
+    // optional here.
     let receipts: BTreeSet<_> = find!(
-        (receipt: Id, locator: TextHandle),
-        pattern!(facts, [{
-            ?receipt @ archive_schema::source_projection::projects_to: block,
-            archive_schema::source_projection::source_locator: ?locator
-        }])
+        receipt: Id,
+        pattern!(facts, [{ ?receipt @ archive_schema::source_projection::projects_to: block }])
     )
     .collect();
-    for (receipt, locator) in receipts {
+    for receipt in receipts {
+        let locators: BTreeSet<TextHandle> = find!(
+            locator: TextHandle,
+            pattern!(facts, [{
+                receipt @ archive_schema::source_projection::source_locator: ?locator
+            }])
+        )
+        .collect();
+        let mut names = Vec::with_capacity(locators.len());
+        for locator in locators {
+            names.push(read_text(reader, locator)?);
+        }
         writeln!(
             out,
             "receipt: {receipt:X} {} {}",
-            read_text(reader, locator)?,
+            names.join(" "),
             projection_actor(facts, reader, receipt)?,
         )?;
     }
@@ -1587,7 +1598,8 @@ mod tests {
 
         assert_eq!(
             projection_ids(&storage(&fixture).load().unwrap().facts().unwrap()).len(),
-            10
+            7,
+            "one receipt per message; envelopes store nothing"
         );
     }
 
@@ -1806,6 +1818,82 @@ mod tests {
         result.unwrap();
         assert_eq!(outcomes, [UNCHANGED, PUBLISHED, UNCHANGED]);
         assert_eq!(archive_root_payloads(&fixture), 4);
+    }
+
+    /// One `archive import --source chatgpt` over PATH, with its outcome.
+    fn chatgpt_outcome(fixture: &Fixture, path: &Path) -> String {
+        let mut outcomes = Vec::new();
+        super::super::cli::import_paths(
+            &fixture.pile,
+            Some(&fixture.key),
+            &[path.to_path_buf()],
+            CliImportSource::ChatGpt,
+            &mut Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    if let Some(outcome) = text.strip_prefix("Archive collection: ") {
+                        outcomes.push(outcome.trim_end().to_owned());
+                    }
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        outcomes.pop().unwrap()
+    }
+
+    #[test]
+    fn a_chatgpt_re_export_under_new_ids_adds_only_its_conversation_id() {
+        let fixture = fixture();
+        let directory = fixture._directory.path();
+        let export = |conversation: &str, user: &str, answer: &str| {
+            serde_json::json!([{
+                "id": conversation,
+                "title": "Weather",
+                "mapping": {
+                    "root": {"parent": null, "message": null},
+                    user: {"parent": "root", "message": {"id": user,
+                        "author": {"role": "user"}, "create_time": 1772382841.5,
+                        "content": {"content_type": "text", "parts": ["weather?"]}}},
+                    answer: {"parent": user, "message": {"id": answer,
+                        "author": {"role": "assistant"}, "create_time": 1772382850.0,
+                        "content": {"content_type": "text", "parts": ["rain"]}}},
+                },
+            }])
+            .to_string()
+        };
+        let old_dir = directory.join("old");
+        let new_dir = directory.join("new");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&new_dir).unwrap();
+        let old = old_dir.join("conversations.json");
+        let new = new_dir.join("conversations.json");
+        fs::write(&old, export("6800-0000-8002-old", "u-old", "a-old")).unwrap();
+        fs::write(&new, export("69aa-0000-83ab-new", "u-new", "a-new")).unwrap();
+
+        assert_eq!(chatgpt_outcome(&fixture, &old), PUBLISHED);
+        let facts = storage(&fixture).load().unwrap().facts().unwrap();
+        let blocks_before: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(&facts, [{ ?block @ metadata::tag: &archive_schema::block::KIND }])
+        )
+        .collect();
+        let tribles_before = facts.iter().count();
+        drop(facts);
+        let size_before = fs::metadata(&fixture.pile).unwrap().len();
+        assert_eq!(chatgpt_outcome(&fixture, &old), UNCHANGED);
+        assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), size_before);
+
+        // The new ids and path land on the same blocks and receipts: the
+        // re-export's commit holds its conversation id and path on the leaf.
+        assert_eq!(chatgpt_outcome(&fixture, &new), PUBLISHED);
+        let facts = storage(&fixture).load().unwrap().facts().unwrap();
+        let blocks_after: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(&facts, [{ ?block @ metadata::tag: &archive_schema::block::KIND }])
+        )
+        .collect();
+        assert_eq!(blocks_before, blocks_after);
+        assert_eq!(facts.iter().count(), tribles_before + 2);
     }
 
     #[test]

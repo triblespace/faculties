@@ -1,8 +1,8 @@
 //! Shared zero-copy source-adapter substrate for Archive transcript importers.
 //!
 //! Source adapters own only format knowledge: they scan immutable bytes into
-//! [`SourceRecord`]s whose strings and raw records remain views of the source
-//! allocation. This module owns source-DAG validation, transparent-node
+//! [`SourceRecord`]s whose strings remain views of the source allocation
+//! while projecting; no source bytes reach the pile. This module owns source-DAG validation, transparent-node
 //! contraction, content construction, source receipts, and callback emission.
 //! No adapter needs a dynamic JSON tree, repository head, branch, or cursor.
 
@@ -20,11 +20,10 @@ use triblespace::prelude::*;
 use crate::blockdag::{self, ProjectionAnnotations};
 use crate::schemas::blockdag as schema;
 
-/// One immutable, disk-backed copy of a potentially live source prefix.
+/// One immutable, private copy of a potentially live source prefix.
 ///
-/// `digest` is ephemeral mutation-detection evidence for a multi-pass adapter;
-/// exact durable identity comes from [`source_snapshot_fragment`]'s ordered
-/// content-addressed chunks.
+/// `digest` is ephemeral mutation-detection evidence for a multi-pass adapter.
+/// The bytes are only parsed; no source byte is ever written to the pile.
 #[derive(Clone, Debug)]
 pub struct FrozenSource {
     pub bytes: Bytes,
@@ -77,44 +76,17 @@ fn freeze_open_file(source: &mut File, path: &Path, len: u64) -> Result<FrozenSo
     Ok(FrozenSource { bytes, digest })
 }
 
-/// Represent one exact frozen source as a self-describing snapshot value.
-///
-/// Fixed-size byte chunks are source-format agnostic and may split UTF-8 or a
-/// JSON record. Their intrinsic handles are reused across append-only imports;
-/// the snapshot root preserves which ordered set and exact length coexisted.
-pub fn source_snapshot_fragment(
-    namespace: Id,
-    anchor: &str,
-    source_path: &Path,
-    bytes: &Bytes,
-) -> Result<(Fragment, usize)> {
-    let mut chunks = Fragment::empty();
-    let mut count = 0usize;
-    for offset in (0..bytes.len()).step_by(schema::source_chunk::CANONICAL_BYTES) {
-        let end = offset
-            .saturating_add(schema::source_chunk::CANONICAL_BYTES)
-            .min(bytes.len());
-        chunks += blockdag::source_chunk(offset as u128, bytes.slice(offset..end))?;
-        count += 1;
-    }
-    let length = u128::try_from(bytes.len()).expect("usize always fits u128");
-    let snapshot = blockdag::source_snapshot(
-        namespace,
-        format!("snapshot/v1/{anchor}"),
-        length,
-        chunks,
-        Some(source_path.to_string_lossy().into_owned()),
-    )?;
-    Ok((snapshot, count))
-}
-
 /// Whether an occurrence participates in the canonical dialogue DAG.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Threading {
     /// The projected block is a semantic predecessor for source children.
     #[default]
     Semantic,
-    /// Retain the occurrence, but contract it out of semantic predecessor paths.
+    /// A side branch: the record's block follows its nearest semantic
+    /// ancestors, but the record is contracted out of its children's
+    /// predecessor paths. Tool exhaust, hidden harness context, and envelope
+    /// nodes use it, so a source that omits them (a newer export format, a
+    /// replay that skips tool records) still threads the same dialogue blocks.
     Transparent,
 }
 
@@ -168,24 +140,21 @@ pub struct SourceClaims {
     pub raw_model: Option<View<str>>,
 }
 
-/// One exact source occurrence plus its semantic interpretation.
+/// One source occurrence plus its semantic interpretation.
 #[derive(Clone, Debug)]
 pub struct SourceRecord {
-    /// Vendor-stable locator, scoped by the adapter namespace.
+    /// The record's key inside one projection call. It only threads the
+    /// source graph while projecting and is never stored: identity comes
+    /// from content and structure alone.
     pub locator: View<str>,
-    /// Exact source bytes for this occurrence, never a reserialization.
-    pub raw_record: Bytes,
-    /// Source locators whose nearest semantic projections precede this one.
+    /// Keys of records that precede this one.
     pub predecessors: Vec<View<str>>,
-    /// Optional stable timestamp that genuinely belongs in semantic block ID.
+    /// Genuine event time, attached to the block as a nonidentity annotation.
     pub block_timestamp: Option<Inline<NsTAIInterval>>,
     /// Whether children see this record in their semantic predecessor frontier.
     pub threading: Threading,
-    /// Ordered semantic content. Empty records remain source-only receipts.
-    ///
-    /// Adapters that intentionally expose a raw source event must add an
-    /// explicit `EVENT` part. Provenance bytes are never promoted into
-    /// searchable semantic content implicitly.
+    /// Ordered semantic content. A record without content projects nothing
+    /// and is contracted out of its children's predecessor paths.
     pub parts: Vec<SourcePart>,
     /// Nonidentity source claims.
     pub claims: SourceClaims,
@@ -195,6 +164,9 @@ pub struct SourceRecord {
 pub struct ProjectedSource {
     pub source_path: PathBuf,
     pub fragment: Fragment,
+    /// Key of the record this receipt projects, for diagnostics and tests.
+    /// `None` on a leaf annotation. It is never stored.
+    pub record: Option<View<str>>,
 }
 
 /// Common accounting across source adapters.
@@ -204,7 +176,7 @@ pub struct ProjectionStats {
     pub projections_emitted: usize,
     pub content_parts: usize,
     pub transparent_records: usize,
-    pub raw_only_records: usize,
+    pub contentless_records: usize,
     pub missing_predecessors: usize,
 }
 
@@ -261,6 +233,52 @@ pub fn canonical_json(mut bytes: Bytes) -> std::result::Result<String, sc::ScanE
         ));
     }
     Ok(canonical)
+}
+
+/// Canonicalize one JSON object without the named top-level members.
+///
+/// Used where a record's envelope (ids, times, client state) must not enter
+/// the content it carries. A non-object value is canonicalized whole.
+pub fn canonical_json_without(
+    mut bytes: Bytes,
+    without: &[&str],
+) -> std::result::Result<String, sc::ScanError> {
+    sc::skip_ws(&mut bytes);
+    if bytes.first().copied() != Some(b'{') {
+        return canonical_json(bytes);
+    }
+    let members = sc::object(
+        &mut bytes,
+        BTreeMap::<String, String>::new(),
+        |mut members, key, value| {
+            let key = key
+                .view::<str>()
+                .map_err(|_| sc::ScanError::Syntax("JSON object key is not UTF-8".to_owned()))?;
+            if without.contains(&key.as_ref()) {
+                sc::skip_value(value)?;
+            } else {
+                members.insert(key.as_ref().to_owned(), canonical_json_value(value)?);
+            }
+            Ok(members)
+        },
+    )?;
+    sc::skip_ws(&mut bytes);
+    if !bytes.is_empty() {
+        return Err(sc::ScanError::Syntax(
+            "trailing bytes after canonical JSON value".to_owned(),
+        ));
+    }
+    let mut out = String::from("{");
+    for (ordinal, (key, value)) in members.into_iter().enumerate() {
+        if ordinal != 0 {
+            out.push(',');
+        }
+        out.push_str(&canonical_json_string(&key));
+        out.push(':');
+        out.push_str(&value);
+    }
+    out.push('}');
+    Ok(out)
 }
 
 fn canonical_json_value(bytes: &mut Bytes) -> std::result::Result<String, sc::ScanError> {
@@ -429,15 +447,30 @@ fn build_fact(part: SourcePart) -> Result<Fragment> {
     }
 }
 
+/// Conversation-level annotations of one projected source unit.
+///
+/// They land on the unit's leaves only (the blocks no other record of the unit
+/// follows), never on every message, and never in an identity.
+#[derive(Clone, Debug, Default)]
+pub struct UnitAnnotations {
+    /// Provider name of the conversation (conversation, session or file id).
+    pub source_locator: Option<String>,
+    /// Provider title of the conversation.
+    pub name: Option<String>,
+}
+
 /// Project a complete source graph through the canonical block-DAG model.
 ///
 /// The graph is planned before fragments are emitted. Output is independent of
-/// source iteration order, and transparent envelope nodes are contracted by
-/// the set of nearest semantic ancestors rather than historical path.
+/// source iteration order, and transparent nodes are contracted by the set of
+/// nearest semantic ancestors rather than historical path. Every receipt is a
+/// [`blockdag::block_source_projection`]: provider keys thread the graph while
+/// projecting and are never stored.
 pub fn project_records<F>(
     source_namespace: Id,
     source_path: &Path,
     records: Vec<SourceRecord>,
+    unit: UnitAnnotations,
     mut emit: F,
 ) -> Result<ProjectionStats>
 where
@@ -493,67 +526,44 @@ where
 
     let mut semantic_frontiers = vec![BTreeSet::<usize>::new(); records.len()];
     let mut block_ids = vec![None::<Id>; records.len()];
-    let mut projection_ids = vec![None::<Id>; records.len()];
+    let mut receipt_ids = vec![None::<Id>; records.len()];
+    let mut followed = BTreeSet::<Id>::new();
 
     for index in order {
         let record = &records[index];
-        // A raw-only record projects to the canonical bottom block and is
-        // contracted from semantic history regardless of an adapter's nominal
-        // threading preference. Its timestamp remains an occurrence claim.
-        let semantic_frontier_member =
-            record.threading == Threading::Semantic && !record.parts.is_empty();
         let mut predecessor_indices = BTreeSet::new();
         for predecessor in &record.predecessors {
             if let Some(&parent) = by_locator.get(predecessor) {
                 predecessor_indices.extend(semantic_frontiers[parent].iter().copied());
             }
         }
+        if record.parts.is_empty() {
+            // Nothing to store: the record only forwards its ancestors.
+            stats.contentless_records += 1;
+            stats.transparent_records += 1;
+            semantic_frontiers[index] = predecessor_indices;
+            continue;
+        }
 
         let mut parts = Fragment::empty();
-        if record.parts.is_empty() {
-            stats.raw_only_records += 1;
-        }
         for (ordinal, part) in record.parts.iter().cloned().enumerate() {
             let ordinal = u64::try_from(ordinal).context("content-part ordinal exceeds u64")?;
             parts += blockdag::content_part(ordinal, build_fact(part)?, None)?;
             stats.content_parts += 1;
         }
-
-        let predecessors: Vec<Id> = if semantic_frontier_member {
-            predecessor_indices
-                .iter()
-                .map(|parent| {
-                    block_ids[*parent].expect("semantic frontier contains a projected block")
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let block_timestamp = (!record.parts.is_empty())
-            .then_some(record.block_timestamp)
-            .flatten();
-        let block = blockdag::block(predecessors, block_timestamp, parts)?;
+        let predecessors: BTreeSet<Id> = predecessor_indices
+            .iter()
+            .map(|parent| block_ids[*parent].expect("semantic frontier contains a projected block"))
+            .collect();
+        if record.threading == Threading::Semantic {
+            followed.extend(predecessors.iter().copied());
+        }
+        let block = blockdag::block(predecessors, record.block_timestamp, parts)?;
         let block_id = block.root().expect("canonical block is rooted");
-        let projection = blockdag::source_projection_view(
-            source_namespace,
-            record.locator.clone(),
-            record.raw_record.clone(),
-            block,
-        )?;
-        let predecessor_support: Vec<Id> = if semantic_frontier_member {
-            predecessor_indices
-                .iter()
-                .map(|parent| {
-                    projection_ids[*parent].expect("semantic frontier contains a source projection")
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let projection = blockdag::annotate_source_projection(
-            projection,
+        let receipt = blockdag::block_source_projection(source_namespace, block)?;
+        let receipt = blockdag::annotate_source_projection(
+            receipt,
             ProjectionAnnotations {
-                semantic_predecessor_support: predecessor_support,
                 source_timestamp: record.claims.timestamp,
                 author: record.claims.author,
                 experiencer: record.claims.experiencer,
@@ -572,26 +582,51 @@ where
                     .raw_model
                     .as_ref()
                     .map(|value| value.as_ref().to_owned()),
-                source_path: Some(source_path.display().to_string()),
+                ..ProjectionAnnotations::default()
             },
         )?;
-        let projection_id = projection
-            .root()
-            .expect("canonical source projection is rooted");
+        receipt_ids[index] = Some(receipt.root().expect("canonical receipt is rooted"));
         emit(ProjectedSource {
             source_path: source_path.to_path_buf(),
-            fragment: projection,
+            fragment: receipt,
+            record: Some(record.locator.clone()),
         })?;
 
         block_ids[index] = Some(block_id);
-        projection_ids[index] = Some(projection_id);
-        if semantic_frontier_member {
+        if record.threading == Threading::Semantic {
             semantic_frontiers[index].insert(index);
         } else {
             stats.transparent_records += 1;
             semantic_frontiers[index] = predecessor_indices;
         }
         stats.projections_emitted += 1;
+    }
+
+    // Conversation-level provenance lands on the unit's leaves only.
+    let mut annotated = BTreeSet::new();
+    for ((record, block), receipt) in records.iter().zip(&block_ids).zip(&receipt_ids) {
+        let (Some(block), Some(receipt)) = (block, receipt) else {
+            continue;
+        };
+        if record.threading != Threading::Semantic {
+            continue;
+        }
+        if followed.contains(block) || !annotated.insert(*receipt) {
+            continue;
+        }
+        emit(ProjectedSource {
+            source_path: source_path.to_path_buf(),
+            fragment: blockdag::source_occurrence(
+                *receipt,
+                ProjectionAnnotations {
+                    source_path: Some(source_path.display().to_string()),
+                    source_locator: unit.source_locator.clone(),
+                    name: unit.name.clone(),
+                    ..ProjectionAnnotations::default()
+                },
+            )?,
+            record: None,
+        })?;
     }
 
     Ok(stats)
@@ -618,7 +653,6 @@ mod tests {
     ) -> SourceRecord {
         SourceRecord {
             locator: owned_text(locator),
-            raw_record: Bytes::from_source(format!(r#"{{"locator":"{locator}"}}"#)),
             predecessors: predecessors.iter().copied().map(owned_text).collect(),
             block_timestamp: None,
             threading,
@@ -648,43 +682,170 @@ mod tests {
         .expect("projection names one block")
     }
 
+    fn project(records: Vec<SourceRecord>, unit: UnitAnnotations) -> (ProjectionStats, Fragment) {
+        let mut union = Fragment::empty();
+        let stats = project_records(
+            schema::source_projection::SOURCE_AGY,
+            Path::new("fixture.json"),
+            records,
+            unit,
+            |projected| {
+                union += projected.fragment;
+                Ok(())
+            },
+        )
+        .unwrap();
+        (stats, union)
+    }
+
+    fn blocks(fragment: &Fragment) -> BTreeSet<Id> {
+        find!(
+            block: Id,
+            pattern!(fragment, [{ _?receipt @ schema::source_projection::projects_to: ?block }])
+        )
+        .collect()
+    }
+
+    fn block_with_text(fragment: &mut Fragment, text: &str) -> Id {
+        let handle =
+            fragment.put::<triblespace::prelude::blobencodings::UTF8String, _>(text.to_owned());
+        find!(
+            block: Id,
+            pattern!(&*fragment, [
+                { ?block @ schema::block::contains: _?part },
+                { _?part @ schema::content_part::fact: _?fact },
+                { _?fact @ schema::content_fact::payload: handle },
+            ])
+        )
+        .next()
+        .expect("a block carries the text")
+    }
+
     #[test]
-    fn transparent_nodes_contract_to_the_same_semantic_future() {
+    fn contentless_nodes_store_nothing_and_contract_to_the_same_semantic_future() {
         let records = vec![
             record("child", &["envelope"], Threading::Semantic, Some("b")),
             record("envelope", &["root"], Threading::Transparent, None),
             record("root", &[], Threading::Semantic, Some("a")),
         ];
-        let mut emitted = Vec::new();
-        let stats = project_records(
-            schema::source_projection::SOURCE_AGY,
-            Path::new("fixture.json"),
-            records,
-            |projected| {
-                emitted.push(projected.fragment);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(stats.projections_emitted, 3);
-        assert_eq!(stats.transparent_records, 1);
-        assert_eq!(stats.raw_only_records, 1);
+        let (stats, mut union) = project(records, UnitAnnotations::default());
+        assert_eq!(stats.projections_emitted, 2);
+        assert_eq!(stats.contentless_records, 1);
         assert_eq!(stats.content_parts, 2);
-        let root_projection = emitted[0].root().unwrap();
-        let root_block = projected_block(&emitted[0]);
-        let envelope_block = projected_block(&emitted[1]);
-        let child_block = projected_block(&emitted[2]);
-        assert!(!exists!(pattern!(&emitted[1], [{
-            envelope_block @ schema::block::contains: _?part
-        }])));
-        assert!(exists!(pattern!(&emitted[2], [{
-            child_block @ schema::block::previous: root_block
-        }])));
-        assert!(exists!(pattern!(&emitted[2], [{
-            _?projection @ schema::source_projection::semantic_predecessor_support:
-                root_projection
-        }])));
+        assert_eq!(blocks(&union).len(), 2);
+        let root = block_with_text(&mut union, "a");
+        let child = block_with_text(&mut union, "b");
+        assert!(exists!(
+            pattern!(&union, [{ child @ schema::block::previous: root }])
+        ));
+    }
+
+    #[test]
+    fn side_branches_keep_their_place_without_moving_the_dialogue() {
+        let with_tool = vec![
+            record("root", &[], Threading::Semantic, Some("question")),
+            record(
+                "tool",
+                &["root"],
+                Threading::Transparent,
+                Some("tool output"),
+            ),
+            record("answer", &["tool"], Threading::Semantic, Some("answer")),
+        ];
+        let without_tool = vec![
+            record("root", &[], Threading::Semantic, Some("question")),
+            record("answer", &["root"], Threading::Semantic, Some("answer")),
+        ];
+        let (_, mut full) = project(with_tool, UnitAnnotations::default());
+        let (_, mut lean) = project(without_tool, UnitAnnotations::default());
+        let root = block_with_text(&mut full, "question");
+        let tool = block_with_text(&mut full, "tool output");
+        assert!(exists!(
+            pattern!(&full, [{ tool @ schema::block::previous: root }])
+        ));
+        // The answer is the same block whether or not the source kept the
+        // tool exhaust between question and answer.
+        assert_eq!(
+            block_with_text(&mut full, "answer"),
+            block_with_text(&mut lean, "answer")
+        );
+        assert!(blocks(&lean).is_subset(&blocks(&full)));
+    }
+
+    #[test]
+    fn provider_keys_never_reach_an_identity_or_the_pile() {
+        let first = vec![
+            record("conv-1/node-a", &[], Threading::Semantic, Some("hello")),
+            record(
+                "conv-1/node-b",
+                &["conv-1/node-a"],
+                Threading::Semantic,
+                Some("hi"),
+            ),
+        ];
+        let renamed = vec![
+            record("other-id/x", &[], Threading::Semantic, Some("hello")),
+            record(
+                "other-id/y",
+                &["other-id/x"],
+                Threading::Semantic,
+                Some("hi"),
+            ),
+        ];
+        let unit = |id: &str| UnitAnnotations {
+            source_locator: Some(id.to_owned()),
+            name: Some("Greeting".to_owned()),
+        };
+        let (_, a) = project(first, unit("conv-1"));
+        let (_, b) = project(renamed, unit("other-id"));
+        let receipts = |fragment: &Fragment| -> BTreeSet<Id> {
+            find!(
+                receipt: Id,
+                pattern!(fragment, [{ ?receipt @ schema::source_projection::projects_to: _?block }])
+            )
+            .collect()
+        };
+        assert_eq!(blocks(&a), blocks(&b));
+        assert_eq!(receipts(&a), receipts(&b));
+        // Only the conversation-level locator differs, as an annotation.
+        let difference = a.facts().difference(b.facts());
+        assert!(difference
+            .iter()
+            .all(|trible| *trible.a() == schema::source_projection::source_locator.id()));
+        assert!(!exists!(
+            pattern!(&a, [{ _?r @ schema::source_projection::raw_record: _?raw }])
+        ));
+    }
+
+    #[test]
+    fn unit_annotations_land_on_semantic_leaves_only() {
+        let records = vec![
+            record("root", &[], Threading::Semantic, Some("q")),
+            record("a1", &["root"], Threading::Semantic, Some("first answer")),
+            record(
+                "a2",
+                &["root"],
+                Threading::Semantic,
+                Some("regenerated answer"),
+            ),
+            record("tool", &["a2"], Threading::Transparent, Some("exhaust")),
+        ];
+        let (_, union) = project(
+            records,
+            UnitAnnotations {
+                source_locator: Some("conv".to_owned()),
+                name: None,
+            },
+        );
+        let annotated: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(&union, [{
+                _?receipt @ schema::source_projection::source_locator: _?locator,
+                schema::source_projection::projects_to: ?block
+            }])
+        )
+        .collect();
+        assert_eq!(annotated.len(), 2, "the two answers are the leaves");
     }
 
     #[test]
@@ -698,6 +859,7 @@ mod tests {
             schema::source_projection::SOURCE_AGY,
             Path::new("cycle.json"),
             records,
+            UnitAnnotations::default(),
             |_| {
                 emitted += 1;
                 Ok(())

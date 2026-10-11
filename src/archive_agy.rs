@@ -59,6 +59,7 @@ where
             schema::source_projection::SOURCE_AGY,
             &source_path,
             records,
+            archive_source::UnitAnnotations::default(),
             |projected| {
                 summary.fragments_emitted += 1;
                 emit(projected)
@@ -86,6 +87,7 @@ where
         schema::source_projection::SOURCE_AGY,
         path,
         records,
+        archive_source::UnitAnnotations::default(),
         |projected| {
             summary.fragments_emitted += 1;
             emit(projected)
@@ -136,7 +138,6 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Vec<SourceRecord>> {
         let block_timestamp = claims.timestamp;
         records.push(SourceRecord {
             locator: locator.clone(),
-            raw_record: raw,
             predecessors: previous.iter().cloned().collect(),
             block_timestamp,
             threading,
@@ -330,7 +331,7 @@ fn absorb(target: &mut ProjectionStats, source: ProjectionStats) {
     target.projections_emitted += source.projections_emitted;
     target.content_parts += source.content_parts;
     target.transparent_records += source.transparent_records;
-    target.raw_only_records += source.raw_only_records;
+    target.contentless_records += source.contentless_records;
     target.missing_predecessors += source.missing_predecessors;
 }
 
@@ -392,9 +393,9 @@ mod tests {
         assert_eq!(summary.files_scanned, 1);
         assert_eq!(summary.fragments_emitted, 3);
         assert_eq!(summary.stats.records_seen, 3);
-        assert_eq!(summary.stats.projections_emitted, 3);
+        assert_eq!(summary.stats.projections_emitted, 2);
         assert_eq!(summary.stats.content_parts, 4);
-        assert_eq!(summary.stats.raw_only_records, 1);
+        assert_eq!(summary.stats.contentless_records, 1);
     }
 
     #[test]
@@ -446,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_tool_calls_converge_while_raw_receipts_remain_exact() {
+    fn structured_tool_calls_converge_whatever_their_spelling() {
         let dir = TempDir::new().unwrap();
         let first_dir = dir.path().join("first/session");
         let second_dir = dir.path().join("second/session");
@@ -458,14 +459,6 @@ mod tests {
         let second = r#"{ "tool_calls": [ { "input": { "a": 1, "b": 2 }, "name": "x" } ], "type": "TOOL_CALL", "source": "SYSTEM" }"#;
         fs::write(&first_path, first).unwrap();
         fs::write(&second_path, second).unwrap();
-        assert_eq!(
-            parse_file(&first_path).unwrap()[0].raw_record.as_ref(),
-            first.as_bytes()
-        );
-        assert_eq!(
-            parse_file(&second_path).unwrap()[0].raw_record.as_ref(),
-            second.as_bytes()
-        );
 
         let mut first_fragments = Vec::new();
         project_path(&first_path, |projected| {
@@ -480,12 +473,13 @@ mod tests {
         })
         .unwrap();
 
+        // A tool call is a side branch, so no leaf names the file.
         assert_eq!(first_fragments.len(), 1);
         assert_eq!(second_fragments.len(), 1);
-        assert_ne!(
+        assert_eq!(
             first_fragments[0].root(),
             second_fragments[0].root(),
-            "exactly different source records retain distinct receipt identities"
+            "JSON spelling never reaches a receipt"
         );
         let first_semantics = semantic_identity(&first_fragments[0]);
         let second_semantics = semantic_identity(&second_fragments[0]);

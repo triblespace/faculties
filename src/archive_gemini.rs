@@ -106,6 +106,7 @@ where
             schema::source_projection::SOURCE_GEMINI,
             &source_path,
             records,
+            archive_source::UnitAnnotations::default(),
             |projected| {
                 summary.fragments_emitted += 1;
                 emit(projected)
@@ -171,11 +172,18 @@ fn parse_content(
         if !is_gemini_card(&raw)? {
             continue;
         }
-        parsed.push(parse_card(raw.clone())?.unwrap_or(ParsedCard {
+        let parsed_card = parse_card(raw.clone())?;
+        // A card whose layout is not understood keeps its visible text as an
+        // ambient event: no source bytes are stored, so nothing else would.
+        let fallback = match parsed_card {
+            Some(_) => String::new(),
+            None => render_cell(&raw)?.text.trim().to_owned(),
+        };
+        parsed.push(parsed_card.unwrap_or(ParsedCard {
             raw,
             timestamp: None,
             prompted: false,
-            input: String::new(),
+            input: fallback,
             output: String::new(),
             input_assets: Vec::new(),
             output_assets: Vec::new(),
@@ -229,7 +237,6 @@ fn parse_content(
                 let locator = archive_source::owned_text(format!("{card_anchor}/user"));
                 records.push(SourceRecord {
                     locator: locator.clone(),
-                    raw_record: card.raw.clone(),
                     predecessors: Vec::new(),
                     block_timestamp: card.timestamp,
                     threading: Threading::Semantic,
@@ -263,7 +270,6 @@ fn parse_content(
                 let locator = archive_source::owned_text(format!("{card_anchor}/assistant"));
                 records.push(SourceRecord {
                     locator,
-                    raw_record: card.raw,
                     predecessors: local_user.into_iter().collect(),
                     block_timestamp: card.timestamp,
                     threading: Threading::Semantic,
@@ -300,7 +306,6 @@ fn parse_content(
             let locator = archive_source::owned_text(format!("{card_anchor}/activity"));
             records.push(SourceRecord {
                 locator,
-                raw_record: card.raw,
                 predecessors: Vec::new(),
                 block_timestamp: card.timestamp,
                 threading: Threading::Transparent,
@@ -349,6 +354,7 @@ where
         schema::source_projection::SOURCE_GEMINI,
         path,
         records,
+        archive_source::UnitAnnotations::default(),
         |projected| {
             summary.fragments_emitted += 1;
             emit(projected)
@@ -1018,7 +1024,7 @@ fn absorb(target: &mut ProjectionStats, source: ProjectionStats) {
     target.projections_emitted += source.projections_emitted;
     target.content_parts += source.content_parts;
     target.transparent_records += source.transparent_records;
-    target.raw_only_records += source.raw_only_records;
+    target.contentless_records += source.contentless_records;
     target.missing_predecessors += source.missing_predecessors;
 }
 
@@ -1028,9 +1034,6 @@ mod tests {
     use std::fs;
 
     use tempfile::TempDir;
-    use triblespace::core::repo::BlobStoreGet;
-    use triblespace::prelude::blobencodings::RawBytes;
-    use triblespace::prelude::inlineencodings::Handle;
     use triblespace::prelude::*;
 
     use super::*;
@@ -1060,7 +1063,9 @@ mod tests {
     fn project_blocks(path: &Path) -> Vec<Id> {
         let mut blocks = Vec::new();
         project_path(path, |projected| {
-            blocks.push(projected_block(&projected.fragment));
+            if projected.record.is_some() {
+                blocks.push(projected_block(&projected.fragment));
+            }
             Ok(())
         })
         .unwrap();
@@ -1170,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn recognized_card_with_unknown_schema_is_retained_exactly_as_raw_only() {
+    fn recognized_card_with_unknown_schema_keeps_its_text_as_an_event() {
         let temp = TempDir::new().unwrap();
         let activity = temp.path().join("My Activity.html");
         let drifted = "<div class=\"outer-cell mdl-cell mdl-cell--12-col mdl-shadow--2dp\"><div class=\"mdl-grid\"><div class=\"header-cell mdl-cell mdl-cell--12-col\"><p>Gemini Apps<br></p></div><section class=\"future-content-layout\">Prompted&nbsp;not yet understood</section></div></div>";
@@ -1186,34 +1191,20 @@ mod tests {
         assert_eq!(summary.files_scanned, 1);
         assert_eq!(summary.cards_seen, 1);
         assert_eq!(summary.records_emitted, 1);
-        assert_eq!(summary.stats.raw_only_records, 1);
+        assert_eq!(summary.stats.contentless_records, 0);
         assert_eq!(summary.stats.transparent_records, 1);
         assert_eq!(emitted.len(), 1);
 
-        let projection = emitted[0].root().expect("projection has one root");
-        let raw: Inline<Handle<RawBytes>> = find!(
-            raw: Inline<Handle<RawBytes>>,
-            pattern!(&emitted[0], [{
-                projection @ schema::source_projection::raw_record: ?raw
-            }])
-        )
-        .next()
-        .expect("source receipt retains its raw card");
-        let reader = emitted[0]
-            .blobs_mut()
-            .snapshot()
-            .expect("MemoryBlobStore reader construction is infallible");
-        let recovered: Bytes = reader.get(raw).unwrap();
-        assert_eq!(recovered.as_ref(), drifted.as_bytes());
-
         let block = projected_block(&emitted[0]);
-        assert!(!exists!(pattern!(&emitted[0], [{
-            block @ schema::block::contains: _?part
-        }])));
+        assert!(exists!(pattern!(&emitted[0], [
+            { block @ schema::block::contains: _?part },
+            { _?part @ schema::content_part::fact: _?fact },
+            { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::EVENT },
+        ])));
     }
 
     #[test]
-    fn malformed_source_timestamp_is_untimed_without_losing_raw_evidence() {
+    fn malformed_source_timestamp_is_untimed() {
         let temp = TempDir::new().unwrap();
         let activity = temp.path().join("My Activity.html");
         let malformed =
@@ -1231,28 +1222,13 @@ mod tests {
         assert_eq!(summary.cards_seen, 1);
         assert_eq!(summary.records_emitted, 1);
         assert_eq!(summary.stats.content_parts, 1);
-        assert_eq!(emitted.len(), 1);
+        // The receipt, then the path on the leaf.
+        assert_eq!(emitted.len(), 2);
 
         let block = projected_block(&emitted[0]);
         assert!(!exists!(pattern!(&emitted[0], [{
             block @ schema::block::timestamp: _?timestamp
         }])));
-
-        let projection = emitted[0].root().expect("projection has one root");
-        let raw: Inline<Handle<RawBytes>> = find!(
-            raw: Inline<Handle<RawBytes>>,
-            pattern!(&emitted[0], [{
-                projection @ schema::source_projection::raw_record: ?raw
-            }])
-        )
-        .next()
-        .expect("source receipt retains its raw card");
-        let reader = emitted[0]
-            .blobs_mut()
-            .snapshot()
-            .expect("MemoryBlobStore reader construction is infallible");
-        let recovered: Bytes = reader.get(raw).unwrap();
-        assert_eq!(recovered.as_ref(), malformed.as_bytes());
     }
 
     #[test]

@@ -18,7 +18,6 @@ use anybytes::Bytes;
 use anyhow::{anyhow, bail, Result};
 use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::blob::MemoryBlobStoreSnapshot;
-use triblespace::core::inline::IntoInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
@@ -38,8 +37,9 @@ use crate::schemas::{blockdag as schema, files as files_schema};
 #[derive(Clone, Debug, Default)]
 pub struct ProjectionAnnotations {
     /// Source receipts that additively support the projected block's semantic
-    /// predecessor classes. This is not exact vendor occurrence adjacency;
-    /// that evidence remains in the exact raw record.
+    /// predecessor classes. Importers leave it empty: their receipts are the
+    /// namespace and the block, so the support is derivable from the block's
+    /// predecessors.
     pub semantic_predecessor_support: Vec<Id>,
     /// Genuine source timestamp claim, if independently decodable.
     pub source_timestamp: Option<Inline<NsTAIInterval>>,
@@ -55,6 +55,12 @@ pub struct ProjectionAnnotations {
     pub raw_model: Option<String>,
     /// Movable source path. This reuses Files' occurrence-level attribute.
     pub source_path: Option<String>,
+    /// Provider name of the conversation this receipt belongs to (a session,
+    /// rollout or conversation id). Importers attach it to the leaves of one
+    /// source unit only; it never enters an identity.
+    pub source_locator: Option<String>,
+    /// Human-readable title of that conversation, as the provider spelled it.
+    pub name: Option<String>,
 }
 
 type TextHandle = Inline<Handle<UTF8String>>;
@@ -94,14 +100,6 @@ struct AttachmentPlan {
     texts: BTreeSet<TextHandle>,
     raws: BTreeSet<RawHandle>,
     media_type_names: BTreeSet<TextHandle>,
-    source_chunks: BTreeMap<Id, (u128, RawHandle)>,
-    source_snapshots: Vec<SourceSnapshotPlan>,
-}
-
-struct SourceSnapshotPlan {
-    id: Id,
-    byte_length: u128,
-    chunks: Vec<Id>,
 }
 
 fn rooted(fragment: &Fragment, what: &str) -> Result<Id> {
@@ -134,50 +132,6 @@ pub fn vocabulary_fragment() -> Fragment {
         };
     }
     fragment
-}
-
-/// Construct one intrinsic byte range inside a frozen source snapshot.
-pub fn source_chunk(offset: u128, bytes: Bytes) -> Result<Fragment> {
-    let offset: Inline<U256BE> = offset.to_inline();
-    let mut fragment = Fragment::empty();
-    let bytes = fragment.put::<RawBytes, _>(bytes);
-    fragment += entity! { _ @
-        schema::source_chunk::offset: offset,
-        schema::source_chunk::bytes: bytes,
-    };
-    attach_kind(fragment, schema::source_chunk::KIND, "source chunk")
-}
-
-/// Construct one exact frozen-source snapshot over intrinsic byte ranges.
-///
-/// `chunks` exports [`schema::source_chunk`] roots. Their offsets and byte
-/// handles determine ordering and reconstruction; the snapshot's total length
-/// makes validation independent of import history or collection COMMIT grouping.
-pub fn source_snapshot(
-    namespace: Id,
-    locator: impl Into<String>,
-    byte_length: u128,
-    chunks: Fragment,
-    source_path: Option<String>,
-) -> Result<Fragment> {
-    let byte_length: Inline<U256BE> = byte_length.to_inline();
-    let mut fragment = Fragment::empty();
-    let locator = fragment.put::<UTF8String, _>(locator.into());
-    fragment += entity! { _ @
-        schema::source_projection::source_namespace: &namespace,
-        schema::source_projection::source_locator: locator,
-        schema::source_snapshot::byte_length: byte_length,
-        schema::source_snapshot::contains*: chunks,
-    };
-    let mut fragment = attach_kind(fragment, schema::source_snapshot::KIND, "source snapshot")?;
-    if let Some(source_path) = source_path {
-        let snapshot = rooted(&fragment, "source snapshot")?;
-        let path = fragment.put::<UTF8String, _>(source_path);
-        fragment += entity! { ExclusiveId::force_ref(&snapshot) @
-            files_schema::file::source_path: path,
-        };
-    }
-    Ok(fragment)
 }
 
 /// Construct one intrinsic textual content fact.
@@ -394,12 +348,13 @@ pub fn block(
     attach_kind(fragment, schema::block::KIND, "block")
 }
 
-/// Construct one exact source-occurrence projection receipt.
+/// Construct one producer-native receipt: a producer's own canonical record
+/// of the event, in the producer's own encoding.
 ///
-/// The identity contains the source namespace, stable locator, exact raw
-/// record bytes, and projected canonical block. Replaying the same record is
-/// therefore naturally idempotent, while two source occurrences of one shared
-/// block stay distinguishable.
+/// The identity contains the source namespace, the producer's locator, the
+/// producer's receipt bytes, and the projected block. Drive writes its live
+/// history this way. Importers never do: they store no source bytes and use
+/// [`block_source_projection`] instead.
 pub fn source_projection<T>(
     source_namespace: Id,
     source_locator: impl Into<String>,
@@ -409,35 +364,9 @@ pub fn source_projection<T>(
 where
     T: triblespace::core::blob::IntoBlob<RawBytes>,
 {
-    source_projection_blob(source_namespace, source_locator.into(), raw_record, block)
-}
-
-/// Construct a source projection while retaining a source-backed locator view.
-pub fn source_projection_view<T>(
-    source_namespace: Id,
-    source_locator: anybytes::View<str>,
-    raw_record: T,
-    block: Fragment,
-) -> Result<Fragment>
-where
-    T: triblespace::core::blob::IntoBlob<RawBytes>,
-{
-    source_projection_blob(source_namespace, source_locator, raw_record, block)
-}
-
-fn source_projection_blob<L, T>(
-    source_namespace: Id,
-    source_locator: L,
-    raw_record: T,
-    block: Fragment,
-) -> Result<Fragment>
-where
-    L: triblespace::core::blob::IntoBlob<UTF8String>,
-    T: triblespace::core::blob::IntoBlob<RawBytes>,
-{
     rooted(&block, "block")?;
     let mut fragment = Fragment::empty();
-    let source_locator = fragment.put::<UTF8String, _>(source_locator);
+    let source_locator = fragment.put::<UTF8String, _>(source_locator.into());
     let raw_record = fragment.put::<RawBytes, _>(raw_record);
     fragment += entity! { _ @
         schema::source_projection::source_namespace: &source_namespace,
@@ -459,14 +388,11 @@ where
 /// The block already fixes the message's content and its place in the
 /// conversation (its predecessor chain), so every source occurrence of that
 /// message converges on this one receipt: the original line, a fork's replayed
-/// copy of it, a resumed rollout's. Where and when each occurrence was read
-/// (locator, exact raw record, timestamp, path) annotates the receipt through
-/// [`source_occurrence`] and never enters its identity.
+/// copy of it, a resumed rollout's, a re-export's under new provider ids. Time,
+/// actor, model, conversation id and path annotate the receipt (directly or
+/// through [`source_occurrence`]) and never enter its identity.
 ///
-/// This is for sources that replay their own history into new files under new
-/// timestamps, as Codex forks do. An exact-occurrence [`source_projection`]
-/// there mints one receipt per replayed record, each carrying its own raw
-/// record, which made every fork cost a full second projection.
+/// Every importer uses this receipt. No source bytes are part of it.
 pub fn block_source_projection(source_namespace: Id, block: Fragment) -> Result<Fragment> {
     rooted(&block, "block")?;
     let fragment = entity! { _ @
@@ -483,27 +409,12 @@ pub fn block_source_projection(source_namespace: Id, block: Fragment) -> Result<
 /// One source occurrence of a [`block_source_projection`] receipt, as a
 /// fragment of its own.
 ///
-/// It holds only facts about `receipt`: the occurrence's locator, its exact
-/// raw record, and the given occurrence annotations. Keeping it apart from the
+/// It holds only annotations of `receipt`. Keeping it apart from the
 /// receipt's intrinsic closure lets an import skip that closure whole when it
-/// is already known, and stage just the new occurrence.
-pub fn source_occurrence<T>(
-    receipt: Id,
-    source_locator: impl Into<String>,
-    raw_record: T,
-    annotations: ProjectionAnnotations,
-) -> Result<Fragment>
-where
-    T: triblespace::core::blob::IntoBlob<RawBytes>,
-{
-    let mut fragment = Fragment::rooted(receipt, TribleSet::new());
-    let source_locator = fragment.put::<UTF8String, _>(source_locator.into());
-    let raw_record = fragment.put::<RawBytes, _>(raw_record);
-    fragment += entity! { ExclusiveId::force_ref(&receipt) @
-        schema::source_projection::source_locator: source_locator,
-        schema::source_projection::raw_record: raw_record,
-    };
-    annotate_source_projection(fragment, annotations)
+/// is already known, and stage just the new annotations. No source bytes are
+/// part of an occurrence.
+pub fn source_occurrence(receipt: Id, annotations: ProjectionAnnotations) -> Result<Fragment> {
+    annotate_source_projection(Fragment::rooted(receipt, TribleSet::new()), annotations)
 }
 
 /// Attach occurrence-scoped evidence without changing a projection receipt's
@@ -525,6 +436,12 @@ pub fn annotate_source_projection(
     let source_path = annotations
         .source_path
         .map(|value| projection.put::<UTF8String, _>(value));
+    let source_locator = annotations
+        .source_locator
+        .map(|value| projection.put::<UTF8String, _>(value));
+    let name = annotations
+        .name
+        .map(|value| projection.put::<UTF8String, _>(value));
 
     projection += entity! { ExclusiveId::force_ref(&root) @
         schema::source_projection::semantic_predecessor_support*:
@@ -536,6 +453,8 @@ pub fn annotate_source_projection(
         schema::source_projection::raw_role?: raw_role.as_ref(),
         schema::source_projection::raw_model?: raw_model.as_ref(),
         files_schema::file::source_path?: source_path.as_ref(),
+        schema::source_projection::source_locator?: source_locator.as_ref(),
+        metadata::name?: name.as_ref(),
     };
     debug_assert_eq!(projection.root(), Some(root));
     Ok(projection)
@@ -718,16 +637,12 @@ where
     let content_parts = ids_of_kind(facts, schema::content_part::KIND);
     let blocks = ids_of_kind(facts, schema::block::KIND);
     let projections = ids_of_kind(facts, schema::source_projection::KIND);
-    let source_chunks = ids_of_kind(facts, schema::source_chunk::KIND);
-    let source_snapshots = ids_of_kind(facts, schema::source_snapshot::KIND);
     let media_types = ids_of_kind(facts, files_schema::KIND_MEDIA_TYPE);
     require_disjoint(&[
         ("content fact", &content_facts),
         ("content part", &content_parts),
         ("block", &blocks),
         ("source projection", &projections),
-        ("source chunk", &source_chunks),
-        ("source snapshot", &source_snapshots),
         ("media type", &media_types),
     ])?;
 
@@ -776,22 +691,6 @@ where
     let resolutions = values_by_entity(find!(
         (entity: Id, value: RawHandle),
         pattern!(facts, [{ ?entity @ schema::content_fact::resolved_to: ?value }])
-    ));
-    let source_chunk_offsets = values_by_entity(find!(
-        (entity: Id, value: OrdinalValue),
-        pattern!(facts, [{ ?entity @ schema::source_chunk::offset: ?value }])
-    ));
-    let source_chunk_bytes = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::source_chunk::bytes: ?value }])
-    ));
-    let source_snapshot_lengths = values_by_entity(find!(
-        (entity: Id, value: OrdinalValue),
-        pattern!(facts, [{ ?entity @ schema::source_snapshot::byte_length: ?value }])
-    ));
-    let source_snapshot_chunks = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_snapshot::contains: ?value }])
     ));
 
     let ordinals = values_by_entity(find!(
@@ -912,66 +811,6 @@ where
         }
         expected += vocabulary_fragment().into_facts();
     }
-
-    let mut referenced_source_chunks = BTreeSet::new();
-    for id in &source_chunks {
-        let offset = one_required(&source_chunk_offsets, *id, "source chunk offset")?;
-        let offset_number = u128::try_from_inline(&offset)
-            .map_err(|error| anyhow!("source chunk {id:x} offset does not fit u128: {error:?}"))?;
-        let bytes = one_required(&source_chunk_bytes, *id, "source chunk bytes")?;
-        let core = entity! { _ @
-            schema::source_chunk::offset: offset,
-            schema::source_chunk::bytes: bytes,
-        };
-        expected +=
-            ensure_intrinsic_with_kind(*id, core, schema::source_chunk::KIND, "source chunk")?;
-        attachments
-            .source_chunks
-            .insert(*id, (offset_number, bytes));
-    }
-
-    for id in &source_snapshots {
-        let namespace = one_required(&source_namespaces, *id, "source snapshot namespace")?;
-        let locator = one_required(&source_locators, *id, "source snapshot locator")?;
-        let byte_length =
-            one_required(&source_snapshot_lengths, *id, "source snapshot byte length")?;
-        let byte_length_number = u128::try_from_inline(&byte_length).map_err(|error| {
-            anyhow!("source snapshot {id:x} length does not fit u128: {error:?}")
-        })?;
-        let chunks = values_for(&source_snapshot_chunks, *id);
-        for chunk in &chunks {
-            if !source_chunks.contains(chunk) {
-                bail!("source snapshot {id:x} cites missing chunk {chunk:x}");
-            }
-        }
-        referenced_source_chunks.extend(chunks.iter().copied());
-        let paths = values_for(&source_paths, *id);
-        let core = entity! { _ @
-            schema::source_projection::source_namespace: &namespace,
-            schema::source_projection::source_locator: locator,
-            schema::source_snapshot::byte_length: byte_length,
-            schema::source_snapshot::contains*: chunks.iter(),
-        };
-        let mut canonical = ensure_intrinsic_with_kind(
-            *id,
-            core,
-            schema::source_snapshot::KIND,
-            "source snapshot",
-        )?;
-        canonical += entity! { ExclusiveId::force_ref(id) @
-            files_schema::file::source_path*: paths.iter(),
-        }
-        .into_facts();
-        expected += canonical;
-        attachments.texts.insert(locator);
-        attachments.texts.extend(paths.iter().copied());
-        attachments.source_snapshots.push(SourceSnapshotPlan {
-            id: *id,
-            byte_length: byte_length_number,
-            chunks: chunks.into_iter().collect(),
-        });
-    }
-    require_coverage(&source_chunks, &referenced_source_chunks, "source chunk")?;
 
     for id in &content_facts {
         let modality = one_required(&modalities, *id, "content fact modality")?;
@@ -1206,8 +1045,10 @@ where
         let receipt_raw_roles = values_for(&raw_roles, *id);
         let receipt_raw_models = values_for(&raw_models, *id);
         let paths = values_for(&source_paths, *id);
+        let names = values_for(&media_names, *id);
 
         attachments.texts.extend(locators.iter().copied());
+        attachments.texts.extend(names.iter().copied());
         attachments.raws.extend(raws.iter().copied());
         attachments
             .texts
@@ -1255,6 +1096,7 @@ where
             schema::source_projection::raw_role*: receipt_raw_roles.iter(),
             schema::source_projection::raw_model*: receipt_raw_models.iter(),
             files_schema::file::source_path*: paths.iter(),
+            metadata::name*: names.iter(),
         }
         .into_facts();
         expected += canonical;
@@ -1412,141 +1254,6 @@ fn raw_attachment_present(
         .map_err(|error| format!("inspect resident RawBytes attachment: {error}"))
 }
 
-fn validate_source_snapshots(
-    chunks: &BTreeMap<Id, (u128, RawHandle)>,
-    snapshots: &[SourceSnapshotPlan],
-    stored_lengths: &BTreeMap<RawHandle, u128>,
-) -> std::result::Result<(), String> {
-    for snapshot in snapshots {
-        let mut ordered = snapshot
-            .chunks
-            .iter()
-            .map(|chunk| {
-                let (offset, handle) = chunks.get(chunk).ok_or_else(|| {
-                    format!(
-                        "source snapshot {:x} lost declared chunk {:x}",
-                        snapshot.id, chunk
-                    )
-                })?;
-                Ok((*offset, *chunk, *handle))
-            })
-            .collect::<std::result::Result<Vec<_>, String>>()?;
-        ordered.sort_unstable();
-
-        if snapshot.byte_length == 0 && !ordered.is_empty() {
-            return Err(format!(
-                "empty source snapshot {:x} contains byte chunks",
-                snapshot.id
-            ));
-        }
-        if snapshot.byte_length != 0 && ordered.is_empty() {
-            return Err(format!(
-                "nonempty source snapshot {:x} contains no byte chunks",
-                snapshot.id
-            ));
-        }
-
-        let mut cursor = 0u128;
-        for (index, (offset, chunk, handle)) in ordered.iter().copied().enumerate() {
-            if offset != cursor {
-                return Err(format!(
-                    "source snapshot {:x} chunk {:x} starts at {offset}, expected {cursor}",
-                    snapshot.id, chunk
-                ));
-            }
-            let is_last = index + 1 == ordered.len();
-            let len = if is_last {
-                snapshot.byte_length.checked_sub(offset).ok_or_else(|| {
-                    format!(
-                        "source snapshot {:x} chunk {:x} starts beyond its claimed length",
-                        snapshot.id, chunk
-                    )
-                })?
-            } else {
-                schema::source_chunk::CANONICAL_BYTES as u128
-            };
-            if len == 0 || len > schema::source_chunk::CANONICAL_BYTES as u128 {
-                return Err(format!(
-                    "source snapshot {:x} chunk {:x} has noncanonical length {len}",
-                    snapshot.id, chunk
-                ));
-            }
-            if let Some(stored) = stored_lengths.get(&handle) {
-                if *stored != len {
-                    return Err(format!(
-                        "source snapshot {:x} chunk {:x} stores {stored} bytes, expected {len}",
-                        snapshot.id, chunk
-                    ));
-                }
-            }
-            if !is_last && len != schema::source_chunk::CANONICAL_BYTES as u128 {
-                return Err(format!(
-                    "source snapshot {:x} nonfinal chunk {:x} has length {len}, expected {}",
-                    snapshot.id,
-                    chunk,
-                    schema::source_chunk::CANONICAL_BYTES
-                ));
-            }
-            cursor = cursor.checked_add(len).ok_or_else(|| {
-                format!("source snapshot {:x} length overflows u128", snapshot.id)
-            })?;
-        }
-        if cursor != snapshot.byte_length {
-            return Err(format!(
-                "source snapshot {:x} reconstructs {cursor} bytes, claims {}",
-                snapshot.id, snapshot.byte_length
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn source_chunk_storage_lengths(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    chunks: &BTreeMap<Id, (u128, RawHandle)>,
-) -> std::result::Result<BTreeMap<RawHandle, u128>, String> {
-    let wanted: BTreeSet<_> = chunks.values().map(|(_, handle)| handle.raw).collect();
-    let mut lengths = BTreeMap::new();
-    if wanted.is_empty() {
-        return Ok(lengths);
-    }
-    for raw in &wanted {
-        let handle = Inline::<Handle<RawBytes>>::new(*raw);
-        if let Some(info) = reader
-            .blob_info(handle)
-            .map_err(|error| format!("inspect resident source chunk: {error}"))?
-        {
-            lengths.insert(handle, u128::from(info.length));
-        }
-    }
-    if let Some(overlay) = overlay {
-        for info in overlay.blobs() {
-            let info = info.map_err(|error| format!("enumerate staged source chunks: {error}"))?;
-            if wanted.contains(&info.handle.raw) {
-                let handle = Inline::<Handle<RawBytes>>::new(info.handle.raw);
-                // A caller-supplied overlay can contain a forged handle.
-                // Validate staged bytes once; durable Pile headers are trusted
-                // only for length/presence and remain hash-lazy until read.
-                let bytes: Bytes = overlay.get(handle).map_err(|error| {
-                    format!(
-                        "invalid staged source chunk {}: {error}",
-                        hex::encode(handle.raw)
-                    )
-                })?;
-                if bytes.len() as u64 != info.length {
-                    return Err(format!(
-                        "staged source chunk {} header length disagrees with its bytes",
-                        hex::encode(handle.raw)
-                    ));
-                }
-                lengths.insert(handle, u128::from(info.length));
-            }
-        }
-    }
-    Ok(lengths)
-}
-
 fn validate_attachments(
     reader: &PileSnapshot,
     overlay: Option<&OverlayReader>,
@@ -1556,8 +1263,6 @@ fn validate_attachments(
         texts,
         raws,
         media_type_names,
-        source_chunks,
-        source_snapshots,
     } = plan;
     let mut missing = BTreeSet::new();
     for handle in texts {
@@ -1576,22 +1281,6 @@ fn validate_attachments(
                 missing.insert(handle.raw);
             }
             Err(reason) => return CatalogValidation::Rejected(reason),
-        }
-    }
-    let source_chunk_lengths = match source_chunk_storage_lengths(reader, overlay, &source_chunks) {
-        Ok(lengths) => lengths,
-        Err(reason) => return CatalogValidation::Rejected(reason),
-    };
-    if let Err(reason) =
-        validate_source_snapshots(&source_chunks, &source_snapshots, &source_chunk_lengths)
-    {
-        return CatalogValidation::Rejected(reason);
-    }
-    let source_chunk_handles: BTreeSet<_> =
-        source_chunks.values().map(|(_, handle)| *handle).collect();
-    for handle in source_chunk_handles {
-        if !source_chunk_lengths.contains_key(&handle) {
-            missing.insert(handle.raw);
         }
     }
     for handle in media_type_names {
@@ -1840,137 +1529,6 @@ mod tests {
     }
 
     #[test]
-    fn source_snapshot_is_exact_path_independent_and_empty_safe() {
-        let make = |path: Option<&str>| {
-            source_snapshot(
-                schema::source_projection::SOURCE_CLAUDE_CODE,
-                "snapshot/v1/session:test",
-                3,
-                source_chunk(0, Bytes::from_source(b"abc".to_vec())).unwrap(),
-                path.map(str::to_owned),
-            )
-            .unwrap()
-        };
-        let first = make(Some("/old/export.jsonl"));
-        let moved = make(Some("/new/export.jsonl"));
-        assert_eq!(first.root(), moved.root());
-        assert_ne!(first.facts(), moved.facts());
-        assert_eq!(validate_fragment(&first), CatalogValidation::Accepted);
-
-        let empty = source_snapshot(
-            schema::source_projection::SOURCE_CLAUDE_CODE,
-            "snapshot/v1/empty",
-            0,
-            Fragment::empty(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(validate_fragment(&empty), CatalogValidation::Accepted);
-        assert!(!exists!(pattern!(&empty, [{
-            _?chunk @ schema::source_chunk::bytes: _?raw
-        }])));
-    }
-
-    #[test]
-    fn source_snapshot_geometry_uses_store_lengths_without_reading_payloads() {
-        let wrong_total = source_snapshot(
-            schema::source_projection::SOURCE_CLAUDE_CODE,
-            "snapshot/v1/wrong-total",
-            2,
-            source_chunk(0, Bytes::from_source(vec![1u8])).unwrap(),
-            None,
-        )
-        .unwrap();
-        let validation = validate_fragment(&wrong_total);
-        match validation {
-            CatalogValidation::Rejected(reason) => assert!(
-                reason.contains("stores 1 bytes, expected 2"),
-                "unexpected rejection: {reason}"
-            ),
-            other => panic!("expected length rejection, got {other:?}"),
-        }
-
-        let mut short_nonfinal = Fragment::empty();
-        short_nonfinal += source_chunk(0, Bytes::from_source(vec![1u8])).unwrap();
-        short_nonfinal += source_chunk(
-            schema::source_chunk::CANONICAL_BYTES as u128,
-            Bytes::from_source(vec![2u8]),
-        )
-        .unwrap();
-        let short_nonfinal = source_snapshot(
-            schema::source_projection::SOURCE_CLAUDE_CODE,
-            "snapshot/v1/short-nonfinal",
-            schema::source_chunk::CANONICAL_BYTES as u128 + 1,
-            short_nonfinal,
-            None,
-        )
-        .unwrap();
-        let validation = validate_fragment(&short_nonfinal);
-        match validation {
-            CatalogValidation::Rejected(reason) => assert!(
-                reason.contains("stores 1 bytes, expected 8388608"),
-                "unexpected rejection: {reason}"
-            ),
-            other => panic!("expected nonfinal length rejection, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn source_snapshot_rejects_gaps_duplicates_and_orphan_chunks_before_residency() {
-        let canonical = schema::source_chunk::CANONICAL_BYTES as u128;
-        for (label, second_offset, expected) in [
-            ("gap", canonical + 1, "starts at 8388609, expected 8388608"),
-            ("duplicate", 0, "starts at 0, expected 8388608"),
-        ] {
-            let mut chunks = Fragment::empty();
-            chunks += source_chunk(0, Bytes::from_source(vec![1u8])).unwrap();
-            chunks += source_chunk(second_offset, Bytes::from_source(vec![2u8])).unwrap();
-            let snapshot = source_snapshot(
-                schema::source_projection::SOURCE_CLAUDE_CODE,
-                format!("snapshot/v1/{label}"),
-                canonical + 1,
-                chunks,
-                None,
-            )
-            .unwrap();
-            let snapshot = without_blobs(snapshot);
-            assert!(matches!(
-                validate_fragment(&snapshot),
-                CatalogValidation::Rejected(reason) if reason.contains(expected)
-            ));
-        }
-
-        let orphan = source_chunk(0, Bytes::from_source(vec![1u8])).unwrap();
-        assert!(matches!(
-            validate_fragment(&orphan),
-            CatalogValidation::Rejected(reason) if reason.contains("orphan source chunk")
-        ));
-    }
-
-    #[test]
-    fn source_snapshot_with_absent_bytes_is_pending_not_rejected() {
-        let snapshot = source_snapshot(
-            schema::source_projection::SOURCE_CLAUDE_CODE,
-            "snapshot/v1/missing",
-            1,
-            source_chunk(0, Bytes::from_source(vec![7u8])).unwrap(),
-            None,
-        )
-        .unwrap();
-        let raw = find!(
-            handle: RawHandle,
-            pattern!(&snapshot, [{ _?chunk @ schema::source_chunk::bytes: ?handle }])
-        )
-        .next()
-        .unwrap();
-        let snapshot = without_blobs(snapshot);
-        assert!(matches!(
-            validate_fragment(&snapshot),
-            CatalogValidation::Pending { missing } if missing.contains(&raw.raw)
-        ));
-    }
-
-    #[test]
     fn timestamp_is_a_repeatable_annotation_not_intrinsic_state() {
         let without = block([], None, one_part("same")).unwrap();
         let with_42 = block([], Some(instant(42.0)), one_part("same")).unwrap();
@@ -2055,6 +1613,8 @@ mod tests {
                 raw_role: Some("user".into()),
                 raw_model: Some("model-v1".into()),
                 source_path: Some("/moved/export.jsonl".into()),
+                source_locator: Some("conversation/7".into()),
+                name: Some("A title".into()),
             },
         )
         .unwrap();

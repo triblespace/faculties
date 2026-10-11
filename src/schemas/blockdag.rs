@@ -1,21 +1,20 @@
 //! Canonical block-DAG archive schema.
 //!
-//! Archive data is split into semantic/source-occurrence layers plus an
-//! orthogonal exact-source substrate:
+//! Archive data is split into semantic layers plus source-scoped receipts:
 //!
 //! ```text
 //! content fact  -- semantic datum (text, media, tool payload, ...)
 //! content part  -- ordinal-bearing occurrence of one fact inside a block
 //! block         -- structural event in the predecessor DAG
-//! source projection -- exact vendor occurrence projected onto one block
-//! source chunk      -- reusable content-addressed source byte range
-//! source snapshot   -- exact ordered version of one source file
+//! source projection -- one source's receipt of one block
 //! ```
 //!
-//! The first three layers are structural hash-consing. Source multiplicity,
-//! actor pairing, vendor ids, and movable paths belong only to projection
-//! receipts. This lets repeated exports converge without erasing how often a
-//! source actually emitted the event.
+//! The first three layers are structural hash-consing. A block is identified by
+//! its predecessors and its content only, never by a provider id, a path or a
+//! time. Importer receipts are identified by their source namespace and block
+//! alone; provider ids, times, paths and actors only annotate them. No source
+//! bytes are stored: imported sources are projected into these layers and the
+//! files themselves stay outside the pile.
 //!
 //! The block/content-fact ids and attributes preserve the approved
 //! `8011a65..a2e575c` design lineage. The scope, content-part, media-type, and
@@ -149,69 +148,35 @@ pub mod content_fact {
     }
 }
 
-/// One content-addressed byte range inside an exact frozen source snapshot.
-pub mod source_chunk {
-    use super::*;
-
-    /// Canonical fixed boundary used by every Archive source adapter.
-    pub const CANONICAL_BYTES: usize = 8 * 1024 * 1024;
-
-    attributes! {
-        /// IDENTITY. Zero-based byte offset inside the frozen source.
-        "28C0C5F405037AD6D385E47B8504EC05" as pub offset: U256BE;
-        /// IDENTITY. Exact bytes in this range; chunk boundaries may split
-        /// UTF-8 and source-format records.
-        "A4839C10C67A7AD3952BEA072865CC2B" as pub bytes: Handle<RawBytes>;
-    }
-
-    /// Nonidentity kind marker. Minted with `trible genid` on 2026-08-17.
-    pub const KIND: Id = id_hex!("6BE555E2350E42803AFF1DF43283ACD0");
-}
-
-/// One exact, reconstructible version of a potentially live source file.
-pub mod source_snapshot {
-    use super::*;
-
-    attributes! {
-        /// IDENTITY. Exact source length in bytes.
-        "6123C7D5D325756485E74212336BD1D4" as pub byte_length: U256BE;
-        /// IDENTITY. Ordered byte ranges, whose offsets live on the referenced
-        /// [`source_chunk`] entities.
-        "F9A5D6DC87EA518FAC423D5E81158A2D" as pub contains: GenId;
-    }
-
-    /// Nonidentity kind marker. Minted with `trible genid` on 2026-08-17.
-    pub const KIND: Id = id_hex!("CF3D9B1669728FD0A5DAC20417ACEE58");
-}
-
-/// Exact vendor occurrence and projection receipt.
+/// Source-scoped receipt of one projected block.
 ///
-/// An exact-occurrence receipt's identity core is the first four fields. A
-/// block receipt (`blockdag::block_source_projection`, used for Codex) has
-/// only `source_namespace` and `projects_to` in its core: its locators and raw
-/// records annotate it, one per observed occurrence, so replayed copies of a
-/// message converge on one receipt. Every other field is occurrence-scoped
-/// evidence attached monotonically after construction.
+/// An importer receipt ([`crate::blockdag::block_source_projection`]) has only
+/// `source_namespace` and `projects_to` in its identity core, so every
+/// occurrence of one message in one source (an original, a fork's replay, a
+/// re-export under new provider ids) converges on one receipt. Everything else
+/// annotates it. A producer-native receipt
+/// ([`crate::blockdag::source_projection`], used by Drive for its own protocol
+/// records) also has a locator and a `raw_record` in its core; importers never
+/// write `raw_record`, because no source bytes are stored.
 pub mod source_projection {
     use super::*;
 
     attributes! {
         /// IDENTITY. Reified source protocol/namespace.
         "3D9FCD3A68CBFBCFD7375E35D63FB87D" unsafe as pub source_namespace: GenId;
-        /// IDENTITY of an exact-occurrence receipt; occurrence annotation on a
-        /// block receipt. Vendor id scoped by session, or an append-stable
-        /// fallback coordinate. Never a movable filesystem path by itself.
+        /// IDENTITY of a producer-native receipt; annotation on an importer
+        /// receipt, where it names the conversation (session, rollout or
+        /// conversation id) on the leaves of one imported source unit.
         "5F3F80B819EBFB04E2AF20852F9FE3E3" unsafe as pub source_locator: Handle<UTF8String>;
-        /// IDENTITY of an exact-occurrence receipt; occurrence annotation on a
-        /// block receipt. Exact raw source record bytes.
+        /// IDENTITY of a producer-native receipt (Drive's own canonical
+        /// receipt encoding). Never written by an importer.
         "584415CC85A866E45B91C2673C7F794E" unsafe as pub raw_record: Handle<RawBytes>;
         /// IDENTITY. Canonical block produced by this projection.
         "3810AAD922D0523B9A609E4E1EBA9320" unsafe as pub projects_to: GenId;
 
         /// NONIDENTITY. Additive receipt evidence supporting the semantic
-        /// predecessor classes of the projected block. This is deliberately
-        /// not the raw occurrence's vendor `parent` relation; exact vendor
-        /// adjacency remains recoverable from `raw_record`.
+        /// predecessor classes of the projected block. Written by Drive;
+        /// derivable for importer receipts, which therefore omit it.
         "1CE3ACF6B860D6009BA4CB622FBE1DC9" unsafe as pub semantic_predecessor_support: GenId;
         /// NONIDENTITY. Genuine source timestamp claim, when decodable.
         "A6892FD4C7FEB9445C3C5F8E96FC9E6A" unsafe as pub source_timestamp: NsTAIInterval;

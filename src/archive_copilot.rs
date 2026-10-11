@@ -144,6 +144,7 @@ where
             schema::source_projection::SOURCE_COPILOT,
             &source_path,
             records,
+            archive_source::UnitAnnotations::default(),
             |projected| {
                 summary.fragments_emitted += 1;
                 emit(projected)
@@ -173,6 +174,7 @@ where
         schema::source_projection::SOURCE_COPILOT,
         path,
         records,
+        archive_source::UnitAnnotations::default(),
         |projected| {
             summary.fragments_emitted += 1;
             emit(projected)
@@ -219,7 +221,6 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
         archive_source::owned_text(format!("{}/root", default_conversation.as_ref()));
     let mut records = vec![SourceRecord {
         locator: root_locator.clone(),
-        raw_record: bytes,
         predecessors: Vec::new(),
         block_timestamp: None,
         threading: Threading::Transparent,
@@ -273,7 +274,6 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                 ));
                 records.push(SourceRecord {
                     locator: locator.clone(),
-                    raw_record: raw.clone(),
                     predecessors: vec![previous],
                     block_timestamp: timestamp,
                     threading: Threading::Semantic,
@@ -296,7 +296,6 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                 ));
                 records.push(SourceRecord {
                     locator: locator.clone(),
-                    raw_record: raw.clone(),
                     predecessors: vec![previous],
                     block_timestamp: timestamp,
                     threading: Threading::Semantic,
@@ -323,7 +322,6 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                 ));
                 records.push(SourceRecord {
                     locator: locator.clone(),
-                    raw_record: raw,
                     predecessors: vec![previous],
                     block_timestamp: timestamp,
                     threading: Threading::Transparent,
@@ -362,7 +360,7 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
             planned_messages.push((raw, message, locator));
         }
 
-        for (raw, message, locator) in planned_messages {
+        for (_raw, message, locator) in planned_messages {
             let role = message
                 .role
                 .unwrap_or_else(|| archive_source::owned_text("assistant"));
@@ -402,7 +400,6 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
             let timestamp = message.timestamp.as_ref().and_then(parse_timestamp);
             records.push(SourceRecord {
                 locator: locator.clone(),
-                raw_record: raw,
                 predecessors,
                 block_timestamp: timestamp,
                 threading: if parts.is_empty() {
@@ -1345,7 +1342,7 @@ fn absorb(target: &mut ProjectionStats, source: ProjectionStats) {
     target.projections_emitted += source.projections_emitted;
     target.content_parts += source.content_parts;
     target.transparent_records += source.transparent_records;
-    target.raw_only_records += source.raw_only_records;
+    target.contentless_records += source.contentless_records;
     target.missing_predecessors += source.missing_predecessors;
 }
 
@@ -1355,9 +1352,6 @@ mod tests {
     use std::fs;
 
     use tempfile::TempDir;
-    use triblespace::core::repo::BlobStoreGet;
-    use triblespace::prelude::blobencodings::RawBytes;
-    use triblespace::prelude::inlineencodings::Handle;
     use triblespace::prelude::*;
 
     use super::*;
@@ -1403,7 +1397,7 @@ mod tests {
         assert_eq!(summary.fragments_emitted, 3); // source receipt + user + assistant
         assert_eq!(summary.stats.records_seen, 3);
         assert_eq!(summary.stats.content_parts, 2);
-        assert_eq!(summary.stats.raw_only_records, 1);
+        assert_eq!(summary.stats.contentless_records, 1);
     }
 
     #[test]
@@ -1425,7 +1419,6 @@ mod tests {
             .expect("explicit session is recognized");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].locator.as_ref(), "empty-session/root");
-        assert_eq!(records[0].raw_record.as_ref(), source.as_bytes());
         assert!(records[0].parts.is_empty());
         assert_eq!(records[0].threading, Threading::Transparent);
 
@@ -1436,25 +1429,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(summary.files_scanned, 1);
-        assert_eq!(summary.fragments_emitted, 1);
+        assert_eq!(
+            summary.fragments_emitted, 0,
+            "an empty session stores nothing"
+        );
         assert_eq!(summary.stats.records_seen, 1);
-        assert_eq!(summary.stats.raw_only_records, 1);
-
-        let projection = emitted[0].root().expect("receipt has one root");
-        let raw: Inline<Handle<RawBytes>> = find!(
-            raw: Inline<Handle<RawBytes>>,
-            pattern!(&emitted[0], [{
-                projection @ schema::source_projection::raw_record: ?raw
-            }])
-        )
-        .next()
-        .expect("receipt retains exact source bytes");
-        let reader = emitted[0]
-            .blobs_mut()
-            .snapshot()
-            .expect("MemoryBlobStore reader construction is infallible");
-        let recovered: Bytes = reader.get(raw).unwrap();
-        assert_eq!(recovered.as_ref(), source.as_bytes());
+        assert_eq!(summary.stats.contentless_records, 1);
+        assert!(emitted.is_empty());
     }
 
     #[test]
@@ -1495,15 +1476,20 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_ne!(
-            before_fragments[0].root(),
-            after_fragments[0].root(),
-            "the exact root envelope changed when another request was appended"
-        );
-        assert_eq!(
-            before_fragments[1].root(),
-            after_fragments[1].root(),
-            "the unchanged first request keeps its path-independent identity"
+        let receipts = |fragments: &[Fragment]| -> std::collections::BTreeSet<Id> {
+            fragments
+                .iter()
+                .filter(|fragment| {
+                    exists!(pattern!(*fragment, [{
+                        _?receipt @ schema::source_projection::projects_to: _?block
+                    }]))
+                })
+                .filter_map(Fragment::root)
+                .collect()
+        };
+        assert!(
+            receipts(&before_fragments).is_subset(&receipts(&after_fragments)),
+            "the unchanged requests keep their path-independent identity"
         );
     }
 
@@ -1554,19 +1540,14 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_ne!(
+        assert_eq!(
             first_fragments[0].root(),
             second_fragments[0].root(),
-            "exact root receipts retain distinct source member order"
+            "semantic receipt identity uses fixed alias priority"
         );
         assert_eq!(
-            first_fragments[1].root(),
-            second_fragments[1].root(),
-            "semantic child receipt identity uses fixed alias priority"
-        );
-        assert_eq!(
-            semantic_identity(&first_fragments[1]),
-            semantic_identity(&second_fragments[1])
+            semantic_identity(&first_fragments[0]),
+            semantic_identity(&second_fragments[0])
         );
     }
 
@@ -1631,7 +1612,6 @@ mod tests {
             .iter()
             .find(|record| record.locator.as_ref() == "session-a/request/r-a/user")
             .unwrap();
-        assert_eq!(first_user.raw_record.as_ref(), first_request.as_bytes());
         assert_eq!(first_user.parts.len(), 3);
         match &first_user.parts[1] {
             SourcePart::Pointer {
@@ -1719,7 +1699,6 @@ mod tests {
             .iter()
             .find(|record| record.locator.as_ref() == "thread-1/message/m-1")
             .unwrap();
-        assert_eq!(message.raw_record.as_ref(), raw_message.as_bytes());
         assert_eq!(message.parts.len(), 4);
         assert!(matches!(
             &message.parts[0],
@@ -1750,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn structured_skill_payloads_converge_while_raw_receipts_remain_exact() {
+    fn structured_skill_payloads_converge_whatever_their_spelling() {
         let dir = TempDir::new().unwrap();
         let first_dir = dir.path().join("first");
         let second_dir = dir.path().join("second");
@@ -1772,14 +1751,7 @@ mod tests {
         .unwrap();
         let first_records = parse_file(&first_path).unwrap().unwrap();
         let second_records = parse_file(&second_path).unwrap().unwrap();
-        assert_eq!(
-            first_records[1].raw_record.as_ref(),
-            first_message.as_bytes()
-        );
-        assert_eq!(
-            second_records[1].raw_record.as_ref(),
-            second_message.as_bytes()
-        );
+        assert_eq!(first_records.len(), second_records.len());
 
         let mut first_fragments = Vec::new();
         project_path(&first_path, |projected| {
@@ -1794,15 +1766,16 @@ mod tests {
         })
         .unwrap();
 
+        // The receipt, then the path on the leaf.
         assert_eq!(first_fragments.len(), 2);
         assert_eq!(second_fragments.len(), 2);
-        assert_ne!(
-            first_fragments[1].root(),
-            second_fragments[1].root(),
-            "exactly different source records retain distinct receipt identities"
+        assert_eq!(
+            first_fragments[0].root(),
+            second_fragments[0].root(),
+            "JSON spelling never reaches a receipt"
         );
-        let first_semantics = semantic_identity(&first_fragments[1]);
-        let second_semantics = semantic_identity(&second_fragments[1]);
+        let first_semantics = semantic_identity(&first_fragments[0]);
+        let second_semantics = semantic_identity(&second_fragments[0]);
         assert_eq!(first_semantics, second_semantics);
         assert_eq!(first_semantics.1.len(), 4);
     }
