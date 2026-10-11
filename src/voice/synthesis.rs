@@ -344,7 +344,7 @@ impl Synthesizer {
         drop(samples);
         let config = BreezeVoiceConfig {
             quantization: mary::persist::QUANTIZATION_NVFP4.to_owned(),
-            lane: Default::default(),
+            lane: mary::models::breeze::PROMPT_LANE,
             reference_wav: source.reference_wav.clone(),
             reference_text: ref_text,
             direction: source.direction.clone(),
