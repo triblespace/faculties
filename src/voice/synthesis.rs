@@ -1,11 +1,10 @@
 //! Explicit resident speech backend, drained into existing audio/host sinks.
 use anybytes::Bytes;
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "voice")]
 use std::sync::{Arc, Mutex};
-use triblespace::prelude::Id;
 
 #[derive(Clone, Debug)]
 pub enum ModelSources {
@@ -25,14 +24,11 @@ pub enum ModelSources {
 
 #[derive(Clone, Debug)]
 pub struct BreezeSources {
-    /// Launcher custody promise through CUDA storage teardown, including errors.
-    pub immutable_pile: bool,
+    /// The pile whose model collection (`TRIBLESPACE_COLLECTION_MODELS`)
+    /// holds Breeze's `nvfp4` root. Its bytes are aliased onto the GPU, which
+    /// the pile allows: it is append-only, and compaction writes a new file
+    /// and renames it, leaving the mapped one untouched.
     pub pile: PathBuf,
-    pub model_root: Id,
-    pub config_root: Id,
-    pub tokenizer_asset: Id,
-    pub external_codec_root: Id,
-    pub external_codec_config_root: Id,
     pub reference_wav: PathBuf,
     pub reference_text: PathBuf,
     pub direction: Option<String>,
@@ -77,20 +73,6 @@ impl ModelSources {
                     ensure!(!value.is_empty(), "{name} must not be empty");
                     Ok(PathBuf::from(value))
                 };
-                let id = |name: &str| -> Result<Id> {
-                    let value = text(name)?;
-                    ensure!(
-                        value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                        "{name} must be a full 32-hex opaque ID"
-                    );
-                    Id::from_hex(&value).with_context(|| format!("invalid {name}"))
-                };
-                // This records the launcher's custody promise, not a claim that
-                // an O_RDONLY descriptor or mode bits make memory aliases safe.
-                ensure!(
-                    text("FACULTIES_BREEZE_IMMUTABLE_PILE")? == "1",
-                    "FACULTIES_BREEZE_IMMUTABLE_PILE=1 must affirm immutable mapped bytes through CUDA teardown"
-                );
                 let direction = get("FACULTIES_BREEZE_DIRECTION")
                     .map(|_| text("FACULTIES_BREEZE_DIRECTION"))
                     .transpose()?;
@@ -111,13 +93,7 @@ impl ModelSources {
                     "non-unit Breeze CFG requires an explicit direction"
                 );
                 Ok(Self::Breeze(BreezeSources {
-                    immutable_pile: true,
-                    pile: path("FACULTIES_BREEZE_PILE")?,
-                    model_root: id("FACULTIES_BREEZE_MODEL_ROOT")?,
-                    config_root: id("FACULTIES_BREEZE_CONFIG_ROOT")?,
-                    tokenizer_asset: id("FACULTIES_BREEZE_TOKENIZER_ASSET")?,
-                    external_codec_root: id("FACULTIES_BREEZE_EXTERNAL_CODEC_ROOT")?,
-                    external_codec_config_root: id("FACULTIES_BREEZE_EXTERNAL_CODEC_CONFIG_ROOT")?,
+                    pile: path("PILE")?,
                     reference_wav: path("FACULTIES_BREEZE_REFERENCE_WAV")?,
                     reference_text: path("FACULTIES_BREEZE_REFERENCE_TEXT")?,
                     direction,
@@ -131,9 +107,6 @@ impl ModelSources {
     fn check_backend(&self) -> Result<()> {
         match self {
             Self::Invalid(error) => anyhow::bail!("invalid speech configuration: {error}"),
-            Self::Breeze(source) if !source.immutable_pile => anyhow::bail!(
-                "Breeze requires explicit immutable pile custody through CUDA teardown"
-            ),
             Self::Breeze(_) if !cfg!(feature = "voice-breeze") => {
                 anyhow::bail!("Breeze speech requires a build with the voice-breeze feature")
             }
@@ -353,9 +326,7 @@ impl Synthesizer {
 
     #[cfg(feature = "voice-breeze")]
     fn load_breeze(source: &BreezeSources) -> Result<Resident> {
-        use mary::models::breeze::{
-            generator::GenerationOptions, load::Artifacts, resident::BreezeVoiceConfig,
-        };
+        use mary::models::breeze::{generator::GenerationOptions, resident::BreezeVoiceConfig};
         let ref_text = std::fs::read_to_string(&source.reference_text)
             .context("read configured Breeze reference transcript")?;
         // Native FLOAT/PCM16 preflight; never Qwen's PCM16/NPY reference kit.
@@ -364,14 +335,8 @@ impl Synthesizer {
         let reference_chars = ref_text.trim().chars().count();
         drop(samples);
         let config = BreezeVoiceConfig {
-            pile: source.pile.clone(),
-            artifacts: Artifacts {
-                model_root: source.model_root,
-                config_root: source.config_root,
-                tokenizer_asset: source.tokenizer_asset,
-                external_codec_root: source.external_codec_root,
-                external_codec_config_root: source.external_codec_config_root,
-            },
+            quantization: mary::persist::QUANTIZATION_NVFP4.to_owned(),
+            lane: Default::default(),
             reference_wav: source.reference_wav.clone(),
             reference_text: ref_text,
             direction: source.direction.clone(),
@@ -381,11 +346,12 @@ impl Synthesizer {
             },
         };
         config.validate()?;
-        // SAFETY: the explicit immutable-generation launcher contract was
-        // required during configuration. It covers the genuine pile's mapped
-        // bytes/page prefixes through CUDA storage teardown, also on errors;
-        // neither this reader closing nor a worker dropping lifts that duty.
-        let session = unsafe { mary::speak::Synthesizer::spawn_breeze(config) }?;
+        let models = crate::model_storage::models(&source.pile)?;
+        // SAFETY: the selected tensors are aliased from the pile's mapping
+        // through CUDA storage teardown. The pile is append-only and is only
+        // ever compacted into a new file that is then renamed over it, so the
+        // mapped bytes, page prefixes included, never change under the alias.
+        let session = unsafe { mary::speak::Synthesizer::spawn_breeze(models, config) }?;
         Ok(Resident {
             session,
             reference_seconds,
@@ -538,16 +504,9 @@ mod tests {
     use super::*;
 
     fn breeze_settings() -> Vec<(&'static str, OsString)> {
-        let id = format!("{:x}", triblespace::prelude::fucid().id);
         vec![
             ("FACULTIES_VOICE_BACKEND", "breeze".into()),
-            ("FACULTIES_BREEZE_IMMUTABLE_PILE", "1".into()),
-            ("FACULTIES_BREEZE_PILE", "/explicit/native.pile".into()),
-            ("FACULTIES_BREEZE_MODEL_ROOT", id.clone().into()),
-            ("FACULTIES_BREEZE_CONFIG_ROOT", id.clone().into()),
-            ("FACULTIES_BREEZE_TOKENIZER_ASSET", id.clone().into()),
-            ("FACULTIES_BREEZE_EXTERNAL_CODEC_ROOT", id.clone().into()),
-            ("FACULTIES_BREEZE_EXTERNAL_CODEC_CONFIG_ROOT", id.into()),
+            ("PILE", "/explicit/self.pile".into()),
             (
                 "FACULTIES_BREEZE_REFERENCE_WAV",
                 "/explicit/preferred-float.wav".into(),
@@ -604,11 +563,9 @@ mod tests {
         for name in ["", "Breeze", " breeze", "qwen", "unknown"] {
             assert!(parse_settings(&[("FACULTIES_VOICE_BACKEND", name.into())]).is_err());
         }
-        assert!(
-            ModelSources::Invalid("test configuration error".into())
-                .check_backend()
-                .is_err()
-        );
+        assert!(ModelSources::Invalid("test configuration error".into())
+            .check_backend()
+            .is_err());
     }
 
     #[test]
@@ -647,14 +604,14 @@ mod tests {
     }
 
     #[test]
-    fn breeze_configuration_uses_only_its_explicit_assets_and_opaque_ids() {
+    fn breeze_configuration_uses_only_its_explicit_assets() {
         let mut settings = breeze_settings();
         settings.push(("QWEN3TTS_PILE", "/must-not-be-used.pile".into()));
         let selected = parse_settings(&settings).unwrap();
         let ModelSources::Breeze(source) = &selected else {
             panic!("wrong backend")
         };
-        assert_eq!(source.pile, Path::new("/explicit/native.pile"));
+        assert_eq!(source.pile, Path::new("/explicit/self.pile"));
         assert_eq!(
             source.reference_wav,
             Path::new("/explicit/preferred-float.wav")
@@ -662,48 +619,28 @@ mod tests {
         assert_eq!(source.reference_text, Path::new("/explicit/known.txt"));
         assert_eq!(source.cfg_scale, 1.0);
         assert!(source.direction.is_none());
-        assert!(source.immutable_pile);
-        // Random IDs need not encode a source/model/version or be distinct.
-        assert_eq!(source.model_root, source.external_codec_root);
         if cfg!(feature = "voice-breeze") {
             selected.check_backend().unwrap();
         } else {
-            assert!(
-                selected
-                    .check_backend()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("voice-breeze")
-            );
+            assert!(selected
+                .check_backend()
+                .unwrap_err()
+                .to_string()
+                .contains("voice-breeze"));
         }
     }
 
     #[test]
-    fn breeze_rejects_missing_paths_partial_ids_and_unaffirmed_custody_without_io() {
+    fn breeze_rejects_missing_paths_without_io() {
         for key in [
-            "FACULTIES_BREEZE_PILE",
+            "PILE",
             "FACULTIES_BREEZE_REFERENCE_WAV",
             "FACULTIES_BREEZE_REFERENCE_TEXT",
-            "FACULTIES_BREEZE_IMMUTABLE_PILE",
         ] {
             let mut settings = breeze_settings();
             settings.retain(|(name, _)| *name != key);
             assert!(parse_settings(&settings).is_err(), "{key}");
         }
-        for bad in ["abc", "not-a-root", "", "00000000000000000000000000000000"] {
-            let mut settings = breeze_settings();
-            settings
-                .iter_mut()
-                .find(|(name, _)| *name == "FACULTIES_BREEZE_MODEL_ROOT")
-                .unwrap()
-                .1 = bad.into();
-            assert!(parse_settings(&settings).is_err(), "{bad}");
-        }
-        let ModelSources::Breeze(mut source) = parse_settings(&breeze_settings()).unwrap() else {
-            unreachable!()
-        };
-        source.immutable_pile = false;
-        assert!(ModelSources::Breeze(source).check_backend().is_err());
     }
 
     #[test]

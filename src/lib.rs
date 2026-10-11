@@ -75,7 +75,12 @@ pub mod mcp;
 pub mod memory;
 pub mod memory_cover;
 pub mod message;
-#[cfg(any(feature = "local-embed", feature = "voice", feature = "imagine"))]
+#[cfg(any(
+    feature = "local-embed",
+    feature = "voice",
+    feature = "imagine",
+    feature = "discord-hearing"
+))]
 mod model_storage;
 #[cfg(feature = "local-embed")]
 pub mod nomic;
