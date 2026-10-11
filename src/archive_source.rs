@@ -409,19 +409,23 @@ pub fn modality_for_media_type(media_type: &str) -> Id {
     }
 }
 
-fn build_fact(part: SourcePart) -> Result<Fragment> {
-    match part {
+/// Build one content fact, and separately the recovered bytes of a pointer
+/// fact. The bytes annotate the fact and never enter the part's or block's
+/// identity: whether an export happened to include an asset file is not part
+/// of the message.
+fn build_fact(part: SourcePart) -> Result<(Fragment, Option<Fragment>)> {
+    let fact = match part {
         SourcePart::Text {
             modality,
             direction,
             value,
-        } => blockdag::text_fact_view(modality, direction, value),
+        } => blockdag::text_fact_view(modality, direction, value)?,
         SourcePart::Blob {
             modality,
             direction,
             bytes,
             media_type,
-        } => blockdag::blob_fact(modality, direction, bytes, media_type.as_ref()),
+        } => blockdag::blob_fact(modality, direction, bytes, media_type.as_ref())?,
         SourcePart::Pointer {
             modality,
             direction,
@@ -439,12 +443,20 @@ fn build_fact(part: SourcePart) -> Result<Fragment> {
                 media_type.as_ref().map(AsRef::as_ref),
                 size,
             )?;
-            match resolved {
-                Some(bytes) => blockdag::resolve_pointer_fact(fact, bytes),
-                None => Ok(fact),
-            }
+            let resolution = match resolved {
+                Some(bytes) => {
+                    let root = fact.root().expect("content fact is rooted");
+                    Some(blockdag::resolve_pointer_fact(
+                        Fragment::rooted(root, TribleSet::new()),
+                        bytes,
+                    )?)
+                }
+                None => None,
+            };
+            return Ok((fact, resolution));
         }
-    }
+    };
+    Ok((fact, None))
 }
 
 /// Conversation-level annotations of one projected source unit.
@@ -548,7 +560,14 @@ where
         let mut parts = Fragment::empty();
         for (ordinal, part) in record.parts.iter().cloned().enumerate() {
             let ordinal = u64::try_from(ordinal).context("content-part ordinal exceeds u64")?;
-            parts += blockdag::content_part(ordinal, build_fact(part)?, None)?;
+            let (fact, resolution) = build_fact(part)?;
+            parts += blockdag::content_part(ordinal, fact, None)?;
+            if let Some(resolution) = resolution {
+                // Facts and bytes only: the fact must not become an export
+                // of the parts the block contains.
+                let (_, facts, metafacts, blobs) = resolution.into_parts();
+                parts += Fragment::from_parts(facts, metafacts, blobs);
+            }
             stats.content_parts += 1;
         }
         let predecessors: BTreeSet<Id> = predecessor_indices

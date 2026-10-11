@@ -1166,7 +1166,9 @@ fn file_id_from_asset_pointer(pointer: &str) -> Option<&str> {
 
 fn file_id_from_filename(filename: &str) -> Option<String> {
     if let Some(rest) = filename.strip_prefix("file_") {
-        let id = rest.split('.').next().unwrap_or(rest);
+        // `file_<hex>.png`, `file_<hex>-sanitized.png` and
+        // `file_<hex>-<uuid>.wav` all carry the asset `file_<hex>`.
+        let id = rest.split(['.', '-']).next().unwrap_or(rest);
         return (!id.is_empty()).then(|| format!("file_{id}"));
     }
     if filename.starts_with("file-") {
@@ -1573,6 +1575,39 @@ mod tests {
     }
 
     #[test]
+    fn an_asset_file_in_the_export_never_changes_a_block() {
+        let with = TempDir::new().unwrap();
+        let without = TempDir::new().unwrap();
+        let export = TINY_EXPORT.replace("file-abc", "file_00000000aa11");
+        fs::write(with.path().join("conversations.json"), &export).unwrap();
+        fs::write(without.path().join("conversations.json"), &export).unwrap();
+        fs::write(
+            with.path().join("file_00000000aa11-sanitized.png"),
+            [1, 2, 3, 4],
+        )
+        .unwrap();
+        let project = |root: &Path| {
+            let mut union = Fragment::empty();
+            let summary = project_path(root, |projection| {
+                union += projection.fragment;
+                Ok(())
+            })
+            .unwrap();
+            (summary, union)
+        };
+        let (resolved_summary, resolved) = project(with.path());
+        let (_, unresolved) = project(without.path());
+        assert_eq!(resolved_summary.attachments_resolved, 1);
+        assert_eq!(blocks(&resolved), blocks(&unresolved));
+        assert!(exists!(pattern!(&resolved, [{
+            _?fact @ schema::content_fact::resolved_to: _?bytes
+        }])));
+        assert!(!exists!(pattern!(&resolved, [{
+            _?part @ schema::content_part::resolution: _?bytes
+        }])));
+    }
+
+    #[test]
     fn duplicate_sidecars_remain_unresolved_independent_of_input_order() {
         fn project_with_index(
             export: &Path,
@@ -1918,6 +1953,10 @@ mod tests {
         assert_eq!(
             file_id_from_filename("file_voice123.wav").as_deref(),
             Some("file_voice123")
+        );
+        assert_eq!(
+            file_id_from_filename("file_0000000001ac71f4867daa5e038cd8e6-sanitized.png").as_deref(),
+            Some("file_0000000001ac71f4867daa5e038cd8e6")
         );
     }
 }
