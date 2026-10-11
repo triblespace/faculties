@@ -143,6 +143,9 @@ struct PrefixPlan {
     has_events: bool,
     /// The legacy bare format: a header line, then bare response items.
     legacy: bool,
+    /// Creation time (Unix ms) of a fork that opens by replaying its
+    /// parent's records; `None` for a file that replays nothing.
+    fork_start_ms: Option<i64>,
     observed_bytes: u64,
     complete_bytes: u64,
     trailing_bytes: u64,
@@ -168,6 +171,14 @@ struct Projector<'a> {
     leaf: Option<Id>,
     /// Content part of each tool call, by call id, for `responds_to`.
     call_parts: std::collections::HashMap<String, Id>,
+    /// Records a single line yields beyond its first (a sealed token that
+    /// follows legacy reasoning).
+    extra: Vec<ProjectedRecord>,
+    /// Inside a fork's replay of its parent: record times are the copy's,
+    /// not the event's, and are not kept.
+    replaying: bool,
+    fork_start_ms: i64,
+    last_ms: i64,
     stats: ProjectionStats,
 }
 
@@ -268,14 +279,24 @@ where
         side_head: None,
         leaf: None,
         call_parts: std::collections::HashMap::new(),
+        extra: Vec::new(),
+        replaying: plan.fork_start_ms.is_some(),
+        fork_start_ms: plan.fork_start_ms.unwrap_or(0),
+        last_ms: plan.fork_start_ms.unwrap_or(0),
         stats: ProjectionStats::default(),
     };
     let mut fragments_emitted = 0usize;
     let projected = scan_frozen_prefix(&frozen.bytes, |line, raw| {
         let before = projector.stats;
-        if let Some(record) = projector.project_record(line, raw)? {
-            let mut record_stats = projector.stats.since(before);
-            record_stats.records_seen = 1;
+        let first = projector.project_record(line, raw)?;
+        let extra = std::mem::take(&mut projector.extra);
+        for (index, record) in first.into_iter().chain(extra).enumerate() {
+            let mut record_stats = if index == 0 {
+                projector.stats.since(before)
+            } else {
+                ProjectionStats::default()
+            };
+            record_stats.records_seen = usize::from(index == 0);
             // Two fragments, so a writer that already holds the receipt's
             // closure (a fork replaying its parent) skips that closure whole
             // and stages only the occurrence.
@@ -337,6 +358,10 @@ struct PlanScan {
     legacy_id: Option<String>,
     has_events: bool,
     first: bool,
+    /// Leading `session_meta` records; a fork names its ancestors after itself.
+    metas: usize,
+    first_meta_ms: Option<i64>,
+    forked: bool,
 }
 
 impl PlanScan {
@@ -363,6 +388,24 @@ impl PlanScan {
         if record.record_type.as_deref() != Some("session_meta") {
             return Ok(());
         }
+        self.metas += 1;
+        if self.metas == 1 {
+            self.first_meta_ms = record
+                .timestamp
+                .as_deref()
+                .and_then(parse_iso_timestamp)
+                .map(epoch_ms);
+            self.forked = serde_json::from_slice::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("payload")?
+                        .get("forked_from_id")?
+                        .as_str()
+                        .map(|id| !id.trim().is_empty())
+                })
+                .unwrap_or(false);
+        }
         let payload = record
             .payload
             .as_ref()
@@ -381,11 +424,15 @@ impl PlanScan {
         Ok(())
     }
 
-    /// The session id, and whether the file is in the legacy bare format.
-    fn finish(self, path: &Path) -> Result<(String, bool, bool)> {
+    /// The session id, whether the file is in the legacy bare format,
+    /// whether it carries events, and a replaying fork's creation time.
+    fn finish(self, path: &Path) -> Result<(String, bool, bool, Option<i64>)> {
+        let fork_start_ms = (self.forked || self.metas >= 2)
+            .then_some(self.first_meta_ms)
+            .flatten();
         match (self.session_id, self.legacy_id) {
-            (Some(id), _) => Ok((id, false, self.has_events)),
-            (None, Some(id)) => Ok((id, true, self.has_events)),
+            (Some(id), _) => Ok((id, false, self.has_events, fork_start_ms)),
+            (None, Some(id)) => Ok((id, true, self.has_events, None)),
             (None, None) => bail!(
                 "Codex rollout {} has no stable session_meta.payload.id/session_id or legacy header id in its complete prefix",
                 path.display()
@@ -404,13 +451,14 @@ where
     let path = Path::new(source_name);
     let mut planned = PlanScan::default();
     let scan = scan_frozen_prefix(&bytes, |_line, raw| planned.observe(raw.as_ref(), path))?;
-    let (session_id, legacy, has_events) = planned.finish(path)?;
+    let (session_id, legacy, has_events, fork_start_ms) = planned.finish(path)?;
     let observed_bytes = u64::try_from(bytes.len()).context("resident Codex length exceeds u64")?;
     let digest = *blake3::hash(bytes.as_ref()).as_bytes();
     let plan = PrefixPlan {
         session_id,
         has_events,
         legacy,
+        fork_start_ms,
         observed_bytes,
         complete_bytes: scan.complete_bytes,
         trailing_bytes: observed_bytes.saturating_sub(scan.complete_bytes),
@@ -432,11 +480,12 @@ fn plan_prefix(path: &Path) -> Result<PrefixPlan> {
         .len();
     let mut planned = PlanScan::default();
     let (scan, digest) = scan_prefix(path, source_len, |_line, raw| planned.observe(raw, path))?;
-    let (session_id, legacy, has_events) = planned.finish(path)?;
+    let (session_id, legacy, has_events, fork_start_ms) = planned.finish(path)?;
     Ok(PrefixPlan {
         session_id,
         has_events,
         legacy,
+        fork_start_ms,
         observed_bytes: source_len,
         complete_bytes: scan.complete_bytes,
         trailing_bytes: source_len.saturating_sub(scan.complete_bytes),
@@ -530,7 +579,42 @@ where
 }
 
 impl Projector<'_> {
+    /// End a fork's replay at its own first turn: a turn that starts at or
+    /// after the fork's creation, or a pause the bulk copy never makes.
+    fn observe_replay(&mut self, raw: &[u8]) {
+        if contains(raw, b"\"session_meta\"") {
+            return;
+        }
+        let at = line_ms(raw);
+        if let Some(at) = at {
+            if at > self.last_ms + 3_000 {
+                self.replaying = false;
+                return;
+            }
+            self.last_ms = self.last_ms.max(at);
+        }
+        let turn_start = if contains(raw, b"\"task_started\"") || contains(raw, b"\"turn_context\"")
+        {
+            serde_json::from_slice::<Value>(raw).ok().and_then(|value| {
+                let payload = value.get("payload")?;
+                payload
+                    .get("started_at")
+                    .and_then(Value::as_i64)
+                    .map(|seconds| seconds * 1_000)
+                    .or_else(|| payload.get("turn_id")?.as_str().and_then(uuid_v7_ms))
+            })
+        } else {
+            None
+        };
+        if turn_start.is_some_and(|start| start >= self.fork_start_ms - 1_000) {
+            self.replaying = false;
+        }
+    }
+
     fn project_record(&mut self, _line: u64, raw: Bytes) -> Result<Option<ProjectedRecord>> {
+        if self.replaying {
+            self.observe_replay(raw.as_ref());
+        }
         if self.legacy {
             return self.project_item_line(raw);
         }
@@ -702,6 +786,9 @@ impl Projector<'_> {
         let receipt_id = receipt
             .root()
             .expect("canonical source-projection constructor returns one root");
+        // A fork's replayed records carry the time of the copy, which
+        // records a tool copying lines, not anything that happened.
+        let timestamp = if self.replaying { None } else { timestamp };
         let occurrence = blockdag::source_occurrence(
             receipt_id,
             blockdag::ProjectionAnnotations {
@@ -746,24 +833,45 @@ impl Projector<'_> {
         match kind {
             "response_item" => self.response_item(payload, timestamp),
             "compacted" => {
-                let parts = match payload.get("message").and_then(Value::as_str) {
-                    Some(message) if !message.trim().is_empty() => {
-                        let mut parts = Fragment::empty();
-                        let mut ordinal = 0;
-                        push_part(
-                            &mut parts,
-                            &mut ordinal,
-                            blockdag::text_fact(
-                                schema::content_fact::modality::TEXT,
-                                schema::content_fact::direction::AMBIENT,
-                                message,
-                            )?,
-                            &mut self.stats,
-                        )?;
-                        parts
-                    }
-                    _ => Fragment::empty(),
-                };
+                let mut parts = Fragment::empty();
+                let mut ordinal = 0;
+                if let Some(message) = payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                {
+                    push_part(
+                        &mut parts,
+                        &mut ordinal,
+                        blockdag::text_fact(
+                            schema::content_fact::modality::TEXT,
+                            schema::content_fact::direction::AMBIENT,
+                            message,
+                        )?,
+                        &mut self.stats,
+                    )?;
+                }
+                // The sealed compaction tokens; the rest of the replacement
+                // history repeats items the file already holds.
+                for token in payload
+                    .get("replacement_history")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("encrypted_content")?.as_str())
+                    .filter(|token| !token.is_empty())
+                {
+                    push_part(
+                        &mut parts,
+                        &mut ordinal,
+                        archive_source::sealed_fact(
+                            token,
+                            schema::content_fact::sealed::OPENAI_COMPACTION,
+                            archive_source::SealedAlphabet::UrlSafe,
+                        )?,
+                        &mut self.stats,
+                    )?;
+                }
                 self.side(parts, "compacted", timestamp)
             }
             "world_state" => {
@@ -818,9 +926,40 @@ impl Projector<'_> {
                 }
             }
             "reasoning" => {
+                // The sealed token is kept as the bytes it is, on a side
+                // branch, so files without it meet on the same dialogue.
+                let sealed = match payload
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .filter(|token| !token.is_empty())
+                {
+                    Some(token) => {
+                        let mut parts = Fragment::empty();
+                        let mut ordinal = 0;
+                        push_part(
+                            &mut parts,
+                            &mut ordinal,
+                            archive_source::sealed_fact(
+                                token,
+                                schema::content_fact::sealed::OPENAI_REASONING,
+                                archive_source::SealedAlphabet::UrlSafe,
+                            )?,
+                            &mut self.stats,
+                        )?;
+                        Some(parts)
+                    }
+                    None => None,
+                };
                 if self.has_events {
-                    self.stats.skipped_records += 1;
-                    return Ok(None);
+                    // The summary is the events' reasoning; only the sealed
+                    // token is new here.
+                    return match sealed {
+                        Some(parts) => self.side(parts, "reasoning", timestamp),
+                        None => {
+                            self.stats.skipped_records += 1;
+                            Ok(None)
+                        }
+                    };
                 }
                 let mut parts = Fragment::empty();
                 let mut ordinal = 0;
@@ -850,7 +989,21 @@ impl Projector<'_> {
                         )?;
                     }
                 }
-                self.dialogue(parts, "reasoning", timestamp)
+                let Some(sealed) = sealed else {
+                    return self.dialogue(parts, "reasoning", timestamp);
+                };
+                if parts.exports().next().is_none() {
+                    return self.side(sealed, "reasoning", timestamp);
+                }
+                let dialogue = self.dialogue(parts, "reasoning", timestamp)?;
+                let side = self.side(sealed, "reasoning", timestamp)?;
+                match dialogue {
+                    Some(dialogue) => {
+                        self.extra.extend(side);
+                        Ok(Some(dialogue))
+                    }
+                    None => Ok(side),
+                }
             }
             // `ghost_snapshot` holds git object references; a record without
             // a kind is the legacy header or a legacy `record_type/state`.
@@ -1504,6 +1657,29 @@ fn parse_iso_timestamp(value: &str) -> Option<Epoch> {
     }
 }
 
+fn epoch_ms(epoch: Epoch) -> i64 {
+    epoch.to_unix_milliseconds() as i64
+}
+
+/// Unix ms of a UUIDv7 (its first 48 bits), if `id` is one.
+fn uuid_v7_ms(id: &str) -> Option<i64> {
+    let hex: String = id.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 || hex.as_bytes()[12] != b'7' {
+        return None;
+    }
+    i64::from_str_radix(&hex[..12], 16).ok()
+}
+
+/// The envelope timestamp of a record line, read without a full parse.
+fn line_ms(raw: &[u8]) -> Option<i64> {
+    let start = memmem::find(raw, b"\"timestamp\":\"")? + 13;
+    let end = start + raw[start..].iter().position(|byte| *byte == b'"')?;
+    std::str::from_utf8(&raw[start..end])
+        .ok()
+        .and_then(parse_iso_timestamp)
+        .map(epoch_ms)
+}
+
 fn epoch_interval(epoch: Epoch) -> Option<Inline<NsTAIInterval>> {
     (epoch, epoch).try_to_inline().ok()
 }
@@ -1518,7 +1694,7 @@ mod tests {
     use triblespace::core::repo::pile::{Pile, PileSnapshot};
     use triblespace::core::repo::BlobStoreGet;
     use triblespace::macros::{find, pattern};
-    use triblespace::prelude::blobencodings::UTF8String;
+    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
@@ -1750,13 +1926,49 @@ mod tests {
     }
 
     #[test]
-    fn sealed_only_reasoning_and_bookkeeping_project_nothing() {
+    fn sealed_only_reasoning_is_kept_as_bytes_off_the_dialogue() {
         let source = chunked_telemetry_rollout(256 * 1024);
         let (_directory, summary, fragment) = project_text(&source, "sealed.jsonl");
         assert_eq!(summary.stats.records_seen, 1_026);
-        assert_eq!(summary.stats.skipped_records, 1_026);
-        assert_eq!(summary.fragments_emitted, 0);
-        assert!(fragment.facts().is_empty());
+        assert_eq!(summary.stats.skipped_records, 2, "the meta and the padding");
+        assert_eq!(summary.stats.side_projections, 1_024);
+        assert_eq!(summary.stats.source_projections, 0);
+        use schema::content_fact::{direction, modality};
+        // One token, "opaque", which is not canonical base64: kept as its
+        // exact text under the `+text` media type, as a THINKING blob.
+        assert_eq!(
+            content_facts(&fragment, modality::THINKING, direction::OUT).len(),
+            1
+        );
+        assert!(!exists!(pattern!(fragment.facts(), [{
+            _?fact @ schema::content_fact::payload: _?text
+        }])));
+    }
+
+    #[test]
+    fn encrypted_reasoning_is_kept_as_bytes_without_moving_the_dialogue() {
+        use base64::engine::general_purpose::URL_SAFE;
+        let token = URL_SAFE.encode([0x80u8; 45]);
+        let with = ITEM_ROLLOUT.replace(
+            r#""encrypted_content":"opaque""#,
+            &format!(r#""encrypted_content":"{token}""#),
+        );
+        let without = ITEM_ROLLOUT.replace(r#","encrypted_content":"opaque""#, "");
+        let (_with_dir, with_summary, with) = project_text(&with, "with.jsonl");
+        let (_without_dir, _, without) = project_text(&without, "without.jsonl");
+        assert_eq!(with_summary.stats.side_projections, 2);
+        assert!(ids_with_tag(&without, schema::block::KIND)
+            .is_subset(&ids_with_tag(&with, schema::block::KIND)));
+        let mut probe = Fragment::empty();
+        let bytes = probe.put::<RawBytes, _>(vec![0x80u8; 45]);
+        let media =
+            probe.put::<UTF8String, _>(schema::content_fact::sealed::OPENAI_REASONING.to_owned());
+        assert!(exists!(pattern!(with.facts(), [
+            { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::THINKING,
+                schema::content_fact::blob: bytes,
+                schema::content_fact::media_type: _?media_type },
+            { _?media_type @ metadata::name: media },
+        ])));
     }
 
     /// The legacy bare format (2025): a header, then bare response items with
@@ -1785,7 +1997,10 @@ mod tests {
             summary.stats.source_projections, 3,
             "user, reasoning, assistant"
         );
-        assert_eq!(summary.stats.side_projections, 2, "the call and its output");
+        assert_eq!(
+            summary.stats.side_projections, 3,
+            "the sealed reasoning, the call and its output"
+        );
         assert_eq!(summary.stats.skipped_records, 2, "header and state");
         use schema::content_fact::{direction, modality};
         assert_eq!(
@@ -1798,7 +2013,8 @@ mod tests {
         );
         assert_eq!(
             content_facts(&fragment, modality::THINKING, direction::OUT).len(),
-            1
+            2,
+            "the summary text and the sealed token"
         );
         // The output answers the call through a semantic edge, not the id.
         let call_part = find!(
@@ -1943,19 +2159,23 @@ mod tests {
         let (_directory, summary, fragment) = project_text(ITEM_ROLLOUT, "items.jsonl");
         assert_eq!(summary.stats.records_seen, 14);
         assert_eq!(summary.stats.source_projections, 3);
-        assert_eq!(summary.stats.side_projections, 1);
-        // text + image, two summary parts, one text, and the harness text.
-        assert_eq!(summary.stats.content_parts, 6);
         assert_eq!(
-            summary.stats.skipped_records, 10,
+            summary.stats.side_projections, 2,
+            "harness text, sealed reasoning"
+        );
+        // text + image, two summary parts, one text, the harness text, and
+        // the sealed reasoning token.
+        assert_eq!(summary.stats.content_parts, 7);
+        assert_eq!(
+            summary.stats.skipped_records, 9,
             "bookkeeping, tool items, the empty reasoning item and response mirrors"
         );
-        assert_eq!(summary.fragments_emitted, 9);
+        assert_eq!(summary.fragments_emitted, 11);
         assert_eq!(
             ids_with_tag(&fragment, schema::source_projection::KIND).len(),
-            4
+            5
         );
-        assert_eq!(ids_with_tag(&fragment, schema::block::KIND).len(), 4);
+        assert_eq!(ids_with_tag(&fragment, schema::block::KIND).len(), 5);
         assert_eq!(
             root_blocks(&fragment).len(),
             2,
@@ -1978,7 +2198,8 @@ mod tests {
         );
         assert_eq!(
             content_facts(&fragment, modality::THINKING, direction::OUT).len(),
-            2
+            3,
+            "two summary parts and the sealed token"
         );
         assert_eq!(
             content_facts(&fragment, modality::TEXT, direction::OUT).len(),
@@ -2116,8 +2337,9 @@ mod tests {
                 .all(|fact| receipts.contains(fact.e())));
         }
 
-        // The shared prefix is projected once: one receipt per block, and each
-        // replayed receipt carries both of its occurrences.
+        // The shared prefix is projected once: one receipt per block. The
+        // replay's copy times are not kept: each replayed receipt carries its
+        // original record's time only.
         assert_eq!(receipts.len(), 5);
         assert_eq!(ids_with_tag(&union, schema::block::KIND).len(), 5);
         let observed_twice = receipts
@@ -2134,7 +2356,17 @@ mod tests {
                     == 2
             })
             .count();
-        assert_eq!(observed_twice, 3);
+        assert_eq!(observed_twice, 0);
+        let timed = receipts
+            .iter()
+            .filter(|receipt| {
+                let receipt = **receipt;
+                exists!(pattern!(union.facts(), [{
+                    receipt @ schema::source_projection::source_timestamp: _?timestamp
+                }]))
+            })
+            .count();
+        assert_eq!(timed, 5, "the parent's three and the fork's own two");
         let (_reader_directory, reader) = empty_reader();
         let (_, validation) =
             blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();

@@ -109,6 +109,17 @@ pub mod content_fact {
     /// Nonidentity kind marker attached after intrinsic fact construction.
     pub const KIND: Id = id_hex!("C29DDE04AD573274192D1AB86BA5B0A3");
 
+    /// Media types of sealed reasoning: bytes only the provider can decrypt,
+    /// kept as THINKING blob facts. A `+base64` suffix marks a token whose
+    /// base64 spelling did not round-trip, kept as its exact text bytes.
+    pub mod sealed {
+        pub const OPENAI_REASONING: &str = "application/vnd.openai.encrypted-reasoning";
+        pub const OPENAI_COMPACTION: &str = "application/vnd.openai.encrypted-compaction";
+        pub const ANTHROPIC_THINKING_SIGNATURE: &str =
+            "application/vnd.anthropic.thinking-signature";
+        pub const ANTHROPIC_REDACTED_THINKING: &str = "application/vnd.anthropic.redacted-thinking";
+    }
+
     pub mod modality {
         use super::*;
         pub const TEXT: Id = id_hex!("AE8DC7E9948F3B2408F86049F1D2C548");
@@ -193,6 +204,10 @@ pub mod source_projection {
         "2874AFE6553B4E044D4EBFB8FA89A641" unsafe as pub raw_role: Handle<UTF8String>;
         /// NONIDENTITY. Exact vendor model label retained for provenance.
         "CEB26C9520076D245DF83F77D994A800" unsafe as pub raw_model: Handle<UTF8String>;
+        /// NONIDENTITY. Canonical JSON of provider metadata about the
+        /// conversation a leaf ends, such as a Claude Code subagent's
+        /// `.meta.json`. Minted with `trible genid` on 2026-10-11.
+        "8784841BA7FA549AB6898424722F72DA" as pub source_detail: Handle<UTF8String>;
     }
 
     /// Nonidentity kind marker attached after intrinsic receipt construction.

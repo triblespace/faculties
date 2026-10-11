@@ -212,6 +212,11 @@ enum ContentDraft {
         pointer: View<str>,
         media_type: Option<View<str>>,
     },
+    /// A sealed reasoning token and its media type.
+    Sealed {
+        token: View<str>,
+        media_type: &'static str,
+    },
     Unknown,
 }
 
@@ -422,6 +427,8 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
         kind: Option<View<str>>,
         text: Option<View<str>>,
         thinking: Option<View<str>>,
+        signature: Option<View<str>>,
+        data: Option<View<str>>,
         id: Option<View<str>>,
         tool_use_id: Option<View<str>>,
         name: Option<View<str>>,
@@ -447,6 +454,8 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
             b"type" => fields.kind = nullable_string(value)?,
             b"text" => fields.text = nullable_string(value)?,
             b"thinking" => fields.thinking = nullable_string(value)?,
+            b"signature" => fields.signature = nullable_string(value)?,
+            b"data" => fields.data = nullable_string(value)?,
             b"id" => fields.id = nullable_string(value)?,
             b"tool_use_id" => fields.tool_use_id = nullable_string(value)?,
             b"name" => fields.name = nullable_string(value)?,
@@ -481,10 +490,31 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
     };
     match kind {
         "text" | "knowledge" => text(schema::content_fact::modality::TEXT, fields.text),
-        "thinking" | "reasoning" => text(
-            schema::content_fact::modality::THINKING,
-            fields.thinking.or(fields.text),
-        ),
+        "thinking" | "reasoning" => {
+            let mut drafts: Vec<ContentDraft> = text(
+                schema::content_fact::modality::THINKING,
+                fields.thinking.or(fields.text),
+            )?;
+            drafts.extend(
+                fields
+                    .signature
+                    .and_then(nonempty)
+                    .map(|token| ContentDraft::Sealed {
+                        token,
+                        media_type: schema::content_fact::sealed::ANTHROPIC_THINKING_SIGNATURE,
+                    }),
+            );
+            Ok(drafts)
+        }
+        "redacted_thinking" => Ok(fields
+            .data
+            .and_then(nonempty)
+            .map(|token| ContentDraft::Sealed {
+                token,
+                media_type: schema::content_fact::sealed::ANTHROPIC_REDACTED_THINKING,
+            })
+            .into_iter()
+            .collect()),
         "tool_use" | "tool_call" => Ok(vec![ContentDraft::Text {
             modality: schema::content_fact::modality::TOOL_CALL,
             text: archive_source::owned_text(canonical_tool_payload(
@@ -801,6 +831,7 @@ fn records_from_conversations(
             let direction = direction_for_sender(message.sender.as_ref().map(AsRef::as_ref));
 
             let mut parts = Vec::new();
+            let mut sealed = Vec::new();
             if message.content.is_empty() {
                 if let Some(text) = message.flat_text.clone().and_then(nonempty) {
                     parts.push(SourcePart::text(
@@ -830,6 +861,13 @@ fn records_from_conversations(
                             size: None,
                             resolved: None,
                         }),
+                        ContentDraft::Sealed { token, media_type } => {
+                            sealed.push(archive_source::sealed_part(
+                                token.as_ref(),
+                                media_type,
+                                archive_source::SealedAlphabet::Standard,
+                            ))
+                        }
                         ContentDraft::Unknown => stats.unknown_content_items += 1,
                     }
                 }
@@ -889,6 +927,22 @@ fn records_from_conversations(
             } else {
                 Threading::Semantic
             };
+            if !sealed.is_empty() {
+                // Sealed thinking follows its message on a side branch, so an
+                // export without signatures threads the same messages.
+                records.push(SourceRecord {
+                    locator: archive_source::owned_text(format!("{}/sealed", locator.as_ref())),
+                    predecessors: vec![locator.clone()],
+                    block_timestamp: timestamp,
+                    threading: Threading::Transparent,
+                    parts: sealed,
+                    claims: SourceClaims {
+                        timestamp,
+                        raw_model: message.model.clone(),
+                        ..SourceClaims::default()
+                    },
+                });
+            }
             records.push(SourceRecord {
                 locator: locator.clone(),
                 predecessors: predecessor.into_iter().collect(),

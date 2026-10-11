@@ -24,9 +24,14 @@
 //! model saw (`attachment` records) and `system` records project as side
 //! branches: their blocks follow the nearest dialogue ancestors, but children
 //! contract through them, so a copy of the session that lacks them still
-//! threads the same dialogue blocks. The session id, title and file path
-//! annotate the receipts of the file's leaves only. No source bytes are
-//! stored; [`SKIPPED_KINDS`] lists what is not projected and why.
+//! threads the same dialogue blocks. Sealed reasoning (a thinking block's
+//! `signature`, a `redacted_thinking` block's `data`) is kept as THINKING
+//! blob facts on a side block that follows its record's block. The session
+//! id, title and file path annotate the receipts of the file's leaves only; a
+//! subagent's `.meta.json` annotates its transcript's leaves. `history.jsonl`
+//! prompts that no transcript beside it holds become blocks of their own. No
+//! source bytes are stored; [`SKIPPED_KINDS`] lists what is not projected and
+//! why.
 
 /// Record kinds and fields that project to nothing, with the reason. Anything
 /// else of consequence is a block.
@@ -47,10 +52,6 @@ pub const SKIPPED_KINDS: &[(&str, &str)] = &[
         "UI and session state",
     ),
     ("ai-title, custom-title", "kept as the session title on the leaves"),
-    (
-        "message.content[].signature",
-        "sealed reasoning token only the provider can decrypt",
-    ),
     (
         "toolUseResult",
         "client-side structured mirror of the tool_result content block",
@@ -115,6 +116,13 @@ pub struct ProjectionStats {
     /// Side-branch projections of harness context (`attachment`) and
     /// `system` records.
     pub side_projections: usize,
+    /// Sealed reasoning tokens kept as THINKING blob facts.
+    pub sealed_tokens: usize,
+    /// `history.jsonl` prompts read.
+    pub history_prompts: usize,
+    /// Of those, prompts a transcript beside the log already holds; they
+    /// land on the transcript's blocks and project nothing here.
+    pub history_in_transcripts: usize,
     /// Ordered content parts emitted before set-level deduplication.
     pub content_parts: usize,
     /// Records projected to nothing: bookkeeping kinds, contentless records,
@@ -141,6 +149,9 @@ impl ProjectionStats {
         self.records_seen += other.records_seen;
         self.source_projections += other.source_projections;
         self.side_projections += other.side_projections;
+        self.sealed_tokens += other.sealed_tokens;
+        self.history_prompts += other.history_prompts;
+        self.history_in_transcripts += other.history_in_transcripts;
         self.content_parts += other.content_parts;
         self.skipped_records += other.skipped_records;
         self.missing_source_identity += other.missing_source_identity;
@@ -189,12 +200,60 @@ where
     if path.is_dir() {
         return project_directory(path, &mut emit);
     }
+    if path.file_name().and_then(|name| name.to_str()) == Some(HISTORY_FILE) {
+        return project_history(path, &mut emit);
+    }
+    // A subagent's `.meta.json` annotates its transcript's leaves, so it is
+    // projected through that transcript.
+    let path = &match path
+        .to_str()
+        .and_then(|name| name.strip_suffix(".meta.json"))
+    {
+        Some(stem) => PathBuf::from(format!("{stem}.jsonl")),
+        None => path.to_path_buf(),
+    };
 
     let prescan = prescan_file(path)?;
     let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan))
         .context("plan canonical Claude Code lineage")?;
     let snapshot = archive_source::freeze_file(path)?;
-    project_snapshot(path, snapshot, prescan.digest, &plan, &mut emit)
+    let meta = subagent_meta(path)?;
+    project_snapshot(path, snapshot, prescan.digest, &plan, meta, &mut emit)
+}
+
+/// The prompt log Claude Code keeps beside `projects/`.
+const HISTORY_FILE: &str = "history.jsonl";
+
+/// A subagent's `.meta.json`: its canonical JSON and its description.
+#[derive(Clone, Debug, Default)]
+struct SubagentMeta {
+    detail: String,
+    description: Option<String>,
+}
+
+/// Read `agent-<id>.meta.json` beside `agent-<id>.jsonl`, if there is one.
+fn subagent_meta(transcript: &Path) -> Result<Option<SubagentMeta>> {
+    let Some(stem) = transcript
+        .to_str()
+        .and_then(|name| name.strip_suffix(".jsonl"))
+    else {
+        return Ok(None);
+    };
+    let meta = PathBuf::from(format!("{stem}.meta.json"));
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let bytes = archive_source::read_file(&meta)?;
+    let detail = archive_source::canonical_json(bytes.clone())
+        .map_err(|error| anyhow!("parse {}: {error}", meta.display()))?;
+    let description = serde_json::from_slice::<serde_json::Value>(bytes.as_ref())
+        .ok()
+        .and_then(|value| value.get("description")?.as_str().map(str::to_owned))
+        .filter(|description| !description.trim().is_empty());
+    Ok(Some(SubagentMeta {
+        detail,
+        description,
+    }))
 }
 
 /// Project an immutable resident JSONL stream with the same canonical lineage
@@ -212,7 +271,7 @@ where
         digest: *blake3::hash(bytes.as_ref()).as_bytes(),
         bytes,
     };
-    project_snapshot(path, snapshot, prescan.digest, &plan, &mut emit)
+    project_snapshot(path, snapshot, prescan.digest, &plan, None, &mut emit)
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -855,8 +914,17 @@ where
     // per-file fragment unions concurrently.
     for (path, prescan) in paths.iter().zip(&prescans) {
         let snapshot = archive_source::freeze_file(path)?;
-        let projected = project_snapshot(path, snapshot, prescan.digest, &plan, emit)
+        let meta = subagent_meta(path)?;
+        let projected = project_snapshot(path, snapshot, prescan.digest, &plan, meta, emit)
             .with_context(|| format!("project Claude Code file {}", path.display()))?;
+        summary.fragments_emitted += projected.fragments_emitted;
+        summary.stats.absorb(projected.stats);
+    }
+
+    let history = root.join(HISTORY_FILE);
+    if history.is_file() {
+        let projected = project_history(&history, emit)?;
+        summary.files_scanned += 1;
         summary.fragments_emitted += projected.fragments_emitted;
         summary.stats.absorb(projected.stats);
     }
@@ -876,6 +944,7 @@ fn collect_jsonl_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
                 .extension()
                 .and_then(|extension| extension.to_str())
                 == Some("jsonl")
+            && entry_path.file_name().and_then(|name| name.to_str()) != Some(HISTORY_FILE)
         {
             out.push(entry_path);
         }
@@ -960,6 +1029,7 @@ fn project_snapshot<F>(
     snapshot: archive_source::FrozenSource,
     expected_digest: [u8; 32],
     plan: &SourcePlan,
+    meta: Option<SubagentMeta>,
     emit: &mut F,
 ) -> Result<ProjectionSummary>
 where
@@ -1031,7 +1101,10 @@ where
 
     // The session id, its title and this file's path annotate the leaves the
     // file projects, never every message.
-    let name = custom_title.or(ai_title);
+    let name = custom_title
+        .or(ai_title)
+        .or_else(|| meta.as_ref().and_then(|meta| meta.description.clone()));
+    let detail = meta.map(|meta| meta.detail);
     let mut annotated = BTreeSet::new();
     for (_, receipt) in leaves {
         if !annotated.insert(receipt) {
@@ -1043,6 +1116,7 @@ where
                 source_path: Some(source_path.to_string_lossy().into_owned()),
                 source_locator: session.as_ref().map(|id| format!("session/{id}")),
                 name: name.clone(),
+                source_detail: detail.clone(),
                 ..blockdag::ProjectionAnnotations::default()
             },
         )?;
@@ -1054,6 +1128,274 @@ where
         summary.fragments_emitted += 1;
     }
     Ok(summary)
+}
+
+// ---------------------------------------------------------------------------
+// history.jsonl: the prompt log
+// ---------------------------------------------------------------------------
+
+/// One prompt of the log, with pasted text expanded.
+struct HistoryPrompt {
+    text: String,
+    display: String,
+    timestamp: Option<Inline<NsTAIInterval>>,
+}
+
+/// Project the prompts of `history.jsonl` that no transcript beside it holds.
+///
+/// A prompt a transcript holds (as a user message, a queued prompt, or a
+/// slash command) is that transcript's block; it projects nothing here, so it
+/// cannot land anywhere else. The others (sessions whose transcripts are gone,
+/// prompts a transcript never recorded) become user TEXT blocks, chained per
+/// session in log order: the log is a contraction of the session to its
+/// prompts. The session id and the log's path annotate each chain's leaf.
+fn project_history<F>(path: &Path, emit: &mut F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
+    let root = path.parent().unwrap_or_else(|| Path::new("."));
+    let bytes = archive_source::read_file(path)?;
+    let mut sessions: std::collections::BTreeMap<String, Vec<HistoryPrompt>> = Default::default();
+    let mut order = Vec::<String>::new();
+    let mut stats = ProjectionStats::default();
+    let text = bytes.as_ref();
+    let complete = text
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |end| end + 1);
+    for line in text[..complete].split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        stats.records_seen += 1;
+        let Ok(entry) = serde_json::from_slice::<serde_json::Value>(line) else {
+            stats.skipped_records += 1;
+            continue;
+        };
+        let (Some(session), Some(display)) = (
+            entry.get("sessionId").and_then(serde_json::Value::as_str),
+            entry.get("display").and_then(serde_json::Value::as_str),
+        ) else {
+            stats.missing_source_identity += 1;
+            stats.skipped_records += 1;
+            continue;
+        };
+        stats.history_prompts += 1;
+        let text = expand_pasted(root, display, entry.get("pastedContents"));
+        let timestamp = entry
+            .get("timestamp")
+            .and_then(serde_json::Value::as_f64)
+            .map(Epoch::from_unix_milliseconds)
+            .and_then(epoch_interval);
+        if !sessions.contains_key(session) {
+            order.push(session.to_owned());
+        }
+        sessions
+            .entry(session.to_owned())
+            .or_default()
+            .push(HistoryPrompt {
+                text,
+                display: display.to_owned(),
+                timestamp,
+            });
+    }
+
+    let mut summary = ProjectionSummary {
+        files_scanned: 1,
+        ..ProjectionSummary::default()
+    };
+    for session in order {
+        let prompts = sessions.remove(&session).unwrap_or_default();
+        let known = transcript_prompts(root, &session)?;
+        let mut previous = None::<Id>;
+        let mut leaf = None::<Id>;
+        for prompt in prompts {
+            if known.holds(&prompt) {
+                stats.history_in_transcripts += 1;
+                continue;
+            }
+            if prompt.text.trim().is_empty() {
+                stats.skipped_records += 1;
+                continue;
+            }
+            let fact = blockdag::text_fact(
+                schema::content_fact::modality::TEXT,
+                schema::content_fact::direction::IN,
+                prompt.text,
+            )?;
+            let parts = blockdag::content_part(0, fact, None)?;
+            stats.content_parts += 1;
+            let block = blockdag::block(previous, prompt.timestamp, parts)?;
+            let block_id = block.root().expect("canonical block is rooted");
+            let receipt = blockdag::block_source_projection(
+                schema::source_projection::SOURCE_CLAUDE_CODE,
+                block,
+            )?;
+            let receipt = blockdag::annotate_source_projection(
+                receipt,
+                blockdag::ProjectionAnnotations {
+                    source_timestamp: prompt.timestamp,
+                    raw_role: Some("user".to_owned()),
+                    ..blockdag::ProjectionAnnotations::default()
+                },
+            )?;
+            leaf = receipt.root();
+            emit(ProjectedFile {
+                source_path: path.to_path_buf(),
+                fragment: receipt,
+                stats: ProjectionStats::default(),
+            })?;
+            summary.fragments_emitted += 1;
+            stats.source_projections += 1;
+            previous = Some(block_id);
+        }
+        if let Some(leaf) = leaf {
+            emit(ProjectedFile {
+                source_path: path.to_path_buf(),
+                fragment: blockdag::source_occurrence(
+                    leaf,
+                    blockdag::ProjectionAnnotations {
+                        source_path: Some(path.to_string_lossy().into_owned()),
+                        source_locator: Some(format!("session/{session}")),
+                        ..blockdag::ProjectionAnnotations::default()
+                    },
+                )?,
+                stats: ProjectionStats::default(),
+            })?;
+            summary.fragments_emitted += 1;
+        }
+    }
+    summary.stats = stats;
+    Ok(summary)
+}
+
+/// Replace `[Pasted text #N ...]` placeholders with the pasted text: inline
+/// `content`, or `paste-cache/<contentHash>.txt` beside the log.
+fn expand_pasted(root: &Path, display: &str, pasted: Option<&serde_json::Value>) -> String {
+    let mut text = display.to_owned();
+    let Some(pasted) = pasted.and_then(serde_json::Value::as_object) else {
+        return text;
+    };
+    for (id, entry) in pasted {
+        let content = match entry.get("content").and_then(serde_json::Value::as_str) {
+            Some(content) => Some(content.to_owned()),
+            None => entry
+                .get("contentHash")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|hash| {
+                    fs::read_to_string(root.join("paste-cache").join(format!("{hash}.txt"))).ok()
+                }),
+        };
+        let Some(content) = content else {
+            continue;
+        };
+        let marker = format!("[Pasted text #{id}");
+        if let Some(start) = text.find(&marker) {
+            if let Some(length) = text[start..].find(']') {
+                text.replace_range(start..start + length + 1, &content);
+            }
+        }
+    }
+    text
+}
+
+/// The prompts the transcripts of one session hold.
+#[derive(Default)]
+struct TranscriptPrompts {
+    texts: HashSet<String>,
+    commands: HashSet<String>,
+}
+
+impl TranscriptPrompts {
+    fn holds(&self, prompt: &HistoryPrompt) -> bool {
+        if self.texts.contains(&prompt.text)
+            || self.texts.contains(&prompt.display)
+            || self.texts.contains(prompt.text.trim())
+        {
+            return true;
+        }
+        prompt
+            .display
+            .strip_prefix('/')
+            .and_then(|command| command.split_whitespace().next())
+            .is_some_and(|command| self.commands.contains(command))
+    }
+}
+
+/// Read every `projects/*/<session>.jsonl` beside the log for its prompts.
+fn transcript_prompts(root: &Path, session: &str) -> Result<TranscriptPrompts> {
+    let mut prompts = TranscriptPrompts::default();
+    let projects = root.join("projects");
+    let Ok(entries) = fs::read_dir(&projects) else {
+        return Ok(prompts);
+    };
+    for entry in entries {
+        let transcript = entry?.path().join(format!("{session}.jsonl"));
+        let Ok(file) = File::open(&transcript) else {
+            continue;
+        };
+        for line in BufReader::new(file).split(b'\n') {
+            let line = line?;
+            let user = memchr::memmem::find(&line, b"\"type\":\"user\"").is_some();
+            let queued = memchr::memmem::find(&line, b"queued_command").is_some();
+            let command = memchr::memmem::find(&line, b"<command-name>").is_some();
+            if !(user || queued || command) {
+                continue;
+            }
+            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if let Some(content) = record
+                .get("message")
+                .and_then(|message| message.get("content"))
+            {
+                let text = match content {
+                    serde_json::Value::String(text) => Some(text.clone()),
+                    serde_json::Value::Array(blocks) => {
+                        let texts: Vec<&str> = blocks
+                            .iter()
+                            .filter(|block| {
+                                block.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("text")
+                            })
+                            .filter_map(|block| block.get("text")?.as_str())
+                            .collect();
+                        (!texts.is_empty()).then(|| texts.concat())
+                    }
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    collect_commands(&text, &mut prompts.commands);
+                    prompts.texts.insert(text.trim().to_owned());
+                    prompts.texts.insert(text);
+                }
+            }
+            if let Some(prompt) = record
+                .get("attachment")
+                .and_then(|attachment| attachment.get("prompt"))
+                .and_then(serde_json::Value::as_str)
+            {
+                prompts.texts.insert(prompt.trim().to_owned());
+                prompts.texts.insert(prompt.to_owned());
+            }
+            if let Some(content) = record.get("content").and_then(serde_json::Value::as_str) {
+                collect_commands(content, &mut prompts.commands);
+            }
+        }
+    }
+    Ok(prompts)
+}
+
+fn collect_commands(text: &str, commands: &mut HashSet<String>) {
+    let mut rest = text;
+    while let Some(start) = rest.find("<command-name>") {
+        rest = &rest[start + "<command-name>".len()..];
+        let Some(end) = rest.find("</command-name>") else {
+            break;
+        };
+        commands.insert(rest[..end].trim_start_matches('/').to_owned());
+        rest = &rest[end..];
+    }
 }
 
 #[cfg(test)]
@@ -1114,8 +1456,76 @@ fn is_side_record(record: &RawRecord) -> bool {
     match record.record_type.as_str() {
         "attachment" => record.attachment_type.as_deref() != Some("total_tokens_reminder"),
         "system" => record.subtype.as_deref() != Some("turn_duration"),
+        // A dialogue record without readable content can still carry
+        // sealed reasoning, which follows its nearest dialogue ancestors.
+        "user" | "assistant" => record.has_sealed(),
         _ => false,
     }
+}
+
+/// Project a dialogue record's sealed reasoning tokens as one side-branch
+/// block of THINKING blob facts. It follows the record's own block when the
+/// record has readable content, else the record's nearest dialogue ancestors,
+/// and no dialogue block follows it: a copy without the tokens threads the
+/// same dialogue.
+fn project_sealed(
+    record: &RawRecord,
+    class: &SourceKey,
+    own_block: Option<Id>,
+    plan: &SourcePlan,
+    corpus: &mut Fragment,
+    stats: &mut ProjectionStats,
+) -> Result<()> {
+    let mut parts = Fragment::empty();
+    let mut ordinal = 0u64;
+    for (token, media_type) in record
+        .blocks
+        .iter()
+        .filter_map(|block| block.sealed.as_ref())
+    {
+        let fact = archive_source::sealed_fact(
+            token,
+            media_type,
+            archive_source::SealedAlphabet::Standard,
+        )?;
+        parts += blockdag::content_part(ordinal, fact, None)?;
+        ordinal += 1;
+        stats.content_parts += 1;
+        stats.sealed_tokens += 1;
+    }
+    if ordinal == 0 {
+        return Ok(());
+    }
+    let mut predecessors = BTreeSet::new();
+    match own_block {
+        Some(block) => {
+            predecessors.insert(block);
+        }
+        None => {
+            for parent in plan.side_parents.get(class).into_iter().flatten() {
+                match plan.blocks.get(parent) {
+                    Some(block) => {
+                        predecessors.insert(*block);
+                    }
+                    None => stats.unresolved_parents += 1,
+                }
+            }
+        }
+    }
+    let timestamp = record.timestamp.and_then(epoch_interval);
+    let block = blockdag::block(predecessors, timestamp, parts)?;
+    let receipt =
+        blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, block)?;
+    *corpus += blockdag::annotate_source_projection(
+        receipt,
+        blockdag::ProjectionAnnotations {
+            source_timestamp: timestamp,
+            raw_model: record.model.clone(),
+            ..blockdag::ProjectionAnnotations::default()
+        },
+    )?;
+    stats.side_projections += 1;
+    Ok(())
 }
 
 /// Project one record. Returns the dialogue class and receipt it projected,
@@ -1182,7 +1592,11 @@ fn project_record(
     }
 
     if parts.exports().next().is_none() {
-        stats.skipped_records += 1;
+        if record.has_sealed() {
+            project_sealed(&record, &class, None, plan, corpus, stats)?;
+        } else {
+            stats.skipped_records += 1;
+        }
         return Ok(None);
     }
 
@@ -1225,6 +1639,7 @@ fn project_record(
         );
     }
 
+    project_sealed(&record, &class, Some(block_id), plan, corpus, stats)?;
     let receipt =
         blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, block)?;
     let receipt = blockdag::annotate_source_projection(
@@ -1434,6 +1849,10 @@ struct ForkedFrom {
 }
 
 impl RawRecord {
+    fn has_sealed(&self) -> bool {
+        self.blocks.iter().any(|block| block.sealed.is_some())
+    }
+
     fn source_key(&self) -> Option<SourceKey> {
         Some(SourceKey::new(self.session_id.clone()?, self.uuid.clone()?))
     }
@@ -1453,6 +1872,9 @@ struct RawBlock {
     kind: BlockKind,
     correlator: Option<String>,
     items: Vec<RawItem>,
+    /// A sealed reasoning token and its media type: a thinking block's
+    /// `signature` or a `redacted_thinking` block's `data`.
+    sealed: Option<(String, &'static str)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1549,6 +1971,8 @@ struct RawImageSource {
 #[derive(Default)]
 struct BlockAccum {
     block_type: String,
+    signature: Option<String>,
+    data: Option<String>,
     text: Option<String>,
     thinking: Option<String>,
     tool_id: Option<String>,
@@ -1695,6 +2119,7 @@ fn scan_content(bytes: &mut Bytes) -> std::result::Result<Vec<RawBlock>, sc::Sca
             kind: BlockKind::Text,
             correlator: None,
             items: vec![RawItem::Text(bytes_to_string(sc::parse_string(bytes)?)?)],
+            sealed: None,
         }]),
         Some(b'[') => {
             let mut blocks = Vec::new();
@@ -1721,7 +2146,8 @@ fn scan_content_block(bytes: &mut Bytes) -> std::result::Result<RawBlock, sc::Sc
             "type" => block.block_type = parse_optional_string(value)?.unwrap_or_default(),
             "text" => block.text = parse_optional_string(value)?,
             "thinking" => block.thinking = parse_optional_string(value)?,
-            "signature" => sc::skip_value(value)?,
+            "signature" => block.signature = parse_optional_string(value)?,
+            "data" => block.data = parse_optional_string(value)?,
             "id" => block.tool_id = parse_optional_string(value)?,
             "name" => block.tool_name = parse_optional_string(value)?,
             "tool_use_id" => block.tool_use_id = parse_optional_string(value)?,
@@ -1737,16 +2163,47 @@ fn scan_content_block(bytes: &mut Bytes) -> std::result::Result<RawBlock, sc::Sc
 }
 
 fn build_block(block: BlockAccum) -> std::result::Result<RawBlock, sc::ScanError> {
+    let sealed = match block.block_type.as_str() {
+        "thinking" => block
+            .signature
+            .clone()
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                (
+                    token,
+                    schema::content_fact::sealed::ANTHROPIC_THINKING_SIGNATURE,
+                )
+            }),
+        "redacted_thinking" => block
+            .data
+            .clone()
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                (
+                    token,
+                    schema::content_fact::sealed::ANTHROPIC_REDACTED_THINKING,
+                )
+            }),
+        _ => None,
+    };
+    let mut raw = build_unsealed_block(block)?;
+    raw.sealed = sealed;
+    Ok(raw)
+}
+
+fn build_unsealed_block(block: BlockAccum) -> std::result::Result<RawBlock, sc::ScanError> {
     Ok(match block.block_type.as_str() {
         "text" => RawBlock {
             kind: BlockKind::Text,
             correlator: None,
             items: block.text.into_iter().map(RawItem::Text).collect(),
+            sealed: None,
         },
         "thinking" => RawBlock {
             kind: BlockKind::Thinking,
             correlator: None,
             items: block.thinking.into_iter().map(RawItem::Text).collect(),
+            sealed: None,
         },
         "tool_use" => RawBlock {
             kind: BlockKind::ToolUse,
@@ -1755,6 +2212,7 @@ fn build_block(block: BlockAccum) -> std::result::Result<RawBlock, sc::ScanError
                 block.tool_name,
                 block.input_raw,
             )?)],
+            sealed: None,
         },
         "tool_result" => {
             let mut items = Vec::with_capacity(
@@ -1766,17 +2224,20 @@ fn build_block(block: BlockAccum) -> std::result::Result<RawBlock, sc::ScanError
                 kind: BlockKind::ToolResult,
                 correlator: block.tool_use_id,
                 items,
+                sealed: None,
             }
         }
         "image" => RawBlock {
             kind: BlockKind::Image,
             correlator: None,
             items: block.image_source.into_iter().map(RawItem::Image).collect(),
+            sealed: None,
         },
         _ => RawBlock {
             kind: BlockKind::Other,
             correlator: None,
             items: Vec::new(),
+            sealed: None,
         },
     })
 }
@@ -1910,7 +2371,7 @@ mod tests {
     use triblespace::core::metadata;
     use triblespace::core::repo::pile::{Pile, PileSnapshot};
     use triblespace::core::repo::BlobStoreGet;
-    use triblespace::prelude::blobencodings::UTF8String;
+    use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
 
     use super::*;
@@ -1932,10 +2393,17 @@ mod tests {
             bytes,
         };
         let mut fragment = Fragment::empty();
-        let summary = project_snapshot(path, snapshot, prescan.digest, &plan, &mut |projected| {
-            fragment += projected.fragment;
-            Ok(())
-        })
+        let summary = project_snapshot(
+            path,
+            snapshot,
+            prescan.digest,
+            &plan,
+            None,
+            &mut |projected| {
+                fragment += projected.fragment;
+                Ok(())
+            },
+        )
         .unwrap();
         Projected {
             fragment,
@@ -2002,10 +2470,165 @@ mod tests {
     }
 
     #[test]
+    fn sealed_thinking_is_kept_as_bytes_off_the_dialogue() {
+        let token = BASE64_STANDARD.encode([7u8; 48]);
+        let signed = SINGLE_FILE.replace(
+            r#""signature":"opaque""#,
+            &format!(r#""signature":"{token}""#),
+        );
+        let unsigned = SINGLE_FILE.replace(r#","signature":"opaque""#, "");
+        let signed = project_text(&signed, Path::new("signed.jsonl"));
+        let unsigned = project_text(&unsigned, Path::new("unsigned.jsonl"));
+        assert_eq!(signed.stats.sealed_tokens, 1);
+        assert_eq!(unsigned.stats.sealed_tokens, 0);
+        // The dialogue is the same blocks with or without the token.
+        let dialogue = |fragment: &Fragment| {
+            ["hello there", "consider it", "screenshot below"]
+                .map(|needle| block_with_payload(fragment, needle))
+        };
+        assert_eq!(dialogue(&signed.fragment), dialogue(&unsigned.fragment));
+        // The token is a THINKING blob of its decoded bytes, typed as what it
+        // is, on a block that follows the assistant's block.
+        let assistant = block_with_payload(&signed.fragment, "consider it");
+        let bytes = signed.fragment.clone().put::<RawBytes, _>(vec![7u8; 48]);
+        let media = signed.fragment.clone().put::<UTF8String, _>(
+            schema::content_fact::sealed::ANTHROPIC_THINKING_SIGNATURE.to_owned(),
+        );
+        assert!(exists!(pattern!(&signed.fragment, [
+            { _?sealed @ schema::block::previous: assistant,
+                schema::block::contains: _?part },
+            { _?part @ schema::content_part::fact: _?fact },
+            { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::THINKING,
+                schema::content_fact::blob: bytes,
+                schema::content_fact::media_type: _?media_type },
+            { _?media_type @ metadata::name: media },
+        ])));
+    }
+
+    #[test]
+    fn history_prompts_land_on_transcript_blocks_or_chain_on_their_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("projects/p")).unwrap();
+        fs::create_dir_all(root.join("paste-cache")).unwrap();
+        fs::write(root.join("paste-cache/abc.txt"), "pasted body").unwrap();
+        fs::write(
+            root.join("projects/p/kept.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"kept","uuid":"u1","message":{"role":"user","content":"in the transcript"}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"local_command","sessionId":"kept","uuid":"s1","parentUuid":"u1","content":"<command-name>/model</command-name>"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("history.jsonl"),
+            concat!(
+                r#"{"display":"in the transcript","pastedContents":{},"timestamp":1772379241539,"project":"/p","sessionId":"kept"}"#,
+                "\n",
+                r#"{"display":"/model","pastedContents":{},"timestamp":1772379241600,"project":"/p","sessionId":"kept"}"#,
+                "\n",
+                r#"{"display":"queued while busy","pastedContents":{},"timestamp":1772379241700,"project":"/p","sessionId":"kept"}"#,
+                "\n",
+                r#"{"display":"first of a lost session","pastedContents":{},"timestamp":1772379242000,"project":"/p","sessionId":"lost"}"#,
+                "\n",
+                r#"{"display":"see [Pasted text #1 +3 lines]","pastedContents":{"1":{"id":1,"type":"text","contentHash":"abc"}},"timestamp":1772379243000,"project":"/p","sessionId":"lost"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut history = Fragment::empty();
+        let summary = project_path(&root.join("history.jsonl"), |projected| {
+            history += projected.fragment;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(summary.stats.history_prompts, 5);
+        assert_eq!(summary.stats.history_in_transcripts, 2);
+        assert_eq!(summary.stats.source_projections, 3);
+        // A prompt the transcript holds projects nothing from the log, so it
+        // lands only on the transcript's own block.
+        let transcript = project_text(
+            &fs::read_to_string(root.join("projects/p/kept.jsonl")).unwrap(),
+            Path::new("kept.jsonl"),
+        );
+        let kept = block_with_payload(&transcript.fragment, "in the transcript");
+        assert!(!ids_with_tag(&history, schema::block::KIND).contains(&kept));
+        // The lost session's prompts chain in log order, with the paste.
+        let first = block_with_payload(&history, "first of a lost session");
+        let second = block_with_payload(&history, "see pasted body");
+        assert!(exists!(
+            pattern!(&history, [{ second @ schema::block::previous: first }])
+        ));
+        // Importing the whole directory lands the same blocks.
+        let mut union = Fragment::empty();
+        project_path(root, |projected| {
+            union += projected.fragment;
+            Ok(())
+        })
+        .unwrap();
+        assert!(ids_with_tag(&history, schema::block::KIND)
+            .is_subset(&ids_with_tag(&union, schema::block::KIND)));
+        assert!(ids_with_tag(&union, schema::block::KIND).contains(&kept));
+    }
+
+    #[test]
+    fn subagent_meta_annotates_the_transcript_leaves() {
+        let directory = tempfile::tempdir().unwrap();
+        let agents = directory.path().join("session/subagents");
+        fs::create_dir_all(&agents).unwrap();
+        let transcript = agents.join("agent-a1.jsonl");
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","sessionId":"session","agentId":"a1","isSidechain":true,"uuid":"q","message":{"role":"user","content":"audit this"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"session","agentId":"a1","isSidechain":true,"uuid":"a","parentUuid":"q","message":{"role":"assistant","content":"done"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            agents.join("agent-a1.meta.json"),
+            r#"{"description":"Audit the code","agentType":"general-purpose","toolUseId":"toolu_1","spawnDepth":1}"#,
+        )
+        .unwrap();
+        for path in [transcript.clone(), agents.join("agent-a1.meta.json")] {
+            let mut union = Fragment::empty();
+            project_path(&path, |projected| {
+                union += projected.fragment;
+                Ok(())
+            })
+            .unwrap();
+            let leaf = block_with_payload(&union, "done");
+            let detail = union.put::<UTF8String, _>(
+                r#"{"agentType":"general-purpose","description":"Audit the code","spawnDepth":1,"toolUseId":"toolu_1"}"#
+                    .to_owned(),
+            );
+            let name = union.put::<UTF8String, _>("Audit the code".to_owned());
+            assert!(exists!(pattern!(&union, [{
+                _?receipt @ schema::source_projection::projects_to: leaf,
+                schema::source_projection::source_detail: detail,
+                metadata::name: name
+            }])));
+            let root = block_with_payload(&union, "audit this");
+            assert!(!exists!(pattern!(&union, [{
+                _?receipt @ schema::source_projection::projects_to: root,
+                schema::source_projection::source_detail: _?any
+            }])));
+        }
+    }
+
+    #[test]
     fn projection_is_canonical_and_does_not_fabricate_missing_time_or_actors() {
         let projected = project_text(SINGLE_FILE, Path::new("/imports/session.jsonl"));
         assert_eq!(projected.stats.source_projections, 3);
-        assert_eq!(projected.stats.content_parts, 6);
+        // Six readable parts, and the thinking block's signature.
+        assert_eq!(projected.stats.content_parts, 7);
+        assert_eq!(projected.stats.sealed_tokens, 1);
+        assert_eq!(projected.stats.side_projections, 1);
         assert_eq!(projected.stats.unresolved_tool_results, 0);
         assert_eq!(projected.stats.undecodable_images, 0);
 
@@ -2180,7 +2803,7 @@ mod tests {
         .unwrap();
         let snapshot = archive_source::freeze_file(&path).unwrap();
         let mut emitted = 0usize;
-        let error = project_snapshot(&path, snapshot, prescan.digest, &plan, &mut |_| {
+        let error = project_snapshot(&path, snapshot, prescan.digest, &plan, None, &mut |_| {
             emitted += 1;
             Ok(())
         })

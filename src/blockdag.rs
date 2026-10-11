@@ -61,6 +61,8 @@ pub struct ProjectionAnnotations {
     pub source_locator: Option<String>,
     /// Human-readable title of that conversation, as the provider spelled it.
     pub name: Option<String>,
+    /// Canonical JSON of provider metadata about that conversation.
+    pub source_detail: Option<String>,
 }
 
 type TextHandle = Inline<Handle<UTF8String>>;
@@ -442,6 +444,9 @@ pub fn annotate_source_projection(
     let name = annotations
         .name
         .map(|value| projection.put::<UTF8String, _>(value));
+    let source_detail = annotations
+        .source_detail
+        .map(|value| projection.put::<UTF8String, _>(value));
 
     projection += entity! { ExclusiveId::force_ref(&root) @
         schema::source_projection::semantic_predecessor_support*:
@@ -455,6 +460,7 @@ pub fn annotate_source_projection(
         files_schema::file::source_path?: source_path.as_ref(),
         schema::source_projection::source_locator?: source_locator.as_ref(),
         metadata::name?: name.as_ref(),
+        schema::source_projection::source_detail?: source_detail.as_ref(),
     };
     debug_assert_eq!(projection.root(), Some(root));
     Ok(projection)
@@ -545,8 +551,10 @@ fn textual_modality(value: Id) -> bool {
     .contains(&value)
 }
 
+/// THINKING is both: readable reasoning is text, sealed reasoning is bytes.
 fn media_modality(value: Id) -> bool {
     [
+        schema::content_fact::modality::THINKING,
         schema::content_fact::modality::AUDIO,
         schema::content_fact::modality::IMAGE,
         schema::content_fact::modality::FILE,
@@ -768,6 +776,10 @@ where
     let raw_models = values_by_entity(find!(
         (entity: Id, value: TextHandle),
         pattern!(facts, [{ ?entity @ schema::source_projection::raw_model: ?value }])
+    ));
+    let source_details = values_by_entity(find!(
+        (entity: Id, value: TextHandle),
+        pattern!(facts, [{ ?entity @ schema::source_projection::source_detail: ?value }])
     ));
     let source_paths = values_by_entity(find!(
         (entity: Id, value: TextHandle),
@@ -1046,9 +1058,11 @@ where
         let receipt_raw_models = values_for(&raw_models, *id);
         let paths = values_for(&source_paths, *id);
         let names = values_for(&media_names, *id);
+        let details = values_for(&source_details, *id);
 
         attachments.texts.extend(locators.iter().copied());
         attachments.texts.extend(names.iter().copied());
+        attachments.texts.extend(details.iter().copied());
         attachments.raws.extend(raws.iter().copied());
         attachments
             .texts
@@ -1097,6 +1111,7 @@ where
             schema::source_projection::raw_model*: receipt_raw_models.iter(),
             files_schema::file::source_path*: paths.iter(),
             metadata::name*: names.iter(),
+            schema::source_projection::source_detail*: details.iter(),
         }
         .into_facts();
         expected += canonical;
@@ -1615,6 +1630,7 @@ mod tests {
                 source_path: Some("/moved/export.jsonl".into()),
                 source_locator: Some("conversation/7".into()),
                 name: Some("A title".into()),
+                source_detail: Some(r#"{"agentType":"general-purpose"}"#.into()),
             },
         )
         .unwrap();

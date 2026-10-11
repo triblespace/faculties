@@ -396,6 +396,53 @@ pub fn owned_text(value: impl Into<String>) -> View<str> {
         .expect("String is valid UTF-8")
 }
 
+/// Wire alphabet of a sealed reasoning token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SealedAlphabet {
+    /// RFC 4648 base64 with padding (Anthropic signatures).
+    Standard,
+    /// RFC 4648 URL-safe base64 with padding (OpenAI Fernet tokens).
+    UrlSafe,
+}
+
+/// The bytes of one sealed reasoning token and the media type that says what
+/// they are. A token is decoded when its base64 spelling round-trips exactly,
+/// so the provider's own spelling is recoverable from the bytes and the type.
+/// Otherwise the token's exact text is kept under `<media_type>+text`.
+pub fn sealed_bytes(token: &str, media_type: &str, alphabet: SealedAlphabet) -> (Vec<u8>, String) {
+    use base64::Engine as _;
+    let engine = match alphabet {
+        SealedAlphabet::Standard => &base64::engine::general_purpose::STANDARD,
+        SealedAlphabet::UrlSafe => &base64::engine::general_purpose::URL_SAFE,
+    };
+    match engine.decode(token.as_bytes()) {
+        Ok(bytes) if engine.encode(&bytes) == token => (bytes, media_type.to_owned()),
+        _ => (token.as_bytes().to_vec(), format!("{media_type}+text")),
+    }
+}
+
+/// One sealed reasoning token as a THINKING blob fact.
+pub fn sealed_fact(token: &str, media_type: &str, alphabet: SealedAlphabet) -> Result<Fragment> {
+    let (bytes, media_type) = sealed_bytes(token, media_type, alphabet);
+    blockdag::blob_fact(
+        schema::content_fact::modality::THINKING,
+        schema::content_fact::direction::OUT,
+        bytes,
+        &media_type,
+    )
+}
+
+/// One sealed reasoning token as a source part.
+pub fn sealed_part(token: &str, media_type: &str, alphabet: SealedAlphabet) -> SourcePart {
+    let (bytes, media_type) = sealed_bytes(token, media_type, alphabet);
+    SourcePart::Blob {
+        modality: schema::content_fact::modality::THINKING,
+        direction: schema::content_fact::direction::OUT,
+        bytes: Bytes::from_source(bytes),
+        media_type: owned_text(media_type),
+    }
+}
+
 /// Pick a canonical binary modality from a MIME spelling.
 pub fn modality_for_media_type(media_type: &str) -> Id {
     if media_type.starts_with("image/") {
