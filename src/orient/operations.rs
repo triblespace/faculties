@@ -7995,6 +7995,7 @@ mod tests {
                 daemon: None,
                 provider_publication_budget: Some(0),
                 bind: None,
+                walk_algorithm: triblespace_net::walk_stream::Algorithm::Prefix,
             },
         );
         let sources = test_block_on(OrientSources::open(
