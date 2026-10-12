@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Follow the network library's default walk preference in foreground Leech
+  construction instead of forcing Prefix. Collection selection and one-way
+  authorization are unchanged; this source change does not restart a service.
+
 - Build against the triblespace sync redesign (transport generation 30), which
   removed `PeerConfig::peers`. `TRIBLESPACE_PEERS` is gone: nothing reads it.
   A command's first network contact is the pile's sync daemon, named by the key
