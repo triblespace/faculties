@@ -29,6 +29,15 @@ pub struct BreezeSources {
     pub pile: PathBuf,
     pub reference_wav: PathBuf,
     pub reference_text: PathBuf,
+    /// Where the clip's encoded codes are kept between starts, so a start
+    /// reads them back instead of encoding the clip on the CPU again (21 to
+    /// 24 s on sky for the live clip). `FACULTIES_BREEZE_REFERENCE_CACHE`
+    /// names it; empty disables it; unset means
+    /// `$XDG_CACHE_HOME/faculties/breeze-reference` or
+    /// `~/.cache/faculties/breeze-reference`, like the other faculty caches.
+    /// The files are keyed by clip, transcript, encoder weights and encoder
+    /// version, so one directory serves every binary and every voice.
+    pub reference_cache: Option<PathBuf>,
     pub direction: Option<String>,
     pub cfg_scale: f32,
 }
@@ -100,10 +109,19 @@ impl ModelSources {
                         "Breeze reads its model from the pile's model collection; it needs a pile",
                     )?
                     .to_path_buf();
+                let reference_cache = match get("FACULTIES_BREEZE_REFERENCE_CACHE") {
+                    Some(value) if value.is_empty() => None,
+                    Some(value) => Some(PathBuf::from(value)),
+                    None => get("XDG_CACHE_HOME")
+                        .map(PathBuf::from)
+                        .or_else(|| get("HOME").map(|home| PathBuf::from(home).join(".cache")))
+                        .map(|base| base.join("faculties").join("breeze-reference")),
+                };
                 Ok(Self::Breeze(BreezeSources {
                     pile,
                     reference_wav: path("FACULTIES_BREEZE_REFERENCE_WAV")?,
                     reference_text: path("FACULTIES_BREEZE_REFERENCE_TEXT")?,
+                    reference_cache,
                     direction,
                     cfg_scale,
                 }))
@@ -347,6 +365,7 @@ impl Synthesizer {
             lane: mary::models::breeze::PROMPT_LANE,
             reference_wav: source.reference_wav.clone(),
             reference_text: ref_text,
+            reference_cache: source.reference_cache.clone(),
             direction: source.direction.clone(),
             options: GenerationOptions {
                 cfg_scale: source.cfg_scale,
@@ -624,6 +643,10 @@ mod tests {
         assert_eq!(source.reference_text, Path::new("/explicit/known.txt"));
         assert_eq!(source.cfg_scale, 1.0);
         assert!(source.direction.is_none());
+        assert!(
+            source.reference_cache.is_none(),
+            "no cache without a cache home"
+        );
         if cfg!(feature = "voice-breeze") {
             selected.check_backend().unwrap();
         } else {
@@ -633,6 +656,51 @@ mod tests {
                 .to_string()
                 .contains("voice-breeze"));
         }
+    }
+
+    #[test]
+    fn breeze_reference_cache_is_explicit_or_the_faculty_cache_home() {
+        let cache = |extra: &[(&'static str, OsString)]| {
+            let mut settings = breeze_settings();
+            settings.extend_from_slice(extra);
+            match parse_settings(&settings).unwrap() {
+                ModelSources::Breeze(source) => source.reference_cache,
+                _ => panic!("wrong backend"),
+            }
+        };
+        assert_eq!(
+            cache(&[("HOME", "/home/someone".into())]),
+            Some(PathBuf::from(
+                "/home/someone/.cache/faculties/breeze-reference"
+            ))
+        );
+        assert_eq!(
+            cache(&[
+                ("HOME", "/home/someone".into()),
+                ("XDG_CACHE_HOME", "/var/cache/someone".into()),
+            ]),
+            Some(PathBuf::from(
+                "/var/cache/someone/faculties/breeze-reference"
+            ))
+        );
+        assert_eq!(
+            cache(&[
+                ("HOME", "/home/someone".into()),
+                (
+                    "FACULTIES_BREEZE_REFERENCE_CACHE",
+                    "/staged/run/reference".into()
+                ),
+            ]),
+            Some(PathBuf::from("/staged/run/reference"))
+        );
+        assert_eq!(
+            cache(&[
+                ("HOME", "/home/someone".into()),
+                ("FACULTIES_BREEZE_REFERENCE_CACHE", "".into()),
+            ]),
+            None,
+            "an empty value disables the cache"
+        );
     }
 
     #[test]

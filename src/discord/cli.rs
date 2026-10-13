@@ -82,6 +82,18 @@ enum Command {
         /// The clip.
         wav: PathBuf,
     },
+    /// Load the voice the way `live --voice-channel` does, without Discord,
+    /// speak TEXT to nowhere, and exit. Run it through the staged binary's
+    /// launcher before a switch: the live start then finds the reference
+    /// codes and the codec's kernels already cached, and its first line
+    /// comes in seconds instead of after their 22 s and 15 s. Needs the pile
+    /// whose model collection holds the voice (`--pile` or `PILE`) and a
+    /// build with the discord-voice feature.
+    Warm {
+        /// What to speak into the void; a short line is enough.
+        #[arg(default_value = "The voice is warm.")]
+        text: String,
+    },
 }
 
 #[derive(Args)]
@@ -214,6 +226,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Command::Collection(command) => command,
         Command::Live(args) => return run_live(&cli, args),
         Command::Say { state, text } => return say(state.state_dir, &text, out),
+        Command::Warm { text } => return warm(cli.pile.as_deref(), &text, out),
         #[cfg(feature = "discord-hearing")]
         Command::Hear { wav } => {
             let pile = cli
@@ -454,6 +467,34 @@ fn say(_: Option<PathBuf>, _: &str, _: &mut Out<'_>) -> Result<()> {
     bail!(NO_VOICE)
 }
 
+/// `discord warm`: the voice loaded and one line spoken, with no Discord.
+/// Loading and speaking are what fill the caches a start reads; both are
+/// timed so a run of this after a switch candidate is staged shows what the
+/// live start will pay.
+#[cfg(feature = "discord-voice")]
+fn warm(pile: Option<&std::path::Path>, text: &str, out: &mut Out<'_>) -> Result<()> {
+    use crate::voice::synthesis::{ModelSources, Synthesizer};
+    let synthesizer = Synthesizer::new(ModelSources::from_environment(pile));
+    let started = std::time::Instant::now();
+    synthesizer.prime()?;
+    out.line(format!(
+        "voice loaded in {:.1} s",
+        started.elapsed().as_secs_f64()
+    ))?;
+    let started = std::time::Instant::now();
+    let clip = synthesizer.synthesize(text)?;
+    out.line(format!(
+        "spoke {:.1} s of audio in {:.1} s",
+        clip.duration_seconds(),
+        started.elapsed().as_secs_f64()
+    ))
+}
+
+#[cfg(not(feature = "discord-voice"))]
+fn warm(_: Option<&std::path::Path>, _: &str, _: &mut Out<'_>) -> Result<()> {
+    bail!(NO_VOICE)
+}
+
 fn require_token(cli: &Cli) -> Result<String> {
     if cli.token.is_none() {
         let pile = cli.pile.clone().ok_or_else(|| anyhow!(
@@ -527,6 +568,11 @@ mod tests {
         assert!(live.intake_dms);
         // A voice channel is nothing without its guild.
         assert!(Cli::try_parse_from(["discord", "live", "--voice-channel", "2"]).is_err());
+        let cli = Cli::try_parse_from(["discord", "warm"]).unwrap();
+        let Some(Command::Warm { text }) = cli.command else {
+            panic!("warm parses as warm");
+        };
+        assert_eq!(text, "The voice is warm.");
         let cli = Cli::try_parse_from(["discord", "say", "--state-dir", "/s", "hello"]).unwrap();
         let Some(Command::Say { state, text }) = cli.command else {
             panic!("say parses as say");
