@@ -93,7 +93,7 @@ enum Command {
         /// What to speak into the void; a short line is enough.
         #[arg(default_value = "The voice is warm.")]
         text: String,
-        /// Also load the hearing model the way `live --hear` does and have
+        /// First load the hearing model the way `live --hear` does and have
         /// it transcribe the voice's reference clip once, so that a start
         /// with --hear finds its kernels cached too (its first load in a new
         /// directory otherwise compiles them for 17 s, and the voice's first
@@ -475,15 +475,25 @@ fn say(_: Option<PathBuf>, _: &str, _: &mut Out<'_>) -> Result<()> {
     bail!(NO_VOICE)
 }
 
-/// `discord warm`: the voice loaded and one line spoken, with no Discord,
-/// and with `hear` the hearing model loaded and the voice's reference clip
-/// transcribed after it. Loading and running are what fill the caches a
-/// start reads; everything is timed so a run of this after a switch
-/// candidate is staged shows what the live start will pay.
+/// `discord warm`: with `hear` the hearing model loaded and the voice's
+/// reference clip transcribed, then the voice loaded and one line spoken,
+/// with no Discord. Loading and running are what fill the caches a start
+/// reads; everything is timed so a run of this after a switch candidate is
+/// staged shows what the live start will pay.
+///
+/// Hearing goes first because the two models share one device and burn's
+/// device settings take their default float type from whichever backend
+/// touches the device first: after the voice (an f32 lane) has loaded, the
+/// hearing model's activations come out F32 and its NVFP4 projections
+/// refuse them. This is the order a live start produces too, with the
+/// hearing thread's load ahead of the voice's.
 #[cfg(feature = "discord-voice")]
 fn warm(pile: Option<&std::path::Path>, text: &str, hear: bool, out: &mut Out<'_>) -> Result<()> {
     use crate::voice::synthesis::{ModelSources, Synthesizer};
     let synthesizer = Synthesizer::new(ModelSources::from_environment(pile));
+    if hear {
+        warm_hearing(pile, &synthesizer.sources, out)?;
+    }
     let started = std::time::Instant::now();
     synthesizer.prime()?;
     out.line(format!(
@@ -496,11 +506,7 @@ fn warm(pile: Option<&std::path::Path>, text: &str, hear: bool, out: &mut Out<'_
         "spoke {:.1} s of audio in {:.1} s",
         clip.duration_seconds(),
         started.elapsed().as_secs_f64()
-    ))?;
-    if hear {
-        warm_hearing(pile, &synthesizer.sources, out)?;
-    }
-    Ok(())
+    ))
 }
 
 #[cfg(not(feature = "discord-voice"))]
