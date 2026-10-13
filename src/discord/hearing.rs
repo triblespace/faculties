@@ -885,6 +885,44 @@ pub fn hear_clip(pile: &Path, clip: &[f32], out: &mut crate::out::Out<'_>) -> Re
     Ok(())
 }
 
+/// `discord warm --hear`: the transcriber loaded the way `live --hear` loads
+/// it, then `clip` (mono at `rate`) transcribed once as one utterance, with
+/// no Discord. Loading compiles the stream's kernels and the utterance
+/// compiles the rest, so a start in the same directory finds them cached.
+/// Both are timed and written to `out`, the words with them. Nothing is
+/// stored.
+pub fn warm(pile: &Path, clip: &[f32], rate: u32, out: &mut crate::out::Out<'_>) -> Result<()> {
+    let started = Instant::now();
+    let ear = voxtral::Voxtral::load(pile)?;
+    out.line(format!(
+        "hearing loaded in {:.1} s",
+        started.elapsed().as_secs_f64()
+    ))?;
+    let clip = at_rate(clip, rate);
+    let started = Instant::now();
+    let text = ear.transcribe(&clip)?;
+    out.line(format!(
+        "transcribed {:.1} s of audio in {:.1} s: \"{}\"",
+        clip.len() as f64 / RATE as f64,
+        started.elapsed().as_secs_f64(),
+        text.trim()
+    ))
+}
+
+/// `clip`, mono at `rate`, brought to [`RATE`] by rodio's resampler, the one
+/// the speaker sink runs the voice through. Identity at [`RATE`].
+fn at_rate(clip: &[f32], rate: u32) -> Vec<f32> {
+    use std::num::NonZero;
+    if rate as usize == RATE {
+        return clip.to_vec();
+    }
+    let mono = NonZero::new(1).expect("one channel");
+    let rate = NonZero::new(rate).expect("a rate");
+    let heard = NonZero::new(RATE as u32).expect("the hearing rate");
+    let clip = rodio::buffer::SamplesBuffer::new(mono, rate, clip);
+    rodio::source::UniformSourceIterator::new(clip, mono, heard).collect()
+}
+
 /// A 16-bit mono PCM WAV of `samples` at [`RATE`]. They came from 16-bit PCM
 /// divided by 32768, so they go back exactly.
 pub fn wav_pcm16(samples: &[f32]) -> Vec<u8> {
@@ -1003,6 +1041,24 @@ mod voxtral {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// A 24 kHz clip comes out at the hearing rate and the same length in
+    /// seconds; one already at the rate is untouched.
+    #[test]
+    fn warm_brings_the_clip_to_the_hearing_rate() {
+        let clip: Vec<f32> = (0..24_000 * 3)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / 24_000.0).sin() * 0.5)
+            .collect();
+        let heard = at_rate(&clip, 24_000);
+        let expected = RATE * 3;
+        assert!(
+            heard.len().abs_diff(expected) <= RATE / 100,
+            "{} samples for {expected}",
+            heard.len()
+        );
+        assert!(heard.iter().all(|s| s.abs() <= 0.5 + 1e-3));
+        assert_eq!(at_rate(&clip[..RATE], RATE as u32), clip[..RATE]);
+    }
 
     const JP: u64 = 100000000000000400;
     const OTHER: u64 = 100000000000000500;

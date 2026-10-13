@@ -93,6 +93,14 @@ enum Command {
         /// What to speak into the void; a short line is enough.
         #[arg(default_value = "The voice is warm.")]
         text: String,
+        /// Also load the hearing model the way `live --hear` does and have
+        /// it transcribe the voice's reference clip once, so that a start
+        /// with --hear finds its kernels cached too (its first load in a new
+        /// directory otherwise compiles them for 17 s, and the voice's first
+        /// line waits behind that). Needs a build with the discord-hearing
+        /// and voice-breeze features.
+        #[arg(long)]
+        hear: bool,
     },
 }
 
@@ -226,7 +234,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Command::Collection(command) => command,
         Command::Live(args) => return run_live(&cli, args),
         Command::Say { state, text } => return say(state.state_dir, &text, out),
-        Command::Warm { text } => return warm(cli.pile.as_deref(), &text, out),
+        Command::Warm { text, hear } => return warm(cli.pile.as_deref(), &text, hear, out),
         #[cfg(feature = "discord-hearing")]
         Command::Hear { wav } => {
             let pile = cli
@@ -467,12 +475,13 @@ fn say(_: Option<PathBuf>, _: &str, _: &mut Out<'_>) -> Result<()> {
     bail!(NO_VOICE)
 }
 
-/// `discord warm`: the voice loaded and one line spoken, with no Discord.
-/// Loading and speaking are what fill the caches a start reads; both are
-/// timed so a run of this after a switch candidate is staged shows what the
-/// live start will pay.
+/// `discord warm`: the voice loaded and one line spoken, with no Discord,
+/// and with `hear` the hearing model loaded and the voice's reference clip
+/// transcribed after it. Loading and running are what fill the caches a
+/// start reads; everything is timed so a run of this after a switch
+/// candidate is staged shows what the live start will pay.
 #[cfg(feature = "discord-voice")]
-fn warm(pile: Option<&std::path::Path>, text: &str, out: &mut Out<'_>) -> Result<()> {
+fn warm(pile: Option<&std::path::Path>, text: &str, hear: bool, out: &mut Out<'_>) -> Result<()> {
     use crate::voice::synthesis::{ModelSources, Synthesizer};
     let synthesizer = Synthesizer::new(ModelSources::from_environment(pile));
     let started = std::time::Instant::now();
@@ -487,12 +496,47 @@ fn warm(pile: Option<&std::path::Path>, text: &str, out: &mut Out<'_>) -> Result
         "spoke {:.1} s of audio in {:.1} s",
         clip.duration_seconds(),
         started.elapsed().as_secs_f64()
-    ))
+    ))?;
+    if hear {
+        warm_hearing(pile, &synthesizer.sources, out)?;
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "discord-voice"))]
-fn warm(_: Option<&std::path::Path>, _: &str, _: &mut Out<'_>) -> Result<()> {
+fn warm(_: Option<&std::path::Path>, _: &str, _: bool, _: &mut Out<'_>) -> Result<()> {
     bail!(NO_VOICE)
+}
+
+/// `discord warm --hear`: the hearing model loaded as `live --hear` loads
+/// it, and the voice's reference clip, read as the voice reads it (24 kHz),
+/// heard once through the same transcriber the voice channel's utterances
+/// go through.
+#[cfg(all(feature = "discord-hearing", feature = "voice-breeze"))]
+fn warm_hearing(
+    pile: Option<&std::path::Path>,
+    sources: &crate::voice::synthesis::ModelSources,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    use crate::voice::synthesis::{BreezeSources, ModelSources};
+    use mary::models::breeze::reference::{read_wav, SAMPLE_RATE};
+    let pile = pile.ok_or_else(|| anyhow!("hearing needs a pile (--pile or PILE)"))?;
+    let reference_wav = match sources {
+        ModelSources::Breeze(BreezeSources { reference_wav, .. })
+        | ModelSources::Qwen3Tts { reference_wav, .. } => reference_wav,
+        ModelSources::Invalid(error) => bail!("invalid speech configuration: {error}"),
+    };
+    let clip = read_wav(reference_wav)?;
+    super::hearing::warm(pile, &clip, SAMPLE_RATE, out)
+}
+
+#[cfg(not(all(feature = "discord-hearing", feature = "voice-breeze")))]
+fn warm_hearing(
+    _: Option<&std::path::Path>,
+    _: &crate::voice::synthesis::ModelSources,
+    _: &mut Out<'_>,
+) -> Result<()> {
+    bail!("warm --hear needs a build with the discord-hearing and voice-breeze features")
 }
 
 fn require_token(cli: &Cli) -> Result<String> {
@@ -569,10 +613,21 @@ mod tests {
         // A voice channel is nothing without its guild.
         assert!(Cli::try_parse_from(["discord", "live", "--voice-channel", "2"]).is_err());
         let cli = Cli::try_parse_from(["discord", "warm"]).unwrap();
-        let Some(Command::Warm { text }) = cli.command else {
+        let Some(Command::Warm { text, hear }) = cli.command else {
             panic!("warm parses as warm");
         };
-        assert_eq!(text, "The voice is warm.");
+        assert_eq!((text.as_str(), hear), ("The voice is warm.", false));
+        // Hearing is a switch beside the text, in either order.
+        for args in [
+            ["discord", "warm", "--hear", "hello"],
+            ["discord", "warm", "hello", "--hear"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Some(Command::Warm { text, hear }) = cli.command else {
+                panic!("warm parses as warm");
+            };
+            assert_eq!((text.as_str(), hear), ("hello", true));
+        }
         let cli = Cli::try_parse_from(["discord", "say", "--state-dir", "/s", "hello"]).unwrap();
         let Some(Command::Say { state, text }) = cli.command else {
             panic!("say parses as say");
