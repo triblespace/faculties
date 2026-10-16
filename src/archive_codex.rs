@@ -20,9 +20,13 @@
 //! `agent_reasoning_raw_content` event, which was never projected either.
 //!
 //! A Codex fork or resume replays its parent's records into a new file under
-//! new timestamps. A block is its predecessors and its content, and a receipt
-//! is the source namespace and the block, so a replayed message lands on the
-//! parent's block and receipt; the replayed copy's time is not kept.
+//! new timestamps. A node is its predecessors and its content, and a receipt
+//! is the source namespace and the node, so a replayed message lands on the
+//! parent's node and receipt; the replayed copy's time is not kept. The
+//! file's first `session_meta` is its own; a 2025 resume follows it with
+//! the header of every ancestor under the ancestor's own id. Those ids are
+//! parse-only and never refuse the file: the replay converges with each
+//! ancestor's own rollout by structure.
 //!
 //! Every record with content sits in the main chain in file order, which is
 //! the order the model experienced it: the dialogue events, tool calls and
@@ -353,6 +357,9 @@ struct PlanScan {
     metas: usize,
     first_meta_ms: Option<i64>,
     forked: bool,
+    /// Headers naming another session than the rollout's own: ancestors a
+    /// resume or fork replays.
+    ancestor_sessions: usize,
 }
 
 impl PlanScan {
@@ -402,15 +409,16 @@ impl PlanScan {
             .as_ref()
             .ok_or_else(|| anyhow!("Codex session_meta has no object field \"payload\""))?;
         let id = consistent_session_id(payload)?;
-        match &self.session_id {
-            Some(previous) if previous != &id => bail!(
-                "Codex rollout {} contains conflicting session ids {:?} and {:?}",
-                path.display(),
-                previous,
-                id
-            ),
-            Some(_) => {}
-            None => self.session_id = Some(id),
+        // The first header is the rollout's own. A resume or fork written
+        // before `session_id` existed (2025) names each ancestor after it
+        // under the ancestor's own id and replays the ancestor's history;
+        // provider ids are parse-only, so a later header never decides
+        // identity: the replay converges with the ancestor's own rollout by
+        // structure, and this rollout's continuation follows it.
+        if self.session_id.is_none() {
+            self.session_id = Some(id);
+        } else if self.session_id.as_ref() != Some(&id) {
+            self.ancestor_sessions += 1;
         }
         Ok(())
     }
@@ -2251,6 +2259,112 @@ mod tests {
         fork
     }
 
+    /// A 2025 rollout: its header carries only `id`.
+    const GRAND_2025: &str = concat!(
+        r#"{"timestamp":"2025-11-26T16:56:48.273Z","type":"session_meta","payload":{"id":"grand-2025","timestamp":"2025-11-26T16:56:48.273Z","originator":"codex_cli_rs"}}"#,
+        "\n",
+        r#"{"timestamp":"2025-11-26T16:56:48.300Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+        "\n",
+        r#"{"timestamp":"2025-11-26T16:56:49.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first question"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2025-11-26T16:56:49.001Z","type":"event_msg","payload":{"type":"user_message","message":"first question","images":[]}}"#,
+        "\n",
+        r#"{"timestamp":"2025-11-26T16:56:50.000Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"weigh it"}}"#,
+        "\n",
+        r#"{"timestamp":"2025-11-26T16:56:51.000Z","type":"event_msg","payload":{"type":"agent_message","message":"first answer"}}"#,
+        "\n",
+    );
+
+    /// A 2025 resume as Codex wrote it: its own header, then the header of
+    /// every ancestor under the ancestor's own id, then the ancestor's
+    /// history copied under the resume's creation time, then its own turn.
+    /// The ancestor headers keep their own payload; every copied line is
+    /// restamped with the resume's creation time.
+    fn resume_2025(own: &str, created: &str, history: &str, turn: &str) -> String {
+        let mut rollout = format!(
+            r#"{{"timestamp":"{created}","type":"session_meta","payload":{{"id":"{own}","timestamp":"{created}","originator":"codex_cli_rs"}}}}"#
+        );
+        rollout.push('\n');
+        for line in history.lines() {
+            let (_, rest) = line.split_once(r#"","type""#).unwrap();
+            rollout.push_str(&format!(r#"{{"timestamp":"{created}","type""#));
+            rollout.push_str(rest);
+            rollout.push('\n');
+        }
+        let later = |seconds: u32| created.replace(":00.000Z", &format!(":{seconds:02}.000Z"));
+        for line in [
+            format!(
+                r#"{{"timestamp":"{}","type":"turn_context","payload":{{"model":"gpt-test"}}}}"#,
+                later(10)
+            ),
+            format!(
+                r#"{{"timestamp":"{}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{turn} question"}}]}}}}"#,
+                later(11)
+            ),
+            format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"user_message","message":"{turn} question","images":[]}}}}"#,
+                later(12)
+            ),
+            format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"agent_message","message":"{turn} answer"}}}}"#,
+                later(13)
+            ),
+        ] {
+            rollout.push_str(&line);
+            rollout.push('\n');
+        }
+        rollout
+    }
+
+    #[test]
+    fn a_resume_naming_its_ancestors_converges_on_their_rollouts() {
+        // As in the 2025 rollouts: a resume carries its ancestors' headers
+        // under their own ids and replays their history.
+        let parent = resume_2025(
+            "parent-2025",
+            "2025-12-11T01:58:00.000Z",
+            GRAND_2025,
+            "second",
+        );
+        let child = resume_2025("child-2025", "2025-12-11T22:16:00.000Z", &parent, "third");
+        assert_eq!(child.matches(r#""type":"session_meta""#).count(), 3);
+        let mut threads = Vec::new();
+        for (rollout, name) in [
+            (GRAND_2025, "grand"),
+            (parent.as_str(), "parent"),
+            (child.as_str(), "child"),
+        ] {
+            let (_directory, summary, fragment) = project_text(rollout, &format!("{name}.jsonl"));
+            assert_eq!(summary.stats.held_back_records, 0, "{name}");
+            assert_eq!(summary.stats.unresolved_tool_results, 0, "{name}");
+            let tip = leaf(&fragment);
+            let thread = blockdag::thread_to(fragment.facts(), tip);
+            assert_eq!(
+                ids_with_tag(&fragment, schema::block::KIND),
+                thread.iter().copied().collect::<BTreeSet<_>>(),
+                "{name} is one chain"
+            );
+            // The rollout's own session names its leaf.
+            let locator = fragment
+                .clone()
+                .put::<UTF8String, _>(format!("session/{name}-2025"));
+            assert!(
+                exists!(pattern!(fragment.facts(), [{
+                    _?receipt @ schema::source_projection::projects_to: tip,
+                        schema::source_projection::source_locator: locator
+                }])),
+                "{name}"
+            );
+            threads.push(thread);
+        }
+        // Each replay is its ancestor's own thread; each continuation follows.
+        assert_eq!(threads[0].len(), 3);
+        assert_eq!(threads[1][..3], threads[0][..]);
+        assert_eq!(threads[1].len(), 3 + 2);
+        assert_eq!(threads[2][..5], threads[1][..]);
+        assert_eq!(threads[2].len(), 5 + 2);
+    }
+
     #[test]
     fn a_fork_adds_only_its_own_messages_and_occurrence_annotations() {
         let fork_text = fork_rollout();
@@ -2458,6 +2572,16 @@ mod tests {
             // Cut after the event, and after the context behind it: the event
             // may yet be a mirror, so it and what follows wait.
             (EVENT_FIRST_ROLLOUT, Some(vec![0, 0, 0, 1, 2, 0, 0, 0, 0])),
+            (GRAND_2025, None),
+            (
+                &resume_2025(
+                    "parent-2025",
+                    "2025-12-11T01:58:00.000Z",
+                    GRAND_2025,
+                    "second",
+                ),
+                None,
+            ),
         ] {
             let (_whole_directory, whole_summary, whole) = project_text(rollout, "grow.jsonl");
             assert_eq!(whole_summary.stats.held_back_records, 0);
