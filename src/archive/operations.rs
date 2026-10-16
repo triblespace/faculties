@@ -1784,12 +1784,12 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::write(
             source.join("origin.jsonl"),
-            r#"{"type":"user","sessionId":"origin","uuid":"message","message":{"role":"user","content":"origin"}}"#,
+            r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"origin"}}"#,
         )
         .unwrap();
         fs::write(
             source.join("fork.jsonl"),
-            r#"{"type":"user","sessionId":"fork","uuid":"copy","forkedFrom":{"sessionId":"origin","messageUuid":"message"},"message":{"role":"user","content":"different"}}"#,
+            r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"different"}}"#,
         )
         .unwrap();
 
@@ -1970,12 +1970,12 @@ mod tests {
         fs::create_dir(&conflict).unwrap();
         fs::write(
             conflict.join("origin.jsonl"),
-            r#"{"type":"user","sessionId":"origin","uuid":"message","message":{"role":"user","content":"origin"}}"#,
+            r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"origin"}}"#,
         )
         .unwrap();
         fs::write(
             conflict.join("fork.jsonl"),
-            r#"{"type":"user","sessionId":"fork","uuid":"copy","forkedFrom":{"sessionId":"origin","messageUuid":"message"},"message":{"role":"user","content":"different"}}"#,
+            r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"different"}}"#,
         )
         .unwrap();
         let later = claude_code_session(directory, "later");

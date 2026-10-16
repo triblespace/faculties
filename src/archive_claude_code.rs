@@ -20,6 +20,10 @@
 //! while projecting and are never stored: a node is its predecessors and the
 //! fact it holds, and its receipt is the source namespace and the node.
 //! Copies of a record that differ only in time agree: time is annotation.
+//! Copies under one uuid that say different things (a fork replayed by an
+//! older Claude Code, an attachment rendered anew after an upgrade) are
+//! different records, each in its own position; only copies that say the
+//! same thing collapse, and a fork copy is its origin only where they agree.
 //!
 //! Every fact of every record with content is one node in the main chain, in
 //! the order the agent experienced it: user and assistant records, harness
@@ -333,6 +337,9 @@ struct PreScan {
     digest: [u8; 32],
     /// The file is known finished: what it holds back at its tail is emitted.
     finished: bool,
+    /// Line numbers whose record is a further version of its uuid, with the
+    /// key that version is planned under.
+    versions: HashMap<usize, SourceKey>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -342,6 +349,9 @@ struct SourceObservation {
     turn_duration: bool,
     non_turn_duration: bool,
     parents: BTreeSet<SourceKey>,
+    /// Where a fork's replay placed its copy; used only when the copy turns
+    /// out to say something else than its origin.
+    replay_parents: BTreeSet<SourceKey>,
     shapes: Vec<RecordShape>,
     /// How the record takes part in the agent's perceive-act order.
     flow: Option<Flow>,
@@ -483,12 +493,35 @@ impl SourcePlan {
                 observation.non_turn_duration |= incoming.non_turn_duration;
                 observation.flow = merge_flow(observation.flow.take(), incoming.flow.clone());
                 observation.parents.extend(incoming.parents.iter().cloned());
+                observation
+                    .replay_parents
+                    .extend(incoming.replay_parents.iter().cloned());
                 for shape in &incoming.shapes {
                     if !observation.shapes.contains(shape) {
                         observation.shapes.push(shape.clone());
                     }
                 }
             }
+        }
+        // A fork copy is its origin only where it says the same thing. One
+        // that says something else is a record of its own, in the position
+        // its replay gave it.
+        let aliases = equal_aliases(&raw, aliases);
+        let aliased: HashSet<&SourceKey> =
+            aliases.iter().map(|(destination, _)| destination).collect();
+        let replayed: Vec<(SourceKey, BTreeSet<SourceKey>)> = raw
+            .iter()
+            .filter(|(key, observation)| {
+                !observation.replay_parents.is_empty() && !aliased.contains(key)
+            })
+            .map(|(key, observation)| (key.clone(), observation.replay_parents.clone()))
+            .collect();
+        for (key, parents) in replayed {
+            keys.extend(parents.iter().cloned());
+            raw.get_mut(&key)
+                .expect("a replayed key is observed")
+                .parents
+                .extend(parents);
         }
         for (destination, origin) in &aliases {
             keys.insert(destination.clone());
@@ -821,6 +854,58 @@ impl SourcePlan {
     }
 }
 
+/// The alias edges that join only copies saying the same thing.
+///
+/// Edges are taken in their sorted order; an edge is kept unless it would put
+/// two different semantic payloads into one class. A key without content
+/// joins any class.
+fn equal_aliases(
+    raw: &HashMap<SourceKey, SourceObservation>,
+    aliases: BTreeSet<(SourceKey, SourceKey)>,
+) -> BTreeSet<(SourceKey, SourceKey)> {
+    let facts_of = |key: &SourceKey| -> Option<Vec<Id>> {
+        raw.get(key)
+            .and_then(|observation| observation.shapes.first())
+            .map(|shape| shape.parts.iter().map(|part| part.fact).collect())
+    };
+    let mut roots: HashMap<SourceKey, SourceKey> = HashMap::new();
+    let mut payloads: HashMap<SourceKey, Option<Vec<Id>>> = HashMap::new();
+    fn find(roots: &mut HashMap<SourceKey, SourceKey>, key: &SourceKey) -> SourceKey {
+        let mut root = key.clone();
+        while let Some(parent) = roots.get(&root) {
+            if *parent == root {
+                break;
+            }
+            root = parent.clone();
+        }
+        roots.insert(key.clone(), root.clone());
+        root
+    }
+    let mut kept = BTreeSet::new();
+    for (destination, origin) in aliases {
+        for key in [&destination, &origin] {
+            if !roots.contains_key(key) {
+                roots.insert(key.clone(), key.clone());
+                payloads.insert(key.clone(), facts_of(key));
+            }
+        }
+        let (left, right) = (find(&mut roots, &destination), find(&mut roots, &origin));
+        if left == right {
+            kept.insert((destination, origin));
+            continue;
+        }
+        let joined = match (&payloads[&left], &payloads[&right]) {
+            (Some(left), Some(right)) if left != right => continue,
+            (Some(payload), _) | (_, Some(payload)) => Some(payload.clone()),
+            (None, None) => None,
+        };
+        roots.insert(right.clone(), left.clone());
+        payloads.insert(left, joined);
+        kept.insert((destination, origin));
+    }
+    kept
+}
+
 /// Classes in a deterministic topological order.
 fn topological_order(
     semantic: &HashSet<SourceKey>,
@@ -938,6 +1023,20 @@ impl DisjointSet {
             }
         }
     }
+}
+
+/// The key of a further version of a provider uuid: derived from what the
+/// version says, so the same version gets the same key in every file.
+fn content_version(key: &SourceKey, facts: &[Id]) -> SourceKey {
+    let mut hasher = blake3::Hasher::new();
+    for fact in facts {
+        hasher.update(&fact.raw());
+    }
+    let digest = hasher.finalize();
+    SourceKey::new(
+        key.session.clone(),
+        format!("{}#{}", key.uuid, &digest.to_hex()[..16]),
+    )
 }
 
 /// Copies of one record agree on their flow; where they would not, the
@@ -1187,6 +1286,9 @@ fn prescan_file(path: &Path, finished_before: Option<SystemTime>) -> Result<PreS
 
 fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreScan> {
     let mut scan = PreScan::default();
+    // Each uuid's versions seen so far, and the one written most recently.
+    let mut versions: HashMap<SourceKey, Vec<(Vec<Id>, SourceKey)>> = HashMap::new();
+    let mut current: HashMap<SourceKey, SourceKey> = HashMap::new();
     let mut digest = blake3::Hasher::new();
     for_each_jsonl_line(reader, Some(&mut digest), |line_number, raw| {
         let mut bytes = scanner_bytes(raw)?;
@@ -1197,22 +1299,55 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
                 line_number
             )
         })?;
-        let Some(key) = record.source_key() else {
+        let Some(raw_key) = record.source_key() else {
             return Ok(());
         };
-        let shape = record_parts(&record, raw, &key, &mut ProjectionStats::default())?
+        let shape = record_parts(&record, raw, &raw_key, &mut ProjectionStats::default())?
             .map(|draft| draft.shape());
+        // A provider uuid is parse-only. Copies under one uuid that say the
+        // same thing are one record; a copy that says something else (a
+        // fork replayed by an older Claude Code, an attachment rendered
+        // anew after an upgrade) is a record of its own, under a key derived
+        // from what it says. References resolve to the version of a uuid
+        // written most recently before them in this file.
+        let key = match &shape {
+            Some(shape) => {
+                let facts: Vec<Id> = shape.parts.iter().map(|part| part.fact).collect();
+                let seen = versions.entry(raw_key.clone()).or_default();
+                match seen.iter().find(|(known, _)| *known == facts) {
+                    Some((_, key)) => key.clone(),
+                    None => {
+                        let key = if seen.is_empty() {
+                            raw_key.clone()
+                        } else {
+                            content_version(&raw_key, &facts)
+                        };
+                        seen.push((facts, key.clone()));
+                        key
+                    }
+                }
+            }
+            None => current
+                .get(&raw_key)
+                .cloned()
+                .unwrap_or_else(|| raw_key.clone()),
+        };
+        let resolve = |reference: SourceKey| current.get(&reference).cloned().unwrap_or(reference);
+        let raw_parent = record
+            .parent_uuid
+            .as_ref()
+            .map(|parent| resolve(SourceKey::new(raw_key.session.clone(), parent.clone())));
+        let fork_origin = record.fork_origin_key()?.map(resolve);
+        current.insert(raw_key.clone(), key.clone());
+        if key != raw_key {
+            scan.versions.insert(line_number, key.clone());
+        }
         let turn_duration =
             record.record_type == "system" && record.subtype.as_deref() == Some("turn_duration");
         // A compaction boundary starts a new physical chain. Its
         // `logicalParentUuid` is not used as an edge: in live files it can
         // name a record that itself descends from the boundary (observed in
         // f03d61a4, 2026-10-11), which would close a cycle.
-        let raw_parent = record
-            .parent_uuid
-            .as_ref()
-            .map(|parent| SourceKey::new(key.session.clone(), parent.clone()));
-        let fork_origin = record.fork_origin_key()?;
         if let Some(origin) = &fork_origin {
             scan.aliases.insert((key.clone(), origin.clone()));
         }
@@ -1237,6 +1372,11 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
         }
         if let Some(parent) = parent {
             observation.parents.insert(parent);
+        }
+        if fork_origin.is_some() {
+            // Where the replay put it: its position if it turns out not to
+            // be a copy of its origin.
+            observation.replay_parents.extend(raw_parent);
         }
         if let Some(shape) = shape {
             let flow = match record.record_type.as_str() {
@@ -1312,14 +1452,15 @@ where
         if session.is_none() {
             session = record.session_id.clone();
         }
-        let fragments = project_record(record, raw, plan, &mut receipts, &mut row_stats)
+        let version = prescan.versions.get(&line_number);
+        let fragments = project_record(record, version, raw, plan, &mut receipts, &mut row_stats)
             .with_context(|| {
-                format!(
-                    "project Claude Code record at {}:{}",
-                    source_path.display(),
-                    line_number
-                )
-            })?;
+            format!(
+                "project Claude Code record at {}:{}",
+                source_path.display(),
+                line_number
+            )
+        })?;
         summary.stats.absorb(row_stats);
         let mut stats = Some(row_stats);
         for fragment in fragments {
@@ -1789,12 +1930,14 @@ fn record_parts(
 /// per fact, each with its receipt.
 fn project_record(
     record: RawRecord,
+    version: Option<&SourceKey>,
     raw_record: &[u8],
     plan: &SourcePlan,
     receipts: &mut BTreeMap<Id, Id>,
     stats: &mut ProjectionStats,
 ) -> Result<Vec<Fragment>> {
-    let Some(key) = record.source_key() else {
+    // A further version of its uuid is planned under its own key.
+    let Some(key) = version.cloned().or_else(|| record.source_key()) else {
         if matches!(
             record.record_type.as_str(),
             "user" | "assistant" | "attachment" | "system"
@@ -2815,6 +2958,104 @@ mod tests {
     }
 
     #[test]
+    fn copies_under_one_uuid_that_say_different_things_are_different_records() {
+        // As in a long session file: a fork copy replayed by an older Claude
+        // Code (forkedFrom names the origin) and, later in the same file,
+        // the original record under the same uuid, its attachment rendered
+        // differently after an upgrade.
+        let source = concat!(
+            r#"{"type":"user","sessionId":"dest","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"start"}}"#,
+            "\n",
+            r#"{"type":"attachment","sessionId":"dest","uuid":"x","parentUuid":"u1","version":"2.1.114","cwd":"/a","forkedFrom":{"sessionId":"origin","messageUuid":"x"},"attachment":{"type":"file","filename":"notes.txt","content":{"file":{"content":"snippet"}}}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"dest","uuid":"a1","parentUuid":"x","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"after the copy"}]}}"#,
+            "\n",
+            r#"{"type":"attachment","sessionId":"dest","uuid":"x","parentUuid":"a1","version":"2.1.121","cwd":"/b","slug":"later","attachment":{"type":"file","filename":"notes.txt","displayPath":"notes.txt","content":{"file":{"content":"rendered anew"}}}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"dest","uuid":"a2","parentUuid":"x","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"after the original"}]}}"#,
+            "\n",
+            // An equal copy of the original under the same uuid collapses.
+            r#"{"type":"attachment","sessionId":"dest","uuid":"x","parentUuid":"a1","version":"2.1.121","cwd":"/c","slug":"again","attachment":{"type":"file","filename":"notes.txt","displayPath":"notes.txt","content":{"file":{"content":"rendered anew"}}}}"#,
+            "\n",
+        );
+        let projected = project_text(source, Path::new("dest.jsonl"));
+        assert_eq!(projected.stats.held_back_records, 0);
+        let fragment = &projected.fragment;
+        let payloads: Vec<Id> = find!(
+            node: Id,
+            pattern!(fragment.facts(), [
+                { ?node @ schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::EVENT },
+            ])
+        )
+        .collect();
+        assert_eq!(
+            payloads.len(),
+            2,
+            "both versions are kept, the equal copy collapses"
+        );
+        let first = block_with_payload(fragment, "after the copy");
+        let second = block_with_payload(fragment, "after the original");
+        // A fork copy is placed by its origin, which this file does not
+        // hold, so it starts the thread: copy, reply, original, reply.
+        let thread = crate::blockdag::thread_to(fragment.facts(), second);
+        assert_eq!(thread.len(), 4);
+        assert_eq!(thread[1], first);
+        assert!(payloads.contains(&thread[0]) && payloads.contains(&thread[2]));
+        assert_ne!(thread[0], thread[2]);
+        assert_eq!(ids_with_tag(fragment, schema::block::KIND).len(), 5);
+    }
+
+    #[test]
+    fn a_fork_copy_that_differs_from_its_origin_keeps_its_replay_position() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("origin.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"origin","uuid":"q","message":{"role":"user","content":"question"}}"#,
+                "\n",
+                r#"{"type":"attachment","sessionId":"origin","uuid":"x","parentUuid":"q","attachment":{"type":"file","filename":"notes.txt","content":"old rendering"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("fork.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"fork","uuid":"q","forkedFrom":{"sessionId":"origin","messageUuid":"q"},"message":{"role":"user","content":"question"}}"#,
+                "\n",
+                r#"{"type":"attachment","sessionId":"fork","uuid":"x","parentUuid":"q","forkedFrom":{"sessionId":"origin","messageUuid":"x"},"attachment":{"type":"file","filename":"notes.txt","content":"new rendering"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"fork","uuid":"a","parentUuid":"x","message":{"id":"msg_1","role":"assistant","content":[{"type":"text","text":"answer"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut union = Fragment::empty();
+        let summary = project_path(directory.path(), |projected| {
+            union += projected.fragment;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(summary.stats.held_back_records, 0);
+        // The question is one record (an equal copy); the two renderings are
+        // two, each after it; the answer follows the fork's own rendering.
+        let question = block_with_payload(&union, "question");
+        let answer = block_with_payload(&union, "answer");
+        let thread = crate::blockdag::thread_to(union.facts(), answer);
+        assert_eq!(thread.len(), 3);
+        assert_eq!(thread[0], question);
+        assert_eq!(ids_with_tag(&union, schema::block::KIND).len(), 4);
+        let renderings: BTreeSet<Id> = find!(
+            node: Id,
+            pattern!(union.facts(), [{ ?node @ schema::block::previous: question }])
+        )
+        .collect();
+        assert_eq!(renderings.len(), 2);
+        assert!(renderings.contains(&thread[1]));
+    }
+
+    #[test]
     fn a_fork_copy_that_differs_only_in_time_converges_on_its_origin() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(
@@ -3304,16 +3545,19 @@ mod tests {
     }
 
     #[test]
-    fn alias_class_payload_conflict_fails_before_emission() {
+    fn one_key_in_two_files_with_different_payloads_fails_before_emission() {
+        // A further version is told apart inside one file, by what it says
+        // and where it is written; two files that each claim one session
+        // record with different payloads stay a conflict.
         let directory = tempfile::tempdir().unwrap();
         fs::write(
-            directory.path().join("origin.jsonl"),
-            r#"{"type":"user","sessionId":"origin","uuid":"message","message":{"role":"user","content":"origin payload"}}"#,
+            directory.path().join("one.jsonl"),
+            r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"one payload"}}"#,
         )
         .unwrap();
         fs::write(
-            directory.path().join("fork.jsonl"),
-            r#"{"type":"user","sessionId":"fork","uuid":"message","forkedFrom":{"sessionId":"origin","messageUuid":"message"},"message":{"role":"user","content":"conflicting payload"}}"#,
+            directory.path().join("two.jsonl"),
+            r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"another payload"}}"#,
         )
         .unwrap();
         let mut emitted = 0;
