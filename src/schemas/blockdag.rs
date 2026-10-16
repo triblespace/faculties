@@ -4,22 +4,28 @@
 //!
 //! ```text
 //! content fact  -- semantic datum (text, media, tool payload, ...)
-//! content part  -- ordinal-bearing occurrence of one fact inside a block
-//! block         -- structural event in the predecessor DAG
-//! source projection -- one source's receipt of one block
+//! node          -- one point of experience in the predecessor DAG
+//! source projection -- one source's receipt of one node
 //! ```
 //!
-//! The first three layers are structural hash-consing. A block is identified by
-//! its predecessors and its content only, never by a provider id, a path or a
-//! time. Importer receipts are identified by their source namespace and block
-//! alone; provider ids, times, paths and actors only annotate them. No source
-//! bytes are stored: imported sources are projected into these layers and the
-//! files themselves stay outside the pile.
+//! The first two layers are structural hash-consing. A node (the entity kind
+//! keeps the name `block`) is identified by its predecessors and the content
+//! facts it holds, directly: nothing else, no provider id, path, time or
+//! position. Sequence is structural only: order is the `previous` chain. A
+//! node holds one fact, or an unordered set of facts the source says happened
+//! at the same moment. Acts and perceptions are a derived view over the chain
+//! ([`crate::blockdag::turns_along`]). Importer receipts are identified by
+//! their source namespace and node alone; provider ids, times, paths and
+//! actors only annotate them. No source bytes are stored.
 //!
 //! The block/content-fact ids and attributes preserve the approved
-//! `8011a65..a2e575c` design lineage. The scope, content-part, media-type, and
-//! projection ids below were minted with `trible genid` on 2026-08-08; their
-//! exact values are kept here beside the protocol they identify.
+//! `8011a65..a2e575c` design lineage. The scope, media-type, and projection ids
+//! below were minted with `trible genid` on 2026-08-08; `holds`, the node's
+//! `responds_to` and the receipt's `resolution` on 2026-10-16. The retired
+//! content-part layer's ids (`A8A1254C…` contains, `DA0B1A13…` part kind,
+//! `63C77505…` ordinal, `28E039E5…` fact, `A7CC0F4A…` responds_to,
+//! `884A0F9A…` resolution) are not reused; rows in that older shape are
+//! simply not read by this vocabulary.
 
 use triblespace::macros::id_hex;
 pub use triblespace::prelude::blobencodings::RawBytes;
@@ -30,60 +36,44 @@ use triblespace::prelude::*;
 /// Stable extrinsic scope of the Archive source collection.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("940F76A54E6C2E64469935B9FEF724A1");
 
-/// A content-addressed position in the perception/action DAG.
+/// A content-addressed node of the perception/action DAG.
+///
+/// A node is one point of experience: one perceived or produced fact, or a
+/// set of facts that happened at the same moment. Its identity is its
+/// predecessors and its facts; order is the chain of `previous` alone.
 pub mod block {
     use super::*;
 
     attributes! {
-        /// IDENTITY. Structural predecessor set. Absent on a root block.
+        /// IDENTITY. Structural predecessor set. Absent on a root node.
         "9B8F693BE959136E90C34CF054F9033F" unsafe as pub previous: GenId;
-        /// IDENTITY when present. A genuine normalized event interval.
+        /// NONIDENTITY annotation. A genuine normalized event interval.
         /// Missing or uncertain source time contributes no row; a sentinel is
-        /// never substituted.
+        /// never substituted. A node may carry several values (a replay
+        /// restamps).
         "695A45C4A57FDA7FDF8A609117878E97" unsafe as pub timestamp: NsTAIInterval;
-        /// IDENTITY. One or more ordinal-bearing [`content_part`] entities.
-        "A8A1254C922182ECDF5DC50A21D74493" unsafe as pub contains: GenId;
+        /// IDENTITY. The content facts the node holds: one, or an unordered
+        /// set that happened at the same moment. Minted with `trible genid`
+        /// on 2026-10-16.
+        "366C896E56C3AC602062A7C241D26FB0" as pub holds: GenId;
+        /// NONIDENTITY annotation. The node of the tool call a result node
+        /// answers. Minted with `trible genid` on 2026-10-16.
+        "E1C88039F93BBA445149820EB55DADED" as pub responds_to: GenId;
     }
 
-    /// Nonidentity kind marker attached after intrinsic block construction.
+    /// Nonidentity kind marker attached after intrinsic node construction.
     pub const KIND: Id = id_hex!("91B88464F7B5A178DC4FA87DE28CDFA9");
 }
 
-/// An ordered occurrence of one semantic content fact inside a block.
-///
-/// Position is not vendor occurrence identity: it is part of the semantic
-/// block value. It preserves order and repeated equal payloads even though
-/// `block::contains` itself is a set.
-pub mod content_part {
-    use super::*;
-
-    attributes! {
-        /// IDENTITY. Zero-based position inside the source block.
-        "63C7750587AD040429750C15BAB9CF29" unsafe as pub ordinal: U256BE;
-        /// IDENTITY. Canonical semantic datum at this position.
-        "28E039E5B292CEE5E41C22EDD0E396E7" unsafe as pub fact: GenId;
-        /// IDENTITY when present. Semantic tool-result/tool-call relation to a
-        /// target part. An unresolved vendor correlator stays in raw source
-        /// provenance; resolving it yields a richer immutable projection.
-        "A7CC0F4A24275330DD48F2836B70F0EC" unsafe as pub responds_to: GenId;
-        /// IDENTITY when present. The exact resident representation selected
-        /// for this occurrence of an external pointer fact. The handle must
-        /// also occur among that fact's monotone `resolved_to` evidence.
-        "884A0F9A519D486B07C3CDDDCC6F5BC9" as pub resolution: Handle<RawBytes>;
-    }
-
-    /// Nonidentity kind marker attached after intrinsic part construction.
-    pub const KIND: Id = id_hex!("DA0B1A13326EFB5567B182BDE1F33880");
-}
-
-/// A single perceived, produced, or ambient semantic datum.
+/// A single perceived or produced semantic datum.
 pub mod content_fact {
     use super::*;
 
     attributes! {
         /// IDENTITY. Reified modality entity.
         "9044EA72B7B056F20CB02375ABFB7D87" unsafe as pub modality: GenId;
-        /// IDENTITY. Reified `in`, `out`, or `ambient` direction entity.
+        /// IDENTITY. Reified `in` or `out` direction entity: what the agent
+        /// perceived and what it produced. This is the training loss mask.
         "3A42C2348E452E2C2E98B6C576576947" unsafe as pub direction: GenId;
         /// IDENTITY for text, thinking, and textual tool payloads.
         "6CA37B269D7900D866824EB5560E747B" unsafe as pub payload: Handle<UTF8String>;
@@ -96,9 +86,12 @@ pub mod content_fact {
         /// pointer, preventing unrelated vendors from sharing an id string.
         "9B38698BD76DB91C8ED478D304375286" unsafe as pub asset_namespace: GenId;
         /// IDENTITY when known. Link to Files' intrinsic canonical media-type
-        /// entity, never an inline MIME spelling.
+        /// entity, never an inline MIME spelling. For an unresolved asset it
+        /// comes only from the source's own metadata, never from bytes found
+        /// beside it.
         "CCEC81B576FF10DDA85C522C6FE86345" unsafe as pub media_type: GenId;
-        /// IDENTITY when known. Claimed byte size of an unresolved asset.
+        /// IDENTITY when known. Byte size of an unresolved asset as the source
+        /// claims it; recovered bytes never supply it.
         "2CF092F132FA9110BA10B1B1482831DB" unsafe as pub asset_size: U256BE;
 
         /// NONIDENTITY, monotone. Bytes later recovered for a pointer-identified
@@ -148,18 +141,21 @@ pub mod content_fact {
         ];
     }
 
+    /// Direction is `in` or `out` only. Everything the agent perceives is
+    /// `in` (system prompts, compaction summaries, tool results, unknown
+    /// senders, hidden context it was shown); everything it produces is `out`
+    /// (text, tool calls, thinking and sealed reasoning).
     pub mod direction {
         use super::*;
         pub const IN: Id = id_hex!("1452B759336E0DEF96E78937D6E7F15D");
         pub const OUT: Id = id_hex!("39990F231B5FDB6F0FF4DB55616A2939");
-        pub const AMBIENT: Id = id_hex!("0EE490D68C82C4F734D15222C8F2AF5D");
 
         /// Canonical, queryable display vocabulary for Archive directions.
-        pub const SPECS: &[(Id, &str)] = &[(IN, "in"), (OUT, "out"), (AMBIENT, "ambient")];
+        pub const SPECS: &[(Id, &str)] = &[(IN, "in"), (OUT, "out")];
     }
 }
 
-/// Source-scoped receipt of one projected block.
+/// Source-scoped receipt of one projected node.
 ///
 /// An importer receipt ([`crate::blockdag::block_source_projection`]) has only
 /// `source_namespace` and `projects_to` in its identity core, so every
@@ -208,6 +204,16 @@ pub mod source_projection {
         /// conversation a leaf ends, such as a Claude Code subagent's
         /// `.meta.json`. Minted with `trible genid` on 2026-10-11.
         "8784841BA7FA549AB6898424722F72DA" as pub source_detail: Handle<UTF8String>;
+        /// NONIDENTITY. The exact recovered body this occurrence selected for
+        /// the external pointer fact its node holds; the handle also occurs
+        /// among that fact's `resolved_to` evidence. Minted with `trible
+        /// genid` on 2026-10-16.
+        "29757DF0058067C0250B586810CA19E0" as pub resolution: Handle<RawBytes>;
+        /// NONIDENTITY. The projection rules an importer applied
+        /// ([`crate::blockdag::IMPORTER_REVISION`]), so receipts written under
+        /// different rules can be told apart. Minted with `trible genid` on
+        /// 2026-10-16.
+        "F8DA86B1D3E8757161E569AFDC35CF43" as pub importer_revision: Handle<UTF8String>;
     }
 
     /// Nonidentity kind marker attached after intrinsic receipt construction.

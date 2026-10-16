@@ -20,7 +20,7 @@ use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::Inline;
 
 use crate::archive_source::{
-    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, Threading,
+    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord,
 };
 use crate::files;
 use crate::schemas::blockdag as schema;
@@ -173,8 +173,8 @@ fn parse_content(
             continue;
         }
         let parsed_card = parse_card(raw.clone())?;
-        // A card whose layout is not understood keeps its visible text as an
-        // ambient event: no source bytes are stored, so nothing else would.
+        // A card whose layout is not understood keeps its visible text as a
+        // perceived event: no source bytes are stored, so nothing else would.
         let fallback = match parsed_card {
             Some(_) => String::new(),
             None => render_cell(&raw)?.text.trim().to_owned(),
@@ -239,8 +239,8 @@ fn parse_content(
                     locator: locator.clone(),
                     predecessors: Vec::new(),
                     block_timestamp: card.timestamp,
-                    threading: Threading::Semantic,
                     parts: input_parts,
+                    links: Vec::new(),
                     claims: SourceClaims {
                         timestamp: card.timestamp,
                         raw_author: Some(archive_source::owned_text("user")),
@@ -272,8 +272,8 @@ fn parse_content(
                     locator,
                     predecessors: local_user.into_iter().collect(),
                     block_timestamp: card.timestamp,
-                    threading: Threading::Semantic,
                     parts: output_parts,
+                    links: Vec::new(),
                     claims: SourceClaims {
                         timestamp: card.timestamp,
                         raw_author: Some(archive_source::owned_text("assistant")),
@@ -285,21 +285,22 @@ fn parse_content(
             }
         } else {
             // Non-prompt cards (for example "Created Gemini Canvas") are
-            // retained as ambient activity without distorting dialogue edges.
+            // activity the agent was shown: perceived, without inventing
+            // dialogue edges.
             let mut parts = Vec::new();
             if !card.input.is_empty() {
                 parts.push(SourcePart::text(
                     schema::content_fact::modality::EVENT,
-                    schema::content_fact::direction::AMBIENT,
+                    schema::content_fact::direction::IN,
                     archive_source::owned_text(card.input),
                 ));
             }
-            let mut ambient_assets = card.input_assets;
-            ambient_assets.extend(card.output_assets);
+            let mut activity_assets = card.input_assets;
+            activity_assets.extend(card.output_assets);
             append_assets(
                 resolve,
-                ambient_assets,
-                schema::content_fact::direction::AMBIENT,
+                activity_assets,
+                schema::content_fact::direction::IN,
                 &mut parts,
                 &mut stats,
             )?;
@@ -308,8 +309,8 @@ fn parse_content(
                 locator,
                 predecessors: Vec::new(),
                 block_timestamp: card.timestamp,
-                threading: Threading::Transparent,
                 parts,
+                links: Vec::new(),
                 claims: SourceClaims {
                     timestamp: card.timestamp,
                     raw_author: Some(archive_source::owned_text("google")),
@@ -384,9 +385,9 @@ fn append_assets(
         if resolved.is_some() {
             stats.assets_resolved += 1;
         }
-        let size = resolved
-            .as_ref()
-            .map(|bytes| u128::try_from(bytes.len()).expect("usize fits u128"));
+        // The exported pointer names the media type. Takeout states no size,
+        // and bytes found on disk only annotate the fact: whether the asset
+        // file was present must not change it.
         let media_type = files::infer_media_type(Path::new(asset.pointer.as_ref()));
         parts.push(SourcePart::Pointer {
             modality: archive_source::modality_for_media_type(media_type),
@@ -394,7 +395,7 @@ fn append_assets(
             namespace: schema::source_projection::SOURCE_GEMINI,
             pointer: asset.pointer,
             media_type: Some(archive_source::owned_text(media_type)),
-            size,
+            size: None,
             resolved,
         });
     }
@@ -1020,12 +1021,7 @@ fn html_attribute(input: &Bytes, tag: Tag, expected: &[u8]) -> Result<Option<Byt
 }
 
 fn absorb(target: &mut ProjectionStats, source: ProjectionStats) {
-    target.records_seen += source.records_seen;
-    target.projections_emitted += source.projections_emitted;
-    target.content_parts += source.content_parts;
-    target.transparent_records += source.transparent_records;
-    target.contentless_records += source.contentless_records;
-    target.missing_predecessors += source.missing_predecessors;
+    target.absorb(source);
 }
 
 #[cfg(test)]
@@ -1094,6 +1090,49 @@ mod tests {
     }
 
     #[test]
+    fn an_asset_file_in_the_takeout_never_changes_a_block() {
+        let html = format!(
+            "{PREFIX}{}{SUFFIX}",
+            card("Prompted&nbsp;hello<br>18 Sept 2025, 12:02:52 CET<br><p>world</p><img src=\"answer.png\">")
+        );
+        let project = |attachments: &std::collections::BTreeMap<String, Bytes>| {
+            let mut union = Fragment::empty();
+            let summary = project_bytes(
+                "My Activity.html",
+                Bytes::from_source(html.clone().into_bytes()),
+                attachments,
+                |projected| {
+                    union += projected.fragment;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            (summary, union)
+        };
+        let present = std::collections::BTreeMap::from([(
+            "answer.png".to_owned(),
+            Bytes::from_source(b"png bytes".to_vec()),
+        )]);
+        let (resolved_summary, resolved) = project(&present);
+        let (_, unresolved) = project(&Default::default());
+        assert_eq!(resolved_summary.assets_resolved, 1);
+        let blocks = |fragment: &Fragment| -> std::collections::BTreeSet<Id> {
+            find!(
+                block: Id,
+                pattern!(fragment, [{ ?block @ triblespace::core::metadata::tag: &schema::block::KIND }])
+            )
+            .collect()
+        };
+        assert_eq!(blocks(&resolved), blocks(&unresolved));
+        assert!(!exists!(pattern!(&resolved, [{
+            _?fact @ schema::content_fact::asset_size: _?size
+        }])));
+        assert!(exists!(pattern!(&resolved, [{
+            _?fact @ schema::content_fact::resolved_to: _?bytes
+        }])));
+    }
+
+    #[test]
     fn projects_local_assets_and_keeps_activity_transparent() {
         let temp = TempDir::new().unwrap();
         let activity = temp.path().join("My Activity.html");
@@ -1115,7 +1154,6 @@ mod tests {
         assert_eq!(summary.assets_seen, 2);
         assert_eq!(summary.assets_resolved, 2);
         assert_eq!(summary.fragments_emitted, emitted);
-        assert_eq!(summary.stats.transparent_records, 1);
     }
 
     #[test]
@@ -1192,13 +1230,11 @@ mod tests {
         assert_eq!(summary.cards_seen, 1);
         assert_eq!(summary.records_emitted, 1);
         assert_eq!(summary.stats.contentless_records, 0);
-        assert_eq!(summary.stats.transparent_records, 1);
-        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted.len(), 2, "the node, then the path on the leaf");
 
         let block = projected_block(&emitted[0]);
         assert!(exists!(pattern!(&emitted[0], [
-            { block @ schema::block::contains: _?part },
-            { _?part @ schema::content_part::fact: _?fact },
+            { block @ schema::block::holds: _?fact },
             { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::EVENT },
         ])));
     }

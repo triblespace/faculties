@@ -53,8 +53,8 @@ use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{NsTAIInterval, U256BE};
-use triblespace::prelude::{TryFromInline, View};
+use triblespace::prelude::inlineencodings::NsTAIInterval;
+use triblespace::prelude::View;
 use GORBIE::card_ctx::GRID_ROW_MODULE;
 use GORBIE::prelude::CardCtx;
 
@@ -545,8 +545,8 @@ fn collect_reason_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Eve
 
 /// Emit one Archive event per source projection receipt. A receipt's
 /// earliest genuine source timestamp wins when present; otherwise the
-/// canonical block time is used. Text parts are rendered in ordinal order
-/// and non-text-only blocks remain visible as a typed placeholder.
+/// canonical node time is used. A node's texts are rendered, and a node
+/// holding no text remains visible as a typed placeholder.
 fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     let source_times = earliest_source_times(dataset.facts);
 
@@ -560,38 +560,28 @@ fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
 
     let mut part_counts = HashMap::<Id, usize>::new();
     for (block, _) in find!(
-        (block: Id, part: Id),
-        pattern!(dataset.facts, [{ ?block @ archive::block::contains: ?part }])
+        (block: Id, fact: Id),
+        pattern!(dataset.facts, [{ ?block @ archive::block::holds: ?fact }])
     ) {
         *part_counts.entry(block).or_default() += 1;
     }
 
-    let mut text_parts = HashMap::<Id, Vec<(u64, Id, String)>>::new();
-    for (block, part, ordinal, payload) in find!(
-        (
-            block: Id,
-            part: Id,
-            ordinal: Inline<U256BE>,
-            payload: TextHandle
-        ),
+    // A node holds one fact, or a set at one moment: its texts in fact order.
+    let mut text_parts = HashMap::<Id, Vec<(Id, String)>>::new();
+    for (block, fact, payload) in find!(
+        (block: Id, fact: Id, payload: TextHandle),
         pattern!(dataset.facts, [
-            { ?block @ archive::block::contains: ?part },
-            { ?part @
-                archive::content_part::ordinal: ?ordinal,
-                archive::content_part::fact: _?fact,
-            },
-            { _?fact @ archive::content_fact::payload: ?payload },
+            { ?block @ archive::block::holds: ?fact },
+            { ?fact @ archive::content_fact::payload: ?payload },
         ])
     ) {
-        let ordinal =
-            u64::try_from_inline(&ordinal).expect("StorageState validated Archive part ordinals");
         text_parts
             .entry(block)
             .or_default()
-            .push((ordinal, part, read_text(dataset, payload)));
+            .push((fact, read_text(dataset, payload)));
     }
     for parts in text_parts.values_mut() {
-        parts.sort_unstable_by_key(|(ordinal, part, _)| (*ordinal, *part));
+        parts.sort_unstable_by_key(|(fact, _)| *fact);
     }
 
     let projections: Vec<(Id, Id)> = find!(
@@ -615,7 +605,7 @@ fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
             .map(|parts| {
                 parts
                     .iter()
-                    .map(|(_, _, text)| text.as_str())
+                    .map(|(_, text)| text.as_str())
                     .collect::<Vec<_>>()
                     .join(" ")
             })

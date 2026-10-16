@@ -1,22 +1,27 @@
-//! Portable exact-term-frequency BM25 over canonical Archive blocks.
+//! Portable exact-term-frequency BM25 over canonical Archive nodes.
 //!
 //! This module is one concrete attached-collection mapping, not a registry.
 //! Its parent is Archive's canonical `SimpleArchive` union and its attached
-//! representation is the portable BM25 carrier. Every canonical semantic block is a document,
-//! including a genuine textless block. The unique content-free canonical
-//! bottom used only by raw source receipts is excluded so provenance volume
-//! cannot perturb corpus statistics. Content parts are occurrences, so the
-//! same content fact at two ordinals contributes twice. Every selected
-//! `UTF8String` payload is tokenized with [`hash_tokens`], and repeated
-//! documents join by pointwise maximum in the portable carrier.
+//! representation is the portable BM25 carrier. Every canonical semantic node
+//! is a document, including a genuine textless one: its document is the text
+//! of the facts it holds (one, or the set that happened at one moment). The
+//! unique content-free canonical bottom used only by raw source receipts is
+//! excluded so provenance volume cannot perturb corpus statistics. Every
+//! selected `UTF8String` payload is tokenized with [`hash_tokens`], and
+//! repeated documents join by pointwise maximum in the portable carrier.
+//!
+//! The node, not a derived act, is the document because a node and its facts
+//! are one identity, written together into one commit, so each commit maps
+//! exactly. An act is a run along the chain that can span commits (a session
+//! re-imported longer, a live writer's checkpoints), so an act document could
+//! only be assembled across members, which a per-member mapping cannot do.
+//! Readers rank nodes and widen a hit to its act with
+//! [`crate::blockdag::turn_of`] at query time.
 //!
 //! Importer receipts are deliberately outside the projection. The mapping is
-//! an open-world typed query: unknown facts and undecodable rows are inert.
-//! A part a node's block references must be present with its content fact in
-//! that node, or the node is refused; but a part the node does not reference
-//! is invisible to it, so a node holding only some of a block's parts is
-//! indexed from those parts, with nothing refused. See
-//! [`ArchiveBlockTextBm25Mapping`] for what that means for a cover.
+//! an open-world typed query: unknown facts, undecodable rows and nodes in an
+//! older shape are inert. A fact a node holds must be present in that member,
+//! or the member is refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -44,17 +49,19 @@ use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::schemas::blockdag as schema;
 
-/// Archive-block-text BM25 member mapping, version 1.
+/// Archive-node-text BM25 member mapping, version 2: one document per node.
 ///
-/// Minted with `trible genid` on 2026-08-30:
-/// `4EC6991611EF484A37FBD95F6E108FC6`.
+/// Minted with `trible genid` on 2026-10-16:
+/// `C896F71EBE5FE1513424B0853F5082B7`. It replaces version 1
+/// (`4EC6991611EF484A37FBD95F6E108FC6`), whose documents were blocks of
+/// ordered content parts.
 ///
 /// Changing the selected graph fields, occurrence aggregation / term-frequency
 /// law, tokenizer behavior, or document/term schemas requires a new mapping id.
 /// Joining mapped members belongs to [`PortableBM25Blob`], not this identity.
 /// BM25 `k1` / `b` scoring policy is derived query behavior and is deliberately
 /// outside the persisted collection identity.
-pub const ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1: Id = id_hex!("4EC6991611EF484A37FBD95F6E108FC6");
+pub const ARCHIVE_NODE_TEXT_BM25_MAPPING_V2: Id = id_hex!("C896F71EBE5FE1513424B0853F5082B7");
 
 pub type ArchiveBM25Index = PortableBM25Index<GenId, WordHash>;
 /// Shared carrier views for one logical Archive search cover.
@@ -73,19 +80,19 @@ struct ProjectionPlan {
     documents: BTreeMap<Id, Vec<Inline<Handle<UTF8String>>>>,
 }
 
-/// The archive-block-text BM25 law, as a describable type.
+/// The archive-node-text BM25 law, as a describable type.
 ///
 /// A descriptor embeds this rather than only naming it, so a reader holding
 /// the pile can learn what the index is without the code that built it.
-pub struct ArchiveBlockTextBm25MappingV1;
+pub struct ArchiveNodeTextBm25MappingV2;
 
-impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
+impl MetaDescribe for ArchiveNodeTextBm25MappingV2 {
     fn describe() -> triblespace::core::trible::Fragment {
-        let id: Id = ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1;
+        let id: Id = ARCHIVE_NODE_TEXT_BM25_MAPPING_V2;
         entity! {
             triblespace::core::id::ExclusiveId::force_ref(&id) @
-                metadata::name: "archive-block-text-bm25-v1",
-                metadata::description: "Canonical mapping from one Archive SimpleArchive member to one PortableBM25Blob. Every canonical semantic block in that member is one document; Archive's content-free bottom is excluded, selected UTF8String payload occurrences are tokenized with hash_tokens, repeated terms contribute exact frequencies, and repeated documents combine by pointwise maximum. PortableBM25Blob owns target-member validation and join. The k1 and b scoring parameters are deliberately absent because they are query-time behaviour.",
+                metadata::name: "archive-node-text-bm25-v2",
+                metadata::description: "Canonical mapping from one Archive SimpleArchive member to one PortableBM25Blob. Every canonical semantic node in that member is one document holding the UTF8String payloads of the facts it holds; Archive's content-free bottom is excluded, payloads are tokenized with hash_tokens, repeated terms contribute exact frequencies, and repeated documents combine by pointwise maximum. PortableBM25Blob owns target-member validation and join. The k1 and b scoring parameters are deliberately absent because they are query-time behaviour.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -94,28 +101,11 @@ impl MetaDescribe for ArchiveBlockTextBm25MappingV1 {
 /// Bound canonical projection from one Archive fact-set member to its
 /// portable BM25 image.
 ///
-/// Its cover-query law ([`MapMapping`](triblespace::core::collection::MapMapping))
-/// is a premise about its input, not something it checks. A block's term
-/// frequency sums over the block's parts, and a node cannot tell that a
-/// block has more parts elsewhere. So this mapping answers like the union
-/// for every cover whose nodes hold whole source units (a block with all its
-/// parts and their facts). A node holding part of a block scores that block
-/// from the part it holds, with no refusal and no residual to show it, so a
-/// cover that splits a block undercounts it even when nothing is unread.
-/// Faculties' own Archive importer commits whole source units
-/// ([`crate::archive_collection::ArchiveImportWriter::stage_fragment`] keeps
-/// each fragment it is given whole in one commit, and the importers hand it
-/// whole blocks), which `every_import_commit_holds_whole_blocks` pins. That
-/// is the premise for data we write. It is not a guarantee: the writer does
-/// not check that a fragment holds whole blocks, and another writer's
-/// commits or historical input need not hold them.
-///
-/// The ignored tests `a_block_whose_parts_sit_in_two_nodes_scores_like_their_union`,
-/// `a_block_extended_by_a_node_without_its_tag_scores_like_their_union` and
-/// `archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes`
-/// are the acceptance tests of the structural fix: a per-fact text BM25 over
-/// the content fact's payload, blocks ranked at query time through the fact
-/// read, which retires this mapping (`4EC6991611EF484A37FBD95F6E108FC6`).
+/// A node's document is the facts it holds, which are its identity and which
+/// faculties' importers commit with it, so a member that holds such a node
+/// holds its whole document and every cover answers like the union of what it
+/// reads. A writer that spreads one set node's held facts over several
+/// members breaks that premise; the ignored tests below pin the gap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArchiveBlockTextBm25Mapping;
 
@@ -129,10 +119,10 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
     fn bind(_parent: &Fragment, attached: &Fragment) -> Result<Self, CollectionOperationError> {
         let actual = triblespace::core::collection::descriptor::mapping_algorithm(attached.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
-        if actual != Some(ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1) {
+        if actual != Some(ARCHIVE_NODE_TEXT_BM25_MAPPING_V2) {
             return Err(CollectionOperationError::Fatal(format!(
                 "Archive BM25 mapping algorithm {:?} does not match archive-block-text-v1 \
-                 {ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1:X}",
+                 {ARCHIVE_NODE_TEXT_BM25_MAPPING_V2:X}",
                 actual.map(|id| format!("{id:X}")),
             )));
         }
@@ -142,13 +132,13 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
     /// Map one parent node, classifying what stops it by what could still
     /// change the answer. A selected text payload that is not here is a
     /// dependency the store may fetch, after which the map runs again. A
-    /// node holding a block that references a part the node does not hold,
-    /// or a part whose content fact is absent or untyped there, is refused
-    /// as that node's capacity: maintenance descends to the nodes beneath
-    /// it, and a merged node above that holds the whole closure represents
-    /// it. Not every split is refused: a node holding a block with only some
-    /// of its `contains` facts, or a `contains` fact without the block's
-    /// tag, is mapped from what it holds (see the type's documentation).
+    /// collection node holding an Archive node whose held fact is absent or
+    /// untyped there is refused as that collection node's capacity:
+    /// maintenance descends to the collection nodes beneath it, and a merged
+    /// one above that holds the whole closure represents it. Not every split
+    /// is refused: a collection node holding an Archive node with only some
+    /// of its `holds` facts, or a `holds` fact without the node's tag, is
+    /// mapped from what it holds (see the type's documentation).
     /// Only a failure to read the store is fatal, because that is the one
     /// thing no other node can get around.
     fn map<R: StoreRead>(
@@ -173,7 +163,7 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
 fn mapping_fragment() -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_MAPPING,
-        mapping_algorithm*: <ArchiveBlockTextBm25MappingV1 as MetaDescribe>::describe(),
+        mapping_algorithm*: <ArchiveNodeTextBm25MappingV2 as MetaDescribe>::describe(),
     }
 }
 
@@ -288,82 +278,62 @@ fn projection_plan(source: Blob<SimpleArchive>) -> std::result::Result<Projectio
     .collect();
     let mut documents = BTreeMap::new();
     for block_id in block_ids {
-        let part_ids: BTreeSet<Id> = find!(
-            part: Id,
-            pattern!(&facts, [{ block_id @ schema::block::contains: ?part }])
+        let fact_ids: BTreeSet<Id> = find!(
+            fact: Id,
+            pattern!(&facts, [{ block_id @ schema::block::holds: ?fact }])
         )
         .collect();
         // The unique content-free bottom is not a BM25 document. Under the
-        // open-world schema, other tag-only rows are simply nonmatching too;
-        // neither case licenses reconstructing or validating an entity id.
-        if part_ids.is_empty() {
+        // open-world schema, other tag-only rows (and nodes in an older
+        // shape) are simply nonmatching too; neither case licenses
+        // reconstructing or validating an entity id.
+        if fact_ids.is_empty() {
             continue;
         }
 
-        let mut parts = Vec::new();
-        for part_id in part_ids {
-            let occurrences: BTreeSet<(u64, Id)> = find!(
-                (ordinal: u64, fact: Id),
+        let mut payloads = Vec::new();
+        for fact_id in fact_ids {
+            if find!(
+                (modality: Id, direction: Id),
                 pattern!(&facts, [{
-                    part_id @ metadata::tag: &schema::content_part::KIND,
-                    schema::content_part::ordinal: ?ordinal,
-                    schema::content_part::fact: ?fact,
+                    fact_id @ metadata::tag: &schema::content_fact::KIND,
+                    schema::content_fact::modality: ?modality,
+                    schema::content_fact::direction: ?direction,
                 }])
             )
-            .collect();
-            if occurrences.is_empty() {
+            .next()
+            .is_none()
+            {
                 return Err(format!(
-                    "Archive block {block_id:X} references absent part {part_id:X} or one without typed fields"
+                    "Archive node {block_id:X} holds absent or untyped fact {fact_id:X}"
                 ));
             }
-            for (ordinal, fact_id) in occurrences {
-                if find!(
-                    (modality: Id, direction: Id),
+            let texts: Vec<Inline<Handle<UTF8String>>> = find!(
+                payload: Inline<Handle<UTF8String>>,
+                pattern!(&facts, [{ fact_id @ schema::content_fact::payload: ?payload }])
+            )
+            .collect();
+            let has_nontext_payload = find!(
+                _blob: Inline<Handle<RawBytes>>,
+                pattern!(&facts, [{ fact_id @ schema::content_fact::blob: ?_blob }])
+            )
+            .next()
+            .is_some()
+                || find!(
+                    _pointer: Inline<Handle<UTF8String>>,
                     pattern!(&facts, [{
-                        fact_id @ metadata::tag: &schema::content_fact::KIND,
-                        schema::content_fact::modality: ?modality,
-                        schema::content_fact::direction: ?direction,
+                        fact_id @ schema::content_fact::asset_pointer: ?_pointer
                     }])
                 )
                 .next()
-                .is_none()
-                {
-                    return Err(format!(
-                        "Archive part {part_id:X} references absent or untyped fact {fact_id:X}"
-                    ));
-                }
-                let payloads: Vec<Inline<Handle<UTF8String>>> = find!(
-                    payload: Inline<Handle<UTF8String>>,
-                    pattern!(&facts, [{ fact_id @ schema::content_fact::payload: ?payload }])
-                )
-                .collect();
-                let has_nontext_payload = find!(
-                    _blob: Inline<Handle<RawBytes>>,
-                    pattern!(&facts, [{ fact_id @ schema::content_fact::blob: ?_blob }])
-                )
-                .next()
-                .is_some()
-                    || find!(
-                        _pointer: Inline<Handle<UTF8String>>,
-                        pattern!(&facts, [{
-                            fact_id @ schema::content_fact::asset_pointer: ?_pointer
-                        }])
-                    )
-                    .next()
-                    .is_some();
-                if payloads.is_empty() && !has_nontext_payload {
-                    return Err(format!(
-                        "Archive content fact {fact_id:X} has no typed payload variant"
-                    ));
-                }
-                parts.push((ordinal, part_id, payloads));
+                .is_some();
+            if texts.is_empty() && !has_nontext_payload {
+                return Err(format!(
+                    "Archive content fact {fact_id:X} has no typed payload variant"
+                ));
             }
+            payloads.extend(texts);
         }
-        parts.sort_unstable_by_key(|(ordinal, part, _)| (*ordinal, *part));
-        let payloads = parts
-            .into_iter()
-            .flat_map(|(_, _, payloads)| payloads)
-            .collect();
         documents.insert(block_id, payloads);
     }
     Ok(ProjectionPlan { documents })
@@ -421,18 +391,18 @@ mod tests {
         (source, attachments)
     }
 
-    fn text_block(parts: &[(Id, &str)]) -> Fragment {
-        let mut occurrences = Fragment::empty();
-        for (ordinal, (modality, text)) in parts.iter().enumerate() {
-            let fact = archive::text_fact(
+    /// One root node holding the given facts as one simultaneous set.
+    fn text_block(facts: &[(Id, &str)]) -> Fragment {
+        let mut held = Fragment::empty();
+        for (modality, text) in facts {
+            held += archive::text_fact(
                 *modality,
                 schema::content_fact::direction::IN,
                 (*text).to_owned(),
             )
             .unwrap();
-            occurrences += archive::content_part(ordinal as u64, fact, None).unwrap();
         }
-        archive::block(std::iter::empty::<Id>(), None, occurrences).unwrap()
+        archive::block(std::iter::empty::<Id>(), None, held).unwrap()
     }
 
     fn parse(blob: Blob<PortableBM25Blob>) -> ArchiveBM25Index {
@@ -446,8 +416,7 @@ mod tests {
     #[test]
     fn a_cold_residual_block_acquires_its_text_without_changing_residency() {
         use triblespace::core::collection::{
-            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt,
-            CollectionStoreExt,
+            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
         };
         use triblespace::core::repo::{BlobStoreList, StorageClose};
 
@@ -456,17 +425,27 @@ mod tests {
         File::create(&path).unwrap();
         let signer = ed25519_dalek::SigningKey::from_bytes(&[113; 32]);
         let mut store = crate::storage::open_store_as(&path, signer.verifying_key()).unwrap();
-        let root = store.collection("cold Archive BM25", CollectionPolicy::new(
-            AdmissionPolicy::direct(signer.verifying_key()),
-            AdmissionPolicy::direct(signer.verifying_key()),
-        )).unwrap();
-        let target = store.attach_with(root, ArchiveBlockTextBm25Mapping).unwrap();
+        let root = store
+            .collection(
+                "cold Archive BM25",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(signer.verifying_key()),
+                    AdmissionPolicy::direct(signer.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let target = store
+            .attach_with(root, ArchiveBlockTextBm25Mapping)
+            .unwrap();
         let text: Blob<UTF8String> = "late comet comet".to_blob();
         let text_handle = text.get_handle();
-        let (node, attachments) = source_and_attachments(text_block(&[
-            (schema::content_fact::modality::TEXT, "late comet comet"),
-        ]));
-        assert!(attachments.iter().any(|blob| blob.get_handle().raw == text_handle.raw));
+        let (node, attachments) = source_and_attachments(text_block(&[(
+            schema::content_fact::modality::TEXT,
+            "late comet comet",
+        )]));
+        assert!(attachments
+            .iter()
+            .any(|blob| blob.get_handle().raw == text_handle.raw));
         let facts = TribleSet::try_from_blob(node.clone()).unwrap();
         store.commit(root, &signer, facts.into()).unwrap();
         let frozen = store.snapshot().unwrap();
@@ -488,9 +467,19 @@ mod tests {
         let selected = reader.attached_acquiring(target).unwrap();
         assert_eq!(selected.residual().len(), 1);
         let index = crate::storage::require_complete_attached_read(
-            selected.read_with_acquiring::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>().unwrap(),
-        ).unwrap();
-        assert_eq!(index.segments().iter().map(|segment| segment.doc_count()).sum::<usize>(), 1);
+            selected
+                .read_with_acquiring::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            index
+                .segments()
+                .iter()
+                .map(|segment| segment.doc_count())
+                .sum::<usize>(),
+            1
+        );
         assert!(!reader.contains_blob(text_handle).unwrap());
         assert!(store.health().started_at.is_none());
         store.close().unwrap();
@@ -534,8 +523,7 @@ mod tests {
             "application/octet-stream",
         )
         .unwrap();
-        let binary_part = archive::content_part(0, binary_fact, None).unwrap();
-        let binary_block = archive::block(std::iter::empty::<Id>(), None, binary_part).unwrap();
+        let binary_block = archive::block(std::iter::empty::<Id>(), None, binary_fact).unwrap();
         let binary_id = binary_block.root().unwrap();
         let bottom = archive::block(std::iter::empty::<Id>(), None, Fragment::empty()).unwrap();
         let mut corpus = empty_text;
@@ -600,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_part_occurrences_sum_across_modalities() {
+    fn repeated_terms_in_a_set_node_sum_across_modalities() {
         let block = text_block(&[
             (schema::content_fact::modality::THINKING, "echo"),
             (schema::content_fact::modality::TOOL_RESULT, "echo"),
@@ -649,14 +637,13 @@ mod tests {
             "open world",
         )
         .unwrap();
-        let part = archive::content_part(0, fact, None).unwrap();
-        let part_id = part.root().unwrap();
+        let fact_id = fact.root().unwrap();
         let block_id = Id::new([0xA5; 16]).unwrap();
-        let mut graph_with_unknown_fact = part;
+        let mut graph_with_unknown_fact = fact;
         graph_with_unknown_fact += entity! { ExclusiveId::force_ref(&block_id) @
             metadata::tag: &schema::block::KIND,
-            metadata::name: "unexpected block field",
-            schema::block::contains: &part_id,
+            metadata::name: "unexpected node field",
+            schema::block::holds: &fact_id,
         };
         let (graph_with_unknown_fact, attachments) =
             source_and_attachments(graph_with_unknown_fact);
@@ -699,8 +686,8 @@ mod tests {
         }
     }
 
-    /// One block cut in two: its own facts, and its parts and facts with
-    /// every text payload.
+    /// One Archive node cut in two: its own facts (tag and `holds`), and its
+    /// held facts with every text payload.
     fn split(block: Fragment) -> (Fragment, Fragment) {
         let block_id = block.root().unwrap();
         let (_, facts, metafacts, blobs) = block.into_parts();
@@ -730,12 +717,12 @@ mod tests {
             .collect()
     }
 
-    /// The cover-query equivalence law for the archive-block mapping over
-    /// the one split it refuses: a block's own facts in one commit and its
-    /// parts and facts in another. The commit holding the block references
-    /// parts it lacks and cannot be indexed alone (`Capacity`), only from a
-    /// node holding both. Splits the mapping does not refuse are the ignored
-    /// tests below.
+    /// The cover-query equivalence law for the archive-node mapping over
+    /// the one split it refuses: an Archive node's own facts in one commit
+    /// and its held facts in another. The commit holding the node references
+    /// facts it lacks and cannot be indexed alone (`Capacity`), only from a
+    /// collection node holding both. Splits the mapping does not refuse are
+    /// the ignored tests below.
     ///
     /// Over random commits (some blocks split), the host's carry or not,
     /// random host merges over possibly overlapping nodes, and an attachment
@@ -937,60 +924,67 @@ mod tests {
         assert!(attachments_taken > 0);
     }
 
-    // The three ignored tests below show the cover law failing when a
-    // block's parts span nodes. They are the acceptance tests of the
-    // structural fix: a per-fact text BM25 over the content fact's payload,
-    // with blocks ranked at query time through the fact read, which retires
-    // mapping 4EC6991611EF484A37FBD95F6E108FC6. They stop being ignored with
-    // it; until then this mapping's law holds only for covers of whole source
-    // units (see `ArchiveBlockTextBm25Mapping`).
+    // The three ignored tests below show the cover law failing when one
+    // node's held facts span members. Faculties' importers never write that:
+    // a node and its facts are one identity, committed together, and only a
+    // simultaneous set node holds more than one fact. Another writer can
+    // still spread a set node's facts over commits; a per-fact text BM25,
+    // with nodes ranked at query time through the fact read, would close
+    // the gap. Until then this mapping's law holds only for covers whose
+    // nodes arrive whole (see `ArchiveBlockTextBm25Mapping`).
 
-    /// One block of several text parts, and each part's fragment.
+    /// One set node of several distinct text facts, and each fact. The
+    /// modality varies with the position so equal words stay distinct
+    /// facts: a set of equal facts is one fact.
     fn parts_block(texts: &[&str]) -> (Fragment, Vec<Fragment>) {
-        let mut parts = Vec::new();
-        let mut occurrences = Fragment::empty();
-        for (ordinal, text) in texts.iter().enumerate() {
+        const MODALITIES: [Id; 3] = [
+            schema::content_fact::modality::TEXT,
+            schema::content_fact::modality::THINKING,
+            schema::content_fact::modality::TOOL_RESULT,
+        ];
+        let mut facts = Vec::new();
+        let mut held = Fragment::empty();
+        for (index, text) in texts.iter().enumerate() {
             let fact = archive::text_fact(
-                schema::content_fact::modality::TEXT,
+                MODALITIES[index % MODALITIES.len()],
                 schema::content_fact::direction::IN,
                 (*text).to_owned(),
             )
             .unwrap();
-            let part = archive::content_part(ordinal as u64, fact, None).unwrap();
-            parts.push(part.clone());
-            occurrences += part;
+            facts.push(fact.clone());
+            held += fact;
         }
-        let block = archive::block(std::iter::empty::<Id>(), None, occurrences).unwrap();
-        (block, parts)
+        let node = archive::block(std::iter::empty::<Id>(), None, held).unwrap();
+        (node, facts)
     }
 
-    /// The facts of `block` a node holds when it has the `contains` fact and
-    /// the whole closure of each of `parts`, and, when `tagged`, every other
-    /// fact of the block itself.
-    fn block_piece(block: &Fragment, parts: &[&Fragment], tagged: bool) -> Fragment {
-        let block_id = block.root().unwrap();
-        let contains = schema::block::contains.id();
-        let mut facts = TribleSet::new();
-        for part in parts {
-            facts += part.facts().clone();
-            let part_id: Inline<GenId> = part.root().unwrap().to_inline();
-            for fact in block.facts().iter() {
-                if fact.e() == &block_id
-                    && fact.a() == &contains
-                    && fact.v::<GenId>().raw == part_id.raw
+    /// The facts of `node` a member holds when it has the `holds` fact and
+    /// the closure of each of `facts`, and, when `tagged`, every other fact
+    /// of the node itself.
+    fn block_piece(node: &Fragment, facts: &[&Fragment], tagged: bool) -> Fragment {
+        let node_id = node.root().unwrap();
+        let holds = schema::block::holds.id();
+        let mut piece = TribleSet::new();
+        for fact in facts {
+            piece += fact.facts().clone();
+            let fact_id: Inline<GenId> = fact.root().unwrap().to_inline();
+            for trible in node.facts().iter() {
+                if trible.e() == &node_id
+                    && trible.a() == &holds
+                    && trible.v::<GenId>().raw == fact_id.raw
                 {
-                    facts.insert(fact);
+                    piece.insert(trible);
                 }
             }
         }
         if tagged {
-            for fact in block.facts().iter() {
-                if fact.e() == &block_id && fact.a() != &contains {
-                    facts.insert(fact);
+            for trible in node.facts().iter() {
+                if trible.e() == &node_id && trible.a() != &holds {
+                    piece.insert(trible);
                 }
             }
         }
-        Fragment::from(facts)
+        Fragment::from(piece)
     }
 
     /// Commit each node, attach every one of them, and score each query
@@ -1053,14 +1047,14 @@ mod tests {
             .collect()
     }
 
-    /// Two nodes each hold the block and one of its two parts, each part
-    /// with the same word. Each node maps, to a frequency of one; the union
-    /// holds both parts, a frequency of two. The cover's pointwise maximum
-    /// says one; a sum would say two here, and twice the truth wherever the
-    /// two nodes hold the same part.
+    /// Two members each hold the set node and one of its two facts, each
+    /// fact with the same word. Each member maps, to a frequency of one; the
+    /// union holds both facts, a frequency of two. The cover's pointwise
+    /// maximum says one; a sum would say two here, and twice the truth
+    /// wherever the two members hold the same fact.
     #[test]
-    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
-                holding some of a block's parts cannot tell; no combination of per-node images \
+    #[ignore = "open design question: a set node's term frequency sums over its held facts, and \
+                a member holding some of them cannot tell; no combination of per-member images \
                 is exact"]
     fn a_block_whose_parts_sit_in_two_nodes_scores_like_their_union() {
         let (block, parts) = parts_block(&["echo", "echo"]);
@@ -1075,15 +1069,15 @@ mod tests {
         }
     }
 
-    /// The same block, one node holding it with its first part and another
-    /// holding only its `contains` fact for the second part and that part's
-    /// closure, not the block's tag. The second node has no document, so
-    /// the block is in one image only, and still its union's frequency is
-    /// larger: finding the blocks two images share cannot find every block
-    /// the cover gets wrong.
+    /// The same set node, one member holding it with its first fact and
+    /// another holding only its `holds` fact for the second fact and that
+    /// fact's closure, not the node's tag. The second member has no document,
+    /// so the node is in one image only, and still its union's frequency is
+    /// larger: finding the nodes two images share cannot find every node the
+    /// cover gets wrong.
     #[test]
-    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
-                holding some of a block's parts cannot tell; no combination of per-node images \
+    #[ignore = "open design question: a set node's term frequency sums over its held facts, and \
+                a member holding some of them cannot tell; no combination of per-member images \
                 is exact"]
     fn a_block_extended_by_a_node_without_its_tag_scores_like_their_union() {
         let (block, parts) = parts_block(&["echo", "echo"]);
@@ -1098,16 +1092,15 @@ mod tests {
         }
     }
 
-    /// The cover-query equivalence law over blocks of several parts whose
-    /// facts are spread over nodes: whole, one part per node with the
-    /// block's own facts in each, two overlapping runs of parts, or the
-    /// block's own facts with its first part and each other part's
-    /// `contains` fact and closure elsewhere; the pieces of different
-    /// blocks share nodes at random. Every node maps, so the law must hold
-    /// with nothing unread.
+    /// The cover-query equivalence law over set nodes whose held facts are
+    /// spread over members: whole, one fact per member with the node's own
+    /// facts in each, two overlapping runs of facts, or the node's own facts
+    /// with its first fact and each other fact's `holds` fact and closure
+    /// elsewhere; the pieces of different nodes share members at random.
+    /// Every member maps, so the law must hold with nothing unread.
     #[test]
-    #[ignore = "open design question: a block's term frequency sums over its parts, and a node \
-                holding some of a block's parts cannot tell; no combination of per-node images \
+    #[ignore = "open design question: a set node's term frequency sums over its held facts, and \
+                a member holding some of them cannot tell; no combination of per-member images \
                 is exact"]
     fn archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes() {
         const WORDS: [&str; 4] = ["alpha", "bravo", "charlie", "echo"];

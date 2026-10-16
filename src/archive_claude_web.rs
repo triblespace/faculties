@@ -18,7 +18,7 @@ use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
 use crate::archive_source::{
-    self, ProjectedSource, SourceClaims, SourcePart, SourceRecord, Threading,
+    self, ProjectedSource, SourceClaims, SourcePart, SourceRecord, ToolLink,
 };
 use crate::schemas::blockdag as schema;
 
@@ -49,12 +49,7 @@ impl ProjectionStats {
         self.missing_message_uuids += other.missing_message_uuids;
         self.invalid_timestamps += other.invalid_timestamps;
         self.unknown_content_items += other.unknown_content_items;
-        self.common.records_seen += other.common.records_seen;
-        self.common.projections_emitted += other.common.projections_emitted;
-        self.common.content_parts += other.common.content_parts;
-        self.common.transparent_records += other.common.transparent_records;
-        self.common.contentless_records += other.common.contentless_records;
-        self.common.missing_predecessors += other.common.missing_predecessors;
+        self.common.absorb(other.common);
     }
 }
 
@@ -206,6 +201,9 @@ enum ContentDraft {
     Text {
         modality: Id,
         text: View<str>,
+        /// The vendor's tool correlator: a call's `id` or a result's
+        /// `tool_use_id`. It links the two and is never hashed.
+        link: Option<ToolLink>,
     },
     Pointer {
         modality: Id,
@@ -386,6 +384,7 @@ fn parse_content(value: &mut Bytes) -> ScanResult<Vec<ContentDraft>> {
             .map(|text| ContentDraft::Text {
                 modality: schema::content_fact::modality::TEXT,
                 text,
+                link: None,
             })
             .collect()),
         Some(b'[') => sc::array(value, Vec::new(), |mut parts, value| {
@@ -414,6 +413,7 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
             .map(|text| ContentDraft::Text {
                 modality: schema::content_fact::modality::TEXT,
                 text,
+                link: None,
             })
             .collect());
     }
@@ -485,7 +485,13 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
     let text = |modality, text: Option<View<str>>| {
         Ok(text
             .and_then(nonempty)
-            .map(|text| vec![ContentDraft::Text { modality, text }])
+            .map(|text| {
+                vec![ContentDraft::Text {
+                    modality,
+                    text,
+                    link: None,
+                }]
+            })
             .unwrap_or_default())
     };
     match kind {
@@ -518,17 +524,16 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
         "tool_use" | "tool_call" => Ok(vec![ContentDraft::Text {
             modality: schema::content_fact::modality::TOOL_CALL,
             text: archive_source::owned_text(canonical_tool_payload(
-                fields.id.as_ref(),
                 fields.name.as_ref(),
                 fields.input,
                 fields.message,
                 fields.display_content,
             )?),
+            link: fields.id.map(ToolLink::Call),
         }]),
         "tool_result" => Ok(vec![ContentDraft::Text {
             modality: schema::content_fact::modality::TOOL_RESULT,
             text: archive_source::owned_text(canonical_tool_result(
-                fields.tool_use_id.as_ref(),
                 fields.name.as_ref(),
                 fields.content,
                 fields.message,
@@ -536,6 +541,7 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
                 fields.structured_content,
                 fields.is_error,
             )?),
+            link: fields.tool_use_id.map(ToolLink::Result),
         }]),
         "json_block" => text(
             schema::content_fact::modality::TEXT,
@@ -600,31 +606,31 @@ fn parse_content_item(raw: Bytes) -> ScanResult<Vec<ContentDraft>> {
         "webpage_metadata" | "single_select" => Ok(vec![ContentDraft::Text {
             modality: schema::content_fact::modality::TEXT,
             text: archive_source::owned_text(archive_source::canonical_json(original)?),
+            link: None,
         }]),
         _ => Ok(vec![ContentDraft::Unknown]),
     }
 }
 
+/// The hashed form of a tool call: what was called and with what. The
+/// vendor's call id is a correlator, carried by `responds_to`, never hashed.
 fn canonical_tool_payload(
-    id: Option<&View<str>>,
     name: Option<&View<str>>,
     input: Option<Bytes>,
     message: Option<Bytes>,
     display_content: Option<Bytes>,
 ) -> ScanResult<String> {
     Ok(format!(
-        r#"{{"display_content":{},"id":{},"input":{},"message":{},"name":{}}}"#,
+        r#"{{"display_content":{},"input":{},"message":{},"name":{}}}"#,
         canonical_or_null(display_content)?,
-        canonical_string_or_null(id),
         canonical_or_null(input)?,
         canonical_or_null(message)?,
         canonical_string_or_null(name),
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The hashed form of a tool result, without the vendor's `tool_use_id`.
 fn canonical_tool_result(
-    tool_use_id: Option<&View<str>>,
     name: Option<&View<str>>,
     content: Option<Bytes>,
     message: Option<Bytes>,
@@ -633,14 +639,13 @@ fn canonical_tool_result(
     is_error: Option<Bytes>,
 ) -> ScanResult<String> {
     Ok(format!(
-        r#"{{"content":{},"display_content":{},"is_error":{},"message":{},"name":{},"structured_content":{},"tool_use_id":{}}}"#,
+        r#"{{"content":{},"display_content":{},"is_error":{},"message":{},"name":{},"structured_content":{}}}"#,
         canonical_or_null(content)?,
         canonical_or_null(display_content)?,
         canonical_or_null(is_error)?,
         canonical_or_null(message)?,
         canonical_string_or_null(name),
         canonical_or_null(structured_content)?,
-        canonical_string_or_null(tool_use_id),
     ))
 }
 
@@ -830,8 +835,11 @@ fn records_from_conversations(
             };
             let direction = direction_for_sender(message.sender.as_ref().map(AsRef::as_ref));
 
+            // Parts in the order the agent experienced them. A tool result is
+            // what it perceived even inside an assistant message, and sealed
+            // thinking stays beside the thinking it seals.
             let mut parts = Vec::new();
-            let mut sealed = Vec::new();
+            let mut links = Vec::new();
             if message.content.is_empty() {
                 if let Some(text) = message.flat_text.clone().and_then(nonempty) {
                     parts.push(SourcePart::text(
@@ -843,8 +851,25 @@ fn records_from_conversations(
             } else {
                 for content in message.content {
                     match content {
-                        ContentDraft::Text { modality, text } => {
+                        ContentDraft::Text {
+                            modality,
+                            text,
+                            link,
+                        } => {
                             if let Some(text) = nonempty(text) {
+                                let direction =
+                                    if modality == schema::content_fact::modality::TOOL_RESULT {
+                                        schema::content_fact::direction::IN
+                                    } else if modality == schema::content_fact::modality::TOOL_CALL
+                                        || modality == schema::content_fact::modality::THINKING
+                                    {
+                                        schema::content_fact::direction::OUT
+                                    } else {
+                                        direction
+                                    };
+                                if let Some(link) = link {
+                                    links.push((parts.len(), link));
+                                }
                                 parts.push(SourcePart::text(modality, direction, text));
                             }
                         }
@@ -862,7 +887,7 @@ fn records_from_conversations(
                             resolved: None,
                         }),
                         ContentDraft::Sealed { token, media_type } => {
-                            sealed.push(archive_source::sealed_part(
+                            parts.push(archive_source::sealed_part(
                                 token.as_ref(),
                                 media_type,
                                 archive_source::SealedAlphabet::Standard,
@@ -922,33 +947,12 @@ fn records_from_conversations(
 
             let timestamp =
                 parse_timestamp(message.created_at.as_ref(), &mut stats.invalid_timestamps);
-            let threading = if parts.is_empty() {
-                Threading::Transparent
-            } else {
-                Threading::Semantic
-            };
-            if !sealed.is_empty() {
-                // Sealed thinking follows its message on a side branch, so an
-                // export without signatures threads the same messages.
-                records.push(SourceRecord {
-                    locator: archive_source::owned_text(format!("{}/sealed", locator.as_ref())),
-                    predecessors: vec![locator.clone()],
-                    block_timestamp: timestamp,
-                    threading: Threading::Transparent,
-                    parts: sealed,
-                    claims: SourceClaims {
-                        timestamp,
-                        raw_model: message.model.clone(),
-                        ..SourceClaims::default()
-                    },
-                });
-            }
             records.push(SourceRecord {
                 locator: locator.clone(),
                 predecessors: predecessor.into_iter().collect(),
                 block_timestamp: timestamp,
-                threading,
                 parts,
+                links,
                 claims: SourceClaims {
                     timestamp,
                     raw_author: message.sender.clone(),
@@ -962,18 +966,13 @@ fn records_from_conversations(
 
         // The conversation object carries source evidence that is not part of
         // any individual message: name, summary, account, settings, and future
-        // vendor fields. Keep its exact bytes as a source-only occurrence. It
-        // deliberately has no semantic predecessors or parts, so the shared
-        // projector maps it to the canonical bottom block and contracts it out
-        // of the message DAG rather than inventing an ambient EVENT.
-        records.push(SourceRecord {
-            locator: conversation_envelope_locator(&conversation_uuid),
-            predecessors: Vec::new(),
-            block_timestamp: None,
-            threading: Threading::Transparent,
-            parts: Vec::new(),
-            claims: SourceClaims::default(),
-        });
+        // vendor fields. No source bytes are stored, so it projects nothing:
+        // a contentless record that the shared projector contracts.
+        records.push(SourceRecord::new(
+            conversation_envelope_locator(&conversation_uuid),
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     Ok((records, stats))
 }
@@ -1021,16 +1020,17 @@ fn qualified_locator(conversation: &View<str>, message: &View<str>) -> View<str>
     archive_source::owned_text(format!("{}/{}", conversation.as_ref(), message.as_ref()))
 }
 
+/// What the assistant produced is `out`; the human's words and anything from
+/// an unknown or missing sender is what the agent perceived.
 fn direction_for_sender(sender: Option<&str>) -> Id {
-    let Some(sender) = sender else {
-        return schema::content_fact::direction::AMBIENT;
-    };
-    if sender.eq_ignore_ascii_case("human") || sender.eq_ignore_ascii_case("user") {
-        schema::content_fact::direction::IN
-    } else if sender.eq_ignore_ascii_case("assistant") || sender.eq_ignore_ascii_case("claude") {
-        schema::content_fact::direction::OUT
-    } else {
-        schema::content_fact::direction::AMBIENT
+    match sender {
+        Some(sender)
+            if sender.eq_ignore_ascii_case("assistant")
+                || sender.eq_ignore_ascii_case("claude") =>
+        {
+            schema::content_fact::direction::OUT
+        }
+        _ => schema::content_fact::direction::IN,
     }
 }
 
@@ -1119,12 +1119,12 @@ fn syntax(message: impl Into<String>) -> sc::ScanError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
     use tempfile::TempDir;
     use triblespace::core::repo::BlobStoreGet;
-    use triblespace::macros::{exists, pattern};
+    use triblespace::macros::{exists, find, pattern};
     use triblespace::prelude::blobencodings::UTF8String;
     use triblespace::prelude::inlineencodings::Handle;
 
@@ -1231,7 +1231,7 @@ mod tests {
                 .next()
                 .expect("projection has its identity core");
                 let has_content = exists!(pattern!(&projected.fragment, [{
-                    block @ schema::block::contains: _?part
+                    block @ schema::block::holds: _?fact
                 }]));
                 let has_block_timestamp = exists!(pattern!(&projected.fragment, [{
                     block @ schema::block::timestamp: _?timestamp
@@ -1321,7 +1321,7 @@ mod tests {
                 assert_eq!(*modality, schema::content_fact::modality::TOOL_CALL);
                 assert_eq!(
                     value.as_ref(),
-                    r#"{"display_content":{"json_block":"{\"x\":1}","type":"json_block"},"id":"toolu-1","input":{"a":1,"z":2},"message":"run it","name":"bash_tool"}"#
+                    r#"{"display_content":{"json_block":"{\"x\":1}","type":"json_block"},"input":{"a":1,"z":2},"message":"run it","name":"bash_tool"}"#
                 );
             }
             _ => panic!("first part is not a canonical tool call"),
@@ -1337,10 +1337,16 @@ mod tests {
         }
         match &records[0].parts[2] {
             SourcePart::Text {
-                modality, value, ..
+                modality,
+                direction,
+                value,
             } => {
                 assert_eq!(*modality, schema::content_fact::modality::TOOL_RESULT);
-                assert!(value.as_ref().contains(r#""tool_use_id":"toolu-1""#));
+                assert_eq!(*direction, schema::content_fact::direction::IN);
+                assert!(
+                    !value.as_ref().contains("toolu-1"),
+                    "no vendor id is hashed"
+                );
                 assert!(value
                     .as_ref()
                     .contains(r#""content":[{"text":"done","type":"text"}]"#));
@@ -1360,7 +1366,57 @@ mod tests {
             }
             _ => panic!("fourth part is not the stable file pointer"),
         }
+        // The vendor ids link the result to its call instead.
+        assert!(matches!(
+            records[0].links.as_slice(),
+            [(0, ToolLink::Call(call)), (2, ToolLink::Result(result))]
+                if call.as_ref() == "toolu-1" && result.as_ref() == "toolu-1"
+        ));
         assert!(records[1].parts.is_empty());
+    }
+
+    #[test]
+    fn a_re_export_with_new_tool_ids_lands_on_the_same_blocks() {
+        let export = |call: &str| {
+            format!(
+                r#"[{{"uuid":"tools","chat_messages":[
+                    {{"uuid":"q","sender":"human","text":"run it"}},
+                    {{"uuid":"a","parent_message_uuid":"q","sender":"assistant","content":[
+                        {{"type":"tool_use","id":"{call}","name":"bash_tool","input":{{"cmd":"ls"}}}},
+                        {{"type":"tool_result","tool_use_id":"{call}","name":"bash_tool","content":[{{"type":"text","text":"a.txt"}}]}},
+                        {{"type":"text","text":"one file"}}
+                    ]}}
+                ]}}]"#
+            )
+        };
+        let project = |text: String| {
+            let mut fragment = Fragment::empty();
+            project_bytes(
+                "conversations.json",
+                Bytes::from_source(text.into_bytes()),
+                |p| {
+                    fragment += p.fragment;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            fragment
+        };
+        let first = project(export("toolu_first"));
+        let second = project(export("toolu_second"));
+        let blocks = |fragment: &Fragment| -> BTreeSet<Id> {
+            find!(
+                block: Id,
+                pattern!(fragment, [{ _?receipt @ schema::source_projection::projects_to: ?block }])
+            )
+            .collect()
+        };
+        // The prompt; the call; the result it perceived; the reply.
+        assert_eq!(blocks(&first).len(), 4);
+        assert_eq!(blocks(&first), blocks(&second));
+        assert!(exists!(pattern!(&first, [{
+            _?result @ schema::block::responds_to: _?call
+        }])));
     }
 
     #[test]
@@ -1385,8 +1441,6 @@ mod tests {
         );
         assert_eq!(first_stats.contentless_records, 1);
         assert_eq!(second_stats.contentless_records, 1);
-        assert_eq!(first_stats.transparent_records, 1);
-        assert_eq!(second_stats.transparent_records, 1);
     }
 
     #[test]
@@ -1492,35 +1546,40 @@ mod tests {
         );
         assert_eq!(records[2].predecessors, vec![records[1].locator.clone()]);
 
-        let mut second_has_predecessor = None;
+        let mut union = Fragment::empty();
         archive_source::project_records(
             schema::source_projection::SOURCE_CLAUDE_WEB,
             Path::new("conversations.json"),
             records,
             archive_source::UnitAnnotations::default(),
             |projected| {
-                let Some(locator) = projected.record.clone() else {
-                    return Ok(());
-                };
-                let projection = projected.fragment.root().unwrap();
-                let block = find!(
-                    block: Id,
-                    pattern!(&projected.fragment, [{
-                        projection @ schema::source_projection::projects_to: ?block
-                    }])
-                )
-                .next()
-                .unwrap();
-                if locator.as_ref() == "explicit-root/m2" {
-                    second_has_predecessor = Some(exists!(pattern!(&projected.fragment, [{
-                        block @ schema::block::previous: _?previous
-                    }])));
-                }
+                union += projected.fragment;
                 Ok(())
             },
         )
         .unwrap();
-        assert_eq!(second_has_predecessor, Some(false));
+        // "second" starts a chain of its own; "third" is perceived with it.
+        let mut node_of = |text: &str| -> Id {
+            let payload = union.put::<UTF8String, _>(text.to_owned());
+            find!(
+                node: Id,
+                pattern!(&union, [
+                    { ?node @ schema::block::holds: _?fact },
+                    { _?fact @ schema::content_fact::payload: payload },
+                ])
+            )
+            .next()
+            .unwrap()
+        };
+        let second = node_of("second");
+        let third = node_of("third");
+        assert_eq!(
+            crate::blockdag::turn_of(union.facts(), third),
+            vec![second, third]
+        );
+        assert!(!exists!(pattern!(&union, [{
+            second @ schema::block::previous: _?previous
+        }])));
     }
 
     #[test]

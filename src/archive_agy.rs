@@ -10,7 +10,7 @@ use triblespace::core::import::scanner as sc;
 use triblespace::core::inline::TryToInline;
 
 use crate::archive_source::{
-    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, Threading,
+    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, ToolLink,
 };
 use crate::schemas::blockdag as schema;
 
@@ -117,31 +117,62 @@ fn parse_file(path: &Path) -> Result<Vec<SourceRecord>> {
     parse_bytes(path, archive_source::read_file(path)?)
 }
 
+/// The transcript's records in the order the model experienced them.
+///
+/// Antigravity writes records as they settle, so a tool's result can be
+/// written before the step that called it. Every record names its
+/// `step_index`, the conversation's own order; when all of them do, the
+/// chain follows it, and otherwise file order. Blank lines are nothing.
 fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Vec<SourceRecord>> {
     let lines = exact_lines(&bytes);
     let conversation = conversation_anchor(lines.first());
-    let mut records = Vec::new();
-    let mut previous = None::<View<str>>;
-
+    let mut entries = Vec::new();
     for (line_index, raw) in lines.into_iter().enumerate() {
         let line_number = u64::try_from(line_index + 1).expect("line number fits u64");
-        let locator = archive_source::owned_text(format!("{conversation}/line/{line_number}"));
         let trimmed = trim_ascii(raw.clone());
-        let (parts, claims, threading) = if trimmed.is_empty() {
-            (Vec::new(), SourceClaims::default(), Threading::Transparent)
-        } else {
-            let fields = scan_fields(trimmed).with_context(|| {
-                format!("parse Antigravity {} line {line_number}", path.display())
-            })?;
-            interpret(fields)?
-        };
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fields = scan_fields(trimmed)
+            .with_context(|| format!("parse Antigravity {} line {line_number}", path.display()))?;
+        let step = fields.step_index;
+        let (parts, claims) = interpret(fields)?;
+        entries.push((step, line_number, parts, claims));
+    }
+    if entries.iter().all(|(step, ..)| step.is_some()) {
+        entries.sort_by_key(|(step, line, ..)| (*step, *line));
+    }
+
+    let mut records = Vec::with_capacity(entries.len());
+    let mut previous = None::<View<str>>;
+    // Antigravity names no call ids: a tool's result answers the most recent
+    // tool call before it.
+    let mut last_call = None::<View<str>>;
+    for (_, line_number, parts, claims) in entries {
+        let locator = archive_source::owned_text(format!("{conversation}/line/{line_number}"));
+        let mut links = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let SourcePart::Text { modality, .. } = part else {
+                continue;
+            };
+            if *modality == schema::content_fact::modality::TOOL_CALL {
+                links.push((index, ToolLink::Call(locator.clone())));
+                last_call = Some(locator.clone());
+            } else if *modality == schema::content_fact::modality::TOOL_RESULT
+                && part.direction() == schema::content_fact::direction::IN
+            {
+                if let Some(call) = &last_call {
+                    links.push((index, ToolLink::Result(call.clone())));
+                }
+            }
+        }
         let block_timestamp = claims.timestamp;
         records.push(SourceRecord {
             locator: locator.clone(),
             predecessors: previous.iter().cloned().collect(),
             block_timestamp,
-            threading,
             parts,
+            links,
             claims,
         });
         previous = Some(locator);
@@ -216,7 +247,12 @@ fn optional_string(value: &mut Bytes) -> std::result::Result<Option<View<str>>, 
     }
 }
 
+/// A count spelled as a JSON number or, as Antigravity writes `step_index`,
+/// as a string of digits.
 fn optional_u64(value: &mut Bytes) -> std::result::Result<Option<u64>, sc::ScanError> {
+    if value.first().copied() == Some(b'"') {
+        return Ok(optional_string(value)?.and_then(|text| text.as_ref().trim().parse().ok()));
+    }
     if value
         .first()
         .copied()
@@ -233,49 +269,41 @@ fn optional_u64(value: &mut Bytes) -> std::result::Result<Option<u64>, sc::ScanE
     }
 }
 
-fn interpret(fields: RawFields) -> Result<(Vec<SourcePart>, SourceClaims, Threading)> {
+fn interpret(fields: RawFields) -> Result<(Vec<SourcePart>, SourceClaims)> {
     let source = fields.source.as_ref().map(AsRef::as_ref).unwrap_or("");
     let record_type = fields.record_type.as_ref().map(AsRef::as_ref).unwrap_or("");
-    let (direction, modality, threading) = match source {
+    let (direction, modality) = match source {
         "USER_EXPLICIT" | "USER_INPUT" => (
             schema::content_fact::direction::IN,
             schema::content_fact::modality::TEXT,
-            Threading::Semantic,
         ),
         "MODEL" if record_type == "PLANNER_RESPONSE" => (
             schema::content_fact::direction::OUT,
             schema::content_fact::modality::TEXT,
-            Threading::Semantic,
         ),
         "SYSTEM" if record_type == "TOOL_CALL" => (
             schema::content_fact::direction::OUT,
             schema::content_fact::modality::TOOL_CALL,
-            Threading::Transparent,
         ),
         "SYSTEM" if record_type == "TOOL_RESPONSE" => (
             schema::content_fact::direction::IN,
             schema::content_fact::modality::TOOL_RESULT,
-            Threading::Transparent,
         ),
+        // The model's tool steps (VIEW_FILE, RUN_COMMAND, READ_URL_CONTENT,
+        // GENERIC, ...) record what the tool returned: perceived.
         "MODEL" => (
-            schema::content_fact::direction::OUT,
+            schema::content_fact::direction::IN,
             schema::content_fact::modality::TOOL_RESULT,
-            Threading::Transparent,
         ),
+        // Any other record is what the agent was shown.
         _ => (
-            schema::content_fact::direction::AMBIENT,
+            schema::content_fact::direction::IN,
             schema::content_fact::modality::EVENT,
-            Threading::Transparent,
         ),
     };
 
+    // The model thinks before it writes or calls.
     let mut parts = Vec::new();
-    if let Some(content) = fields
-        .content
-        .filter(|content| !content.as_ref().trim().is_empty())
-    {
-        parts.push(SourcePart::text(modality, direction, content));
-    }
     if let Some(thinking) = fields
         .thinking
         .filter(|thinking| !thinking.as_ref().trim().is_empty())
@@ -286,8 +314,14 @@ fn interpret(fields: RawFields) -> Result<(Vec<SourcePart>, SourceClaims, Thread
             thinking,
         ));
     }
+    if let Some(content) = fields
+        .content
+        .filter(|content| !content.as_ref().trim().is_empty())
+    {
+        parts.push(SourcePart::text(modality, direction, content));
+    }
     if let Some(tool_calls) = fields.tool_calls {
-        let value = archive_source::owned_text(archive_source::canonical_json(tool_calls)?);
+        let value = archive_source::owned_text(canonical_tool_calls(tool_calls)?);
         parts.push(SourcePart::text(
             schema::content_fact::modality::TOOL_CALL,
             schema::content_fact::direction::OUT,
@@ -306,8 +340,26 @@ fn interpret(fields: RawFields) -> Result<(Vec<SourcePart>, SourceClaims, Thread
         raw_role: fields.record_type.clone(),
         ..SourceClaims::default()
     };
-    let _ = fields.step_index;
-    Ok((parts, claims, threading))
+    Ok((parts, claims))
+}
+
+/// Vendor call ids a tool call may carry. They are correlators, not content,
+/// and never enter a hashed text.
+const CALL_IDS: &[&str] = &["id", "call_id", "callId", "tool_call_id", "toolCallId"];
+
+/// The canonical JSON of a `tool_calls` value without its call ids.
+fn canonical_tool_calls(raw: Bytes) -> std::result::Result<String, sc::ScanError> {
+    let mut input = raw.clone();
+    sc::skip_ws(&mut input);
+    if input.first().copied() != Some(b'[') {
+        return archive_source::canonical_json_without(raw, CALL_IDS);
+    }
+    let calls = sc::array(&mut input, Vec::new(), |mut calls, element| {
+        let call = archive_source::raw_value(element)?;
+        calls.push(archive_source::canonical_json_without(call, CALL_IDS)?);
+        Ok(calls)
+    })?;
+    Ok(format!("[{}]", calls.join(",")))
 }
 
 /// Derive a path-independent birth anchor from the first physical JSONL
@@ -327,16 +379,12 @@ fn conversation_anchor(first_line: Option<&Bytes>) -> String {
 }
 
 fn absorb(target: &mut ProjectionStats, source: ProjectionStats) {
-    target.records_seen += source.records_seen;
-    target.projections_emitted += source.projections_emitted;
-    target.content_parts += source.content_parts;
-    target.transparent_records += source.transparent_records;
-    target.contentless_records += source.contentless_records;
-    target.missing_predecessors += source.missing_predecessors;
+    target.absorb(source);
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::blockdag;
     use std::collections::BTreeSet;
     use std::fs;
 
@@ -345,7 +393,7 @@ mod tests {
 
     use super::*;
 
-    fn semantic_identity(fragment: &Fragment) -> (Id, BTreeSet<(Id, Id)>) {
+    fn semantic_identity(fragment: &Fragment) -> (Id, BTreeSet<Id>) {
         let projection = fragment.root().expect("source projection has one root");
         let block = find!(
             (block: Id),
@@ -355,13 +403,10 @@ mod tests {
         )
         .next()
         .map(|(block,)| block)
-        .expect("source projection names one block");
+        .expect("source projection names one node");
         let content = find!(
-            (part: Id, fact: Id),
-            pattern!(fragment.facts(), [
-                { block @ schema::block::contains: ?part },
-                { ?part @ schema::content_part::fact: ?fact },
-            ])
+            fact: Id,
+            pattern!(fragment.facts(), [{ block @ schema::block::holds: ?fact }])
         )
         .collect();
         (block, content)
@@ -391,11 +436,84 @@ mod tests {
         })
         .unwrap();
         assert_eq!(summary.files_scanned, 1);
-        assert_eq!(summary.fragments_emitted, 3);
+        // Four nodes, one per fact, and the leaf's conversation provenance.
+        assert_eq!(summary.fragments_emitted, 5);
         assert_eq!(summary.stats.records_seen, 3);
-        assert_eq!(summary.stats.projections_emitted, 2);
+        assert_eq!(summary.stats.projections_emitted, 4);
         assert_eq!(summary.stats.content_parts, 4);
         assert_eq!(summary.stats.contentless_records, 1);
+    }
+
+    #[test]
+    fn steps_follow_their_index_and_tool_steps_are_perceived_results() {
+        // As Antigravity writes them: string step indices, and a tool's result
+        // written before the reminder that preceded it.
+        let transcript = concat!(
+            r#"{"step_index":"1","source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","content":"look at it"}"#,
+            "\n",
+            r#"{"step_index":"2","source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","thinking":"plan it","tool_calls":[{"name":"view_file","args":{"AbsolutePath":"/a","toolAction":"Read"}}]}"#,
+            "\n",
+            r#"{"step_index":"4","source":"SYSTEM","type":"EPHEMERAL_MESSAGE","status":"DONE","content":"a reminder"}"#,
+            "\n",
+            r#"{"step_index":"3","source":"MODEL","type":"VIEW_FILE","status":"DONE","content":"the file"}"#,
+            "\n",
+            r#"{"step_index":"5","source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"seen"}"#,
+            "\n",
+        );
+        let mut union = Fragment::empty();
+        let summary = project_bytes(
+            "transcript_full.jsonl",
+            Bytes::from_source(transcript.as_bytes().to_vec()),
+            |p| {
+                union += p.fragment;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.stats.projections_emitted, 6);
+        assert_eq!(summary.stats.unresolved_tool_results, 0);
+        let mut node_of = |text: &str| -> Id {
+            let handle = union.put::<blobencodings::UTF8String, _>(text.to_owned());
+            find!(
+                node: Id,
+                pattern!(&union, [
+                    { ?node @ schema::block::holds: _?fact },
+                    { _?fact @ schema::content_fact::payload: handle },
+                ])
+            )
+            .next()
+            .unwrap()
+        };
+        let prompt = node_of("look at it");
+        let thinking = node_of("plan it");
+        let file = node_of("the file");
+        let reminder = node_of("a reminder");
+        let answer = node_of("seen");
+        let call = find!(
+            node: Id,
+            pattern!(&union, [
+                { ?node @ schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::TOOL_CALL },
+            ])
+        )
+        .next()
+        .unwrap();
+        assert_eq!(
+            blockdag::thread_to(union.facts(), answer),
+            vec![prompt, thinking, call, file, reminder, answer],
+            "steps follow their index: the result before the reminder"
+        );
+        assert!(
+            exists!(pattern!(&union, [
+                { file @ schema::block::responds_to: call },
+            ])),
+            "the result answers the call"
+        );
+        assert_eq!(
+            blockdag::turn_of(union.facts(), reminder),
+            vec![file, reminder],
+            "the tool step is perceived with the reminder after it"
+        );
     }
 
     #[test]
@@ -473,9 +591,9 @@ mod tests {
         })
         .unwrap();
 
-        // A tool call is a side branch, so no leaf names the file.
-        assert_eq!(first_fragments.len(), 1);
-        assert_eq!(second_fragments.len(), 1);
+        // The call's block, then the path on the leaf it is.
+        assert_eq!(first_fragments.len(), 2);
+        assert_eq!(second_fragments.len(), 2);
         assert_eq!(
             first_fragments[0].root(),
             second_fragments[0].root(),

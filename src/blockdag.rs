@@ -5,8 +5,11 @@
 //! all facts and blobs. The resulting root therefore follows the data model:
 //!
 //! ```text
-//! content fact -> content part -> block -> source projection
+//! content fact(s) -> node (`block`) -> source projection
 //! ```
+//!
+//! A node holds one fact, or the unordered set of facts that happened at one
+//! moment, and follows its previous node(s); order is that chain alone.
 //!
 //! Kind markers and source annotations are attached only after intrinsic
 //! construction. They remain queryable without becoming hidden inputs to a
@@ -28,6 +31,12 @@ use triblespace::prelude::*;
 
 use crate::files;
 use crate::schemas::{blockdag as schema, files as files_schema};
+
+/// The projection rules the importers apply, annotated on every importer
+/// receipt. Change it whenever a rule changes what an importer writes for the
+/// same source.
+pub const IMPORTER_REVISION: &str =
+    "archive-importers/2: acts and perceptions, in/out, main chain (2026-10-16)";
 
 /// Source-occurrence evidence that must not affect the projected block or
 /// projection-receipt identity.
@@ -63,12 +72,15 @@ pub struct ProjectionAnnotations {
     pub name: Option<String>,
     /// Canonical JSON of provider metadata about that conversation.
     pub source_detail: Option<String>,
+    /// The projection rules that produced the receipt
+    /// ([`IMPORTER_REVISION`] for the importers).
+    pub importer_revision: Option<String>,
 }
 
 type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
 type IntervalValue = Inline<NsTAIInterval>;
-type OrdinalValue = Inline<U256BE>;
+type SizeValue = Inline<U256BE>;
 type OverlayReader = MemoryBlobStoreSnapshot;
 
 /// Result of validating one exact materialized Archive catalog.
@@ -266,44 +278,22 @@ where
     Ok(fact)
 }
 
-/// Wrap one content fact in an ordinal-bearing intrinsic part.
+/// Construct one intrinsic node from structural predecessors, an optional
+/// genuine event interval, and the exported content facts it holds.
 ///
-/// `responds_to` is a semantic edge to another canonical part. Unresolved
-/// vendor correlators stay on the raw source receipt instead.
-pub fn content_part(ordinal: u64, fact: Fragment, responds_to: Option<Id>) -> Result<Fragment> {
-    let fact_id = rooted(&fact, "content fact")?;
-    let resolutions: BTreeSet<RawHandle> = find!(
-        resolution: RawHandle,
-        pattern!(&fact, [{ fact_id @ schema::content_fact::resolved_to: ?resolution }])
-    )
-    .collect();
-    // A source occurrence carrying one exact recovered body selects it in the
-    // part's identity. A genuinely unresolved or already-ambiguous fact makes
-    // no such claim; ambiguity remains monotone evidence on the fact itself.
-    let resolution =
-        (resolutions.len() == 1).then(|| *resolutions.first().expect("one resolution exists"));
-    let fragment = entity! { _ @
-        schema::content_part::ordinal: ordinal,
-        schema::content_part::fact*: fact,
-        schema::content_part::responds_to?: responds_to,
-        schema::content_part::resolution?: resolution,
-    };
-    attach_kind(fragment, schema::content_part::KIND, "content part")
-}
-
-/// Construct one intrinsic block from structural predecessors, an optional
-/// genuine event interval, and zero or more exported content parts.
-///
-/// The unique predecessor-free, timeless, content-free block is the bottom
-/// projection used by exact source receipts that yielded no semantic content.
+/// A node holds one fact, or an unordered set of facts the source says
+/// happened at the same moment; `facts` must export them. Order is the
+/// `previous` chain alone. The unique predecessor-free, timeless, content-free
+/// node is the bottom projection used by exact source receipts that yielded no
+/// semantic content.
 pub fn block(
     predecessors: impl IntoIterator<Item = Id>,
     timestamp: Option<Inline<NsTAIInterval>>,
-    parts: Fragment,
+    facts: Fragment,
 ) -> Result<Fragment> {
     let predecessors: Vec<_> = predecessors.into_iter().collect();
-    if parts.exports().next().is_none() && (!predecessors.is_empty() || timestamp.is_some()) {
-        bail!("a content-free block must be the predecessor-free, timeless canonical bottom");
+    if facts.exports().next().is_none() && (!predecessors.is_empty() || timestamp.is_some()) {
+        bail!("a content-free node must be the predecessor-free, timeless canonical bottom");
     }
     // IDENTITY IS `previous` + CONTENT. The timestamp is an ANNOTATION on that
     // identity, not part of it.
@@ -327,10 +317,9 @@ pub fn block(
     // Collapsing is also the TRUER statement. A replayed block is the same
     // block observed again; storing it 622 times asserts 622 distinct events.
     // Nothing is lost by collapsing, because multiplicity lives where it is
-    // actually true: `source_projection` is identified by source locator and
-    // raw record bytes and carries its own `source_timestamp`, so every
-    // occurrence stays distinguishable and a query joining on time enumerates
-    // them all. JP: "the timestamps unfold them."
+    // actually true: every occurrence adds its own `source_timestamp` to the
+    // receipt, so a query joining on time enumerates them all. "The
+    // timestamps unfold them."
     //
     // Root collisions become correct rather than hazardous: two conversations
     // that genuinely open with identical content DO share that opening, and
@@ -340,7 +329,7 @@ pub fn block(
     // state").
     let mut fragment = entity! { _ @
         schema::block::previous*: predecessors.iter(),
-        schema::block::contains*: parts,
+        schema::block::holds*: facts,
     };
     let root = rooted(&fragment, "block")?;
     fragment += entity! { ExclusiveId::force_ref(&root) @
@@ -348,6 +337,124 @@ pub fn block(
     };
     debug_assert_eq!(fragment.root(), Some(root));
     attach_kind(fragment, schema::block::KIND, "block")
+}
+
+/// Annotate a result node with the node of the tool call it answers.
+pub fn responds_to(node: Id, call: Id) -> Fragment {
+    Fragment::from_facts_and_blobs(
+        entity! { ExclusiveId::force_ref(&node) @ schema::block::responds_to: &call }.into_facts(),
+        Default::default(),
+    )
+}
+
+/// Annotate a source receipt with the exact body its source selected for the
+/// pointer fact its node holds.
+///
+/// Annotation only: the receipt, its node and the fact keep their ids. The
+/// body must be among the fact's own `resolved_to` values, which the reader
+/// checks; the bytes travel with the fact.
+pub fn select_resolution(receipt: Id, body: Inline<Handle<RawBytes>>) -> Fragment {
+    Fragment::from_facts_and_blobs(
+        entity! { ExclusiveId::force_ref(&receipt) @
+            schema::source_projection::resolution: body,
+        }
+        .into_facts(),
+        Default::default(),
+    )
+}
+
+/// The directions of the facts a node holds.
+pub fn node_directions<P: TriblePattern>(facts: &P, node: Id) -> BTreeSet<Id> {
+    find!(
+        direction: Id,
+        pattern!(facts, [
+            { node @ schema::block::holds: _?fact },
+            { _?fact @ schema::content_fact::direction: ?direction },
+        ])
+    )
+    .collect()
+}
+
+/// The thread that ends at `leaf`, root first. Where a node follows several
+/// predecessors, the thread continues through the smallest id.
+pub fn thread_to<P: TriblePattern>(facts: &P, leaf: Id) -> Vec<Id> {
+    let mut thread = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut cursor = Some(leaf);
+    while let Some(node) = cursor {
+        if !seen.insert(node) {
+            break;
+        }
+        thread.push(node);
+        cursor = find!(
+            previous: Id,
+            pattern!(facts, [{ node @ schema::block::previous: ?previous }])
+        )
+        .min();
+    }
+    thread.reverse();
+    thread
+}
+
+/// The thread ending at `leaf` as turns: each a maximal run of consecutive
+/// nodes whose facts have one and the same direction. An act is a run of
+/// `out` nodes and a perception a run of `in` nodes; a node holding facts of
+/// both directions at once is a turn of its own. This is the view of acts
+/// and perceptions; it is derived, never stored.
+pub fn turns_along<P: TriblePattern>(facts: &P, leaf: Id) -> Vec<Vec<Id>> {
+    let mut turns: Vec<(BTreeSet<Id>, Vec<Id>)> = Vec::new();
+    for node in thread_to(facts, leaf) {
+        let directions = node_directions(facts, node);
+        match turns.last_mut() {
+            Some((current, run)) if directions.len() == 1 && *current == directions => {
+                run.push(node)
+            }
+            _ => turns.push((directions, vec![node])),
+        }
+    }
+    turns.into_iter().map(|(_, run)| run).collect()
+}
+
+/// The turn that holds `node`: the maximal run of consecutive nodes of its
+/// direction around it, following its predecessor back and its single
+/// successor forward. A branch ends the run forward.
+pub fn turn_of<P: TriblePattern>(facts: &P, node: Id) -> Vec<Id> {
+    let directions = node_directions(facts, node);
+    let mut run = vec![node];
+    if directions.len() != 1 {
+        return run;
+    }
+    let mut cursor = node;
+    loop {
+        let previous: Vec<Id> = find!(
+            previous: Id,
+            pattern!(facts, [{ cursor @ schema::block::previous: ?previous }])
+        )
+        .collect();
+        match previous.as_slice() {
+            [single] if node_directions(facts, *single) == directions && !run.contains(single) => {
+                run.insert(0, *single);
+                cursor = *single;
+            }
+            _ => break,
+        }
+    }
+    let mut cursor = node;
+    loop {
+        let next: Vec<Id> = find!(
+            next: Id,
+            pattern!(facts, [{ ?next @ schema::block::previous: cursor }])
+        )
+        .collect();
+        match next.as_slice() {
+            [single] if node_directions(facts, *single) == directions && !run.contains(single) => {
+                run.push(*single);
+                cursor = *single;
+            }
+            _ => break,
+        }
+    }
+    run
 }
 
 /// Construct one producer-native receipt: a producer's own canonical record
@@ -447,6 +554,9 @@ pub fn annotate_source_projection(
     let source_detail = annotations
         .source_detail
         .map(|value| projection.put::<UTF8String, _>(value));
+    let importer_revision = annotations
+        .importer_revision
+        .map(|value| projection.put::<UTF8String, _>(value));
 
     projection += entity! { ExclusiveId::force_ref(&root) @
         schema::source_projection::semantic_predecessor_support*:
@@ -461,6 +571,7 @@ pub fn annotate_source_projection(
         schema::source_projection::source_locator?: source_locator.as_ref(),
         metadata::name?: name.as_ref(),
         schema::source_projection::source_detail?: source_detail.as_ref(),
+        schema::source_projection::importer_revision?: importer_revision.as_ref(),
     };
     debug_assert_eq!(projection.root(), Some(root));
     Ok(projection)
@@ -642,13 +753,11 @@ where
     P: TriblePattern,
 {
     let content_facts = ids_of_kind(facts, schema::content_fact::KIND);
-    let content_parts = ids_of_kind(facts, schema::content_part::KIND);
     let blocks = ids_of_kind(facts, schema::block::KIND);
     let projections = ids_of_kind(facts, schema::source_projection::KIND);
     let media_types = ids_of_kind(facts, files_schema::KIND_MEDIA_TYPE);
     require_disjoint(&[
         ("content fact", &content_facts),
-        ("content part", &content_parts),
         ("block", &blocks),
         ("source projection", &projections),
         ("media type", &media_types),
@@ -693,29 +802,12 @@ where
         pattern!(facts, [{ ?entity @ schema::content_fact::media_type: ?value }])
     ));
     let asset_sizes = values_by_entity(find!(
-        (entity: Id, value: OrdinalValue),
+        (entity: Id, value: SizeValue),
         pattern!(facts, [{ ?entity @ schema::content_fact::asset_size: ?value }])
     ));
     let resolutions = values_by_entity(find!(
         (entity: Id, value: RawHandle),
         pattern!(facts, [{ ?entity @ schema::content_fact::resolved_to: ?value }])
-    ));
-
-    let ordinals = values_by_entity(find!(
-        (entity: Id, value: OrdinalValue),
-        pattern!(facts, [{ ?entity @ schema::content_part::ordinal: ?value }])
-    ));
-    let part_facts = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_part::fact: ?value }])
-    ));
-    let responds_to = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_part::responds_to: ?value }])
-    ));
-    let part_resolutions = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::content_part::resolution: ?value }])
     ));
 
     let block_previous = values_by_entity(find!(
@@ -726,9 +818,17 @@ where
         (entity: Id, value: IntervalValue),
         pattern!(facts, [{ ?entity @ schema::block::timestamp: ?value }])
     ));
-    let block_parts = values_by_entity(find!(
+    let node_holds = values_by_entity(find!(
         (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::block::contains: ?value }])
+        pattern!(facts, [{ ?entity @ schema::block::holds: ?value }])
+    ));
+    let node_responses = values_by_entity(find!(
+        (entity: Id, value: Id),
+        pattern!(facts, [{ ?entity @ schema::block::responds_to: ?value }])
+    ));
+    let receipt_resolutions = values_by_entity(find!(
+        (entity: Id, value: RawHandle),
+        pattern!(facts, [{ ?entity @ schema::source_projection::resolution: ?value }])
     ));
 
     let source_namespaces = values_by_entity(find!(
@@ -780,6 +880,10 @@ where
     let source_details = values_by_entity(find!(
         (entity: Id, value: TextHandle),
         pattern!(facts, [{ ?entity @ schema::source_projection::source_detail: ?value }])
+    ));
+    let importer_revisions = values_by_entity(find!(
+        (entity: Id, value: TextHandle),
+        pattern!(facts, [{ ?entity @ schema::source_projection::importer_revision: ?value }])
     ));
     let source_paths = values_by_entity(find!(
         (entity: Id, value: TextHandle),
@@ -923,94 +1027,53 @@ where
         expected += canonical;
     }
 
-    let mut ordinal_numbers = BTreeMap::new();
-    let mut referenced_content_facts = BTreeSet::new();
-    for id in &content_parts {
-        let ordinal = one_required(&ordinals, *id, "content part ordinal")?;
-        let ordinal_number: u64 = ordinal
-            .try_from_inline()
-            .map_err(|error| anyhow!("content part {id:x} ordinal does not fit u64: {error:?}"))?;
-        let fact = one_required(&part_facts, *id, "content part fact")?;
-        if !content_facts.contains(&fact) {
-            bail!("content part {id:x} cites missing content fact {fact:x}");
-        }
-        referenced_content_facts.insert(fact);
-        let response = one_optional(&responds_to, *id, "content part responds-to")?;
-        if let Some(response) = response {
-            if !content_parts.contains(&response) {
-                bail!("content part {id:x} responds to missing part {response:x}");
-            }
-        }
-        let resolution = one_optional(&part_resolutions, *id, "content part resolution")?;
-        if let Some(resolution) = resolution {
-            let available = values_for(&resolutions, fact);
-            if !available.contains(&resolution) {
-                bail!("content part {id:x} selects resolution absent from content fact {fact:x}");
-            }
-        }
-        let core = entity! { _ @
-            schema::content_part::ordinal: ordinal,
-            schema::content_part::fact: &fact,
-            schema::content_part::responds_to?: response,
-            schema::content_part::resolution?: resolution,
-        };
-        expected +=
-            ensure_intrinsic_with_kind(*id, core, schema::content_part::KIND, "content part")?;
-        ordinal_numbers.insert(*id, ordinal_number);
-    }
-
     let mut block_graph = BTreeMap::new();
-    let mut referenced_parts = BTreeSet::new();
+    let mut referenced_content_facts = BTreeSet::new();
     for id in &blocks {
         let previous = values_for(&block_previous, *id);
         for predecessor in &previous {
             if !blocks.contains(predecessor) {
-                bail!("block {id:x} cites missing predecessor {predecessor:x}");
+                bail!("node {id:x} cites missing predecessor {predecessor:x}");
             }
         }
         let timestamps = values_for(&block_timestamps, *id);
         for timestamp in &timestamps {
             let _: (i128, i128) = timestamp.try_from_inline().map_err(|error| {
-                anyhow!("block {id:x} has invalid timestamp interval: {error:?}")
+                anyhow!("node {id:x} has invalid timestamp interval: {error:?}")
             })?;
         }
-        let parts = values_for(&block_parts, *id);
-        if parts.is_empty() && (!previous.is_empty() || !timestamps.is_empty()) {
+        let held = values_for(&node_holds, *id);
+        if held.is_empty() && (!previous.is_empty() || !timestamps.is_empty()) {
             bail!(
-                "content-free block {id:x} is not the predecessor-free, timeless canonical bottom"
+                "content-free node {id:x} is not the predecessor-free, timeless canonical bottom"
             );
         }
-        let mut by_ordinal = BTreeMap::new();
-        for part in &parts {
-            if !content_parts.contains(part) {
-                bail!("block {id:x} contains missing part {part:x}");
-            }
-            let ordinal = ordinal_numbers[part];
-            if let Some(other) = by_ordinal.insert(ordinal, *part) {
-                bail!("block {id:x} contains parts {other:x} and {part:x} at ordinal {ordinal}");
+        for fact in &held {
+            if !content_facts.contains(fact) {
+                bail!("node {id:x} holds missing content fact {fact:x}");
             }
         }
-        for (expected_ordinal, actual) in (0u64..).zip(by_ordinal.keys().copied()) {
-            if actual != expected_ordinal {
-                bail!(
-                    "block {id:x} has non-contiguous part ordinals; expected {expected_ordinal}, found {actual}"
-                );
+        referenced_content_facts.extend(held.iter().copied());
+        let responses = values_for(&node_responses, *id);
+        for target in &responses {
+            if !blocks.contains(target) {
+                bail!("node {id:x} responds to missing node {target:x}");
             }
         }
-        referenced_parts.extend(parts.iter().copied());
         let core = entity! { _ @
             schema::block::previous*: previous.iter(),
-            schema::block::contains*: parts.iter(),
+            schema::block::holds*: held.iter(),
         };
-        let mut canonical = ensure_intrinsic_with_kind(*id, core, schema::block::KIND, "block")?;
+        let mut canonical = ensure_intrinsic_with_kind(*id, core, schema::block::KIND, "node")?;
         canonical += entity! { ExclusiveId::force_ref(id) @
             schema::block::timestamp*: timestamps.iter(),
+            schema::block::responds_to*: responses.iter(),
         }
         .into_facts();
         expected += canonical;
         block_graph.insert(*id, previous);
     }
-    validate_dag(&block_graph, "block DAG")?;
+    validate_dag(&block_graph, "node DAG")?;
 
     let mut referenced_blocks = BTreeSet::new();
     for id in &projections {
@@ -1059,8 +1122,22 @@ where
         let paths = values_for(&source_paths, *id);
         let names = values_for(&media_names, *id);
         let details = values_for(&source_details, *id);
+        let revisions = values_for(&importer_revisions, *id);
+        let selected = values_for(&receipt_resolutions, *id);
+        let available: BTreeSet<RawHandle> = values_for(&node_holds, projected)
+            .iter()
+            .flat_map(|fact| values_for(&resolutions, *fact))
+            .collect();
+        if let Some(resolution) = selected.difference(&available).next() {
+            bail!(
+                "source projection {id:x} selects resolution {:?} absent from its node's facts",
+                resolution.raw
+            );
+        }
+        attachments.raws.extend(selected.iter().copied());
 
         attachments.texts.extend(locators.iter().copied());
+        attachments.texts.extend(revisions.iter().copied());
         attachments.texts.extend(names.iter().copied());
         attachments.texts.extend(details.iter().copied());
         attachments.raws.extend(raws.iter().copied());
@@ -1112,6 +1189,8 @@ where
             files_schema::file::source_path*: paths.iter(),
             metadata::name*: names.iter(),
             schema::source_projection::source_detail*: details.iter(),
+            schema::source_projection::importer_revision*: revisions.iter(),
+            schema::source_projection::resolution*: selected.iter(),
         }
         .into_facts();
         expected += canonical;
@@ -1119,7 +1198,6 @@ where
 
     require_coverage(&media_types, &referenced_media_types, "media type")?;
     require_coverage(&content_facts, &referenced_content_facts, "content fact")?;
-    require_coverage(&content_parts, &referenced_parts, "content part")?;
     require_coverage(&blocks, &referenced_blocks, "block")?;
 
     let (missing, unexpected) = canonical_difference_counts(&expected, observed);
@@ -1180,7 +1258,7 @@ fn validate_succinct_structure(facts: &UnionArchive<OrderedUniverse>) -> Result<
 /// Validate only the canonical graph, without consulting any blob store.
 ///
 /// This proves intrinsic identities, exact field shapes, graph closure,
-/// predecessor acyclicity, ordinal continuity, and reachability coverage. It
+/// predecessor acyclicity, and reachability coverage. It
 /// deliberately does not claim that named attachments are resident or
 /// decodable; use [`validate_catalog`] or [`validate_catalog_union`] for that.
 pub fn validate_catalog_structure(facts: &TribleSet) -> Result<()> {
@@ -1415,7 +1493,7 @@ mod tests {
     }
 
     fn one_part(value: &str) -> Fragment {
-        content_part(0, text(value), None).unwrap()
+        text(value)
     }
 
     fn projection(parts: Fragment) -> Fragment {
@@ -1450,39 +1528,118 @@ mod tests {
         Fragment::from_parts(facts, metafacts, Default::default())
     }
 
+    fn said(direction: Id, value: &str) -> Fragment {
+        text_fact(schema::content_fact::modality::TEXT, direction, value).unwrap()
+    }
+
     #[test]
-    fn part_ordinals_preserve_order_and_repeated_equal_facts() {
-        let a = text("a");
-        let b = text("b");
+    fn a_simultaneous_set_node_keeps_both_facts_and_no_order() {
+        let heard = said(schema::content_fact::direction::IN, "heard");
+        let spoken = said(schema::content_fact::direction::OUT, "spoken");
+        let one_way = block([], None, heard.clone() + spoken.clone()).unwrap();
+        let other_way = block([], None, spoken + heard).unwrap();
+        assert_eq!(one_way.root(), other_way.root(), "a set has no order");
+        let node = one_way.root().unwrap();
+        assert_eq!(
+            find!(fact: Id, pattern!(&one_way, [{ node @ schema::block::holds: ?fact }])).count(),
+            2
+        );
+        assert_eq!(node_directions(one_way.facts(), node).len(), 2);
+        assert_eq!(
+            turn_of(one_way.facts(), node),
+            vec![node],
+            "both ways at once is a turn of its own"
+        );
+    }
 
-        let mut ab = Fragment::empty();
-        ab += content_part(0, a.clone(), None).unwrap();
-        ab += content_part(1, b.clone(), None).unwrap();
-        let ab = block([], None, ab).unwrap();
-
-        let mut ba = Fragment::empty();
-        ba += content_part(0, b, None).unwrap();
-        ba += content_part(1, a.clone(), None).unwrap();
-        let ba = block([], None, ba).unwrap();
-        assert_ne!(ab.root(), ba.root(), "part order is semantic");
-
-        let fact = a.root().unwrap();
-        let mut repeated = Fragment::empty();
-        repeated += content_part(0, a.clone(), None).unwrap();
-        repeated += content_part(1, a, None).unwrap();
-        let repeated = block([], None, repeated).unwrap();
-        let root = repeated.root().unwrap();
-        let parts: Vec<Id> = find!(
-            part: Id,
-            pattern!(&repeated, [{ root @ schema::block::contains: ?part }])
-        )
-        .collect();
-        assert_eq!(parts.len(), 2, "equal payloads at two positions survive");
-        for part in parts {
-            assert!(exists!(pattern!(&repeated, [{
-                part @ schema::content_part::fact: &fact
-            }])));
+    #[test]
+    fn order_is_recovered_from_the_chain_alone() {
+        let mut union = Fragment::empty();
+        let mut previous = None;
+        let mut expected = Vec::new();
+        // An equal fact twice is two nodes: the chain, not a position, tells
+        // them apart.
+        for value in ["first", "second", "first", "third"] {
+            let node = block(previous, None, text(value)).unwrap();
+            previous = node.root();
+            expected.push(previous.unwrap());
+            union += node;
         }
+        assert_eq!(expected.iter().collect::<BTreeSet<_>>().len(), 4);
+        assert_eq!(
+            thread_to(union.facts(), *expected.last().unwrap()),
+            expected
+        );
+    }
+
+    #[test]
+    fn the_turn_view_groups_runs_of_one_direction() {
+        use schema::content_fact::direction::{IN, OUT};
+        let mut union = Fragment::empty();
+        let mut previous = None;
+        let mut nodes = Vec::new();
+        for (direction, value) in [
+            (IN, "question"),
+            (OUT, "thinking"),
+            (OUT, "call"),
+            (IN, "tool result"),
+            (IN, "user message"),
+            (OUT, "answer"),
+        ] {
+            let node = block(previous, None, said(direction, value)).unwrap();
+            previous = node.root();
+            nodes.push(previous.unwrap());
+            union += node;
+        }
+        assert_eq!(
+            turns_along(union.facts(), nodes[5]),
+            vec![
+                vec![nodes[0]],
+                vec![nodes[1], nodes[2]],
+                vec![nodes[3], nodes[4]],
+                vec![nodes[5]],
+            ],
+            "a tool result and the user message after it are one perception"
+        );
+        assert_eq!(turn_of(union.facts(), nodes[4]), vec![nodes[3], nodes[4]]);
+        assert_eq!(turn_of(union.facts(), nodes[1]), vec![nodes[1], nodes[2]]);
+    }
+
+    #[test]
+    fn responds_to_links_node_to_node_without_changing_identity() {
+        let call = block([], None, text("call")).unwrap();
+        let call_id = call.root().unwrap();
+        let result = block([call_id], None, text("result")).unwrap();
+        let result_id = result.root().unwrap();
+        let mut linked = call + result;
+        linked += responds_to(result_id, call_id);
+        assert!(exists!(pattern!(&linked, [{
+            result_id @ schema::block::responds_to: call_id
+        }])));
+        let receipt = source_projection(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "linked",
+            b"{}".as_slice(),
+            Fragment::rooted(result_id, linked.facts().clone()),
+        )
+        .unwrap();
+        let (_directory, reader) = empty_reader();
+        let mut catalog = receipt;
+        catalog += source_projection(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "call",
+            b"{}".as_slice(),
+            block([], None, text("call")).unwrap(),
+        )
+        .unwrap();
+        let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &catalog).unwrap();
+        assert!(
+            matches!(
+                validation,
+                CatalogValidation::Accepted | CatalogValidation::Pending { .. }
+            ),
+            "{validation:?}"
+        );
     }
 
     #[test]
@@ -1499,12 +1656,23 @@ mod tests {
         .map(|(block,)| block)
         .unwrap();
         assert!(!exists!(pattern!(&receipt, [{
-            block @ schema::block::contains: _?part
+            block @ schema::block::holds: _?fact
         }])));
 
         let (_directory, reader) = empty_reader();
         let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &receipt).unwrap();
         assert_eq!(validation, CatalogValidation::Accepted);
+    }
+
+    #[test]
+    fn direction_is_in_or_out_only() {
+        assert_eq!(
+            schema::content_fact::direction::SPECS,
+            &[
+                (schema::content_fact::direction::IN, "in"),
+                (schema::content_fact::direction::OUT, "out"),
+            ]
+        );
     }
 
     #[test]
@@ -1631,6 +1799,7 @@ mod tests {
                 source_locator: Some("conversation/7".into()),
                 name: Some("A title".into()),
                 source_detail: Some(r#"{"agentType":"general-purpose"}"#.into()),
+                importer_revision: Some(IMPORTER_REVISION.into()),
             },
         )
         .unwrap();
@@ -1776,14 +1945,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_response_edges_participate_in_part_identity() {
-        let target = content_part(0, text("call"), None).unwrap().root().unwrap();
-        let unrelated = content_part(1, text("result"), None).unwrap();
-        let related = content_part(1, text("result"), Some(target)).unwrap();
-        assert_ne!(unrelated.root(), related.root());
-    }
-
-    #[test]
     fn resolving_pointer_bytes_keeps_the_intrinsic_root() {
         let fact = asset_pointer_fact(
             schema::content_fact::modality::IMAGE,
@@ -1806,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn a_part_selects_the_unique_pointer_resolution_in_its_identity() {
+    fn an_exact_body_annotates_and_never_identifies() {
         let make = |bytes: &'static [u8]| {
             asset_pointer_fact(
                 schema::content_fact::modality::FILE,
@@ -1819,29 +1980,27 @@ mod tests {
             .and_then(|fact| resolve_pointer_fact(fact, bytes))
             .unwrap()
         };
-        let first = make(b"first");
-        let replay = make(b"first");
-        let second = make(b"other");
-        assert_eq!(first, replay);
-        assert_eq!(first.root(), second.root());
-
-        let first = content_part(0, first, None).unwrap();
-        let replay = content_part(0, replay, None).unwrap();
-        let second = content_part(0, second, None).unwrap();
-        assert_eq!(first, replay);
-        assert_ne!(first.root(), second.root());
-
-        for part in [first, second] {
-            let root = part.root().unwrap();
-            let resolutions: Vec<Inline<Handle<RawBytes>>> = find!(
-                resolution: Inline<Handle<RawBytes>>,
-                pattern!(&part, [{
-                    root @ schema::content_part::resolution: ?resolution
-                }])
-            )
-            .collect();
-            assert_eq!(resolutions.len(), 1);
-        }
+        let first = block([], None, make(b"first")).unwrap();
+        let second = block([], None, make(b"other")).unwrap();
+        assert_eq!(first.root(), second.root(), "the body is not the node");
+        let body = (b"first".as_slice()).to_blob().get_handle();
+        let receipt = source_projection(
+            schema::source_projection::SOURCE_DRIVE,
+            "occurrence",
+            b"{}".as_slice(),
+            first,
+        )
+        .unwrap();
+        let root = receipt.root().unwrap();
+        let mut selected = receipt.clone();
+        selected += entity! { ExclusiveId::force_ref(&root) @
+            schema::source_projection::resolution: body,
+        };
+        assert_eq!(selected.root(), Some(root));
+        let (_directory, reader) = empty_reader();
+        let (_, validation) =
+            validate_catalog_union(&reader, &TribleSet::new(), &selected).unwrap();
+        assert_eq!(validation, CatalogValidation::Accepted);
     }
 
     #[test]
@@ -1883,11 +2042,18 @@ mod tests {
     #[test]
     fn structural_rejection_dominates_missing_attachments() {
         let (_directory, reader) = empty_reader();
-        let malformed = projection(content_part(1, text("ordinal gap"), None).unwrap());
+        let mut malformed = projection(one_part("dangling response"));
+        let node = find!(
+            node: Id,
+            pattern!(&malformed, [{ _?receipt @ schema::source_projection::projects_to: ?node }])
+        )
+        .next()
+        .unwrap();
+        malformed += responds_to(node, id(99));
         let validation = validate_catalog(&reader, malformed.facts()).unwrap();
         assert!(matches!(
             validation,
-            CatalogValidation::Rejected(reason) if reason.contains("non-contiguous part ordinals")
+            CatalogValidation::Rejected(reason) if reason.contains("responds to missing node")
         ));
     }
 
@@ -1903,7 +2069,7 @@ mod tests {
             Some(3),
         )
         .unwrap();
-        let unresolved = projection(content_part(0, unresolved, None).unwrap());
+        let unresolved = projection(unresolved);
         let (_, validation) =
             validate_catalog_union(&reader, &TribleSet::new(), &unresolved).unwrap();
         assert_eq!(validation, CatalogValidation::Accepted);
@@ -1919,7 +2085,7 @@ mod tests {
         .and_then(|fact| resolve_pointer_fact(fact, b"first".as_slice()))
         .and_then(|fact| resolve_pointer_fact(fact, b"second".as_slice()))
         .unwrap();
-        let resolved = projection(content_part(0, resolved, None).unwrap());
+        let resolved = projection(resolved);
         let (_, validation) =
             validate_catalog_union(&reader, &TribleSet::new(), &resolved).unwrap();
         assert_eq!(validation, CatalogValidation::Accepted);
@@ -1970,7 +2136,7 @@ mod tests {
     fn closed_modality_vocabulary_is_enforced_before_residency() {
         let (_directory, reader) = empty_reader();
         let unknown = text_fact(id(12), schema::content_fact::direction::IN, "unknown").unwrap();
-        let fragment = projection(content_part(0, unknown, None).unwrap());
+        let fragment = projection(unknown);
         let validation = validate_catalog(&reader, fragment.facts()).unwrap();
         assert!(matches!(
             validation,

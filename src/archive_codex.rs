@@ -1,5 +1,5 @@
-//! Streaming projection of one Codex app-server rollout onto Archive's
-//! canonical block DAG.
+//! Projection of one Codex app-server rollout onto Archive's canonical block
+//! DAG.
 //!
 //! Codex writes several overlapping views of a turn. `event_msg` user and
 //! agent messages are the visible dialogue stream, while `agent_reasoning`
@@ -16,31 +16,33 @@
 //! `text` parts, plus `image`/`localImage` pointers in Codex's input
 //! protocol), `AgentMessage` (`content`: `Text` parts) or `Reasoning`
 //! (`summary_text`: the summary parts, one string each). Both spellings
-//! project to the same content facts; the new one only gathers a message's
-//! parts, or a reasoning item's summary parts, into one record and so into one
-//! block. `Reasoning.raw_content` mirrors the old `agent_reasoning_raw_content`
-//! event, which was never projected either.
+//! project to the same content facts. `Reasoning.raw_content` mirrors the old
+//! `agent_reasoning_raw_content` event, which was never projected either.
 //!
 //! A Codex fork or resume replays its parent's records into a new file under
 //! new timestamps. A block is its predecessors and its content, and a receipt
 //! is the source namespace and the block, so a replayed message lands on the
-//! parent's block and receipt and adds at most its replay time.
+//! parent's block and receipt; the replayed copy's time is not kept.
 //!
-//! Dialogue (the event stream above, or, in a file without events, the
-//! `response_item` messages and reasoning summaries) threads the DAG. Tool
-//! calls and their outputs, harness context (developer and user-role
-//! `response_item` messages), inter-agent messages, compaction summaries and
-//! `world_state` project as side branches: they follow the latest dialogue
-//! block (and the side record before them), but the next dialogue block does
-//! not follow them. A fork whose replay carries only the event stream therefore
-//! threads the same dialogue blocks as its parent's original file.
+//! Every record with content sits in the main chain in file order, which is
+//! the order the model experienced it: the dialogue events, tool calls and
+//! their outputs, harness context (developer and user-role `response_item`
+//! messages), inter-agent messages, compaction summaries and `world_state`,
+//! the last five perceived (`in`). Each fact is one node after the one
+//! before it; acts and perceptions are the runs of one direction along that
+//! chain. A tool output's node names the call node it answers; call ids and
+//! envelope times stay out of every hashed text.
+//!
+//! Sealed tokens are kept as the bytes they are: a reasoning item's
+//! `encrypted_content` (a token only the provider can decrypt) as THINKING
+//! blob output, and a compaction's sealed history as THINKING blob input.
 //!
 //! No source bytes are stored. Skipped, with the reason:
 //! `token_count`, `token_usage_record`, `task_started`, `task_complete`,
 //! `turn_aborted`, `thread_settings_applied`, `inter_agent_communication_metadata`
-//! and legacy `record_type/state` are bookkeeping; `response_item/reasoning`
-//! in a file with events mirrors the `agent_reasoning`/`Reasoning` events, and
-//! its `encrypted_content` is a sealed token only the provider can decrypt;
+//! and legacy `record_type/state` are bookkeeping; the summary of a
+//! `response_item/reasoning` in a file with events mirrors the
+//! `agent_reasoning`/`Reasoning` events (its sealed token is kept);
 //! assistant `response_item` messages in a file with events mirror
 //! `agent_message`; `*_begin`, `*_end`, `item_completed` tool items
 //! (`CommandExecution`, `FileChange`, `McpToolCall`, ...) and `patch_apply_end`
@@ -52,7 +54,10 @@
 //!
 //! A live rollout is planned at its last newline-terminated record; appends
 //! are harmless and mutation of already observed bytes aborts before
-//! `ArchiveImportWriter` can publish its COMMIT.
+//! `ArchiveImportWriter` can publish its COMMIT. In a rollout that writes
+//! response items, a prompt's event at the tail whose response item is not
+//! written yet is held back with what follows it, so a longer rollout only
+//! appends nodes.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -72,8 +77,9 @@ use triblespace::prelude::*;
 
 use serde_json::Value;
 
+use crate::archive_source::{SourceClaims, SourcePart, SourceRecord, ToolLink};
 use crate::schemas::blockdag as schema;
-use crate::{archive_source, blockdag, files};
+use crate::{archive_source, files};
 
 /// Observable projection accounting. Non-dialogue records are contracted, not
 /// silently mistaken for additional messages.
@@ -81,10 +87,8 @@ use crate::{archive_source, blockdag, files};
 pub struct ProjectionStats {
     /// Non-empty, newline-terminated JSONL records in the frozen prefix.
     pub records_seen: usize,
-    /// Projections emitted for dialogue records.
+    /// Nodes emitted: one per fact, in the main chain.
     pub source_projections: usize,
-    /// Side-branch projections (tools, harness context, compactions).
-    pub side_projections: usize,
     /// Ordered content parts emitted before set-level deduplication.
     pub content_parts: usize,
     /// Bookkeeping, mirrors and other rows that project to nothing.
@@ -93,28 +97,16 @@ pub struct ProjectionStats {
     pub invalid_timestamps: usize,
     /// Data-URI assets whose bytes could not be decoded.
     pub undecodable_assets: usize,
-}
-
-impl ProjectionStats {
-    fn since(self, earlier: Self) -> Self {
-        Self {
-            records_seen: self.records_seen.saturating_sub(earlier.records_seen),
-            source_projections: self
-                .source_projections
-                .saturating_sub(earlier.source_projections),
-            side_projections: self
-                .side_projections
-                .saturating_sub(earlier.side_projections),
-            content_parts: self.content_parts.saturating_sub(earlier.content_parts),
-            skipped_records: self.skipped_records.saturating_sub(earlier.skipped_records),
-            invalid_timestamps: self
-                .invalid_timestamps
-                .saturating_sub(earlier.invalid_timestamps),
-            undecodable_assets: self
-                .undecodable_assets
-                .saturating_sub(earlier.undecodable_assets),
-        }
-    }
+    /// Tool outputs whose call the rollout does not hold.
+    pub unresolved_tool_results: usize,
+    /// User-message events dropped because a response item carries the same
+    /// prompt (counted among `skipped_records` too).
+    pub mirrored_prompts: usize,
+    /// Records held back at the tail: a prompt's event whose response item is
+    /// not yet written, and what follows it. They land on a later import.
+    pub held_back_records: usize,
+    /// The facts of those records: the nodes a later import adds for them.
+    pub held_back_facts: usize,
 }
 
 /// One frozen rollout projection.
@@ -163,17 +155,19 @@ struct Projector<'a> {
     has_events: bool,
     legacy: bool,
     current_model: Option<String>,
-    /// Head of the dialogue chain.
-    previous_block: Option<Id>,
-    /// Head of the side chain hanging off the current dialogue block.
-    side_head: Option<Id>,
-    /// Receipt of the last dialogue block, the file's leaf.
-    leaf: Option<Id>,
-    /// Content part of each tool call, by call id, for `responds_to`.
-    call_parts: std::collections::HashMap<String, Id>,
-    /// Records a single line yields beyond its first (a sealed token that
-    /// follows legacy reasoning).
-    extra: Vec<ProjectedRecord>,
+    /// Every record with content, in file order: the main chain, linked and
+    /// linked by [`Projector::chain`].
+    records: Vec<SourceRecord>,
+    /// For each record, the prompt texts of a user-message event; `None`
+    /// for every other record.
+    event_prompts: Vec<Option<Vec<String>>>,
+    /// Text the model was given in user-role response items.
+    response_prompts: std::collections::HashSet<String>,
+    /// The rollout writes response items at all: a prompt's event is then
+    /// mirrored by the response item that carries it.
+    response_items: bool,
+    /// The rollout is known finished: nothing at its tail is held back.
+    finished: bool,
     /// Inside a fork's replay of its parent: record times are the copy's,
     /// not the event's, and are not kept.
     replaying: bool,
@@ -222,15 +216,6 @@ struct ItemContent {
     path: Option<View<str>>,
 }
 
-/// The two fragments one projected record yields.
-struct ProjectedRecord {
-    /// The receipt's intrinsic closure (content fact, part, block, receipt)
-    /// with the annotations a replay of the record reproduces exactly.
-    receipt: Fragment,
-    /// This occurrence of it: its (replay-varying) timestamp.
-    occurrence: Fragment,
-}
-
 /// Project one explicit Codex rollout file.
 ///
 /// Recursive session-directory ingestion is intentionally absent: Codex child
@@ -244,12 +229,39 @@ pub fn project_path<F>(path: &Path, emit: F) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedFile) -> Result<()>,
 {
+    project_path_finished(path, None, emit)
+}
+
+/// [`project_path`], treating a rollout last modified before
+/// `finished_before` as finished: a prompt's event at its tail is emitted
+/// rather than held back, exactly as if a later record had shown it is no
+/// mirror. The modification time only decides WHEN that event is emitted,
+/// never what any node or receipt is: identity stays free of time.
+pub fn project_path_finished<F>(
+    path: &Path,
+    finished_before: Option<std::time::SystemTime>,
+    emit: F,
+) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
     if path.is_dir() {
         bail!(
             "Codex Archive import requires one explicit rollout JSONL file; recursive session-directory ingestion is intentionally unsupported"
         );
     }
 
+    // Read before the records, so a write after it can only make the file
+    // look unfinished.
+    let finished = match finished_before {
+        Some(cutoff) => {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .with_context(|| format!("read the modification time of {}", path.display()))?
+                < cutoff
+        }
+        None => false,
+    };
     let plan = plan_prefix(path)?;
     let frozen = archive_source::freeze_prefix(path, plan.observed_bytes)?;
     if frozen.digest != plan.digest {
@@ -258,13 +270,14 @@ where
             path.display()
         );
     }
-    project_planned(path, plan, frozen, emit)
+    project_planned(path, plan, frozen, finished, emit)
 }
 
 fn project_planned<F>(
     path: &Path,
     plan: PrefixPlan,
     frozen: archive_source::FrozenSource,
+    finished: bool,
     mut emit: F,
 ) -> Result<ProjectionSummary>
 where
@@ -275,44 +288,18 @@ where
         has_events: plan.has_events,
         legacy: plan.legacy,
         current_model: None,
-        previous_block: None,
-        side_head: None,
-        leaf: None,
-        call_parts: std::collections::HashMap::new(),
-        extra: Vec::new(),
+        records: Vec::new(),
+        event_prompts: Vec::new(),
+        response_prompts: Default::default(),
+        response_items: false,
+        finished,
         replaying: plan.fork_start_ms.is_some(),
         fork_start_ms: plan.fork_start_ms.unwrap_or(0),
         last_ms: plan.fork_start_ms.unwrap_or(0),
         stats: ProjectionStats::default(),
     };
-    let mut fragments_emitted = 0usize;
     let projected = scan_frozen_prefix(&frozen.bytes, |line, raw| {
-        let before = projector.stats;
-        let first = projector.project_record(line, raw)?;
-        let extra = std::mem::take(&mut projector.extra);
-        for (index, record) in first.into_iter().chain(extra).enumerate() {
-            let mut record_stats = if index == 0 {
-                projector.stats.since(before)
-            } else {
-                ProjectionStats::default()
-            };
-            record_stats.records_seen = usize::from(index == 0);
-            // Two fragments, so a writer that already holds the receipt's
-            // closure (a fork replaying its parent) skips that closure whole
-            // and stages only the occurrence.
-            emit(ProjectedFile {
-                source_path: path.to_path_buf(),
-                fragment: record.receipt,
-                stats: record_stats,
-            })?;
-            emit(ProjectedFile {
-                source_path: path.to_path_buf(),
-                fragment: record.occurrence,
-                stats: ProjectionStats::default(),
-            })?;
-            fragments_emitted += 2;
-        }
-        Ok(())
+        projector.project_record(line, raw)
     })?;
     if projected.complete_bytes != plan.complete_bytes {
         bail!(
@@ -322,33 +309,37 @@ where
     }
     projector.stats.records_seen = projected.records_seen;
 
-    // The session id and path annotate the file's leaf only.
-    if let Some(leaf) = projector.leaf {
-        emit(ProjectedFile {
-            source_path: path.to_path_buf(),
-            fragment: blockdag::source_occurrence(
-                leaf,
-                blockdag::ProjectionAnnotations {
-                    source_path: Some(path.to_string_lossy().into_owned()),
-                    source_locator: Some(format!("session/{}", plan.session_id)),
-                    ..blockdag::ProjectionAnnotations::default()
-                },
-            )?,
-            stats: ProjectionStats::default(),
-        })?;
-        fragments_emitted += 1;
-    }
-
-    let stats = projector.stats;
-    let summary = ProjectionSummary {
+    // One whole node per fact; the session id and path
+    // annotate the file's leaf only.
+    let mut fragments_emitted = 0usize;
+    let common = archive_source::project_records(
+        schema::source_projection::SOURCE_CODEX,
+        path,
+        projector.chain(),
+        archive_source::UnitAnnotations {
+            source_locator: Some(format!("session/{}", plan.session_id)),
+            name: None,
+        },
+        |projected| {
+            fragments_emitted += 1;
+            emit(ProjectedFile {
+                source_path: path.to_path_buf(),
+                fragment: projected.fragment,
+                stats: ProjectionStats::default(),
+            })
+        },
+    )?;
+    let mut stats = projector.stats;
+    stats.source_projections = common.projections_emitted;
+    stats.content_parts = common.content_parts;
+    stats.unresolved_tool_results = common.unresolved_tool_results;
+    Ok(ProjectionSummary {
         files_scanned: 1,
         fragments_emitted,
         frozen_bytes: plan.observed_bytes,
         trailing_bytes_ignored: plan.trailing_bytes,
         stats,
-        ..ProjectionSummary::default()
-    };
-    Ok(summary)
+    })
 }
 
 /// What the planning pass learns from the records of one rollout.
@@ -468,6 +459,7 @@ where
         path,
         plan,
         archive_source::FrozenSource { bytes, digest },
+        false,
         emit,
     )
 }
@@ -611,7 +603,7 @@ impl Projector<'_> {
         }
     }
 
-    fn project_record(&mut self, _line: u64, raw: Bytes) -> Result<Option<ProjectedRecord>> {
+    fn project_record(&mut self, _line: u64, raw: Bytes) -> Result<()> {
         if self.replaying {
             self.observe_replay(raw.as_ref());
         }
@@ -628,7 +620,7 @@ impl Projector<'_> {
                     .filter(|model| !model.trim().is_empty())
                     .map(ToString::to_string);
                 self.stats.skipped_records += 1;
-                return Ok(None);
+                return Ok(());
             }
         }
 
@@ -649,7 +641,7 @@ impl Projector<'_> {
                     payload,
                     schema::content_fact::direction::IN,
                     &mut self.stats,
-                )?,
+                ),
                 "user_message",
             ),
             Some("agent_message") => (
@@ -657,17 +649,14 @@ impl Projector<'_> {
                     payload,
                     schema::content_fact::direction::OUT,
                     &mut self.stats,
-                )?,
+                ),
                 "agent_message",
             ),
-            Some("agent_reasoning") => (
-                project_reasoning_parts(payload, &mut self.stats)?,
-                "agent_reasoning",
-            ),
+            Some("agent_reasoning") => (project_reasoning_parts(payload), "agent_reasoning"),
             Some("item_completed") => {
                 let Some(item) = payload.item.as_ref() else {
                     self.stats.skipped_records += 1;
-                    return Ok(None);
+                    return Ok(());
                 };
                 match item.item_type.as_deref() {
                     Some("UserMessage") => (
@@ -675,7 +664,7 @@ impl Projector<'_> {
                             item,
                             schema::content_fact::direction::IN,
                             &mut self.stats,
-                        )?,
+                        ),
                         "UserMessage",
                     ),
                     Some("AgentMessage") => (
@@ -683,26 +672,42 @@ impl Projector<'_> {
                             item,
                             schema::content_fact::direction::OUT,
                             &mut self.stats,
-                        )?,
+                        ),
                         "AgentMessage",
                     ),
-                    Some("Reasoning") => (
-                        project_item_reasoning_parts(item, &mut self.stats)?,
-                        "Reasoning",
-                    ),
+                    Some("Reasoning") => (project_item_reasoning_parts(item), "Reasoning"),
                     _ => {
                         self.stats.skipped_records += 1;
-                        return Ok(None);
+                        return Ok(());
                     }
                 }
             }
             _ => {
                 self.stats.skipped_records += 1;
-                return Ok(None);
+                return Ok(());
             }
         };
         let timestamp = self.timestamp(record.timestamp.as_deref());
-        self.dialogue(parts, raw_role, timestamp)
+        let prompt = matches!(raw_role, "user_message" | "UserMessage").then(|| {
+            parts
+                .iter()
+                .filter_map(|part| match part {
+                    SourcePart::Text {
+                        modality, value, ..
+                    } if *modality == schema::content_fact::modality::TEXT => {
+                        Some(value.as_ref().trim().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect()
+        });
+        if self.push(parts, Vec::new(), raw_role, timestamp) {
+            *self
+                .event_prompts
+                .last_mut()
+                .expect("a pushed record has a prompt slot") = prompt;
+        }
+        Ok(())
     }
 
     fn timestamp(&mut self, value: Option<&str>) -> Option<Inline<NsTAIInterval>> {
@@ -717,94 +722,104 @@ impl Projector<'_> {
             .and_then(epoch_interval)
     }
 
-    /// Emit one dialogue block: it follows the previous dialogue block.
-    fn dialogue(
+    /// Put one record with content on the main chain. Role and model ride
+    /// with its receipt; its time is kept unless it is a fork's replayed
+    /// copy, whose time records a tool copying lines rather than anything
+    /// that happened. Time never enters the block, because Codex restamps
+    /// replayed records. Returns whether the record had content.
+    fn push(
         &mut self,
-        parts: Fragment,
+        parts: Vec<SourcePart>,
+        links: Vec<(usize, ToolLink)>,
         raw_role: &str,
         timestamp: Option<Inline<NsTAIInterval>>,
-    ) -> Result<Option<ProjectedRecord>> {
-        if parts.exports().next().is_none() {
+    ) -> bool {
+        if parts.is_empty() {
             self.stats.skipped_records += 1;
-            return Ok(None);
+            return false;
         }
-        // Codex child rollouts replay inherited records while rewriting their
-        // observation time. Time therefore annotates the receipt, never the
-        // shared block.
-        let block = blockdag::block(self.previous_block, None, parts)?;
-        let block_id = block
-            .root()
-            .expect("canonical block constructor returns one root");
-        let record = self.receipt(block, raw_role, timestamp)?;
-        self.previous_block = Some(block_id);
-        self.side_head = None;
-        self.leaf = Some(record.receipt.root().expect("receipt is rooted"));
-        self.stats.source_projections += 1;
-        Ok(Some(record))
+        let mut record = SourceRecord::new(
+            archive_source::owned_text(format!("record/{}", self.records.len())),
+            Vec::new(),
+            parts,
+        );
+        record.links = links;
+        record.claims = SourceClaims {
+            timestamp: if self.replaying { None } else { timestamp },
+            raw_role: Some(archive_source::owned_text(raw_role.to_owned())),
+            raw_model: self.current_model.clone().map(archive_source::owned_text),
+            ..SourceClaims::default()
+        };
+        self.records.push(record);
+        self.event_prompts.push(None);
+        true
     }
 
-    /// Emit one side-branch block: it follows the side record before it, or
-    /// the latest dialogue block, and no dialogue block follows it.
-    fn side(
-        &mut self,
-        parts: Fragment,
-        raw_role: &str,
-        timestamp: Option<Inline<NsTAIInterval>>,
-    ) -> Result<Option<ProjectedRecord>> {
-        if parts.exports().next().is_none() {
-            self.stats.skipped_records += 1;
-            return Ok(None);
+    /// The main chain: every record after the one before it.
+    ///
+    /// A user-message event is the UI's notice of a prompt; what the model was
+    /// given is the user-role response item carrying the same text. The
+    /// event is kept only where no response item carries its prompt (formats
+    /// without response items), so a prompt is never perceived twice.
+    ///
+    /// In a rollout that writes response items, an event whose response item
+    /// is not written yet, with nothing the model produced after it, is a
+    /// live tail: whether the event is a mirror is not known yet. It is held
+    /// back with everything after it, so a later import appends rather than
+    /// leaving a dead end.
+    fn chain(&mut self) -> Vec<SourceRecord> {
+        let mut records = std::mem::take(&mut self.records);
+        let prompts = std::mem::take(&mut self.event_prompts);
+        let response_prompts = std::mem::take(&mut self.response_prompts);
+        let mirrored = |texts: &Vec<String>| {
+            !texts.is_empty() && texts.iter().all(|text| response_prompts.contains(text))
+        };
+        let produced_after = |index: usize| {
+            records[index + 1..].iter().any(|record| {
+                record
+                    .parts
+                    .iter()
+                    .any(|part| part.direction() == schema::content_fact::direction::OUT)
+            })
+        };
+        let held = (self.response_items && !self.finished)
+            .then(|| {
+                prompts.iter().enumerate().position(|(index, prompt)| {
+                    prompt
+                        .as_ref()
+                        .is_some_and(|texts| !texts.is_empty() && !mirrored(texts))
+                        && !produced_after(index)
+                })
+            })
+            .flatten();
+        if let Some(index) = held {
+            for record in records.drain(index..) {
+                self.stats.held_back_records += 1;
+                self.stats.held_back_facts += record.parts.len();
+            }
         }
-        let block = blockdag::block(self.side_head.or(self.previous_block), None, parts)?;
-        let block_id = block
-            .root()
-            .expect("canonical block constructor returns one root");
-        let record = self.receipt(block, raw_role, timestamp)?;
-        self.side_head = Some(block_id);
-        self.stats.side_projections += 1;
-        Ok(Some(record))
-    }
-
-    /// The receipt is the namespace and the block; role and model ride with
-    /// it, and the replay-varying time is a fragment of its own.
-    fn receipt(
-        &mut self,
-        block: Fragment,
-        raw_role: &str,
-        timestamp: Option<Inline<NsTAIInterval>>,
-    ) -> Result<ProjectedRecord> {
-        let receipt =
-            blockdag::block_source_projection(schema::source_projection::SOURCE_CODEX, block)?;
-        let receipt = blockdag::annotate_source_projection(
-            receipt,
-            blockdag::ProjectionAnnotations {
-                raw_role: Some(raw_role.to_owned()),
-                raw_model: self.current_model.clone(),
-                ..blockdag::ProjectionAnnotations::default()
-            },
-        )?;
-        let receipt_id = receipt
-            .root()
-            .expect("canonical source-projection constructor returns one root");
-        // A fork's replayed records carry the time of the copy, which
-        // records a tool copying lines, not anything that happened.
-        let timestamp = if self.replaying { None } else { timestamp };
-        let occurrence = blockdag::source_occurrence(
-            receipt_id,
-            blockdag::ProjectionAnnotations {
-                source_timestamp: timestamp,
-                ..blockdag::ProjectionAnnotations::default()
-            },
-        )?;
-        Ok(ProjectedRecord {
-            receipt,
-            occurrence,
-        })
+        let mut chained: Vec<SourceRecord> = Vec::with_capacity(records.len());
+        for (mut record, prompt) in records.into_iter().zip(prompts) {
+            if let Some(texts) = prompt {
+                if mirrored(&texts) {
+                    self.stats.mirrored_prompts += 1;
+                    self.stats.skipped_records += 1;
+                    continue;
+                }
+            }
+            record.predecessors = chained
+                .last()
+                .map(|previous| previous.locator.clone())
+                .into_iter()
+                .collect();
+            chained.push(record);
+        }
+        chained
     }
 
     /// Project one non-event record: a response item, a compaction, a world
     /// state, or (legacy format) a bare response item.
-    fn project_item_line(&mut self, raw: Bytes) -> Result<Option<ProjectedRecord>> {
+    fn project_item_line(&mut self, raw: Bytes) -> Result<()> {
         let cheap = raw.as_ref();
         if !self.legacy
             && !contains(cheap, b"\"response_item\"")
@@ -812,7 +827,7 @@ impl Projector<'_> {
             && !contains(cheap, b"\"world_state\"")
         {
             self.stats.skipped_records += 1;
-            return Ok(None);
+            return Ok(());
         }
         let value: serde_json::Value = serde_json::from_slice(cheap)
             .with_context(|| format!("parse Codex record in {}", self.source_path.display()))?;
@@ -833,23 +848,19 @@ impl Projector<'_> {
         match kind {
             "response_item" => self.response_item(payload, timestamp),
             "compacted" => {
-                let mut parts = Fragment::empty();
-                let mut ordinal = 0;
+                // A compaction is what the model is shown in place of its
+                // history: its summary and its sealed state are perceived.
+                let mut parts = Vec::new();
                 if let Some(message) = payload
                     .get("message")
                     .and_then(Value::as_str)
                     .filter(|message| !message.trim().is_empty())
                 {
-                    push_part(
-                        &mut parts,
-                        &mut ordinal,
-                        blockdag::text_fact(
-                            schema::content_fact::modality::TEXT,
-                            schema::content_fact::direction::AMBIENT,
-                            message,
-                        )?,
-                        &mut self.stats,
-                    )?;
+                    parts.push(text_part(
+                        schema::content_fact::modality::TEXT,
+                        schema::content_fact::direction::IN,
+                        message,
+                    ));
                 }
                 // The sealed compaction tokens; the rest of the replacement
                 // history repeats items the file already holds.
@@ -861,31 +872,23 @@ impl Projector<'_> {
                     .filter_map(|item| item.get("encrypted_content")?.as_str())
                     .filter(|token| !token.is_empty())
                 {
-                    push_part(
-                        &mut parts,
-                        &mut ordinal,
-                        archive_source::sealed_fact(
-                            token,
-                            schema::content_fact::sealed::OPENAI_COMPACTION,
-                            archive_source::SealedAlphabet::UrlSafe,
-                        )?,
-                        &mut self.stats,
-                    )?;
+                    parts.push(sealed(
+                        token,
+                        schema::content_fact::sealed::OPENAI_COMPACTION,
+                        schema::content_fact::direction::IN,
+                    ));
                 }
-                self.side(parts, "compacted", timestamp)
+                self.push(parts, Vec::new(), "compacted", timestamp);
+                Ok(())
             }
             "world_state" => {
-                let parts = event_parts(
-                    payload,
-                    &[],
-                    schema::content_fact::direction::IN,
-                    &mut self.stats,
-                )?;
-                self.side(parts, "world_state", timestamp)
+                let parts = event_parts(payload, schema::content_fact::direction::IN)?;
+                self.push(parts, Vec::new(), "world_state", timestamp);
+                Ok(())
             }
             _ => {
                 self.stats.skipped_records += 1;
-                Ok(None)
+                Ok(())
             }
         }
     }
@@ -894,7 +897,8 @@ impl Projector<'_> {
         &mut self,
         payload: &Value,
         timestamp: Option<Inline<NsTAIInterval>>,
-    ) -> Result<Option<ProjectedRecord>> {
+    ) -> Result<()> {
+        self.response_items = true;
         let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "message" => {
@@ -907,7 +911,22 @@ impl Projector<'_> {
                 if self.has_events && role == "assistant" {
                     // The event stream carries the assistant's words.
                     self.stats.skipped_records += 1;
-                    return Ok(None);
+                    return Ok(());
+                }
+                // User-role items are the typed prompt and the harness
+                // context around it; developer and system items are
+                // instructions. All of it is what the model saw.
+                if role == "user" {
+                    for entry in payload
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(text) = entry.get("text").and_then(Value::as_str) {
+                            self.response_prompts.insert(text.trim().to_owned());
+                        }
+                    }
                 }
                 let parts = response_content_parts(
                     payload.get("content"),
@@ -915,143 +934,119 @@ impl Projector<'_> {
                     direction,
                     &mut self.stats,
                 )?;
-                match role {
-                    "user" | "assistant" if !self.has_events => {
-                        self.dialogue(parts, role, timestamp)
-                    }
-                    // User-role items are the typed prompt and the harness
-                    // context around it; developer and system items are
-                    // instructions. All of it is what the model saw.
-                    _ => self.side(parts, role, timestamp),
-                }
+                self.push(parts, Vec::new(), role, timestamp);
+                Ok(())
             }
             "reasoning" => {
-                // The sealed token is kept as the bytes it is, on a side
-                // branch, so files without it meet on the same dialogue.
-                let sealed = match payload
+                // Readable reasoning, then the sealed token: one act with the
+                // rest of the model's response.
+                let mut parts = Vec::new();
+                if !self.has_events {
+                    // In a file with events the summary is the events'
+                    // reasoning; only the sealed token is new here.
+                    for field in ["summary", "content"] {
+                        for entry in payload
+                            .get(field)
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                        {
+                            let Some(text) = entry
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .filter(|text| !text.trim().is_empty())
+                            else {
+                                continue;
+                            };
+                            parts.push(text_part(
+                                schema::content_fact::modality::THINKING,
+                                schema::content_fact::direction::OUT,
+                                text,
+                            ));
+                        }
+                    }
+                }
+                if let Some(token) = payload
                     .get("encrypted_content")
                     .and_then(Value::as_str)
                     .filter(|token| !token.is_empty())
                 {
-                    Some(token) => {
-                        let mut parts = Fragment::empty();
-                        let mut ordinal = 0;
-                        push_part(
-                            &mut parts,
-                            &mut ordinal,
-                            archive_source::sealed_fact(
-                                token,
-                                schema::content_fact::sealed::OPENAI_REASONING,
-                                archive_source::SealedAlphabet::UrlSafe,
-                            )?,
-                            &mut self.stats,
-                        )?;
-                        Some(parts)
-                    }
-                    None => None,
-                };
-                if self.has_events {
-                    // The summary is the events' reasoning; only the sealed
-                    // token is new here.
-                    return match sealed {
-                        Some(parts) => self.side(parts, "reasoning", timestamp),
-                        None => {
-                            self.stats.skipped_records += 1;
-                            Ok(None)
-                        }
-                    };
+                    parts.push(sealed(
+                        token,
+                        schema::content_fact::sealed::OPENAI_REASONING,
+                        schema::content_fact::direction::OUT,
+                    ));
                 }
-                let mut parts = Fragment::empty();
-                let mut ordinal = 0;
-                for field in ["summary", "content"] {
-                    for entry in payload
-                        .get(field)
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        let Some(text) = entry
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .filter(|text| !text.trim().is_empty())
-                        else {
-                            continue;
-                        };
-                        push_part(
-                            &mut parts,
-                            &mut ordinal,
-                            blockdag::text_fact(
-                                schema::content_fact::modality::THINKING,
-                                schema::content_fact::direction::OUT,
-                                text,
-                            )?,
-                            &mut self.stats,
-                        )?;
-                    }
-                }
-                let Some(sealed) = sealed else {
-                    return self.dialogue(parts, "reasoning", timestamp);
-                };
-                if parts.exports().next().is_none() {
-                    return self.side(sealed, "reasoning", timestamp);
-                }
-                let dialogue = self.dialogue(parts, "reasoning", timestamp)?;
-                let side = self.side(sealed, "reasoning", timestamp)?;
-                match dialogue {
-                    Some(dialogue) => {
-                        self.extra.extend(side);
-                        Ok(Some(dialogue))
-                    }
-                    None => Ok(side),
-                }
+                self.push(parts, Vec::new(), "reasoning", timestamp);
+                Ok(())
             }
             // `ghost_snapshot` holds git object references; a record without
             // a kind is the legacy header or a legacy `record_type/state`.
             "ghost_snapshot" | "" => {
                 self.stats.skipped_records += 1;
-                Ok(None)
+                Ok(())
             }
             kind if kind.ends_with("_output") => {
-                let call_id = payload.get("call_id").and_then(Value::as_str);
-                let responds_to = call_id.and_then(|id| self.call_parts.get(id).copied());
-                let parts = tool_output_parts(payload.get("output"), responds_to, &mut self.stats)?;
-                self.side(parts, kind, timestamp)
+                let parts = tool_output_parts(payload.get("output"), &mut self.stats)?;
+                let links = match payload.get("call_id").and_then(Value::as_str) {
+                    Some(call_id) => (0..parts.len())
+                        .map(|index| {
+                            (
+                                index,
+                                ToolLink::Result(archive_source::owned_text(call_id.to_owned())),
+                            )
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                self.push(parts, links, kind, timestamp);
+                Ok(())
             }
             kind if kind.ends_with("_call") => {
                 let body = canonical_value(&without(payload, CALL_ENVELOPE))?;
-                let fact = blockdag::text_fact(
+                let parts = vec![text_part(
                     schema::content_fact::modality::TOOL_CALL,
                     schema::content_fact::direction::OUT,
-                    body,
-                )?;
-                let part = blockdag::content_part(0, fact, None)?;
-                self.stats.content_parts += 1;
-                if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
-                    self.call_parts
-                        .insert(call_id.to_owned(), part.root().expect("part is rooted"));
-                }
-                self.side(part, kind, timestamp)
+                    &body,
+                )];
+                let links = payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(|call_id| {
+                        (
+                            0,
+                            ToolLink::Call(archive_source::owned_text(call_id.to_owned())),
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                self.push(parts, links, kind, timestamp);
+                Ok(())
             }
             // Inter-agent messages and any item kind not named above.
             _ => {
                 let parts = event_parts(
-                    payload,
-                    CALL_ENVELOPE,
+                    &without(payload, CALL_ENVELOPE),
                     schema::content_fact::direction::IN,
-                    &mut self.stats,
                 )?;
-                self.side(parts, kind, timestamp)
+                self.push(parts, Vec::new(), kind, timestamp);
+                Ok(())
             }
         }
     }
 }
 
-/// Fields of a response item that are envelope, not content.
+/// Fields of a response item that are envelope, not content: the vendor's
+/// item and call ids, its status, and its timing metadata. Call ids link a
+/// result to its call through `responds_to` instead.
 const CALL_ENVELOPE: &[&str] = &[
     "id",
     "call_id",
     "status",
     "internal_chat_message_metadata_passthrough",
+    "timestamp",
+    "created_at",
+    "create_time",
 ];
 
 fn without(value: &Value, keys: &[&str]) -> Value {
@@ -1066,69 +1061,80 @@ fn without(value: &Value, keys: &[&str]) -> Value {
     }
 }
 
-/// One EVENT part holding the canonical JSON of `value` without `keys`.
-fn event_parts(
-    value: &Value,
-    keys: &[&str],
-    direction: Id,
-    stats: &mut ProjectionStats,
-) -> Result<Fragment> {
-    let body = canonical_value(&without(value, keys))?;
-    let mut parts = Fragment::empty();
-    if body != "{}" && body != "null" {
-        let mut ordinal = 0;
-        push_part(
-            &mut parts,
-            &mut ordinal,
-            blockdag::text_fact(schema::content_fact::modality::EVENT, direction, body)?,
-            stats,
-        )?;
+fn text_part(modality: Id, direction: Id, text: &str) -> SourcePart {
+    SourcePart::text(
+        modality,
+        direction,
+        archive_source::owned_text(text.to_owned()),
+    )
+}
+
+/// One sealed token as a THINKING blob part in the given direction.
+fn sealed(token: &str, media_type: &str, direction: Id) -> SourcePart {
+    let (bytes, media_type) =
+        archive_source::sealed_bytes(token, media_type, archive_source::SealedAlphabet::UrlSafe);
+    SourcePart::Blob {
+        modality: schema::content_fact::modality::THINKING,
+        direction,
+        bytes: Bytes::from_source(bytes),
+        media_type: archive_source::owned_text(media_type),
     }
-    Ok(parts)
+}
+
+/// One EVENT part holding the canonical JSON of `value`.
+fn event_parts(value: &Value, direction: Id) -> Result<Vec<SourcePart>> {
+    let body = canonical_value(value)?;
+    Ok(if body != "{}" && body != "null" {
+        vec![text_part(
+            schema::content_fact::modality::EVENT,
+            direction,
+            &body,
+        )]
+    } else {
+        Vec::new()
+    })
 }
 
 /// Text and image items of a response item's `content`, in order.
-fn response_content_facts(
+fn response_content_parts(
     content: Option<&Value>,
     modality: Id,
     direction: Id,
     stats: &mut ProjectionStats,
-) -> Result<Vec<Fragment>> {
+) -> Result<Vec<SourcePart>> {
     let items: Vec<&Value> = match content {
         Some(Value::Array(items)) => items.iter().collect(),
         Some(other) => vec![other],
         None => Vec::new(),
     };
-    let mut facts = Vec::new();
+    let mut parts = Vec::new();
     for item in items {
-        let fact = match item {
+        let part = match item {
             Value::String(text) if !text.trim().is_empty() => {
-                Some(blockdag::text_fact(modality, direction, text.as_str())?)
+                Some(text_part(modality, direction, text))
             }
             Value::Object(_) => {
                 if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    (!text.trim().is_empty())
-                        .then(|| blockdag::text_fact(modality, direction, text))
-                        .transpose()?
+                    (!text.trim().is_empty()).then(|| text_part(modality, direction, text))
                 } else if let Some(url) = item
                     .get("image_url")
                     .and_then(Value::as_str)
                     .or_else(|| item.get("url").and_then(Value::as_str))
                 {
-                    project_asset(url, schema::content_fact::modality::IMAGE, direction, stats)?
+                    project_asset(url, schema::content_fact::modality::IMAGE, direction, stats)
                 } else {
-                    Some(blockdag::text_fact(
+                    Some(text_part(
                         schema::content_fact::modality::EVENT,
                         direction,
-                        canonical_value(item)?,
-                    )?)
+                        &canonical_value(item)?,
+                    ))
                 }
             }
             _ => None,
         };
-        facts.extend(fact);
+        parts.extend(part);
     }
-    Ok(facts)
+    Ok(parts)
 }
 
 fn canonical_value(value: &Value) -> Result<String> {
@@ -1136,52 +1142,21 @@ fn canonical_value(value: &Value) -> Result<String> {
         .map_err(|error| anyhow!("canonicalize Codex JSON: {error}"))
 }
 
-/// Wrap facts into ordered parts, each optionally answering one call part.
-fn wrap_parts(
-    facts: Vec<Fragment>,
-    responds_to: Option<Id>,
-    stats: &mut ProjectionStats,
-) -> Result<Fragment> {
-    let mut parts = Fragment::empty();
-    for (ordinal, fact) in facts.into_iter().enumerate() {
-        let ordinal = u64::try_from(ordinal).context("content-part ordinal exceeds u64")?;
-        parts += blockdag::content_part(ordinal, fact, responds_to)?;
-        stats.content_parts += 1;
-    }
-    Ok(parts)
-}
-
-fn response_content_parts(
-    content: Option<&Value>,
-    modality: Id,
-    direction: Id,
-    stats: &mut ProjectionStats,
-) -> Result<Fragment> {
-    let facts = response_content_facts(content, modality, direction, stats)?;
-    wrap_parts(facts, None, stats)
-}
-
-/// The parts of a tool output: its text and images, each answering the call.
+/// The parts of a tool output: its text and images.
 fn tool_output_parts(
     output: Option<&Value>,
-    responds_to: Option<Id>,
     stats: &mut ProjectionStats,
-) -> Result<Fragment> {
+) -> Result<Vec<SourcePart>> {
     let direction = schema::content_fact::direction::IN;
     let modality = schema::content_fact::modality::TOOL_RESULT;
-    let facts = match output {
+    Ok(match output {
         Some(Value::String(text)) if !text.is_empty() => {
-            vec![blockdag::text_fact(modality, direction, text.as_str())?]
+            vec![text_part(modality, direction, text)]
         }
         Some(Value::String(_)) | Some(Value::Null) | None => Vec::new(),
-        Some(Value::Array(_)) => response_content_facts(output, modality, direction, stats)?,
-        Some(other) => vec![blockdag::text_fact(
-            modality,
-            direction,
-            canonical_value(other)?,
-        )?],
-    };
-    wrap_parts(facts, responds_to, stats)
+        Some(Value::Array(_)) => response_content_parts(output, modality, direction, stats)?,
+        Some(other) => vec![text_part(modality, direction, &canonical_value(other)?)],
+    })
 }
 
 /// Project a 2026-09 `UserMessage` or `AgentMessage` item's content, in order.
@@ -1194,155 +1169,114 @@ fn project_item_message_parts(
     item: &CodexItem,
     direction: Id,
     stats: &mut ProjectionStats,
-) -> Result<Fragment> {
-    let mut parts = Fragment::empty();
-    let mut ordinal = 0u64;
+) -> Vec<SourcePart> {
+    let mut parts = Vec::new();
     for content in &item.content {
-        let fact = match content.content_type.as_deref() {
-            Some("text" | "Text") => match content
+        let part = match content.content_type.as_deref() {
+            Some("text" | "Text") => content
                 .text
-                .as_deref()
+                .as_ref()
                 .filter(|text| !text.trim().is_empty())
-            {
-                Some(text) => Some(blockdag::text_fact(
-                    schema::content_fact::modality::TEXT,
-                    direction,
-                    text,
-                )?),
-                None => None,
-            },
-            Some("image") => match content.image_url.as_ref().or(content.url.as_ref()) {
-                Some(pointer) => project_asset(
+                .map(|text| {
+                    SourcePart::text(
+                        schema::content_fact::modality::TEXT,
+                        direction,
+                        text.clone(),
+                    )
+                }),
+            Some("image") => content
+                .image_url
+                .as_ref()
+                .or(content.url.as_ref())
+                .and_then(|pointer| {
+                    project_asset(
+                        pointer,
+                        schema::content_fact::modality::IMAGE,
+                        direction,
+                        stats,
+                    )
+                }),
+            Some("localImage" | "local_image") => content.path.as_ref().and_then(|pointer| {
+                project_asset(
                     pointer,
                     schema::content_fact::modality::IMAGE,
                     direction,
                     stats,
-                )?,
-                None => None,
-            },
-            Some("localImage" | "local_image") => match content.path.as_ref() {
-                Some(pointer) => project_asset(
-                    pointer,
-                    schema::content_fact::modality::IMAGE,
-                    direction,
-                    stats,
-                )?,
-                None => None,
-            },
+                )
+            }),
             _ => None,
         };
-        if let Some(fact) = fact {
-            push_part(&mut parts, &mut ordinal, fact, stats)?;
-        }
+        parts.extend(part);
     }
-    Ok(parts)
+    parts
 }
 
 /// Project a 2026-09 `Reasoning` item's summary parts, in order: each is what
 /// one old-format `agent_reasoning` event carried.
-fn project_item_reasoning_parts(item: &CodexItem, stats: &mut ProjectionStats) -> Result<Fragment> {
-    let mut parts = Fragment::empty();
-    let mut ordinal = 0u64;
-    for text in item
-        .summary_text
+fn project_item_reasoning_parts(item: &CodexItem) -> Vec<SourcePart> {
+    item.summary_text
         .iter()
         .filter(|text| !text.trim().is_empty())
-    {
-        push_part(
-            &mut parts,
-            &mut ordinal,
-            blockdag::text_fact(
+        .map(|text| {
+            SourcePart::text(
                 schema::content_fact::modality::THINKING,
                 schema::content_fact::direction::OUT,
-                text.as_ref(),
-            )?,
-            stats,
-        )?;
-    }
-    Ok(parts)
+                text.clone(),
+            )
+        })
+        .collect()
 }
 
-fn project_reasoning_parts(
-    payload: &CodexPayload,
-    stats: &mut ProjectionStats,
-) -> Result<Fragment> {
-    let mut parts = Fragment::empty();
-    let Some(text) = payload
+fn project_reasoning_parts(payload: &CodexPayload) -> Vec<SourcePart> {
+    payload
         .text
-        .as_deref()
+        .as_ref()
         .filter(|text| !text.trim().is_empty())
-    else {
-        return Ok(parts);
-    };
-    let mut ordinal = 0;
-    push_part(
-        &mut parts,
-        &mut ordinal,
-        blockdag::text_fact(
-            schema::content_fact::modality::THINKING,
-            schema::content_fact::direction::OUT,
-            text,
-        )?,
-        stats,
-    )?;
-    Ok(parts)
+        .map(|text| {
+            SourcePart::text(
+                schema::content_fact::modality::THINKING,
+                schema::content_fact::direction::OUT,
+                text.clone(),
+            )
+        })
+        .into_iter()
+        .collect()
 }
 
 fn project_message_parts(
     payload: &CodexPayload,
     direction: Id,
     stats: &mut ProjectionStats,
-) -> Result<Fragment> {
-    let mut parts = Fragment::empty();
-    let mut ordinal = 0u64;
+) -> Vec<SourcePart> {
+    let mut parts = Vec::new();
     if let Some(message) = payload
         .message
-        .as_deref()
+        .as_ref()
         .filter(|message| !message.trim().is_empty())
     {
-        push_part(
-            &mut parts,
-            &mut ordinal,
-            blockdag::text_fact(schema::content_fact::modality::TEXT, direction, message)?,
-            stats,
-        )?;
+        parts.push(SourcePart::text(
+            schema::content_fact::modality::TEXT,
+            direction,
+            message.clone(),
+        ));
     }
-
     for pointer in payload.images.iter().chain(&payload.local_images) {
-        if let Some(fact) = project_asset(
+        parts.extend(project_asset(
             pointer,
             schema::content_fact::modality::IMAGE,
             direction,
             stats,
-        )? {
-            push_part(&mut parts, &mut ordinal, fact, stats)?;
-        }
+        ));
     }
     for pointer in payload.audio.iter().chain(&payload.local_audio) {
-        if let Some(fact) = project_asset(
+        parts.extend(project_asset(
             pointer,
             schema::content_fact::modality::AUDIO,
             direction,
             stats,
-        )? {
-            push_part(&mut parts, &mut ordinal, fact, stats)?;
-        }
+        ));
     }
-    Ok(parts)
-}
-
-fn push_part(
-    parts: &mut Fragment,
-    ordinal: &mut u64,
-    fact: Fragment,
-    stats: &mut ProjectionStats,
-) -> Result<()> {
-    *parts += blockdag::content_part(*ordinal, fact, None)?;
-    *ordinal = ordinal
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("Codex message has more than u64::MAX content parts"))?;
-    stats.content_parts += 1;
-    Ok(())
+    parts
 }
 
 fn project_asset(
@@ -1350,24 +1284,24 @@ fn project_asset(
     modality: Id,
     direction: Id,
     stats: &mut ProjectionStats,
-) -> Result<Option<Fragment>> {
+) -> Option<SourcePart> {
     if let Some(data) = pointer.strip_prefix("data:") {
         let Some((header, payload)) = data.split_once(',') else {
             stats.undecodable_assets += 1;
-            return Ok(None);
+            return None;
         };
         if !header
             .split(';')
             .any(|component| component.eq_ignore_ascii_case("base64"))
         {
             stats.undecodable_assets += 1;
-            return Ok(None);
+            return None;
         }
         let bytes = match BASE64_STANDARD.decode(payload.as_bytes()) {
             Ok(bytes) => bytes,
             Err(_) => {
                 stats.undecodable_assets += 1;
-                return Ok(None);
+                return None;
             }
         };
         let media_type = header
@@ -1376,22 +1310,23 @@ fn project_asset(
             .filter(|value| !value.trim().is_empty())
             .map(files::normalize_media_type_or_default)
             .unwrap_or_else(|| files::DEFAULT_MEDIA_TYPE.to_owned());
-        return Ok(Some(blockdag::blob_fact(
+        return Some(SourcePart::Blob {
             modality,
             direction,
-            bytes,
-            &media_type,
-        )?));
+            bytes: Bytes::from_source(bytes),
+            media_type: archive_source::owned_text(media_type),
+        });
     }
 
-    Ok(Some(blockdag::asset_pointer_fact(
+    Some(SourcePart::Pointer {
         modality,
         direction,
-        schema::source_projection::SOURCE_CODEX,
-        pointer.to_owned(),
-        None,
-        None,
-    )?))
+        namespace: schema::source_projection::SOURCE_CODEX,
+        pointer: archive_source::owned_text(pointer.to_owned()),
+        media_type: None,
+        size: None,
+        resolved: None,
+    })
 }
 
 fn consistent_session_id(payload: &CodexPayload) -> Result<String> {
@@ -1699,6 +1634,7 @@ mod tests {
 
     use super::*;
     use crate::archive_collection::ArchiveImportWriter;
+    use crate::blockdag;
     use crate::storage::FactView;
 
     const ROLLOUT: &str = concat!(
@@ -1770,23 +1706,22 @@ mod tests {
     }
 
     #[test]
-    fn visible_events_thread_the_dialogue_and_harness_items_branch_off_it() {
+    fn every_record_with_content_is_one_chain_of_perceptions_and_acts() {
         let (_directory, summary, fragment) = project_text(ROLLOUT, "rollout.jsonl");
+        // The user-role response item is the prompt (the user event only
+        // mirrors it); the reasoning and the reply follow it, one node each.
         assert_eq!(summary.stats.source_projections, 3);
-        assert_eq!(
-            summary.stats.side_projections, 1,
-            "the user-role response item"
-        );
-        assert_eq!(summary.stats.content_parts, 5);
+        assert_eq!(summary.stats.content_parts, 3);
         assert_eq!(summary.stats.records_seen, 8);
-        // A receipt and an occurrence per projected record, then the leaf.
-        assert_eq!(summary.fragments_emitted, 9);
-        assert_eq!(summary.stats.skipped_records, 4);
+        // One node each, then the leaf.
+        assert_eq!(summary.fragments_emitted, 4);
+        assert_eq!(summary.stats.skipped_records, 5);
+        assert_eq!(summary.stats.mirrored_prompts, 1);
         assert_eq!(
             ids_with_tag(&fragment, schema::source_projection::KIND).len(),
-            4
+            3
         );
-        assert_eq!(ids_with_tag(&fragment, schema::block::KIND).len(), 4);
+        assert_eq!(ids_with_tag(&fragment, schema::block::KIND).len(), 3);
         assert!(!exists!(pattern!(fragment.facts(), [{
             _?receipt @ schema::source_projection::raw_record: _?raw
         }])));
@@ -1814,7 +1749,8 @@ mod tests {
                 }])
             )
             .count(),
-            4
+            3,
+            "each node's receipt carries the time of its record"
         );
         assert_eq!(
             find!(
@@ -1926,13 +1862,19 @@ mod tests {
     }
 
     #[test]
-    fn sealed_only_reasoning_is_kept_as_bytes_off_the_dialogue() {
+    fn sealed_only_reasoning_is_kept_as_bytes_in_one_act() {
         let source = chunked_telemetry_rollout(256 * 1024);
         let (_directory, summary, fragment) = project_text(&source, "sealed.jsonl");
         assert_eq!(summary.stats.records_seen, 1_026);
         assert_eq!(summary.stats.skipped_records, 2, "the meta and the padding");
-        assert_eq!(summary.stats.side_projections, 1_024);
-        assert_eq!(summary.stats.source_projections, 0);
+        // One node per record, the same fact each time: the chain tells
+        // them apart, and nothing was perceived between them, so one act.
+        assert_eq!(summary.stats.source_projections, 1_024);
+        assert_eq!(summary.stats.content_parts, 1_024);
+        assert_eq!(
+            blockdag::turn_of(fragment.facts(), leaf(&fragment)).len(),
+            1_024
+        );
         use schema::content_fact::{direction, modality};
         // One token, "opaque", which is not canonical base64: kept as its
         // exact text under the `+text` media type, as a THINKING blob.
@@ -1946,29 +1888,48 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_reasoning_is_kept_as_bytes_without_moving_the_dialogue() {
+    fn encrypted_reasoning_is_kept_as_bytes_in_the_act_it_belongs_to() {
         use base64::engine::general_purpose::URL_SAFE;
         let token = URL_SAFE.encode([0x80u8; 45]);
         let with = ITEM_ROLLOUT.replace(
             r#""encrypted_content":"opaque""#,
             &format!(r#""encrypted_content":"{token}""#),
         );
-        let without = ITEM_ROLLOUT.replace(r#","encrypted_content":"opaque""#, "");
         let (_with_dir, with_summary, with) = project_text(&with, "with.jsonl");
-        let (_without_dir, _, without) = project_text(&without, "without.jsonl");
-        assert_eq!(with_summary.stats.side_projections, 2);
-        assert!(ids_with_tag(&without, schema::block::KIND)
-            .is_subset(&ids_with_tag(&with, schema::block::KIND)));
+        assert_eq!(with_summary.stats.source_projections, 5);
         let mut probe = Fragment::empty();
         let bytes = probe.put::<RawBytes, _>(vec![0x80u8; 45]);
         let media =
             probe.put::<UTF8String, _>(schema::content_fact::sealed::OPENAI_REASONING.to_owned());
+        let reply = probe.put::<UTF8String, _>("hi".to_owned());
+        // The sealed token, the readable summary and the reply are one act.
         assert!(exists!(pattern!(with.facts(), [
             { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::THINKING,
+                schema::content_fact::direction: &schema::content_fact::direction::OUT,
                 schema::content_fact::blob: bytes,
                 schema::content_fact::media_type: _?media_type },
             { _?media_type @ metadata::name: media },
+            { _?sealed @ schema::block::holds: _?fact },
         ])));
+        let sealed = find!(
+            node: Id,
+            pattern!(with.facts(), [
+                { ?node @ schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::blob: bytes },
+            ])
+        )
+        .next()
+        .unwrap();
+        let reply = find!(
+            node: Id,
+            pattern!(with.facts(), [
+                { ?node @ schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::payload: reply },
+            ])
+        )
+        .next()
+        .unwrap();
+        assert!(blockdag::turn_of(with.facts(), reply).contains(&sealed));
     }
 
     /// The legacy bare format (2025): a header, then bare response items with
@@ -1994,12 +1955,8 @@ mod tests {
     fn legacy_rollouts_project_messages_reasoning_and_tools() {
         let (_directory, summary, fragment) = project_text(LEGACY_ROLLOUT, "legacy.jsonl");
         assert_eq!(
-            summary.stats.source_projections, 3,
-            "user, reasoning, assistant"
-        );
-        assert_eq!(
-            summary.stats.side_projections, 3,
-            "the sealed reasoning, the call and its output"
+            summary.stats.source_projections, 6,
+            "the prompt; reasoning; sealed reasoning; the call; the output; the answer"
         );
         assert_eq!(summary.stats.skipped_records, 2, "header and state");
         use schema::content_fact::{direction, modality};
@@ -2017,30 +1974,22 @@ mod tests {
             "the summary text and the sealed token"
         );
         // The output answers the call through a semantic edge, not the id.
-        let call_part = find!(
-            part: Id,
+        let call = find!(
+            node: Id,
             pattern!(fragment.facts(), [
-                { ?part @ schema::content_part::fact: _?fact },
+                { ?node @ schema::block::holds: _?fact },
                 { _?fact @ schema::content_fact::modality: &modality::TOOL_CALL },
             ])
         )
         .next()
         .unwrap();
-        assert!(exists!(pattern!(fragment.facts(), [{
-            _?answer @ schema::content_part::responds_to: call_part
-        }])));
-        // The tool exhaust hangs off the reasoning; the answer follows the
-        // reasoning, not the output.
-        let (_lean_directory, _, lean) = project_text(
-            &LEGACY_ROLLOUT
-                .lines()
-                .filter(|line| !line.contains("function_call"))
-                .map(|line| format!("{line}\n"))
-                .collect::<String>(),
-            "lean.jsonl",
-        );
-        assert!(ids_with_tag(&lean, schema::block::KIND)
-            .is_subset(&ids_with_tag(&fragment, schema::block::KIND)));
+        // The answer follows the output it saw, which follows the call it
+        // answers.
+        assert!(exists!(pattern!(fragment.facts(), [
+            { _?output @ schema::block::previous: call,
+                schema::block::responds_to: call },
+            { _?answer @ schema::block::previous: _?output },
+        ])));
         let (_reader_directory, reader) = empty_reader();
         let (_, validation) =
             blockdag::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
@@ -2054,7 +2003,7 @@ mod tests {
         assert!(summary.trailing_bytes_ignored > 0);
         assert_eq!(
             ids_with_tag(&fragment, schema::source_projection::KIND).len(),
-            4
+            3
         );
 
         let directory = tempfile::tempdir().unwrap();
@@ -2142,6 +2091,21 @@ mod tests {
         .collect()
     }
 
+    /// The one node nothing follows.
+    fn leaf(fragment: &Fragment) -> Id {
+        let leaves: Vec<Id> = ids_with_tag(fragment, schema::block::KIND)
+            .into_iter()
+            .filter(|node| {
+                let node = *node;
+                !exists!(pattern!(fragment.facts(), [{
+                    _?next @ schema::block::previous: node
+                }]))
+            })
+            .collect();
+        assert_eq!(leaves.len(), 1, "one chain");
+        leaves[0]
+    }
+
     fn root_blocks(fragment: &Fragment) -> BTreeSet<Id> {
         ids_with_tag(fragment, schema::block::KIND)
             .into_iter()
@@ -2158,29 +2122,25 @@ mod tests {
     fn item_completed_rollouts_project_into_the_old_vocabulary() {
         let (_directory, summary, fragment) = project_text(ITEM_ROLLOUT, "items.jsonl");
         assert_eq!(summary.stats.records_seen, 14);
-        assert_eq!(summary.stats.source_projections, 3);
+        // The prompt the model was given is one node (the UserMessage item
+        // only mirrors it); the sealed reasoning, the summary parts and the
+        // reply follow it, one node each, and are one act.
+        assert_eq!(summary.stats.source_projections, 5);
+        // The prompt, two summary parts, one text, and the sealed reasoning
+        // token.
+        assert_eq!(summary.stats.content_parts, 5);
         assert_eq!(
-            summary.stats.side_projections, 2,
-            "harness text, sealed reasoning"
+            summary.stats.skipped_records, 10,
+            "bookkeeping, tool items, the empty reasoning item and mirrors"
         );
-        // text + image, two summary parts, one text, the harness text, and
-        // the sealed reasoning token.
-        assert_eq!(summary.stats.content_parts, 7);
-        assert_eq!(
-            summary.stats.skipped_records, 9,
-            "bookkeeping, tool items, the empty reasoning item and response mirrors"
-        );
-        assert_eq!(summary.fragments_emitted, 11);
+        assert_eq!(summary.stats.mirrored_prompts, 1);
+        assert_eq!(summary.fragments_emitted, 6);
         assert_eq!(
             ids_with_tag(&fragment, schema::source_projection::KIND).len(),
             5
         );
         assert_eq!(ids_with_tag(&fragment, schema::block::KIND).len(), 5);
-        assert_eq!(
-            root_blocks(&fragment).len(),
-            2,
-            "one chain of three blocks, and the harness item before it"
-        );
+        assert_eq!(root_blocks(&fragment).len(), 1, "one chain");
 
         let (_reader_directory, reader) = empty_reader();
         let (_, validation) =
@@ -2193,10 +2153,6 @@ mod tests {
             1
         );
         assert_eq!(
-            content_facts(&fragment, modality::IMAGE, direction::IN).len(),
-            1
-        );
-        assert_eq!(
             content_facts(&fragment, modality::THINKING, direction::OUT).len(),
             3,
             "two summary parts and the sealed token"
@@ -2206,28 +2162,33 @@ mod tests {
             1
         );
 
-        // Both summary parts land in one block, in their source order.
+        // Both summary parts follow each other along the chain, in their
+        // source order, in the act that ends with the reply.
         let mut blobs = fragment.blobs().clone();
         let blob_reader = blobs.snapshot().unwrap();
-        let mut thinking: Vec<(u64, Inline<Handle<UTF8String>>)> = find!(
-            (ordinal: u64, payload: Inline<Handle<UTF8String>>),
-            pattern!(fragment.facts(), [
-                { _?block @ schema::block::contains: _?part },
-                { _?part @
-                    schema::content_part::ordinal: ?ordinal,
-                    schema::content_part::fact: _?fact,
-                },
-                { _?fact @
-                    schema::content_fact::modality: &modality::THINKING,
-                    schema::content_fact::payload: ?payload,
-                },
-            ])
-        )
-        .collect();
-        thinking.sort();
-        let thinking: Vec<String> = thinking
+        let tip = leaf(&fragment);
+        let act = blockdag::turn_of(fragment.facts(), tip);
+        assert_eq!(
+            act.len(),
+            4,
+            "sealed reasoning, two summary parts, the reply"
+        );
+        let thinking: Vec<String> = blockdag::thread_to(fragment.facts(), tip)
             .into_iter()
-            .map(|(_, payload)| {
+            .flat_map(|node| {
+                find!(
+                    payload: Inline<Handle<UTF8String>>,
+                    pattern!(fragment.facts(), [
+                        { node @ schema::block::holds: _?fact },
+                        { _?fact @
+                            schema::content_fact::modality: &modality::THINKING,
+                            schema::content_fact::payload: ?payload,
+                        },
+                    ])
+                )
+                .collect::<Vec<_>>()
+            })
+            .map(|payload| {
                 blob_reader
                     .get::<View<str>, UTF8String>(payload)
                     .unwrap()
@@ -2241,7 +2202,6 @@ mod tests {
         let (_old_directory, _, old) = project_text(ROLLOUT, "old.jsonl");
         for (spoken, heading) in [
             (modality::TEXT, direction::IN),
-            (modality::IMAGE, direction::IN),
             (modality::TEXT, direction::OUT),
         ] {
             assert_eq!(
@@ -2303,8 +2263,9 @@ mod tests {
         }
         let novel = |fragment: &Fragment| fragment.facts().iter().any(|fact| !known.contains(fact));
 
-        // Every fork record but its own two projects to a receipt closure the
-        // parent already holds, block, parts, facts and receipt alike.
+        // Every fork node but its own two projects to a receipt closure the
+        // parent already holds, node, fact and receipt alike: the replay's
+        // copy times are not kept.
         let closures: Vec<&Fragment> = fork
             .iter()
             .filter(|fragment| has_tag(fragment, schema::block::KIND))
@@ -2315,8 +2276,8 @@ mod tests {
             2
         );
 
-        // What is new for the replayed three is their occurrence: facts about
-        // a receipt and nothing else.
+        // The only other fragment is the leaf's session: facts about a
+        // receipt and nothing else.
         let mut union = Fragment::empty();
         for fragment in parent.iter().chain(&fork) {
             union += fragment.clone();
@@ -2329,7 +2290,7 @@ mod tests {
                     && !has_tag(fragment, schema::source_projection::KIND)
             })
             .collect();
-        assert_eq!(occurrences.len(), 6, "five times and the leaf's session");
+        assert_eq!(occurrences.len(), 1, "the leaf's session");
         for occurrence in occurrences {
             assert!(occurrence
                 .facts()
@@ -2337,26 +2298,18 @@ mod tests {
                 .all(|fact| receipts.contains(fact.e())));
         }
 
-        // The shared prefix is projected once: one receipt per block. The
-        // replay's copy times are not kept: each replayed receipt carries its
-        // original record's time only.
+        // The shared prefix is projected once: one receipt per node. Each
+        // replayed receipt carries its original record's time only.
         assert_eq!(receipts.len(), 5);
         assert_eq!(ids_with_tag(&union, schema::block::KIND).len(), 5);
-        let observed_twice = receipts
-            .iter()
-            .filter(|receipt| {
-                let receipt = **receipt;
-                find!(
-                    timestamp: Inline<NsTAIInterval>,
-                    pattern!(union.facts(), [{
-                        receipt @ schema::source_projection::source_timestamp: ?timestamp
-                    }])
-                )
-                .count()
-                    == 2
-            })
-            .count();
-        assert_eq!(observed_twice, 0);
+        let copy_time =
+            epoch_interval(parse_iso_timestamp("2026-08-03T09:00:00.500Z").unwrap()).unwrap();
+        assert!(
+            !exists!(pattern!(union.facts(), [{
+                _?receipt @ schema::source_projection::source_timestamp: copy_time
+            }])),
+            "no receipt carries the time a record was copied"
+        );
         let timed = receipts
             .iter()
             .filter(|receipt| {
@@ -2421,5 +2374,232 @@ mod tests {
             .count(),
             5
         );
+    }
+
+    #[test]
+    fn a_prompt_is_perceived_once_as_the_response_item_the_model_was_given() {
+        // The response item carries the prompt and its image as the model got
+        // them; the user-message event after it is the UI's notice.
+        let with_item = concat!(
+            r#"{"timestamp":"2026-09-10T08:00:00.000Z","type":"session_meta","payload":{"id":"thread-prompt"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-10T08:00:00.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<image name=[Image #1]>"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw=="},{"type":"input_text","text":"</image>"},{"type":"input_text","text":"what is this?\n"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-10T08:00:00.200Z","type":"event_msg","payload":{"type":"user_message","message":"what is this?","images":[],"local_images":["/home/ada/shot.png"]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-10T08:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"a picture"}}"#,
+            "\n",
+        );
+        let (_directory, summary, fragment) = project_text(with_item, "prompt.jsonl");
+        assert_eq!(summary.stats.mirrored_prompts, 1);
+        use schema::content_fact::{direction, modality};
+        let prompt = content_facts(&fragment, modality::TEXT, direction::IN);
+        assert_eq!(
+            prompt.len(),
+            3,
+            "the item's three texts, and no second copy"
+        );
+        // The image is the bytes the model was given, not the UI's path.
+        assert!(!exists!(pattern!(fragment.facts(), [{
+            _?fact @ schema::content_fact::asset_pointer: _?pointer
+        }])));
+        assert_eq!(
+            content_facts(&fragment, modality::IMAGE, direction::IN).len(),
+            1
+        );
+
+        // Without a response item (an older format) the event is the prompt.
+        let event_only = with_item
+            .lines()
+            .filter(|line| !line.contains(r#""response_item""#))
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let (_directory, summary, fragment) = project_text(&event_only, "event.jsonl");
+        assert_eq!(summary.stats.mirrored_prompts, 0);
+        assert_eq!(
+            content_facts(&fragment, modality::TEXT, direction::IN).len(),
+            1
+        );
+    }
+
+    /// A prompt's event written before the response item that carries it,
+    /// with harness context between them.
+    const EVENT_FIRST_ROLLOUT: &str = concat!(
+        r#"{"timestamp":"2026-09-20T08:00:00.000Z","type":"session_meta","payload":{"id":"thread-event-first"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:00.001Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:00.002Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"be brief"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:00.003Z","type":"event_msg","payload":{"type":"user_message","message":"hello","images":[],"local_images":[]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:00.004Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment>here</environment>"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:00.005Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:00.500Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"answer it"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"hi"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-20T08:00:01.001Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_longer_rollout_only_appends_nodes() {
+        // Each prefix of a rollout cut at a line end holds exactly a prefix
+        // of the whole one's thread, with no dead end: what is not known yet
+        // is held back.
+        for (rollout, expected_held) in [
+            (ROLLOUT, None),
+            (ITEM_ROLLOUT, None),
+            (LEGACY_ROLLOUT, None),
+            (PARENT_ROLLOUT, None),
+            // Cut after the event, and after the context behind it: the event
+            // may yet be a mirror, so it and what follows wait.
+            (EVENT_FIRST_ROLLOUT, Some(vec![0, 0, 0, 1, 2, 0, 0, 0, 0])),
+        ] {
+            let (_whole_directory, whole_summary, whole) = project_text(rollout, "grow.jsonl");
+            assert_eq!(whole_summary.stats.held_back_records, 0);
+            let thread = blockdag::thread_to(whole.facts(), leaf(&whole));
+            assert_eq!(
+                ids_with_tag(&whole, schema::block::KIND),
+                thread.iter().copied().collect::<BTreeSet<_>>()
+            );
+            let whole_receipts = ids_with_tag(&whole, schema::source_projection::KIND);
+            let lines: Vec<&str> = rollout.split_inclusive('\n').collect();
+            let mut held = Vec::new();
+            for cut in 1..=lines.len() {
+                let prefix: String = lines[..cut].concat();
+                let (_directory, summary, part) = project_text(&prefix, "grow.jsonl");
+                let nodes = ids_with_tag(&part, schema::block::KIND);
+                assert_eq!(
+                    nodes,
+                    thread[..nodes.len()]
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>(),
+                    "cut after line {cut}: a prefix of the whole thread"
+                );
+                assert!(
+                    ids_with_tag(&part, schema::source_projection::KIND).is_subset(&whole_receipts),
+                    "cut after line {cut}"
+                );
+                held.push(summary.stats.held_back_records);
+            }
+            if let Some(expected) = expected_held {
+                assert_eq!(held, expected);
+            }
+        }
+        // The event is the response item's mirror once both are written.
+        let (_directory, summary, _) = project_text(EVENT_FIRST_ROLLOUT, "whole.jsonl");
+        assert_eq!(summary.stats.mirrored_prompts, 1);
+    }
+
+    #[test]
+    fn a_finished_rollout_emits_its_trailing_event() {
+        let lines: Vec<&str> = EVENT_FIRST_ROLLOUT.split_inclusive('\n').collect();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stopped.jsonl");
+        fs::write(&path, lines[..4].concat()).unwrap();
+        let project = |finished_before| {
+            let mut fragment = Fragment::empty();
+            let summary = project_path_finished(&path, finished_before, |projected| {
+                fragment += projected.fragment;
+                Ok(())
+            })
+            .unwrap();
+            (summary, fragment)
+        };
+        let (held, held_fragment) = project(None);
+        assert_eq!(held.stats.held_back_records, 1);
+        let cutoff = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let (flushed, flushed_fragment) = project(Some(cutoff));
+        assert_eq!(flushed.stats.held_back_records, 0);
+        assert_eq!(
+            ids_with_tag(&flushed_fragment, schema::block::KIND).len(),
+            ids_with_tag(&held_fragment, schema::block::KIND).len() + 1,
+            "the event is emitted after the context before it"
+        );
+        use schema::content_fact::{direction, modality};
+        // The instruction before it, and now the prompt.
+        assert_eq!(
+            content_facts(&held_fragment, modality::TEXT, direction::IN).len(),
+            1
+        );
+        assert_eq!(
+            content_facts(&flushed_fragment, modality::TEXT, direction::IN).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_compaction_is_perceived() {
+        let rollout = concat!(
+            r#"{"timestamp":"2026-09-10T08:00:00.000Z","type":"session_meta","payload":{"id":"thread-compact"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-10T08:00:00.100Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-10T08:00:00.200Z","type":"compacted","payload":{"message":"summary of the work so far","replacement_history":[{"type":"compaction","encrypted_content":"sealed-history"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-09-10T08:00:00.300Z","type":"event_msg","payload":{"type":"agent_message","message":"continuing"}}"#,
+            "\n",
+        );
+        let (_directory, summary, fragment) = project_text(rollout, "compact.jsonl");
+        assert_eq!(
+            summary.stats.source_projections, 4,
+            "the message; the compaction's summary and sealed history; the message"
+        );
+        use schema::content_fact::{direction, modality};
+        assert_eq!(
+            content_facts(&fragment, modality::TEXT, direction::IN).len(),
+            1
+        );
+        assert_eq!(
+            content_facts(&fragment, modality::THINKING, direction::IN).len(),
+            1
+        );
+        assert_eq!(
+            content_facts(&fragment, modality::TEXT, direction::OUT).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn call_ids_and_envelope_times_stay_out_of_every_hashed_text() {
+        let rollout = |call: &str, created: &str| {
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-09-10T08:00:00.000Z","type":"session_meta","payload":{{"id":"thread-ids"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-09-10T08:00:00.100Z","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"run it"}}]}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-09-10T08:00:00.200Z","type":"response_item","payload":{{"type":"function_call","id":"fc_{call}","call_id":"{call}","name":"shell","arguments":"{{}}","internal_chat_message_metadata_passthrough":{{"create_time":{created}}}}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-09-10T08:00:00.300Z","type":"response_item","payload":{{"type":"function_call_output","id":"out_{call}","call_id":"{call}","output":"done"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-09-10T08:00:00.400Z","type":"response_item","payload":{{"type":"agent_message","id":"amsg_{call}","author":"/root/peer","recipient":"/root","content":[{{"type":"input_text","text":"peer says hi"}}],"internal_chat_message_metadata_passthrough":{{"create_time":{created}}},"created_at":"{created}"}}}}"#,
+                    "\n",
+                ),
+                call = call,
+                created = created,
+            )
+        };
+        let (_first_directory, first_summary, first) =
+            project_text(&rollout("call_1", "1788691762.1"), "first.jsonl");
+        let (_second_directory, _, second) =
+            project_text(&rollout("call_2", "1799999999.9"), "second.jsonl");
+        assert_eq!(first_summary.stats.unresolved_tool_results, 0);
+        assert_eq!(
+            ids_with_tag(&first, schema::block::KIND),
+            ids_with_tag(&second, schema::block::KIND)
+        );
+        assert_eq!(
+            ids_with_tag(&first, schema::content_fact::KIND),
+            ids_with_tag(&second, schema::content_fact::KIND)
+        );
+        assert!(exists!(pattern!(first.facts(), [{
+            _?output @ schema::block::responds_to: _?call
+        }])));
     }
 }

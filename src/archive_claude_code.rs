@@ -17,21 +17,29 @@
 //! removed before any intrinsic block identity is constructed. Blocks are then
 //! planned over the complete record DAG, so cross-file references and Rayon
 //! completion order cannot affect identity. Provider uuids thread that graph
-//! while projecting and are never stored: a block is its predecessors and its
-//! content, and its receipt is the source namespace and the block.
+//! while projecting and are never stored: a node is its predecessors and the
+//! fact it holds, and its receipt is the source namespace and the node.
+//! Copies of a record that differ only in time agree: time is annotation.
 //!
-//! Dialogue (`user`/`assistant` records) threads the DAG. Harness context the
-//! model saw (`attachment` records) and `system` records project as side
-//! branches: their blocks follow the nearest dialogue ancestors, but children
-//! contract through them, so a copy of the session that lacks them still
-//! threads the same dialogue blocks. Sealed reasoning (a thinking block's
-//! `signature`, a `redacted_thinking` block's `data`) is kept as THINKING
-//! blob facts on a side block that follows its record's block. The session
-//! id, title and file path annotate the receipts of the file's leaves only; a
-//! subagent's `.meta.json` annotates its transcript's leaves. `history.jsonl`
-//! prompts that no transcript beside it holds become blocks of their own. No
-//! source bytes are stored; [`SKIPPED_KINDS`] lists what is not projected and
-//! why.
+//! Every fact of every record with content is one node in the main chain, in
+//! the order the agent experienced it: user and assistant records, harness
+//! context the model saw (`attachment` records) and `system` records, all of
+//! the last two `in`. Sealed reasoning (a thinking block's `signature`, a
+//! `redacted_thinking` block's `data`) is a THINKING blob fact right after
+//! the thinking it seals. Claude Code runs a tool as soon as its call is
+//! complete and logs the result before the message's next call; the model
+//! emitted every call of one message (one `message.id`) before it perceived
+//! any result, so what was logged inside a message follows the whole message.
+//! A message is complete once the transcript shows a record of another
+//! message or a user prompt; until then what was logged inside it is held
+//! back, so a longer transcript only appends nodes. A tool result's node
+//! names the node of the call it answers. Each emitted fragment is one node
+//! with its fact and receipt. The session id, title and file path annotate
+//! the receipts of the file's leaves only; a subagent's `.meta.json`
+//! annotates its transcript's leaves.
+//! `history.jsonl` prompts that no transcript beside it holds become nodes
+//! of their own. No source bytes are stored; [`SKIPPED_KINDS`] lists what is
+//! not projected and why.
 
 /// Record kinds and fields that project to nothing, with the reason. Anything
 /// else of consequence is a block.
@@ -62,7 +70,7 @@ pub const SKIPPED_KINDS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Top-level fields of a side-branch record that are envelope, not content.
+/// Top-level fields of a harness record that are envelope, not content.
 const ENVELOPE_KEYS: &[&str] = &[
     "parentUuid",
     "logicalParentUuid",
@@ -85,10 +93,11 @@ const ENVELOPE_KEYS: &[&str] = &[
     "forkedFrom",
 ];
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -111,11 +120,8 @@ const TOOL_RESULT_STATUS_ERROR: &str = "urn:triblespace:archive:tool-result-stat
 pub struct ProjectionStats {
     /// Non-empty JSONL records scanned.
     pub records_seen: usize,
-    /// Canonical source projections emitted for dialogue records.
+    /// Distinct nodes emitted, one per fact.
     pub source_projections: usize,
-    /// Side-branch projections of harness context (`attachment`) and
-    /// `system` records.
-    pub side_projections: usize,
     /// Sealed reasoning tokens kept as THINKING blob facts.
     pub sealed_tokens: usize,
     /// `history.jsonl` prompts read.
@@ -123,7 +129,7 @@ pub struct ProjectionStats {
     /// Of those, prompts a transcript beside the log already holds; they
     /// land on the transcript's blocks and project nothing here.
     pub history_in_transcripts: usize,
-    /// Ordered content parts emitted before set-level deduplication.
+    /// Facts emitted, one node each, before set-level deduplication.
     pub content_parts: usize,
     /// Records projected to nothing: bookkeeping kinds, contentless records,
     /// and records without a `(sessionId, uuid)` identity. See
@@ -142,17 +148,23 @@ pub struct ProjectionStats {
     pub unresolved_tool_results: usize,
     /// Image sources omitted because neither bytes nor a usable pointer existed.
     pub undecodable_images: usize,
+    /// Records held back at the tail: what arrived inside a message the
+    /// transcript does not yet show complete. They land on a later import.
+    pub held_back_records: usize,
+    /// The facts of those records: the nodes a later import adds for them.
+    pub held_back_facts: usize,
 }
 
 impl ProjectionStats {
     fn absorb(&mut self, other: Self) {
         self.records_seen += other.records_seen;
         self.source_projections += other.source_projections;
-        self.side_projections += other.side_projections;
         self.sealed_tokens += other.sealed_tokens;
         self.history_prompts += other.history_prompts;
         self.history_in_transcripts += other.history_in_transcripts;
         self.content_parts += other.content_parts;
+        self.held_back_records += other.held_back_records;
+        self.held_back_facts += other.held_back_facts;
         self.skipped_records += other.skipped_records;
         self.missing_source_identity += other.missing_source_identity;
         self.skipped_parents += other.skipped_parents;
@@ -193,12 +205,33 @@ pub struct ProjectionSummary {
 /// fragment into one `ArchiveImportWriter` and publish (`commit_unit` or
 /// `finish`) only after projection succeeds; publishing fragments independently can expose an
 /// invalid partial catalog. The projector itself performs no pile writes.
-pub fn project_path<F>(path: &Path, mut emit: F) -> Result<ProjectionSummary>
+pub fn project_path<F>(path: &Path, emit: F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
+    project_path_finished(path, None, emit)
+}
+
+/// [`project_path`], treating every transcript last modified before
+/// `finished_before` as finished.
+///
+/// The transcript itself never says that a message is complete when it ends
+/// on what was logged inside it (a session stopped after a tool ran, a
+/// subagent ending on its StructuredOutput result), so such a tail is held
+/// back. A file older than the cutoff is finished: its held-back tail is
+/// placed after its message, exactly as if a later record had closed it. The
+/// modification time only decides WHEN that tail is emitted, never what any
+/// node or receipt is: identity stays free of time.
+pub fn project_path_finished<F>(
+    path: &Path,
+    finished_before: Option<SystemTime>,
+    mut emit: F,
+) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedFile) -> Result<()>,
 {
     if path.is_dir() {
-        return project_directory(path, &mut emit);
+        return project_directory(path, finished_before, &mut emit);
     }
     if path.file_name().and_then(|name| name.to_str()) == Some(HISTORY_FILE) {
         return project_history(path, &mut emit);
@@ -213,12 +246,12 @@ where
         None => path.to_path_buf(),
     };
 
-    let prescan = prescan_file(path)?;
+    let prescan = prescan_file(path, finished_before)?;
     let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan))
         .context("plan canonical Claude Code lineage")?;
     let snapshot = archive_source::freeze_file(path)?;
     let meta = subagent_meta(path)?;
-    project_snapshot(path, snapshot, prescan.digest, &plan, meta, &mut emit)
+    project_snapshot(path, snapshot, &prescan, &plan, meta, &mut emit)
 }
 
 /// The prompt log Claude Code keeps beside `projects/`.
@@ -271,7 +304,7 @@ where
         digest: *blake3::hash(bytes.as_ref()).as_bytes(),
         bytes,
     };
-    project_snapshot(path, snapshot, prescan.digest, &plan, None, &mut emit)
+    project_snapshot(path, snapshot, &prescan, &plan, None, &mut emit)
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -298,28 +331,45 @@ struct PreScan {
     sources: HashMap<SourceKey, SourceObservation>,
     aliases: BTreeSet<(SourceKey, SourceKey)>,
     digest: [u8; 32],
+    /// The file is known finished: what it holds back at its tail is emitted.
+    finished: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SourceObservation {
-    semantic: bool,
+    /// The record has content to project.
+    content: bool,
     turn_duration: bool,
     non_turn_duration: bool,
-    /// A side-branch record (harness context or system event).
-    side: bool,
     parents: BTreeSet<SourceKey>,
     shapes: Vec<RecordShape>,
+    /// How the record takes part in the agent's perceive-act order.
+    flow: Option<Flow>,
 }
 
+/// How one record takes part in the perceive-act order.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Flow {
+    /// A record of one assistant message, keyed by the provider's message id
+    /// (or its own locator when it has none). The id is never stored.
+    Act(String),
+    /// What the harness logged inside a message: tool results and harness
+    /// context. The agent perceived it only after the message.
+    Inside,
+    /// A user prompt that is not a tool result: the message before it is
+    /// complete.
+    Prompt,
+}
+
+/// What one record contributes, without time: time is annotation, so two
+/// copies of a record that differ only in time agree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordShape {
-    timestamp: Option<Inline<NsTAIInterval>>,
     parts: Vec<PartShape>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PartShape {
-    ordinal: u64,
     fact: Id,
     tool_call_id: Option<String>,
     responds_to: Option<ToolReference>,
@@ -332,26 +382,81 @@ struct ToolReference {
     correlator: String,
 }
 
-/// Canonical semantic source graph built from every exact receipt before any
-/// intrinsic block identity is constructed.
+/// Canonical source graph and node plan, built from every record before any
+/// fragment is emitted.
 ///
 /// Explicit `forkedFrom` edges form an identity quotient. Parent observations
 /// from non-fork receipts union between quotient classes. Contentless source
 /// records are contracted; only reciprocal backlinks on Claude's proven
-/// message-less `system/turn_duration` telemetry are removed. The result is a
-/// construction-history-independent predecessor set for every projected key.
+/// message-less `system/turn_duration` telemetry are removed. Every class with
+/// content is a chain of nodes, one per fact, in the main chain.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SourcePlan {
-    semantic: HashSet<SourceKey>,
-    parents: HashMap<SourceKey, BTreeSet<SourceKey>>,
     canonical: HashMap<SourceKey, SourceKey>,
-    blocks: HashMap<SourceKey, Id>,
-    tool_parts: HashMap<(SourceKey, String), Id>,
-    session_tool_parts: HashMap<(String, String), Id>,
-    /// Nearest dialogue ancestors of every side-branch class.
-    side_parents: HashMap<SourceKey, BTreeSet<SourceKey>>,
-    /// Dialogue classes that some dialogue class follows.
-    followed: HashSet<SourceKey>,
+    /// Nearest classes with content above each class, as observed; a class
+    /// absent from the corpus stays here so it can be counted unresolved.
+    parents: HashMap<SourceKey, BTreeSet<SourceKey>>,
+    /// The nodes of each class with content, in order.
+    nodes: HashMap<SourceKey, Vec<Id>>,
+    /// What the first node of each class follows.
+    firsts: HashMap<SourceKey, BTreeSet<Id>>,
+    /// The call node each fact of a class answers, if any.
+    responds: HashMap<SourceKey, Vec<Option<Id>>>,
+    /// Tool results of each class whose call the corpus does not hold.
+    unresolved_results: HashMap<SourceKey, usize>,
+    /// Nodes some other node follows.
+    followed: HashSet<Id>,
+    /// Classes held back at the tail, inside a message not yet complete.
+    held: HashSet<SourceKey>,
+}
+
+/// Where a branch of the history stands while classes are placed.
+#[derive(Clone, Debug, Default)]
+struct Placement {
+    /// What the next placed node follows.
+    tail: BTreeSet<Id>,
+    /// The message still open, if any.
+    message: Option<String>,
+    /// What was logged inside the open message, in source order, not yet
+    /// placed.
+    deferred: Vec<SourceKey>,
+}
+
+/// Assigns node chains to classes.
+struct Placer<'a> {
+    observed: &'a HashMap<SourceKey, SourceObservation>,
+    nodes: HashMap<SourceKey, Vec<Id>>,
+    firsts: HashMap<SourceKey, BTreeSet<Id>>,
+}
+
+impl Placer<'_> {
+    /// Chain one class's nodes after `previous`; returns its last node.
+    fn place(&mut self, key: &SourceKey, previous: BTreeSet<Id>) -> Result<BTreeSet<Id>> {
+        let shape = self.observed[key]
+            .shapes
+            .first()
+            .expect("a class with content has a shape");
+        let mut tail = previous.clone();
+        let mut chain = Vec::with_capacity(shape.parts.len());
+        for part in &shape.parts {
+            let node = node_id(&tail, part.fact)?;
+            chain.push(node);
+            tail = BTreeSet::from([node]);
+        }
+        self.nodes.insert(key.clone(), chain);
+        self.firsts.insert(key.clone(), previous);
+        Ok(tail)
+    }
+
+    /// Complete the open message: what it deferred follows it, in source
+    /// order. Returns the new tail.
+    fn close(&mut self, state: Placement) -> Result<BTreeSet<Id>> {
+        let mut tail = state.tail;
+        for key in &state.deferred {
+            tail = self.place(key, tail)?;
+        }
+        Ok(tail)
+    }
 }
 
 impl SourcePlan {
@@ -363,16 +468,20 @@ impl SourcePlan {
         let mut raw: HashMap<SourceKey, SourceObservation> = HashMap::new();
         let mut keys = BTreeSet::new();
         let mut aliases = BTreeSet::new();
-        for scan in scans {
+        let mut key_scans: HashMap<SourceKey, BTreeSet<usize>> = HashMap::new();
+        for (index, scan) in scans.iter().enumerate() {
             aliases.extend(scan.aliases.iter().cloned());
             for (key, incoming) in &scan.sources {
+                if incoming.content {
+                    key_scans.entry(key.clone()).or_default().insert(index);
+                }
                 keys.insert(key.clone());
                 keys.extend(incoming.parents.iter().cloned());
                 let observation = raw.entry(key.clone()).or_default();
-                observation.semantic |= incoming.semantic;
+                observation.content |= incoming.content;
                 observation.turn_duration |= incoming.turn_duration;
                 observation.non_turn_duration |= incoming.non_turn_duration;
-                observation.side |= incoming.side;
+                observation.flow = merge_flow(observation.flow.take(), incoming.flow.clone());
                 observation.parents.extend(incoming.parents.iter().cloned());
                 for shape in &incoming.shapes {
                     if !observation.shapes.contains(shape) {
@@ -391,20 +500,26 @@ impl SourcePlan {
             |key: &SourceKey| canonical.get(key).cloned().unwrap_or_else(|| key.clone());
         let mut observed: HashMap<SourceKey, SourceObservation> = HashMap::new();
         for (key, incoming) in &raw {
-            let observation = observed.entry(canonical_key(key)).or_default();
-            observation.semantic |= incoming.semantic;
+            let class = canonical_key(key);
+            let observation = observed.entry(class).or_default();
+            observation.content |= incoming.content;
             observation.turn_duration |= incoming.turn_duration;
             observation.non_turn_duration |= incoming.non_turn_duration;
-            observation.side |= incoming.side;
+            observation.flow = merge_flow(observation.flow.take(), incoming.flow.clone());
             observation
                 .parents
                 .extend(incoming.parents.iter().map(&canonical_key));
+            for shape in &incoming.shapes {
+                if !observation.shapes.contains(shape) {
+                    observation.shapes.push(shape.clone());
+                }
+            }
         }
 
         for (key, observation) in &observed {
-            if observation.semantic && observation.turn_duration {
+            if observation.content && observation.turn_duration {
                 bail!(
-                    "Claude Code source key {} is both semantic dialogue and turn-duration telemetry",
+                    "Claude Code source key {} is both content and turn-duration telemetry",
                     key.locator()
                 );
             }
@@ -412,7 +527,7 @@ impl SourcePlan {
 
         let semantic: HashSet<_> = observed
             .iter()
-            .filter_map(|(key, observation)| observation.semantic.then_some(key.clone()))
+            .filter_map(|(key, observation)| observation.content.then_some(key.clone()))
             .collect();
         let mut normalized: HashMap<_, _> = observed
             .iter()
@@ -464,26 +579,6 @@ impl SourcePlan {
             }
             parents.insert(key, frontier);
         }
-        let mut side_parents = HashMap::new();
-        let mut side_keys: Vec<_> = observed
-            .iter()
-            .filter(|(key, observation)| observation.side && !semantic.contains(*key))
-            .map(|(key, _)| key.clone())
-            .collect();
-        side_keys.sort();
-        for key in side_keys {
-            let mut frontier = BTreeSet::new();
-            for parent in normalized.get(&key).into_iter().flatten() {
-                frontier.extend(semantic_frontier(
-                    parent,
-                    &semantic,
-                    &normalized,
-                    &mut memo,
-                )?);
-            }
-            side_parents.insert(key, frontier);
-        }
-        let followed = parents.values().flatten().cloned().collect();
 
         // Full-corpus evidence for this quotient (2026-08-09): 126,058
         // explicit aliases collapse into 796,984 classes; unioning every
@@ -493,19 +588,172 @@ impl SourcePlan {
         // not merely cosmetic.
         validate_semantic_dag(&semantic, &parents)?;
 
-        let mut tool_parts = HashMap::new();
-        let mut session_tool_parts = HashMap::new();
+        // Each class is a chain of nodes, one per fact, placed in the order
+        // the agent experienced it. Claude Code runs a call as soon as the
+        // call is complete and logs its result before the message's next
+        // call, but the model emitted every call of a message before it
+        // perceived any result: what the harness logged inside a message
+        // (`Flow::Inside`) is deferred until the message is complete, which
+        // the transcript shows by a record of another message or a user
+        // prompt. A message still open where a branch ends may yet grow, so
+        // what was deferred inside it is held back and lands on a later
+        // import: growth only ever appends nodes.
+        let order = topological_order(&semantic, &parents)?;
+        let mut class_scans: HashMap<SourceKey, BTreeSet<usize>> = HashMap::new();
+        for (key, indices) in &key_scans {
+            class_scans
+                .entry(canonical_key(key))
+                .or_default()
+                .extend(indices.iter().copied());
+        }
+        let mut children: HashMap<&SourceKey, usize> = HashMap::new();
+        for key in &order {
+            for parent in &parents[key] {
+                if semantic.contains(parent) {
+                    *children.entry(parent).or_default() += 1;
+                }
+            }
+        }
+        let mut placer = Placer {
+            observed: &observed,
+            nodes: HashMap::with_capacity(order.len()),
+            firsts: HashMap::with_capacity(order.len()),
+        };
+        let mut states: HashMap<&SourceKey, (Placement, usize)> = HashMap::new();
+        let mut held = HashSet::new();
+        for key in &order {
+            let incoming: Vec<&SourceKey> = parents[key]
+                .iter()
+                .filter(|parent| semantic.contains(*parent))
+                .collect();
+            let mut taken = Vec::with_capacity(incoming.len());
+            for parent in &incoming {
+                let (state, remaining) = states
+                    .get_mut(*parent)
+                    .expect("a parent is placed before its children");
+                *remaining -= 1;
+                taken.push(if *remaining == 0 {
+                    states.remove(*parent).expect("present").0
+                } else {
+                    state.clone()
+                });
+            }
+            let mut state = match taken.len() {
+                0 => Placement::default(),
+                1 => taken.pop().expect("one state"),
+                _ => {
+                    let mut tail = BTreeSet::new();
+                    for state in taken {
+                        tail.extend(placer.close(state)?);
+                    }
+                    Placement {
+                        tail,
+                        ..Placement::default()
+                    }
+                }
+            };
+            match observed[key]
+                .flow
+                .clone()
+                .expect("a class with content has a flow")
+            {
+                Flow::Act(message) => {
+                    if state.message.as_ref() != Some(&message) {
+                        state.tail = placer.close(std::mem::take(&mut state))?;
+                        state.message = Some(message);
+                    }
+                    state.tail = placer.place(key, std::mem::take(&mut state.tail))?;
+                }
+                Flow::Inside if state.message.is_some() => state.deferred.push(key.clone()),
+                Flow::Inside => {
+                    state.tail = placer.place(key, std::mem::take(&mut state.tail))?;
+                }
+                Flow::Prompt => {
+                    let tail = placer.close(std::mem::take(&mut state))?;
+                    state.tail = placer.place(key, tail)?;
+                }
+            }
+            match children.get(key).copied().unwrap_or(0) {
+                // The branch ends here: what the open message deferred waits
+                // for the transcript to show the message complete, unless
+                // every file holding it is known finished.
+                0 => {
+                    let finished = std::iter::once(key).chain(&state.deferred).all(|class| {
+                        class_scans.get(class).is_some_and(|indices| {
+                            !indices.is_empty()
+                                && indices.iter().all(|&index| scans[index].finished)
+                        })
+                    });
+                    if finished {
+                        placer.close(state)?;
+                    } else {
+                        held.extend(state.deferred);
+                    }
+                }
+                1 => {
+                    states.insert(key, (state, 1));
+                }
+                // Branches would each place the deferred records anew, so
+                // the message closes where the history forks.
+                several => {
+                    let tail = placer.close(state)?;
+                    states.insert(
+                        key,
+                        (
+                            Placement {
+                                tail,
+                                ..Placement::default()
+                            },
+                            several,
+                        ),
+                    );
+                }
+            }
+        }
+        let Placer { nodes, firsts, .. } = placer;
+        // A node is followed exactly when some node names it as previous.
+        let mut followed = HashSet::new();
+        for (key, chain) in &nodes {
+            followed.extend(firsts[key].iter().copied());
+            followed.extend(chain[..chain.len() - 1].iter().copied());
+        }
+
+        // Copies of one record (an original and its fork's replay) must say
+        // the same thing; time is not part of what they say.
         for (key, observation) in &raw {
             let class = canonical_key(key);
+            let Some(chain) = nodes.get(&class) else {
+                continue;
+            };
+            let expected = &observed[&class].shapes[0];
             for shape in &observation.shapes {
-                for part in &shape.parts {
+                let facts: Vec<Id> = shape.parts.iter().map(|part| part.fact).collect();
+                let planned: Vec<Id> = expected.parts.iter().map(|part| part.fact).collect();
+                if facts != planned || chain.len() != facts.len() {
+                    bail!(
+                        "Claude Code alias class {} carries conflicting semantic payloads",
+                        class.locator()
+                    );
+                }
+            }
+        }
+
+        let mut tool_nodes = HashMap::new();
+        let mut session_tool_nodes = HashMap::new();
+        for (key, observation) in &raw {
+            let class = canonical_key(key);
+            let Some(chain) = nodes.get(&class) else {
+                continue;
+            };
+            for shape in &observation.shapes {
+                for (position, part) in shape.parts.iter().enumerate() {
                     let Some(correlator) = &part.tool_call_id else {
                         continue;
                     };
-                    let id = content_part_id(part.ordinal, part.fact, None)?;
-                    if tool_parts
-                        .insert((class.clone(), correlator.clone()), id)
-                        .is_some_and(|previous| previous != id)
+                    let node = chain[position];
+                    if tool_nodes
+                        .insert((class.clone(), correlator.clone()), node)
+                        .is_some_and(|previous| previous != node)
                     {
                         bail!(
                             "Claude Code tool correlator {:?} has conflicting calls in alias class {}",
@@ -513,9 +761,9 @@ impl SourcePlan {
                             class.locator()
                         );
                     }
-                    if session_tool_parts
-                        .insert((key.session.clone(), correlator.clone()), id)
-                        .is_some_and(|previous| previous != id)
+                    if session_tool_nodes
+                        .insert((key.session.clone(), correlator.clone()), node)
+                        .is_some_and(|previous| previous != node)
                     {
                         bail!(
                             "Claude Code tool correlator {:?} has conflicting calls in raw session {:?}",
@@ -526,36 +774,43 @@ impl SourcePlan {
                 }
             }
         }
-
-        let mut plan = Self {
-            semantic,
-            parents,
-            canonical,
-            blocks: HashMap::new(),
-            tool_parts,
-            session_tool_parts,
-            side_parents,
-            followed,
-        };
-
-        let mut shapes = HashMap::new();
-        for (key, observation) in &raw {
-            let class = plan.canonical_key(key);
-            for shape in &observation.shapes {
-                let resolved = plan.resolve_shape(shape)?;
-                if shapes
-                    .insert(class.clone(), resolved.clone())
-                    .is_some_and(|previous| previous != resolved)
-                {
-                    bail!(
-                        "Claude Code alias class {} carries conflicting semantic payloads",
-                        class.locator()
-                    );
-                }
+        let resolve = |reference: &ToolReference| -> Option<Id> {
+            match &reference.source {
+                Some(source) => tool_nodes
+                    .get(&(canonical_key(source), reference.correlator.clone()))
+                    .copied(),
+                None => session_tool_nodes
+                    .get(&(reference.session.clone(), reference.correlator.clone()))
+                    .copied(),
             }
+        };
+        let mut responds = HashMap::with_capacity(order.len());
+        let mut unresolved_results = HashMap::with_capacity(order.len());
+        for key in &order {
+            let shape = &observed[key].shapes[0];
+            let mut targets = Vec::with_capacity(shape.parts.len());
+            let mut unresolved = 0usize;
+            for part in &shape.parts {
+                targets.push(part.responds_to.as_ref().and_then(|reference| {
+                    let target = resolve(reference);
+                    unresolved += usize::from(target.is_none());
+                    target
+                }));
+            }
+            responds.insert(key.clone(), targets);
+            unresolved_results.insert(key.clone(), unresolved);
         }
-        plan.blocks = build_block_ids(&plan.semantic, &plan.parents, &shapes)?;
-        Ok(plan)
+
+        Ok(Self {
+            canonical,
+            parents,
+            nodes,
+            firsts,
+            responds,
+            unresolved_results,
+            followed,
+            held,
+        })
     }
 
     fn canonical_key(&self, key: &SourceKey) -> SourceKey {
@@ -564,40 +819,51 @@ impl SourcePlan {
             .cloned()
             .unwrap_or_else(|| key.clone())
     }
-
-    fn resolve_tool_part(&self, reference: &ToolReference) -> Option<Id> {
-        match &reference.source {
-            Some(source) => self
-                .tool_parts
-                .get(&(self.canonical_key(source), reference.correlator.clone()))
-                .copied(),
-            None => self
-                .session_tool_parts
-                .get(&(reference.session.clone(), reference.correlator.clone()))
-                .copied(),
-        }
-    }
-
-    fn resolve_shape(&self, shape: &RecordShape) -> Result<ResolvedRecordShape> {
-        let mut parts = Vec::with_capacity(shape.parts.len());
-        for part in &shape.parts {
-            let responds_to = part
-                .responds_to
-                .as_ref()
-                .and_then(|reference| self.resolve_tool_part(reference));
-            parts.push(content_part_id(part.ordinal, part.fact, responds_to)?);
-        }
-        Ok(ResolvedRecordShape {
-            timestamp: shape.timestamp,
-            parts,
-        })
-    }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResolvedRecordShape {
-    timestamp: Option<Inline<NsTAIInterval>>,
-    parts: Vec<Id>,
+/// Classes in a deterministic topological order.
+fn topological_order(
+    semantic: &HashSet<SourceKey>,
+    parents: &HashMap<SourceKey, BTreeSet<SourceKey>>,
+) -> Result<Vec<SourceKey>> {
+    let mut dependencies = HashMap::new();
+    let mut children: HashMap<SourceKey, BTreeSet<SourceKey>> = HashMap::new();
+    let mut ready = BTreeSet::new();
+    for key in semantic {
+        let known: Vec<_> = parents
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter(|parent| semantic.contains(*parent))
+            .collect();
+        dependencies.insert(key.clone(), known.len());
+        if known.is_empty() {
+            ready.insert(key.clone());
+        }
+        for parent in known {
+            children
+                .entry(parent.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+    let mut order = Vec::with_capacity(semantic.len());
+    while let Some(key) = ready.pop_first() {
+        for child in children.get(&key).into_iter().flatten() {
+            let remaining = dependencies
+                .get_mut(child)
+                .expect("every semantic child has a dependency count");
+            *remaining -= 1;
+            if *remaining == 0 {
+                ready.insert(child.clone());
+            }
+        }
+        order.push(key);
+    }
+    if order.len() != semantic.len() {
+        bail!("semantic Claude Code source cycle remains after normalization");
+    }
+    Ok(order)
 }
 
 fn alias_quotient(
@@ -674,82 +940,23 @@ impl DisjointSet {
     }
 }
 
-fn content_part_id(ordinal: u64, fact: Id, responds_to: Option<Id>) -> Result<Id> {
-    blockdag::content_part(
-        ordinal,
-        Fragment::rooted(fact, TribleSet::new()),
-        responds_to,
-    )?
-    .root()
-    .ok_or_else(|| anyhow!("canonical content-part constructor returned no root"))
+/// Copies of one record agree on their flow; where they would not, the
+/// least wins, whatever the order they were read in.
+fn merge_flow(left: Option<Flow>, right: Option<Flow>) -> Option<Flow> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    }
 }
 
-fn build_block_ids(
-    semantic: &HashSet<SourceKey>,
-    parents: &HashMap<SourceKey, BTreeSet<SourceKey>>,
-    shapes: &HashMap<SourceKey, ResolvedRecordShape>,
-) -> Result<HashMap<SourceKey, Id>> {
-    let mut dependencies = HashMap::new();
-    let mut children: HashMap<SourceKey, BTreeSet<SourceKey>> = HashMap::new();
-    let mut ready = BTreeSet::new();
-    for key in semantic {
-        let count = parents
-            .get(key)
-            .into_iter()
-            .flatten()
-            .filter(|parent| semantic.contains(*parent))
-            .count();
-        dependencies.insert(key.clone(), count);
-        if count == 0 {
-            ready.insert(key.clone());
-        }
-        for parent in parents
-            .get(key)
-            .into_iter()
-            .flatten()
-            .filter(|parent| semantic.contains(*parent))
-        {
-            children
-                .entry(parent.clone())
-                .or_default()
-                .insert(key.clone());
-        }
-    }
-
-    let mut blocks = HashMap::with_capacity(semantic.len());
-    while let Some(key) = ready.pop_first() {
-        let shape = shapes.get(&key).ok_or_else(|| {
-            anyhow!(
-                "semantic Claude Code alias class {} has no payload",
-                key.locator()
-            )
-        })?;
-        let predecessors = parents
-            .get(&key)
-            .into_iter()
-            .flatten()
-            .filter_map(|parent| blocks.get(parent).copied())
-            .collect::<BTreeSet<_>>();
-        let parts = Fragment::new(shape.parts.iter().copied(), TribleSet::new());
-        let block = blockdag::block(predecessors, shape.timestamp, parts)?
-            .root()
-            .ok_or_else(|| anyhow!("canonical block constructor returned no root"))?;
-        blocks.insert(key.clone(), block);
-
-        for child in children.get(&key).into_iter().flatten() {
-            let remaining = dependencies
-                .get_mut(child)
-                .expect("every semantic child has a dependency count");
-            *remaining -= 1;
-            if *remaining == 0 {
-                ready.insert(child.clone());
-            }
-        }
-    }
-    if blocks.len() != semantic.len() {
-        bail!("semantic Claude Code source cycle remains after normalization");
-    }
-    Ok(blocks)
+fn node_id(previous: &BTreeSet<Id>, fact: Id) -> Result<Id> {
+    blockdag::block(
+        previous.iter().copied(),
+        None,
+        Fragment::new([fact], TribleSet::new()),
+    )?
+    .root()
+    .ok_or_else(|| anyhow!("canonical node constructor returned no root"))
 }
 
 fn sorted_source_keys(keys: &HashSet<SourceKey>) -> Vec<SourceKey> {
@@ -888,7 +1095,11 @@ fn validate_semantic_dag(
     Ok(())
 }
 
-fn project_directory<F>(root: &Path, emit: &mut F) -> Result<ProjectionSummary>
+fn project_directory<F>(
+    root: &Path,
+    finished_before: Option<SystemTime>,
+    emit: &mut F,
+) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedFile) -> Result<()>,
 {
@@ -897,7 +1108,10 @@ where
         .with_context(|| format!("scan Claude Code source {}", root.display()))?;
     paths.sort();
 
-    let scanned: Vec<Result<PreScan>> = paths.par_iter().map(|path| prescan_file(path)).collect();
+    let scanned: Vec<Result<PreScan>> = paths
+        .par_iter()
+        .map(|path| prescan_file(path, finished_before))
+        .collect();
     let mut prescans = Vec::with_capacity(scanned.len());
     for (path, scan) in paths.iter().zip(scanned) {
         prescans.push(scan.with_context(|| format!("pre-scan {}", path.display()))?);
@@ -915,7 +1129,7 @@ where
     for (path, prescan) in paths.iter().zip(&prescans) {
         let snapshot = archive_source::freeze_file(path)?;
         let meta = subagent_meta(path)?;
-        let projected = project_snapshot(path, snapshot, prescan.digest, &plan, meta, emit)
+        let projected = project_snapshot(path, snapshot, prescan, &plan, meta, emit)
             .with_context(|| format!("project Claude Code file {}", path.display()))?;
         summary.fragments_emitted += projected.fragments_emitted;
         summary.stats.absorb(projected.stats);
@@ -952,10 +1166,23 @@ fn collect_jsonl_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn prescan_file(path: &Path) -> Result<PreScan> {
+fn prescan_file(path: &Path, finished_before: Option<SystemTime>) -> Result<PreScan> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    // Read before the records, so a write after it can only make the file
+    // look unfinished; the frozen digest then still guards its bytes.
+    let finished = match finished_before {
+        Some(cutoff) => {
+            file.metadata()
+                .and_then(|metadata| metadata.modified())
+                .with_context(|| format!("read the modification time of {}", path.display()))?
+                < cutoff
+        }
+        None => false,
+    };
     let mut reader = BufReader::new(file);
-    prescan_reader(&mut reader, path)
+    let mut scan = prescan_reader(&mut reader, path)?;
+    scan.finished = finished;
+    Ok(scan)
 }
 
 fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreScan> {
@@ -973,9 +1200,8 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
         let Some(key) = record.source_key() else {
             return Ok(());
         };
-        let shape = record_shape(&record, &key)?;
-        let side = shape.is_none() && is_side_record(&record);
-        let semantic = shape.is_some();
+        let shape = record_parts(&record, raw, &key, &mut ProjectionStats::default())?
+            .map(|draft| draft.shape());
         let turn_duration =
             record.record_type == "system" && record.subtype.as_deref() == Some("turn_duration");
         // A compaction boundary starts a new physical chain. Its
@@ -992,20 +1218,19 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
         }
         // `forkedFrom` is an explicit identity alias to the named origin. Its
         // destination `parentUuid` describes replay serialization (and can
-        // reverse tool chronology), so it remains in the exact raw receipt but
-        // is not a canonical semantic ancestry assertion.
+        // reverse tool chronology), so it is not a canonical semantic
+        // ancestry assertion.
         let parent = fork_origin
             .is_none()
             .then_some(raw_parent.clone())
             .flatten();
         let observation = scan.sources.entry(key.clone()).or_default();
-        observation.semantic |= semantic;
+        observation.content |= shape.is_some();
         observation.turn_duration |= turn_duration;
         observation.non_turn_duration |= !turn_duration;
-        observation.side |= side;
-        if observation.semantic && observation.turn_duration {
+        if observation.content && observation.turn_duration {
             bail!(
-                "Claude Code source key {}/{} is both semantic dialogue and turn-duration telemetry",
+                "Claude Code source key {}/{} is both content and turn-duration telemetry",
                 key.session,
                 key.uuid
             );
@@ -1014,6 +1239,19 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
             observation.parents.insert(parent);
         }
         if let Some(shape) = shape {
+            let flow = match record.record_type.as_str() {
+                "assistant" => Flow::Act(
+                    record
+                        .message_id
+                        .clone()
+                        .unwrap_or_else(|| format!("record/{}", key.locator())),
+                ),
+                "user" if !shape.parts.iter().any(|part| part.responds_to.is_some()) => {
+                    Flow::Prompt
+                }
+                _ => Flow::Inside,
+            };
+            observation.flow = merge_flow(observation.flow.take(), Some(flow));
             if !observation.shapes.contains(&shape) {
                 observation.shapes.push(shape);
             }
@@ -1027,7 +1265,7 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
 fn project_snapshot<F>(
     source_path: &Path,
     snapshot: archive_source::FrozenSource,
-    expected_digest: [u8; 32],
+    prescan: &PreScan,
     plan: &SourcePlan,
     meta: Option<SubagentMeta>,
     emit: &mut F,
@@ -1035,7 +1273,7 @@ fn project_snapshot<F>(
 where
     F: FnMut(ProjectedFile) -> Result<()>,
 {
-    if snapshot.digest != expected_digest {
+    if snapshot.digest != prescan.digest {
         bail!(
             "Claude Code source {} changed between dependency pre-scan and immutable snapshot",
             source_path.display()
@@ -1047,7 +1285,8 @@ where
         ..ProjectionSummary::default()
     };
     let mut reader = std::io::Cursor::new(snapshot.bytes.as_ref());
-    let mut leaves = Vec::<(SourceKey, Id)>::new();
+    // Receipts of the nodes this file projects, for the leaf annotation.
+    let mut receipts = BTreeMap::<Id, Id>::new();
     let mut session = None::<String>;
     let mut ai_title = None::<String>;
     let mut custom_title = None::<String>;
@@ -1073,8 +1312,7 @@ where
         if session.is_none() {
             session = record.session_id.clone();
         }
-        let mut fragment = Fragment::empty();
-        let projected = project_record(record, raw, plan, &mut fragment, &mut row_stats)
+        let fragments = project_record(record, raw, plan, &mut receipts, &mut row_stats)
             .with_context(|| {
                 format!(
                     "project Claude Code record at {}:{}",
@@ -1082,17 +1320,13 @@ where
                     line_number
                 )
             })?;
-        if let Some((class, receipt)) = projected {
-            if !plan.followed.contains(&class) {
-                leaves.push((class, receipt));
-            }
-        }
         summary.stats.absorb(row_stats);
-        if !fragment.facts().is_empty() {
+        let mut stats = Some(row_stats);
+        for fragment in fragments {
             emit(ProjectedFile {
                 source_path: source_path.to_path_buf(),
                 fragment,
-                stats: row_stats,
+                stats: stats.take().unwrap_or_default(),
             })?;
             summary.fragments_emitted += 1;
         }
@@ -1100,14 +1334,13 @@ where
     })?;
 
     // The session id, its title and this file's path annotate the leaves the
-    // file projects, never every message.
+    // file projects, never every node.
     let name = custom_title
         .or(ai_title)
         .or_else(|| meta.as_ref().and_then(|meta| meta.description.clone()));
     let detail = meta.map(|meta| meta.detail);
-    let mut annotated = BTreeSet::new();
-    for (_, receipt) in leaves {
-        if !annotated.insert(receipt) {
+    for (node, receipt) in receipts {
+        if plan.followed.contains(&node) {
             continue;
         }
         let fragment = blockdag::source_occurrence(
@@ -1146,9 +1379,10 @@ struct HistoryPrompt {
 /// A prompt a transcript holds (as a user message, a queued prompt, or a
 /// slash command) is that transcript's block; it projects nothing here, so it
 /// cannot land anywhere else. The others (sessions whose transcripts are gone,
-/// prompts a transcript never recorded) become user TEXT blocks, chained per
-/// session in log order: the log is a contraction of the session to its
-/// prompts. The session id and the log's path annotate each chain's leaf.
+/// prompts a transcript never recorded) become user TEXT blocks of their own.
+/// The log keeps no acts, so consecutive prompts are not one perception and
+/// no prompt is claimed to follow another directly: each is a root, and the
+/// session id, the log's path and the prompt's time place it.
 fn project_history<F>(path: &Path, emit: &mut F) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedFile) -> Result<()>,
@@ -1207,8 +1441,6 @@ where
     for session in order {
         let prompts = sessions.remove(&session).unwrap_or_default();
         let known = transcript_prompts(root, &session)?;
-        let mut previous = None::<Id>;
-        let mut leaf = None::<Id>;
         for prompt in prompts {
             if known.holds(&prompt) {
                 stats.history_in_transcripts += 1;
@@ -1223,10 +1455,8 @@ where
                 schema::content_fact::direction::IN,
                 prompt.text,
             )?;
-            let parts = blockdag::content_part(0, fact, None)?;
             stats.content_parts += 1;
-            let block = blockdag::block(previous, prompt.timestamp, parts)?;
-            let block_id = block.root().expect("canonical block is rooted");
+            let block = blockdag::block(None, prompt.timestamp, fact)?;
             let receipt = blockdag::block_source_projection(
                 schema::source_projection::SOURCE_CLAUDE_CODE,
                 block,
@@ -1239,7 +1469,15 @@ where
                     ..blockdag::ProjectionAnnotations::default()
                 },
             )?;
-            leaf = receipt.root();
+            let receipt = blockdag::annotate_source_projection(
+                receipt,
+                blockdag::ProjectionAnnotations {
+                    source_path: Some(path.to_string_lossy().into_owned()),
+                    source_locator: Some(format!("session/{session}")),
+                    importer_revision: Some(blockdag::IMPORTER_REVISION.to_owned()),
+                    ..blockdag::ProjectionAnnotations::default()
+                },
+            )?;
             emit(ProjectedFile {
                 source_path: path.to_path_buf(),
                 fragment: receipt,
@@ -1247,22 +1485,6 @@ where
             })?;
             summary.fragments_emitted += 1;
             stats.source_projections += 1;
-            previous = Some(block_id);
-        }
-        if let Some(leaf) = leaf {
-            emit(ProjectedFile {
-                source_path: path.to_path_buf(),
-                fragment: blockdag::source_occurrence(
-                    leaf,
-                    blockdag::ProjectionAnnotations {
-                        source_path: Some(path.to_string_lossy().into_owned()),
-                        source_locator: Some(format!("session/{session}")),
-                        ..blockdag::ProjectionAnnotations::default()
-                    },
-                )?,
-                stats: ProjectionStats::default(),
-            })?;
-            summary.fragments_emitted += 1;
         }
     }
     summary.stats = stats;
@@ -1451,266 +1673,211 @@ fn scanner_bytes(raw: &[u8]) -> Result<Bytes> {
     Ok(Bytes::from_source(raw[first..=last].to_vec()))
 }
 
-/// Whether a record without dialogue content projects as a side branch.
-fn is_side_record(record: &RawRecord) -> bool {
-    match record.record_type.as_str() {
-        "attachment" => record.attachment_type.as_deref() != Some("total_tokens_reminder"),
-        "system" => record.subtype.as_deref() != Some("turn_duration"),
-        // A dialogue record without readable content can still carry
-        // sealed reasoning, which follows its nearest dialogue ancestors.
-        "user" | "assistant" => record.has_sealed(),
-        _ => false,
+/// One record's content, in the order the agent experienced it.
+struct RecordDraft {
+    parts: Vec<PartDraft>,
+}
+
+struct PartDraft {
+    fact: Fragment,
+    tool_call_id: Option<String>,
+    responds_to: Option<ToolReference>,
+}
+
+impl RecordDraft {
+    fn shape(&self) -> RecordShape {
+        RecordShape {
+            parts: self
+                .parts
+                .iter()
+                .map(|part| PartShape {
+                    fact: part.fact.root().expect("canonical content fact is rooted"),
+                    tool_call_id: part.tool_call_id.clone(),
+                    responds_to: part.responds_to.clone(),
+                })
+                .collect(),
+        }
     }
 }
 
-/// Project a dialogue record's sealed reasoning tokens as one side-branch
-/// block of THINKING blob facts. It follows the record's own block when the
-/// record has readable content, else the record's nearest dialogue ancestors,
-/// and no dialogue block follows it: a copy without the tokens threads the
-/// same dialogue.
-fn project_sealed(
+/// The content of one record, or `None` when it has none.
+///
+/// A user record is what the agent perceived; an assistant record is one of
+/// the records of an assistant message, with its sealed reasoning beside the
+/// thinking it seals. Harness context (`attachment`) and `system` records are
+/// what the agent was shown: one EVENT part holding the canonical JSON of the
+/// record without its envelope, direction `in`.
+fn record_parts(
     record: &RawRecord,
-    class: &SourceKey,
-    own_block: Option<Id>,
-    plan: &SourcePlan,
-    corpus: &mut Fragment,
+    raw_record: &[u8],
+    source: &SourceKey,
     stats: &mut ProjectionStats,
-) -> Result<()> {
-    let mut parts = Fragment::empty();
-    let mut ordinal = 0u64;
-    for (token, media_type) in record
-        .blocks
-        .iter()
-        .filter_map(|block| block.sealed.as_ref())
-    {
-        let fact = archive_source::sealed_fact(
-            token,
-            media_type,
-            archive_source::SealedAlphabet::Standard,
-        )?;
-        parts += blockdag::content_part(ordinal, fact, None)?;
-        ordinal += 1;
-        stats.content_parts += 1;
-        stats.sealed_tokens += 1;
-    }
-    if ordinal == 0 {
-        return Ok(());
-    }
-    let mut predecessors = BTreeSet::new();
-    match own_block {
-        Some(block) => {
-            predecessors.insert(block);
+) -> Result<Option<RecordDraft>> {
+    let direction = match record.record_type.as_str() {
+        "user" => schema::content_fact::direction::IN,
+        "assistant" => schema::content_fact::direction::OUT,
+        "attachment" if record.attachment_type.as_deref() == Some("total_tokens_reminder") => {
+            return Ok(None)
         }
-        None => {
-            for parent in plan.side_parents.get(class).into_iter().flatten() {
-                match plan.blocks.get(parent) {
-                    Some(block) => {
-                        predecessors.insert(*block);
-                    }
-                    None => stats.unresolved_parents += 1,
-                }
+        "system" if record.subtype.as_deref() == Some("turn_duration") => return Ok(None),
+        "attachment" | "system" => {
+            let body =
+                archive_source::canonical_json_without(scanner_bytes(raw_record)?, ENVELOPE_KEYS)
+                    .map_err(|error| anyhow!("canonicalize Claude Code harness record: {error}"))?;
+            if body == "{}" {
+                return Ok(None);
             }
+            let fact = blockdag::text_fact(
+                schema::content_fact::modality::EVENT,
+                schema::content_fact::direction::IN,
+                body,
+            )?;
+            return Ok(Some(RecordDraft {
+                parts: vec![PartDraft {
+                    fact,
+                    tool_call_id: None,
+                    responds_to: None,
+                }],
+            }));
+        }
+        _ => return Ok(None),
+    };
+    let explicit_tool_source = record
+        .source_tool_assistant_uuid
+        .as_ref()
+        .map(|uuid| SourceKey::new(source.session.clone(), uuid.clone()));
+    let mut parts = Vec::new();
+    for block in &record.blocks {
+        let responds_to = (block.kind == BlockKind::ToolResult)
+            .then(|| {
+                block.correlator.as_ref().map(|correlator| ToolReference {
+                    source: explicit_tool_source.clone(),
+                    session: source.session.clone(),
+                    correlator: correlator.clone(),
+                })
+            })
+            .flatten();
+        for item in &block.items {
+            let Some(fact) = project_item(item, block.kind, direction, stats)? else {
+                continue;
+            };
+            parts.push(PartDraft {
+                fact,
+                tool_call_id: (block.kind == BlockKind::ToolUse)
+                    .then(|| block.correlator.clone())
+                    .flatten(),
+                responds_to: responds_to.clone(),
+            });
+        }
+        if let Some((token, media_type)) = &block.sealed {
+            parts.push(PartDraft {
+                fact: archive_source::sealed_fact(
+                    token,
+                    media_type,
+                    archive_source::SealedAlphabet::Standard,
+                )?,
+                tool_call_id: None,
+                responds_to: None,
+            });
+            stats.sealed_tokens += 1;
         }
     }
-    let timestamp = record.timestamp.and_then(epoch_interval);
-    let block = blockdag::block(predecessors, timestamp, parts)?;
-    let receipt =
-        blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, block)?;
-    *corpus += blockdag::annotate_source_projection(
-        receipt,
-        blockdag::ProjectionAnnotations {
-            source_timestamp: timestamp,
-            raw_model: record.model.clone(),
-            ..blockdag::ProjectionAnnotations::default()
-        },
-    )?;
-    stats.side_projections += 1;
-    Ok(())
+    Ok((!parts.is_empty()).then_some(RecordDraft { parts }))
 }
 
-/// Project one record. Returns the dialogue class and receipt it projected,
-/// so the caller can annotate the file's leaves.
+/// Project one record into its nodes: one whole node (the node and its fact)
+/// per fact, each with its receipt.
 fn project_record(
     record: RawRecord,
     raw_record: &[u8],
     plan: &SourcePlan,
-    corpus: &mut Fragment,
+    receipts: &mut BTreeMap<Id, Id>,
     stats: &mut ProjectionStats,
-) -> Result<Option<(SourceKey, Id)>> {
-    let direction = match record.record_type.as_str() {
-        "user" => schema::content_fact::direction::IN,
-        "assistant" => schema::content_fact::direction::OUT,
-        _ if is_side_record(&record) => {
-            project_side_record(&record, raw_record, plan, corpus, stats)?;
-            return Ok(None);
-        }
-        _ => {
-            stats.skipped_records += 1;
-            return Ok(None);
-        }
-    };
-
+) -> Result<Vec<Fragment>> {
     let Some(key) = record.source_key() else {
-        stats.missing_source_identity += 1;
+        if matches!(
+            record.record_type.as_str(),
+            "user" | "assistant" | "attachment" | "system"
+        ) {
+            stats.missing_source_identity += 1;
+        }
         stats.skipped_records += 1;
-        return Ok(None);
+        return Ok(Vec::new());
+    };
+    if plan.held.contains(&plan.canonical_key(&key)) {
+        // Inside a message the transcript does not yet show complete: it
+        // lands on the import that sees the message end.
+        stats.held_back_records += 1;
+        if let Some(draft) =
+            record_parts(&record, raw_record, &key, &mut ProjectionStats::default())?
+        {
+            stats.held_back_facts += draft.parts.len();
+        }
+        return Ok(Vec::new());
+    }
+    let Some(draft) = record_parts(&record, raw_record, &key, stats)? else {
+        stats.skipped_records += 1;
+        return Ok(Vec::new());
     };
     let class = plan.canonical_key(&key);
-    let mut parts = Fragment::empty();
-    let mut ordinal = 0u64;
-    for content in &record.blocks {
-        let responds_to = if content.kind == BlockKind::ToolResult {
-            content.correlator.as_ref().and_then(|correlator| {
-                let reference = ToolReference {
-                    source: record
-                        .source_tool_assistant_uuid
-                        .as_ref()
-                        .map(|uuid| SourceKey::new(key.session.clone(), uuid.clone())),
-                    session: key.session.clone(),
-                    correlator: correlator.clone(),
-                };
-                let target = plan.resolve_tool_part(&reference);
-                if target.is_none() {
-                    stats.unresolved_tool_results += 1;
-                }
-                target
-            })
-        } else {
-            None
-        };
-        for item in &content.items {
-            let Some(fact) = project_item(item, content.kind, direction, stats)? else {
-                continue;
-            };
-            let part = blockdag::content_part(ordinal, fact, responds_to)?;
-            parts += part;
-            ordinal = ordinal.checked_add(1).ok_or_else(|| {
-                anyhow!("Claude Code record has more than u64::MAX content parts")
-            })?;
-            stats.content_parts += 1;
-        }
-    }
-
-    if parts.exports().next().is_none() {
-        if record.has_sealed() {
-            project_sealed(&record, &class, None, plan, corpus, stats)?;
-        } else {
-            stats.skipped_records += 1;
-        }
-        return Ok(None);
-    }
-
-    let planned_parents = plan.parents.get(&class).ok_or_else(|| {
+    let chain = plan.nodes.get(&class).ok_or_else(|| {
         anyhow!(
             "projectable Claude Code source {} was absent from its source plan",
             key.locator()
         )
     })?;
+    let planned_parents = plan.parents.get(&class).cloned().unwrap_or_default();
     if record.forked_from.is_none() && record.parent_uuid.is_some() && planned_parents.is_empty() {
-        // The observed edge ended at a known transparent root after canonical
+        // The observed edge ended at a contentless root after canonical
         // contraction. This is distinct from a corpus-external predecessor,
         // which remains in `planned_parents` and is counted as unresolved.
         stats.skipped_parents += 1;
     }
-    let mut predecessors = BTreeSet::new();
-    for parent_key in planned_parents {
-        if let Some(block) = plan.blocks.get(parent_key) {
-            predecessors.insert(*block);
-        } else {
-            stats.unresolved_parents += 1;
-        }
-    }
+    stats.unresolved_parents += planned_parents
+        .iter()
+        .filter(|parent| !plan.nodes.contains_key(*parent))
+        .count();
+    stats.unresolved_tool_results += plan.unresolved_results[&class];
 
     let timestamp = record.timestamp.and_then(epoch_interval);
-    let block = blockdag::block(predecessors, timestamp, parts)?;
-    let block_id = block
-        .root()
-        .expect("canonical block constructor returns one root");
-    let planned_block = plan.blocks.get(&class).ok_or_else(|| {
-        anyhow!(
-            "projectable Claude Code alias class {} has no planned block",
-            class.locator()
-        )
-    })?;
-    if block_id != *planned_block {
-        bail!(
-            "Claude Code source {} materialized block {block_id:x}, expected {planned_block:x}",
-            key.locator()
-        );
-    }
-
-    project_sealed(&record, &class, Some(block_id), plan, corpus, stats)?;
-    let receipt =
-        blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, block)?;
-    let receipt = blockdag::annotate_source_projection(
-        receipt,
-        blockdag::ProjectionAnnotations {
-            source_timestamp: timestamp,
-            raw_role: record.role,
-            raw_model: record.model,
-            ..blockdag::ProjectionAnnotations::default()
-        },
-    )?;
-    let receipt_id = receipt
-        .root()
-        .expect("canonical source-projection constructor returns one root");
-    *corpus += receipt;
-    stats.source_projections += 1;
-    Ok(Some((class, receipt_id)))
-}
-
-/// Project one `attachment` or `system` record as a side branch: one EVENT
-/// part holding the canonical JSON of the record without its envelope, on a
-/// block that follows the record's nearest dialogue ancestors.
-fn project_side_record(
-    record: &RawRecord,
-    raw_record: &[u8],
-    plan: &SourcePlan,
-    corpus: &mut Fragment,
-    stats: &mut ProjectionStats,
-) -> Result<()> {
-    let Some(key) = record.source_key() else {
-        stats.missing_source_identity += 1;
-        stats.skipped_records += 1;
-        return Ok(());
+    let annotations = blockdag::ProjectionAnnotations {
+        source_timestamp: timestamp,
+        raw_role: record.role,
+        raw_model: record.model,
+        ..blockdag::ProjectionAnnotations::default()
     };
-    let body = archive_source::canonical_json_without(scanner_bytes(raw_record)?, ENVELOPE_KEYS)
-        .map_err(|error| anyhow!("canonicalize Claude Code side record: {error}"))?;
-    if body == "{}" {
-        stats.skipped_records += 1;
-        return Ok(());
-    }
-    let direction = if record.record_type == "attachment" {
-        schema::content_fact::direction::IN
-    } else {
-        schema::content_fact::direction::AMBIENT
+    let revision = blockdag::ProjectionAnnotations {
+        importer_revision: Some(blockdag::IMPORTER_REVISION.to_owned()),
+        ..blockdag::ProjectionAnnotations::default()
     };
-    let fact = blockdag::text_fact(schema::content_fact::modality::EVENT, direction, body)?;
-    let parts = blockdag::content_part(0, fact, None)?;
-    stats.content_parts += 1;
-    let class = plan.canonical_key(&key);
-    let mut predecessors = BTreeSet::new();
-    for parent in plan.side_parents.get(&class).into_iter().flatten() {
-        match plan.blocks.get(parent) {
-            Some(block) => {
-                predecessors.insert(*block);
-            }
-            None => stats.unresolved_parents += 1,
+    let mut previous = plan.firsts[&class].clone();
+    let mut fragments = Vec::with_capacity(draft.parts.len());
+    for (position, part) in draft.parts.into_iter().enumerate() {
+        let mut node = blockdag::block(previous.iter().copied(), timestamp, part.fact)?;
+        let node_id = chain[position];
+        if node.root() != Some(node_id) {
+            bail!(
+                "Claude Code source {} materialized node {position} differently from its plan",
+                key.locator()
+            );
         }
+        if let Some(call) = plan.responds[&class][position] {
+            node += blockdag::responds_to(node_id, call);
+        }
+        let receipt =
+            blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, node)?;
+        let receipt = blockdag::annotate_source_projection(receipt, annotations.clone())?;
+        let receipt = blockdag::annotate_source_projection(receipt, revision.clone())?;
+        // An alias line repeats its nodes: each is counted once.
+        if let std::collections::btree_map::Entry::Vacant(entry) = receipts.entry(node_id) {
+            entry.insert(receipt.root().expect("canonical receipt is rooted"));
+            stats.source_projections += 1;
+        }
+        fragments.push(receipt);
+        stats.content_parts += 1;
+        previous = BTreeSet::from([node_id]);
     }
-    let timestamp = record.timestamp.and_then(epoch_interval);
-    let block = blockdag::block(predecessors, timestamp, parts)?;
-    let receipt =
-        blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, block)?;
-    *corpus += blockdag::annotate_source_projection(
-        receipt,
-        blockdag::ProjectionAnnotations {
-            source_timestamp: timestamp,
-            ..blockdag::ProjectionAnnotations::default()
-        },
-    )?;
-    stats.side_projections += 1;
-    Ok(())
+    Ok(fragments)
 }
 
 fn project_item(
@@ -1839,6 +2006,8 @@ struct RawRecord {
     timestamp: Option<Epoch>,
     role: Option<String>,
     model: Option<String>,
+    /// The provider's message id: the records of one message share it.
+    message_id: Option<String>,
     blocks: Vec<RawBlock>,
 }
 
@@ -1849,10 +2018,6 @@ struct ForkedFrom {
 }
 
 impl RawRecord {
-    fn has_sealed(&self) -> bool {
-        self.blocks.iter().any(|block| block.sealed.is_some())
-    }
-
     fn source_key(&self) -> Option<SourceKey> {
         Some(SourceKey::new(self.session_id.clone()?, self.uuid.clone()?))
     }
@@ -1891,59 +2056,6 @@ enum RawItem {
     Text(String),
     Image(RawImageSource),
     ToolResultStatus(bool),
-}
-
-fn record_shape(record: &RawRecord, source: &SourceKey) -> Result<Option<RecordShape>> {
-    let direction = match record.record_type.as_str() {
-        "user" => schema::content_fact::direction::IN,
-        "assistant" => schema::content_fact::direction::OUT,
-        _ => return Ok(None),
-    };
-    let explicit_tool_source = record
-        .source_tool_assistant_uuid
-        .as_ref()
-        .map(|uuid| SourceKey::new(source.session.clone(), uuid.clone()));
-    let mut parts = Vec::new();
-    let mut ordinal = 0u64;
-    let mut stats = ProjectionStats::default();
-    for block in &record.blocks {
-        let responds_to = (block.kind == BlockKind::ToolResult)
-            .then(|| {
-                block.correlator.as_ref().map(|correlator| ToolReference {
-                    source: explicit_tool_source.clone(),
-                    session: source.session.clone(),
-                    correlator: correlator.clone(),
-                })
-            })
-            .flatten();
-        for item in &block.items {
-            let Some(fact) = project_item(item, block.kind, direction, &mut stats)? else {
-                continue;
-            };
-            let fact = fact
-                .root()
-                .expect("canonical content-fact constructor returns one root");
-            parts.push(PartShape {
-                ordinal,
-                fact,
-                tool_call_id: (block.kind == BlockKind::ToolUse)
-                    .then(|| block.correlator.clone())
-                    .flatten(),
-                responds_to: responds_to.clone(),
-            });
-            ordinal = ordinal.checked_add(1).ok_or_else(|| {
-                anyhow!("Claude Code record has more than u64::MAX content parts")
-            })?;
-        }
-    }
-    if parts.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(RecordShape {
-            timestamp: record.timestamp.and_then(epoch_interval),
-            parts,
-        }))
-    }
 }
 
 fn usable_pointer(image: &RawImageSource) -> Option<&String> {
@@ -1986,6 +2098,7 @@ struct BlockAccum {
 
 #[derive(Default)]
 struct MessagePart {
+    id: Option<String>,
     role: Option<String>,
     model: Option<String>,
     blocks: Vec<RawBlock>,
@@ -2045,6 +2158,7 @@ fn scan_record(bytes: &mut Bytes) -> std::result::Result<RawRecord, sc::ScanErro
             "message" => {
                 let message = scan_message(value)?;
                 record.role = message.role;
+                record.message_id = message.id;
                 record.model = message.model;
                 record.blocks = message.blocks;
             }
@@ -2103,6 +2217,7 @@ fn scan_message(bytes: &mut Bytes) -> std::result::Result<MessagePart, sc::ScanE
             .view::<str>()
             .map_err(|_| scan_syntax("invalid UTF-8 object key"))?;
         match key.as_ref() {
+            "id" => message.id = parse_optional_string(value)?,
             "role" => message.role = parse_optional_string(value)?,
             "model" => message.model = parse_optional_string(value)?,
             "content" => message.blocks = scan_content(value)?,
@@ -2377,7 +2492,8 @@ mod tests {
     use super::*;
     const SINGLE_FILE: &str = r#"{"type":"user","sessionId":"session-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T15:34:01.542Z","message":{"role":"user","content":"hello there"}}
 {"type":"assistant","sessionId":"session-1","uuid":"a1","parentUuid":"u1","timestamp":"2026-03-01T15:34:02.000Z","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"thinking","thinking":"consider it","signature":"opaque"},{"type":"text","text":"hi!"},{"type":"tool_use","id":"toolu_1","name":"Screenshot","input":{"display":1}}]}}
-{"type":"user","sessionId":"session-1","uuid":"u2","parentUuid":"a1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"screenshot below"},{"type":"image","source":{"type":"base64","media_type":"IMAGE/PNG; charset=binary","data":"iVBORw=="}}]}]}}"#;
+{"type":"user","sessionId":"session-1","uuid":"u2","parentUuid":"a1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"screenshot below"},{"type":"image","source":{"type":"base64","media_type":"IMAGE/PNG; charset=binary","data":"iVBORw=="}}]}]}}
+{"type":"assistant","sessionId":"session-1","uuid":"a2","parentUuid":"u2","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"seen it"}]}}"#;
 
     fn prescan_text(text: &str, path: &Path) -> PreScan {
         let mut cursor = Cursor::new(text.as_bytes());
@@ -2393,17 +2509,10 @@ mod tests {
             bytes,
         };
         let mut fragment = Fragment::empty();
-        let summary = project_snapshot(
-            path,
-            snapshot,
-            prescan.digest,
-            &plan,
-            None,
-            &mut |projected| {
-                fragment += projected.fragment;
-                Ok(())
-            },
-        )
+        let summary = project_snapshot(path, snapshot, &prescan, &plan, None, &mut |projected| {
+            fragment += projected.fragment;
+            Ok(())
+        })
         .unwrap();
         Projected {
             fragment,
@@ -2435,8 +2544,7 @@ mod tests {
         for (block, payload) in find!(
             (block: Id, payload: Inline<Handle<UTF8String>>),
             pattern!(fragment.facts(), [
-                { ?block @ schema::block::contains: _?part },
-                { _?part @ schema::content_part::fact: _?fact },
+                { ?block @ schema::block::holds: _?fact },
                 { _?fact @ schema::content_fact::payload: ?payload },
             ])
         ) {
@@ -2445,7 +2553,7 @@ mod tests {
                 return block;
             }
         }
-        panic!("no block contains payload {needle:?}");
+        panic!("no node holds payload {needle:?}");
     }
 
     fn projection_for_block(fragment: &Fragment, block: Id) -> Id {
@@ -2470,39 +2578,284 @@ mod tests {
     }
 
     #[test]
-    fn sealed_thinking_is_kept_as_bytes_off_the_dialogue() {
+    fn sealed_thinking_is_kept_as_bytes_beside_the_thinking_it_seals() {
         let token = BASE64_STANDARD.encode([7u8; 48]);
         let signed = SINGLE_FILE.replace(
             r#""signature":"opaque""#,
             &format!(r#""signature":"{token}""#),
         );
-        let unsigned = SINGLE_FILE.replace(r#","signature":"opaque""#, "");
         let signed = project_text(&signed, Path::new("signed.jsonl"));
-        let unsigned = project_text(&unsigned, Path::new("unsigned.jsonl"));
         assert_eq!(signed.stats.sealed_tokens, 1);
-        assert_eq!(unsigned.stats.sealed_tokens, 0);
-        // The dialogue is the same blocks with or without the token.
-        let dialogue = |fragment: &Fragment| {
-            ["hello there", "consider it", "screenshot below"]
-                .map(|needle| block_with_payload(fragment, needle))
-        };
-        assert_eq!(dialogue(&signed.fragment), dialogue(&unsigned.fragment));
         // The token is a THINKING blob of its decoded bytes, typed as what it
-        // is, on a block that follows the assistant's block.
-        let assistant = block_with_payload(&signed.fragment, "consider it");
-        let bytes = signed.fragment.clone().put::<RawBytes, _>(vec![7u8; 48]);
-        let media = signed.fragment.clone().put::<UTF8String, _>(
+        // is, produced, and the node right after the thinking it seals.
+        let thinking = block_with_payload(&signed.fragment, "consider it");
+        let mut probe = signed.fragment.clone();
+        let bytes = probe.put::<RawBytes, _>(vec![7u8; 48]);
+        let media = probe.put::<UTF8String, _>(
             schema::content_fact::sealed::ANTHROPIC_THINKING_SIGNATURE.to_owned(),
         );
-        assert!(exists!(pattern!(&signed.fragment, [
-            { _?sealed @ schema::block::previous: assistant,
-                schema::block::contains: _?part },
-            { _?part @ schema::content_part::fact: _?fact },
-            { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::THINKING,
-                schema::content_fact::blob: bytes,
-                schema::content_fact::media_type: _?media_type },
-            { _?media_type @ metadata::name: media },
+        let sealed: Vec<Id> = find!(
+            sealed: Id,
+            pattern!(&signed.fragment, [
+                { ?sealed @ schema::block::previous: thinking,
+                    schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::THINKING,
+                    schema::content_fact::direction: &schema::content_fact::direction::OUT,
+                    schema::content_fact::blob: bytes,
+                    schema::content_fact::media_type: _?media_type },
+                { _?media_type @ metadata::name: media },
+            ])
+        )
+        .collect();
+        assert_eq!(sealed.len(), 1);
+    }
+
+    #[test]
+    fn one_message_is_one_act_and_the_results_it_ran_early_follow_it() {
+        // Claude Code runs a call as soon as the call is complete and logs
+        // its result before the message's next call. The model emitted every
+        // call before it perceived any result, so the results follow the
+        // whole message, in the order they were logged.
+        let source = concat!(
+            r#"{"type":"user","sessionId":"act","uuid":"u","parentUuid":null,"message":{"role":"user","content":"look at both"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"act","uuid":"t","parentUuid":"u","message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"two reads"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"act","uuid":"c1","parentUuid":"t","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"act","uuid":"r1","parentUuid":"c1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents of a"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"act","uuid":"c2","parentUuid":"r1","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file":"b"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"act","uuid":"r2","parentUuid":"c2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"contents of b"}]}}"#,
+            "\n",
+            r#"{"type":"attachment","sessionId":"act","uuid":"note","parentUuid":"r2","attachment":{"type":"date_change","date":"tomorrow"}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"act","uuid":"u2","parentUuid":"note","message":{"role":"user","content":"and now?"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"act","uuid":"answer","parentUuid":"u2","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"both read"}]}}"#,
+        );
+        let projected = project_text(source, Path::new("act.jsonl"));
+        assert_eq!(projected.stats.source_projections, 9, "one node per fact");
+        assert_eq!(projected.stats.unresolved_tool_results, 0);
+        assert_eq!(projected.stats.held_back_records, 0);
+        let fragment = &projected.fragment;
+        let node = |text: &str| block_with_payload(fragment, text);
+        let prompt = node("look at both");
+        let thinking = node("two reads");
+        let first_call = node(r#"{"name":"Read","input":{"file":"a"}}"#);
+        let first_result = node("contents of a");
+        let second_call = node(r#"{"name":"Read","input":{"file":"b"}}"#);
+        let second_result = node("contents of b");
+        let note = node(r#"{"attachment":{"date":"tomorrow","type":"date_change"}}"#);
+        let question = node("and now?");
+        let answer = node("both read");
+        let facts = fragment.facts();
+        assert_eq!(
+            crate::blockdag::turns_along(facts, answer),
+            vec![
+                vec![prompt],
+                vec![thinking, first_call, second_call],
+                vec![first_result, second_result, note, question],
+                vec![answer],
+            ],
+            "one message is one act; what arrived inside it is perceived after it"
+        );
+        // Each result's node names its call's node.
+        assert!(exists!(pattern!(fragment, [
+            { first_result @ schema::block::responds_to: first_call },
+            { second_result @ schema::block::responds_to: second_call },
         ])));
+        assert_eq!(
+            find!(
+                (result: Id, call: Id),
+                pattern!(fragment, [{ ?result @ schema::block::responds_to: ?call }])
+            )
+            .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_longer_transcript_only_appends_nodes() {
+        // Cut at every line, including between a message's calls and their
+        // results: what a cut emits is always a prefix of the whole log's
+        // thread, so the longer log only appends. What arrived inside a
+        // message the cut does not show complete is held back.
+        let full = concat!(
+            r#"{"type":"user","sessionId":"grow","uuid":"u","parentUuid":null,"timestamp":"2026-03-01T10:00:00Z","message":{"role":"user","content":"look at both"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"grow","uuid":"t","parentUuid":"u","message":{"id":"msg_1","role":"assistant","content":[{"type":"thinking","thinking":"two reads"},{"type":"text","text":"reading"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"grow","uuid":"c1","parentUuid":"t","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"grow","uuid":"r1","parentUuid":"c1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents of a","is_error":false}]}}"#,
+            "\n",
+            r#"{"type":"attachment","sessionId":"grow","uuid":"h1","parentUuid":"r1","attachment":{"type":"hook_success","content":"checked"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"grow","uuid":"c2","parentUuid":"h1","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file":"b"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"grow","uuid":"r2","parentUuid":"c2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"contents of b"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"grow","uuid":"m2","parentUuid":"r2","message":{"id":"msg_2","role":"assistant","content":[{"type":"tool_use","id":"toolu_3","name":"Read","input":{"file":"c"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"grow","uuid":"r3","parentUuid":"m2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_3","content":"contents of c"}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"grow","uuid":"p","parentUuid":"r3","message":{"role":"user","content":"and now?"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"grow","uuid":"answer","parentUuid":"p","message":{"id":"msg_3","role":"assistant","content":[{"type":"text","text":"all read"}]}}"#,
+            "\n",
+        );
+        let whole = project_text(full, Path::new("grow.jsonl"));
+        assert_eq!(
+            whole.stats.held_back_records, 0,
+            "a finished log emits everything"
+        );
+        let whole_receipts = ids_with_tag(&whole.fragment, schema::source_projection::KIND);
+        let leaf = block_with_payload(&whole.fragment, "all read");
+        let thread = crate::blockdag::thread_to(whole.fragment.facts(), leaf);
+        assert_eq!(thread.len(), 13);
+        assert_eq!(
+            ids_with_tag(&whole.fragment, schema::block::KIND),
+            thread.iter().copied().collect::<BTreeSet<_>>()
+        );
+        let lines: Vec<&str> = full.split_inclusive('\n').collect();
+        let mut held = Vec::new();
+        for cut in 1..=lines.len() {
+            let prefix: String = lines[..cut].concat();
+            let part = project_text(&prefix, Path::new("grow.jsonl"));
+            let nodes = ids_with_tag(&part.fragment, schema::block::KIND);
+            assert_eq!(
+                nodes,
+                thread[..nodes.len()]
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                "cut after line {cut}: a prefix of the whole thread, with no dead end"
+            );
+            assert!(
+                ids_with_tag(&part.fragment, schema::source_projection::KIND)
+                    .is_subset(&whole_receipts),
+                "cut after line {cut}"
+            );
+            held.push(part.stats.held_back_records);
+        }
+        // Held back: the results and hook inside msg_1 until its next call
+        // is followed by another message, and msg_2's result until the
+        // prompt shows msg_2 complete.
+        assert_eq!(held, vec![0, 0, 0, 1, 2, 2, 3, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn a_finished_transcript_emits_its_held_back_tail_and_still_only_grows() {
+        // A session stopped after its tool ran: it ends on a result logged
+        // inside its last message, which the transcript cannot show complete.
+        let stopped = concat!(
+            r#"{"type":"user","sessionId":"stopped","uuid":"u","parentUuid":null,"message":{"role":"user","content":"look"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"stopped","uuid":"c","parentUuid":"u","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"stopped","uuid":"r","parentUuid":"c","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents of a"}]}}"#,
+            "\n",
+        );
+        // Resumed later: a new prompt and a new message.
+        let resumed = format!(
+            "{stopped}{}\n{}\n",
+            r#"{"type":"user","sessionId":"stopped","uuid":"p","parentUuid":"r","message":{"role":"user","content":"go on"}}"#,
+            r#"{"type":"assistant","sessionId":"stopped","uuid":"a","parentUuid":"p","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"done"}]}}"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stopped.jsonl");
+        let project = |finished_before: Option<SystemTime>| {
+            let mut fragment = Fragment::empty();
+            let summary = project_path_finished(&path, finished_before, |projected| {
+                fragment += projected.fragment;
+                Ok(())
+            })
+            .unwrap();
+            (summary, fragment)
+        };
+        fs::write(&path, stopped).unwrap();
+        let (held, held_fragment) = project(None);
+        assert_eq!(
+            held.stats.held_back_records, 1,
+            "without the option, held back"
+        );
+        assert_eq!(ids_with_tag(&held_fragment, schema::block::KIND).len(), 2);
+        // Last modified before a cutoff an hour from now: finished.
+        let cutoff = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let (flushed, flushed_fragment) = project(Some(cutoff));
+        assert_eq!(flushed.stats.held_back_records, 0);
+        let call = block_with_payload(&flushed_fragment, r#"{"name":"Read","input":{"file":"a"}}"#);
+        let result = block_with_payload(&flushed_fragment, "contents of a");
+        assert!(exists!(pattern!(&flushed_fragment, [
+            { result @ schema::block::previous: call, schema::block::responds_to: call },
+        ])));
+        // Nothing but when: the flushed nodes are exactly what a later
+        // record closing the message places.
+        let flushed_nodes = ids_with_tag(&flushed_fragment, schema::block::KIND);
+        assert!(ids_with_tag(&held_fragment, schema::block::KIND).is_subset(&flushed_nodes));
+
+        fs::write(&path, resumed).unwrap();
+        for finished_before in [None, Some(cutoff)] {
+            let (grown, grown_fragment) = project(finished_before);
+            assert_eq!(grown.stats.held_back_records, 0);
+            let leaf = block_with_payload(&grown_fragment, "done");
+            let thread = crate::blockdag::thread_to(grown_fragment.facts(), leaf);
+            assert_eq!(
+                thread[..flushed_nodes.len()]
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>(),
+                flushed_nodes,
+                "the resumed session only appends to what was flushed"
+            );
+            assert_eq!(thread.len(), flushed_nodes.len() + 2);
+        }
+    }
+
+    #[test]
+    fn a_fork_copy_that_differs_only_in_time_converges_on_its_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("origin.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"origin","uuid":"q","timestamp":"2026-03-01T10:00:00Z","message":{"role":"user","content":"question"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"origin","uuid":"a","parentUuid":"q","timestamp":"2026-03-01T10:00:05Z","message":{"id":"msg_a","role":"assistant","content":"answer"}}"#,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            directory.path().join("fork.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"fork","uuid":"q2","timestamp":"2026-03-09T08:00:00Z","forkedFrom":{"sessionId":"origin","messageUuid":"q"},"message":{"role":"user","content":"question"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"fork","uuid":"a2","parentUuid":"q2","timestamp":"2026-03-09T08:00:00Z","forkedFrom":{"sessionId":"origin","messageUuid":"a"},"message":{"id":"msg_a","role":"assistant","content":"answer"}}"#,
+            ),
+        )
+        .unwrap();
+        let mut union = Fragment::empty();
+        project_path(directory.path(), |projected| {
+            union += projected.fragment;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(ids_with_tag(&union, schema::block::KIND).len(), 2);
+        let answer = block_with_payload(&union, "answer");
+        assert_eq!(projections_for_block(&union, answer).len(), 1);
+        // Both times annotate the one receipt.
+        let receipt = projection_for_block(&union, answer);
+        assert_eq!(
+            find!(
+                timestamp: Inline<NsTAIInterval>,
+                pattern!(&union, [{
+                    receipt @ schema::source_projection::source_timestamp: ?timestamp
+                }])
+            )
+            .count(),
+            2
+        );
     }
 
     #[test]
@@ -2556,12 +2909,21 @@ mod tests {
         );
         let kept = block_with_payload(&transcript.fragment, "in the transcript");
         assert!(!ids_with_tag(&history, schema::block::KIND).contains(&kept));
-        // The lost session's prompts chain in log order, with the paste.
+        // The log keeps no acts: each of the lost session's prompts is a
+        // perception of its own, placed by its session and time, with the
+        // paste expanded.
         let first = block_with_payload(&history, "first of a lost session");
         let second = block_with_payload(&history, "see pasted body");
-        assert!(exists!(
-            pattern!(&history, [{ second @ schema::block::previous: first }])
+        assert!(!exists!(
+            pattern!(&history, [{ second @ schema::block::previous: _?any }])
         ));
+        let lost = history.put::<UTF8String, _>("session/lost".to_owned());
+        for block in [first, second] {
+            assert!(exists!(pattern!(&history, [{
+                _?receipt @ schema::source_projection::projects_to: block,
+                schema::source_projection::source_locator: lost
+            }])));
+        }
         // Importing the whole directory lands the same blocks.
         let mut union = Fragment::empty();
         project_path(root, |projected| {
@@ -2624,11 +2986,12 @@ mod tests {
     #[test]
     fn projection_is_canonical_and_does_not_fabricate_missing_time_or_actors() {
         let projected = project_text(SINGLE_FILE, Path::new("/imports/session.jsonl"));
-        assert_eq!(projected.stats.source_projections, 3);
-        // Six readable parts, and the thinking block's signature.
-        assert_eq!(projected.stats.content_parts, 7);
+        // Seven readable facts, and the thinking block's signature: one node
+        // each.
+        assert_eq!(projected.stats.source_projections, 8);
+        assert_eq!(projected.stats.content_parts, 8);
+        assert_eq!(projected.stats.held_back_records, 0);
         assert_eq!(projected.stats.sealed_tokens, 1);
-        assert_eq!(projected.stats.side_projections, 1);
         assert_eq!(projected.stats.unresolved_tool_results, 0);
         assert_eq!(projected.stats.undecodable_images, 0);
 
@@ -2676,7 +3039,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_and_system_records_are_side_branches_off_the_dialogue() {
+    fn harness_and_system_records_are_perceived_in_the_main_chain() {
         let source = format!(
             "{}\n{}\n{}\n{}\n{}",
             r#"{"type":"user","sessionId":"contract","uuid":"root","parentUuid":null,"message":{"role":"user","content":"before metadata"}}"#,
@@ -2690,36 +3053,30 @@ mod tests {
             projected.stats.skipped_records, 1,
             "only the empty user record"
         );
-        assert_eq!(projected.stats.side_projections, 2);
+        assert_eq!(projected.stats.source_projections, 4);
         assert_eq!(projected.stats.unresolved_parents, 0);
 
-        let parent = block_with_payload(&projected.fragment, "before metadata");
-        let child = block_with_payload(&projected.fragment, "after metadata");
-        assert!(exists!(pattern!(&projected.fragment, [{
-            child @ schema::block::previous: &parent
-        }])));
-        // The attachment is the content without its envelope (`cwd`, ids).
-        let attachment = block_with_payload(
+        // The prompt, the harness context and the system record are one
+        // perception, without their envelopes (`cwd`, ids, time); the reply
+        // follows all of it.
+        let prompt = block_with_payload(&projected.fragment, "before metadata");
+        let harness = block_with_payload(
             &projected.fragment,
             r#"{"attachment":{"content":"skills","type":"skill_listing"}}"#,
         );
         let system = block_with_payload(&projected.fragment, r#"{"content":"metadata"}"#);
-        for side in [attachment, system] {
-            assert!(exists!(pattern!(&projected.fragment, [{
-                side @ schema::block::previous: &parent
-            }])));
-        }
-
-        // The same dialogue without the side records threads the same blocks.
-        let lean = project_text(
-            concat!(
-                r#"{"type":"user","sessionId":"contract","uuid":"root","parentUuid":null,"message":{"role":"user","content":"before metadata"}}"#,
-                "\n",
-                r#"{"type":"assistant","sessionId":"contract","uuid":"child","parentUuid":"root","message":{"role":"assistant","model":"claude","content":"after metadata"}}"#,
-            ),
-            Path::new("lean.jsonl"),
+        let child = block_with_payload(&projected.fragment, "after metadata");
+        let facts = projected.fragment.facts();
+        assert_eq!(
+            crate::blockdag::turns_along(facts, child),
+            vec![vec![prompt, harness, system], vec![child]]
         );
-        assert_eq!(block_with_payload(&lean.fragment, "after metadata"), child);
+        for node in [prompt, harness, system] {
+            assert_eq!(
+                crate::blockdag::node_directions(facts, node),
+                BTreeSet::from([schema::content_fact::direction::IN])
+            );
+        }
     }
 
     #[test]
@@ -2794,7 +3151,7 @@ mod tests {
             r#"{"type":"user","sessionId":"mutable","uuid":"before","message":{"role":"user","content":"before"}}"#,
         )
         .unwrap();
-        let prescan = prescan_file(&path).unwrap();
+        let prescan = prescan_file(&path, None).unwrap();
         let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan)).unwrap();
         fs::write(
             &path,
@@ -2803,7 +3160,7 @@ mod tests {
         .unwrap();
         let snapshot = archive_source::freeze_file(&path).unwrap();
         let mut emitted = 0usize;
-        let error = project_snapshot(&path, snapshot, prescan.digest, &plan, None, &mut |_| {
+        let error = project_snapshot(&path, snapshot, &prescan, &plan, None, &mut |_| {
             emitted += 1;
             Ok(())
         })
@@ -2843,10 +3200,10 @@ mod tests {
         assert_eq!(plan.parents[&p], BTreeSet::from([u]));
         assert_eq!(plan.parents[&a], BTreeSet::from([p]));
         assert_eq!(plan.parents[&n], BTreeSet::from([a]));
-        assert!(!plan.semantic.contains(&s));
+        assert!(!plan.nodes.contains_key(&s));
 
         let projected = project_text(source, Path::new("turn-duration.jsonl"));
-        assert_eq!(projected.stats.source_projections, 5);
+        assert_eq!(projected.stats.source_projections, 4);
         assert_eq!(projected.stats.skipped_records, 1);
         assert_eq!(projected.stats.unresolved_parents, 0);
         let thought = block_with_payload(&projected.fragment, "thought");
@@ -2899,6 +3256,9 @@ mod tests {
             r#"{"type":"user","sessionId":"77fe8720-6f5b-42d9-8462-a3edd3445af9","uuid":"353e151f-7443-40f6-9dc1-7736b5f02db8","parentUuid":"1fdd8a4d-15f2-4915-a4ab-0630bfbbaf76","sourceToolAssistantUUID":"1fdd8a4d-15f2-4915-a4ab-0630bfbbaf76","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_exemplar","content":"result"}]}}"#,
             "\n",
             r#"{"type":"assistant","sessionId":"77fe8720-6f5b-42d9-8462-a3edd3445af9","uuid":"1fdd8a4d-15f2-4915-a4ab-0630bfbbaf76","parentUuid":"2b46fe81-12d5-4291-a494-40b7130cf37e","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_exemplar","name":"Read","input":{"file":"x"}}]}}"#,
+            "\n",
+            // The next message shows the call's message complete.
+            r#"{"type":"assistant","sessionId":"77fe8720-6f5b-42d9-8462-a3edd3445af9","uuid":"closing","parentUuid":"353e151f-7443-40f6-9dc1-7736b5f02db8","message":{"role":"assistant","content":[{"type":"text","text":"closed"}]}}"#,
         );
 
         let projected = project_text(source, Path::new("fork-exemplar.jsonl"));
@@ -3108,14 +3468,15 @@ mod tests {
         assert_ne!(missing_block, ok_block);
         assert_ne!(ok_block, error_block);
         assert_ne!(missing_block, error_block);
-        assert_eq!(
-            block_with_payload(&ok.fragment, TOOL_RESULT_STATUS_OK),
-            ok_block
-        );
-        assert_eq!(
-            block_with_payload(&error.fragment, TOOL_RESULT_STATUS_ERROR),
-            error_block
-        );
+        // The status leads the result: the output's node follows it.
+        let ok_status = block_with_payload(&ok.fragment, TOOL_RESULT_STATUS_OK);
+        let error_status = block_with_payload(&error.fragment, TOOL_RESULT_STATUS_ERROR);
+        assert!(exists!(pattern!(&ok.fragment, [{
+            ok_block @ schema::block::previous: ok_status
+        }])));
+        assert!(exists!(pattern!(&error.fragment, [{
+            error_block @ schema::block::previous: error_status
+        }])));
         let (_empty, reader) = empty_reader();
         let (_, validation) =
             blockdag::validate_catalog_union(&reader, &TribleSet::new(), &ok.fragment).unwrap();
@@ -3126,13 +3487,15 @@ mod tests {
                 r#"{"type":"assistant","sessionId":"linked","uuid":"call","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_linked","name":"Bash","input":{"command":"true"}}]}}"#,
                 "\n",
                 r#"{"type":"user","sessionId":"linked","uuid":"result","parentUuid":"call","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_linked","content":"done","is_error":false}]}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"linked","uuid":"closing","parentUuid":"result","message":{"role":"assistant","content":[{"type":"text","text":"closed"}]}}"#,
             ),
             Path::new("linked.jsonl"),
         );
-        let call_part = find!(
-            part: Id,
+        let call_node = find!(
+            node: Id,
             pattern!(linked.fragment.facts(), [
-                { ?part @ schema::content_part::fact: _?fact },
+                { ?node @ schema::block::holds: _?fact },
                 { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::TOOL_CALL },
             ])
         )
@@ -3141,8 +3504,8 @@ mod tests {
         let response_modalities: BTreeSet<Id> = find!(
             modality: Id,
             pattern!(linked.fragment.facts(), [
-                { _?part @ schema::content_part::responds_to: &call_part },
-                { _?part @ schema::content_part::fact: _?fact },
+                { _?node @ schema::block::responds_to: &call_node,
+                    schema::block::holds: _?fact },
                 { _?fact @ schema::content_fact::modality: ?modality },
             ])
         )
@@ -3216,22 +3579,24 @@ mod tests {
                 r#"{"type":"user","sessionId":"forward-tool","uuid":"result","parentUuid":"call","sourceToolAssistantUUID":"call","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_forward","content":"forward result"}]}}"#,
                 "\n",
                 r#"{"type":"assistant","sessionId":"forward-tool","uuid":"call","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_forward","name":"Read","input":{"file":"later"}}]}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"forward-tool","uuid":"closing","parentUuid":"result","message":{"role":"assistant","content":[{"type":"text","text":"closed"}]}}"#,
             ),
             Path::new("forward-tool.jsonl"),
         );
         assert_eq!(projected.stats.unresolved_tool_results, 0);
-        let call_part = find!(
-            part: Id,
+        let call_node = find!(
+            node: Id,
             pattern!(projected.fragment.facts(), [
-                { ?part @ schema::content_part::fact: _?fact },
+                { ?node @ schema::block::holds: _?fact },
                 { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::TOOL_CALL },
             ])
         )
         .next()
         .unwrap();
         assert!(exists!(pattern!(projected.fragment.facts(), [
-            { _?part @ schema::content_part::responds_to: &call_part },
-            { _?part @ schema::content_part::fact: _?fact },
+            { _?node @ schema::block::responds_to: &call_node,
+                schema::block::holds: _?fact },
             { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::TOOL_RESULT },
         ])));
     }
@@ -3259,6 +3624,8 @@ mod tests {
             r#"{"type":"assistant","sessionId":"local","uuid":"call","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_reused","name":"Read","input":{"file":"local"}}]}}"#,
             "\n",
             r#"{"type":"user","sessionId":"local","uuid":"result","parentUuid":"call","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_reused","content":"local result"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"local","uuid":"closing","parentUuid":"result","message":{"role":"assistant","content":[{"type":"text","text":"closed"}]}}"#,
         );
         let extended = format!(
             "{base}\n{}",
@@ -3382,11 +3749,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(summary.stats.unresolved_parents, 0);
+        // No file holds the root, the attachment and the system record
+        // together, so each is emitted whole by its own file, in the chain.
         let root = block_with_payload(&union, "file root");
+        let attachment = block_with_payload(&union, r#"{"attachment":{"type":"skill_listing"}}"#);
+        let system = block_with_payload(&union, r#"{"content":"metadata"}"#);
         let child = block_with_payload(&union, "file child");
-        assert!(exists!(pattern!(&union, [{
-            child @ schema::block::previous: &root
-        }])));
+        assert!(exists!(pattern!(&union, [
+            { attachment @ schema::block::previous: &root },
+            { system @ schema::block::previous: &attachment },
+            { child @ schema::block::previous: &system },
+        ])));
+        let (_empty, reader) = empty_reader();
+        let (_, validation) =
+            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
+        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
     }
 
     #[test]

@@ -52,6 +52,15 @@ pub(super) enum Command {
         /// Source adapter used to interpret PATH.
         #[arg(long, value_enum, default_value = "claude-code")]
         source: CliImportSource,
+        /// Treat a source file last modified longer ago than this (for
+        /// example `1h`) as finished, and emit what it holds back at its tail:
+        /// Claude Code results logged inside its last message, a trailing
+        /// Codex prompt event. A transcript cannot say it is finished, so
+        /// without this option such a tail waits for a later record. The
+        /// modification time decides only when the tail is emitted, never any
+        /// identity.
+        #[arg(long, value_name = "DURATION", value_parser = parse_finished_after)]
+        finished_after: Option<std::time::Duration>,
     },
     /// List the most recent source projections from one frozen Archive view.
     List {
@@ -161,6 +170,7 @@ pub(super) fn import_paths(
     key: Option<&Path>,
     paths: &[PathBuf],
     source: CliImportSource,
+    finished_before: Option<std::time::SystemTime>,
     out: &mut Out<'_>,
 ) -> Result<()> {
     let mut writer = ArchiveImportWriter::open(pile, key)?;
@@ -169,7 +179,7 @@ pub(super) fn import_paths(
         if total > 1 {
             eprintln!("[{}/{total}] {}", index + 1, path.display());
         }
-        import_into(&mut writer, path, source, out)
+        import_into(&mut writer, path, source, finished_before, out)
             .with_context(|| format!("import {}", path.display()))
     });
     writer.close(result)
@@ -184,6 +194,7 @@ fn import_into(
     writer: &mut ArchiveImportWriter,
     path: &Path,
     source: CliImportSource,
+    finished_before: Option<std::time::SystemTime>,
     out: &mut Out<'_>,
 ) -> Result<()> {
     let mut stage = |fragment: Fragment, source_path: &Path| {
@@ -201,16 +212,20 @@ fn import_into(
                 .map(ImportSummary::ChatGpt)
         }
         CliImportSource::ClaudeCode => {
-            archive_claude_code::project_path(path, |p| stage(p.fragment, &p.source_path))
-                .map(ImportSummary::ClaudeCode)
+            archive_claude_code::project_path_finished(path, finished_before, |p| {
+                stage(p.fragment, &p.source_path)
+            })
+            .map(ImportSummary::ClaudeCode)
         }
         CliImportSource::ClaudeWeb => {
             archive_claude_web::project_path(path, |p| stage(p.fragment, &p.source_path))
                 .map(ImportSummary::ClaudeWeb)
         }
         CliImportSource::Codex => {
-            archive_codex::project_path(path, |p| stage(p.fragment, &p.source_path))
-                .map(ImportSummary::Codex)
+            archive_codex::project_path_finished(path, finished_before, |p| {
+                stage(p.fragment, &p.source_path)
+            })
+            .map(ImportSummary::Codex)
         }
         CliImportSource::Copilot => {
             archive_copilot::project_path(path, |p| stage(p.fragment, &p.source_path))
@@ -225,6 +240,11 @@ fn import_into(
     summary.write(commit.is_some(), out)
 }
 
+/// A `--finished-after` age such as `90s`, `1h` or `2days`.
+fn parse_finished_after(raw: &str) -> std::result::Result<std::time::Duration, String> {
+    humantime::parse_duration(raw).map_err(|error| error.to_string())
+}
+
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         out.line(Cli::command().render_help().to_string())?;
@@ -232,8 +252,26 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     };
     let archive = Archive::new(cli.pile.clone(), cli.key.clone());
     match command {
-        Command::Import { path, source } => {
-            import_paths(&cli.pile, cli.key.as_deref(), &path, source, out)
+        Command::Import {
+            path,
+            source,
+            finished_after,
+        } => {
+            let finished_before = finished_after
+                .map(|age| {
+                    std::time::SystemTime::now()
+                        .checked_sub(age)
+                        .ok_or_else(|| anyhow!("--finished-after reaches before the clock's epoch"))
+                })
+                .transpose()?;
+            import_paths(
+                &cli.pile,
+                cli.key.as_deref(),
+                &path,
+                source,
+                finished_before,
+                out,
+            )
         }
         Command::List { limit } => archive.list(limit, out),
         Command::Show { id } => archive.show(&id, out),

@@ -361,18 +361,18 @@ fn print_agy_import_summary(
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
-        "projected {} Antigravity transcript file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        "projected {} Antigravity transcript file(s), emitted {} fragment(s), {} node(s), {} fact(s)",
         summary.files_scanned,
         summary.fragments_emitted,
         summary.stats.projections_emitted,
         summary.stats.content_parts,
     ))?;
     out.line(format!(
-        "records={} transparent={} raw_only={} missing_predecessors={}",
+        "records={} raw_only={} missing_predecessors={} unresolved_tool_results={}",
         summary.stats.records_seen,
-        summary.stats.transparent_records,
         summary.stats.contentless_records,
         summary.stats.missing_predecessors,
+        summary.stats.unresolved_tool_results,
     ))?;
     print_collection_publication(published, out)?;
     Ok(())
@@ -384,7 +384,7 @@ fn print_chatgpt_import_summary(
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
-        "projected {} ChatGPT shard(s), {} conversation(s), {} mapping node(s), {} source projection(s), {} content part(s)",
+        "projected {} ChatGPT shard(s), {} conversation(s), {} mapping node(s), {} node(s), {} fact(s)",
         summary.files_scanned,
         summary.conversations_seen,
         summary.mapping_nodes_seen,
@@ -392,12 +392,12 @@ fn print_chatgpt_import_summary(
         summary.stats.content_parts,
     ))?;
     out.line(format!(
-        "attachments={} resolved={} transparent={} raw_only={} missing_predecessors={}",
+        "attachments={} resolved={} raw_only={} missing_predecessors={} unresolved_tool_results={}",
         summary.attachments_seen,
         summary.attachments_resolved,
-        summary.stats.transparent_records,
         summary.stats.contentless_records,
         summary.stats.missing_predecessors,
+        summary.stats.unresolved_tool_results,
     ))?;
     print_collection_publication(published, out)?;
     Ok(())
@@ -409,20 +409,22 @@ fn print_claude_code_import_summary(
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
-        "projected {} Claude Code file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        "projected {} Claude Code file(s), emitted {} fragment(s), {} node(s), {} fact(s)",
         summary.files_scanned,
         summary.fragments_emitted,
         summary.stats.source_projections,
         summary.stats.content_parts,
     ))?;
     out.line(format!(
-        "skipped={} missing_identity={} skipped_parents={} unresolved_parents={} unresolved_tool_results={} undecodable_images={}",
+        "skipped={} missing_identity={} skipped_parents={} unresolved_parents={} unresolved_tool_results={} undecodable_images={} held_back={} record(s)/{} fact(s)",
         summary.stats.skipped_records,
         summary.stats.missing_source_identity,
         summary.stats.skipped_parents,
         summary.stats.unresolved_parents,
         summary.stats.unresolved_tool_results,
         summary.stats.undecodable_images,
+        summary.stats.held_back_records,
+        summary.stats.held_back_facts,
     ))?;
     print_collection_publication(published, out)?;
     Ok(())
@@ -434,16 +436,19 @@ fn print_codex_import_summary(
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
-        "projected {} Codex rollout file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        "projected {} Codex rollout file(s), emitted {} fragment(s), {} node(s), {} fact(s)",
         summary.files_scanned,
         summary.fragments_emitted,
         summary.stats.source_projections,
         summary.stats.content_parts,
     ))?;
     out.line(format!(
-        "records={} skipped={} invalid_timestamps={} undecodable_assets={} frozen_bytes={} trailing_bytes_ignored={}",
+        "records={} skipped={} mirrored_prompts={} held_back={} record(s)/{} fact(s) invalid_timestamps={} undecodable_assets={} frozen_bytes={} trailing_bytes_ignored={}",
         summary.stats.records_seen,
         summary.stats.skipped_records,
+        summary.stats.mirrored_prompts,
+        summary.stats.held_back_records,
+        summary.stats.held_back_facts,
         summary.stats.invalid_timestamps,
         summary.stats.undecodable_assets,
         summary.frozen_bytes,
@@ -459,7 +464,7 @@ fn print_claude_web_import_summary(
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
-        "projected {} Claude Web export file(s), emitted {} fragment(s), {} conversation(s), {} message(s), {} content part(s)",
+        "projected {} Claude Web export file(s), emitted {} fragment(s), {} conversation(s), {} message(s), {} fact(s)",
         summary.files_scanned,
         summary.fragments_emitted,
         summary.stats.conversations,
@@ -485,7 +490,7 @@ fn print_copilot_import_summary(
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
-        "projected {} Copilot session file(s), ignored {} unrelated JSON file(s), emitted {} fragment(s), {} source projection(s), {} content part(s)",
+        "projected {} Copilot session file(s), ignored {} unrelated JSON file(s), emitted {} fragment(s), {} node(s), {} fact(s)",
         summary.files_scanned,
         summary.files_ignored,
         summary.fragments_emitted,
@@ -493,11 +498,11 @@ fn print_copilot_import_summary(
         summary.stats.content_parts,
     ))?;
     out.line(format!(
-        "records={} transparent={} raw_only={} missing_predecessors={}",
+        "records={} raw_only={} missing_predecessors={} unresolved_tool_results={}",
         summary.stats.records_seen,
-        summary.stats.transparent_records,
         summary.stats.contentless_records,
         summary.stats.missing_predecessors,
+        summary.stats.unresolved_tool_results,
     ))?;
     print_collection_publication(published, out)?;
     Ok(())
@@ -509,7 +514,7 @@ fn print_gemini_import_summary(
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
-        "projected {} Gemini Takeout file(s), ignored {} unrelated HTML file(s), {} activity card(s), {} source projection(s), {} content part(s)",
+        "projected {} Gemini Takeout file(s), ignored {} unrelated HTML file(s), {} activity card(s), {} node(s), {} fact(s)",
         summary.files_scanned,
         summary.files_ignored,
         summary.cards_seen,
@@ -517,12 +522,12 @@ fn print_gemini_import_summary(
         summary.stats.content_parts,
     ))?;
     out.line(format!(
-        "assets={} resolved={} transparent={} raw_only={} missing_predecessors={}",
+        "assets={} resolved={} raw_only={} missing_predecessors={} unresolved_tool_results={}",
         summary.assets_seen,
         summary.assets_resolved,
-        summary.stats.transparent_records,
         summary.stats.contentless_records,
         summary.stats.missing_predecessors,
+        summary.stats.unresolved_tool_results,
     ))?;
     print_collection_publication(published, out)?;
     Ok(())
@@ -617,17 +622,13 @@ fn projection_actor(facts: &FactArchive, reader: &PileSnapshot, projection: Id) 
 }
 
 fn block_snippet(facts: &FactArchive, reader: &PileSnapshot, block: Id) -> Result<String> {
-    let parts: BTreeSet<_> = find!(
-        (ordinal: u64, part: Id, fact: Id),
-        pattern!(facts, [
-            { block @ archive_schema::block::contains: ?part },
-            { ?part @ archive_schema::content_part::ordinal: ?ordinal,
-                archive_schema::content_part::fact: ?fact },
-        ])
+    let held: BTreeSet<Id> = find!(
+        fact: Id,
+        pattern!(facts, [{ block @ archive_schema::block::holds: ?fact }])
     )
     .collect();
     let mut values = Vec::new();
-    for (_, _, fact) in parts {
+    for fact in held {
         for text in find!(
             text: TextHandle,
             pattern!(facts, [{ fact @ archive_schema::content_fact::payload: ?text }])
@@ -692,6 +693,8 @@ fn render_projection_summary(
     ))
 }
 
+/// The facts a node holds (a set: one, or several at the same moment) and
+/// the call node it answers.
 fn render_parts(
     out: &mut String,
     facts: &FactArchive,
@@ -699,33 +702,31 @@ fn render_parts(
     block: Id,
     include_all: bool,
 ) -> Result<()> {
-    let parts: BTreeSet<_> = find!(
-        (ordinal: u64, part: Id, fact: Id, modality: Id, direction: Id),
+    for target in find!(
+        target: Id,
+        pattern!(facts, [{ block @ archive_schema::block::responds_to: ?target }])
+    ) {
+        writeln!(out, "responds_to: {target:X}")?;
+    }
+    let held: BTreeSet<_> = find!(
+        (fact: Id, modality: Id, direction: Id),
         pattern!(facts, [
-            { block @ archive_schema::block::contains: ?part },
-            { ?part @ archive_schema::content_part::ordinal: ?ordinal,
-                archive_schema::content_part::fact: ?fact },
+            { block @ archive_schema::block::holds: ?fact },
             { ?fact @ archive_schema::content_fact::modality: ?modality,
                 archive_schema::content_fact::direction: ?direction },
         ])
     )
     .collect();
-    for (ordinal, part, fact, modality, direction) in parts {
+    for (fact, modality, direction) in held {
         if !include_all && modality != archive_schema::content_fact::modality::TEXT {
             continue;
         }
         writeln!(
             out,
-            "part[{ordinal}]: {} {} id={part:X} fact={fact:X}",
+            "fact: {} {} id={fact:X}",
             entity_label(facts, reader, modality, "modality")?,
             entity_label(facts, reader, direction, "direction")?,
         )?;
-        for target in find!(
-            target: Id,
-            pattern!(facts, [{ part @ archive_schema::content_part::responds_to: ?target }])
-        ) {
-            writeln!(out, "  responds_to: {target:X}")?;
-        }
         for text in find!(
             text: TextHandle,
             pattern!(facts, [{ fact @ archive_schema::content_fact::payload: ?text }])
@@ -769,16 +770,6 @@ fn render_parts(
             pattern!(facts, [{ fact @ archive_schema::content_fact::resolved_to: ?resolution }])
         ) {
             writeln!(out, "  resolution: {}", hex::encode_upper(resolution.raw))?;
-        }
-        for resolution in find!(
-            resolution: RawHandle,
-            pattern!(facts, [{ part @ archive_schema::content_part::resolution: ?resolution }])
-        ) {
-            writeln!(
-                out,
-                "  selected_resolution: {}",
-                hex::encode_upper(resolution.raw)
-            )?;
         }
     }
     Ok(())
@@ -832,6 +823,16 @@ fn render_projection(facts: &FactArchive, reader: &PileSnapshot, projection: Id)
         pattern!(facts, [{ projection @ archive_schema::source_projection::raw_record: ?raw }])
     ) {
         writeln!(out, "raw_record: {}", hex::encode_upper(raw.raw))?;
+    }
+    for resolution in find!(
+        resolution: RawHandle,
+        pattern!(facts, [{ projection @ archive_schema::source_projection::resolution: ?resolution }])
+    ) {
+        writeln!(
+            out,
+            "selected_resolution: {}",
+            hex::encode_upper(resolution.raw)
+        )?;
     }
     for timestamp in find!(
         timestamp: (i128, i128),
@@ -1043,6 +1044,12 @@ fn render_block(
     ) {
         writeln!(out, "previous: {previous:X}")?;
     }
+    // The act or perception this node belongs to: the derived run of one
+    // direction around it.
+    let turn = crate::blockdag::turn_of(facts, block);
+    if let (Some(first), Some(last)) = (turn.first(), turn.last()) {
+        writeln!(out, "turn: {first:X}..{last:X} ({} node(s))", turn.len())?;
+    }
     // A receipt names its conversation only on a leaf, so the locator is
     // optional here.
     let receipts: BTreeSet<_> = find!(
@@ -1123,8 +1130,20 @@ fn run_search(
             }])
         )
         .collect();
+        // The hit is a node; its act or perception is the derived run of one
+        // direction around it along its thread.
+        let turn = crate::blockdag::turn_of(&facts, block);
+        let turn = match (turn.first(), turn.last()) {
+            (Some(first), Some(last)) if turn.len() > 1 => format!(
+                " turn {}..{} ({} node(s))",
+                short_id(*first),
+                short_id(*last),
+                turn.len()
+            ),
+            _ => String::new(),
+        };
         out.line(format!(
-            "{score:.4} {} {} receipt(s) {}",
+            "{score:.4} {} {} receipt(s){turn} {}",
             short_id(block),
             receipts.len(),
             block_snippet(&facts, observed.snapshot(), block)?,
@@ -1287,8 +1306,7 @@ fn run_replay(
         .filter(|item| {
             with_tools
                 || exists!(pattern!(&facts, [
-                    { item.block @ archive_schema::block::contains: _?part },
-                    { _?part @ archive_schema::content_part::fact: _?fact },
+                    { item.block @ archive_schema::block::holds: _?fact },
                     { _?fact @ archive_schema::content_fact::modality:
                         &archive_schema::content_fact::modality::TEXT },
                 ]))
@@ -1371,6 +1389,7 @@ mod tests {
             storage.storage.key_path(),
             &[path.to_path_buf()],
             source,
+            None,
             &mut Out::new(&mut |_| Ok(())),
         )
     }
@@ -1473,6 +1492,50 @@ mod tests {
                 Some(Command::Import { source, .. }) if source == expected
             ));
         }
+    }
+
+    #[test]
+    fn finished_after_parses_a_human_duration_and_defaults_to_holding_back() {
+        let parsed = Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "import",
+            "session.jsonl",
+            "--finished-after",
+            "1h",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Import { finished_after: Some(age), .. })
+                if age == std::time::Duration::from_secs(3600)
+        ));
+        let parsed = Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "import",
+            "session.jsonl",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Import {
+                finished_after: None,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from([
+            "archive",
+            "--pile",
+            "archive.pile",
+            "import",
+            "session.jsonl",
+            "--finished-after",
+            "soon",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1768,6 +1831,7 @@ mod tests {
             Some(&fixture.key),
             paths,
             CliImportSource::ClaudeCode,
+            None,
             &mut Out::new(&mut |part| {
                 if let crate::out::Part::Text { text } = part {
                     if let Some(outcome) = text.strip_prefix("Archive collection: ") {
@@ -1828,6 +1892,7 @@ mod tests {
             Some(&fixture.key),
             &[path.to_path_buf()],
             CliImportSource::ChatGpt,
+            None,
             &mut Out::new(&mut |part| {
                 if let crate::out::Part::Text { text } = part {
                     if let Some(outcome) = text.strip_prefix("Archive collection: ") {
@@ -2117,7 +2182,7 @@ mod tests {
         )
         .unwrap();
         let fact_id = fact.root().unwrap();
-        let part = blockdag::content_part(0, fact, None).unwrap();
+        let part = fact;
         let block = blockdag::block([], None, part).unwrap();
         let block_id = block.root().unwrap();
         let mut fragment = blockdag::source_projection(
@@ -2135,13 +2200,13 @@ mod tests {
         fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&fact_id) @
             archive_schema::content_fact::asset_pointer: "also an external interpretation",
         };
+        // A held entity this reader cannot type is skipped, not an error.
         let undecodable = fucid();
         fragment += entity! { &undecodable @
-            archive_schema::content_part::ordinal: u128::MAX,
-            archive_schema::content_part::fact: fact_id,
+            metadata::name: "an untyped held entity",
         };
         fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&block_id) @
-            archive_schema::block::contains: &undecodable,
+            archive_schema::block::holds: &undecodable,
         };
         let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
         let mut pile = open_pile_strict(&fixture.pile).unwrap();
@@ -2161,7 +2226,7 @@ mod tests {
         assert!(rendered.contains("another author"));
         assert!(rendered.contains("readable body"));
         assert!(rendered.contains("also an external interpretation"));
-        assert_eq!(rendered.matches("part[").count(), 1);
+        assert_eq!(rendered.matches("fact: ").count(), 1);
         let summary = render_projection_summary(&facts, observed.snapshot(), projection).unwrap();
         assert!(summary.contains("readable body"));
     }

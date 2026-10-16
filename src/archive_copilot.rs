@@ -11,7 +11,7 @@ use triblespace::core::import::scanner as sc;
 use triblespace::core::inline::TryToInline;
 
 use crate::archive_source::{
-    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, Threading,
+    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, ToolLink,
 };
 use crate::schemas::blockdag as schema;
 
@@ -81,10 +81,18 @@ struct MessageFields {
     skill_executions: Option<Bytes>,
 }
 
+/// Parts with the tool correlators of some of them.
+type LinkedParts = (Vec<SourcePart>, Vec<(usize, ToolLink)>);
+
 #[derive(Default)]
 struct ResultProjection {
     session_id: Option<View<str>>,
-    parts: Vec<SourcePart>,
+    /// One model message per tool-call round: its text, then its calls.
+    rounds: Vec<LinkedParts>,
+    /// What each call returned, by call id, in source order.
+    results: Vec<(View<str>, Vec<View<str>>)>,
+    /// The latest assistant message of `metadata.messages`.
+    messages: Vec<View<str>>,
 }
 
 #[derive(Default)]
@@ -219,14 +227,11 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
     let messages = root.messages.unwrap_or_default();
     let root_locator =
         archive_source::owned_text(format!("{}/root", default_conversation.as_ref()));
-    let mut records = vec![SourceRecord {
-        locator: root_locator.clone(),
-        predecessors: Vec::new(),
-        block_timestamp: None,
-        threading: Threading::Transparent,
-        parts: Vec::new(),
-        claims: SourceClaims::default(),
-    }];
+    let mut records = vec![SourceRecord::new(
+        root_locator.clone(),
+        Vec::new(),
+        Vec::new(),
+    )];
 
     if !requests.is_empty() {
         // VS Code stores the durable conversation identity under each
@@ -276,8 +281,8 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                     locator: locator.clone(),
                     predecessors: vec![previous],
                     block_timestamp: timestamp,
-                    threading: Threading::Semantic,
                     parts: user_parts,
+                    links: Vec::new(),
                     claims: SourceClaims {
                         timestamp,
                         raw_author: Some(archive_source::owned_text("user")),
@@ -288,9 +293,11 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                 previous = locator;
             }
 
-            if !assistant.is_empty() {
+            // Each tool-call round is one model message, and so one act; what
+            // its calls returned follows it.
+            for (round, ((parts, links), role)) in assistant.into_iter().enumerate() {
                 let locator = archive_source::owned_text(format!(
-                    "{}/request/{}/assistant",
+                    "{}/request/{}/assistant/{round}",
                     conversation.as_ref(),
                     request_id.as_ref()
                 ));
@@ -298,12 +305,12 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                     locator: locator.clone(),
                     predecessors: vec![previous],
                     block_timestamp: timestamp,
-                    threading: Threading::Semantic,
-                    parts: assistant,
+                    parts,
+                    links,
                     claims: SourceClaims {
                         timestamp,
-                        raw_author: Some(archive_source::owned_text("assistant")),
-                        raw_role: Some(archive_source::owned_text("assistant")),
+                        raw_author: Some(archive_source::owned_text(role)),
+                        raw_role: Some(archive_source::owned_text(role)),
                         ..SourceClaims::default()
                     },
                 });
@@ -320,17 +327,11 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                     conversation.as_ref(),
                     request_id.as_ref()
                 ));
-                records.push(SourceRecord {
-                    locator: locator.clone(),
-                    predecessors: vec![previous],
-                    block_timestamp: timestamp,
-                    threading: Threading::Transparent,
-                    parts: Vec::new(),
-                    claims: SourceClaims {
-                        timestamp,
-                        ..SourceClaims::default()
-                    },
-                });
+                records.push(SourceRecord::new(
+                    locator.clone(),
+                    vec![previous],
+                    Vec::new(),
+                ));
                 previous = locator;
             }
             previous_by_session.insert(session_key, previous);
@@ -369,7 +370,7 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
             } else {
                 schema::content_fact::direction::OUT
             };
-            let mut parts = message
+            let (mut parts, links) = message
                 .skill_executions
                 .as_ref()
                 .map(extract_skill_executions)
@@ -402,12 +403,8 @@ fn parse_bytes(path: &Path, bytes: Bytes) -> Result<Option<Vec<SourceRecord>>> {
                 locator: locator.clone(),
                 predecessors,
                 block_timestamp: timestamp,
-                threading: if parts.is_empty() {
-                    Threading::Transparent
-                } else {
-                    Threading::Semantic
-                },
                 parts,
+                links,
                 claims: SourceClaims {
                     timestamp,
                     raw_author: Some(role.clone()),
@@ -549,34 +546,124 @@ fn extract_user_parts(request: &RequestFields, occurrence: &str) -> Result<Vec<S
     Ok(parts)
 }
 
-fn extract_assistant(request: &RequestFields, result: ResultProjection) -> Result<Vec<SourcePart>> {
-    let mut parts = result.parts;
-    let has_final_text = parts.iter().any(|part| {
-        matches!(
-            part,
-            SourcePart::Text { modality, .. }
-                if *modality == schema::content_fact::modality::TEXT
-        )
-    });
-    if !has_final_text {
-        parts.extend(
-            request
-                .response
-                .as_ref()
-                .map(extract_content_value)
-                .transpose()?
-                .unwrap_or_default()
-                .into_iter()
-                .map(|value| {
-                    SourcePart::text(
-                        schema::content_fact::modality::TEXT,
-                        schema::content_fact::direction::OUT,
-                        value,
-                    )
-                }),
-        );
+/// The assistant side of one request, in order: one model message per
+/// tool-call round, each followed by what its calls returned.
+///
+/// A tool-call round carries the text the model wrote in that round, so the
+/// last round usually holds the final answer. The latest assistant message of
+/// `metadata.messages` follows the rounds as a message of its own unless the
+/// last round already said exactly it; the rendered `response` stands in only
+/// when neither says anything. A result whose call no round names follows the
+/// last round.
+fn extract_assistant(
+    request: &RequestFields,
+    result: ResultProjection,
+) -> Result<Vec<(LinkedParts, &'static str)>> {
+    let rounds: Vec<LinkedParts> = result
+        .rounds
+        .into_iter()
+        .filter(|(parts, _)| !parts.is_empty())
+        .collect();
+    let texts = |parts: &[SourcePart]| -> Vec<String> {
+        parts
+            .iter()
+            .filter_map(|part| match part {
+                SourcePart::Text {
+                    modality, value, ..
+                } if *modality == schema::content_fact::modality::TEXT => {
+                    Some(value.as_ref().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let has_round_text = rounds.iter().any(|(parts, _)| !texts(parts).is_empty());
+    let last_round_text = rounds
+        .last()
+        .map(|(parts, _)| texts(parts))
+        .unwrap_or_default();
+
+    let mut results = result.results;
+    let answered = |results: &mut Vec<(View<str>, Vec<View<str>>)>, calls: &[View<str>]| {
+        let mut parts = Vec::new();
+        let mut links = Vec::new();
+        for call in calls {
+            while let Some(index) = results.iter().position(|(id, _)| id == call) {
+                let (id, outputs) = results.remove(index);
+                for output in outputs {
+                    links.push((parts.len(), ToolLink::Result(id.clone())));
+                    parts.push(SourcePart::text(
+                        schema::content_fact::modality::TOOL_RESULT,
+                        schema::content_fact::direction::IN,
+                        output,
+                    ));
+                }
+            }
+        }
+        (parts, links)
+    };
+    let round_count = rounds.len();
+    let mut messages: Vec<(LinkedParts, &'static str)> = Vec::new();
+    for (index, (parts, links)) in rounds.into_iter().enumerate() {
+        let mut calls: Vec<View<str>> = links
+            .iter()
+            .filter_map(|(_, link)| match link {
+                ToolLink::Call(id) => Some(id.clone()),
+                ToolLink::Result(_) => None,
+            })
+            .collect();
+        if index + 1 == round_count {
+            calls.extend(results.iter().map(|(id, _)| id.clone()));
+        }
+        messages.push(((parts, links), "assistant"));
+        let returned = answered(&mut results, &calls);
+        if !returned.0.is_empty() {
+            messages.push((returned, "tool"));
+        }
     }
-    Ok(parts)
+    if round_count == 0 {
+        let calls: Vec<View<str>> = results.iter().map(|(id, _)| id.clone()).collect();
+        let returned = answered(&mut results, &calls);
+        if !returned.0.is_empty() {
+            messages.push((returned, "tool"));
+        }
+    }
+
+    let final_text: Vec<View<str>> = if !result.messages.is_empty() {
+        let said: Vec<String> = result
+            .messages
+            .iter()
+            .map(|value| value.as_ref().to_owned())
+            .collect();
+        if said == last_round_text {
+            Vec::new()
+        } else {
+            result.messages
+        }
+    } else if !has_round_text {
+        request
+            .response
+            .as_ref()
+            .map(extract_content_value)
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let parts: Vec<SourcePart> = final_text
+        .into_iter()
+        .map(|value| {
+            SourcePart::text(
+                schema::content_fact::modality::TEXT,
+                schema::content_fact::direction::OUT,
+                value,
+            )
+        })
+        .collect();
+    if !parts.is_empty() {
+        messages.push(((parts, Vec::new()), "assistant"));
+    }
+    Ok(messages)
 }
 
 fn extract_result(bytes: &Bytes) -> Result<ResultProjection> {
@@ -602,6 +689,7 @@ fn extract_result(bytes: &Bytes) -> Result<ResultProjection> {
         session_id: Option<View<str>>,
         messages: Option<Bytes>,
         tool_rounds: Option<Bytes>,
+        tool_results: Option<Bytes>,
     }
 
     let mut fields = MetadataFields::default();
@@ -610,32 +698,149 @@ fn extract_result(bytes: &Bytes) -> Result<ResultProjection> {
             "sessionId" => fields.session_id = optional_string(value)?,
             "messages" => fields.messages = Some(archive_source::raw_value(value)?),
             "toolCallRounds" => fields.tool_rounds = Some(archive_source::raw_value(value)?),
+            "toolCallResults" => fields.tool_results = Some(archive_source::raw_value(value)?),
             _ => sc::skip_value(value)?,
         }
         Ok(fields)
     })?;
 
-    // Tool calls/results causally precede the final assistant response even
+    // Tool-call rounds causally precede the final assistant response even
     // though VS Code's metadata object may serialize `messages` first.
-    let mut parts = fields
+    let rounds = fields
         .tool_rounds
         .as_ref()
-        .map(tool_round_parts)
+        .map(tool_rounds)
         .transpose()?
         .unwrap_or_default();
-    if let Some(mut messages) = fields.messages {
-        parts.extend(assistant_messages(&mut messages)?.into_iter().map(|value| {
-            SourcePart::text(
-                schema::content_fact::modality::TEXT,
-                schema::content_fact::direction::OUT,
-                value,
-            )
-        }));
-    }
+    let messages = match fields.messages {
+        Some(mut messages) => assistant_messages(&mut messages)?,
+        None => Vec::new(),
+    };
+    let results = match fields.tool_results {
+        Some(mut results) => tool_call_results(&mut results)?,
+        None => Vec::new(),
+    };
     Ok(ResultProjection {
         session_id: fields.session_id,
-        parts,
+        rounds,
+        results,
+        messages,
     })
+}
+
+/// `metadata.toolCallResults`: what each call returned, keyed by call id.
+///
+/// Each result's `content` holds plain strings or prompt trees (`{"node":
+/// ...}`); a tree is rendered as the text of its leaves in order, a leaf
+/// marked `lineBreakBefore` starting a new line. That is the result's text as
+/// the model was given it, without the renderer's layout metadata.
+fn tool_call_results(
+    bytes: &mut Bytes,
+) -> std::result::Result<Vec<(View<str>, Vec<View<str>>)>, sc::ScanError> {
+    sc::skip_ws(bytes);
+    if bytes.first().copied() != Some(b'{') {
+        sc::skip_value(bytes)?;
+        return Ok(Vec::new());
+    }
+    sc::object(bytes, Vec::new(), |mut results, key, value| {
+        let id = utf8_key(key)?;
+        let mut outputs = Vec::new();
+        if value.first().copied() == Some(b'{') {
+            sc::object(value, &mut outputs, |outputs, key, value| {
+                if utf8_key(key)?.as_ref() == "content" && value.first().copied() == Some(b'[') {
+                    sc::array(value, &mut *outputs, |outputs, item| {
+                        if let Some(text) = result_item_text(item)? {
+                            outputs.push(text);
+                        }
+                        Ok(outputs)
+                    })?;
+                } else {
+                    sc::skip_value(value)?;
+                }
+                Ok(outputs)
+            })?;
+        } else {
+            sc::skip_value(value)?;
+        }
+        results.push((id, outputs));
+        Ok(results)
+    })
+}
+
+/// One item of a result's `content`: its `value` string, or its rendered tree.
+fn result_item_text(item: &mut Bytes) -> std::result::Result<Option<View<str>>, sc::ScanError> {
+    if item.first().copied() != Some(b'{') {
+        sc::skip_value(item)?;
+        return Ok(None);
+    }
+    let mut text = None;
+    sc::object(item, &mut text, |text, key, value| {
+        if utf8_key(key)?.as_ref() != "value" {
+            sc::skip_value(value)?;
+            return Ok(text);
+        }
+        match value.first().copied() {
+            Some(b'"') => *text = optional_string(value)?,
+            Some(b'{') => {
+                let mut rendered = String::new();
+                sc::object(value, &mut rendered, |rendered, key, value| {
+                    if utf8_key(key)?.as_ref() == "node" {
+                        render_prompt_node(value, rendered)?;
+                    } else {
+                        sc::skip_value(value)?;
+                    }
+                    Ok(rendered)
+                })?;
+                *text = Some(archive_source::owned_text(rendered));
+            }
+            _ => sc::skip_value(value)?,
+        }
+        Ok(text)
+    })?;
+    Ok(text.filter(|text| !text.as_ref().trim().is_empty()))
+}
+
+/// Append the text leaves of one prompt tree node, in order.
+fn render_prompt_node(
+    node: &mut Bytes,
+    out: &mut String,
+) -> std::result::Result<(), sc::ScanError> {
+    if node.first().copied() != Some(b'{') {
+        return sc::skip_value(node);
+    }
+    #[derive(Default)]
+    struct Node {
+        text: Option<View<str>>,
+        line_break: bool,
+        children: Option<Bytes>,
+    }
+    let fields = sc::object(node, Node::default(), |mut fields, key, value| {
+        match utf8_key(key)?.as_ref() {
+            "text" => fields.text = optional_string(value)?,
+            "lineBreakBefore" => {
+                fields.line_break = value.starts_with(b"true");
+                sc::skip_value(value)?;
+            }
+            "children" => fields.children = Some(archive_source::raw_value(value)?),
+            _ => sc::skip_value(value)?,
+        }
+        Ok(fields)
+    })?;
+    if let Some(text) = fields.text {
+        if fields.line_break && !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(text.as_ref());
+    }
+    if let Some(mut children) = fields.children {
+        sc::skip_ws(&mut children);
+        if children.first().copied() == Some(b'[') {
+            sc::array(&mut children, (), |(), child| {
+                render_prompt_node(child, out)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn assistant_messages(bytes: &mut Bytes) -> std::result::Result<Vec<View<str>>, sc::ScanError> {
@@ -660,12 +865,13 @@ fn assistant_messages(bytes: &mut Bytes) -> std::result::Result<Vec<View<str>>, 
     Ok(latest)
 }
 
-fn tool_round_parts(bytes: &Bytes) -> Result<Vec<SourcePart>> {
+/// One model message per round: the text it wrote, then the calls it made.
+fn tool_rounds(bytes: &Bytes) -> Result<Vec<LinkedParts>> {
     let mut input = bytes.clone();
-    let parts = sc::array(&mut input, Vec::new(), |mut parts, element| {
+    let rounds = sc::array(&mut input, Vec::new(), |mut rounds, element| {
         if element.first().copied() != Some(b'{') {
             sc::skip_value(element)?;
-            return Ok(parts);
+            return Ok(rounds);
         }
 
         #[derive(Default)]
@@ -681,72 +887,88 @@ fn tool_round_parts(bytes: &Bytes) -> Result<Vec<SourcePart>> {
             }
             Ok(fields)
         })?;
-        if let Some(calls) = fields.calls {
-            parts.extend(tool_call_parts(&calls)?);
-        }
+        let mut parts = Vec::new();
+        let mut links = Vec::new();
         if let Some(mut response) = fields.response {
             parts.extend(
                 extract_content_value_scan(&mut response)?
                     .into_iter()
                     .map(|value| {
                         SourcePart::text(
-                            schema::content_fact::modality::TOOL_RESULT,
-                            schema::content_fact::direction::IN,
+                            schema::content_fact::modality::TEXT,
+                            schema::content_fact::direction::OUT,
                             value,
                         )
                     }),
             );
         }
-        Ok(parts)
+        if let Some(calls) = fields.calls {
+            let (calls, call_links) = tool_call_parts(&calls)?;
+            let offset = parts.len();
+            parts.extend(calls);
+            links.extend(
+                call_links
+                    .into_iter()
+                    .map(|(index, link)| (offset + index, link)),
+            );
+        }
+        rounds.push((parts, links));
+        Ok(rounds)
     })?;
-    Ok(parts)
+    Ok(rounds)
 }
 
-fn tool_call_parts(bytes: &Bytes) -> std::result::Result<Vec<SourcePart>, sc::ScanError> {
+fn tool_call_parts(bytes: &Bytes) -> std::result::Result<LinkedParts, sc::ScanError> {
     let mut input = bytes.clone();
-    sc::array(&mut input, Vec::new(), |mut parts, element| {
-        if element.first().copied() != Some(b'{') {
-            sc::skip_value(element)?;
-            return Ok(parts);
-        }
-        let fields = sc::object(
-            element,
-            ToolCallFields::default(),
-            |mut fields, key, value| {
-                match utf8_key(key)?.as_ref() {
-                    "id" | "callId" | "toolCallId" => fields.id = optional_string(value)?,
-                    "name" | "toolId" => fields.name = optional_string(value)?,
-                    "arguments" | "input" => {
-                        fields.arguments = Some(archive_source::raw_value(value)?)
+    sc::array(
+        &mut input,
+        (Vec::new(), Vec::new()),
+        |(mut parts, mut links), element| {
+            if element.first().copied() != Some(b'{') {
+                sc::skip_value(element)?;
+                return Ok((parts, links));
+            }
+            let fields = sc::object(
+                element,
+                ToolCallFields::default(),
+                |mut fields, key, value| {
+                    match utf8_key(key)?.as_ref() {
+                        "id" | "callId" | "toolCallId" => fields.id = optional_string(value)?,
+                        "name" | "toolId" => fields.name = optional_string(value)?,
+                        "arguments" | "input" => {
+                            fields.arguments = Some(archive_source::raw_value(value)?)
+                        }
+                        _ => sc::skip_value(value)?,
                     }
-                    _ => sc::skip_value(value)?,
+                    Ok(fields)
+                },
+            )?;
+            if let Some(value) = tool_call_text(&fields)? {
+                if let Some(id) = fields.id.clone() {
+                    links.push((parts.len(), ToolLink::Call(id)));
                 }
-                Ok(fields)
-            },
-        )?;
-        if let Some(value) = tool_call_text(&fields)? {
-            parts.push(SourcePart::text(
-                schema::content_fact::modality::TOOL_CALL,
-                schema::content_fact::direction::OUT,
-                value,
-            ));
-        }
-        Ok(parts)
-    })
+                parts.push(SourcePart::text(
+                    schema::content_fact::modality::TOOL_CALL,
+                    schema::content_fact::direction::OUT,
+                    value,
+                ));
+            }
+            Ok((parts, links))
+        },
+    )
 }
 
+/// The hashed form of a tool call: its name and arguments. The vendor's call
+/// id is a correlator carried by `responds_to`, never part of the text.
 fn tool_call_text(
     fields: &ToolCallFields,
 ) -> std::result::Result<Option<View<str>>, sc::ScanError> {
-    if fields.id.is_none() && fields.name.is_none() && fields.arguments.is_none() {
+    if fields.name.is_none() && fields.arguments.is_none() {
         return Ok(None);
     }
     let mut lines = Vec::new();
     if let Some(name) = fields.name.as_ref() {
         lines.push(format!("name: {}", name.as_ref()));
-    }
-    if let Some(id) = fields.id.as_ref() {
-        lines.push(format!("id: {}", id.as_ref()));
     }
     if let Some(arguments) = fields.arguments.as_ref() {
         lines.push(format!("arguments: {}", semantic_json_value(arguments)?));
@@ -763,65 +985,76 @@ fn semantic_json_value(bytes: &Bytes) -> std::result::Result<String, sc::ScanErr
     archive_source::canonical_json(bytes.clone())
 }
 
-fn extract_skill_executions(bytes: &Bytes) -> Result<Vec<SourcePart>> {
+/// A message's skill executions in order: each call, then the status and
+/// references it returned, linked to the call.
+fn extract_skill_executions(bytes: &Bytes) -> Result<LinkedParts> {
     let mut input = bytes.clone();
-    let parts = sc::array(&mut input, Vec::new(), |mut parts, element| {
-        if element.first().copied() != Some(b'{') {
-            sc::skip_value(element)?;
-            return Ok(parts);
-        }
-        let fields = sc::object(element, SkillFields::default(), |mut fields, key, value| {
-            match utf8_key(key)?.as_ref() {
-                "callId" | "id" | "toolCallId" => fields.id = optional_string(value)?,
-                "slug" | "name" => fields.name = optional_string(value)?,
-                "status" => fields.status = optional_string(value)?,
-                "arguments" | "input" => fields.arguments = Some(archive_source::raw_value(value)?),
-                "references" | "result" => {
-                    fields.references = Some(archive_source::raw_value(value)?)
+    let linked = sc::array(
+        &mut input,
+        (Vec::new(), Vec::new()),
+        |(mut parts, mut links), element| {
+            if element.first().copied() != Some(b'{') {
+                sc::skip_value(element)?;
+                return Ok((parts, links));
+            }
+            let fields = sc::object(element, SkillFields::default(), |mut fields, key, value| {
+                match utf8_key(key)?.as_ref() {
+                    "callId" | "id" | "toolCallId" => fields.id = optional_string(value)?,
+                    "slug" | "name" => fields.name = optional_string(value)?,
+                    "status" => fields.status = optional_string(value)?,
+                    "arguments" | "input" => {
+                        fields.arguments = Some(archive_source::raw_value(value)?)
+                    }
+                    "references" | "result" => {
+                        fields.references = Some(archive_source::raw_value(value)?)
+                    }
+                    _ => sc::skip_value(value)?,
                 }
-                _ => sc::skip_value(value)?,
-            }
-            Ok(fields)
-        })?;
+                Ok(fields)
+            })?;
 
-        let call = ToolCallFields {
-            id: fields.id.clone(),
-            name: fields.name.clone(),
-            arguments: fields.arguments.clone(),
-        };
-        if let Some(value) = tool_call_text(&call)? {
-            parts.push(SourcePart::text(
-                schema::content_fact::modality::TOOL_CALL,
-                schema::content_fact::direction::OUT,
-                value,
-            ));
-        }
-
-        if let Some(status) = fields.status.as_ref() {
-            let mut value = format!("status: {}", status.as_ref());
-            if let Some(id) = fields.id.as_ref() {
-                value.push_str("\nid: ");
-                value.push_str(id.as_ref());
+            let call = ToolCallFields {
+                id: fields.id.clone(),
+                name: fields.name.clone(),
+                arguments: fields.arguments.clone(),
+            };
+            let mut link = |index: usize, link: fn(View<str>) -> ToolLink| {
+                if let Some(id) = fields.id.clone() {
+                    links.push((index, link(id)));
+                }
+            };
+            if let Some(value) = tool_call_text(&call)? {
+                link(parts.len(), ToolLink::Call);
+                parts.push(SourcePart::text(
+                    schema::content_fact::modality::TOOL_CALL,
+                    schema::content_fact::direction::OUT,
+                    value,
+                ));
             }
-            parts.push(SourcePart::text(
-                schema::content_fact::modality::TOOL_RESULT,
-                schema::content_fact::direction::IN,
-                archive_source::owned_text(value),
-            ));
-        }
-        if let Some(references) = fields.references {
-            let value = semantic_json_value(&references)?;
-            if !matches!(value.trim(), "" | "[]" | "null") {
+
+            if let Some(status) = fields.status.as_ref() {
+                link(parts.len(), ToolLink::Result);
                 parts.push(SourcePart::text(
                     schema::content_fact::modality::TOOL_RESULT,
                     schema::content_fact::direction::IN,
-                    archive_source::owned_text(value),
+                    archive_source::owned_text(format!("status: {}", status.as_ref())),
                 ));
             }
-        }
-        Ok(parts)
-    })?;
-    Ok(parts)
+            if let Some(references) = fields.references {
+                let value = semantic_json_value(&references)?;
+                if !matches!(value.trim(), "" | "[]" | "null") {
+                    link(parts.len(), ToolLink::Result);
+                    parts.push(SourcePart::text(
+                        schema::content_fact::modality::TOOL_RESULT,
+                        schema::content_fact::direction::IN,
+                        archive_source::owned_text(value),
+                    ));
+                }
+            }
+            Ok((parts, links))
+        },
+    )?;
+    Ok(linked)
 }
 
 fn extract_variable_parts(bytes: &Bytes, occurrence: &str) -> Result<Vec<SourcePart>> {
@@ -929,10 +1162,11 @@ fn variable_part(
     }
     .unwrap_or_else(|| archive_source::owned_text(format!("{occurrence}/variable/{ordinal}")));
 
+    // The export's own metadata names the media type; embedded bytes only
+    // resolve the pointer and never decide its type or size.
     let media_type = normalized_media_type(
         fields.media_type.as_ref(),
         fields.name.as_ref().or(Some(&pointer)),
-        resolved.as_ref().map(AsRef::as_ref),
     );
     let modality = if is_image {
         schema::content_fact::modality::IMAGE
@@ -942,14 +1176,13 @@ fn variable_part(
             .map(|value| archive_source::modality_for_media_type(value.as_ref()))
             .unwrap_or(schema::content_fact::modality::FILE)
     };
-    let size = resolved.as_ref().map(|bytes| bytes.len() as u128);
     Ok(Some(SourcePart::Pointer {
         modality,
         direction: schema::content_fact::direction::IN,
         namespace: schema::source_projection::SOURCE_COPILOT,
         pointer,
         media_type,
-        size,
+        size: None,
         resolved,
     }))
 }
@@ -1087,7 +1320,6 @@ fn byte_object(bytes: &mut Bytes) -> std::result::Result<Option<Vec<u8>>, sc::Sc
 fn normalized_media_type(
     explicit: Option<&View<str>>,
     name: Option<&View<str>>,
-    bytes: Option<&[u8]>,
 ) -> Option<View<str>> {
     let explicit = explicit.and_then(|value| {
         let value = value.as_ref().trim().to_ascii_lowercase();
@@ -1121,23 +1353,7 @@ fn normalized_media_type(
             .to_owned(),
         )
     });
-    let sniffed = bytes.and_then(|bytes| {
-        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            Some("image/png")
-        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-            Some("image/jpeg")
-        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-            Some("image/gif")
-        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-            Some("image/webp")
-        } else {
-            None
-        }
-    });
-    explicit
-        .or(inferred)
-        .or_else(|| sniffed.map(str::to_owned))
-        .map(archive_source::owned_text)
+    explicit.or(inferred).map(archive_source::owned_text)
 }
 
 fn extract_content_value(bytes: &Bytes) -> Result<Vec<View<str>>> {
@@ -1338,12 +1554,7 @@ fn fallback_conversation_id(root: &RootFields, exact_root: &Bytes) -> Result<Str
 }
 
 fn absorb(target: &mut ProjectionStats, source: ProjectionStats) {
-    target.records_seen += source.records_seen;
-    target.projections_emitted += source.projections_emitted;
-    target.content_parts += source.content_parts;
-    target.transparent_records += source.transparent_records;
-    target.contentless_records += source.contentless_records;
-    target.missing_predecessors += source.missing_predecessors;
+    target.absorb(source);
 }
 
 #[cfg(test)]
@@ -1356,7 +1567,7 @@ mod tests {
 
     use super::*;
 
-    fn semantic_identity(fragment: &Fragment) -> (Id, BTreeSet<(Id, Id)>) {
+    fn semantic_identity(fragment: &Fragment) -> (Id, BTreeSet<Id>) {
         let projection = fragment.root().expect("source projection has one root");
         let block = find!(
             (block: Id),
@@ -1366,13 +1577,10 @@ mod tests {
         )
         .next()
         .map(|(block,)| block)
-        .expect("source projection names one block");
+        .expect("source projection names one node");
         let content = find!(
-            (part: Id, fact: Id),
-            pattern!(fragment.facts(), [
-                { block @ schema::block::contains: ?part },
-                { ?part @ schema::content_part::fact: ?fact },
-            ])
+            fact: Id,
+            pattern!(fragment.facts(), [{ block @ schema::block::holds: ?fact }])
         )
         .collect();
         (block, content)
@@ -1394,7 +1602,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(summary.files_scanned, 1);
-        assert_eq!(summary.fragments_emitted, 3); // source receipt + user + assistant
+        assert_eq!(summary.fragments_emitted, 3); // user + assistant + leaf path
         assert_eq!(summary.stats.records_seen, 3);
         assert_eq!(summary.stats.content_parts, 2);
         assert_eq!(summary.stats.contentless_records, 1);
@@ -1420,7 +1628,6 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].locator.as_ref(), "empty-session/root");
         assert!(records[0].parts.is_empty());
-        assert_eq!(records[0].threading, Threading::Transparent);
 
         let mut emitted = Vec::new();
         let summary = project_path(&path, |projected| {
@@ -1445,7 +1652,9 @@ mod tests {
         let moved_dir = dir.path().join("moved");
         fs::create_dir_all(&moved_dir).unwrap();
         let after_path = moved_dir.join("renamed.json");
-        let first_request = r#"{"message":"same birth"}"#;
+        // The first request was answered, so the appended prompt starts a
+        // new perception rather than extending the first one.
+        let first_request = r#"{"message":"same birth","response":[{"value":"answered"}]}"#;
         fs::write(&before_path, format!(r#"{{"requests":[{first_request}]}}"#)).unwrap();
         fs::write(
             &after_path,
@@ -1455,10 +1664,11 @@ mod tests {
 
         let before = parse_file(&before_path).unwrap().unwrap();
         let after = parse_file(&after_path).unwrap().unwrap();
-        assert_eq!(before.len(), 2); // exact root receipt + first user message
-        assert_eq!(after.len(), 3);
+        assert_eq!(before.len(), 3); // exact root receipt + user message + answer
+        assert_eq!(after.len(), 4);
         assert_eq!(before[0].locator, after[0].locator);
         assert_eq!(before[1].locator, after[1].locator);
+        assert_eq!(before[2].locator, after[2].locator);
         assert!(before[0]
             .locator
             .as_ref()
@@ -1625,7 +1835,7 @@ mod tests {
                 assert_eq!(*modality, schema::content_fact::modality::IMAGE);
                 assert_eq!(pointer.as_ref(), "image-sha");
                 assert_eq!(media_type.as_ref().unwrap().as_ref(), "image/png");
-                assert_eq!(*size, Some(8));
+                assert_eq!(*size, None, "embedded bytes never decide the size");
                 assert_eq!(resolved.as_ref().unwrap().as_ref(), b"\x89PNG\r\n\x1a\n");
             }
             _ => panic!("expected resolved image pointer"),
@@ -1640,27 +1850,38 @@ mod tests {
             _ => panic!("expected file pointer"),
         }
 
-        let first_assistant = records
+        // The round is one model message: the text it wrote, then its call
+        // (the call id links, and is not hashed). The final message follows.
+        let round = records
             .iter()
-            .find(|record| record.locator.as_ref() == "session-a/request/r-a/assistant")
+            .find(|record| record.locator.as_ref() == "session-a/request/r-a/assistant/0")
             .unwrap();
-        assert_eq!(first_assistant.parts.len(), 3);
+        assert_eq!(round.parts.len(), 2);
         assert!(matches!(
-            &first_assistant.parts[0],
-            SourcePart::Text { modality, value, .. }
-                if *modality == schema::content_fact::modality::TOOL_CALL
-                    && value.as_ref().contains("name: read_file")
-                    && value.as_ref().contains("call-1")
-        ));
-        assert!(matches!(
-            &first_assistant.parts[1],
-            SourcePart::Text { modality, value, .. }
-                if *modality == schema::content_fact::modality::TOOL_RESULT
+            &round.parts[0],
+            SourcePart::Text { modality, direction, value }
+                if *modality == schema::content_fact::modality::TEXT
+                    && *direction == schema::content_fact::direction::OUT
                     && value.as_ref() == "file contents"
         ));
         assert!(matches!(
-            &first_assistant.parts[2],
+            &round.parts[1],
             SourcePart::Text { modality, value, .. }
+                if *modality == schema::content_fact::modality::TOOL_CALL
+                    && value.as_ref().contains("name: read_file")
+                    && !value.as_ref().contains("call-1")
+        ));
+        assert!(matches!(
+            round.links.as_slice(),
+            [(1, ToolLink::Call(call))] if call.as_ref() == "call-1"
+        ));
+        let final_message = records
+            .iter()
+            .find(|record| record.locator.as_ref() == "session-a/request/r-a/assistant/1")
+            .unwrap();
+        assert!(matches!(
+            final_message.parts.as_slice(),
+            [SourcePart::Text { modality, value, .. }]
                 if *modality == schema::content_fact::modality::TEXT
                     && value.as_ref() == "done"
         ));
@@ -1679,7 +1900,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             same_session.predecessors[0].as_ref(),
-            "session-a/request/r-a/assistant"
+            "session-a/request/r-a/assistant/1"
         );
     }
 
@@ -1705,8 +1926,14 @@ mod tests {
             SourcePart::Text { modality, value, .. }
                 if *modality == schema::content_fact::modality::TOOL_CALL
                     && value.as_ref().contains("name: code-search")
-                    && value.as_ref().contains("toolu-1")
+                    && !value.as_ref().contains("toolu-1")
                     && value.as_ref().contains("needle")
+        ));
+        // The call id links the results to the call and is never hashed.
+        assert!(matches!(
+            message.links.as_slice(),
+            [(0, ToolLink::Call(call)), (1, ToolLink::Result(status)), (2, ToolLink::Result(references))]
+                if [call, status, references].iter().all(|id| id.as_ref() == "toolu-1")
         ));
         assert!(matches!(
             &message.parts[1],
@@ -1726,6 +1953,122 @@ mod tests {
                 if *modality == schema::content_fact::modality::TEXT
                     && value.as_ref() == "summary"
         ));
+    }
+
+    #[test]
+    fn tool_results_are_perceived_after_their_round_and_answer_its_calls() {
+        let request = r#"{"requestId":"r-1","message":{"text":"find the bug"},"result":{"metadata":{"sessionId":"tools","toolCallRounds":[{"response":"looking","toolCalls":[{"name":"grep","arguments":"{\"q\":\"bug\"}","id":"call-1"}],"id":"round-1"},{"response":"found it","toolCalls":[],"id":"round-2"}],"toolCallResults":{"call-1":{"$mid":20,"content":[{"$mid":22,"value":{"node":{"type":1,"ctor":2,"ctorName":"Nee","children":[{"type":2,"priority":20,"text":"2 matches","lineBreakBefore":true},{"type":1,"ctor":2,"ctorName":"wj","children":[{"type":2,"priority":1,"text":"src/lib.rs:7: bug","lineBreakBefore":true}],"props":{}}],"props":{}}}},{"$mid":22,"value":"plain output"}]}}}}}"#;
+        let project = |text: String| {
+            let mut fragment = Fragment::empty();
+            project_bytes("tools.json", Bytes::from_source(text.into_bytes()), |p| {
+                fragment += p.fragment;
+                Ok(())
+            })
+            .unwrap();
+            fragment
+        };
+        let records = parse_bytes(
+            Path::new("tools.json"),
+            Bytes::from_source(format!(r#"{{"requests":[{request}]}}"#).into_bytes()),
+        )
+        .unwrap()
+        .unwrap();
+        let returned = records
+            .iter()
+            .find(|record| record.locator.as_ref() == "tools/request/r-1/assistant/1")
+            .unwrap();
+        assert!(matches!(
+            returned.parts.as_slice(),
+            [
+                SourcePart::Text { modality: first_modality, direction: first_direction, value: first },
+                SourcePart::Text { value: second, .. },
+            ] if *first_modality == schema::content_fact::modality::TOOL_RESULT
+                && *first_direction == schema::content_fact::direction::IN
+                && first.as_ref() == "2 matches\nsrc/lib.rs:7: bug"
+                && second.as_ref() == "plain output"
+        ));
+
+        let mut union = project(format!(r#"{{"requests":[{request}]}}"#));
+        let node_of = |union: &mut Fragment, text: &str| -> Id {
+            let handle = union.put::<blobencodings::UTF8String, _>(text.to_owned());
+            find!(
+                node: Id,
+                pattern!(&*union, [
+                    { ?node @ schema::block::holds: _?fact },
+                    { _?fact @ schema::content_fact::payload: handle },
+                ])
+            )
+            .next()
+            .unwrap()
+        };
+        let looking = node_of(&mut union, "looking");
+        let matches = node_of(&mut union, "2 matches\nsrc/lib.rs:7: bug");
+        let plain = node_of(&mut union, "plain output");
+        let answer = node_of(&mut union, "found it");
+        let call = find!(
+            node: Id,
+            pattern!(&union, [
+                { ?node @ schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::modality: &schema::content_fact::modality::TOOL_CALL },
+            ])
+        )
+        .next()
+        .unwrap();
+        let thread = crate::blockdag::thread_to(union.facts(), answer);
+        assert_eq!(&thread[1..], &[looking, call, matches, plain, answer]);
+        assert_eq!(
+            crate::blockdag::turn_of(union.facts(), plain),
+            vec![matches, plain],
+            "what the round returned is perceived after it"
+        );
+        assert_eq!(
+            find!(
+                result: Id,
+                pattern!(&union, [{ ?result @ schema::block::responds_to: call }])
+            )
+            .collect::<BTreeSet<_>>(),
+            BTreeSet::from([matches, plain]),
+            "both outputs answer the call"
+        );
+    }
+
+    #[test]
+    fn a_re_export_with_new_call_ids_lands_on_the_same_blocks() {
+        let export = |call: &str| {
+            format!(
+                r#"{{"threadUrl":"thread-ids","messages":[{{"id":"m-1","role":"assistant","content":"done","skillExecutions":[{{"slug":"search","status":"completed","arguments":{{"q":"x"}},"references":[{{"type":"text","text":"hit"}}],"callId":"{call}"}}]}}]}}"#
+            )
+        };
+        let project = |text: String| {
+            let mut fragment = Fragment::empty();
+            project_bytes("github.json", Bytes::from_source(text.into_bytes()), |p| {
+                fragment += p.fragment;
+                Ok(())
+            })
+            .unwrap();
+            fragment
+        };
+        let first = project(export("call-first"));
+        let second = project(export("call-second"));
+        let blocks = |fragment: &Fragment| -> BTreeSet<Id> {
+            find!(
+                block: Id,
+                pattern!(fragment, [{ _?receipt @ schema::source_projection::projects_to: ?block }])
+            )
+            .collect()
+        };
+        // The call, its status, the references, the reply.
+        assert_eq!(blocks(&first).len(), 4);
+        assert_eq!(blocks(&first), blocks(&second));
+        assert_eq!(
+            find!(
+                result: Id,
+                pattern!(&first, [{ ?result @ schema::block::responds_to: _?call }])
+            )
+            .count(),
+            2,
+            "the status and the references answer the call"
+        );
     }
 
     #[test]
@@ -1766,17 +2109,20 @@ mod tests {
         })
         .unwrap();
 
-        // The receipt, then the path on the leaf.
-        assert_eq!(first_fragments.len(), 2);
-        assert_eq!(second_fragments.len(), 2);
-        assert_eq!(
-            first_fragments[0].root(),
-            second_fragments[0].root(),
-            "JSON spelling never reaches a receipt"
-        );
-        let first_semantics = semantic_identity(&first_fragments[0]);
-        let second_semantics = semantic_identity(&second_fragments[0]);
-        assert_eq!(first_semantics, second_semantics);
-        assert_eq!(first_semantics.1.len(), 4);
+        // The call, its status, what it returned, the reply; then the path
+        // on the leaf.
+        assert_eq!(first_fragments.len(), 5);
+        assert_eq!(second_fragments.len(), 5);
+        for (first, second) in first_fragments.iter().zip(&second_fragments).take(4) {
+            assert_eq!(
+                first.root(),
+                second.root(),
+                "JSON spelling never reaches a receipt"
+            );
+            assert_eq!(semantic_identity(first), semantic_identity(second));
+        }
+        for fragment in &first_fragments[..4] {
+            assert_eq!(semantic_identity(fragment).1.len(), 1, "one fact per node");
+        }
     }
 }

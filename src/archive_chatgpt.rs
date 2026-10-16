@@ -8,10 +8,12 @@
 //!
 //! A mapping node with a null `message` stores nothing and is contracted, so
 //! it does not invent a semantic turn between its nearest message-bearing
-//! ancestors and descendants. Visible user and assistant messages thread the
-//! dialogue; tool calls (assistant messages to a recipient other than `all`),
-//! tool results, system and hidden messages are side branches, so an export
-//! that drops them threads the same dialogue blocks as one that kept them.
+//! ancestors and descendants. Every message sits in the main chain where the
+//! mapping puts it: assistant messages (tool calls to a recipient other than
+//! `all` among them) are acts, and user, tool, system and hidden messages are
+//! what the agent perceived. A tool message answers the nearest call above it.
+//! An attachment's media type comes from the export's own metadata; sidecar
+//! bytes found beside the export only annotate the fact.
 //! Node and conversation ids only thread the graph while projecting; the
 //! conversation id and title annotate the conversation's leaves. Envelope UI
 //! and export state (`current_node`, `update_time`, `safe_urls`, plugin ids,
@@ -30,7 +32,7 @@ use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
 use crate::archive_source::{
-    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, Threading,
+    self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, ToolLink,
 };
 use crate::files;
 use crate::schemas::blockdag as schema;
@@ -53,12 +55,7 @@ impl ProjectionSummary {
         self.mapping_nodes_seen += other.mapping_nodes_seen;
         self.attachments_seen += other.attachments_seen;
         self.attachments_resolved += other.attachments_resolved;
-        self.stats.records_seen += other.stats.records_seen;
-        self.stats.projections_emitted += other.stats.projections_emitted;
-        self.stats.content_parts += other.stats.content_parts;
-        self.stats.transparent_records += other.stats.transparent_records;
-        self.stats.contentless_records += other.stats.contentless_records;
-        self.stats.missing_predecessors += other.stats.missing_predecessors;
+        self.stats.absorb(other.stats);
     }
 }
 
@@ -161,12 +158,7 @@ where
             unit,
             &mut *emit,
         )?;
-        summary.stats.records_seen += stats.records_seen;
-        summary.stats.projections_emitted += stats.projections_emitted;
-        summary.stats.content_parts += stats.content_parts;
-        summary.stats.transparent_records += stats.transparent_records;
-        summary.stats.contentless_records += stats.contentless_records;
-        summary.stats.missing_predecessors += stats.missing_predecessors;
+        summary.stats.absorb(stats);
     }
     Ok(summary)
 }
@@ -220,10 +212,37 @@ impl Conversation {
             }
         }
 
+        // What each node is, for linking a tool message to the call it
+        // answers: the nearest call above it, through other tool messages and
+        // message-less nodes only.
+        let mut kinds = HashMap::<View<str>, (NodeKind, Option<View<str>>)>::new();
+        for node in &self.nodes {
+            let kind = match &node.message {
+                None => NodeKind::Empty,
+                Some(message) if message.is_tool_call() => NodeKind::Call,
+                Some(message) if message.role.as_deref() == Some("tool") => NodeKind::ToolResult,
+                Some(_) => NodeKind::Other,
+            };
+            kinds.insert(node.id.clone(), (kind, node.parent.clone()));
+        }
+        let answered_call = |node: &MappingNode| -> Option<View<str>> {
+            let mut current = node.parent.clone();
+            for _ in 0..kinds.len() {
+                let id = current?;
+                let (kind, parent) = kinds.get(&id)?;
+                match kind {
+                    NodeKind::Call => return Some(id),
+                    NodeKind::ToolResult | NodeKind::Empty => current = parent.clone(),
+                    NodeKind::Other => return None,
+                }
+            }
+            None
+        };
+
         let mut attachments_seen = 0usize;
         let mut attachments_resolved = 0usize;
         let mut records = Vec::with_capacity(self.nodes.len());
-        for node in self.nodes {
+        for node in &self.nodes {
             let locator = locators
                 .get(&node.id)
                 .expect("locator was planned for every mapping node")
@@ -238,72 +257,37 @@ impl Conversation {
                     })
                     .into_iter()
                     .collect();
+            let answers = answered_call(node);
+            let Some(message) = node.message.clone() else {
+                records.push(SourceRecord::new(locator, predecessors, Vec::new()));
+                continue;
+            };
+            let timestamp = message.timestamp.and_then(epoch_interval);
+            let direction = direction_for_role(message.role.as_deref());
+            let to_tool = message.is_tool_call();
+            let text_modality = if to_tool {
+                schema::content_fact::modality::TOOL_CALL
+            } else {
+                text_modality(message.role.as_deref(), message.content_type.as_deref())
+            };
+            let mut parts = Vec::new();
+            let mut represented_attachments = HashSet::<String>::new();
 
-            let (threading, block_timestamp, parts, claims) = match node.message {
-                Some(message) => {
-                    let timestamp = message.timestamp.and_then(epoch_interval);
-                    let direction = direction_for_role(message.role.as_deref());
-                    let to_tool = message.role.as_deref() == Some("assistant")
-                        && message
-                            .recipient
-                            .as_deref()
-                            .is_some_and(|recipient| recipient != "all");
-                    let text_modality = if to_tool {
-                        schema::content_fact::modality::TOOL_CALL
-                    } else {
-                        text_modality(message.role.as_deref(), message.content_type.as_deref())
-                    };
-                    // Only visible user and assistant turns thread the
-                    // dialogue. Tool calls, tool results, system and hidden
-                    // context hang off it as side branches, so an export
-                    // format that drops them (2026-05-30 onwards) threads
-                    // the same dialogue blocks as one that kept them.
-                    let threading = if !message.hidden
-                        && !to_tool
-                        && matches!(message.role.as_deref(), Some("user" | "assistant"))
-                    {
-                        Threading::Semantic
-                    } else {
-                        Threading::Transparent
-                    };
-                    let mut parts = Vec::new();
-                    let mut represented_attachments = HashSet::<String>::new();
-
-                    for item in message.content {
-                        match item {
-                            ContentItem::Text(value) => {
-                                parts.push(SourcePart::text(text_modality, direction, value));
-                            }
-                            ContentItem::Attachment(mut attachment) => {
-                                if let Some(id) = attachment.id.as_ref() {
-                                    represented_attachments.insert(id.as_ref().to_owned());
-                                    if let Some(metadata) = message
-                                        .attachments
-                                        .iter()
-                                        .find(|candidate| candidate.id.as_ref() == Some(id))
-                                    {
-                                        attachment.enrich(metadata);
-                                    }
-                                }
-                                let (part, was_resolved) =
-                                    attachment.into_source_part(direction, sidecars)?;
-                                parts.push(part);
-                                attachments_seen += 1;
-                                attachments_resolved += usize::from(was_resolved);
-                            }
-                        }
+            for item in message.content {
+                match item {
+                    ContentItem::Text(value) => {
+                        parts.push(SourcePart::text(text_modality, direction, value));
                     }
-
-                    // Metadata attachments which had no ordered content-part
-                    // pointer are still semantic file occurrences.  They are
-                    // appended in their source array order.
-                    for attachment in message.attachments {
-                        if attachment
-                            .id
-                            .as_ref()
-                            .is_some_and(|id| represented_attachments.contains(id.as_ref()))
-                        {
-                            continue;
+                    ContentItem::Attachment(mut attachment) => {
+                        if let Some(id) = attachment.id.as_ref() {
+                            represented_attachments.insert(id.as_ref().to_owned());
+                            if let Some(metadata) = message
+                                .attachments
+                                .iter()
+                                .find(|candidate| candidate.id.as_ref() == Some(id))
+                            {
+                                attachment.enrich(metadata);
+                            }
                         }
                         let (part, was_resolved) =
                             attachment.into_source_part(direction, sidecars)?;
@@ -311,35 +295,67 @@ impl Conversation {
                         attachments_seen += 1;
                         attachments_resolved += usize::from(was_resolved);
                     }
-
-                    let claims = SourceClaims {
-                        timestamp,
-                        raw_author: message.author_name,
-                        raw_role: message.role,
-                        raw_model: message.model,
-                        ..SourceClaims::default()
-                    };
-                    (threading, timestamp, parts, claims)
                 }
-                None => (
-                    Threading::Transparent,
-                    None,
-                    Vec::new(),
-                    SourceClaims::default(),
-                ),
-            };
+            }
+
+            // Metadata attachments which had no ordered content-part
+            // pointer are still semantic file occurrences.  They are
+            // appended in their source array order.
+            for attachment in message.attachments {
+                if attachment
+                    .id
+                    .as_ref()
+                    .is_some_and(|id| represented_attachments.contains(id.as_ref()))
+                {
+                    continue;
+                }
+                let (part, was_resolved) = attachment.into_source_part(direction, sidecars)?;
+                parts.push(part);
+                attachments_seen += 1;
+                attachments_resolved += usize::from(was_resolved);
+            }
+
+            let mut links = Vec::new();
+            if to_tool {
+                if let Some(first) = parts.iter().position(|part| {
+                    matches!(part, SourcePart::Text { modality, .. }
+                        if *modality == schema::content_fact::modality::TOOL_CALL)
+                }) {
+                    links.push((first, ToolLink::Call(node.id.clone())));
+                }
+            } else if message.role.as_deref() == Some("tool") {
+                if let Some(call) = answers {
+                    links.extend(
+                        (0..parts.len()).map(|index| (index, ToolLink::Result(call.clone()))),
+                    );
+                }
+            }
 
             records.push(SourceRecord {
                 locator,
                 predecessors,
-                block_timestamp,
-                threading,
+                block_timestamp: timestamp,
                 parts,
-                claims,
+                links,
+                claims: SourceClaims {
+                    timestamp,
+                    raw_author: message.author_name,
+                    raw_role: message.role,
+                    raw_model: message.model,
+                    ..SourceClaims::default()
+                },
             });
         }
         Ok((records, attachments_seen, attachments_resolved))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NodeKind {
+    Empty,
+    Call,
+    ToolResult,
+    Other,
 }
 
 #[derive(Debug)]
@@ -349,7 +365,7 @@ struct MappingNode {
     message: Option<Message>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Message {
     id: Option<View<str>>,
     role: Option<View<str>>,
@@ -365,7 +381,18 @@ struct Message {
     attachments: Vec<Attachment>,
 }
 
-#[derive(Debug)]
+impl Message {
+    /// An assistant message addressed to a tool rather than the user.
+    fn is_tool_call(&self) -> bool {
+        self.role.as_deref() == Some("assistant")
+            && self
+                .recipient
+                .as_deref()
+                .is_some_and(|recipient| recipient != "all")
+    }
+}
+
+#[derive(Clone, Debug)]
 enum ContentItem {
     Text(View<str>),
     Attachment(Attachment),
@@ -468,11 +495,13 @@ impl Attachment {
             .transpose()?
             .flatten();
 
+        // The export's own metadata names the media type. A sidecar found on
+        // disk only resolves the bytes: whether an export happened to ship
+        // its asset files must not change the fact.
         let media_type = clean_media_type(
             self.media_type.clone(),
             self.format.as_deref(),
             self.kind.as_deref(),
-            resolved_path,
         );
         let modality = media_type
             .as_ref()
@@ -1058,11 +1087,12 @@ fn node_locator(conversation: &str, node: &str, message: Option<&View<str>>) -> 
     archive_source::owned_text(locator)
 }
 
+/// What the assistant produced is `out`; everything else in a conversation
+/// (user, tool, system and unknown authors) is what it perceived.
 fn direction_for_role(role: Option<&str>) -> Id {
     match role {
-        Some("user") | Some("tool") => schema::content_fact::direction::IN,
         Some("assistant") => schema::content_fact::direction::OUT,
-        _ => schema::content_fact::direction::AMBIENT,
+        _ => schema::content_fact::direction::IN,
     }
 }
 
@@ -1100,7 +1130,6 @@ fn clean_media_type(
     raw: Option<View<str>>,
     format: Option<&str>,
     kind: Option<&str>,
-    path: Option<&PathBuf>,
 ) -> Option<View<str>> {
     if let Some(raw) = raw {
         if let Ok(normalized) = files::normalize_media_type(raw.as_ref()) {
@@ -1110,10 +1139,9 @@ fn clean_media_type(
             return Some(archive_source::owned_text(normalized));
         }
     }
-    if let Some(format) = format.and_then(|format| media_type_for_format(format, kind)) {
-        return Some(archive_source::owned_text(format));
-    }
-    path.map(|path| archive_source::owned_text(files::infer_media_type(path)))
+    format
+        .and_then(|format| media_type_for_format(format, kind))
+        .map(archive_source::owned_text)
 }
 
 fn media_type_for_format(format: &str, kind: Option<&str>) -> Option<String> {
@@ -1230,7 +1258,10 @@ fn collect_files(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
+
+    use triblespace::core::metadata;
 
     use tempfile::TempDir;
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
@@ -1362,13 +1393,12 @@ mod tests {
         find!(
             block: Id,
             pattern!(&*fragment, [
-                { ?block @ schema::block::contains: _?part },
-                { _?part @ schema::content_part::fact: _?fact },
+                { ?block @ schema::block::holds: _?fact },
                 { _?fact @ schema::content_fact::payload: handle },
             ])
         )
         .next()
-        .unwrap_or_else(|| panic!("no block carries {text:?}"))
+        .unwrap_or_else(|| panic!("no node holds {text:?}"))
     }
 
     #[test]
@@ -1556,55 +1586,74 @@ mod tests {
         assert_eq!(summary.mapping_nodes_seen, 3);
         assert_eq!(summary.attachments_seen, 1);
         assert_eq!(summary.attachments_resolved, 1);
-        assert_eq!(summary.stats.transparent_records, 1);
         assert_eq!(summary.stats.contentless_records, 1);
-        assert_eq!(summary.stats.projections_emitted, 2);
+        assert_eq!(summary.stats.projections_emitted, 4);
         assert_eq!(summary.stats.content_parts, 4);
-        // Two receipts, then the conversation id on the leaf.
-        assert_eq!(projected.len(), 3);
+        // A receipt per node, then the conversation id on the leaf.
+        assert_eq!(projected.len(), 5);
         let mut union = Fragment::empty();
         for projection in projected {
             union += projection.fragment;
         }
-        let tip = block_with_text(&mut union, "hi!");
+        // The leaf is the image after "hi!".
+        let reply = block_with_text(&mut union, "hi!");
         let locator = union.put::<UTF8String, _>("conversation/conversation-1".to_owned());
-        assert!(exists!(pattern!(&union, [{
-            _?receipt @ schema::source_projection::projects_to: tip,
-            schema::source_projection::source_locator: locator
-        }])));
+        assert!(exists!(pattern!(&union, [
+            { _?tip @ schema::block::previous: reply },
+            { _?receipt @ schema::source_projection::projects_to: _?tip,
+                schema::source_projection::source_locator: locator },
+        ])));
     }
 
     #[test]
     fn an_asset_file_in_the_export_never_changes_a_block() {
-        let with = TempDir::new().unwrap();
-        let without = TempDir::new().unwrap();
-        let export = TINY_EXPORT.replace("file-abc", "file_00000000aa11");
-        fs::write(with.path().join("conversations.json"), &export).unwrap();
-        fs::write(without.path().join("conversations.json"), &export).unwrap();
-        fs::write(
-            with.path().join("file_00000000aa11-sanitized.png"),
-            [1, 2, 3, 4],
-        )
-        .unwrap();
-        let project = |root: &Path| {
-            let mut union = Fragment::empty();
-            let summary = project_path(root, |projection| {
-                union += projection.fragment;
-                Ok(())
-            })
+        // With the export's own MIME type, and without one: a sidecar file
+        // found beside the export never supplies the type.
+        let renamed = TINY_EXPORT.replace("file-abc", "file_00000000aa11");
+        let untyped = renamed.replace(r#""mime_type": "image/png", "#, "");
+        assert_ne!(renamed, untyped);
+        for export in [renamed, untyped] {
+            let with = TempDir::new().unwrap();
+            let without = TempDir::new().unwrap();
+            fs::write(with.path().join("conversations.json"), &export).unwrap();
+            fs::write(without.path().join("conversations.json"), &export).unwrap();
+            fs::write(
+                with.path().join("file_00000000aa11-sanitized.png"),
+                [1, 2, 3, 4],
+            )
             .unwrap();
-            (summary, union)
-        };
-        let (resolved_summary, resolved) = project(with.path());
-        let (_, unresolved) = project(without.path());
-        assert_eq!(resolved_summary.attachments_resolved, 1);
-        assert_eq!(blocks(&resolved), blocks(&unresolved));
-        assert!(exists!(pattern!(&resolved, [{
-            _?fact @ schema::content_fact::resolved_to: _?bytes
-        }])));
-        assert!(!exists!(pattern!(&resolved, [{
-            _?part @ schema::content_part::resolution: _?bytes
-        }])));
+            let project = |root: &Path| {
+                let mut union = Fragment::empty();
+                let summary = project_path(root, |projection| {
+                    union += projection.fragment;
+                    Ok(())
+                })
+                .unwrap();
+                (summary, union)
+            };
+            let (resolved_summary, resolved) = project(with.path());
+            let (_, unresolved) = project(without.path());
+            assert_eq!(resolved_summary.attachments_resolved, 1);
+            assert_eq!(blocks(&resolved), blocks(&unresolved));
+            assert_eq!(
+                find!(
+                    fact: Id,
+                    pattern!(&resolved, [{ ?fact @ metadata::tag: &schema::content_fact::KIND }])
+                )
+                .collect::<BTreeSet<_>>(),
+                find!(
+                    fact: Id,
+                    pattern!(&unresolved, [{ ?fact @ metadata::tag: &schema::content_fact::KIND }])
+                )
+                .collect::<BTreeSet<_>>(),
+            );
+            assert!(exists!(pattern!(&resolved, [{
+                _?fact @ schema::content_fact::resolved_to: _?bytes
+            }])));
+            assert!(!exists!(pattern!(&resolved, [{
+                _?receipt @ schema::source_projection::resolution: _?bytes
+            }])));
+        }
     }
 
     #[test]
@@ -1773,47 +1822,43 @@ mod tests {
 ]"#;
 
     /// The same conversation as a later export spells it: new conversation
-    /// and node ids, hidden and tool nodes dropped, the answer re-parented.
-    const NEW_FORMAT: &str = r#"[
-  {
-    "id": "69aa0000-1111-83ab-bbbb-000000000002",
-    "title": "Weather",
-    "mapping": {
-      "client-created-root": {"parent": null, "message": null},
-      "u-2": {"parent": "client-created-root", "message": {"id": "u-2", "author": {"role": "user"},
-        "create_time": 1772382841.5,
-        "content": {"content_type": "text", "parts": ["weather in Bremen?"]}}},
-      "a-2": {"parent": "u-2", "message": {"id": "a-2", "author": {"role": "assistant"},
-        "create_time": 1772382850,
-        "content": {"content_type": "text", "parts": ["Rainy, 12 degrees."]}}}
+    /// and node ids.
+    fn renamed(export: &str) -> String {
+        let mut renamed = export.replace(
+            "6800a1b2-0000-8002-aaaa-000000000001",
+            "69aa0000-1111-83ab-bbbb-000000000002",
+        );
+        for node in ["root", "system", "user", "call", "tool", "answer"] {
+            for (before, after) in [
+                (
+                    format!(r#""{node}": {{"parent""#),
+                    format!(r#""{node}-2": {{"parent""#),
+                ),
+                (
+                    format!(r#""parent": "{node}""#),
+                    format!(r#""parent": "{node}-2""#),
+                ),
+                (format!(r#""id": "{node}""#), format!(r#""id": "{node}-2""#)),
+            ] {
+                renamed = renamed.replace(&before, &after);
+            }
+        }
+        renamed
     }
-  }
-]"#;
 
     #[test]
-    fn a_re_export_under_new_ids_and_a_new_format_lands_on_the_same_dialogue() {
+    fn a_re_export_under_new_ids_lands_on_the_same_blocks() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("conversations.json");
         let mut old = project_export(&path, OLD_FORMAT);
-        let mut new = project_export(&path, NEW_FORMAT);
+        let mut new = project_export(&path, &renamed(OLD_FORMAT));
         for text in ["weather in Bremen?", "Rainy, 12 degrees."] {
             assert_eq!(
                 block_with_text(&mut old, text),
                 block_with_text(&mut new, text)
             );
         }
-        assert!(blocks(&new).is_subset(&blocks(&old)));
-        // The tool call, its result and the hidden context hang off the
-        // dialogue in the old export.
-        let call = block_with_text(&mut old, "search(Bremen weather)");
-        let user = block_with_text(&mut old, "weather in Bremen?");
-        assert!(exists!(
-            pattern!(&old, [{ call @ schema::block::previous: user }])
-        ));
-        use schema::content_fact::modality;
-        assert!(exists!(pattern!(&old, [{
-            _?fact @ schema::content_fact::modality: &modality::TOOL_CALL
-        }])));
+        assert_eq!(blocks(&new), blocks(&old));
 
         // Importing the new export after the old one adds nothing but its
         // own conversation id on the leaf.
@@ -1826,6 +1871,43 @@ mod tests {
             .iter()
             .all(|trible| *trible.a() == schema::source_projection::source_locator.id()));
         assert_eq!(novel.len(), 1);
+    }
+
+    #[test]
+    fn hidden_context_and_tool_exhaust_sit_in_the_main_chain() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("conversations.json");
+        let mut old = project_export(&path, OLD_FORMAT);
+        // The hidden system message is perceived with the user's question.
+        let hidden = block_with_text(&mut old, "hidden instructions");
+        let user = block_with_text(&mut old, "weather in Bremen?");
+        assert_eq!(
+            crate::blockdag::turn_of(old.facts(), user),
+            vec![hidden, user]
+        );
+        // The call follows it; the tool's result is perceived after the call
+        // and answers it; the answer follows what the tool said.
+        let call = block_with_text(&mut old, "search(Bremen weather)");
+        let tool = block_with_text(&mut old, "12 degrees, rain");
+        let answer = block_with_text(&mut old, "Rainy, 12 degrees.");
+        assert_eq!(
+            crate::blockdag::thread_to(old.facts(), answer),
+            vec![hidden, user, call, tool, answer]
+        );
+        assert!(exists!(pattern!(&old, [
+            { tool @ schema::block::responds_to: call },
+        ])));
+        use schema::content_fact::{direction, modality};
+        assert!(exists!(pattern!(&old, [{
+            _?fact @ schema::content_fact::modality: &modality::TOOL_CALL,
+            schema::content_fact::direction: &direction::OUT
+        }])));
+        let directions: BTreeSet<Id> = find!(
+            way: Id,
+            pattern!(&old, [{ _?fact @ schema::content_fact::direction: ?way }])
+        )
+        .collect();
+        assert_eq!(directions, BTreeSet::from([direction::IN, direction::OUT]));
     }
 
     #[test]
