@@ -14,7 +14,7 @@ use crate::out::Out;
 const TOOLS: &[Tool] = &[
     Tool {
         name: "compass_add",
-        description: "Add a goal with an initial status and optional note. Title and note are literal text; leading @ characters never read host files.",
+        description: "Add a goal with an initial status and optional note. Title and note are literal text; leading @ characters never read host files. An @label inside the title or note mentions that Relations persona or group (Orient tells them once); a tag equal to a persona's own label assigns the goal to it.",
         input_schema: r#"{"type":"object","properties":{"title":{"type":"string"},"status":{"type":"string","default":"todo"},"parent":{"type":"string","description":"Parent goal id or unique prefix"},"tags":{"type":"array","items":{"type":"string"},"default":[]},"note":{"type":"string"},"persona":{"type":"string","description":"Optional active Relations persona label or full id for cooperative attribution; never read from the server's PERSONA environment."}},"required":["title"],"additionalProperties":false}"#,
     },
     Tool {
@@ -29,7 +29,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "compass_note",
-        description: "Append a literal note with optional tags, exact references, and note supersedes links. Superseded notes remain visible.",
+        description: "Append a literal note with optional tags, exact references, and note supersedes links. Superseded notes remain visible. An @label inside the note mentions that Relations persona or every member of that group.",
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"note":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]},"references":{"type":"array","items":{"type":"string"},"default":[]},"supersedes":{"type":"array","items":{"type":"string","description":"Existing full 32-character note id"},"default":[]},"persona":{"type":"string","description":"Optional active Relations persona label or full id for cooperative attribution; never read from the server's PERSONA environment."}},"required":["id","note"],"additionalProperties":false}"#,
     },
     Tool {

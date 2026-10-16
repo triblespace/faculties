@@ -794,3 +794,123 @@ fn output_failure_does_not_retry_or_erase_an_already_published_action() {
     let (facts, _) = fixture.snapshot();
     assert_eq!(compass::goal_ids(&facts).len(), 1);
 }
+
+/// Publish `ada`, `bea`, a person whose label looks like an email domain,
+/// and a `crew` group, the people `@` tokens resolve against.
+fn mention_roster(fixture: &Fixture) -> (Id, Id, Id, Id) {
+    let (ada, bea, domain, crew) = (genid().id, genid().id, genid().id, genid().id);
+    let mut fragment = Fragment::empty();
+    for (person, label) in [(ada, "ada"), (bea, "bea"), (domain, "example.org")] {
+        fragment += faculties::relations::person_fragment(
+            person,
+            faculties::relations::ProfileInput {
+                label: label.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+    }
+    let (group, snapshot) = faculties::relations::group_create_fragment(crew, "crew").unwrap();
+    fragment += group;
+    fragment +=
+        faculties::relations::group_snapshot_fragment(crew, "crew", &[ada, bea], &[snapshot])
+            .unwrap();
+    publish_fragment(
+        &fixture.pile,
+        Some(&fixture.key),
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+        fragment,
+    )
+    .unwrap();
+    (ada, bea, domain, crew)
+}
+
+fn mentions_of(facts: &TribleSet, entity: Id) -> BTreeSet<Id> {
+    find!(target: Id, pattern!(facts, [{ entity @ board::mention: ?target }])).collect()
+}
+
+/// `@label` tokens in a title or note resolve, case-insensitively, to the
+/// person or group they name and are recorded on that entity. An address
+/// inside a word (`ada@example.org`) is not a mention, and the mention facts
+/// leave the note's derived identity exactly what its core alone derives.
+#[test]
+fn mentions_resolve_to_people_and_groups_beside_the_entity_identity() {
+    let fixture = Fixture::new();
+    let (ada, bea, domain, crew) = mention_roster(&fixture);
+    let operations = fixture.operations();
+    let added = operations
+        .add(
+            "Plan the release with @crew",
+            AddOptions {
+                note: Some("@ADA, mail ada@example.org and ping @ada."),
+                ..AddOptions::default()
+            },
+        )
+        .unwrap();
+    let goal = format!("{:x}", added.goal);
+    let body = "(@bea) over to you";
+    let noted = operations
+        .note(&goal, body, NoteOptions::default())
+        .unwrap();
+
+    let (facts, _) = fixture.snapshot();
+    assert_eq!(mentions_of(&facts, added.goal), BTreeSet::from([crew]));
+    assert_eq!(
+        mentions_of(&facts, added.note.unwrap()),
+        BTreeSet::from([ada])
+    );
+    assert_eq!(mentions_of(&facts, noted.note), BTreeSet::from([bea]));
+    assert!(!find!(
+        entity: Id,
+        pattern!(&facts, [{ ?entity @ board::mention: &domain }])
+    )
+    .any(|_| true));
+
+    let created_at = find!(
+        at: Inline<inlineencodings::NsTAIInterval>,
+        pattern!(&facts, [{ noted.note @ metadata::created_at: ?at }])
+    )
+    .next()
+    .unwrap();
+    let (_, derived) =
+        compass::note_fragment(added.goal, body, vec![], vec![], vec![], None, created_at).unwrap();
+    assert_eq!(derived, noted.note);
+}
+
+/// An `@label` that names nobody is reported on stderr, and the note is
+/// written all the same.
+#[test]
+fn an_unknown_mention_warns_and_still_writes() {
+    let fixture = Fixture::new();
+    mention_roster(&fixture);
+    let added = fixture
+        .operations()
+        .add("A goal", AddOptions::default())
+        .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_compass"));
+    clean_child(&mut command);
+    let output = command
+        .arg("--pile")
+        .arg(&fixture.pile)
+        .arg("--key")
+        .arg(&fixture.key)
+        .args([
+            "note",
+            &format!("{:x}", added.goal),
+            "hello @nobody and @ada",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let warnings: Vec<&str> = stderr.lines().filter(|line| line.contains('@')).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("@nobody"), "{stderr}");
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .contains("Added note"));
+    let (facts, _) = fixture.snapshot();
+    assert_eq!(compass::note_ids(&facts).len(), 1);
+}

@@ -131,6 +131,50 @@ pub fn canonical_tags(values: impl IntoIterator<Item = String>) -> Result<Vec<St
     Ok(values)
 }
 
+/// The `@label` tokens in a goal title or note body, in first-seen order and
+/// deduplicated by [`crate::relations::lookup_key`].
+///
+/// A token starts at the beginning of the text or after a character that is
+/// not alphanumeric, so `ada@example.org` mentions nobody. The label runs over
+/// ASCII letters, digits, `_`, `.` and `-`, with trailing punctuation trimmed,
+/// so `@ada.` names `ada`.
+pub fn mention_labels(text: &str) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut previous: Option<char> = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        let starts = ch == '@' && !previous.is_some_and(char::is_alphanumeric);
+        previous = Some(ch);
+        if !starts {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')))
+            .unwrap_or(rest.len());
+        let label = rest[..end].trim_end_matches(['_', '.', '-']);
+        if !label.is_empty()
+            && !labels.iter().any(|seen| {
+                crate::relations::lookup_key(seen) == crate::relations::lookup_key(label)
+            })
+        {
+            labels.push(label.to_owned());
+        }
+    }
+    labels
+}
+
+/// The Relations anchors `targets` that a goal or note's text mentioned, as
+/// an annotation beside that entity's core. The entity id is whatever its own
+/// constructor derived; mentions never enter it.
+pub fn mention_fragment(entity: Id, targets: &[Id]) -> Fragment {
+    let targets = sorted_ids(targets.iter().copied());
+    if targets.is_empty() {
+        return Fragment::empty();
+    }
+    entity! { ExclusiveId::force_ref(&entity) @ board::mention*: targets.iter() }
+}
+
 fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
     let mut values: Vec<Id> = values.into_iter().collect();
     values.sort_unstable();

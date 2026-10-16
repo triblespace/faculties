@@ -29,7 +29,8 @@ and notes then carry the acting relations person. Attribution says who made an
 observation; it does not grant authority or change workflow semantics.
 
 Every note has a stable ID, printed when it is created and by `compass show`.
-Use repeatable `--tag` values to request attention, `--ref` for opaque exact
+Write `@label` in a note (or a goal title) to mention a persona or a
+Relations group; use repeatable `--tag` values for topics, `--ref` for opaque exact
 artifact references, and `--supersedes <full-note-id>` when one note records a
 newer observation. Recognized `[text](faculty:hex)` links are stored as
 references automatically. Supersedes is provenance only: Compass still shows
@@ -59,8 +60,17 @@ trivial next actions; the conversation is the right level for those.
 
 Compass tags work like wiki tags. Common ones are `#meta`, `#bootstrap`, and
 `#parking`, plus project-specific tags such as `#myproject` or `#deploy`.
-Tag a goal with a persona's relations label to address it to that persona;
-Orient can surface that as directed news.
+Tag a goal with a persona's own relations label to assign it to that persona:
+Orient then reports other people's status changes and notes on it as directed
+news. Every other tag, a group name such as `crew` included, is only a topic.
+To address someone once, mention them: an `@label` in a title or note names a
+persona label, alias or group name (case-insensitively), and Orient tells that
+persona, or every member of that group, about it. A mention starts the text or
+follows a non-alphanumeric character, so an email address mentions nobody, and
+an `@label` that matches nobody is warned about while the write still succeeds.
+On the command line a leading `@` reads the text from a file, so text that
+begins with a mention starts with `@@` instead (`@@ada please look`).
+Writing a note or moving a goal does not subscribe you to it.
 
 == Scope control: parking lot
 

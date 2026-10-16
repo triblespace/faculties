@@ -45,8 +45,9 @@ compass move "$GOAL" doing
 
 The Compass status and notes are the durable work ledger. The message carries
 the human-readable hand-off and acknowledgement. For a lightweight directed
-assignment, tag a goal with the recipient's relations label; use a message
-when context or an explicit reply matters.
+assignment, tag a goal with the recipient's own relations label; to draw one
+person or a whole group to a goal or note once, write `@label` in its text.
+Use a message when context or an explicit reply matters.
 
 == Asynchronous diagnostic review
 
@@ -96,8 +97,10 @@ another message. One callback invocation is the only delivery path.
 Manual `orient poll` and one-shot `orient wait` remain available when needed.
 
 With a persona set, the watcher wakes for directed news: unread inbox or group
-messages, relevant goal transitions, new goals tagged with the persona or one
-of its Relations groups, and newly status-bearing windows. An agent's own
+messages, goals and notes that `@`-mention the persona or one of its Relations
+groups, other people's status changes and notes on goals tagged with the
+persona's own label, and newly status-bearing windows. Group-name tags are
+topics and wake nobody, and writing on a goal subscribes nobody. An agent's own
 status edits stay quiet. Habit sweeps include global intentions and those
 explicitly addressed to this persona. Give a personal clock an explicit
 target when creating it:

@@ -232,16 +232,33 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
         &pile.path,
         &["group", "add", "reviewers", "me"],
     ));
+    // Tagged with the persona's own label: assigned to it.
     let added = stdout(run(
         compass,
         &pile.path,
-        &["--persona", "me", "add", "Shared goal"],
+        &["--persona", "me", "add", "Shared goal", "--tag", "me"],
     ));
     let goal_id = id_after("Added goal ", &added);
 
     pile.maintain_attention();
     let baseline = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(baseline.is_empty());
+
+    // A group name as a tag is a topic: it addresses nobody.
+    stdout(run(
+        compass,
+        &pile.path,
+        &[
+            "--persona",
+            "peer",
+            "add",
+            "Group-tagged goal",
+            "--tag",
+            "reviewers",
+        ],
+    ));
+    pile.maintain_attention();
+    assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 
     let addressed = stdout(run(
         compass,
@@ -250,9 +267,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
             "--persona",
             "peer",
             "add",
-            "Group-addressed goal",
-            "--tag",
-            "reviewers",
+            "Group-addressed goal for @Reviewers",
         ],
     ));
     let addressed_goal = id_after("Added goal ", &addressed);
@@ -260,7 +275,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(
         news.contains(&format!(
-            "goal [{}] \"Group-addressed goal\" is now todo",
+            "goal [{}] \"Group-addressed goal for @Reviewers\" by peer mentions you",
             short(&addressed_goal)
         )),
         "unexpected news: {news}"
@@ -323,6 +338,21 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let unrelated_goal = id_after("Added goal ", &unrelated);
     pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
+    stdout(run(
+        compass,
+        &pile.path,
+        &[
+            "--persona",
+            "peer",
+            "note",
+            &unrelated_goal,
+            "group-tagged aside",
+            "--tag",
+            "reviewers",
+        ],
+    ));
+    pile.maintain_attention();
+    assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
     let direct = stdout(run(
         compass,
         &pile.path,
@@ -331,9 +361,8 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
             "peer",
             "note",
             &unrelated_goal,
-            "direct ping",
-            "--tag",
-            "reviewers",
+            // A leading `@` reads a file on the CLI; `@@` escapes it.
+            "@@reviewers direct ping",
         ],
     ));
     let direct_id = id_after("Added note ", &direct);
@@ -341,7 +370,7 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
     assert!(
         news.contains(&format!(
-            "note on [{}] \"Unrelated goal\" by peer: direct ping",
+            "note on [{}] \"Unrelated goal\" by peer mentions you: @reviewers direct ping",
             short(&unrelated_goal)
         )),
         "unexpected news: {news}"
@@ -369,23 +398,11 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
     ));
     let joining_id = id_after("Added note ", &joining);
     pile.maintain_attention();
-    let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(
-        news.contains(&format!(
-            "goal [{}] \"Participated goal\" is now todo",
-            short(&participated_goal)
-        )),
-        "unexpected news: {news}"
-    );
-    // A preview would leak an own note into the report; nothing of it appears.
-    assert!(
-        !news.contains("joining the discussion"),
-        "own note was presented: {news}"
-    );
-    let _ = &joining_id;
-    pile.maintain_attention();
+    // Writing on a goal subscribes nobody: neither the own note nor the
+    // goal's earlier status is news, and a later reply is not either.
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
-    let response = stdout(run(
+    let _ = &joining_id;
+    stdout(run(
         compass,
         &pile.path,
         &[
@@ -396,17 +413,6 @@ fn orient_wakes_once_for_visible_notes_and_keeps_own_notes_quiet() {
             "peer response",
         ],
     ));
-    let response_id = id_after("Added note ", &response);
-    pile.maintain_attention();
-    let news = stdout(run(orient, &pile.path, &["--persona", "me", "poll"]));
-    assert!(
-        news.contains(&format!(
-            "note on [{}] \"Participated goal\" by peer: peer response",
-            short(&participated_goal)
-        )),
-        "unexpected news: {news}"
-    );
-    let _ = &response_id;
     pile.maintain_attention();
     assert!(stdout(run(orient, &pile.path, &["--persona", "me", "poll"])).is_empty());
 }

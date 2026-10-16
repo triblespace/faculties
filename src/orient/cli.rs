@@ -26,6 +26,13 @@ pub struct Cli {
     /// Contact/routing selector for directed news (Relations label or
     /// 32-char hex ID). Receipt history belongs to the signing zooid's key,
     /// not to this selector.
+    ///
+    /// Directed news for a persona: messages and mail to it or its groups;
+    /// Compass goals and notes that `@`-mention it or a group it belongs to;
+    /// other people's status changes and notes on goals tagged with its own
+    /// label (assignment); newly status-bearing windows; Teams, Discord and
+    /// health news. Group-name tags are topics, and writing on a goal does
+    /// not subscribe you to it. Your own actions never wake you.
     #[arg(long, env = "PERSONA")]
     persona: Option<String>,
     /// Zooid identity and durable signing key. Defaults to the pile-adjacent key.
@@ -112,6 +119,10 @@ enum Command {
         todo_limit: usize,
     },
     /// Wait for directed news, an actionable local health alert, or a stale report
+    ///
+    /// Compass news is addressed, not subscribed: an `@label` mention of the
+    /// persona or of a group it belongs to, or a change by someone else on a
+    /// goal tagged with the persona's own label. See `--persona`.
     Wait {
         #[command(subcommand)]
         target: Option<WaitTarget>,

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Compass `@mentions` replace tag subscriptions as Orient's way of
+  addressing people.** An `@label` in a goal title or note (a persona label,
+  alias or Relations group name, case-insensitive, starting the text or after
+  a non-alphanumeric character) is resolved when Compass writes and recorded
+  on that goal or note as `board::mention` (attribute
+  `8D328575788173EDF8D4CA9373B5BB6F`), an annotation that never changes the
+  entity's id; an `@label` matching nobody warns on stderr and the write still
+  succeeds. Orient reports a mention once to the persona, or to every member
+  of the mentioned group, unless they wrote it. A goal tagged with a persona's
+  own label stays assigned to it. Group-name tags no longer wake anyone, and
+  writing a note or a status move on a goal no longer subscribes the writer to
+  it.
+
 - Follow the network library's default walk preference in foreground Leech
   construction instead of forcing Prefix. Collection selection and one-way
   authorization are unchanged; this source change does not restart a service.

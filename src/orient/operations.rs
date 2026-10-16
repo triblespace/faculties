@@ -598,12 +598,20 @@ fn entity_tags(query: &OrientQuery<'_>, entity_id: Id) -> Result<Vec<String>> {
     Ok(tags)
 }
 
+/// Foreign or unattributed notes this persona should hear about, each with
+/// its goal and whether the note mentions the persona.
+///
+/// A note is visible when an `@mention` on it names one of `addressees` (the
+/// persona's settled identities and the groups they belong to), when it
+/// carries one of the persona's own labels as a tag, or when its goal is
+/// assigned to the persona. The persona's own notes never are.
 fn visible_notes(
     query: &OrientQuery<'_>,
     own_identities: &HashSet<Id>,
-    attention_keys: &HashSet<String>,
-    relevant_goals: &HashSet<Id>,
-) -> Result<BTreeMap<Id, Id>> {
+    assignment_keys: &HashSet<String>,
+    addressees: &HashSet<Id>,
+    assigned_goals: &HashSet<Id>,
+) -> Result<BTreeMap<Id, (Id, bool)>> {
     let space = query.compass;
     let mut notes = BTreeMap::new();
     for (note_id, goal_id) in find!(
@@ -625,11 +633,16 @@ fn visible_notes(
         if own_note {
             continue;
         }
-        let directly_addressed = entity_tags(query, note_id)?
-            .iter()
-            .any(|tag| attention_keys.contains(&tag.to_ascii_lowercase()));
-        if directly_addressed || relevant_goals.contains(&goal_id) {
-            insert_note_goal(&mut notes, note_id, goal_id);
+        let mentioned = exists!((target: Id), and!(
+            addressees.has(target),
+            pattern!(space, [{ note_id @ board::mention: ?target }])
+        ));
+        let directly_addressed = mentioned
+            || entity_tags(query, note_id)?
+                .iter()
+                .any(|tag| assignment_keys.contains(&tag.to_ascii_lowercase()));
+        if directly_addressed || assigned_goals.contains(&goal_id) {
+            insert_note_goal(&mut notes, note_id, goal_id, mentioned);
         }
     }
     Ok(notes)
@@ -3328,62 +3341,29 @@ fn persona_keys(query: &OrientQuery<'_>, persona: Id) -> Result<HashSet<String>>
         .collect()
 }
 
-/// Every textual group selector that may currently address `persona`.
+/// Every Relations group whose mention addresses `persona`.
 ///
 /// Attention is a conservative read projection, not a mutation precondition:
 /// a legitimate fork in one group must not disable every watcher. We therefore
-/// inspect each maximal snapshot independently. A fork head names an
-/// attention group only when that same snapshot contains the persona; names
-/// from a sibling head cannot borrow another head's membership. Settled
-/// same-person components still participate in membership, while an exact id
-/// without a Relations person record simply belongs to no group yet.
-fn group_attention_name_handles<P: TriblePattern>(
-    facts: &P,
-    persona: Id,
-) -> Result<Vec<relations::TextHandle>> {
+/// inspect each maximal snapshot independently, and a group addresses the
+/// persona when any one of its heads contains it. Settled same-person
+/// components still participate in membership, while an exact id without a
+/// Relations person record simply belongs to no group yet.
+fn persona_groups<P: TriblePattern>(facts: &P, persona: Id) -> Result<BTreeSet<Id>> {
     if !person_anchors(facts).contains(&persona) {
-        return Ok(Vec::new());
+        return Ok(BTreeSet::new());
     }
     let equivalent = IdentityIndex::from_relations(facts).component(persona)?;
-    let mut handles = BTreeSet::new();
-    for group in group_anchors(facts) {
-        for head in group_head_ids(facts, group) {
-            if group_members(facts, head)
-                .iter()
-                .any(|member| equivalent.contains(member))
-            {
-                handles.extend(find!(
-                    handle: relations::TextHandle,
-                    pattern!(facts, [{ head @ metadata::name: ?handle }])
-                ));
-            }
-        }
-    }
-    Ok(handles.into_iter().collect())
-}
-
-fn group_attention_keys<R: BlobStoreList + BlobStoreGet, P: TriblePattern>(
-    reader: &R,
-    facts: &P,
-    persona: Id,
-) -> Result<HashSet<String>> {
-    group_attention_name_handles(facts, persona)?
+    Ok(group_anchors(facts)
         .into_iter()
-        .map(|handle| {
-            read_utf8(reader, handle, "Relations group name")
-                .map(|value| relations::lookup_key(&value))
+        .filter(|group| {
+            group_head_ids(facts, *group).into_iter().any(|head| {
+                group_members(facts, head)
+                    .iter()
+                    .any(|member| equivalent.contains(member))
+            })
         })
-        .collect()
-}
-
-fn attention_keys(query: &OrientQuery<'_>, persona: Id) -> Result<HashSet<String>> {
-    let mut keys = persona_keys(query, persona)?;
-    keys.extend(group_attention_keys(
-        &query.payloads,
-        query.relations,
-        persona,
-    )?);
-    Ok(keys)
+        .collect())
 }
 
 fn status_roster(query: &OrientQuery<'_>) -> Result<BTreeSet<Id>> {
@@ -3397,15 +3377,16 @@ fn status_roster(query: &OrientQuery<'_>) -> Result<BTreeSet<Id>> {
     .collect())
 }
 
-fn insert_note_goal(notes: &mut BTreeMap<Id, Id>, note_id: Id, goal_id: Id) {
+fn insert_note_goal(notes: &mut BTreeMap<Id, (Id, bool)>, note_id: Id, goal_id: Id, mention: bool) {
     notes
         .entry(note_id)
-        .and_modify(|existing| {
+        .and_modify(|(existing, mentioned)| {
             if goal_id < *existing {
                 *existing = goal_id;
             }
+            *mentioned |= mention;
         })
-        .or_insert(goal_id);
+        .or_insert((goal_id, mention));
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3457,6 +3438,13 @@ enum AttentionEvent {
     Note {
         note: Id,
         goal: Id,
+        /// The note `@`-mentions the reader or one of its groups.
+        mention: bool,
+    },
+    /// A goal whose title `@`-mentions the reader or one of its groups,
+    /// presented once under the goal's own id.
+    GoalMention {
+        goal: Id,
     },
     StatusWindow(Id),
     Health {
@@ -3480,6 +3468,7 @@ impl AttentionEvent {
             | Self::StatusWindow(id) => *id,
             Self::Goal { event, .. } => *event,
             Self::Note { note, .. } => *note,
+            Self::GoalMention { goal } => *goal,
             Self::Health { event, .. } | Self::ServiceFailure { event, .. } => *event,
         }
     }
@@ -3498,9 +3487,17 @@ impl AttentionEvent {
             Self::Goal { goal, status, .. } => {
                 format!("goal [{}] is now {status}", fmt_id(*goal))
             }
-            Self::Note { note, goal } => {
-                format!("new note [{}] on goal [{}]", fmt_id(*note), fmt_id(*goal))
-            }
+            Self::Note {
+                note,
+                goal,
+                mention,
+            } => format!(
+                "new note [{}] on goal [{}]{}",
+                fmt_id(*note),
+                fmt_id(*goal),
+                if *mention { " mentions you" } else { "" }
+            ),
+            Self::GoalMention { goal } => format!("goal [{}] mentions you", fmt_id(*goal)),
             Self::StatusWindow(window) => {
                 format!("new status window [{}]", fmt_id(*window))
             }
@@ -3571,56 +3568,87 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
         view.insert(AttentionEvent::Discord(message));
     }
 
-    let attention_keys = attention_keys(query, persona_id)?;
+    // A goal is assigned to a persona by carrying one of its own labels as a
+    // tag; a group name used as a tag is only a topic. Groups, and people
+    // without an assignment, are addressed by `@mention` alone, and writing
+    // on a goal subscribes nobody to it.
+    let assignment_keys = persona_keys(query, persona_id)?;
+    let mut addressees = own_identities.clone();
+    addressees.extend(persona_groups(query.relations, persona_id)?);
 
-    let mut relevant_goals = HashSet::new();
+    let mut assigned_goals = HashSet::new();
     for id in find!(id: Id, pattern!(query.compass, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
-        let authored_status = exists!((by: Id), and!(own_identities.has(by), pattern!(query.compass, [{
-            _?evt @
-            metadata::tag: &KIND_STATUS_ID,
-            board::status_of: &id,
-            board::by: ?by,
-        }])));
-        let authored_note = exists!((by: Id), and!(own_identities.has(by), pattern!(query.compass, [{
-            _?evt @
-            metadata::tag: &KIND_NOTE_ID,
-            board::task: &id,
-            board::note: _?body,
-            board::by: ?by,
-        }])));
-        let involved = authored_status || authored_note;
-        let tags = entity_tags(query, id)?;
-        let addressed = tags
+        let assigned = entity_tags(query, id)?
             .iter()
-            .any(|tag| attention_keys.contains(&tag.to_ascii_lowercase()));
-        if involved || addressed {
-            relevant_goals.insert(id);
-            match latest_goal_status(query, id)? {
-                Some((event, status, _)) => {
-                    let authored = exists!((by: Id), and!(
-                        own_identities.has(by),
-                        pattern!(query.compass, [{ event @ board::by: ?by }])
-                    ));
-                    if !authored {
-                        view.insert(AttentionEvent::Goal {
-                            event,
-                            goal: id,
-                            status,
-                        });
-                    }
+            .any(|tag| assignment_keys.contains(&tag.to_ascii_lowercase()));
+        if !assigned {
+            continue;
+        }
+        assigned_goals.insert(id);
+        match latest_goal_status(query, id)? {
+            Some((event, status, _)) => {
+                let authored = exists!((by: Id), and!(
+                    own_identities.has(by),
+                    pattern!(query.compass, [{ event @ board::by: ?by }])
+                ));
+                if !authored {
+                    view.insert(AttentionEvent::Goal {
+                        event,
+                        goal: id,
+                        status,
+                    });
                 }
-                None if addressed => view.insert(AttentionEvent::Goal {
-                    event: id,
-                    goal: id,
-                    status: "todo".to_owned(),
-                }),
-                None => {}
             }
+            None => view.insert(AttentionEvent::Goal {
+                event: id,
+                goal: id,
+                status: "todo".to_owned(),
+            }),
         }
     }
 
-    for (note, goal) in visible_notes(query, &own_identities, &attention_keys, &relevant_goals)? {
-        view.insert(AttentionEvent::Note { note, goal });
+    // A goal has no author of its own: `compass add` attributes the status
+    // event it writes at the goal's creation time, so that event's actor is
+    // the goal's author.
+    for (goal, _) in find!(
+        (goal: Id, target: Id),
+        and!(
+            addressees.has(target),
+            pattern!(query.compass, [{ ?goal @
+                metadata::tag: &KIND_GOAL_ID,
+                board::mention: ?target,
+            }])
+        )
+    ) {
+        let own_goal = exists!((by: Id), and!(
+            own_identities.has(by),
+            pattern!(query.compass, [
+                { goal @ metadata::created_at: _?at },
+                { _?event @
+                    metadata::tag: &KIND_STATUS_ID,
+                    board::status_of: &goal,
+                    board::by: ?by,
+                    metadata::created_at: _?at,
+                },
+            ])
+        ));
+        if !own_goal {
+            view.insert(AttentionEvent::GoalMention { goal });
+        }
+    }
+
+    for (note, (goal, mention)) in visible_notes(
+        query,
+        &own_identities,
+        &assignment_keys,
+        &addressees,
+        &assigned_goals,
+    )? {
+        view.insert(AttentionEvent::Note {
+            note,
+            goal,
+            mention,
+        });
     }
 
     for window in status_roster(query)? {
@@ -4112,9 +4140,14 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
                 _ => format!("goal {name} is now {status}{actor}"),
             }
         }
-        AttentionEvent::Note { note, goal } => {
+        AttentionEvent::Note {
+            note,
+            goal,
+            mention,
+        } => {
             let name = news_goal_name(query, *goal);
             let actor = news_actor(query, *note);
+            let mentions = if *mention { " mentions you" } else { "" };
             let note = *note;
             let preview = find!(
                 handle: compass::TextHandle,
@@ -4125,7 +4158,27 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
             .and_then(|body| clip_line(&body, NEWS_PREVIEW_CHARS))
             .map(|body| format!(": {body}"))
             .unwrap_or_default();
-            format!("note on {name}{actor}{preview}")
+            format!("note on {name}{actor}{mentions}{preview}")
+        }
+        AttentionEvent::GoalMention { goal } => {
+            let goal = *goal;
+            let actor = find!(
+                by: Id,
+                pattern!(query.compass, [
+                    { goal @ metadata::created_at: _?at },
+                    { _?event @
+                        metadata::tag: &KIND_STATUS_ID,
+                        board::status_of: &goal,
+                        board::by: ?by,
+                        metadata::created_at: _?at,
+                    },
+                ])
+            )
+            .next()
+            .and_then(|by| read_native_person_label(query, by).ok())
+            .map(|label| format!(" by {label}"))
+            .unwrap_or_default();
+            format!("goal {}{actor} mentions you", news_goal_name(query, goal))
         }
         AttentionEvent::StatusWindow(window) => match read_native_person_label(query, *window) {
             Ok(label) => format!("new status window {label}"),
@@ -6253,17 +6306,16 @@ mod tests {
                     expected.extend([status_id, note_id]);
                 }
             }
-            // Involvement follows the same settled identity relation: another
-            // person's later update on an untagged goal still deserves attention.
-            let (goal, goal_id) = compass::goal_fragment("involved", vec![], None, now).unwrap();
+            // Writing on a goal subscribes nobody: another person's later
+            // update on an untagged goal the persona (here as its alias) once
+            // commented on is not news.
+            let (goal, goal_id) = compass::goal_fragment("commented", vec![], None, now).unwrap();
             facts += goal;
             facts +=
                 compass::note_fragment(goal_id, "mine", vec![], vec![], vec![], Some(alias), now)
                     .unwrap()
                     .0;
-            let status = compass::status_fragment(goal_id, "done", Some(other), now).unwrap();
-            expected.insert(status.root().unwrap());
-            facts += status;
+            facts += compass::status_fragment(goal_id, "done", Some(other), now).unwrap();
             // A goal without a status/actor is likewise unknown, not self.
             let (goal, goal_id) =
                 compass::goal_fragment("bare", vec!["observer".to_owned()], None, now).unwrap();
@@ -9186,6 +9238,7 @@ mod tests {
         later.insert(AttentionEvent::Note {
             note: event,
             goal: id(11),
+            mention: false,
         });
         assert_eq!(
             later.pending(&presented).ids().collect::<Vec<_>>(),
@@ -9293,6 +9346,281 @@ mod tests {
             assert!(!text.contains(&goal_hex), "{text}");
             pile.close().unwrap();
         });
+    }
+
+    /// Three people, `ada` (the reader in most of these), `bea` and `cy`,
+    /// and one group `crew` holding all three.
+    struct MentionCast {
+        relations: Fragment,
+        ada: Id,
+        bea: Id,
+        cy: Id,
+        crew: Id,
+    }
+
+    fn mention_cast() -> MentionCast {
+        let (ada, bea, cy, crew) = (id(120), id(121), id(122), id(123));
+        let mut relations = Fragment::empty();
+        for (person, label) in [(ada, "ada"), (bea, "bea"), (cy, "cy")] {
+            relations += relations::person_fragment(
+                person,
+                relations::ProfileInput {
+                    label: label.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0;
+        }
+        let (group, snapshot) = relations::group_create_fragment(crew, "crew").unwrap();
+        relations += group;
+        relations +=
+            relations::group_snapshot_fragment(crew, "crew", &[ada, bea, cy], &[snapshot]).unwrap();
+        MentionCast {
+            relations,
+            ada,
+            bea,
+            cy,
+            crew,
+        }
+    }
+
+    /// Commit `relations` and `compass` through the sources a watcher reads,
+    /// then return, for each reader, the attention events it would be shown
+    /// and the report it would print.
+    fn mention_news(
+        relations: Fragment,
+        compass_facts: Fragment,
+        readers: &[Id],
+    ) -> Vec<(BTreeSet<Id>, String)> {
+        runtime().unwrap().block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, relations)
+                .unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, compass_facts)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let mut seen = Vec::new();
+            for reader_id in readers {
+                let view =
+                    load_attention_view(&observation.query(&observation.snapshot), *reader_id)
+                        .unwrap();
+                let news = read(&mut pile, &observation.snapshot, |reader| {
+                    let query = observation.query(reader);
+                    prepare_news_once(&query, *reader_id)
+                })
+                .await
+                .unwrap();
+                let text = match news {
+                    News::Report { text, .. } => text,
+                    _ => String::new(),
+                };
+                seen.push((view.ids().collect(), text));
+            }
+            pile.close().unwrap();
+            seen
+        })
+    }
+
+    fn mention_moment(seconds: f64) -> IntervalValue {
+        clock::point(Epoch::from_tai_seconds(seconds)).unwrap()
+    }
+
+    /// A goal created at `at` by `by`, the way `compass add` writes one: the
+    /// goal and its first status share their creation time.
+    fn mention_goal(
+        facts: &mut Fragment,
+        title: &str,
+        tags: &[&str],
+        by: Id,
+        mentions: &[Id],
+        at: f64,
+    ) -> (Id, Id) {
+        let (goal, goal_id) = compass::goal_fragment(
+            title,
+            tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            None,
+            mention_moment(at),
+        )
+        .unwrap();
+        *facts += goal;
+        *facts += compass::mention_fragment(goal_id, mentions);
+        let status =
+            compass::status_fragment(goal_id, "todo", Some(by), mention_moment(at)).unwrap();
+        let status_id = status.root().unwrap();
+        *facts += status;
+        (goal_id, status_id)
+    }
+
+    fn mention_note(
+        facts: &mut Fragment,
+        goal: Id,
+        body: &str,
+        by: Id,
+        mentions: &[Id],
+        at: f64,
+    ) -> Id {
+        let (note, note_id) = compass::note_fragment(
+            goal,
+            body,
+            vec![],
+            vec![],
+            vec![],
+            Some(by),
+            mention_moment(at),
+        )
+        .unwrap();
+        *facts += note;
+        *facts += compass::mention_fragment(note_id, mentions);
+        note_id
+    }
+
+    /// An `@ada` in a note or a goal title is news for ada and says so; the
+    /// same mention written by ada itself is not, and unmentioned notes on a
+    /// goal nobody assigned to ada stay quiet.
+    #[test]
+    fn a_persona_mention_wakes_it_but_never_its_own_author() {
+        let cast = mention_cast();
+        let mut facts = Fragment::empty();
+        let (goal, _) = mention_goal(&mut facts, "Ship the sync daemon", &[], cast.bea, &[], 1.0);
+        let mentioned = mention_note(
+            &mut facts,
+            goal,
+            "@ada can you check the lock order?",
+            cast.bea,
+            &[cast.ada],
+            2.0,
+        );
+        mention_note(&mut facts, goal, "unrelated progress", cast.bea, &[], 3.0);
+        mention_note(
+            &mut facts,
+            goal,
+            "note to self @ada",
+            cast.ada,
+            &[cast.ada],
+            4.0,
+        );
+        let (titled, _) = mention_goal(
+            &mut facts,
+            "Review the receipts @ada",
+            &[],
+            cast.bea,
+            &[cast.ada],
+            5.0,
+        );
+        mention_goal(
+            &mut facts,
+            "My own @ada reminder",
+            &[],
+            cast.ada,
+            &[cast.ada],
+            6.0,
+        );
+
+        let seen = mention_news(cast.relations, facts, &[cast.ada, cast.bea]);
+        let (cc_events, cc_text) = &seen[0];
+        assert_eq!(cc_events, &BTreeSet::from([mentioned, titled]), "{cc_text}");
+        let short = &fmt_id(goal)[..8];
+        assert!(
+            cc_text.contains(&format!(
+                "News: note on [{short}] \"Ship the sync daemon\" by bea mentions you: @ada can you check the lock order?"
+            )),
+            "{cc_text}"
+        );
+        assert!(
+            cc_text.contains(&format!(
+                "News: goal [{}] \"Review the receipts @ada\" by bea mentions you",
+                &fmt_id(titled)[..8]
+            )),
+            "{cc_text}"
+        );
+        let (bea_events, bea_text) = &seen[1];
+        assert!(bea_events.is_empty(), "{bea_text}");
+    }
+
+    /// `@crew` addresses the group: every member hears it except the
+    /// member who wrote it.
+    #[test]
+    fn a_group_mention_wakes_every_member_except_its_author() {
+        let cast = mention_cast();
+        let mut facts = Fragment::empty();
+        let (goal, _) = mention_goal(&mut facts, "Crew upkeep", &[], cast.bea, &[], 1.0);
+        let note = mention_note(
+            &mut facts,
+            goal,
+            "@crew the cohort is staged",
+            cast.bea,
+            &[cast.crew],
+            2.0,
+        );
+        let seen = mention_news(cast.relations, facts, &[cast.ada, cast.cy, cast.bea]);
+        assert_eq!(seen[0].0, BTreeSet::from([note]), "{}", seen[0].1);
+        assert_eq!(seen[1].0, BTreeSet::from([note]), "{}", seen[1].1);
+        assert!(seen[2].0.is_empty(), "{}", seen[2].1);
+    }
+
+    /// A group name used as a goal tag is a topic: neither the goal, its
+    /// status changes nor its notes wake any member.
+    #[test]
+    fn a_group_tag_without_a_mention_wakes_nobody() {
+        let cast = mention_cast();
+        let mut facts = Fragment::empty();
+        let (goal, _) = mention_goal(&mut facts, "A crew topic", &["crew"], cast.bea, &[], 1.0);
+        facts +=
+            compass::status_fragment(goal, "doing", Some(cast.bea), mention_moment(2.0)).unwrap();
+        mention_note(
+            &mut facts,
+            goal,
+            "progress on the topic",
+            cast.bea,
+            &[],
+            3.0,
+        );
+        let seen = mention_news(cast.relations, facts, &[cast.ada, cast.cy]);
+        assert!(seen[0].0.is_empty(), "{}", seen[0].1);
+        assert!(seen[1].0.is_empty(), "{}", seen[1].1);
+    }
+
+    /// A goal tagged with a persona's own label is assigned to it: other
+    /// people's status changes and notes on it remain news, its own do not.
+    #[test]
+    fn a_persona_tagged_goal_keeps_waking_its_assignee() {
+        let cast = mention_cast();
+        let mut facts = Fragment::empty();
+        let (goal, _) = mention_goal(&mut facts, "Assigned work", &["ada"], cast.bea, &[], 1.0);
+        let moved =
+            compass::status_fragment(goal, "doing", Some(cast.bea), mention_moment(2.0)).unwrap();
+        let moved_id = moved.root().unwrap();
+        facts += moved;
+        let note = mention_note(&mut facts, goal, "context for you", cast.bea, &[], 3.0);
+        mention_note(&mut facts, goal, "my own progress", cast.ada, &[], 4.0);
+        let seen = mention_news(cast.relations, facts, &[cast.ada, cast.cy]);
+        assert_eq!(seen[0].0, BTreeSet::from([moved_id, note]), "{}", seen[0].1);
+        assert!(seen[1].0.is_empty(), "{}", seen[1].1);
+    }
+
+    /// Writing a note on a goal, or moving it, no longer subscribes the
+    /// writer to everything that happens on it afterwards.
+    #[test]
+    fn authoring_on_a_goal_does_not_subscribe_to_it() {
+        let cast = mention_cast();
+        let mut facts = Fragment::empty();
+        let (goal, _) = mention_goal(&mut facts, "Somebody's goal", &[], cast.bea, &[], 1.0);
+        mention_note(&mut facts, goal, "a passing comment", cast.ada, &[], 2.0);
+        facts +=
+            compass::status_fragment(goal, "doing", Some(cast.ada), mention_moment(3.0)).unwrap();
+        facts +=
+            compass::status_fragment(goal, "done", Some(cast.bea), mention_moment(4.0)).unwrap();
+        mention_note(&mut facts, goal, "a later reply", cast.bea, &[], 5.0);
+        let seen = mention_news(cast.relations, facts, &[cast.ada]);
+        assert!(seen[0].0.is_empty(), "{}", seen[0].1);
     }
 
     /// Discord is read like Teams: a message somebody else wrote is news with

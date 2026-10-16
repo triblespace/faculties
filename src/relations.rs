@@ -1594,6 +1594,79 @@ where
     Ok(selector_outcome(settled, forked, BTreeSet::new()))
 }
 
+/// The person and group anchors a Compass `@label` addresses: every
+/// addressable person whose current profile label or alias, and every group
+/// whose current name, equals `label` under [`lookup_key`].
+///
+/// These are the same textual keys Orient's attention has always matched,
+/// so an id or id prefix is never a mention. Every head of a forked profile or
+/// group is consulted, as Orient does, so a concurrent edit cannot silence a
+/// mention; a person whose lifecycle heads all say retired is not
+/// addressable. An anchor whose snapshot track cannot be read is skipped
+/// rather than failing the write that mentions something else; payload reads
+/// still propagate, so an acquiring reader can fetch them.
+pub fn mention_targets<Store, P>(reader: &Store, facts: &P, label: &str) -> Result<BTreeSet<Id>>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    let key = lookup_key(label);
+    let mut targets = BTreeSet::new();
+    if key.is_empty() {
+        return Ok(targets);
+    }
+    let heads_of = |head: Head| match head {
+        Head::Unique(id) => vec![id],
+        Head::Forked(ids) => ids,
+        Head::Missing => Vec::new(),
+    };
+    for person in person_anchors(facts) {
+        let Ok(profiles) = profile_head(facts, person).map(heads_of) else {
+            continue;
+        };
+        let mut matched = false;
+        'heads: for head in profiles {
+            let Ok(snapshot) = profile_snapshot(facts, head) else {
+                continue;
+            };
+            for handle in std::iter::once(snapshot.label).chain(snapshot.aliases) {
+                if lookup_key(&load_text_from(reader, handle)?) == key {
+                    matched = true;
+                    break 'heads;
+                }
+            }
+        }
+        if !matched {
+            continue;
+        }
+        let retired = match lifecycle_head(facts, person) {
+            Ok(Head::Missing) => false,
+            Ok(head) => heads_of(head)
+                .into_iter()
+                .all(|id| lifecycle_snapshot(facts, id).is_ok_and(|snapshot| snapshot.retired)),
+            Err(_) => false,
+        };
+        if !retired {
+            targets.insert(person);
+        }
+    }
+    for group_id in group_anchors(facts) {
+        let Ok(heads) = group_head(facts, group_id).map(heads_of) else {
+            continue;
+        };
+        for head in heads {
+            let Ok(snapshot) = group_snapshot(facts, head) else {
+                continue;
+            };
+            if lookup_key(&load_text_from(reader, snapshot.name)?) == key {
+                targets.insert(group_id);
+                break;
+            }
+        }
+    }
+    Ok(targets)
+}
+
 /// Settled semantic relation between two exact person anchors.
 ///
 /// `Unknown` means there is no settled path proving either outcome. Mixed

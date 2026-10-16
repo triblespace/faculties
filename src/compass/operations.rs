@@ -16,7 +16,7 @@ use crate::storage::{self, AcquiringReader, FactArchive, FacultySnapshot, Facult
 use crate::{clock, compass, relations};
 use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -82,6 +82,9 @@ pub struct AddedGoal {
     pub goal: Id,
     pub status_event: Id,
     pub note: Option<Id>,
+    /// `@label` tokens in the title or note that named no Relations person
+    /// or group. The write succeeded; nobody was addressed by these.
+    pub unresolved_mentions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,6 +98,9 @@ pub struct MovedGoal {
 pub struct AddedNote {
     pub goal: Id,
     pub note: Id,
+    /// `@label` tokens in the note that named no Relations person or group.
+    /// The write succeeded; nobody was addressed by these.
+    pub unresolved_mentions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -251,6 +257,32 @@ fn extract_reference_values(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// What each `@label` of one write resolved to through Relations, keyed by
+/// [`relations::lookup_key`] and keeping the spelling the author used. A label
+/// that resolves to nothing keeps an empty set, so the write can name it in a
+/// warning and still succeed.
+#[derive(Clone, Debug, Default)]
+struct Mentions(BTreeMap<String, (String, BTreeSet<Id>)>);
+
+impl Mentions {
+    /// Every anchor the `@label` tokens of `text` resolved to.
+    fn targets(&self, text: &str) -> Vec<Id> {
+        compass::mention_labels(text)
+            .iter()
+            .filter_map(|label| self.0.get(&relations::lookup_key(label)))
+            .flat_map(|(_, targets)| targets.iter().copied())
+            .collect()
+    }
+
+    fn unresolved(&self) -> Vec<String> {
+        self.0
+            .values()
+            .filter(|(_, targets)| targets.is_empty())
+            .map(|(label, _)| label.clone())
+            .collect()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CompassStorage<'a> {
     storage: &'a Storage,
@@ -306,10 +338,12 @@ impl CompassStorage<'_> {
     fn update<P, T>(
         &self,
         persona: Option<&str>,
+        mentions: &[String],
         mut prepare: impl FnMut(
             &FactArchive,
             &AcquiringReader<FacultySnapshot>,
             Option<Id>,
+            &Mentions,
         ) -> Result<P>,
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
     ) -> Result<T> {
@@ -330,7 +364,7 @@ impl CompassStorage<'_> {
             let compass_rank9 = pile
                 .attach::<Rank9AcceleratedSuccinctArchiveBlob>(compass_source, compass_succinct)
                 .context("register Compass Rank9 collection")?;
-            let relations_rank9 = if persona.is_some() {
+            let relations_rank9 = if persona.is_some() || !mentions.is_empty() {
                 let source = self.storage.open_collection_read(
                     pile,
                     RELATIONS_SCOPE_ID,
@@ -365,14 +399,30 @@ impl CompassStorage<'_> {
             // ensures its own images after it commits.
             let facts = storage::acquire_facts(&reader, compass_rank9)
                 .context("read Compass fact collection")?;
-            let by = if let (Some(persona), Some(rank9)) = (persona, relations_rank9) {
-                let relations = storage::acquire_facts(&reader, rank9)
-                    .context("read Relations fact collection for Compass persona")?;
-                Some(resolve_persona_id(&relations, &reader, persona)?)
-            } else {
-                None
+            let relations = relations_rank9
+                .map(|rank9| {
+                    storage::acquire_facts(&reader, rank9)
+                        .context("read Relations fact collection for Compass persona and mentions")
+                })
+                .transpose()?;
+            let by = match (persona, &relations) {
+                (Some(persona), Some(relations)) => {
+                    Some(resolve_persona_id(relations, &reader, persona)?)
+                }
+                _ => None,
             };
-            let prepared = prepare(&facts, &reader, by)?;
+            let mut resolved = Mentions::default();
+            if let Some(relations) = &relations {
+                for label in mentions {
+                    let key = relations::lookup_key(label);
+                    if resolved.0.contains_key(&key) {
+                        continue;
+                    }
+                    let targets = relations::mention_targets(&reader, relations, label)?;
+                    resolved.0.insert(key, (label.clone(), targets));
+                }
+            }
+            let prepared = prepare(&facts, &reader, by, &resolved)?;
             let (fragment, value) = author(prepared)?;
             if let Some(fragment) = fragment {
                 crate::collection_names::require_command_write_admission_acquiring(
@@ -848,20 +898,29 @@ fn add_goal(
 ) -> Result<AddedGoal> {
     let status = compass::canonical_status(status)?;
     let tags = compass::canonical_tags(tags)?;
+    let mut labels = compass::mention_labels(&title);
+    labels.extend(
+        note.as_deref()
+            .map(compass::mention_labels)
+            .unwrap_or_default(),
+    );
     storage.update(
         persona,
-        |space, _reader, by_id| {
+        &labels,
+        |space, _reader, by_id, mentions| {
             let parent_id = parent
                 .as_deref()
                 .map(|parent| resolve_task_id(parent, space))
                 .transpose()?;
-            Ok((parent_id, by_id))
+            Ok((parent_id, by_id, mentions.clone()))
         },
-        |(parent_id, by_id)| {
+        |(parent_id, by_id, mentions)| {
             let now = clock::point_now()?;
             let mut change = compass::kind_catalog_fragment();
+            let title_mentions = mentions.targets(&title);
             let (goal, task_ref) = compass::goal_fragment(title, tags, parent_id, now)?;
             change += goal;
+            change += compass::mention_fragment(task_ref, &title_mentions);
             let status = compass::status_fragment(task_ref, status, by_id, now)?;
             let status_event = status.root().expect("status event exports one root");
             change += status;
@@ -869,9 +928,11 @@ fn add_goal(
             let mut note_ref = None;
             if let Some(note) = note {
                 let references = extract_reference_values(&note);
+                let note_mentions = mentions.targets(&note);
                 let (record, note_id) =
                     compass::note_fragment(task_ref, note, vec![], references, vec![], by_id, now)?;
                 change += record;
+                change += compass::mention_fragment(note_id, &note_mentions);
                 note_ref = Some(note_id);
             }
             Ok((
@@ -880,6 +941,7 @@ fn add_goal(
                     goal: task_ref,
                     status_event,
                     note: note_ref,
+                    unresolved_mentions: mentions.unresolved(),
                 },
             ))
         },
@@ -919,7 +981,8 @@ fn move_goal(
     let rendered_status = status.clone();
     storage.update(
         persona,
-        |space, _reader, by_id| Ok((resolve_task_id(&id, space)?, by_id)),
+        &[],
+        |space, _reader, by_id, _| Ok((resolve_task_id(&id, space)?, by_id)),
         |(task_id, by_id)| {
             let mut change = compass::kind_catalog_fragment();
             let record = compass::status_fragment(task_id, status, by_id, clock::point_now()?)?;
@@ -957,19 +1020,22 @@ fn add_note(
     references.sort();
     references.dedup();
 
+    let labels = compass::mention_labels(&note);
     storage.update(
         persona,
-        |space, _reader, by_id| {
+        &labels,
+        |space, _reader, by_id, mentions| {
             let task_id = resolve_task_id(&id, space)?;
             let superseded_ids: Vec<Id> = supersedes
                 .iter()
                 .map(|input| resolve_note_id(input, space))
                 .collect::<Result<_>>()?;
-            Ok((task_id, superseded_ids, by_id))
+            Ok((task_id, superseded_ids, by_id, mentions.clone()))
         },
-        |(task_id, superseded_ids, by_id)| {
+        |(task_id, superseded_ids, by_id, mentions)| {
             let now = clock::point_now()?;
             let mut change = compass::kind_catalog_fragment();
+            let note_mentions = mentions.targets(&note);
             let (record, note_id) = compass::note_fragment(
                 task_id,
                 note,
@@ -980,11 +1046,13 @@ fn add_note(
                 now,
             )?;
             change += record;
+            change += compass::mention_fragment(note_id, &note_mentions);
             Ok((
                 Some(change),
                 AddedNote {
                     goal: task_id,
                     note: note_id,
+                    unresolved_mentions: mentions.unresolved(),
                 },
             ))
         },
@@ -1159,7 +1227,8 @@ fn prioritize(
 ) -> Result<PriorityChange> {
     storage.update(
         None,
-        |space, reader, _| {
+        &[],
+        |space, reader, _, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;
             let lower_id = resolve_task_id(&lower_input, space)?;
 
@@ -1214,7 +1283,8 @@ fn deprioritize(
 ) -> Result<PriorityChange> {
     storage.update(
         None,
-        |space, reader, _| {
+        &[],
+        |space, reader, _, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;
             let lower_id = resolve_task_id(&lower_input, space)?;
 

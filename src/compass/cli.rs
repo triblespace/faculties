@@ -9,7 +9,22 @@ use super::{render, AddOptions, Compass, ListOptions, NoteOptions};
 use crate::out::Out;
 
 #[derive(Parser)]
-#[command(version = crate::GIT_VERSION, name = "compass", about = "A small TribleSpace kanban faculty")]
+#[command(
+    version = crate::GIT_VERSION,
+    name = "compass",
+    about = "A small TribleSpace kanban faculty",
+    long_about = "A small TribleSpace kanban faculty.\n\n\
+        Addressing people: an `@label` in a goal title or note (a persona label, alias \
+        or Relations group name, matched case-insensitively) mentions that person or \
+        every member of that group, and `orient` reports it to them once. A mention \
+        starts the text or follows a non-alphanumeric character, so `ada@example.org` \
+        mentions nobody; an `@label` matching nobody is warned about on stderr and the \
+        write still succeeds. A title or note that BEGINS with a mention must start \
+        with `@@` (`@@ada please look`), because a leading `@` reads the text from a \
+        file. Tagging a goal with a persona's own label assigns it: \
+        that persona hears about other people's status changes and notes on it. Group \
+        names as tags are only topics, and writing on a goal subscribes nobody to it."
+)]
 pub struct Cli {
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]
@@ -30,16 +45,23 @@ pub struct Cli {
 enum Command {
     /// Add a new goal
     Add {
-        #[arg(help = "Goal title. Use @path for file input or @- for stdin.")]
+        #[arg(
+            help = "Goal title. Use @path for file input or @- for stdin. An `@label` inside the title mentions that persona or group."
+        )]
         title: String,
         #[arg(long, default_value = "todo")]
         status: String,
         /// Parent goal id (full 32-char hex id; use `compass resolve` to look up by prefix)
         #[arg(long)]
         parent: Option<String>,
+        /// Tag (repeatable). A persona's own Relations label assigns the goal
+        /// to that persona; any other tag, a group name included, is a topic.
         #[arg(long)]
         tag: Vec<String>,
-        #[arg(long, help = "Initial note. Use @path for file input or @- for stdin.")]
+        #[arg(
+            long,
+            help = "Initial note. Use @path for file input or @- for stdin. `@label` mentions inside it are recorded."
+        )]
         note: Option<String>,
     },
     /// List goals in kanban columns (hides done by default)
@@ -63,10 +85,13 @@ enum Command {
     Note {
         /// Full 32-char hex id
         id: String,
-        #[arg(help = "Note text. Use @path for file input or @- for stdin.")]
+        #[arg(
+            help = "Note text. Use @path for file input or @- for stdin. An `@label` inside the note mentions that persona or every member of that group."
+        )]
         note: String,
-        /// Short note tag (repeatable). Relations person or group tags request
-        /// attention through Orient without assigning workflow semantics.
+        /// Short note tag (repeatable). A persona's own Relations label also
+        /// directs the note to that persona; group names are topics (use an
+        /// `@group` mention in the text to address a group).
         #[arg(long)]
         tag: Vec<String>,
         /// Opaque exact reference stored on the note (repeatable). Recognized

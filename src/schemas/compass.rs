@@ -70,6 +70,12 @@ pub mod board {
         // Opaque, exact references attached to a note. Repeated handles keep
         // the ledger queryable without assigning any interpretation here.
         "FD59B704D0F1D06AF14102ADCB5F6FF0" unsafe as reference: inlineencodings::Handle<blobencodings::UTF8String>;
+        // A Relations person or group an `@label` in a goal title or note
+        // body addressed, resolved when Compass wrote it. Repeated, and an
+        // annotation beside the entity's core: it never enters the goal or
+        // note identity. Orient reads it as a directed mention. Minted with
+        // `trible genid` on 2026-10-16.
+        "8D328575788173EDF8D4CA9373B5BB6F" as mention: inlineencodings::GenId;
         "B88842D9D00361A0F2728C478C79D75C" unsafe as higher: inlineencodings::GenId;
         "18F3446C9E9281A248D370A56395A3F0" unsafe as lower: inlineencodings::GenId;
     }

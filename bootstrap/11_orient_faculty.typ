@@ -39,12 +39,13 @@ as presented, after the complete report has been flushed.
 `orient wait` blocks until the maintained target collections at one
 immutable pile snapshot contain news for this persona, rather than reporting
 every raw pile append. Directed news includes unread
-inbox or group messages, relevant goal transitions, new goals tagged with the
-persona or any Relations group containing it, newly status-bearing windows,
-newly visible Compass notes, and unread Mail. A foreign or unattributed note is visible
-when its goal involves the persona or carries such an attention tag itself;
-the persona's own attributed notes, status edits, and message acknowledgements
-stay quiet.
+inbox or group messages, Compass goals and notes whose `@label` mentions name
+the persona or any Relations group containing it, newly status-bearing windows,
+and unread Mail. A goal tagged with the persona's own label is assigned to it:
+other people's status changes and notes on that goal are news too. Group names
+used as tags are topics and address nobody, and writing on a goal does not
+subscribe the writer to it. The persona's own attributed notes, mentions, status
+edits, and message acknowledgements stay quiet.
 
 Orient owns no cursor, checkpoint, or shadow catalog. It derives the current
 attention set directly from maintained collection snapshots and subtracts the
