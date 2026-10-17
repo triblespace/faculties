@@ -61,12 +61,14 @@ home, size_gb, age_days = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 cutoff = time.time() - age_days * 86400
 lanes, scratch = os.path.join(home, "lanes"), os.path.join(home, "scratch")
 
+MARKERS = {".keep", ".leftovers-skip"}
+
 def scan(entry):
     """Allocated bytes and newest mtime under entry, on one filesystem, symlinks
     not followed. Raises OSError if any part cannot be read."""
     st = os.lstat(entry)
     dev = st.st_dev
-    total, newest = st.st_blocks * 512, st.st_mtime
+    total, newest = st.st_blocks * 512, 0.0
     if os.path.islink(entry) or not os.path.isdir(entry):
         return total, newest
     def fail(error):
@@ -78,7 +80,10 @@ def scan(entry):
             if s.st_dev != dev:
                 continue
             total += s.st_blocks * 512
-            newest = max(newest, s.st_mtime)
+            # Writing a marker is a decision about the entry, not use of it,
+            # so it must not make a kept entry look recently changed.
+            if name not in MARKERS:
+                newest = max(newest, s.st_mtime)
             if name in dirs:
                 keep.append(name)
         dirs[:] = keep
