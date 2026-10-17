@@ -331,7 +331,8 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
         .output()
         .unwrap();
     assert!(!denied.status.success());
-    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
+    assert!(String::from_utf8_lossy(&denied.stderr)
+        .contains("is not admitted to write the Compass collection"));
     assert_eq!(records(), before, "a refused command publishes nothing");
 
     // A prefix resolves against what the writer's store reads, which holds

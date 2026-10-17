@@ -1178,16 +1178,25 @@ async fn observe_snapshot_acquiring(
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+        // The stage lines are the refresh probe's evidence of which targets a
+        // refresh attached again; the acquiring reader must keep emitting them.
         let observe = |source: OrientSource| -> Result<OrientFact> {
-            let collection = reader.attached_acquiring(source.rank9)?;
-            let view = crate::storage::acquire_attached_facts(&collection)?;
+            let collection = trace_refresh_call(source.label, "attach", || {
+                reader.attached_acquiring(source.rank9)
+            })?;
+            let view = trace_refresh_call(source.label, "view", || {
+                crate::storage::acquire_attached_facts(&collection)
+            })?;
             Ok(OrientFact {
                 collection: collection.into_frozen(),
                 view,
             })
         };
         let [messages, mail, teams, discord, compass, relations, status] = fact_sources;
-        let presentations = reader.attached(receipts_target)?.into_frozen();
+        let presentations = trace_refresh_call("Orient receipts", "attach", || {
+            reader.attached(receipts_target)
+        })?
+        .into_frozen();
         let presentation_view = if receipts {
             // Receipt history is advisory: absence can repeat an event but
             // cannot suppress readable attention behind a network wait. Read
@@ -1202,10 +1211,14 @@ async fn observe_snapshot_acquiring(
                 ),
             ])
         };
-        let status_collection = reader.attached_acquiring(status_target)?;
-        let status_index = crate::storage::require_complete_attached_read(
-            status_collection.read_acquiring::<LwwIndex>()?,
-        )?;
+        let status_collection = trace_refresh_call("Compass status", "attach", || {
+            reader.attached_acquiring(status_target)
+        })?;
+        let status_index = trace_refresh_call("Compass status", "view", || {
+            crate::storage::require_complete_attached_read(
+                status_collection.read_acquiring::<LwwIndex>()?,
+            )
+        })?;
         Ok(OrientObservation {
             snapshot,
             payloads: DependencyTracker::default(),
@@ -1223,7 +1236,7 @@ async fn observe_snapshot_acquiring(
                     view: presentation_view,
                 },
             },
-            compass_status: status_index.query()?,
+            compass_status: trace_refresh_call("Compass status", "query", || status_index.query())?,
             compass_status_collection: status_collection.into_frozen(),
         })
     })
@@ -5032,6 +5045,7 @@ async fn cmd_observe(
         let mut pending_frame: Option<PendingWaitFrame> = None;
         let mut maintained_from: Option<FacultySnapshot> = None;
         let mut upkeep_interrupted = false;
+        let mut first_read_spent = false;
         // While directed news is still pending, the persona's own clocks keep
         // running against the pending observation. Their baseline and sweep
         // cadence mirror the ready frame's.
@@ -5089,6 +5103,8 @@ async fn cmd_observe(
             // body or preparation payload that answers within its budget lands.
             // Upkeep cut before it could select a frame also gets that retry:
             // resetting the same short cap would starve a slower acquisition.
+            // So does a view selection cut by the cap: the poll interval is
+            // granted once, or a selection slower than one interval never lands.
             let boundary = match pending_habit_deadline(
                 continuous,
                 pending_frame
@@ -5097,7 +5113,8 @@ async fn cmd_observe(
                 &pending_habits_seen,
             ) {
                 Some(deadline) => earliest(next_health_change, Some(deadline)),
-                None if pending_frame.is_none() && !upkeep_interrupted => {
+                None if pending_frame.is_none() && !upkeep_interrupted && !first_read_spent => {
+                    first_read_spent = true;
                     let first_read = Epoch::from_tai_seconds(
                         clock::now()?.to_tai_seconds() + poll.as_secs_f64(),
                     );
@@ -5375,7 +5392,8 @@ async fn cmd_observe(
             let maintenance_changed = maintained_from
                 .as_ref()
                 .is_none_or(|previous| wait_storage_changed(&sampled, previous));
-            let storage_changed = maintenance_changed || !current.is_current(&sampled);
+            let retained_is_current = current.is_current(&sampled);
+            let storage_changed = maintenance_changed || !retained_is_current;
             let probe = RefreshProbe::begin(
                 "ordinary",
                 &sampled,
@@ -5495,7 +5513,11 @@ async fn cmd_observe(
                         }
                         pending_frame = Some(pending);
                     }
-                    None => view_pending = true,
+                    // A cut attempt leaves the view pending only when the retained
+                    // frame no longer describes the sampled prefix. A pass started
+                    // for our own upkeep writes and cut by the command's timeout
+                    // is no evidence that the latest prefix is unreadable.
+                    None => view_pending = view_pending || !retained_is_current,
                 }
             } else if let Some(probe) = &probe {
                 probe.finish("clock_only");
@@ -8014,12 +8036,14 @@ mod tests {
         test_block_on(maintain_sources(&mut pile, &fixture.signer, &sources)).unwrap();
 
         // Already due when the watcher arms, body still missing: reported at
-        // once, nothing acknowledged.
+        // once, nothing acknowledged. The report returns the wait, so the
+        // window is only a ceiling: about 280 ms alone in a debug build, which
+        // 500 ms did not always cover with the whole suite running beside it.
         let armed = run_wait_for(
             &mut pile,
             &fixture,
             "cc",
-            Duration::from_millis(500),
+            Duration::from_secs(3),
             Duration::from_millis(100),
         );
         assert!(

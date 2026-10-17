@@ -1,7 +1,7 @@
 use anybytes::Bytes;
 use clap::Parser;
 use faculties::mcp::{Faculty, InvalidArguments, Server};
-use faculties::orient::{mcp, Orient, ShowOptions, WaitOptions, WakeOptions};
+use faculties::orient::{mcp, NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions};
 use faculties::out::{Out, Part};
 use faculties::schemas::swarm_health::{self as health, Component, Condition, Recorder, State};
 use serde_json::{json, Value};
@@ -319,6 +319,7 @@ fn daemon_keeps_observing_after_delivery_and_records_only_accepted_reports() {
             &WaitOptions {
                 timeout: Some(DAEMON_WINDOW),
                 poll_interval: Duration::from_millis(10),
+                form: NewsForm::Report,
             },
             &mut Out::new(&mut |part| {
                 let Part::Text { text } = &part else {
@@ -399,6 +400,7 @@ fn daemon_retains_due_habit_baseline_across_other_news_and_own_receipts() {
             &WaitOptions {
                 timeout: Some(DAEMON_WINDOW),
                 poll_interval: Duration::from_millis(10),
+                form: NewsForm::Report,
             },
             &mut Out::new(&mut |part| {
                 if parts.is_empty() {
@@ -559,7 +561,9 @@ fn refresh_probe_skips_unrelated_blobs_and_collection_records() {
     let before = f.records();
     let mut child = f
         .process(Some("1"))
-        .args(["wait", "--poll-ms", "20", "for", "2s"])
+        // A first read slower than one poll interval is cut and read again,
+        // which would count twice here; this test is about re-reads after it.
+        .args(["wait", "--poll-ms", "500", "for", "2s"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -635,7 +639,8 @@ fn wait_refreshes_an_arriving_message_target_without_rebuilding_health() {
     f.maintain();
     let mut child = f
         .process(Some("1"))
-        .args(["wait", "--poll-ms", "20", "for", "10s"])
+        // See the poll note in refresh_probe_skips_unrelated_blobs_and_collection_records.
+        .args(["wait", "--poll-ms", "500", "for", "10s"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -717,6 +722,7 @@ fn authorized_reporting_frontends_maintain_lagging_targets_without_a_daemon() {
                         &WaitOptions {
                             timeout: Some(Duration::from_secs(5)),
                             poll_interval: Duration::from_millis(2),
+                            form: NewsForm::Report,
                         },
                         &mut Out::new(&mut |part| {
                             parts.push(part);
@@ -1194,13 +1200,16 @@ fn a_one_shot_wait_reports_once_and_missing_persona_poll_remains_quiet() {
         .is_empty());
     f.message("ready before wait", f.persona);
     f.maintain();
+    // One-shot means not continuous, not zero time: a zero deadline ends the
+    // wait before its first view is read. The news returns it at once.
     let mut parts = Vec::new();
     f.orient()
         .wait(
             &f.who(),
             &WaitOptions {
-                timeout: Some(Duration::ZERO),
+                timeout: Some(Duration::from_secs(10)),
                 poll_interval: Duration::from_millis(1),
+                form: NewsForm::Report,
             },
             &mut Out::new(&mut |p| {
                 parts.push(p);
@@ -1351,6 +1360,7 @@ fn health_is_visible_before_unavailable_message_bodies_and_wait_records_only_wha
             &WaitOptions {
                 timeout: Some(Duration::ZERO),
                 poll_interval: Duration::from_millis(1),
+                form: NewsForm::Report,
             },
             &mut Out::new(&mut |part| {
                 parts.push(part);
@@ -1462,6 +1472,7 @@ fn wait_uses_the_same_reader_max_age_as_poll_and_show() {
     let options = WaitOptions {
         timeout: Some(Duration::ZERO),
         poll_interval: Duration::from_millis(1),
+        form: NewsForm::Report,
     };
     let mut parts = Vec::new();
     f.orient()
@@ -1501,13 +1512,16 @@ fn quiet_health_does_not_wake_wait_and_show_acceptance_owns_its_alert_receipt() 
     let mut recorder = f.health_recorder();
     f.health(&mut recorder, at + -10.0, State::Current, false);
     f.maintain();
+    // "No change" is only known once the wait has read a view and run out:
+    // a zero deadline ends it before the first read.
     let mut parts = Vec::new();
     f.orient()
         .wait(
             &f.who(),
             &WaitOptions {
-                timeout: Some(Duration::ZERO),
+                timeout: Some(Duration::from_secs(2)),
                 poll_interval: Duration::from_millis(1),
+                form: NewsForm::Report,
             },
             &mut Out::new(&mut |part| {
                 parts.push(part);
