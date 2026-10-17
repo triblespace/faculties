@@ -42,7 +42,7 @@ command -v python3 >/dev/null || { echo "leftovers: python3 is missing" >&2; exi
 [ -d "${HOME:-}" ] || { echo "leftovers: HOME is not a directory" >&2; exit 126; }
 
 exec python3 - "$HOME" "$SIZE_GB" "$AGE_DAYS" <<'PY'
-import os, subprocess, sys, time
+import os, stat, subprocess, sys, time
 
 home, size_gb, age_days = sys.argv[1], float(sys.argv[2]), float(sys.argv[3])
 cutoff = time.time() - age_days * 86400
@@ -99,7 +99,13 @@ lines = []
 for parent in (home, lanes, scratch):
     if not os.path.isdir(parent):
         continue
-    for name in sorted(os.listdir(parent)):
+    try:
+        names = sorted(os.listdir(parent))
+    except OSError as error:
+        # A parent we cannot list is a failed scan, never an empty one.
+        print(f"leftovers: cannot list {parent}: {error}", file=sys.stderr)
+        sys.exit(126)
+    for name in names:
         entry = os.path.join(parent, name)
         if parent == home and name.startswith("."):
             continue
@@ -118,9 +124,15 @@ for parent in (home, lanes, scratch):
             continue
         stamp = time.strftime("%Y-%m-%d", time.localtime(newest))
         keep = os.path.join(entry, ".keep")
-        if os.path.isfile(keep):
+        try:
+            keep_is_file = stat.S_ISREG(os.lstat(keep).st_mode)
+        except OSError:
+            keep_is_file = False
+        if keep_is_file:
+            # A regular file only, opened without following links, like the walk.
             kept += 1
-            with open(keep, errors="replace") as f:
+            fd = os.open(keep, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, errors="replace") as f:
                 reason = f.readline().strip()
             lines.append(f"kept    {size / 1e9:.1f} GB  last change {stamp}  {entry}  ({reason})")
             continue
