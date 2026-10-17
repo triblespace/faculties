@@ -8,7 +8,8 @@
 #   ingest-sessions.sh --all                 first run that imports every session here
 #
 # Each machine imports its own Claude Code transcripts (~/.claude/projects) and
-# Codex rollouts ($CODEX_HOME/sessions, default ~/.codex/sessions) with its own
+# Codex rollouts (every ~/.codex*/sessions, and $CODEX_HOME/sessions when it is
+# set elsewhere; the habit's check may run without the window's CODEX_HOME) with its own
 # key, and sync carries the commits to the other piles. Nothing is copied
 # between machines: a session present on two of them imports to the same nodes,
 # because a node's identity is its content and predecessors, not who imported
@@ -37,7 +38,11 @@ set -uo pipefail
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/faculties
 STAMP=$STATE/ingest-sessions.stamp
 CLAUDE_ROOT=$HOME/.claude/projects
-CODEX_ROOT=${CODEX_HOME:-$HOME/.codex}/sessions
+CODEX_ROOTS=()
+for d in "$HOME"/.codex*/sessions ${CODEX_HOME:+"$CODEX_HOME/sessions"}; do
+  [ -d "$d" ] || continue
+  case " ${CODEX_ROOTS[*]-} " in *" $d "*) ;; *) CODEX_ROOTS+=("$d") ;; esac
+done
 LOCK=${GB10_LOCK:-$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)/mary/scripts/gb10-lock.sh}
 HOST=$(hostname -s)
 CHUNK=300
@@ -59,7 +64,9 @@ case "${1:-}" in
   --due)
     if [ -f "$STAMP" ] && [ -z "$(find "$STAMP" -mmin +1200 -print)" ]; then exit 1; fi
     if [ ! -f "$STAMP" ]; then exit 0; fi
-    [ -n "$(changed "$CLAUDE_ROOT" | head -1)$(changed "$CODEX_ROOT" | head -1)" ]
+    hit=$(changed "$CLAUDE_ROOT" | head -1)
+    for d in ${CODEX_ROOTS[@]+"${CODEX_ROOTS[@]}"}; do [ -n "$hit" ] && break; hit=$(changed "$d" | head -1); done
+    [ -n "$hit" ]
     exit ;;
   --since)
     [ -n "${2:-}" ] || { echo "ingest-sessions: --since needs CCYYMMDDhhmm" >&2; exit 2; }
@@ -105,7 +112,9 @@ run_chunk() {
   fi
 }
 
-for pair in "claude-code:$CLAUDE_ROOT" "codex:$CODEX_ROOT"; do
+PAIRS=("claude-code:$CLAUDE_ROOT")
+for d in ${CODEX_ROOTS[@]+"${CODEX_ROOTS[@]}"}; do PAIRS+=("codex:$d"); done
+for pair in "${PAIRS[@]}"; do
   src=${pair%%:*} root=${pair#*:}
   chunk=() acc=0
   while IFS= read -r f; do
