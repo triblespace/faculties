@@ -21,6 +21,19 @@
 # changes and HEADs on no remote branch, from local refs only (it never
 # fetches).
 #
+# A second section lists cargo build output anywhere under $HOME: every
+# directory holding a CACHEDIR.TAG written by cargo and a .rustc_info.json (a
+# target directory; cargo's registry cache has the tag but not the file), at
+# any depth, that is at least 0.1 GB and has not changed within --age-days.
+# The generic cache-directory signature alone is not enough: Hugging Face and
+# Python virtual environments write the same first line. Dot-entries directly
+# under $HOME are not searched, nor any directory holding a file named
+# `.leftovers-skip`: put one in archived snapshots, whose contents are history
+# even when they look like build output. Top-level entries
+# alone miss it, because a work folder that is touched daily can hold hundreds
+# of gigabytes of stale targets (2026-10-17: 595 GB inside one such folder).
+# Build output can always be rebuilt; its lines say "clean", not "decide".
+#
 # The walk is Python (os.walk over lstat, one filesystem, no symlinks
 # followed), so it behaves the same on Linux and macOS. An entry that cannot be
 # read completely is reported as "error", never as untouched. It never deletes
@@ -139,10 +152,59 @@ for parent in (home, lanes, scratch):
         found += 1
         total_bytes += size
         lines.append(f"decide  {size / 1e9:.1f} GB  last change {stamp}  {entry}{git_state(entry)}")
+# Cargo build output at any depth, found by its CACHEDIR.TAG signature.
+CARGO_TAG = b"Signature: 8a477f597d28d172789f06886806bc55"
+home_dev = os.lstat(home).st_dev
+targets = []
+def note(error):
+    global errors
+    errors += 1
+    lines.append(f"error   {getattr(error, 'filename', '?')}  (could not search it: {error})")
+for path, dirs, files in os.walk(home, onerror=note):
+    if "CACHEDIR.TAG" in files and ".rustc_info.json" in files:
+        try:
+            with open(os.path.join(path, "CACHEDIR.TAG"), "rb") as f:
+                head = f.read(256)
+            if head.startswith(CARGO_TAG) and b"created by cargo" in head:
+                targets.append(path)
+                dirs[:] = []
+                continue
+        except OSError:
+            pass
+    keep = []
+    for d in dirs:
+        if path == home and d.startswith("."):
+            continue
+        if os.path.exists(os.path.join(path, d, ".leftovers-skip")):
+            continue
+        full = os.path.join(path, d)
+        try:
+            s = os.lstat(full)
+        except OSError:
+            continue
+        if d != ".git" and stat.S_ISDIR(s.st_mode) and s.st_dev == home_dev:
+            keep.append(d)
+    dirs[:] = keep
+to_clean = clean_bytes = 0
+for target in targets:
+    try:
+        size, newest = scan(target)
+    except OSError as error:
+        errors += 1
+        lines.append(f"error   {target}  (could not read all of it: {error})")
+        continue
+    if size < 0.1e9 or newest >= cutoff:
+        continue
+    to_clean += 1
+    clean_bytes += size
+    stamp = time.strftime("%Y-%m-%d", time.localtime(newest))
+    lines.append(f"clean   {size / 1e9:.1f} GB  last change {stamp}  {target}  (cargo build output)")
+
 for line in lines:
     print(line)
+print(f"leftovers: {to_clean} build outputs to clean ({clean_bytes / 1e9:.1f} GB) of {len(targets)} found")
 print(f"leftovers: {found} to decide ({total_bytes / 1e9:.1f} GB), {kept} kept, {errors} unreadable, "
       f"{examined} entries examined (lanes of any size, other entries of at least {size_gb:g} GB; "
       f"nothing changed in {age_days:g} days)")
-sys.exit(0 if found or errors else 1)
+sys.exit(0 if found or errors or to_clean else 1)
 PY
