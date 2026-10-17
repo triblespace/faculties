@@ -62,6 +62,10 @@ cutoff = time.time() - age_days * 86400
 lanes, scratch = os.path.join(home, "lanes"), os.path.join(home, "scratch")
 
 MARKERS = {".keep", ".leftovers-skip"}
+# Every (device, inode) is counted once across the whole report: hard links
+# would otherwise make the sum of the rows larger than what deleting them all
+# frees (found on 2026-10-17: 776 GB of rows for 692 GB allocated).
+counted = set()
 
 def scan(entry):
     """Allocated bytes and newest mtime under entry, on one filesystem, symlinks
@@ -79,7 +83,9 @@ def scan(entry):
             s = os.lstat(os.path.join(path, name))
             if s.st_dev != dev:
                 continue
-            total += s.st_blocks * 512
+            if (s.st_dev, s.st_ino) not in counted:
+                counted.add((s.st_dev, s.st_ino))
+                total += s.st_blocks * 512
             # Writing a marker is a decision about the entry, not use of it,
             # so it must not make a kept entry look recently changed.
             if name not in MARKERS:
