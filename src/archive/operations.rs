@@ -27,23 +27,35 @@ pub enum ImportSummary {
 }
 pub struct ImportReceipt {
     pub summary: ImportSummary,
-    pub commit: Option<CollectionCommit>,
+    pub publication: UnitPublication,
 }
 impl ImportReceipt {
     pub fn write(&self, out: &mut Out<'_>) -> Result<()> {
-        self.summary.write(self.commit.is_some(), out)
+        self.summary.write(
+            &Publication {
+                unit: self.publication.clone(),
+                appended: None,
+            },
+            out,
+        )
     }
 }
+/// What one import published: its unit's pieces and COMMITs, and how many
+/// bytes the pile file grew by, when the store is a file the caller measured.
+pub struct Publication {
+    pub unit: UnitPublication,
+    pub appended: Option<u64>,
+}
 impl ImportSummary {
-    pub fn write(&self, published: bool, out: &mut Out<'_>) -> Result<()> {
+    pub fn write(&self, publication: &Publication, out: &mut Out<'_>) -> Result<()> {
         match self {
-            Self::Agy(s) => print_agy_import_summary(s, published, out),
-            Self::ChatGpt(s) => print_chatgpt_import_summary(s, published, out),
-            Self::ClaudeCode(s) => print_claude_code_import_summary(s, published, out),
-            Self::ClaudeWeb(s) => print_claude_web_import_summary(s, published, out),
-            Self::Codex(s) => print_codex_import_summary(s, published, out),
-            Self::Copilot(s) => print_copilot_import_summary(s, published, out),
-            Self::Gemini(s) => print_gemini_import_summary(s, published, out),
+            Self::Agy(s) => print_agy_import_summary(s, publication, out),
+            Self::ChatGpt(s) => print_chatgpt_import_summary(s, publication, out),
+            Self::ClaudeCode(s) => print_claude_code_import_summary(s, publication, out),
+            Self::ClaudeWeb(s) => print_claude_web_import_summary(s, publication, out),
+            Self::Codex(s) => print_codex_import_summary(s, publication, out),
+            Self::Copilot(s) => print_copilot_import_summary(s, publication, out),
+            Self::Gemini(s) => print_gemini_import_summary(s, publication, out),
         }
     }
 }
@@ -130,8 +142,11 @@ impl Archive {
                 }
             };
             let summary = projection?;
-            let commit = writer.commit_unit()?;
-            Ok(ImportReceipt { summary, commit })
+            let publication = writer.commit_unit()?;
+            Ok(ImportReceipt {
+                summary,
+                publication,
+            })
         })
     }
     pub fn list(&self, limit: usize, out: &mut Out<'_>) -> Result<()> {
@@ -204,6 +219,7 @@ use crate::archive_claude_web::{self, ProjectionSummary as ClaudeWebProjectionSu
 use crate::archive_codex::{self, ProjectionSummary as CodexProjectionSummary};
 use crate::archive_collection::{
     self as archive_collection, ArchiveImportWriter, ArchiveTimelineBlock, ArchiveTimelineCursor,
+    UnitPublication,
 };
 use crate::archive_copilot::{self, ProjectionSummary as CopilotProjectionSummary};
 use crate::archive_gemini::{self, ProjectionSummary as GeminiProjectionSummary};
@@ -240,7 +256,6 @@ type RawHandle = Inline<Handle<RawBytes>>;
 
 use crate::out::Out;
 use anybytes::Bytes;
-use triblespace::core::collection::CollectionCommit;
 #[derive(Clone, Copy)]
 struct ArchiveStorage<'a> {
     storage: &'a crate::storage::Storage,
@@ -357,7 +372,7 @@ impl ArchiveStorage<'_> {
 
 fn print_agy_import_summary(
     summary: &AgyProjectionSummary,
-    published: bool,
+    publication: &Publication,
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
@@ -374,13 +389,13 @@ fn print_agy_import_summary(
         summary.stats.missing_predecessors,
         summary.stats.unresolved_tool_results,
     ))?;
-    print_collection_publication(published, out)?;
+    print_collection_publication(publication, out)?;
     Ok(())
 }
 
 fn print_chatgpt_import_summary(
     summary: &ChatGptProjectionSummary,
-    published: bool,
+    publication: &Publication,
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
@@ -399,13 +414,13 @@ fn print_chatgpt_import_summary(
         summary.stats.missing_predecessors,
         summary.stats.unresolved_tool_results,
     ))?;
-    print_collection_publication(published, out)?;
+    print_collection_publication(publication, out)?;
     Ok(())
 }
 
 fn print_claude_code_import_summary(
     summary: &ClaudeCodeProjectionSummary,
-    published: bool,
+    publication: &Publication,
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
@@ -426,13 +441,13 @@ fn print_claude_code_import_summary(
         summary.stats.held_back_records,
         summary.stats.held_back_facts,
     ))?;
-    print_collection_publication(published, out)?;
+    print_collection_publication(publication, out)?;
     Ok(())
 }
 
 fn print_codex_import_summary(
     summary: &CodexProjectionSummary,
-    published: bool,
+    publication: &Publication,
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
@@ -454,13 +469,13 @@ fn print_codex_import_summary(
         summary.frozen_bytes,
         summary.trailing_bytes_ignored,
     ))?;
-    print_collection_publication(published, out)?;
+    print_collection_publication(publication, out)?;
     Ok(())
 }
 
 fn print_claude_web_import_summary(
     summary: &ClaudeWebProjectionSummary,
-    published: bool,
+    publication: &Publication,
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
@@ -480,13 +495,13 @@ fn print_claude_web_import_summary(
         summary.stats.invalid_timestamps,
         summary.stats.common.missing_predecessors,
     ))?;
-    print_collection_publication(published, out)?;
+    print_collection_publication(publication, out)?;
     Ok(())
 }
 
 fn print_copilot_import_summary(
     summary: &CopilotProjectionSummary,
-    published: bool,
+    publication: &Publication,
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
@@ -504,13 +519,13 @@ fn print_copilot_import_summary(
         summary.stats.missing_predecessors,
         summary.stats.unresolved_tool_results,
     ))?;
-    print_collection_publication(published, out)?;
+    print_collection_publication(publication, out)?;
     Ok(())
 }
 
 fn print_gemini_import_summary(
     summary: &GeminiProjectionSummary,
-    published: bool,
+    publication: &Publication,
     out: &mut Out<'_>,
 ) -> Result<()> {
     out.line(format!(
@@ -529,19 +544,21 @@ fn print_gemini_import_summary(
         summary.stats.missing_predecessors,
         summary.stats.unresolved_tool_results,
     ))?;
-    print_collection_publication(published, out)?;
+    print_collection_publication(publication, out)?;
     Ok(())
 }
 
-fn print_collection_publication(published: bool, out: &mut Out<'_>) -> Result<()> {
-    out.line(format!(
-        "Archive collection: {}",
-        if published {
-            "new pieces published"
-        } else {
-            "unchanged (every piece already published)"
-        }
-    ))?;
+fn print_collection_publication(publication: &Publication, out: &mut Out<'_>) -> Result<()> {
+    let unit = &publication.unit;
+    let mut line = format!(
+        "Archive collection: {} piece(s) in {} COMMIT(s)",
+        unit.pieces,
+        unit.commits.len()
+    );
+    if let Some(appended) = publication.appended {
+        line.push_str(&format!(", {appended} bytes appended to the pile"));
+    }
+    out.line(line)?;
     Ok(())
 }
 
@@ -1554,9 +1571,13 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-        assert!(receipt.commit.is_some());
+        assert_eq!(receipt.publication.pieces, 1);
         let before = archive.storage().load().unwrap();
-        assert_eq!(before.support().len(), 2, "the vocabulary and the unit");
+        assert_eq!(
+            before.support().len(),
+            3,
+            "the vocabulary and the unit's annotation and identity COMMITs"
+        );
 
         // A later operation cannot reopen this pathname, but it can borrow the
         // retained owner. Its explicit key remains at the configured location.
@@ -1571,7 +1592,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-        assert!(retry.commit.is_none());
+        assert_eq!(retry.publication, receipt.publication);
         assert!(archive
             .import(
                 ImportSource::ChatGpt,
@@ -1580,7 +1601,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .is_err());
-        assert_eq!(archive.storage().load().unwrap().support().len(), 2);
+        assert_eq!(archive.storage().load().unwrap().support().len(), 3);
 
         let second = archive.import(
             ImportSource::ClaudeWeb,
@@ -1588,11 +1609,15 @@ mod tests {
             br#"[{"uuid":"shared-claude","chat_messages":[{"uuid":"message","sender":"human","text":"second"}]}]"#.to_vec().into(),
             &BTreeMap::new(),
         ).unwrap();
-        assert!(second.commit.is_some());
-        assert_eq!(archive.storage().load().unwrap().support().len(), 3);
+        assert_eq!(
+            second.publication.commits.len(),
+            3,
+            "a new writer's vocabulary and the unit's two"
+        );
+        assert_eq!(archive.storage().load().unwrap().support().len(), 5);
         assert_eq!(
             before.support().len(),
-            2,
+            3,
             "the earlier observation stays frozen"
         );
         assert!(!fixture.pile.exists());
@@ -1611,7 +1636,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &chatgpt, CliImportSource::ChatGpt).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 2);
+        assert_eq!(archive_root_payloads(&fixture), 3);
 
         let claude_web = fixture._directory.path().join("claude-web.json");
         fs::write(
@@ -1620,7 +1645,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &claude_web, CliImportSource::ClaudeWeb).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 3);
+        assert_eq!(archive_root_payloads(&fixture), 5);
 
         let copilot = fixture._directory.path().join("copilot.json");
         fs::write(
@@ -1629,7 +1654,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &copilot, CliImportSource::Copilot).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 4);
+        assert_eq!(archive_root_payloads(&fixture), 7);
 
         let agy = fixture._directory.path().join("transcript_full.jsonl");
         fs::write(
@@ -1641,7 +1666,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &agy, CliImportSource::Agy).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 5);
+        assert_eq!(archive_root_payloads(&fixture), 9);
 
         let gemini = fixture._directory.path().join("My Activity.html");
         fs::write(
@@ -1657,7 +1682,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &gemini, CliImportSource::Gemini).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 6);
+        assert_eq!(archive_root_payloads(&fixture), 11);
 
         assert_eq!(
             projection_ids(&storage(&fixture).load().unwrap().facts().unwrap()).len(),
@@ -1683,14 +1708,14 @@ mod tests {
         .unwrap();
 
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 2);
+        assert_eq!(archive_root_payloads(&fixture), 3);
         let archive = storage(&fixture).load().unwrap();
         assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
         drop(archive);
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
 
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 2);
+        assert_eq!(archive_root_payloads(&fixture), 3);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
     }
 
@@ -1799,8 +1824,21 @@ mod tests {
         assert_eq!(archive_root_payloads(&fixture), 0);
     }
 
-    const PUBLISHED: &str = "new pieces published";
-    const UNCHANGED: &str = "unchanged (every piece already published)";
+    /// The bytes one reported import appended to the pile.
+    fn appended(outcome: &str) -> u64 {
+        outcome
+            .strip_suffix(" bytes appended to the pile")
+            .and_then(|head| head.rsplit(", ").next())
+            .and_then(|bytes| bytes.parse().ok())
+            .unwrap_or_else(|| panic!("no appended bytes in {outcome:?}"))
+    }
+
+    fn appended_all(outcomes: &[String]) -> Vec<bool> {
+        outcomes
+            .iter()
+            .map(|outcome| appended(outcome) > 0)
+            .collect()
+    }
 
     /// One synthetic two-record Claude Code session in its own file.
     fn claude_code_session(directory: &Path, name: &str) -> PathBuf {
@@ -1861,11 +1899,13 @@ mod tests {
 
         let (result, outcomes) = import_outcomes(&fixture, &sessions);
         result.unwrap();
-        assert_eq!(outcomes, [PUBLISHED; 3]);
+        assert_eq!(appended_all(&outcomes), [true; 3]);
+        assert!(outcomes[0].starts_with("1 piece(s) in 3 COMMIT(s), "));
+        assert!(outcomes[1].starts_with("1 piece(s) in 2 COMMIT(s), "));
         assert_eq!(
             archive_root_payloads(&fixture),
-            4,
-            "one COMMIT per path and the vocabulary's"
+            7,
+            "two COMMITs per path and the vocabulary's"
         );
         let archive = storage(&fixture).load().unwrap();
         assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 6);
@@ -1874,18 +1914,17 @@ mod tests {
 
         let (result, outcomes) = import_outcomes(&fixture, &sessions);
         result.unwrap();
-        assert_eq!(outcomes, [UNCHANGED; 3]);
-        assert_eq!(archive_root_payloads(&fixture), 4);
+        assert_eq!(appended_all(&outcomes), [false; 3]);
+        assert_eq!(archive_root_payloads(&fixture), 7);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
 
-        // Within one command a later path is judged against what the earlier
-        // paths of that same command committed, not only against the open.
+        // A path repeated within one command appends nothing the second time.
         let delta = claude_code_session(directory, "delta");
         let (result, outcomes) =
             import_outcomes(&fixture, &[sessions[0].clone(), delta.clone(), delta]);
         result.unwrap();
-        assert_eq!(outcomes, [UNCHANGED, PUBLISHED, UNCHANGED]);
-        assert_eq!(archive_root_payloads(&fixture), 5);
+        assert_eq!(appended_all(&outcomes), [false, true, false]);
+        assert_eq!(archive_root_payloads(&fixture), 9);
     }
 
     /// One `archive import --source chatgpt` over PATH, with its outcome.
@@ -1939,7 +1978,7 @@ mod tests {
         fs::write(&old, export("6800-0000-8002-old", "u-old", "a-old")).unwrap();
         fs::write(&new, export("69aa-0000-83ab-new", "u-new", "a-new")).unwrap();
 
-        assert_eq!(chatgpt_outcome(&fixture, &old), PUBLISHED);
+        assert!(appended(&chatgpt_outcome(&fixture, &old)) > 0);
         let facts = storage(&fixture).load().unwrap().facts().unwrap();
         let blocks_before: BTreeSet<Id> = find!(
             block: Id,
@@ -1949,12 +1988,12 @@ mod tests {
         let tribles_before = facts.iter().count();
         drop(facts);
         let size_before = fs::metadata(&fixture.pile).unwrap().len();
-        assert_eq!(chatgpt_outcome(&fixture, &old), UNCHANGED);
+        assert_eq!(appended(&chatgpt_outcome(&fixture, &old)), 0);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), size_before);
 
         // The new ids and path land on the same blocks and receipts: the
         // re-export's commit holds its conversation id and path on the leaf.
-        assert_eq!(chatgpt_outcome(&fixture, &new), PUBLISHED);
+        assert!(appended(&chatgpt_outcome(&fixture, &new)) > 0);
         let facts = storage(&fixture).load().unwrap().facts().unwrap();
         let blocks_after: BTreeSet<Id> = find!(
             block: Id,
@@ -1992,11 +2031,15 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("conflicting semantic payloads"), "{error}");
-        assert_eq!(outcomes, [PUBLISHED], "the failure stops the command");
+        assert_eq!(
+            appended_all(&outcomes),
+            [true],
+            "the failure stops the command"
+        );
         assert_eq!(
             archive_root_payloads(&fixture),
-            2,
-            "the earlier COMMIT stays"
+            3,
+            "the earlier COMMITs stay"
         );
         let archive = storage(&fixture).load().unwrap();
         assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
@@ -2004,8 +2047,8 @@ mod tests {
 
         let (result, outcomes) = import_outcomes(&fixture, &[first, later]);
         result.unwrap();
-        assert_eq!(outcomes, [UNCHANGED, PUBLISHED]);
-        assert_eq!(archive_root_payloads(&fixture), 3);
+        assert_eq!(appended_all(&outcomes), [false, true]);
+        assert_eq!(archive_root_payloads(&fixture), 5);
     }
 
     #[test]
@@ -2021,7 +2064,10 @@ mod tests {
         let first =
             archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
-        assert_eq!(first.source_elements, 2, "the vocabulary and the unit");
+        assert_eq!(
+            first.source_elements, 3,
+            "the vocabulary and the unit's two"
+        );
         assert_ne!(first.source_collection, first.target_collection);
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
@@ -2045,7 +2091,7 @@ mod tests {
         let first_bm25 =
             archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
-        assert_eq!(first_bm25.source_elements, 2);
+        assert_eq!(first_bm25.source_elements, 3);
         assert_eq!(first_bm25.cover_segments, 2);
         let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(

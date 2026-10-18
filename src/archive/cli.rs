@@ -1,5 +1,5 @@
 //! Archive shell syntax, trace setup and explicit local source discovery.
-use super::{parse_tai_timestamp, Archive, ImportSource, ImportSummary};
+use super::{parse_tai_timestamp, Archive, ImportSource, ImportSummary, Publication};
 use crate::archive_collection::ArchiveImportWriter;
 use crate::out::Out;
 use crate::{
@@ -179,7 +179,7 @@ pub(super) fn import_paths(
         if total > 1 {
             eprintln!("[{}/{total}] {}", index + 1, path.display());
         }
-        import_into(&mut writer, path, source, finished_before, out)
+        import_into(&mut writer, pile, path, source, finished_before, out)
             .with_context(|| format!("import {}", path.display()))
     });
     writer.close(result)
@@ -188,14 +188,18 @@ pub(super) fn import_paths(
 /// Project one source PATH into the open writer and publish its pieces.
 ///
 /// The writer reads nothing back: an unchanged source cuts into the pieces it
-/// cut before, and publishing them again appends nothing to the pile.
+/// cut before, and publishing them again appends nothing to the pile. The
+/// report says how many pieces and COMMITs the path published and how many
+/// bytes the pile file grew by while it did.
 fn import_into(
     writer: &mut ArchiveImportWriter,
+    pile: &Path,
     path: &Path,
     source: CliImportSource,
     finished_before: Option<std::time::SystemTime>,
     out: &mut Out<'_>,
 ) -> Result<()> {
+    let before = pile_length(pile)?;
     let mut stage = |fragment: Fragment, source_path: &Path| {
         writer
             .stage_fragment(fragment)
@@ -235,8 +239,21 @@ fn import_into(
                 .map(ImportSummary::Gemini)
         }
     }?;
-    let commit = writer.commit_unit()?;
-    summary.write(commit.is_some(), out)
+    let unit = writer.commit_unit()?;
+    let appended = pile_length(pile)?.saturating_sub(before);
+    summary.write(
+        &Publication {
+            unit,
+            appended: Some(appended),
+        },
+        out,
+    )
+}
+
+fn pile_length(pile: &Path) -> Result<u64> {
+    Ok(std::fs::metadata(pile)
+        .with_context(|| format!("measure pile {}", pile.display()))?
+        .len())
 }
 
 /// A `--finished-after` age such as `90s`, `1h` or `2days`.

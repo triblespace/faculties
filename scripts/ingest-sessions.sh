@@ -93,7 +93,7 @@ START=$STATE/ingest-sessions.start
 touch "$START"
 t0=$(date +%s)
 pile0=$(size "$PILE")
-files=0 bytes=0 published=0 unchanged=0
+files=0 bytes=0 pieces=0 commits=0
 OUT=$(mktemp) ERR=$(mktemp)
 trap 'rm -f "$OUT" "$ERR"; [ -x "$LOCK" ] && "$LOCK" release "$HOST" "ingest-sessions-$HOST" >/dev/null' EXIT
 
@@ -103,8 +103,12 @@ run_chunk() {
   [ $# -gt 0 ] || return 0
   archive --pile "$PILE" import --source "$src" --finished-after 1h "$@" > "$OUT" 2> "$ERR"
   local rc=$?
-  published=$(( published + $(grep -c 'COMMIT published' "$OUT") ))
-  unchanged=$(( unchanged + $(grep -c 'unchanged' "$OUT") ))
+  # One line per path: "Archive collection: P piece(s) in C COMMIT(s), B bytes
+  # appended to the pile". A COMMIT the pile already held costs nothing, so
+  # the pile's growth below is what the run actually added.
+  local p c
+  read -r p c < <(awk '/^Archive collection: /{p+=$3; c+=$6} END{print p+0, c+0}' "$OUT")
+  pieces=$(( pieces + p )) commits=$(( commits + c ))
   if [ $rc -ne 0 ]; then
     echo "ingest-sessions: $src import failed (rc $rc) at: $(grep -E '^\[[0-9]+/[0-9]+\] ' "$ERR" | tail -1)" >&2
     tail -5 "$ERR" >&2
@@ -128,4 +132,4 @@ for pair in "${PAIRS[@]}"; do
 done
 
 mv "$START" "$STAMP"
-echo "ingest-sessions $HOST: $files file(s), $bytes source bytes, $published commit(s) published, $unchanged unchanged, pile +$(( $(size "$PILE") - pile0 )) bytes, $(( $(date +%s) - t0 )) s"
+echo "ingest-sessions $HOST: $files file(s), $bytes source bytes, $pieces piece(s) in $commits COMMIT(s) published, pile +$(( $(size "$PILE") - pile0 )) bytes, $(( $(date +%s) - t0 )) s"

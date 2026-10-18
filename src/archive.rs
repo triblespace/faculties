@@ -4,4 +4,6 @@
 pub mod cli;
 pub mod mcp;
 mod operations;
-pub use operations::{parse_tai_timestamp, Archive, ImportReceipt, ImportSource, ImportSummary};
+pub use operations::{
+    parse_tai_timestamp, Archive, ImportReceipt, ImportSource, ImportSummary, Publication,
+};

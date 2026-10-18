@@ -60,53 +60,76 @@ type RawHandle = Inline<Handle<RawBytes>>;
 /// it reads nothing the Archive already holds: an import is a pure function
 /// from the source to COMMITs, and the collection is their union.
 ///
-/// The fragments of one source unit arrive in the importer's deterministic
+/// The fragments of one source unit arrive in the importer's content-determined
 /// order, one whole node per fragment. The writer cuts that stream into
 /// pieces at boundaries the content chooses: a piece ends after any fragment
-/// whose root (the node's receipt) has at least [`PIECE_BITS`] trailing zero
-/// bits, and at the end of the unit. The same nodes therefore always cut into
-/// the same pieces, a piece is always the same bytes, and its signed COMMIT is
-/// the same record (deterministic Ed25519 over the collection, the data hash
-/// and the metadata hash, with no time in it). Publishing a piece the pile
-/// already holds appends nothing: blob puts and record inserts both return
-/// early on a resident value. Re-importing an unchanged source costs nothing,
-/// and a grown one costs the pieces from the first changed one on.
+/// holding a node whose id has at least [`PIECE_BITS`] trailing zero bits, and
+/// at the end of the unit. The same nodes therefore always cut into the same
+/// pieces, a piece is always the same bytes, and its signed COMMIT is the same
+/// record (deterministic Ed25519 over the collection, the data hash and the
+/// metadata hash, with no time in it). Publishing a piece the pile already
+/// holds appends nothing: blob puts and record inserts both return early on a
+/// resident value. Re-importing an unchanged source costs nothing, and a grown
+/// one costs the pieces from the first changed one on.
 ///
-/// A closed piece is published as two COMMITs: its intrinsic facts (the
-/// nodes, their content facts, their receipts' identity) and its occurrence
-/// facts (the evidence one reading of one file attaches, see
-/// [`blockdag::is_occurrence_attribute`]). A Codex fork or resume replays its
-/// parent's nodes under different occurrence evidence (no copy times), so its
-/// intrinsic pieces are the parent's own and only the small occurrence pieces
-/// are new. The last, unclosed piece of a unit is one COMMIT holding both: it
-/// changes whenever the source grows, so splitting it would converge with
-/// nothing.
+/// Every piece, the unit's last one included, is two COMMITs: the identity
+/// of its nodes ([`blockdag::split_identity`]) and everything that annotates
+/// them (timestamps, receipts, roles, paths, titles). The same nodes read from
+/// another path, another host, a fork's replay or a later version of the file
+/// have the same identity COMMIT; only the annotation COMMIT differs. A unit
+/// therefore costs at least two COMMITs.
+///
+/// Piece COMMITs carry empty metadata. The Archive's attribute descriptions,
+/// without anything that varies with the build, are the metadata of the
+/// vocabulary COMMIT ([`blockdag::attribute_descriptions`]), published before
+/// a writer's first piece and the same bytes in every writer. Metafacts that
+/// fragments carry are not published.
 pub struct ArchiveImportWriter<P = FacultyStore> {
     pile: P,
     collection: Collection<SimpleArchive>,
     signer: SigningKey,
-    /// Intrinsic facts of the piece being cut.
+    /// Node identities of the piece being cut.
     core: TribleSet,
-    /// Attribute descriptions staged with the piece being cut.
-    metafacts: TribleSet,
-    /// Occurrence facts of the piece being cut.
+    /// Annotations of the piece being cut.
     occurrence: TribleSet,
-    /// The vocabulary, until it is published as a COMMIT of its own before
-    /// this writer's first piece.
-    vocabulary: Option<Fragment>,
-    /// Signed COMMITs of this unit's pieces, whose bytes are already
-    /// appended, each with whether its data was new to the pile; the
-    /// records are inserted when the unit ends.
-    pending: Vec<(CollectionCommit, bool)>,
-    /// Trailing zero bits of a fragment root that end a piece.
+    /// Whether the vocabulary COMMIT is still to be prepared.
+    vocabulary: bool,
+    /// Pieces closed in the unit being staged.
+    pieces: usize,
+    /// Signed COMMITs of the unit's pieces, in insertion order, whose bytes
+    /// are already appended; the records are inserted when the unit ends.
+    pending: Vec<CollectionCommit>,
+    /// Trailing zero bits of a node id that end a piece.
     piece_bits: u32,
     /// Keeps the runtime the descriptor was acquired through alive until close.
     #[allow(dead_code)]
     runtime: Arc<tokio::runtime::Runtime>,
 }
 
-/// Trailing zero bits of a node's receipt id that end a piece: on average one
-/// piece per 2^`PIECE_BITS` nodes.
+/// What one source unit published: how many pieces it cut and the COMMITs it
+/// inserted, in insertion order. A COMMIT the pile already held is inserted
+/// again at no cost, so these count work, not growth; the pile's growth is
+/// the caller's to measure.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UnitPublication {
+    pub pieces: usize,
+    pub commits: Vec<CollectionCommit>,
+}
+
+impl UnitPublication {
+    /// The last COMMIT inserted, if the unit published anything.
+    pub fn last(&self) -> Option<CollectionCommit> {
+        self.commits.last().copied()
+    }
+
+    /// Whether the unit staged nothing.
+    pub fn is_empty(&self) -> bool {
+        self.commits.is_empty()
+    }
+}
+
+/// Trailing zero bits of a node id that end a piece: on average one piece per
+/// 2^`PIECE_BITS` nodes.
 ///
 /// The larger a piece, the more a growing source republishes on every import
 /// (its unclosed tail) and the more of a fork's prefix its first new piece
@@ -118,9 +141,9 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
 /// the median unclosed tail 141 and 104 nodes (about 15 tribles per node).
 pub const PIECE_BITS: u32 = 11;
 
-/// Whether `root` ends a piece under `bits` trailing zero bits.
-fn ends_piece(root: Id, bits: u32) -> bool {
-    let raw: [u8; 16] = root.into();
+/// Whether `node` ends a piece under `bits` trailing zero bits.
+fn ends_piece(node: Id, bits: u32) -> bool {
+    let raw: [u8; 16] = node.into();
     u128::from_be_bytes(raw).trailing_zeros() >= bits
 }
 
@@ -197,9 +220,9 @@ where
             collection,
             signer,
             core: TribleSet::new(),
-            metafacts: TribleSet::new(),
             occurrence: TribleSet::new(),
-            vocabulary: Some(blockdag::vocabulary_fragment()),
+            vocabulary: true,
+            pieces: 0,
             pending: Vec::new(),
             piece_bits: PIECE_BITS,
             runtime,
@@ -238,38 +261,43 @@ where
         }
     }
 
-    /// Add one fragment to the piece being cut, and end the piece when the
-    /// fragment's root says so.
+    /// Add one fragment to the piece being cut, and end the piece when a node
+    /// it holds says so.
     ///
     /// A fragment is the importers' unit: one whole node with its receipt,
-    /// or occurrence annotations of a receipt. Only a fragment holding
-    /// intrinsic facts ends a piece, so a piece never splits a node and the
-    /// annotations an importer emits after its nodes (the leaves' session,
-    /// path and title) ride in the unit's last piece. Nothing is compared
-    /// with what the Archive holds: the union absorbs every repetition.
+    /// or annotations of a receipt. Only a fragment holding a node ends a
+    /// piece, so a piece never splits a node, and the annotations an importer
+    /// emits after its nodes (the leaves' session, path and title) ride in the
+    /// unit's last piece. Nothing is compared with what the Archive holds:
+    /// the union absorbs every repetition.
     pub fn stage_fragment(&mut self, fragment: Fragment) -> Result<()> {
-        let root = fragment.root();
-        let (_, facts, metafacts, blobs) = fragment.into_parts();
+        let (_, facts, _, blobs) = fragment.into_parts();
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
         // keeping payload bytes out of the piece. They remain semantically
         // unreachable until a signed COMMIT names the facts which reference
-        // them.
-        stage_embedded_blobs(&mut self.pile, embedded_blobs(blobs))?;
+        // them. Blobs only the dropped metafacts name (attribute descriptions,
+        // whose text varies with the build) are not appended.
+        let named: std::collections::HashSet<[u8; 32]> = facts
+            .iter()
+            .map(|fact| {
+                let mut value = [0u8; 32];
+                value.copy_from_slice(&fact.data[32..]);
+                value
+            })
+            .collect();
+        let referenced = embedded_blobs(blobs)
+            .into_iter()
+            .filter(|blob| named.contains(&blob.get_handle().raw))
+            .collect();
+        stage_embedded_blobs(&mut self.pile, referenced)?;
 
-        let mut intrinsic = false;
-        for fact in facts.iter() {
-            if blockdag::is_occurrence_attribute(*fact.a()) {
-                self.occurrence.insert(fact);
-            } else {
-                self.core.insert(fact);
-                intrinsic = true;
-            }
-        }
-        self.metafacts += metafacts;
-        if intrinsic && root.is_some_and(|root| ends_piece(root, self.piece_bits)) {
-            self.publish_piece(true)?;
+        let (identity, annotations, nodes) = blockdag::split_identity(&facts);
+        self.core += identity;
+        self.occurrence += annotations;
+        if nodes.iter().any(|node| ends_piece(*node, self.piece_bits)) {
+            self.publish_piece()?;
         }
         Ok(())
     }
@@ -285,92 +313,78 @@ where
         self.core.len() + self.occurrence.len()
     }
 
-    /// End ONE source unit: publish its last piece, then every piece's
-    /// signed COMMIT, and keep the pile open. Returns the last COMMIT whose
-    /// piece was new to the pile, or `None` when every piece the unit cut was
-    /// already there (an unchanged source) or it staged nothing.
+    /// End ONE source unit: publish its last piece, then insert every
+    /// piece's signed COMMITs, and keep the pile open.
     ///
     /// A piece's bytes are appended when it closes, but no record names them
     /// until the unit ends, so a unit whose source fails publishes nothing
-    /// ([`Self::close`] with an error inserts no record). The bytes a failed
-    /// unit left behind are the ones a retry appends, so the retry adds none
-    /// of them again. The unit's records are inserted one after another, in
-    /// cut order: a process killed between two inserts leaves a prefix of the
-    /// unit's pieces visible, and rerunning the import inserts the rest.
+    /// ([`Self::close`] with an error inserts no record). The records go in
+    /// one after another: the vocabulary's first, then for each piece its
+    /// annotations before its node identities, so a node is never visible
+    /// without its annotations, and its predecessors are always in an earlier
+    /// piece. A process killed between two inserts leaves a prefix visible;
+    /// rerunning the import inserts every record again, the present ones at
+    /// no cost, and completes the unit.
     ///
     /// Nothing here carries the collection or attaches its views. Every
     /// read prepares what it reads (`maintain_attached` carries the source
     /// first), and on hosts running `trible pile collection maintain-all`
     /// over the Archive's Rank9 target both stay current in the background.
-    pub fn commit_unit(&mut self) -> Result<Option<CollectionCommit>> {
-        self.publish_piece(false)?;
-        let mut last = None;
-        for (commit, novel) in std::mem::take(&mut self.pending) {
-            CollectionStore::insert(&mut self.pile, CollectionRecord::Commit(commit))
+    pub fn commit_unit(&mut self) -> Result<UnitPublication> {
+        self.publish_piece()?;
+        let commits = std::mem::take(&mut self.pending);
+        for commit in &commits {
+            CollectionStore::insert(&mut self.pile, CollectionRecord::Commit(*commit))
                 .map_err(|error| anyhow!("insert an Archive piece COMMIT: {error}"))?;
-            if novel {
-                last = Some(commit);
-            }
         }
-        Ok(last)
+        Ok(UnitPublication {
+            pieces: std::mem::take(&mut self.pieces),
+            commits,
+        })
     }
 
-    /// Prepare the piece being cut. A closed piece is its intrinsic COMMIT
-    /// and its occurrence COMMIT; the unit's last piece is one COMMIT.
-    fn publish_piece(&mut self, closed: bool) -> Result<()> {
+    /// Prepare the piece being cut, if it holds anything: its annotation
+    /// COMMIT, then its identity COMMIT.
+    fn publish_piece(&mut self) -> Result<()> {
         let core = std::mem::take(&mut self.core);
-        let metafacts = std::mem::take(&mut self.metafacts);
         let occurrence = std::mem::take(&mut self.occurrence);
-        if closed {
-            self.prepare_commit(core, metafacts)?;
-            self.prepare_commit(occurrence, TribleSet::new())
-        } else {
-            let mut facts = core;
-            facts += occurrence;
-            self.prepare_commit(facts, metafacts)
+        if core.is_empty() && occurrence.is_empty() {
+            return Ok(());
         }
+        if self.vocabulary {
+            self.vocabulary = false;
+            let (_, facts, _, blobs) = blockdag::vocabulary_fragment().into_parts();
+            stage_embedded_blobs(&mut self.pile, embedded_blobs(blobs))?;
+            let (descriptions, description_blobs) = blockdag::attribute_descriptions();
+            stage_embedded_blobs(&mut self.pile, description_blobs)?;
+            self.prepare_commit(facts, descriptions)?;
+        }
+        self.pieces += 1;
+        self.prepare_commit(occurrence, TribleSet::new())?;
+        self.prepare_commit(core, TribleSet::new())
     }
 
     /// Append one COMMIT's data and metadata, if it holds facts, and sign it
     /// over the handles the store returned; the record waits for the unit's
-    /// end. The writer's first COMMIT is preceded by the vocabulary's own,
-    /// which is the same bytes in every writer.
-    ///
-    /// Whether the data was resident before is one index probe, for the
-    /// report only; nothing the pile holds is read. Data a failed unit left
-    /// behind counts as resident when a retry publishes its record.
-    fn prepare_commit(&mut self, facts: TribleSet, metafacts: TribleSet) -> Result<()> {
+    /// end.
+    fn prepare_commit(&mut self, facts: TribleSet, metadata: TribleSet) -> Result<()> {
         if facts.is_empty() {
             return Ok(());
         }
-        if let Some(vocabulary) = self.vocabulary.take() {
-            let (_, facts, metafacts, blobs) = vocabulary.into_parts();
-            stage_embedded_blobs(&mut self.pile, embedded_blobs(blobs))?;
-            self.prepare_commit(facts, metafacts)?;
-        }
-        let data: Blob<SimpleArchive> = facts.to_blob();
-        let novel = self
-            .pile
-            .snapshot()
-            .context("observe the pile before an Archive piece")?
-            .metadata(data.get_handle())
-            .map_err(|error| anyhow!("inspect an Archive piece's residency: {error}"))?
-            .is_none();
         let data = self
             .pile
-            .put::<SimpleArchive, _>(data)
+            .put::<SimpleArchive, _>(facts)
             .context("stage an Archive piece")?;
         let metadata = self
             .pile
-            .put::<SimpleArchive, _>(metafacts)
+            .put::<SimpleArchive, _>(metadata)
             .context("stage an Archive piece's metadata")?;
-        let commit = CollectionCommit::sign(
+        self.pending.push(CollectionCommit::sign(
             &self.signer,
             self.collection.handle(),
             Handle::<SimpleArchive>::to_hash(data),
             metadata,
-        );
-        self.pending.push((commit, novel));
+        ));
         Ok(())
     }
 }
@@ -390,10 +404,10 @@ impl ArchiveImportWriter {
         )
     }
 
-    pub fn finish<T>(mut self, surrounding: Result<T>) -> Result<(T, Option<CollectionCommit>)> {
+    pub fn finish<T>(mut self, surrounding: Result<T>) -> Result<(T, UnitPublication)> {
         let result = surrounding.and_then(|value| {
-            let commit = self.commit_unit()?;
-            Ok((value, commit))
+            let publication = self.commit_unit()?;
+            Ok((value, publication))
         });
         close_pile(
             self.pile,
@@ -402,6 +416,7 @@ impl ArchiveImportWriter {
         )
     }
 }
+
 /// Write one constructed streaming payload batch into content-addressed storage.
 ///
 /// A failed put abandons only this batch. Replaying the fragment repeats the
@@ -1081,7 +1096,7 @@ mod tests {
                 archive
                     .stage_fragment(projection("async-worker", "body"))
                     .unwrap();
-                assert!(archive.finish(Ok(())).unwrap().1.is_some());
+                assert!(!archive.finish(Ok(())).unwrap().1.is_empty());
 
                 let mut code =
                     crate::code::ingest::CodeImportWriter::open(&pile, Some(&key)).unwrap();
@@ -1128,7 +1143,7 @@ mod tests {
         let fetched: View<str> = BlobStoreGet::get(&reader, handle).unwrap();
         assert_eq!(fetched.as_ref(), body);
         assert!(!reader.contains_blob(handle).unwrap());
-        assert!(writer.commit_unit().unwrap().is_some());
+        assert!(!writer.commit_unit().unwrap().is_empty());
         writer.close(Ok(())).unwrap();
 
         // Closing, not the captured reader, owns acquisition lifetime. It
@@ -1275,13 +1290,23 @@ mod tests {
         commit_fragment(pile, key, projection(locator, text))
     }
 
+    /// The first embedded blob one of the fragment's facts names.
     fn first_embedded_handle(fragment: &Fragment) -> Inline<Handle<UnknownBlob>> {
+        let named: BTreeSet<[u8; 32]> = fragment
+            .facts()
+            .iter()
+            .map(|fact| {
+                let mut value = [0u8; 32];
+                value.copy_from_slice(&fact.data[32..]);
+                value
+            })
+            .collect();
         let mut blobs = fragment.blobs().clone();
         blobs
             .snapshot()
             .unwrap()
             .iter()
-            .next()
+            .find(|(handle, _)| named.contains(&handle.raw))
             .expect("fixture carries embedded blobs")
             .0
     }
@@ -1327,9 +1352,13 @@ mod tests {
         assert!(before.facts().unwrap().iter().next().is_none());
         drop(before);
 
-        let commit = writer.finish(Ok(())).unwrap().1.unwrap();
+        let commit = writer.finish(Ok(())).unwrap().1.last().unwrap();
         let after = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(after.support().len(), 2, "the vocabulary and the piece");
+        assert_eq!(
+            after.support().len(),
+            3,
+            "the vocabulary and the piece's annotation and identity COMMITs"
+        );
         assert!(facts_stand_on(&after, &commit));
         assert_eq!(projection_ids(&after.facts().unwrap()).len(), 1);
     }
@@ -1388,10 +1417,11 @@ mod tests {
         };
 
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        // The fixture's root is random; no piece boundary inside a unit.
-        writer.piece_bits = u32::MAX;
+        // The fixture holds no node: every fact annotates, and nothing cuts.
         writer.stage_fragment(fragment.clone()).unwrap();
-        assert!(writer.commit_unit().unwrap().is_some());
+        let first = writer.commit_unit().unwrap();
+        assert_eq!(first.pieces, 1);
+        assert_eq!(first.commits.len(), 2, "the vocabulary and the annotations");
         // The reader prepares the projection; the writer only commits.
         let succinct = writer
             .pile
@@ -1422,10 +1452,10 @@ mod tests {
         // The same unit again is the same COMMIT, and adds nothing.
         let length = std::fs::metadata(&pile).unwrap().len();
         writer.stage_fragment(fragment.clone()).unwrap();
-        assert_eq!(writer.commit_unit().unwrap(), None);
+        assert_eq!(writer.commit_unit().unwrap().commits, first.commits[1..]);
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
         writer.stage_fragment(annotation.clone()).unwrap();
-        assert!(writer.finish(Ok(())).unwrap().1.is_some());
+        assert!(!writer.finish(Ok(())).unwrap().1.is_empty());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
         assert_eq!(snapshot.support().len(), 3, "the vocabulary and two units");
@@ -1475,11 +1505,10 @@ mod tests {
         // Replaying both units republishes the same COMMITs: no bytes.
         let length = std::fs::metadata(&pile).unwrap().len();
         let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        retry.piece_bits = u32::MAX;
         retry.stage_fragment(fragment).unwrap();
-        assert_eq!(retry.commit_unit().unwrap(), None);
+        assert_eq!(retry.commit_unit().unwrap(), first);
         retry.stage_fragment(annotation).unwrap();
-        assert!(retry.finish(Ok(())).unwrap().1.is_none());
+        assert!(!retry.finish(Ok(())).unwrap().1.is_empty());
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
     }
 
@@ -1506,7 +1535,7 @@ mod tests {
                     &format!("body {index}"),
                 ))
                 .unwrap();
-            assert!(writer.commit_unit().unwrap().is_some());
+            assert!(!writer.commit_unit().unwrap().is_empty());
         }
         writer.close(Ok(())).unwrap();
 
@@ -1519,15 +1548,16 @@ mod tests {
                 .iter()
                 .filter(|commit| commit.collection() == source.handle())
                 .count(),
-            units + 1,
-            "one COMMIT per unit and the vocabulary's"
+            2 * units + 1,
+            "two COMMITs per unit and the vocabulary's"
         );
         assert!(records.merges().is_empty(), "the writer merged");
+        assert!(records.maps().is_empty(), "the writer attached");
         drop(snapshot);
         reopened.close().unwrap();
 
         let observed = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(observed.support().len(), units + 1);
+        assert_eq!(observed.support().len(), 2 * units + 1);
         assert!(observed.residual().is_empty());
         assert_eq!(projection_ids(&observed.facts().unwrap()).len(), units);
     }
@@ -1585,17 +1615,21 @@ mod tests {
         let fragment = projection("session:one", "one");
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         writer.stage_fragment(fragment.clone()).unwrap();
-        let (_, first) = writer.finish(Ok(())).unwrap();
-        let first = first.unwrap();
+        let (_, published) = writer.finish(Ok(())).unwrap();
+        let first = published.last().unwrap();
         let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         let length = std::fs::metadata(&pile).unwrap().len();
         retry.stage_fragment(fragment).unwrap();
         let (_, repeated) = retry.finish(Ok(())).unwrap();
-        assert_eq!(repeated, None, "the same unit is the same COMMIT, not new");
+        assert_eq!(repeated, published, "the same unit is the same COMMITs");
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 2, "the vocabulary and the unit");
+        assert_eq!(
+            snapshot.support().len(),
+            3,
+            "the vocabulary and the unit's two"
+        );
         assert!(facts_stand_on(&snapshot, &first));
         assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 1);
     }
@@ -1636,7 +1670,7 @@ mod tests {
         let first_len = first_fragment.facts().len();
         let mut first_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         first_writer.stage_fragment(first_fragment.clone()).unwrap();
-        let first = first_writer.finish(Ok(())).unwrap().1.unwrap();
+        let first = first_writer.finish(Ok(())).unwrap().1;
 
         let second_fragment = projection("session:two", "shared");
         let mut second_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
@@ -1648,11 +1682,18 @@ mod tests {
             second_fragment.facts().len(),
             "a unit retains its whole closure, facts already published included"
         );
-        let second = second_writer.finish(Ok(())).unwrap().1.unwrap();
-        assert_ne!(first.data(), second.data());
+        let second = second_writer.finish(Ok(())).unwrap().1;
+        // The two receipts annotate one node: the identity COMMIT, inserted
+        // last, is the same record, and the annotation COMMITs differ.
+        assert_eq!(first.last(), second.last());
+        assert_ne!(first.commits[1], second.commits[0]);
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 3, "the vocabulary and two units");
+        assert_eq!(
+            snapshot.support().len(),
+            4,
+            "the vocabulary, one identity and two annotation COMMITs"
+        );
         assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 2);
         assert!(snapshot.facts().unwrap().iter().count() > first_len);
     }
@@ -2456,7 +2497,7 @@ mod tests {
                 |projected| writer.stage_fragment(projected.fragment),
             );
             let (_, commit) = writer.finish(projection).unwrap();
-            assert!(commit.is_some(), "{name} commits");
+            assert!(!commit.is_empty(), "{name} commits");
         }
 
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
@@ -2474,7 +2515,7 @@ mod tests {
                     ))
                     .unwrap()
             })
-            // The vocabulary's own COMMIT holds no node.
+            // The vocabulary and annotation COMMITs hold no node.
             .filter(|facts: &TribleSet| {
                 exists!(pattern!(facts, [{ _?node @ metadata::tag: &schema::block::KIND }]))
             })
@@ -2673,12 +2714,17 @@ mod tests {
         key: &std::path::Path,
         name: &str,
         text: &str,
-    ) -> Option<CollectionCommit> {
+    ) -> UnitPublication {
         let mut writer = ArchiveImportWriter::open(pile, Some(key)).unwrap();
         // One piece per sixteen nodes on average, so small fixtures cut.
         writer.set_piece_bits(4);
+        let projection = stage_source(&mut writer, name, text);
+        writer.finish(projection).unwrap().1
+    }
+
+    fn stage_source(writer: &mut ArchiveImportWriter, name: &str, text: &str) -> Result<()> {
         let bytes = Bytes::from_source(text.as_bytes().to_vec());
-        let projection = if name.starts_with("rollout") {
+        if name.starts_with("rollout") {
             crate::archive_codex::project_bytes(name, bytes, |projected| {
                 writer.stage_fragment(projected.fragment)
             })
@@ -2688,19 +2734,19 @@ mod tests {
                 writer.stage_fragment(projected.fragment)
             })
             .map(drop)
-        };
-        writer.finish(projection).unwrap().1
+        }
     }
 
     fn pile_length(pile: &std::path::Path) -> u64 {
         std::fs::metadata(pile).unwrap().len()
     }
 
-    /// The data handles of every Archive COMMIT in the pile.
-    fn archive_commit_data(
-        pile: &std::path::Path,
-        key: &std::path::Path,
-    ) -> BTreeSet<CollectionData> {
+    /// A COMMIT as two piles can compare it: its data and metadata handles.
+    /// The signature differs between keys and is left out.
+    type Record = (CollectionData, Inline<Handle<SimpleArchive>>);
+
+    /// Every Archive COMMIT in the pile.
+    fn archive_commit_records(pile: &std::path::Path, key: &std::path::Path) -> BTreeSet<Record> {
         let signer = load_signer(pile, Some(key)).unwrap();
         let mut store = open_pile_strict_as(pile, signer.verifying_key()).unwrap();
         let source = test_source(&mut store, pile, key);
@@ -2710,7 +2756,7 @@ mod tests {
             .commits()
             .iter()
             .filter(|commit| commit.collection() == source.handle())
-            .map(|commit| commit.data())
+            .map(|commit| (commit.data(), commit.metadata()))
             .collect();
         drop(snapshot);
         store.close().unwrap();
@@ -2718,14 +2764,11 @@ mod tests {
     }
 
     /// The node ids every given COMMIT's data holds.
-    fn blocks_in_commits(
-        pile: &std::path::Path,
-        commits: &BTreeSet<CollectionData>,
-    ) -> BTreeSet<Id> {
+    fn blocks_in_commits(pile: &std::path::Path, commits: &BTreeSet<Record>) -> BTreeSet<Id> {
         let mut store = open_pile_strict(pile).unwrap();
         let snapshot = store.snapshot().unwrap();
         let mut blocks = BTreeSet::new();
-        for data in commits {
+        for (data, _) in commits {
             let facts: TribleSet = snapshot
                 .get::<TribleSet, SimpleArchive>(Handle::<SimpleArchive>::from_hash(*data))
                 .unwrap();
@@ -2739,6 +2782,11 @@ mod tests {
         blocks
     }
 
+    /// Records of `after` that `before` lacks.
+    fn novel(after: BTreeSet<Record>, before: &BTreeSet<Record>) -> BTreeSet<Record> {
+        after.difference(before).copied().collect()
+    }
+
     fn fresh_archive(directory: &TempDir, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let pile = directory.path().join(format!("{name}.pile"));
         let key = directory.path().join(format!("{name}.key"));
@@ -2747,17 +2795,48 @@ mod tests {
         (pile, key)
     }
 
+    /// The nodes the read Archive holds, and those of them with a timestamp,
+    /// and the receipts, and those of them with a source timestamp.
+    fn timed_union(
+        pile: &std::path::Path,
+        key: &std::path::Path,
+    ) -> (BTreeSet<Id>, BTreeSet<Id>, BTreeSet<Id>, BTreeSet<Id>) {
+        let observed = pollster::block_on(ensure_local(pile, Some(key))).unwrap();
+        let facts = observed.facts().unwrap();
+        let blocks = find!(
+            block: Id,
+            pattern!(&facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+        )
+        .collect();
+        let timed = find!(
+            (block: Id, at: Inline<NsTAIInterval>),
+            pattern!(&facts, [{ ?block @ schema::block::timestamp: ?at }])
+        )
+        .map(|(block, _)| block)
+        .collect();
+        let receipts = projection_ids(&facts).into_iter().collect();
+        let timed_receipts = find!(
+            (receipt: Id, at: Inline<NsTAIInterval>),
+            pattern!(&facts, [{ ?receipt @ schema::source_projection::source_timestamp: ?at }])
+        )
+        .map(|(receipt, _)| receipt)
+        .collect();
+        (blocks, timed, receipts, timed_receipts)
+    }
+
     #[test]
     fn reimporting_an_unchanged_session_adds_no_bytes() {
         let directory = TempDir::new().unwrap();
         let (pile, key) = fresh_archive(&directory, "archive");
         let transcript = claude_transcript("unchanged", 300);
-        import_source(&pile, &key, "unchanged.jsonl", &transcript);
+        let first = import_source(&pile, &key, "unchanged.jsonl", &transcript);
+        assert!(first.pieces > 4, "{}", first.pieces);
         let length = pile_length(&pile);
-        let commits = archive_commit_data(&pile, &key);
-        import_source(&pile, &key, "unchanged.jsonl", &transcript);
+        let commits = archive_commit_records(&pile, &key);
+        let again = import_source(&pile, &key, "unchanged.jsonl", &transcript);
+        assert_eq!(again, first, "the same COMMITs, inserted again");
         assert_eq!(pile_length(&pile), length, "the second import added bytes");
-        assert_eq!(archive_commit_data(&pile, &key), commits);
+        assert_eq!(archive_commit_records(&pile, &key), commits);
     }
 
     #[test]
@@ -2771,6 +2850,79 @@ mod tests {
         assert_eq!(pile_length(&pile), length, "the second import added bytes");
     }
 
+    /// What a rebuilt cohort changes: the attribute descriptions fragments
+    /// carry (doc comments, module paths). A piece's COMMITs stay the same
+    /// records, so an unchanged source re-imported by another build inserts
+    /// no new record. Piece COMMITs carry empty metadata, and the vocabulary
+    /// COMMIT's metadata holds no doc text and no module path.
+    #[test]
+    fn piece_commits_do_not_depend_on_the_build() {
+        let directory = TempDir::new().unwrap();
+        let transcript = claude_transcript("rebuilt", 120);
+        let (plain, key_a) = fresh_archive(&directory, "plain");
+        import_source(&plain, &key_a, "rebuilt.jsonl", &transcript);
+        let (rebuilt, key_b) = fresh_archive(&directory, "rebuilt");
+        let other_build = entity! { _ @
+            metadata::description: "a doc comment another build wrote",
+            metadata::source_module: "another::module::path",
+        };
+        {
+            let mut writer = ArchiveImportWriter::open(&rebuilt, Some(&key_b)).unwrap();
+            writer.set_piece_bits(4);
+            crate::archive_claude_code::project_bytes(
+                "rebuilt.jsonl",
+                Bytes::from_source(transcript.as_bytes().to_vec()),
+                |projected| {
+                    let (_, facts, mut metafacts, mut blobs) = projected.fragment.into_parts();
+                    metafacts += other_build.facts().clone();
+                    blobs.union(other_build.blobs().clone());
+                    writer.stage_fragment(Fragment::from_parts(facts, metafacts, blobs))
+                },
+            )
+            .unwrap();
+            writer.close(Ok(())).unwrap();
+        }
+        let records = archive_commit_records(&plain, &key_a);
+        assert_eq!(records, archive_commit_records(&rebuilt, &key_b));
+        // Nor is the other build's doc text appended as an orphan blob.
+        let doc = find!(
+            text: Inline<Handle<UTF8String>>,
+            pattern!(other_build.facts(), [{ _?usage @ metadata::description: ?text }])
+        )
+        .next()
+        .unwrap();
+        let mut store = open_pile_strict(&rebuilt).unwrap();
+        assert!(store.snapshot().unwrap().metadata(doc).unwrap().is_none());
+        store.close().unwrap();
+
+        let mut store = open_pile_strict(&plain).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let empty: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        let mut described = 0;
+        for (data, metadata) in &records {
+            let facts: TribleSet = snapshot
+                .get::<TribleSet, SimpleArchive>(Handle::<SimpleArchive>::from_hash(*data))
+                .unwrap();
+            let meta: TribleSet = snapshot.get(*metadata).unwrap();
+            let vocabulary = exists!(pattern!(&facts, [{
+                _?tag @ metadata::tag: &metadata::KIND_TAG
+            }]));
+            if vocabulary {
+                described += 1;
+                assert!(!meta.is_empty(), "the vocabulary describes the attributes");
+                assert!(meta
+                    .iter()
+                    .all(|fact| *fact.a() != metadata::description.id()
+                        && *fact.a() != metadata::source_module.id()));
+            } else {
+                assert_eq!(*metadata, empty.get_handle(), "a piece carries metadata");
+            }
+        }
+        assert_eq!(described, 1);
+        drop(snapshot);
+        store.close().unwrap();
+    }
+
     #[test]
     fn a_grown_session_republishes_only_its_tail() {
         let directory = TempDir::new().unwrap();
@@ -2778,14 +2930,11 @@ mod tests {
         let empty = pile_length(&pile);
         import_source(&pile, &key, "grown.jsonl", &claude_transcript("grown", 400));
         let first = pile_length(&pile) - empty;
-        let before = archive_commit_data(&pile, &key);
+        let before = archive_commit_records(&pile, &key);
         import_source(&pile, &key, "grown.jsonl", &claude_transcript("grown", 410));
         let added = pile_length(&pile) - empty - first;
-        let novel: BTreeSet<_> = archive_commit_data(&pile, &key)
-            .difference(&before)
-            .copied()
-            .collect();
-        let republished = blocks_in_commits(&pile, &novel);
+        let republished =
+            blocks_in_commits(&pile, &novel(archive_commit_records(&pile, &key), &before));
         // 20 new nodes; the rest is the tail piece the growth reopened.
         assert!(
             republished.len() < 20 + 200,
@@ -2795,6 +2944,43 @@ mod tests {
         assert!(added * 3 < first, "{added} bytes added after {first}");
     }
 
+    /// A content-defined cut resynchronises after an insertion: a side branch
+    /// written into the middle of the file costs the piece it lands in. A
+    /// rule that cut by position would shift every later piece.
+    #[test]
+    fn an_interleaved_branch_costs_one_piece() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let base = claude_transcript("branchy", 400);
+        import_source(&pile, &key, "branchy.jsonl", &base);
+        let before = archive_commit_records(&pile, &key);
+        let base_blocks = blocks_in_commits(&pile, &before);
+        let mut lines: Vec<&str> = base.lines().collect();
+        let side_user = r#"{"type":"user","sessionId":"branchy","uuid":"branchy-side-user","parentUuid":"branchy-assistant-5","timestamp":"2026-03-01T10:00:11.500Z","message":{"role":"user","content":"a side question"}}"#;
+        let side_answer = r#"{"type":"assistant","sessionId":"branchy","uuid":"branchy-side-assistant","parentUuid":"branchy-side-user","timestamp":"2026-03-01T10:00:11.700Z","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"a side answer"}]}}"#;
+        lines.insert(12, side_answer);
+        lines.insert(12, side_user);
+        let branched = lines.join("\n") + "\n";
+        import_source(&pile, &key, "branchy.jsonl", &branched);
+        let after = archive_commit_records(&pile, &key);
+        let all = blocks_in_commits(&pile, &after);
+        let again: BTreeSet<_> = blocks_in_commits(&pile, &novel(after, &before))
+            .intersection(&base_blocks)
+            .copied()
+            .collect();
+        assert_eq!(
+            all.len(),
+            base_blocks.len() + 2,
+            "the branch adds its two nodes"
+        );
+        assert!(
+            again.len() < 100,
+            "the branch republished {} of {} nodes",
+            again.len(),
+            base_blocks.len()
+        );
+    }
+
     #[test]
     fn a_codex_fork_converges_with_its_parent_pieces() {
         let directory = TempDir::new().unwrap();
@@ -2802,24 +2988,165 @@ mod tests {
         let parent = codex_parent(300);
         let fork = codex_fork(&parent, 5, 300);
         import_source(&pile, &key, "rollout-parent.jsonl", &parent);
-        let before = archive_commit_data(&pile, &key);
+        let before = archive_commit_records(&pile, &key);
         let parent_blocks = blocks_in_commits(&pile, &before);
         assert!(parent_blocks.len() >= 900, "{}", parent_blocks.len());
         import_source(&pile, &key, "rollout-fork.jsonl", &fork);
-        let novel: BTreeSet<_> = archive_commit_data(&pile, &key)
-            .difference(&before)
-            .copied()
-            .collect();
-        let again: BTreeSet<_> = blocks_in_commits(&pile, &novel)
-            .intersection(&parent_blocks)
-            .copied()
-            .collect();
+        let again: BTreeSet<_> =
+            blocks_in_commits(&pile, &novel(archive_commit_records(&pile, &key), &before))
+                .intersection(&parent_blocks)
+                .copied()
+                .collect();
         assert!(
             again.len() < 200,
             "the fork republished {} of the parent's {} nodes",
             again.len(),
             parent_blocks.len()
         );
+    }
+
+    /// The same session read from another path, or another host, has other
+    /// leaf annotations and the same nodes: every identity COMMIT, the last
+    /// piece's included, is a record the pile already holds.
+    #[test]
+    fn the_same_session_at_another_path_reuses_every_identity_commit() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let transcript = claude_transcript("moved", 60);
+        import_source(
+            &pile,
+            &key,
+            "/Users/jp/.claude/projects/p/moved.jsonl",
+            &transcript,
+        );
+        let before = archive_commit_records(&pile, &key);
+        import_source(&pile, &key, "/srv/mirror/mac/p/moved.jsonl", &transcript);
+        let republished =
+            blocks_in_commits(&pile, &novel(archive_commit_records(&pile, &key), &before));
+        assert!(
+            republished.is_empty(),
+            "{} nodes stored again",
+            republished.len()
+        );
+    }
+
+    /// Dropping a piece's annotation COMMIT would lose its nodes' timestamps
+    /// and its receipts; every node and receipt of a multi-piece import keeps
+    /// them in the read union.
+    #[test]
+    fn every_piece_keeps_its_annotations() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let published = import_source(&pile, &key, "timed.jsonl", &claude_transcript("timed", 300));
+        assert!(published.pieces > 4, "{}", published.pieces);
+        let (blocks, timed, receipts, timed_receipts) = timed_union(&pile, &key);
+        assert_eq!(blocks.len(), 600);
+        assert_eq!(timed, blocks);
+        assert_eq!(receipts.len(), 600);
+        assert_eq!(timed_receipts, receipts);
+    }
+
+    /// What a source publishes does not depend on what the Archive already
+    /// holds, nor on what the same writer published before it.
+    #[test]
+    fn pieces_do_not_depend_on_the_archive_or_the_writer() {
+        let directory = TempDir::new().unwrap();
+        let parent = codex_parent(300);
+        let fork = codex_fork(&parent, 5, 300);
+        let (fresh, key_a) = fresh_archive(&directory, "fresh");
+        let alone = import_source(&fresh, &key_a, "rollout-fork.jsonl", &fork);
+        let alone_records = archive_commit_records(&fresh, &key_a);
+
+        let (held, key_b) = fresh_archive(&directory, "held");
+        import_source(&held, &key_b, "rollout-parent.jsonl", &parent);
+        let beside = import_source(&held, &key_b, "rollout-fork.jsonl", &fork);
+        assert_eq!(beside.pieces, alone.pieces);
+        assert!(alone_records.is_subset(&archive_commit_records(&held, &key_b)));
+
+        let (together, key_c) = fresh_archive(&directory, "together");
+        {
+            let mut writer = ArchiveImportWriter::open(&together, Some(&key_c)).unwrap();
+            writer.set_piece_bits(4);
+            stage_source(&mut writer, "rollout-parent.jsonl", &parent).unwrap();
+            writer.commit_unit().unwrap();
+            stage_source(&mut writer, "rollout-fork.jsonl", &fork).unwrap();
+            let in_one_writer = writer.commit_unit().unwrap();
+            assert_eq!(in_one_writer.pieces, alone.pieces);
+            assert_eq!(in_one_writer.commits.len() + 1, alone.commits.len());
+            writer.close(Ok(())).unwrap();
+        }
+        assert_eq!(
+            archive_commit_records(&held, &key_b),
+            archive_commit_records(&together, &key_c)
+        );
+    }
+
+    /// A unit whose source fails after pieces have closed inserts no record,
+    /// though the closed pieces' bytes are in the pile.
+    #[test]
+    fn a_failed_unit_with_closed_pieces_publishes_no_record() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let empty = pile_length(&pile);
+        let transcript = claude_transcript("failing", 300);
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        writer.set_piece_bits(4);
+        let mut staged = 0usize;
+        let result = crate::archive_claude_code::project_bytes(
+            "failing.jsonl",
+            Bytes::from_source(transcript.as_bytes().to_vec()),
+            |projected| {
+                staged += 1;
+                if staged == 400 {
+                    bail!("the source fails here");
+                }
+                writer.stage_fragment(projected.fragment)
+            },
+        )
+        .map(drop);
+        assert!(writer.pending.len() > 4, "pieces closed before the failure");
+        assert!(writer.close(result).is_err());
+        assert!(
+            pile_length(&pile) > empty,
+            "closed pieces appended their bytes"
+        );
+        assert!(
+            archive_commit_records(&pile, &key).is_empty(),
+            "a failed unit made COMMITs visible"
+        );
+    }
+
+    /// A process killed after any number of a unit's record inserts leaves
+    /// no node visible without its annotations, and rerunning the import
+    /// completes the unit to exactly the records of an uninterrupted import.
+    #[test]
+    fn a_partial_insert_shows_no_bare_node_and_a_retry_completes_it() {
+        let directory = TempDir::new().unwrap();
+        let transcript = claude_transcript("partial", 40);
+        let (clean, clean_key) = fresh_archive(&directory, "clean");
+        let complete = import_source(&clean, &clean_key, "partial.jsonl", &transcript);
+        let expected = archive_commit_records(&clean, &clean_key);
+        assert!(complete.commits.len() > 4, "{}", complete.commits.len());
+        for inserted in 0..complete.commits.len() {
+            let (pile, key) = fresh_archive(&directory, &format!("partial-{inserted}"));
+            let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            writer.set_piece_bits(4);
+            stage_source(&mut writer, "partial.jsonl", &transcript).unwrap();
+            // What `commit_unit` does, stopped after `inserted` records.
+            writer.publish_piece().unwrap();
+            writer.pending.truncate(inserted);
+            writer.commit_unit().unwrap();
+            writer.close(Ok(())).unwrap();
+            assert_eq!(archive_commit_records(&pile, &key).len(), inserted);
+            let (blocks, timed, _, _) = timed_union(&pile, &key);
+            assert!(
+                blocks.is_subset(&timed),
+                "{inserted}: a node without its time"
+            );
+
+            import_source(&pile, &key, "partial.jsonl", &transcript);
+            assert_eq!(archive_commit_records(&pile, &key), expected, "{inserted}");
+        }
     }
 
     #[test]
@@ -2863,8 +3190,8 @@ mod tests {
             }
             store.close().unwrap();
         }
-        let commit = import_source(&thin, &key, "here.jsonl", &claude_transcript("here", 20));
-        assert!(commit.is_some());
+        let published = import_source(&thin, &key, "here.jsonl", &claude_transcript("here", 20));
+        assert!(!published.is_empty());
         let observed = pollster::block_on(ensure_local(&thin, Some(&key))).unwrap();
         let facts = observed.facts().unwrap();
         let blocks: BTreeSet<Id> = find!(
@@ -2873,5 +3200,113 @@ mod tests {
         )
         .collect();
         assert_eq!(blocks.len(), 40, "the local import reads back whole");
+    }
+
+    /// A content fact's media type is part of its identity, and its name is
+    /// part of the media type's: both ride in the identity COMMIT.
+    #[test]
+    fn a_media_type_stays_whole_in_the_identity_commit() {
+        let fact = crate::blockdag::blob_fact(
+            schema::content_fact::modality::IMAGE,
+            schema::content_fact::direction::IN,
+            vec![1u8, 2, 3],
+            "image/png",
+        )
+        .unwrap();
+        let node = crate::blockdag::block(None, None, fact).unwrap();
+        let receipt =
+            crate::blockdag::block_source_projection(schema::source_projection::SOURCE_CODEX, node)
+                .unwrap();
+        let (identity, annotations, nodes) = blockdag::split_identity(receipt.facts());
+        assert_eq!(nodes.len(), 1);
+        let media: Vec<Id> = find!(
+            media: Id,
+            pattern!(&identity, [{ _?fact @ schema::content_fact::media_type: ?media }])
+        )
+        .collect();
+        assert_eq!(media.len(), 1);
+        let media = media[0];
+        assert!(exists!(
+            pattern!(&identity, [{ media @ metadata::name: _?name }])
+        ));
+        assert!(!exists!(
+            pattern!(&annotations, [{ media @ metadata::name: _?name }])
+        ));
+        assert!(exists!(pattern!(&annotations, [{
+            _?receipt @ schema::source_projection::projects_to: _?node
+        }])));
+    }
+
+    /// A node's identity is what its id derives from: its predecessors and
+    /// the facts it holds, with their own identities and the kind tags.
+    /// Its timestamp and its receipt, with every receipt annotation, annotate.
+    #[test]
+    fn split_identity_keeps_node_identities_and_moves_annotations() {
+        let parent = blockdag::block(
+            None,
+            None,
+            blockdag::text_fact(
+                schema::content_fact::modality::TEXT,
+                schema::content_fact::direction::IN,
+                "before",
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .root()
+        .unwrap();
+        let epoch = Epoch::from_unix_seconds(1_700_000_000.0);
+        let at: Inline<NsTAIInterval> = (epoch, epoch).try_to_inline().unwrap();
+        let node = blockdag::block(
+            [parent],
+            Some(at),
+            blockdag::text_fact(
+                schema::content_fact::modality::TEXT,
+                schema::content_fact::direction::OUT,
+                "after",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let node_id = node.root().unwrap();
+        let receipt =
+            blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, node)
+                .unwrap();
+        let receipt = blockdag::annotate_source_projection(
+            receipt,
+            blockdag::ProjectionAnnotations {
+                source_timestamp: Some(at),
+                raw_role: Some("assistant".to_owned()),
+                ..blockdag::ProjectionAnnotations::default()
+            },
+        )
+        .unwrap();
+        let (identity, annotations, nodes) = blockdag::split_identity(receipt.facts());
+        assert_eq!(nodes, vec![node_id]);
+        assert!(exists!(pattern!(&identity, [{ node_id @
+            schema::block::previous: &parent,
+            metadata::tag: &schema::block::KIND,
+        }])));
+        assert!(exists!(
+            pattern!(&identity, [{ node_id @ schema::block::holds: _?fact }, {
+                _?fact @
+                    metadata::tag: &schema::content_fact::KIND,
+                    schema::content_fact::modality: &schema::content_fact::modality::TEXT,
+                    schema::content_fact::direction: &schema::content_fact::direction::OUT,
+                    schema::content_fact::payload: _?payload,
+            }])
+        ));
+        assert!(exists!(
+            pattern!(&annotations, [{ node_id @ schema::block::timestamp: at }])
+        ));
+        assert!(exists!(pattern!(&annotations, [{ _?receipt @
+            schema::source_projection::projects_to: node_id,
+            schema::source_projection::source_timestamp: at,
+        }])));
+        assert_eq!(
+            identity.len() + annotations.len(),
+            receipt.facts().len(),
+            "every fact lands on one side"
+        );
     }
 }

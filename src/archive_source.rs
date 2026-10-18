@@ -593,8 +593,10 @@ pub fn interval_hull(
 /// record lists them: each node follows the node before it, and a record's
 /// first node follows the last nodes of the records before it. A tool
 /// result's node names the node of the call it answers through
-/// `responds_to`. The graph is ordered before fragments are emitted, so
-/// output is independent of source iteration order. Every emitted fragment is
+/// `responds_to`. Records are emitted in topological order, ties broken by
+/// the id of each record's first node, so the order is a function of the
+/// nodes: independent of source iteration order and of provider keys or raw
+/// bytes. Every emitted fragment is
 /// one whole node (the node and its fact) with its
 /// [`blockdag::block_source_projection`] receipt, annotated with the claims of
 /// its record; provider keys thread the graph while projecting and are never
@@ -636,111 +638,136 @@ where
         }
     }
 
-    let mut ready: Vec<usize> = indegree
-        .iter()
-        .enumerate()
-        .filter_map(|(index, count)| (*count == 0).then_some(index))
-        .collect();
-    sort_ready(&mut ready, &records);
-    let mut order = Vec::with_capacity(records.len());
-    while let Some(index) = ready.pop() {
-        order.push(index);
-        for &child in &children[index] {
-            indegree[child] -= 1;
-            if indegree[child] == 0 {
-                ready.push(child);
-                sort_ready(&mut ready, &records);
-            }
-        }
-    }
-    if order.len() != records.len() {
-        bail!("source predecessor graph contains a cycle");
-    }
-
     let revision = ProjectionAnnotations {
         importer_revision: Some(blockdag::IMPORTER_REVISION.to_owned()),
         ..ProjectionAnnotations::default()
     };
+    // Kahn's order with ties broken by content. A record is built as soon as
+    // every predecessor has been emitted, which fixes its frontier, and it
+    // then waits in `ready` under the id of its first node. The smallest id
+    // is emitted next, so wherever several records are ready (Gemini cards,
+    // the roots and branches of a conversation tree) the order, and with it
+    // every piece the import writer cuts, is a function of the nodes alone,
+    // never of provider ids or raw bytes. A contentless record emits nothing
+    // and releases its children at once.
     let mut frontiers = vec![BTreeSet::<Id>::new(); records.len()];
     let mut call_nodes = HashMap::<View<str>, Id>::new();
     let mut followed = BTreeSet::<Id>::new();
     let mut receipts = Vec::<(Id, Id)>::new();
-    for index in order {
-        let record = &records[index];
-        let mut frontier = BTreeSet::new();
-        for predecessor in &record.predecessors {
-            if let Some(&parent) = by_locator.get(predecessor) {
-                frontier.extend(frontiers[parent].iter().copied());
-            }
-        }
-        if record.parts.is_empty() {
-            // Nothing to store: the record only forwards its ancestors.
-            stats.contentless_records += 1;
-            frontiers[index] = frontier;
-            continue;
-        }
-        let claims = &record.claims;
-        let annotations = ProjectionAnnotations {
-            source_timestamp: claims.timestamp,
-            author: claims.author,
-            experiencer: claims.experiencer,
-            raw_author: claims
-                .raw_author
-                .as_ref()
-                .map(|value| value.as_ref().to_owned()),
-            raw_role: claims
-                .raw_role
-                .as_ref()
-                .map(|value| value.as_ref().to_owned()),
-            raw_model: claims
-                .raw_model
-                .as_ref()
-                .map(|value| value.as_ref().to_owned()),
-            ..ProjectionAnnotations::default()
-        };
-        for (position, part) in record.parts.iter().cloned().enumerate() {
-            let (fact, resolution) = build_fact(part)?;
-            let mut node = blockdag::block(frontier.iter().copied(), record.block_timestamp, fact)?;
-            let node_id = node.root().expect("canonical node is rooted");
-            if let Some(resolution) = resolution {
-                // Facts and bytes only: the fact is not exported again.
-                let (_, facts, metafacts, blobs) = resolution.into_parts();
-                node += Fragment::from_parts(facts, metafacts, blobs);
-            }
-            let link = record
-                .links
-                .iter()
-                .find_map(|(part, link)| (*part == position).then_some(link));
-            match link {
-                Some(ToolLink::Call(key)) => {
-                    call_nodes.entry(key.clone()).or_insert(node_id);
+    let mut staged: HashMap<usize, Vec<ProjectedSource>> = HashMap::new();
+    let mut ready = BTreeSet::<(Id, usize)>::new();
+    let mut releasable: Vec<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(index, count)| (*count == 0).then_some(index))
+        .collect();
+    let mut emitted = 0usize;
+    loop {
+        while let Some(index) = releasable.pop() {
+            let record = &records[index];
+            let mut frontier = BTreeSet::new();
+            for predecessor in &record.predecessors {
+                if let Some(&parent) = by_locator.get(predecessor) {
+                    frontier.extend(frontiers[parent].iter().copied());
                 }
-                Some(ToolLink::Result(key)) => match call_nodes.get(key) {
-                    Some(call) => node += blockdag::responds_to(node_id, *call),
-                    None => stats.unresolved_tool_results += 1,
-                },
-                None => {}
             }
-            followed.extend(frontier.iter().copied());
-            let receipt = blockdag::block_source_projection(source_namespace, node)?;
-            let receipt = blockdag::annotate_source_projection(receipt, annotations.clone())?;
-            let receipt = blockdag::annotate_source_projection(receipt, revision.clone())?;
-            receipts.push((
-                node_id,
-                receipt.root().expect("canonical receipt is rooted"),
-            ));
-            emit(ProjectedSource {
-                source_path: source_path.to_path_buf(),
-                fragment: receipt,
-                record: Some(record.locator.clone()),
-            })?;
-            stats.projections_emitted += 1;
-            stats.content_parts += 1;
-            frontier = BTreeSet::from([node_id]);
+            if record.parts.is_empty() {
+                // Nothing to store: the record only forwards its ancestors.
+                stats.contentless_records += 1;
+                frontiers[index] = frontier;
+                emitted += 1;
+                for &child in &children[index] {
+                    indegree[child] -= 1;
+                    if indegree[child] == 0 {
+                        releasable.push(child);
+                    }
+                }
+                continue;
+            }
+            let claims = &record.claims;
+            let annotations = ProjectionAnnotations {
+                source_timestamp: claims.timestamp,
+                author: claims.author,
+                experiencer: claims.experiencer,
+                raw_author: claims
+                    .raw_author
+                    .as_ref()
+                    .map(|value| value.as_ref().to_owned()),
+                raw_role: claims
+                    .raw_role
+                    .as_ref()
+                    .map(|value| value.as_ref().to_owned()),
+                raw_model: claims
+                    .raw_model
+                    .as_ref()
+                    .map(|value| value.as_ref().to_owned()),
+                ..ProjectionAnnotations::default()
+            };
+            let mut first = None;
+            let mut projected = Vec::with_capacity(record.parts.len());
+            for (position, part) in record.parts.iter().cloned().enumerate() {
+                let (fact, resolution) = build_fact(part)?;
+                let mut node =
+                    blockdag::block(frontier.iter().copied(), record.block_timestamp, fact)?;
+                let node_id = node.root().expect("canonical node is rooted");
+                first.get_or_insert(node_id);
+                if let Some(resolution) = resolution {
+                    // Facts and bytes only: the fact is not exported again.
+                    let (_, facts, metafacts, blobs) = resolution.into_parts();
+                    node += Fragment::from_parts(facts, metafacts, blobs);
+                }
+                let link = record
+                    .links
+                    .iter()
+                    .find_map(|(part, link)| (*part == position).then_some(link));
+                match link {
+                    Some(ToolLink::Call(key)) => {
+                        call_nodes.entry(key.clone()).or_insert(node_id);
+                    }
+                    Some(ToolLink::Result(key)) => match call_nodes.get(key) {
+                        Some(call) => node += blockdag::responds_to(node_id, *call),
+                        None => stats.unresolved_tool_results += 1,
+                    },
+                    None => {}
+                }
+                followed.extend(frontier.iter().copied());
+                let receipt = blockdag::block_source_projection(source_namespace, node)?;
+                let receipt = blockdag::annotate_source_projection(receipt, annotations.clone())?;
+                let receipt = blockdag::annotate_source_projection(receipt, revision.clone())?;
+                receipts.push((
+                    node_id,
+                    receipt.root().expect("canonical receipt is rooted"),
+                ));
+                projected.push(ProjectedSource {
+                    source_path: source_path.to_path_buf(),
+                    fragment: receipt,
+                    record: Some(record.locator.clone()),
+                });
+                stats.projections_emitted += 1;
+                stats.content_parts += 1;
+                frontier = BTreeSet::from([node_id]);
+            }
+            frontiers[index] = frontier;
+            staged.insert(index, projected);
+            ready.insert((first.expect("a record with parts has a node"), index));
         }
-        frontiers[index] = frontier;
+        let Some((_, index)) = ready.pop_first() else {
+            break;
+        };
+        for projected in staged.remove(&index).unwrap_or_default() {
+            emit(projected)?;
+        }
+        emitted += 1;
+        for &child in &children[index] {
+            indegree[child] -= 1;
+            if indegree[child] == 0 {
+                releasable.push(child);
+            }
+        }
     }
-
+    if emitted != records.len() {
+        bail!("source predecessor graph contains a cycle");
+    }
     // Conversation-level provenance lands on the unit's leaves only.
     let mut annotated = BTreeSet::new();
     for (node, receipt) in receipts {
@@ -763,15 +790,6 @@ where
     }
 
     Ok(stats)
-}
-
-fn sort_ready(ready: &mut [usize], records: &[SourceRecord]) {
-    ready.sort_by(|left, right| {
-        records[*right]
-            .locator
-            .as_ref()
-            .cmp(records[*left].locator.as_ref())
-    });
 }
 
 #[cfg(test)]

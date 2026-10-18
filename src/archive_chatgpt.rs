@@ -134,6 +134,10 @@ where
         conversations_seen: conversations.len(),
         ..ProjectionSummary::default()
     };
+    // Conversations are emitted in the order of their first node's receipt,
+    // not in export order, which a later export may change: the pieces an
+    // import writer cuts are then a function of the content.
+    let mut projected = Vec::with_capacity(conversations.len());
     for conversation in conversations {
         let unit = archive_source::UnitAnnotations {
             source_locator: Some(format!("conversation/{}", conversation.id.as_ref())),
@@ -151,14 +155,27 @@ where
         // The conversation id and title annotate the conversation's leaves;
         // UI and export state of the envelope (current_node, update_time,
         // safe_urls, plugin ids, ...) is not kept.
+        let mut fragments = Vec::new();
         let stats = archive_source::project_records(
             schema::source_projection::SOURCE_CHATGPT,
             source_path,
             records,
             unit,
-            &mut *emit,
+            |fragment| {
+                fragments.push(fragment);
+                Ok(())
+            },
         )?;
         summary.stats.absorb(stats);
+        if let Some(key) = fragments.first().and_then(|first| first.fragment.root()) {
+            projected.push((key, fragments));
+        }
+    }
+    projected.sort_by_key(|(key, _)| *key);
+    for (_, fragments) in projected {
+        for fragment in fragments {
+            emit(fragment)?;
+        }
     }
     Ok(summary)
 }
@@ -2040,5 +2057,93 @@ mod tests {
             file_id_from_filename("file_0000000001ac71f4867daa5e038cd8e6-sanitized.png").as_deref(),
             Some("file_0000000001ac71f4867daa5e038cd8e6")
         );
+    }
+
+    #[test]
+    fn a_sidecar_changes_no_identity_commit() {
+        use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace::core::repo::BlobStoreGet;
+        let with = TempDir::new().unwrap();
+        let without = TempDir::new().unwrap();
+        fs::write(with.path().join("conversations.json"), TINY_EXPORT).unwrap();
+        fs::write(without.path().join("conversations.json"), TINY_EXPORT).unwrap();
+        fs::write(with.path().join("file-abc-picture.png"), [1, 2, 3, 4]).unwrap();
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let node_commits = |pile: &Path| -> BTreeSet<[u8; 32]> {
+            let mut store = crate::storage::open_pile_strict(pile).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let out = crate::storage::discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .map(|commit| commit.data())
+                .filter(|data| {
+                    let facts: TribleSet = snapshot
+                        .get::<TribleSet, SimpleArchive>(Handle::from_hash(*data))
+                        .unwrap();
+                    exists!(pattern!(&facts, [{ _?block @ metadata::tag: &schema::block::KIND }]))
+                })
+                .map(|data| data.raw)
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            out
+        };
+        let mut seen = Vec::new();
+        for root in [with.path(), without.path()] {
+            let mut writer =
+                crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            writer.set_piece_bits(0);
+            project_path(root, |projected| writer.stage_fragment(projected.fragment)).unwrap();
+            writer.commit_unit().unwrap();
+            writer.close(Ok(())).unwrap();
+            seen.push(node_commits(&pile));
+        }
+        let added = seen[1].difference(&seen[0]).count();
+        assert_eq!(added, 0, "the same nodes cut into a new intrinsic piece");
+    }
+
+    /// Conversations come out in the order of their content, not of the
+    /// export, which a later export may change: the same conversations in
+    /// another order emit the same nodes in the same order.
+    #[test]
+    fn conversations_emit_in_content_order_not_export_order() {
+        let conversation = |id: &str, user: &str, text: &str| {
+            serde_json::json!({
+                "id": id,
+                "title": "Weather",
+                "mapping": {
+                    "root": {"parent": null, "message": null},
+                    user: {"parent": "root", "message": {"id": user,
+                        "author": {"role": "user"}, "create_time": 1772382841.5,
+                        "content": {"content_type": "text", "parts": [text]}}},
+                },
+            })
+        };
+        let alpha = conversation("c-alpha", "u-alpha", "alpha");
+        let beta = conversation("c-beta", "u-beta", "beta");
+        let order = |export: serde_json::Value| -> Vec<Id> {
+            let mut roots = Vec::new();
+            project_bytes(
+                "conversations.json",
+                Bytes::from_source(export.to_string()),
+                &std::collections::BTreeMap::new(),
+                |projected| {
+                    if projected.record.is_some() {
+                        roots.push(projected.fragment.root().unwrap());
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            roots
+        };
+        let forward = order(serde_json::json!([alpha.clone(), beta.clone()]));
+        assert_eq!(forward.len(), 2);
+        assert_eq!(forward, order(serde_json::json!([beta, alpha])));
     }
 }

@@ -53,7 +53,8 @@ impl ProjectionStats {
     }
 }
 
-/// One input export projected into an attachment-complete fragment.
+/// One projected node of an input export, with its receipt. File-level
+/// statistics are in the [`ProjectionSummary`].
 pub struct ProjectedFile {
     pub source_path: PathBuf,
     pub fragment: Fragment,
@@ -70,9 +71,9 @@ pub struct ProjectionSummary {
 
 /// Project one `conversations.json`, or every such file below a directory.
 ///
-/// Files and callbacks are ordered lexicographically.  The adapter performs no
-/// pile writes; callers can stage all returned fragments and publish one
-/// validated Archive collection COMMIT.
+/// Files are ordered lexicographically, and each file's nodes are emitted one
+/// fragment each. The adapter performs no pile writes; callers stage every
+/// fragment into one import writer and publish it as one unit.
 pub fn project_path<F>(path: &Path, mut emit: F) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedFile) -> Result<()>,
@@ -88,41 +89,46 @@ where
 
     let mut summary = ProjectionSummary::default();
     for source_path in paths {
-        let (fragment, stats) = project_file(&source_path)?;
-        summary.files_scanned += 1;
-        summary.stats.absorb(stats);
-        if !fragment.facts().is_empty() {
-            emit(ProjectedFile {
-                source_path,
-                fragment,
-                stats,
-            })?;
-            summary.fragments_emitted += 1;
-        }
+        let bytes = archive_source::map_immutable_file(&source_path)?;
+        project_content(&source_path, bytes, &mut summary, &mut emit)?;
     }
     Ok(summary)
 }
 
-fn project_file(path: &Path) -> Result<(Fragment, ProjectionStats)> {
-    project_content(path, archive_source::map_immutable_file(path)?)
-}
-fn project_content(path: &Path, bytes: Bytes) -> Result<(Fragment, ProjectionStats)> {
+/// Project one export's conversations, emitting each projected node as its
+/// own fragment so the import writer can cut the export into pieces.
+fn project_content<F>(
+    path: &Path,
+    bytes: Bytes,
+    summary: &mut ProjectionSummary,
+    emit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(ProjectedFile) -> Result<()>,
+{
     let conversations = parse_export(bytes)
         .map_err(anyhow::Error::new)
         .with_context(|| format!("scan Claude Web export {}", path.display()))?;
     let (records, mut stats) = records_from_conversations(conversations)?;
-    let mut fragment = Fragment::empty();
+    let mut emitted = 0usize;
     stats.common = archive_source::project_records(
         schema::source_projection::SOURCE_CLAUDE_WEB,
         path,
         records,
         archive_source::UnitAnnotations::default(),
         |projected: ProjectedSource| {
-            fragment += projected.fragment;
-            Ok(())
+            emitted += 1;
+            emit(ProjectedFile {
+                source_path: path.to_path_buf(),
+                fragment: projected.fragment,
+                stats: ProjectionStats::default(),
+            })
         },
     )?;
-    Ok((fragment, stats))
+    summary.files_scanned += 1;
+    summary.fragments_emitted += emitted;
+    summary.stats.absorb(stats);
+    Ok(())
 }
 
 /// Project resident export bytes; the source name is only a provenance label.
@@ -131,20 +137,8 @@ pub fn project_bytes<F>(source_name: &str, bytes: Bytes, mut emit: F) -> Result<
 where
     F: FnMut(ProjectedFile) -> Result<()>,
 {
-    let (fragment, stats) = project_content(Path::new(source_name), bytes)?;
-    let mut summary = ProjectionSummary {
-        files_scanned: 1,
-        stats,
-        ..ProjectionSummary::default()
-    };
-    if !fragment.facts().is_empty() {
-        emit(ProjectedFile {
-            source_path: PathBuf::from(source_name),
-            fragment,
-            stats,
-        })?;
-        summary.fragments_emitted = 1;
-    }
+    let mut summary = ProjectionSummary::default();
+    project_content(Path::new(source_name), bytes, &mut summary, &mut emit)?;
     Ok(summary)
 }
 
@@ -1694,16 +1688,21 @@ mod tests {
         let array_path = directory.path().join("array.json");
         fs::write(&array_path, EXPORT).unwrap();
         let mut calls = 0;
+        let mut receipts = 0;
         let summary = project_path(&array_path, |projected| {
             calls += 1;
-            assert!(exists!(pattern!(projected.fragment.facts(), [{
+            if exists!(pattern!(projected.fragment.facts(), [{
                 _?projection @ schema::source_projection::source_namespace:
                     &schema::source_projection::SOURCE_CLAUDE_WEB
-            }])));
+            }])) {
+                receipts += 1;
+            }
             Ok(())
         })
         .unwrap();
-        assert_eq!(calls, 1);
+        // One fragment per message node, then the leaves' annotations.
+        assert_eq!(receipts, summary.stats.common.projections_emitted);
+        assert_eq!(calls, summary.fragments_emitted);
         assert_eq!(summary.files_scanned, 1);
         assert_eq!(summary.stats.messages, 3);
 
@@ -1717,5 +1716,55 @@ mod tests {
         fs::write(&singleton_path, singleton).unwrap();
         let summary = project_path(&singleton_path, |_| Ok(())).unwrap();
         assert_eq!(summary.stats.messages, 3);
+    }
+
+    #[test]
+    fn an_export_cuts_one_piece_per_node_at_zero_bits() {
+        use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace::core::metadata;
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let mut writer =
+            crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        writer.set_piece_bits(0);
+        let mut fragments = 0usize;
+        project_bytes(
+            "conversations.json",
+            Bytes::from_source(EXPORT.to_owned()),
+            |projected| {
+                fragments += 1;
+                writer.stage_fragment(projected.fragment)
+            },
+        )
+        .unwrap();
+        writer.commit_unit().unwrap();
+        writer.close(Ok(())).unwrap();
+        let mut store = crate::storage::open_pile_strict(&pile).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let mut node_commits = 0usize;
+        let mut nodes = 0usize;
+        for commit in crate::storage::discovered_records(&snapshot)
+            .unwrap()
+            .commits()
+        {
+            let facts: TribleSet = snapshot
+                .get::<TribleSet, SimpleArchive>(Handle::from_hash(commit.data()))
+                .unwrap();
+            let here = find!(
+                block: Id,
+                pattern!(&facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+            )
+            .count();
+            if here > 0 {
+                node_commits += 1;
+                nodes += here;
+            }
+        }
+        drop(snapshot);
+        store.close().unwrap();
+        assert_eq!(node_commits, nodes, "one piece per node at piece_bits 0");
     }
 }

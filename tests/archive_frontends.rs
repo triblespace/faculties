@@ -149,11 +149,14 @@ fn all_seven_resident_scanners_preserve_file_projection_identity_and_bytes() {
         fs::write(&path, content).unwrap();
         let first = fixture.cli(&["import", path.to_str().unwrap(), "--source", spelling]);
         assert!(
-            text(&first).contains("one signed COMMIT published"),
-            "{spelling}"
+            text(&first).contains("1 piece(s) in 3 COMMIT(s), "),
+            "{spelling}: {}",
+            text(&first)
         );
         let ids = fixture.projections();
         assert!(!ids.is_empty(), "{spelling}");
+        // After the read: it carries and attaches, which appends.
+        let length = fs::metadata(&fixture.pile).unwrap().len();
         let receipt = fixture
             .archive()
             .import(
@@ -163,11 +166,17 @@ fn all_seven_resident_scanners_preserve_file_projection_identity_and_bytes() {
                 &BTreeMap::new(),
             )
             .unwrap();
-        assert!(
-            receipt.commit.is_none(),
-            "resident {spelling} must add no facts to its identical file projection"
+        assert_eq!(
+            fs::metadata(&fixture.pile).unwrap().len(),
+            length,
+            "resident {spelling} must publish the COMMITs of its identical file projection"
         );
-        assert_eq!(fixture.roots(), 1);
+        assert_eq!(receipt.publication.pieces, 1, "{spelling}");
+        assert_eq!(
+            fixture.roots(),
+            3,
+            "{spelling}: the vocabulary and one piece's two COMMITs"
+        );
         assert_eq!(fixture.projections(), ids);
     }
 }
@@ -355,7 +364,8 @@ fn malformed_import_is_not_published_and_output_failure_is_not_retried() {
         )
         .is_err());
     assert_eq!(count, 1);
-    assert_eq!(fixture.roots(), 1);
+    assert_eq!(fixture.roots(), 3);
+    let length = fs::metadata(&fixture.pile).unwrap().len();
     let again = fixture
         .archive()
         .import(
@@ -365,8 +375,9 @@ fn malformed_import_is_not_published_and_output_failure_is_not_retried() {
             &BTreeMap::new(),
         )
         .unwrap();
-    assert!(again.commit.is_none());
-    assert_eq!(fixture.roots(), 1);
+    assert!(!again.publication.is_empty());
+    assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
+    assert_eq!(fixture.roots(), 3);
 }
 
 #[test]

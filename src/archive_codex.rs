@@ -2481,7 +2481,7 @@ mod tests {
             let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
             writer.set_piece_bits(0);
             project_path(path, |projected| writer.stage_fragment(projected.fragment)).unwrap();
-            assert!(writer.commit_unit().unwrap().is_some());
+            assert!(!writer.commit_unit().unwrap().is_empty());
             writer.close(Ok(())).unwrap();
             if path == &parent_path {
                 assert_eq!(intrinsic_commits(&pile).len(), 3);
@@ -2739,5 +2739,56 @@ mod tests {
         assert!(exists!(pattern!(first.facts(), [{
             _?output @ schema::block::responds_to: _?call
         }])));
+    }
+
+    /// COMMIT records (data, metadata) of every Archive commit.
+    fn commit_records(pile: &Path) -> BTreeSet<([u8; 32], [u8; 32])> {
+        let mut store = crate::storage::open_pile_strict(pile).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let out = crate::storage::discovered_records(&snapshot)
+            .unwrap()
+            .commits()
+            .iter()
+            .map(|commit| (commit.data().raw, commit.metadata().raw))
+            .collect();
+        drop(snapshot);
+        store.close().unwrap();
+        out
+    }
+
+    #[test]
+    fn a_fork_replay_reuses_the_parent_commit_records() {
+        let fork_text = fork_rollout();
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let parent_path = directory.path().join("parent.jsonl");
+        let fork_path = directory.path().join("fork.jsonl");
+        fs::write(&parent_path, PARENT_ROLLOUT).unwrap();
+        fs::write(&fork_path, &fork_text).unwrap();
+        let mut after_parent = BTreeSet::new();
+        for path in [&parent_path, &fork_path] {
+            let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            writer.set_piece_bits(0);
+            project_path(path, |projected| writer.stage_fragment(projected.fragment)).unwrap();
+            writer.commit_unit().unwrap();
+            writer.close(Ok(())).unwrap();
+            if path == &parent_path {
+                after_parent = commit_records(&pile);
+            }
+        }
+        let after_fork = commit_records(&pile);
+        let parent_data: BTreeSet<[u8; 32]> = after_parent.iter().map(|(data, _)| *data).collect();
+        let repeated: Vec<_> = after_fork
+            .difference(&after_parent)
+            .filter(|(data, _)| parent_data.contains(data))
+            .collect();
+        assert!(
+            repeated.is_empty(),
+            "{} fork COMMITs repeat a parent piece's data under another metadata",
+            repeated.len()
+        );
     }
 }

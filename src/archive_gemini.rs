@@ -1279,4 +1279,75 @@ mod tests {
         assert!(summary.cards_seen > 0);
         assert_eq!(summary.fragments_emitted, summary.records_emitted);
     }
+
+    #[test]
+    fn a_markup_only_change_reuses_every_identity_commit() {
+        use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace::core::metadata;
+        use triblespace::core::repo::BlobStoreGet;
+        use triblespace::prelude::inlineencodings::Handle;
+        let cards: String = (0..40)
+            .map(|index| {
+                card(&format!(
+                    "Prompted&nbsp;question {index}<br>18 Sept 2025, 12:{:02}:52 CET<br><p>answer {index}</p>",
+                    index
+                ))
+            })
+            .collect();
+        let a = format!("{PREFIX}{cards}{SUFFIX}");
+        let b = a.replace("<p>Gemini Apps<br></p>", "<p>Gemini Apps</p>");
+        assert_ne!(a, b);
+        let directory = TempDir::new().unwrap();
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let node_commits = |pile: &Path| -> BTreeSet<[u8; 32]> {
+            let mut store = crate::storage::open_pile_strict(pile).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let out = crate::storage::discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .map(|commit| commit.data())
+                .filter(|data| {
+                    let facts: TribleSet = snapshot
+                        .get::<TribleSet, SimpleArchive>(Handle::from_hash(*data))
+                        .unwrap();
+                    exists!(pattern!(&facts, [{ _?block @ metadata::tag: &schema::block::KIND }]))
+                })
+                .map(|data| data.raw)
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            out
+        };
+        let mut seen = Vec::new();
+        let mut blocks = Vec::new();
+        for html in [&a, &b] {
+            let mut ids = BTreeSet::new();
+            let mut writer =
+                crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            writer.set_piece_bits(3);
+            project_bytes(
+                "My Activity.html",
+                Bytes::from_source(html.clone()),
+                &std::collections::BTreeMap::new(),
+                |projected| {
+                    if projected.record.is_some() {
+                        ids.insert(projected_block(&projected.fragment));
+                    }
+                    writer.stage_fragment(projected.fragment)
+                },
+            )
+            .unwrap();
+            writer.commit_unit().unwrap();
+            writer.close(Ok(())).unwrap();
+            seen.push(node_commits(&pile));
+            blocks.push(ids);
+        }
+        assert_eq!(blocks[0], blocks[1], "the same nodes");
+        let added = seen[1].difference(&seen[0]).count();
+        assert_eq!(added, 0, "the same nodes cut into new pieces");
+    }
 }
