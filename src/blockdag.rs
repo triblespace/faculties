@@ -33,17 +33,17 @@ use triblespace::prelude::*;
 use crate::files;
 use crate::schemas::{blockdag as schema, files as files_schema};
 
-/// The projection rules the importers apply, annotated on every importer
-/// receipt. Change it whenever a rule changes what an importer writes for the
-/// same source.
-pub const IMPORTER_REVISION: &str =
-    "archive-importers/2: acts and perceptions, in/out, main chain (2026-10-16)";
-
 /// Source-occurrence evidence that must not affect the projected block or
 /// projection-receipt identity.
 ///
 /// Every field is additive. `None` means that the source supplied no usable
 /// evidence; it never inserts a sentinel value.
+///
+/// Every field comes from the session's own content, so it is the same in
+/// every copy of the session, read from any folder, on any host, by any
+/// build. Nothing that only describes the machinery around the session (the
+/// file's path, a provider's title for the conversation, the importer's
+/// revision) is an annotation.
 #[derive(Clone, Debug, Default)]
 pub struct ProjectionAnnotations {
     /// Source receipts that additively support the projected block's semantic
@@ -63,19 +63,12 @@ pub struct ProjectionAnnotations {
     pub raw_role: Option<String>,
     /// Exact source spelling of the model field.
     pub raw_model: Option<String>,
-    /// Movable source path. This reuses Files' occurrence-level attribute.
-    pub source_path: Option<String>,
     /// Provider name of the conversation this receipt belongs to (a session,
     /// rollout or conversation id). Importers attach it to the leaves of one
     /// source unit only; it never enters an identity.
     pub source_locator: Option<String>,
-    /// Human-readable title of that conversation, as the provider spelled it.
-    pub name: Option<String>,
     /// Canonical JSON of provider metadata about that conversation.
     pub source_detail: Option<String>,
-    /// The projection rules that produced the receipt
-    /// ([`IMPORTER_REVISION`] for the importers).
-    pub importer_revision: Option<String>,
 }
 
 type TextHandle = Inline<Handle<UTF8String>>;
@@ -544,7 +537,7 @@ where
 /// conversation (its predecessor chain), so every source occurrence of that
 /// message converges on this one receipt: the original line, a fork's replayed
 /// copy of it, a resumed rollout's, a re-export's under new provider ids. Time,
-/// actor, model, conversation id and path annotate the receipt (directly or
+/// actor, model and conversation id annotate the receipt (directly or
 /// through [`source_occurrence`]) and never enter its identity.
 ///
 /// Every importer uses this receipt. No source bytes are part of it.
@@ -588,20 +581,11 @@ pub fn annotate_source_projection(
     let raw_model = annotations
         .raw_model
         .map(|value| projection.put::<UTF8String, _>(value));
-    let source_path = annotations
-        .source_path
-        .map(|value| projection.put::<UTF8String, _>(value));
     let source_locator = annotations
         .source_locator
         .map(|value| projection.put::<UTF8String, _>(value));
-    let name = annotations
-        .name
-        .map(|value| projection.put::<UTF8String, _>(value));
     let source_detail = annotations
         .source_detail
-        .map(|value| projection.put::<UTF8String, _>(value));
-    let importer_revision = annotations
-        .importer_revision
         .map(|value| projection.put::<UTF8String, _>(value));
 
     projection += entity! { ExclusiveId::force_ref(&root) @
@@ -613,11 +597,8 @@ pub fn annotate_source_projection(
         schema::source_projection::raw_author?: raw_author.as_ref(),
         schema::source_projection::raw_role?: raw_role.as_ref(),
         schema::source_projection::raw_model?: raw_model.as_ref(),
-        files_schema::file::source_path?: source_path.as_ref(),
         schema::source_projection::source_locator?: source_locator.as_ref(),
-        metadata::name?: name.as_ref(),
         schema::source_projection::source_detail?: source_detail.as_ref(),
-        schema::source_projection::importer_revision?: importer_revision.as_ref(),
     };
     debug_assert_eq!(projection.root(), Some(root));
     Ok(projection)
@@ -1054,14 +1035,6 @@ where
         (entity: Id, value: TextHandle),
         pattern!(facts, [{ ?entity @ schema::source_projection::source_detail: ?value }])
     ));
-    let importer_revisions = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::importer_revision: ?value }])
-    ));
-    let source_paths = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ files_schema::file::source_path: ?value }])
-    ));
 
     let mut expected = TribleSet::new();
     let mut attachments = AttachmentPlan::default();
@@ -1292,10 +1265,7 @@ where
         let receipt_raw_authors = values_for(&raw_authors, *id);
         let receipt_raw_roles = values_for(&raw_roles, *id);
         let receipt_raw_models = values_for(&raw_models, *id);
-        let paths = values_for(&source_paths, *id);
-        let names = values_for(&media_names, *id);
         let details = values_for(&source_details, *id);
-        let revisions = values_for(&importer_revisions, *id);
         let selected = values_for(&receipt_resolutions, *id);
         let available: BTreeSet<RawHandle> = values_for(&node_holds, projected)
             .iter()
@@ -1310,8 +1280,6 @@ where
         attachments.raws.extend(selected.iter().copied());
 
         attachments.texts.extend(locators.iter().copied());
-        attachments.texts.extend(revisions.iter().copied());
-        attachments.texts.extend(names.iter().copied());
         attachments.texts.extend(details.iter().copied());
         attachments.raws.extend(raws.iter().copied());
         attachments
@@ -1319,7 +1287,6 @@ where
             .extend(receipt_raw_authors.iter().copied());
         attachments.texts.extend(receipt_raw_roles.iter().copied());
         attachments.texts.extend(receipt_raw_models.iter().copied());
-        attachments.texts.extend(paths.iter().copied());
 
         // Two receipt cores share this vocabulary. A block receipt
         // ([`block_source_projection`]) is the namespace and the block alone,
@@ -1359,10 +1326,7 @@ where
             schema::source_projection::raw_author*: receipt_raw_authors.iter(),
             schema::source_projection::raw_role*: receipt_raw_roles.iter(),
             schema::source_projection::raw_model*: receipt_raw_models.iter(),
-            files_schema::file::source_path*: paths.iter(),
-            metadata::name*: names.iter(),
             schema::source_projection::source_detail*: details.iter(),
-            schema::source_projection::importer_revision*: revisions.iter(),
             schema::source_projection::resolution*: selected.iter(),
         }
         .into_facts();
@@ -1968,11 +1932,8 @@ mod tests {
                 raw_author: Some("human".into()),
                 raw_role: Some("user".into()),
                 raw_model: Some("model-v1".into()),
-                source_path: Some("/moved/export.jsonl".into()),
                 source_locator: Some("conversation/7".into()),
-                name: Some("A title".into()),
                 source_detail: Some(r#"{"agentType":"general-purpose"}"#.into()),
-                importer_revision: Some(IMPORTER_REVISION.into()),
             },
         )
         .unwrap();
@@ -1982,7 +1943,7 @@ mod tests {
             schema::source_projection::experiencer: &id(10),
         }])));
         assert!(exists!(pattern!(&annotated, [{
-            root @ files_schema::file::source_path: _?path
+            root @ schema::source_projection::source_locator: _?locator
         }])));
     }
 
@@ -2278,14 +2239,18 @@ mod tests {
     }
 
     #[test]
-    fn source_paths_are_additive_occurrence_annotations() {
+    fn locators_are_additive_occurrence_annotations() {
         let (_directory, reader) = empty_reader();
-        let projection = projection(one_part("moved export"));
+        let projection = block_source_projection(
+            schema::source_projection::SOURCE_CHATGPT,
+            block([], None, one_part("moved export")).unwrap(),
+        )
+        .unwrap();
         let root = projection.root().unwrap();
         let projection = annotate_source_projection(
             projection,
             ProjectionAnnotations {
-                source_path: Some("/first/export.jsonl".into()),
+                source_locator: Some("conversation/first".into()),
                 ..ProjectionAnnotations::default()
             },
         )
@@ -2293,7 +2258,7 @@ mod tests {
             annotate_source_projection(
                 projection,
                 ProjectionAnnotations {
-                    source_path: Some("/second/export.jsonl".into()),
+                    source_locator: Some("conversation/second".into()),
                     ..ProjectionAnnotations::default()
                 },
             )

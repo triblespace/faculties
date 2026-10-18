@@ -559,10 +559,9 @@ fn build_fact(part: SourcePart) -> Result<(Fragment, Option<Fragment>)> {
 /// follows), never on every message, and never in an identity.
 #[derive(Clone, Debug, Default)]
 pub struct UnitAnnotations {
-    /// Provider name of the conversation (conversation, session or file id).
+    /// The conversation's own id, as its content spells it (conversation or
+    /// session id).
     pub source_locator: Option<String>,
-    /// Provider title of the conversation.
-    pub name: Option<String>,
 }
 
 /// The smallest interval covering every given one.
@@ -638,10 +637,6 @@ where
         }
     }
 
-    let revision = ProjectionAnnotations {
-        importer_revision: Some(blockdag::IMPORTER_REVISION.to_owned()),
-        ..ProjectionAnnotations::default()
-    };
     // Kahn's order with ties broken by content. A record is built as soon as
     // every predecessor has been emitted, which fixes its frontier, and it
     // then waits in `ready` under the id of its first node. The smallest id
@@ -733,7 +728,6 @@ where
                 followed.extend(frontier.iter().copied());
                 let receipt = blockdag::block_source_projection(source_namespace, node)?;
                 let receipt = blockdag::annotate_source_projection(receipt, annotations.clone())?;
-                let receipt = blockdag::annotate_source_projection(receipt, revision.clone())?;
                 receipts.push((
                     node_id,
                     receipt.root().expect("canonical receipt is rooted"),
@@ -768,9 +762,12 @@ where
     if emitted != records.len() {
         bail!("source predecessor graph contains a cycle");
     }
-    // Conversation-level provenance lands on the unit's leaves only.
+    // The conversation's id lands on the unit's leaves only.
     let mut annotated = BTreeSet::new();
     for (node, receipt) in receipts {
+        let Some(locator) = unit.source_locator.clone() else {
+            break;
+        };
         if followed.contains(&node) || !annotated.insert(receipt) {
             continue;
         }
@@ -779,9 +776,7 @@ where
             fragment: blockdag::source_occurrence(
                 receipt,
                 ProjectionAnnotations {
-                    source_path: Some(source_path.display().to_string()),
-                    source_locator: unit.source_locator.clone(),
-                    name: unit.name.clone(),
+                    source_locator: Some(locator),
                     ..ProjectionAnnotations::default()
                 },
             )?,
@@ -1057,7 +1052,6 @@ mod tests {
         ];
         let unit = |id: &str| UnitAnnotations {
             source_locator: Some(id.to_owned()),
-            name: Some("Greeting".to_owned()),
         };
         let (_, a) = project(first, unit("conv-1"));
         let (_, b) = project(renamed, unit("other-id"));
@@ -1092,7 +1086,6 @@ mod tests {
             records,
             UnitAnnotations {
                 source_locator: Some("conv".to_owned()),
-                name: None,
             },
         );
         let annotated: BTreeSet<Id> = find!(
@@ -1108,32 +1101,6 @@ mod tests {
             block_with_text(&mut union, "exhaust"),
         ]);
         assert_eq!(annotated, expected);
-    }
-
-    #[test]
-    fn every_receipt_names_the_importer_revision_as_an_annotation() {
-        let (_, mut union) = project(
-            vec![
-                said("q", &[], IN, Some("question")),
-                said("a", &["q"], OUT, Some("answer")),
-            ],
-            UnitAnnotations::default(),
-        );
-        let revision = union.put::<triblespace::prelude::blobencodings::UTF8String, _>(
-            blockdag::IMPORTER_REVISION.to_owned(),
-        );
-        let receipts: BTreeSet<Id> = find!(
-            receipt: Id,
-            pattern!(&union, [{ ?receipt @ schema::source_projection::projects_to: _?block }])
-        )
-        .collect();
-        let revised: BTreeSet<Id> = find!(
-            receipt: Id,
-            pattern!(&union, [{ ?receipt @ schema::source_projection::importer_revision: revision }])
-        )
-        .collect();
-        assert_eq!(receipts.len(), 2);
-        assert_eq!(revised, receipts);
     }
 
     #[test]

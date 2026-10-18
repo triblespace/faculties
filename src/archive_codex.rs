@@ -322,7 +322,6 @@ where
         projector.chain(),
         archive_source::UnitAnnotations {
             source_locator: Some(format!("session/{}", plan.session_id)),
-            name: None,
         },
         |projected| {
             fragments_emitted += 1;
@@ -1821,11 +1820,7 @@ mod tests {
             ids_with_tag(&first, schema::source_projection::KIND),
             ids_with_tag(&moved, schema::source_projection::KIND)
         );
-        assert_ne!(
-            first.facts(),
-            moved.facts(),
-            "the movable path remains additive source evidence"
-        );
+        assert_eq!(first.facts(), moved.facts(), "the path is not kept");
 
         let spaced_source = ROLLOUT.replace(
             r#"{"timestamp":"2026-08-16T08:00:00.003Z","type":"event_msg""#,
@@ -2789,6 +2784,47 @@ mod tests {
             repeated.is_empty(),
             "{} fork COMMITs repeat a parent piece's data under another metadata",
             repeated.len()
+        );
+
+        // The replayed nodes arrive with other annotations (no copy times):
+        // the fork publishes annotation COMMITs that name the parent's nodes,
+        // while their identity COMMITs are the parent's. This is a case the
+        // two-COMMIT split exists for.
+        let mut store = crate::storage::open_pile_strict(&pile).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let facts_of = |data: [u8; 32]| -> TribleSet {
+            snapshot
+                .get::<TribleSet, triblespace::core::blob::encodings::simplearchive::SimpleArchive>(
+                    Handle::from_hash(triblespace::core::inline::Inline::new(data)),
+                )
+                .unwrap()
+        };
+        let mut parent_nodes = BTreeSet::new();
+        for (data, _) in &after_parent {
+            parent_nodes.extend(find!(
+                node: Id,
+                pattern!(&facts_of(*data), [{ ?node @ metadata::tag: &schema::block::KIND }])
+            ));
+        }
+        let mut reannotated = BTreeSet::new();
+        for (data, _) in after_fork.difference(&after_parent) {
+            for node in find!(
+                node: Id,
+                pattern!(&facts_of(*data), [{
+                    _?receipt @ schema::source_projection::projects_to: ?node
+                }])
+            ) {
+                if parent_nodes.contains(&node) {
+                    reannotated.insert(node);
+                }
+            }
+        }
+        drop(snapshot);
+        store.close().unwrap();
+        assert_eq!(parent_nodes.len(), 3);
+        assert_eq!(
+            reannotated, parent_nodes,
+            "every replayed node is annotated anew"
         );
     }
 }

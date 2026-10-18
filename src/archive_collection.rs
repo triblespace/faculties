@@ -3309,4 +3309,31 @@ mod tests {
             "every fact lands on one side"
         );
     }
+
+    /// A session that grows, and a Claude Code session copied into a new
+    /// session file (a resume keeps every message's time, role and model),
+    /// bring back every closed piece of the first import as the same two
+    /// COMMITs. Only the first import's last piece, which carries the leaf's
+    /// session id, is not reused. Neither case needs the two-COMMIT split.
+    #[test]
+    fn growth_and_a_resumed_copy_reuse_both_commits_of_every_closed_piece() {
+        let original = claude_transcript("resumed", 300);
+        let grown = claude_transcript("resumed", 310);
+        let copy = grown.replace(r#""sessionId":"resumed""#, r#""sessionId":"resumed-again""#);
+        assert_ne!(copy, grown);
+        for (label, later) in [("grown", &grown), ("resumed copy", &copy)] {
+            let directory = TempDir::new().unwrap();
+            let (pile, key) = fresh_archive(&directory, "archive");
+            let first = import_source(&pile, &key, "resumed.jsonl", &original);
+            let second = import_source(&pile, &key, "resumed-again.jsonl", later);
+            assert!(first.pieces > 4, "{label}: {}", first.pieces);
+            let closed = &first.commits[1..first.commits.len() - 2];
+            let reused: BTreeSet<_> = second.commits.iter().copied().collect();
+            let missing = closed
+                .iter()
+                .filter(|commit| !reused.contains(commit))
+                .count();
+            assert_eq!(missing, 0, "{label}: closed-piece COMMITs not reused");
+        }
+    }
 }

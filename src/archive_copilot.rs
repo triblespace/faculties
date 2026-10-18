@@ -1602,7 +1602,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(summary.files_scanned, 1);
-        assert_eq!(summary.fragments_emitted, 3); // user + assistant + leaf path
+        assert_eq!(summary.fragments_emitted, 2); // user + assistant
         assert_eq!(summary.stats.records_seen, 3);
         assert_eq!(summary.stats.content_parts, 2);
         assert_eq!(summary.stats.contentless_records, 1);
@@ -2109,10 +2109,9 @@ mod tests {
         })
         .unwrap();
 
-        // The call, its status, what it returned, the reply; then the path
-        // on the leaf.
-        assert_eq!(first_fragments.len(), 5);
-        assert_eq!(second_fragments.len(), 5);
+        // The call, its status, what it returned, the reply.
+        assert_eq!(first_fragments.len(), 4);
+        assert_eq!(second_fragments.len(), 4);
         for (first, second) in first_fragments.iter().zip(&second_fragments).take(4) {
             assert_eq!(
                 first.root(),

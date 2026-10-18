@@ -15,9 +15,9 @@
 //! An attachment's media type comes from the export's own metadata; sidecar
 //! bytes found beside the export only annotate the fact.
 //! Node and conversation ids only thread the graph while projecting; the
-//! conversation id and title annotate the conversation's leaves. Envelope UI
-//! and export state (`current_node`, `update_time`, `safe_urls`, plugin ids,
-//! moderation results) is not kept. The complete mapping DAG is handed to
+//! conversation id annotates the conversation's leaves. The title, envelope
+//! UI and export state (`current_node`, `update_time`, `safe_urls`, plugin
+//! ids, moderation results) are not kept. The complete mapping DAG is handed to
 //! `archive_source` before anything is emitted.
 
 use std::collections::{HashMap, HashSet};
@@ -141,20 +141,15 @@ where
     for conversation in conversations {
         let unit = archive_source::UnitAnnotations {
             source_locator: Some(format!("conversation/{}", conversation.id.as_ref())),
-            name: conversation
-                .title
-                .as_ref()
-                .map(|title| title.as_ref().to_owned())
-                .filter(|title| !title.trim().is_empty()),
         };
         let (records, attachments_seen, attachments_resolved) =
             conversation.into_records(sidecars)?;
         summary.mapping_nodes_seen += records.len();
         summary.attachments_seen += attachments_seen;
         summary.attachments_resolved += attachments_resolved;
-        // The conversation id and title annotate the conversation's leaves;
-        // UI and export state of the envelope (current_node, update_time,
-        // safe_urls, plugin ids, ...) is not kept.
+        // The conversation id annotates the conversation's leaves; the title
+        // and the envelope's UI and export state (current_node, update_time,
+        // safe_urls, plugin ids, ...) are not kept.
         let mut fragments = Vec::new();
         let stats = archive_source::project_records(
             schema::source_projection::SOURCE_CHATGPT,
@@ -205,7 +200,6 @@ where
 #[derive(Debug)]
 struct Conversation {
     id: View<str>,
-    title: Option<View<str>>,
     nodes: Vec<MappingNode>,
 }
 
@@ -632,13 +626,11 @@ fn scan_conversation(raw: Bytes) -> std::result::Result<Conversation, sc::ScanEr
     let mut cursor = raw;
     let mut id = None;
     let mut conversation_id = None;
-    let mut title = None;
     let mut nodes = Vec::new();
     sc::object(&mut cursor, (), |(), key, value| {
         match key_text(key)?.as_ref() {
             "id" => id = Some(optional_string(value)?),
             "conversation_id" => conversation_id = Some(optional_string(value)?),
-            "title" => title = optional_string(value)?,
             "mapping" => nodes = scan_mapping(value)?,
             _ => sc::skip_value(value)?,
         }
@@ -646,7 +638,7 @@ fn scan_conversation(raw: Bytes) -> std::result::Result<Conversation, sc::ScanEr
     })?;
     let id = preferred_alias([id, conversation_id])
         .ok_or_else(|| syntax("ChatGPT conversation has no stable id"))?;
-    Ok(Conversation { id, title, nodes })
+    Ok(Conversation { id, nodes })
 }
 
 fn scan_mapping(bytes: &mut Bytes) -> std::result::Result<Vec<MappingNode>, sc::ScanError> {
@@ -1765,7 +1757,7 @@ mod tests {
     }
 
     #[test]
-    fn envelope_state_is_dropped_and_the_title_names_the_leaf() {
+    fn envelope_state_and_the_title_are_dropped() {
         const ENVELOPE: &str = r#"[
   {
     "id": "envelope-state",
@@ -1800,18 +1792,21 @@ mod tests {
         let changed = ENVELOPE
             .replace("[1, 2, 3]", "[1, 2, 4]")
             .replace("1772382842", "1772382999");
-        let mut first = project_export(&path, ENVELOPE);
+        let first = project_export(&path, ENVELOPE);
         let second = project_export(&path, &changed);
+        let retitled = ENVELOPE.replace("A retained title", "Another title");
         assert_eq!(
             first.facts(),
             second.facts(),
             "UI and export state is not kept"
         );
-        let tip = block_with_text(&mut first, "hi");
-        let title = first.put::<UTF8String, _>("A retained title".to_owned());
-        assert!(exists!(pattern!(&first, [{
-            _?receipt @ schema::source_projection::projects_to: tip,
-            triblespace::core::metadata::name: title
+        assert_eq!(
+            first.facts(),
+            project_export(&path, &retitled).facts(),
+            "the title is not kept"
+        );
+        assert!(!exists!(pattern!(&first, [{
+            _?receipt @ triblespace::core::metadata::name: _?title
         }])));
     }
 
@@ -2093,6 +2088,20 @@ mod tests {
             store.close().unwrap();
             out
         };
+        let all_commits = |pile: &Path| -> BTreeSet<([u8; 32], [u8; 32])> {
+            let mut store = crate::storage::open_pile_strict(pile).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let out = crate::storage::discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .map(|commit| (commit.data().raw, commit.metadata().raw))
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            out
+        };
+        let mut all = Vec::new();
         let mut seen = Vec::new();
         for root in [with.path(), without.path()] {
             let mut writer =
@@ -2102,9 +2111,17 @@ mod tests {
             writer.commit_unit().unwrap();
             writer.close(Ok(())).unwrap();
             seen.push(node_commits(&pile));
+            all.push(all_commits(&pile));
         }
         let added = seen[1].difference(&seen[0]).count();
         assert_eq!(added, 0, "the same nodes cut into a new intrinsic piece");
+        // The sidecar's bytes are an annotation: without them the annotation
+        // COMMITs differ while every identity COMMIT is the same. This is a
+        // case the two-COMMIT split exists for.
+        assert!(
+            all[1].difference(&all[0]).count() > 0,
+            "the sidecar left the annotations unchanged"
+        );
     }
 
     /// Conversations come out in the order of their content, not of the

@@ -209,11 +209,6 @@ pub mod source_projection {
         /// among that fact's `resolved_to` evidence. Minted with `trible
         /// genid` on 2026-10-16.
         "29757DF0058067C0250B586810CA19E0" as pub resolution: Handle<RawBytes>;
-        /// NONIDENTITY. The projection rules an importer applied
-        /// ([`crate::blockdag::IMPORTER_REVISION`]), so receipts written under
-        /// different rules can be told apart. Minted with `trible genid` on
-        /// 2026-10-16.
-        "F8DA86B1D3E8757161E569AFDC35CF43" as pub importer_revision: Handle<UTF8String>;
     }
 
     /// Nonidentity kind marker attached after intrinsic receipt construction.

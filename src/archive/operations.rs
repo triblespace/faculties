@@ -825,8 +825,6 @@ fn render_projection(facts: &FactArchive, reader: &PileSnapshot, projection: Id)
         ),
         ("raw_role", &*archive_schema::source_projection::raw_role),
         ("raw_model", &*archive_schema::source_projection::raw_model),
-        ("source_path", &*crate::schemas::files::file::source_path),
-        ("name", &*metadata::name),
     ] {
         for value in find!(
             value: TextHandle,
@@ -2001,7 +1999,7 @@ mod tests {
         )
         .collect();
         assert_eq!(blocks_before, blocks_after);
-        assert_eq!(facts.iter().count(), tribles_before + 2);
+        assert_eq!(facts.iter().count(), tribles_before + 1);
     }
 
     #[test]

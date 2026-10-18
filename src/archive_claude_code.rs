@@ -38,9 +38,9 @@
 //! message or a user prompt; until then what was logged inside it is held
 //! back, so a longer transcript only appends nodes. A tool result's node
 //! names the node of the call it answers. Each emitted fragment is one node
-//! with its fact and receipt. The session id, title and file path annotate
-//! the receipts of the file's leaves only; a subagent's `.meta.json`
-//! annotates its transcript's leaves.
+//! with its fact and receipt. The session id annotates the receipts of the
+//! file's leaves only; a subagent's `.meta.json` annotates its transcript's
+//! leaves. Titles and the file's path are not kept.
 //! `history.jsonl` prompts that no transcript beside it holds become nodes
 //! of their own. No source bytes are stored; [`SKIPPED_KINDS`] lists what is
 //! not projected and why.
@@ -63,7 +63,10 @@ pub const SKIPPED_KINDS: &[(&str, &str)] = &[
         "last-prompt, mode, permission-mode, atis-latch, frame-link, agent-setting, cost-state, agent-name, started, launched, result, continued-in, fork-context-ref, pr-link",
         "UI and session state",
     ),
-    ("ai-title, custom-title", "kept as the session title on the leaves"),
+    (
+        "ai-title, custom-title",
+        "a label for the session, not part of it",
+    ),
     (
         "toolUseResult",
         "client-side structured mirror of the tool_result content block",
@@ -180,9 +183,8 @@ impl ProjectionStats {
 
 /// One bounded projection fragment plus every blob its facts reference.
 ///
-/// `source_path` is presentation metadata only. It is also attached to each
-/// source-projection receipt as a nonidentity occurrence annotation, so moving
-/// a transcript never changes any source-projection or block id.
+/// `source_path` is for diagnostics only and is never stored: moving a
+/// transcript changes nothing the import publishes.
 #[derive(Debug)]
 pub struct ProjectedFile {
     pub source_path: PathBuf,
@@ -261,11 +263,10 @@ where
 /// The prompt log Claude Code keeps beside `projects/`.
 const HISTORY_FILE: &str = "history.jsonl";
 
-/// A subagent's `.meta.json`: its canonical JSON and its description.
+/// A subagent's `.meta.json`, as canonical JSON.
 #[derive(Clone, Debug, Default)]
 struct SubagentMeta {
     detail: String,
-    description: Option<String>,
 }
 
 /// Read `agent-<id>.meta.json` beside `agent-<id>.jsonl`, if there is one.
@@ -283,14 +284,7 @@ fn subagent_meta(transcript: &Path) -> Result<Option<SubagentMeta>> {
     let bytes = archive_source::read_file(&meta)?;
     let detail = archive_source::canonical_json(bytes.clone())
         .map_err(|error| anyhow!("parse {}: {error}", meta.display()))?;
-    let description = serde_json::from_slice::<serde_json::Value>(bytes.as_ref())
-        .ok()
-        .and_then(|value| value.get("description")?.as_str().map(str::to_owned))
-        .filter(|description| !description.trim().is_empty());
-    Ok(Some(SubagentMeta {
-        detail,
-        description,
-    }))
+    Ok(Some(SubagentMeta { detail }))
 }
 
 /// Project an immutable resident JSONL stream with the same canonical lineage
@@ -1428,8 +1422,6 @@ where
     // Receipts of the nodes this file projects, for the leaf annotation.
     let mut receipts = BTreeMap::<Id, Id>::new();
     let mut session = None::<String>;
-    let mut ai_title = None::<String>;
-    let mut custom_title = None::<String>;
 
     for_each_jsonl_line(&mut reader, None, |line_number, raw| {
         let mut row_stats = ProjectionStats {
@@ -1444,11 +1436,6 @@ where
                 line_number
             )
         })?;
-        match record.record_type.as_str() {
-            "ai-title" => ai_title = record.title.clone().or(ai_title.take()),
-            "custom-title" => custom_title = record.title.clone().or(custom_title.take()),
-            _ => {}
-        }
         if session.is_none() {
             session = record.session_id.clone();
         }
@@ -1474,11 +1461,9 @@ where
         Ok(())
     })?;
 
-    // The session id, its title and this file's path annotate the leaves the
-    // file projects, never every node.
-    let name = custom_title
-        .or(ai_title)
-        .or_else(|| meta.as_ref().and_then(|meta| meta.description.clone()));
+    // The session id and a subagent's spawn metadata annotate the leaves the
+    // file projects, never every node. Titles and the file's path are not
+    // kept: they describe the machinery around the session, not the session.
     let detail = meta.map(|meta| meta.detail);
     for (node, receipt) in receipts {
         if plan.followed.contains(&node) {
@@ -1487,9 +1472,7 @@ where
         let fragment = blockdag::source_occurrence(
             receipt,
             blockdag::ProjectionAnnotations {
-                source_path: Some(source_path.to_string_lossy().into_owned()),
                 source_locator: session.as_ref().map(|id| format!("session/{id}")),
-                name: name.clone(),
                 source_detail: detail.clone(),
                 ..blockdag::ProjectionAnnotations::default()
             },
@@ -1613,9 +1596,7 @@ where
             let receipt = blockdag::annotate_source_projection(
                 receipt,
                 blockdag::ProjectionAnnotations {
-                    source_path: Some(path.to_string_lossy().into_owned()),
                     source_locator: Some(format!("session/{session}")),
-                    importer_revision: Some(blockdag::IMPORTER_REVISION.to_owned()),
                     ..blockdag::ProjectionAnnotations::default()
                 },
             )?;
@@ -1989,10 +1970,6 @@ fn project_record(
         raw_model: record.model,
         ..blockdag::ProjectionAnnotations::default()
     };
-    let revision = blockdag::ProjectionAnnotations {
-        importer_revision: Some(blockdag::IMPORTER_REVISION.to_owned()),
-        ..blockdag::ProjectionAnnotations::default()
-    };
     let mut previous = plan.firsts[&class].clone();
     let mut fragments = Vec::with_capacity(draft.parts.len());
     for (position, part) in draft.parts.into_iter().enumerate() {
@@ -2010,7 +1987,6 @@ fn project_record(
         let receipt =
             blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, node)?;
         let receipt = blockdag::annotate_source_projection(receipt, annotations.clone())?;
-        let receipt = blockdag::annotate_source_projection(receipt, revision.clone())?;
         // An alias line repeats its nodes: each is counted once.
         if let std::collections::btree_map::Entry::Vacant(entry) = receipts.entry(node_id) {
             entry.insert(receipt.root().expect("canonical receipt is rooted"));
@@ -2143,7 +2119,6 @@ struct RawRecord {
     uuid: Option<String>,
     parent_uuid: Option<String>,
     attachment_type: Option<String>,
-    title: Option<String>,
     forked_from: Option<ForkedFrom>,
     source_tool_assistant_uuid: Option<String>,
     timestamp: Option<Epoch>,
@@ -2287,7 +2262,6 @@ fn scan_record(bytes: &mut Bytes) -> std::result::Result<RawRecord, sc::ScanErro
             "sessionId" => record.session_id = parse_optional_string(value)?,
             "uuid" => record.uuid = parse_optional_string(value)?,
             "parentUuid" => record.parent_uuid = parse_optional_string(value)?,
-            "aiTitle" | "customTitle" => record.title = parse_optional_string(value)?,
             "attachment" => record.attachment_type = scan_attachment_type(value)?,
             "forkedFrom" => record.forked_from = scan_optional_forked_from(value)?,
             "sourceToolAssistantUUID" => {
@@ -3177,6 +3151,54 @@ mod tests {
         assert!(ids_with_tag(&union, schema::block::KIND).contains(&kept));
     }
 
+    /// A subagent's `.meta.json` may be beside its transcript on one host and
+    /// missing on another. The same nodes then arrive with and without that
+    /// leaf annotation: the identity COMMIT is the same record, and only the
+    /// annotation COMMIT differs. This is a case the two-COMMIT split exists
+    /// for (here in the unit's last piece, where the leaf annotations ride).
+    #[test]
+    fn a_missing_subagent_meta_changes_only_the_annotation_commit() {
+        let directory = tempfile::tempdir().unwrap();
+        let transcript = concat!(
+            r#"{"type":"user","sessionId":"session","agentId":"a1","isSidechain":true,"uuid":"q","message":{"role":"user","content":"audit this"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"session","agentId":"a1","isSidechain":true,"uuid":"a","parentUuid":"q","message":{"role":"assistant","content":"done"}}"#,
+            "\n",
+        );
+        let mut paths = Vec::new();
+        for (host, meta) in [("with", true), ("without", false)] {
+            let agents = directory.path().join(host).join("session/subagents");
+            fs::create_dir_all(&agents).unwrap();
+            let path = agents.join("agent-a1.jsonl");
+            fs::write(&path, transcript).unwrap();
+            if meta {
+                fs::write(
+                    agents.join("agent-a1.meta.json"),
+                    r#"{"description":"Audit the code","agentType":"general-purpose"}"#,
+                )
+                .unwrap();
+            }
+            paths.push(path);
+        }
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let mut published = Vec::new();
+        for path in &paths {
+            let mut writer =
+                crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            project_path(path, |projected| writer.stage_fragment(projected.fragment)).unwrap();
+            published.push(writer.commit_unit().unwrap());
+            writer.close(Ok(())).unwrap();
+        }
+        let (with, without) = (&published[0], &published[1]);
+        assert_eq!(with.pieces, 1);
+        assert_eq!(with.commits.len(), 3, "vocabulary, annotations, identity");
+        assert_eq!(with.commits[2], without.commits[2], "the identity COMMIT");
+        assert_ne!(with.commits[1], without.commits[1], "the annotation COMMIT");
+    }
+
     #[test]
     fn subagent_meta_annotates_the_transcript_leaves() {
         let directory = tempfile::tempdir().unwrap();
@@ -3210,11 +3232,12 @@ mod tests {
                 r#"{"agentType":"general-purpose","description":"Audit the code","spawnDepth":1,"toolUseId":"toolu_1"}"#
                     .to_owned(),
             );
-            let name = union.put::<UTF8String, _>("Audit the code".to_owned());
             assert!(exists!(pattern!(&union, [{
                 _?receipt @ schema::source_projection::projects_to: leaf,
-                schema::source_projection::source_detail: detail,
-                metadata::name: name
+                schema::source_projection::source_detail: detail
+            }])));
+            assert!(!exists!(pattern!(&union, [{
+                _?receipt @ metadata::name: _?title
             }])));
             let root = block_with_payload(&union, "audit this");
             assert!(!exists!(pattern!(&union, [{
@@ -3272,10 +3295,10 @@ mod tests {
             ids_with_tag(&first.fragment, schema::source_projection::KIND),
             ids_with_tag(&moved.fragment, schema::source_projection::KIND),
         );
-        assert_ne!(
+        assert_eq!(
             first.fragment.facts(),
             moved.fragment.facts(),
-            "the path remains additive occurrence evidence"
+            "the path is not kept"
         );
     }
 

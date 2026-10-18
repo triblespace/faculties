@@ -452,3 +452,221 @@ fn finite_schemas_reject_config_duplicates_invalid_shapes_and_dates_before_stora
         assert_eq!(emitted, 0);
     }
 }
+
+/// A richer Claude Code session: thinking with its sealed signature, a tool
+/// call, and a tool result carrying text and an image.
+const CODE_RICH: &str = concat!(
+    r#"{"type":"user","sessionId":"rich","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T15:34:01.542Z","message":{"role":"user","content":"hello there"}}"#,
+    "\n",
+    r#"{"type":"assistant","sessionId":"rich","uuid":"a1","parentUuid":"u1","timestamp":"2026-03-01T15:34:02.000Z","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"thinking","thinking":"consider it","signature":"opaque"},{"type":"text","text":"hi!"},{"type":"tool_use","id":"toolu_1","name":"Screenshot","input":{"display":1}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"rich","uuid":"u2","parentUuid":"a1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"screenshot below"},{"type":"image","source":{"type":"base64","media_type":"IMAGE/PNG; charset=binary","data":"iVBORw=="}}]}]}}"#,
+    "\n",
+    r#"{"type":"assistant","sessionId":"rich","uuid":"a2","parentUuid":"u2","timestamp":"2026-03-01T15:34:05.000Z","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"I see it"}]}}"#,
+    "\n",
+);
+
+/// Every source the seven importers read, as (source, CLI spelling, file
+/// name, content).
+fn every_source(html: &str) -> Vec<(ImportSource, &'static str, &'static str, String)> {
+    vec![
+        (
+            ImportSource::Agy,
+            "agy",
+            "transcript_full.jsonl",
+            AGY.to_owned(),
+        ),
+        (
+            ImportSource::ChatGpt,
+            "chatgpt",
+            "conversations.json",
+            CHATGPT.to_owned(),
+        ),
+        (
+            ImportSource::ClaudeCode,
+            "claude-code",
+            "claude.jsonl",
+            CODE.to_owned(),
+        ),
+        (
+            ImportSource::ClaudeCode,
+            "claude-code",
+            "rich.jsonl",
+            CODE_RICH.to_owned(),
+        ),
+        (
+            ImportSource::ClaudeWeb,
+            "claude-web",
+            "web.json",
+            WEB.to_owned(),
+        ),
+        (
+            ImportSource::Codex,
+            "codex",
+            "rollout.jsonl",
+            CODEX.to_owned(),
+        ),
+        (
+            ImportSource::Copilot,
+            "copilot",
+            "copilot.json",
+            COPILOT.to_owned(),
+        ),
+        (
+            ImportSource::Gemini,
+            "gemini",
+            "My Activity.html",
+            html.to_owned(),
+        ),
+    ]
+}
+
+/// Every annotation an importer writes comes from the session's own content,
+/// so it is the same in every copy: one session imported from two folders by
+/// the CLI, and once more through the resident API under another name,
+/// publishes the same COMMITs, and the later imports append nothing.
+#[test]
+fn a_session_from_another_folder_or_through_the_api_appends_nothing() {
+    let html = gemini("Prompted&nbsp;quasar needle<br>18 Sept 2025, 12:02:52 CET<br><p>answer</p>");
+    for (source, spelling, name, content) in every_source(&html) {
+        let fixture = Fixture::new();
+        let mut paths = Vec::new();
+        for folder in ["one/place", "another/folder"] {
+            let directory = fixture.directory.path().join(folder);
+            fs::create_dir_all(&directory).unwrap();
+            let path = directory.join(name);
+            fs::write(&path, &content).unwrap();
+            paths.push(path);
+        }
+        let first = fixture.cli(&["import", paths[0].to_str().unwrap(), "--source", spelling]);
+        assert!(text(&first).contains("bytes appended"), "{spelling}");
+        let length = fs::metadata(&fixture.pile).unwrap().len();
+        let second = fixture.cli(&["import", paths[1].to_str().unwrap(), "--source", spelling]);
+        assert!(
+            text(&second).contains(", 0 bytes appended to the pile"),
+            "{spelling} {name}: {}",
+            text(&second)
+        );
+        fixture
+            .archive()
+            .import(
+                source,
+                &format!("elsewhere/{name}"),
+                Bytes::from(content.clone()),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&fixture.pile).unwrap().len(),
+            length,
+            "{spelling} {name}: a later copy appended bytes"
+        );
+    }
+}
+
+/// The attributes an importer may write: the identity of nodes, content
+/// facts and receipts, and the annotations the session's own content
+/// carries. A file path, a provider's title or an importer revision is none
+/// of these. `metadata::name` is allowed on media types only, whose identity
+/// it is.
+#[test]
+fn importers_write_only_content_derived_attributes() {
+    use faculties::schemas::files::KIND_MEDIA_TYPE;
+    let allowed: Vec<Id> = vec![
+        metadata::tag.id(),
+        schema::block::previous.id(),
+        schema::block::holds.id(),
+        schema::block::timestamp.id(),
+        schema::block::responds_to.id(),
+        schema::content_fact::modality.id(),
+        schema::content_fact::direction.id(),
+        schema::content_fact::payload.id(),
+        schema::content_fact::blob.id(),
+        schema::content_fact::asset_pointer.id(),
+        schema::content_fact::asset_namespace.id(),
+        schema::content_fact::media_type.id(),
+        schema::content_fact::asset_size.id(),
+        schema::content_fact::resolved_to.id(),
+        schema::source_projection::source_namespace.id(),
+        schema::source_projection::projects_to.id(),
+        schema::source_projection::raw_record.id(),
+        schema::source_projection::semantic_predecessor_support.id(),
+        schema::source_projection::source_timestamp.id(),
+        schema::source_projection::author.id(),
+        schema::source_projection::experiencer.id(),
+        schema::source_projection::raw_author.id(),
+        schema::source_projection::raw_role.id(),
+        schema::source_projection::raw_model.id(),
+        schema::source_projection::source_locator.id(),
+        schema::source_projection::source_detail.id(),
+        schema::source_projection::resolution.id(),
+    ];
+    let html = gemini("Prompted&nbsp;quasar needle<br>18 Sept 2025, 12:02:52 CET<br><p>answer</p>");
+    let attachments = BTreeMap::new();
+    for (source, _, name, content) in every_source(&html) {
+        let mut facts = TribleSet::new();
+        let bytes = Bytes::from(content.clone());
+        let name = format!("/some/folder/{name}");
+        match source {
+            ImportSource::Agy => faculties::archive_agy::project_bytes(&name, bytes, |p| {
+                facts += p.fragment.facts().clone();
+                Ok(())
+            })
+            .map(drop),
+            ImportSource::ChatGpt => {
+                faculties::archive_chatgpt::project_bytes(&name, bytes, &attachments, |p| {
+                    facts += p.fragment.facts().clone();
+                    Ok(())
+                })
+                .map(drop)
+            }
+            ImportSource::ClaudeCode => {
+                faculties::archive_claude_code::project_bytes(&name, bytes, |p| {
+                    facts += p.fragment.facts().clone();
+                    Ok(())
+                })
+                .map(drop)
+            }
+            ImportSource::ClaudeWeb => {
+                faculties::archive_claude_web::project_bytes(&name, bytes, |p| {
+                    facts += p.fragment.facts().clone();
+                    Ok(())
+                })
+                .map(drop)
+            }
+            ImportSource::Codex => faculties::archive_codex::project_bytes(&name, bytes, |p| {
+                facts += p.fragment.facts().clone();
+                Ok(())
+            })
+            .map(drop),
+            ImportSource::Copilot => faculties::archive_copilot::project_bytes(&name, bytes, |p| {
+                facts += p.fragment.facts().clone();
+                Ok(())
+            })
+            .map(drop),
+            ImportSource::Gemini => {
+                faculties::archive_gemini::project_bytes(&name, bytes, &attachments, |p| {
+                    facts += p.fragment.facts().clone();
+                    Ok(())
+                })
+                .map(drop)
+            }
+        }
+        .unwrap();
+        assert!(!facts.is_empty(), "{name}");
+        let media_types: std::collections::BTreeSet<Id> = find!(
+            media: Id,
+            pattern!(&facts, [{ ?media @ metadata::tag: &KIND_MEDIA_TYPE }])
+        )
+        .collect();
+        for fact in facts.iter() {
+            let attribute = *fact.a();
+            let media_name = attribute == metadata::name.id() && media_types.contains(fact.e());
+            assert!(
+                allowed.contains(&attribute) || media_name,
+                "{name} writes attribute {attribute:X} on {:X}",
+                fact.e()
+            );
+        }
+    }
+}

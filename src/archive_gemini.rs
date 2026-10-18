@@ -1230,7 +1230,7 @@ mod tests {
         assert_eq!(summary.cards_seen, 1);
         assert_eq!(summary.records_emitted, 1);
         assert_eq!(summary.stats.contentless_records, 0);
-        assert_eq!(emitted.len(), 2, "the node, then the path on the leaf");
+        assert_eq!(emitted.len(), 1, "the node alone: no path is kept");
 
         let block = projected_block(&emitted[0]);
         assert!(exists!(pattern!(&emitted[0], [
@@ -1258,8 +1258,8 @@ mod tests {
         assert_eq!(summary.cards_seen, 1);
         assert_eq!(summary.records_emitted, 1);
         assert_eq!(summary.stats.content_parts, 1);
-        // The receipt, then the path on the leaf.
-        assert_eq!(emitted.len(), 2);
+        // The receipt alone: no path is kept.
+        assert_eq!(emitted.len(), 1);
 
         let block = projected_block(&emitted[0]);
         assert!(!exists!(pattern!(&emitted[0], [{
@@ -1322,6 +1322,20 @@ mod tests {
             store.close().unwrap();
             out
         };
+        let all_commits = |pile: &Path| -> BTreeSet<([u8; 32], [u8; 32])> {
+            let mut store = crate::storage::open_pile_strict(pile).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let out = crate::storage::discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .map(|commit| (commit.data().raw, commit.metadata().raw))
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            out
+        };
+        let mut all = Vec::new();
         let mut seen = Vec::new();
         let mut blocks = Vec::new();
         for html in [&a, &b] {
@@ -1344,10 +1358,14 @@ mod tests {
             writer.commit_unit().unwrap();
             writer.close(Ok(())).unwrap();
             seen.push(node_commits(&pile));
+            all.push(all_commits(&pile));
             blocks.push(ids);
         }
         assert_eq!(blocks[0], blocks[1], "the same nodes");
         let added = seen[1].difference(&seen[0]).count();
         assert_eq!(added, 0, "the same nodes cut into new pieces");
+        // Markup carries no annotation either: the whole re-import is the
+        // same COMMITs. The two-COMMIT split is not needed for this case.
+        assert_eq!(all[1], all[0], "a markup change altered an annotation");
     }
 }

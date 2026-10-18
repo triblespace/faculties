@@ -436,8 +436,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(summary.files_scanned, 1);
-        // Four nodes, one per fact, and the leaf's conversation provenance.
-        assert_eq!(summary.fragments_emitted, 5);
+        // Four nodes, one per fact; no path is kept.
+        assert_eq!(summary.fragments_emitted, 4);
         assert_eq!(summary.stats.records_seen, 3);
         assert_eq!(summary.stats.projections_emitted, 4);
         assert_eq!(summary.stats.content_parts, 4);
@@ -591,9 +591,9 @@ mod tests {
         })
         .unwrap();
 
-        // The call's block, then the path on the leaf it is.
-        assert_eq!(first_fragments.len(), 2);
-        assert_eq!(second_fragments.len(), 2);
+        // The call's block alone: no path is kept.
+        assert_eq!(first_fragments.len(), 1);
+        assert_eq!(second_fragments.len(), 1);
         assert_eq!(
             first_fragments[0].root(),
             second_fragments[0].root(),
