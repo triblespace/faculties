@@ -1,11 +1,13 @@
 //! Collection-native Archive runtime over the V4 descriptor-handle calculus.
 //!
 //! Archive authorship has one durable Ed25519 signer and one fixed canonical
-//! SimpleArchive-union descriptor. Imports stage independently derivable source
-//! fragments which contribute new evidence and cross exactly one signed COMMIT
-//! visibility edge per publication. Reads snapshot that same collection;
-//! there is no Repository branch, CAS head, sidecar registry, or fallback
-//! identity.
+//! SimpleArchive-union descriptor. Imports cut each source's projected nodes
+//! into content-defined pieces and publish one signed COMMIT per piece,
+//! without reading anything the Archive holds; a piece published before is
+//! the same bytes and the same record again, and costs nothing. Reads
+//! snapshot that same collection, carrying it and attaching its views as
+//! they go; there is no Repository branch, CAS head, sidecar registry, or
+//! fallback identity.
 
 #[cfg(test)]
 use crate::storage::FactView;
@@ -17,10 +19,10 @@ use anybytes::Bytes;
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
-use triblespace::core::blob::Blob;
+use triblespace::core::blob::{Blob, IntoBlob};
 use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionData, CollectionSnapshotExt, CollectionStoreExt,
 };
@@ -29,9 +31,7 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{
-    BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store, StoreRead,
-};
+use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store};
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
@@ -47,73 +47,81 @@ use crate::storage::{FactArchive, FactLag, FacultyStore};
 #[cfg(test)]
 use crate::collection_names::open_configured;
 #[cfg(test)]
-use triblespace::core::collection::{
-    CollectionAttachment, CollectionMap, CollectionRecord, CollectionStore,
-};
-#[cfg(test)]
+use triblespace::core::collection::{CollectionAttachment, CollectionMap};
+use triblespace::core::collection::{CollectionRecord, CollectionStore};
 use triblespace::core::repo::BlobStoreMeta;
 
 type RawHandle = Inline<Handle<RawBytes>>;
 
-/// Stage Archive fragments for commit-last publication.
+/// Stage Archive fragments and publish them as content-defined pieces.
 ///
 /// Supplied facts remain open-world relations, including opaque ids and further
-/// annotations. Publication does not require a closed-world catalog decode.
+/// annotations. Publication does not require a closed-world catalog decode, and
+/// it reads nothing the Archive already holds: an import is a pure function
+/// from the source to COMMITs, and the collection is their union.
+///
+/// The fragments of one source unit arrive in the importer's deterministic
+/// order, one whole node per fragment. The writer cuts that stream into
+/// pieces at boundaries the content chooses: a piece ends after any fragment
+/// whose root (the node's receipt) has at least [`PIECE_BITS`] trailing zero
+/// bits, and at the end of the unit. The same nodes therefore always cut into
+/// the same pieces, a piece is always the same bytes, and its signed COMMIT is
+/// the same record (deterministic Ed25519 over the collection, the data hash
+/// and the metadata hash, with no time in it). Publishing a piece the pile
+/// already holds appends nothing: blob puts and record inserts both return
+/// early on a resident value. Re-importing an unchanged source costs nothing,
+/// and a grown one costs the pieces from the first changed one on.
+///
+/// A closed piece is published as two COMMITs: its intrinsic facts (the
+/// nodes, their content facts, their receipts' identity) and its occurrence
+/// facts (the evidence one reading of one file attaches, see
+/// [`blockdag::is_occurrence_attribute`]). A Codex fork or resume replays its
+/// parent's nodes under different occurrence evidence (no copy times), so its
+/// intrinsic pieces are the parent's own and only the small occurrence pieces
+/// are new. The last, unclosed piece of a unit is one COMMIT holding both: it
+/// changes whenever the source grows, so splitting it would converge with
+/// nothing.
 pub struct ArchiveImportWriter<P = FacultyStore> {
     pile: P,
     collection: Collection<SimpleArchive>,
     signer: SigningKey,
-    current: FactArchive,
-    delta: Fragment,
+    /// Intrinsic facts of the piece being cut.
+    core: TribleSet,
+    /// Attribute descriptions staged with the piece being cut.
+    metafacts: TribleSet,
+    /// Occurrence facts of the piece being cut.
+    occurrence: TribleSet,
+    /// The vocabulary, until it is published as a COMMIT of its own before
+    /// this writer's first piece.
+    vocabulary: Option<Fragment>,
+    /// Signed COMMITs of this unit's pieces, whose bytes are already
+    /// appended, each with whether its data was new to the pile; the
+    /// records are inserted when the unit ends.
+    pending: Vec<(CollectionCommit, bool)>,
+    /// Trailing zero bits of a fragment root that end a piece.
+    piece_bits: u32,
+    /// Keeps the runtime the descriptor was acquired through alive until close.
+    #[allow(dead_code)]
     runtime: Arc<tokio::runtime::Runtime>,
-    /// Commits published since this writer last carried its source.
-    uncarried: usize,
 }
 
-/// Commits a writer publishes between two carries of its own source.
+/// Trailing zero bits of a node's receipt id that end a piece: on average one
+/// piece per 2^`PIECE_BITS` nodes.
 ///
-/// Every commit is a frontier node of its own until a carry joins it, and
-/// each commit's attachment pass, and each read of the facts back, costs
-/// more the wider the frontier, so a writer that never carried paid more for
-/// every commit than for the one before and left the whole carry to the next
-/// process to open the pile. The carry is the one
-/// [`ArchiveImportWriter::prepare`] runs at open.
-///
-/// Sixteen is measured, not derived (sky, shared GB10; one process importing
-/// hard-linked Codex rollouts into a fresh pile; mean wall time per
-/// rollout). Over 1,000 raw-only rollouts: 8.7 ms at 4, 8.6-9.3 at 8,
-/// 8.8-9.3 at 16, 10.2-10.3 at 32, 12.0 at 64, against 38-39 ms for a writer
-/// that never carries. Over 400 rollouts of 269 projections each: about 150
-/// ms at 8 (outside two stretches of interference), 148.5 at 16, 153.0 at
-/// 32, against 278-330 ms. Below the optimum a carry pass costs more than the
-/// frontier it removes; above it the frontier costs more. The optimum is
-/// flat from 4 to 16; sixteen is its upper edge, which leaves room for a
-/// pass that costs more on a larger pile. The sweep ran on fresh piles that
-/// never held more than 1,000 commits, with the facts read back whole after
-/// every commit, which [`ArchiveImportWriter::commit_unit`] now does once
-/// per carry.
-///
-/// The sweep weighed wall time only; the cadence also costs pile bytes.
-/// Each carry attaches every node it leaves on the frontier, merged nodes
-/// included, and a later carry of the same writer joins most tier-one merged
-/// nodes into a tier-two one. Their Succinct and Rank9 attachments are not
-/// read again, and they stay in the pile until a compaction. A writer that
-/// never carried left its merging to the next open, which attaches only the
-/// frontier it ends with. Measured in review (sky, shared GB10): one writer
-/// importing 3,000 synthetic Claude Code sessions into a fresh pile left 311
-/// attached merged nodes that a later carry consumed, whose attachments hold
-/// 102.8 MB of the pile's 1,171.5 MB of blob bytes (8.8%), against 74.3 MB
-/// attached to the 18 nodes of the final frontier. Two writers over 1,982
-/// real Claude Code sessions: 48.6 MB of 573.8 MB (8.5%).
-const CARRY_EVERY: usize = 16;
+/// The larger a piece, the more a growing source republishes on every import
+/// (its unclosed tail) and the more of a fork's prefix its first new piece
+/// repeats; the smaller, the more COMMITs the collection holds and the more
+/// of them every carry and attachment pass visits. Measured on sky,
+/// 2026-10-18, projecting 38 Codex rollouts (11.2 GB, the largest 4.4 GB) and
+/// 31 Claude Code transcripts (5.9 GB) without a pile: at 11 bits a piece
+/// held 1,961 and 1,732 nodes on average, the largest piece 19,757 nodes, and
+/// the median unclosed tail 141 and 104 nodes (about 15 tribles per node).
+pub const PIECE_BITS: u32 = 11;
 
-#[cfg(test)]
-thread_local! {
-    /// How often [`ArchiveImportWriter::open`] ran on this thread, so a test
-    /// can pin how many times one command opens the pile.
-    pub(crate) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// How often a writer on this thread read its known facts back whole.
-    static READ_BACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+/// Whether `root` ends a piece under `bits` trailing zero bits.
+fn ends_piece(root: Id, bits: u32) -> bool {
+    let raw: [u8; 16] = root.into();
+    u128::from_be_bytes(raw).trailing_zeros() >= bits
 }
 
 impl ArchiveImportWriter {
@@ -125,27 +133,8 @@ impl ArchiveImportWriter {
         let signer = crate::storage::load_signer(pile_path, key_path)?;
         let runtime = Arc::new(crate::storage::runtime()?);
         let mut pile = crate::storage::open_store_as(pile_path, signer.verifying_key())?;
-        let result = Self::prepare(&mut pile, &signer, &runtime, None);
-        match result {
-            Ok((collection, current)) => {
-                let mut writer = Self {
-                    pile,
-                    collection,
-                    signer,
-                    current,
-                    delta: Fragment::empty(),
-                    runtime,
-                    uncarried: 0,
-                };
-                if let Err(error) = writer.stage_fragment(blockdag::vocabulary_fragment()) {
-                    return close_pile(
-                        writer.pile,
-                        Err(error),
-                        "closing Archive pile after vocabulary staging failed",
-                    );
-                }
-                Ok(writer)
-            }
+        match Self::prepare(&mut pile, &signer, &runtime, None) {
+            Ok(collection) => Ok(Self::new(pile, collection, signer, runtime)),
             Err(error) => close_pile(
                 pile,
                 Err(error),
@@ -153,6 +142,13 @@ impl ArchiveImportWriter {
             ),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often [`ArchiveImportWriter::open`] ran on this thread, so a test
+    /// can pin how many times one command opens the pile.
+    pub(crate) static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<P> ArchiveImportWriter<P>
@@ -186,27 +182,39 @@ where
         runtime: Arc<tokio::runtime::Runtime>,
         storage: Option<&crate::storage::Storage>,
     ) -> Result<Self> {
-        let (source, current) = Self::prepare(&mut pile, signer, &runtime, storage)?;
-        let mut writer = Self {
-            pile,
-            collection: source,
-            signer: signer.clone(),
-            current,
-            delta: Fragment::empty(),
-            runtime,
-            uncarried: 0,
-        };
-        writer.stage_fragment(blockdag::vocabulary_fragment())?;
-        Ok(writer)
+        let collection = Self::prepare(&mut pile, signer, &runtime, storage)?;
+        Ok(Self::new(pile, collection, signer.clone(), runtime))
     }
 
+    fn new(
+        pile: P,
+        collection: Collection<SimpleArchive>,
+        signer: SigningKey,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        Self {
+            pile,
+            collection,
+            signer,
+            core: TribleSet::new(),
+            metafacts: TribleSet::new(),
+            occurrence: TribleSet::new(),
+            vocabulary: Some(blockdag::vocabulary_fragment()),
+            pending: Vec::new(),
+            piece_bits: PIECE_BITS,
+            runtime,
+        }
+    }
+
+    /// Open the Archive root for writing. Only its descriptor is read; no
+    /// commit, merge or attachment of the Archive is.
     fn prepare(
         pile: &mut P,
         signer: &SigningKey,
         runtime: &Arc<tokio::runtime::Runtime>,
         storage: Option<&crate::storage::Storage>,
-    ) -> Result<(Collection<SimpleArchive>, FactArchive)> {
-        let source = match storage {
+    ) -> Result<Collection<SimpleArchive>> {
+        match storage {
             Some(storage) => {
                 storage.open_collection_read(
                     pile,
@@ -219,190 +227,160 @@ where
                     schema::DEFAULT_SCOPE_ID,
                     signer.verifying_key(),
                     runtime,
-                )?
+                )
             }
             None => crate::collection_names::open_configured_acquiring(
                 pile,
                 schema::DEFAULT_SCOPE_ID,
                 signer.verifying_key(),
                 runtime,
-            )?,
-        };
-        let (succinct, rank9) = crate::storage::fact_pair(pile, source)?;
-        runtime
-            .block_on(async {
-                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
-                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
-            })
-            .context("maintain Archive import facts")?;
-        let reader = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
-        let current =
-            crate::storage::acquire_facts(&reader, rank9).context("read Archive import facts")?;
-        Ok((source, current))
+            ),
+        }
     }
 
+    /// Add one fragment to the piece being cut, and end the piece when the
+    /// fragment's root says so.
+    ///
+    /// A fragment is the importers' unit: one whole node with its receipt,
+    /// or occurrence annotations of a receipt. Only a fragment holding
+    /// intrinsic facts ends a piece, so a piece never splits a node and the
+    /// annotations an importer emits after its nodes (the leaves' session,
+    /// path and title) ride in the unit's last piece. Nothing is compared
+    /// with what the Archive holds: the union absorbs every repetition.
     pub fn stage_fragment(&mut self, fragment: Fragment) -> Result<()> {
-        // A Fragment is the independently derivable source unit. A wholly
-        // known candidate is an idempotent replay and can be skipped. Once it
-        // contributes even one new fact, retain its complete closure in this
-        // COMMIT element—including facts already present in older elements.
-        // Set union makes that duplication semantically free, and a mapping
-        // that reads a whole block (the Archive block BM25) then finds it in
-        // one commit, without depending on an implicit merge with historical
-        // commits. The fragment is kept as given: nothing here checks that it
-        // holds whole blocks; the importers hand it whole ones.
+        let root = fragment.root();
         let (_, facts, metafacts, blobs) = fragment.into_parts();
-        if facts.iter().all(|fact| {
-            self.delta.facts().contains(fact) || fact_archive_contains(&self.current, fact)
-        }) {
-            return Ok(());
-        }
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
-        // keeping payload bytes out of the long-lived logical delta. They
-        // remain semantically unreachable until a signed COMMIT names the
-        // facts which reference them.
-        let embedded = embedded_blobs(blobs);
-        stage_embedded_blobs(&mut self.pile, embedded)?;
+        // keeping payload bytes out of the piece. They remain semantically
+        // unreachable until a signed COMMIT names the facts which reference
+        // them.
+        stage_embedded_blobs(&mut self.pile, embedded_blobs(blobs))?;
 
-        // Only the lightweight logical delta remains resident between source
-        // fragments. Data and metadata archives are constructed once at the
-        // final publication boundary.
-        self.delta += Fragment::from_parts(facts, metafacts, Default::default());
-        Ok(())
-    }
-
-    pub fn delta_len(&self) -> usize {
-        self.delta.facts().len()
-    }
-
-    /// Publish ONE rollout's staged delta and keep the pile open.
-    ///
-    /// Atomicity is per rollout; it was never per PROCESS. Opening the pile
-    /// costs ~9.3 s on the live 44 GB pile against ~1 s of actual projection
-    /// for a 478 KB rollout (measured 2026-09-01), so paying it once per file
-    /// put a full Codex backfill — 3,161 refused rollouts — at about 8.2 hours
-    /// of pure pile-opening before any work. JP: "we can commit multiple times
-    /// in the same process right xD?" Yes. Same one-signed-COMMIT-per-rollout
-    /// guarantee, one open.
-    ///
-    /// `current` MUST absorb what was just published, or the next rollout's
-    /// idempotence check would re-stage facts this commit already carries —
-    /// which is the whole reason resumed Codex rollouts (they replay large
-    /// parent prefixes) are cheap to ingest in sequence rather than expensive.
-    ///
-    /// Between carries the commit's own Rank9 attachment, which its
-    /// attachment pass has just built, joins `current` as one more zero-copy
-    /// segment, so `current` gains at most [`CARRY_EVERY`] segments before a
-    /// carry. A carry reads `current` back whole from the frontier's Rank9
-    /// attachments, as the next open would read it: one segment per frontier
-    /// node. That read selects a cover over the frontier, and its cost grows
-    /// with every commit the collection holds, not with the frontier, so it
-    /// runs once per carry rather than once per commit. A commit left without
-    /// a usable attachment here (a store whose host is another key attaches
-    /// nothing) is read back whole the same way. A foundation whose bytes are
-    /// not here is left out, never fetched; that can only make a later
-    /// fragment stage facts again, which the union absorbs.
-    pub fn commit_unit(&mut self) -> Result<Option<CollectionCommit>> {
-        let Some(commit) = self.publish()? else {
-            return Ok(None);
-        };
-        let carry = self.uncarried >= CARRY_EVERY;
-        if carry {
-            self.carry()?;
-        } else {
-            self.ensure_downstream()?;
-        }
-        let (_, rank9) = crate::storage::fact_pair(&mut self.pile, self.collection)?;
-        let snapshot = self.pile.snapshot()?;
-        if !carry {
-            if let Some(segment) = attached_node_facts(&snapshot, rank9, commit.data())? {
-                self.current = self.current.with_segments([segment]);
-                return Ok(Some(commit));
+        let mut intrinsic = false;
+        for fact in facts.iter() {
+            if blockdag::is_occurrence_attribute(*fact.a()) {
+                self.occurrence.insert(fact);
+            } else {
+                self.core.insert(fact);
+                intrinsic = true;
             }
         }
-        #[cfg(test)]
-        READ_BACKS.with(|reads| reads.set(reads.get() + 1));
-        self.current = crate::storage::FactRead::read_facts(&snapshot, rank9)
-            .context("read back the published Archive facts")?;
-        Ok(Some(commit))
-    }
-
-    /// Commit the staged delta, if any, as one signed COMMIT.
-    fn publish(&mut self) -> Result<Option<CollectionCommit>> {
-        if self.delta.facts().is_empty() {
-            return Ok(None);
+        self.metafacts += metafacts;
+        if intrinsic && root.is_some_and(|root| ends_piece(root, self.piece_bits)) {
+            self.publish_piece(true)?;
         }
-        let fragment = std::mem::replace(&mut self.delta, Fragment::empty());
-        let commit = self
-            .pile
-            .commit(self.collection, &self.signer, fragment)
-            .context("commit authored Archive projection unit")?;
-        self.uncarried += 1;
-        Ok(Some(commit))
-    }
-
-    /// Attach the source's current frontier into every collection attached
-    /// to it, so what was just committed is readable through them.
-    fn ensure_downstream(&mut self) -> Result<()> {
-        drop(
-            self.runtime
-                .block_on(crate::storage::ensure_downstream(
-                    &mut self.pile,
-                    self.collection,
-                    &self.signer,
-                ))
-                .context(
-                    "Archive projection unit was committed, but ensuring its derived views failed",
-                )?,
-        );
         Ok(())
     }
 
-    /// Carry the source to its fixed point -- every tier holding eight nodes
-    /// joined by one MERGE -- and attach the frontier the carry leaves, so
-    /// neither this writer's next commit nor the next opener inherits the
-    /// commits made since the last carry. A store whose host is not this
-    /// writer's key believes none of its merges and is left uncarried, as
-    /// at open.
-    ///
-    /// A carry appends the merged nodes and their attachments, records of
-    /// several megabytes each, inside whatever process runs the writer: for
-    /// a long import, that import. A process killed during one of those
-    /// appends leaves an incomplete last record, which every later open of
-    /// the pile refuses until an operator inspects and repairs the tail, as
-    /// for any interrupted append ([`crate::storage::pile_read_error`]).
-    fn carry(&mut self) -> Result<()> {
-        self.runtime
-            .block_on(async {
-                crate::storage::tolerate_own_lag(
-                    self.pile.maintain(self.collection, &self.signer).await,
-                )
-            })
-            .context("Archive projection units were committed, but carrying them failed")?;
-        self.uncarried = 0;
-        self.ensure_downstream()
+    /// Cut pieces at `bits` trailing zero bits instead of [`PIECE_BITS`].
+    #[cfg(test)]
+    pub(crate) fn set_piece_bits(&mut self, bits: u32) {
+        self.piece_bits = bits;
     }
 
-    /// Publish what is still staged and carry what this writer committed,
-    /// before it closes: the carry's attachment pass also attaches the last
-    /// commit, and nothing is read back.
-    fn settle(&mut self) -> Result<Option<CollectionCommit>> {
-        let commit = self.publish()?;
-        if self.uncarried > 0 {
-            self.carry()?;
+    /// Facts staged in the piece being cut.
+    pub fn delta_len(&self) -> usize {
+        self.core.len() + self.occurrence.len()
+    }
+
+    /// End ONE source unit: publish its last piece, then every piece's
+    /// signed COMMIT, and keep the pile open. Returns the last COMMIT whose
+    /// piece was new to the pile, or `None` when every piece the unit cut was
+    /// already there (an unchanged source) or it staged nothing.
+    ///
+    /// A piece's bytes are appended when it closes, but no record names them
+    /// until the unit ends, so a unit whose source fails publishes nothing
+    /// ([`Self::close`] with an error inserts no record). The bytes a failed
+    /// unit left behind are the ones a retry appends, so the retry adds none
+    /// of them again. The unit's records are inserted one after another, in
+    /// cut order: a process killed between two inserts leaves a prefix of the
+    /// unit's pieces visible, and rerunning the import inserts the rest.
+    ///
+    /// Nothing here carries the collection or attaches its views. Every
+    /// read prepares what it reads (`maintain_attached` carries the source
+    /// first), and on hosts running `trible pile collection maintain-all`
+    /// over the Archive's Rank9 target both stay current in the background.
+    pub fn commit_unit(&mut self) -> Result<Option<CollectionCommit>> {
+        self.publish_piece(false)?;
+        let mut last = None;
+        for (commit, novel) in std::mem::take(&mut self.pending) {
+            CollectionStore::insert(&mut self.pile, CollectionRecord::Commit(commit))
+                .map_err(|error| anyhow!("insert an Archive piece COMMIT: {error}"))?;
+            if novel {
+                last = Some(commit);
+            }
         }
-        Ok(commit)
+        Ok(last)
+    }
+
+    /// Prepare the piece being cut. A closed piece is its intrinsic COMMIT
+    /// and its occurrence COMMIT; the unit's last piece is one COMMIT.
+    fn publish_piece(&mut self, closed: bool) -> Result<()> {
+        let core = std::mem::take(&mut self.core);
+        let metafacts = std::mem::take(&mut self.metafacts);
+        let occurrence = std::mem::take(&mut self.occurrence);
+        if closed {
+            self.prepare_commit(core, metafacts)?;
+            self.prepare_commit(occurrence, TribleSet::new())
+        } else {
+            let mut facts = core;
+            facts += occurrence;
+            self.prepare_commit(facts, metafacts)
+        }
+    }
+
+    /// Append one COMMIT's data and metadata, if it holds facts, and sign it
+    /// over the handles the store returned; the record waits for the unit's
+    /// end. The writer's first COMMIT is preceded by the vocabulary's own,
+    /// which is the same bytes in every writer.
+    ///
+    /// Whether the data was resident before is one index probe, for the
+    /// report only; nothing the pile holds is read. Data a failed unit left
+    /// behind counts as resident when a retry publishes its record.
+    fn prepare_commit(&mut self, facts: TribleSet, metafacts: TribleSet) -> Result<()> {
+        if facts.is_empty() {
+            return Ok(());
+        }
+        if let Some(vocabulary) = self.vocabulary.take() {
+            let (_, facts, metafacts, blobs) = vocabulary.into_parts();
+            stage_embedded_blobs(&mut self.pile, embedded_blobs(blobs))?;
+            self.prepare_commit(facts, metafacts)?;
+        }
+        let data: Blob<SimpleArchive> = facts.to_blob();
+        let novel = self
+            .pile
+            .snapshot()
+            .context("observe the pile before an Archive piece")?
+            .metadata(data.get_handle())
+            .map_err(|error| anyhow!("inspect an Archive piece's residency: {error}"))?
+            .is_none();
+        let data = self
+            .pile
+            .put::<SimpleArchive, _>(data)
+            .context("stage an Archive piece")?;
+        let metadata = self
+            .pile
+            .put::<SimpleArchive, _>(metafacts)
+            .context("stage an Archive piece's metadata")?;
+        let commit = CollectionCommit::sign(
+            &self.signer,
+            self.collection.handle(),
+            Handle::<SimpleArchive>::to_hash(data),
+            metadata,
+        );
+        self.pending.push((commit, novel));
+        Ok(())
     }
 }
 
 impl ArchiveImportWriter {
-    /// Close the pile, publishing any still-staged delta and carrying what
-    /// this writer committed first.
+    /// Close the pile, ending the unit being staged first. After a failure
+    /// nothing staged since the last unit ended is published.
     pub fn close<T>(mut self, surrounding: Result<T>) -> Result<T> {
         let result = surrounding.and_then(|value| {
-            self.settle()?;
+            self.commit_unit()?;
             Ok(value)
         });
         close_pile(
@@ -414,7 +392,7 @@ impl ArchiveImportWriter {
 
     pub fn finish<T>(mut self, surrounding: Result<T>) -> Result<(T, Option<CollectionCommit>)> {
         let result = surrounding.and_then(|value| {
-            let commit = self.settle()?;
+            let commit = self.commit_unit()?;
             Ok((value, commit))
         });
         close_pile(
@@ -424,7 +402,6 @@ impl ArchiveImportWriter {
         )
     }
 }
-
 /// Write one constructed streaming payload batch into content-addressed storage.
 ///
 /// A failed put abandons only this batch. Replaying the fragment repeats the
@@ -456,63 +433,6 @@ fn embedded_blobs(mut blobs: triblespace::core::blob::MemoryBlobStore) -> Vec<Bl
     embedded.sort_unstable_by_key(|(store_key, _)| store_key.raw);
 
     embedded.into_iter().map(|(_, blob)| blob).collect()
-}
-
-/// One node's facts through the Rank9 attachment a believed MAP gives it in
-/// `snapshot`: one zero-copy segment, or `None` when no attachment of it is
-/// here together with the Succinct archive it accelerates.
-fn attached_node_facts<R: StoreRead>(
-    snapshot: &R,
-    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-    node: CollectionData,
-) -> Result<Option<SuccinctArchive<OrderedUniverse>>> {
-    let coverage = snapshot
-        .coverage(&BTreeSet::from([rank9.handle()]))
-        .map_err(|error| anyhow!("read the Rank9 attachments: {error}"))?;
-    for attachment in coverage.attachments(rank9.handle(), node) {
-        let root = Handle::<Rank9AcceleratedSuccinctArchiveBlob>::from_hash(attachment);
-        if !resident(snapshot, root)? {
-            continue;
-        }
-        let root: Blob<Rank9AcceleratedSuccinctArchiveBlob> = snapshot
-            .get(root)
-            .map_err(|error| anyhow!("read a Rank9 attachment: {error}"))?;
-        let source = Rank9AcceleratedSuccinctArchiveBlob::source_handle(&root)
-            .map_err(|error| anyhow!("read a Rank9 attachment's source: {error}"))?;
-        if !resident(snapshot, source)? {
-            continue;
-        }
-        let raw: Blob<SuccinctArchiveBlob> = snapshot
-            .get(source)
-            .map_err(|error| anyhow!("read a Rank9 attachment's Succinct archive: {error}"))?;
-        return SuccinctArchive::from_accelerated_parts(raw, root)
-            .map(Some)
-            .map_err(|error| anyhow!("attach a Rank9 attachment: {error}"));
-    }
-    Ok(None)
-}
-
-fn resident<R: StoreRead, T: BlobEncoding + 'static>(
-    snapshot: &R,
-    handle: Inline<Handle<T>>,
-) -> Result<bool>
-where
-    Handle<T>: InlineEncoding,
-{
-    Ok(snapshot
-        .metadata(handle)
-        .map_err(|error| anyhow!("inspect blob residency: {error}"))?
-        .is_some())
-}
-
-/// Exact membership without rebuilding an in-memory `TribleSet` over the
-/// maintained shard union.
-fn fact_archive_contains(facts: &FactArchive, fact: &Trible) -> bool {
-    exists!(facts.pattern(
-        inlineencodings::GenId::inline_from(*fact.e()),
-        inlineencodings::GenId::inline_from(*fact.a()),
-        *fact.v::<UnknownInline>(),
-    ))
 }
 
 fn close_pile<T>(pile: impl StorageClose, result: Result<T>, failure_context: &str) -> Result<T> {
@@ -1146,7 +1066,6 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use tempfile::TempDir;
-    use triblespace::core::blob::IntoBlob;
 
     #[test]
     fn synchronous_import_sessions_have_an_explicit_tokio_blocking_boundary() {
@@ -1332,15 +1251,28 @@ mod tests {
         )
     }
 
+    /// One COMMIT of `fragment`, straight into the Archive root: the
+    /// fixtures that use it test the collection's views, not the writer.
+    fn commit_fragment(
+        pile: &std::path::Path,
+        key: &std::path::Path,
+        fragment: Fragment,
+    ) -> CollectionCommit {
+        let signer = load_signer(pile, Some(key)).unwrap();
+        let mut store = open_pile_strict_as(pile, signer.verifying_key()).unwrap();
+        let source = test_source(&mut store, pile, key);
+        let commit = store.commit(source, &signer, fragment).unwrap();
+        store.close().unwrap();
+        commit
+    }
+
     fn commit_projection(
         pile: &std::path::Path,
         key: &std::path::Path,
         locator: &str,
         text: &str,
     ) -> CollectionCommit {
-        let mut writer = ArchiveImportWriter::open(pile, Some(key)).unwrap();
-        writer.stage_fragment(projection(locator, text)).unwrap();
-        writer.finish(Ok(())).unwrap().1.unwrap()
+        commit_fragment(pile, key, projection(locator, text))
     }
 
     fn first_embedded_handle(fragment: &Fragment) -> Inline<Handle<UnknownBlob>> {
@@ -1382,10 +1314,6 @@ mod tests {
         writer.stage_fragment(fragment).unwrap();
 
         assert!(writer.delta_len() > 0);
-        assert!(
-            writer.delta.blobs().is_empty(),
-            "the long-lived logical delta must not retain embedded bytes"
-        );
 
         // The payload is already durable enough to satisfy a fresh reader, but
         // no signed collection root makes its facts visible yet.
@@ -1401,7 +1329,7 @@ mod tests {
 
         let commit = writer.finish(Ok(())).unwrap().1.unwrap();
         let after = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(after.support().len(), 1);
+        assert_eq!(after.support().len(), 2, "the vocabulary and the piece");
         assert!(facts_stand_on(&after, &commit));
         assert_eq!(projection_ids(&after.facts().unwrap()).len(), 1);
     }
@@ -1460,6 +1388,8 @@ mod tests {
         };
 
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        // The fixture's root is random; no piece boundary inside a unit.
+        writer.piece_bits = u32::MAX;
         writer.stage_fragment(fragment.clone()).unwrap();
         assert!(writer.commit_unit().unwrap().is_some());
         // The reader prepares the projection; the writer only commits.
@@ -1484,15 +1414,21 @@ mod tests {
         assert!(fragment
             .facts()
             .iter()
-            .all(|fact| fact_archive_contains(&prepared_facts, fact)));
+            .all(|fact| exists!(prepared_facts.pattern(
+                inlineencodings::GenId::inline_from(*fact.e()),
+                inlineencodings::GenId::inline_from(*fact.a()),
+                *fact.v::<UnknownInline>(),
+            ))));
+        // The same unit again is the same COMMIT, and adds nothing.
+        let length = std::fs::metadata(&pile).unwrap().len();
         writer.stage_fragment(fragment.clone()).unwrap();
-        assert_eq!(writer.delta_len(), 0);
-        assert!(writer.commit_unit().unwrap().is_none());
+        assert_eq!(writer.commit_unit().unwrap(), None);
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
         writer.stage_fragment(annotation.clone()).unwrap();
         assert!(writer.finish(Ok(())).unwrap().1.is_some());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 2);
+        assert_eq!(snapshot.support().len(), 3, "the vocabulary and two units");
         let facts = snapshot.facts().unwrap();
         let tags: BTreeSet<_> = find!(
             tag: Id,
@@ -1536,20 +1472,22 @@ mod tests {
         drop(facts);
         drop(snapshot);
 
+        // Replaying both units republishes the same COMMITs: no bytes.
+        let length = std::fs::metadata(&pile).unwrap().len();
         let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        retry.piece_bits = u32::MAX;
         retry.stage_fragment(fragment).unwrap();
+        assert_eq!(retry.commit_unit().unwrap(), None);
         retry.stage_fragment(annotation).unwrap();
-        assert_eq!(retry.delta_len(), 0);
         assert!(retry.finish(Ok(())).unwrap().1.is_none());
+        assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
     }
 
-    /// A writer that commits many times in one process carries its own
-    /// source as it goes. Its frontier stays within the commits since its
-    /// last carry beside fewer than eight nodes per tier, what it reads back
-    /// after a carry still knows every commit, it closes at the carry's
-    /// fixed point, and the next open finds nothing to merge or attach.
+    /// A writer publishes COMMITs and nothing else: no MERGE and no MAP,
+    /// however many units it imports. The next read carries the source and
+    /// attaches its views, and reads every unit.
     #[test]
-    fn a_long_writer_carries_its_own_commits() {
+    fn a_writer_leaves_carrying_to_the_reader() {
         use triblespace::core::collection::MERGE_FAN_IN;
 
         let directory = TempDir::new().unwrap();
@@ -1558,12 +1496,10 @@ mod tests {
         let key = directory.path().join("archive.key");
         let signer = initialize_archive_fixture(&pile, &key);
 
-        // Fills the second tier once and leaves three commits over.
-        let commits = MERGE_FAN_IN * MERGE_FAN_IN + 3;
+        let units = MERGE_FAN_IN * MERGE_FAN_IN + 3;
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         let source = writer.collection;
-        let mut widest = 0;
-        for index in 0..commits {
+        for index in 0..units {
             writer
                 .stage_fragment(projection(
                     &format!("session:{index}"),
@@ -1571,93 +1507,29 @@ mod tests {
                 ))
                 .unwrap();
             assert!(writer.commit_unit().unwrap().is_some());
-            let snapshot = writer.pile.snapshot().unwrap();
-            widest = widest.max(snapshot.collection(source).unwrap().cover().len());
         }
-        let tiers = 3;
-        assert!(
-            widest < CARRY_EVERY + (MERGE_FAN_IN - 1) * tiers && widest < commits,
-            "the frontier reached {widest} nodes over {commits} commits"
-        );
-        writer
-            .stage_fragment(projection("session:0", "body 0"))
-            .unwrap();
-        assert_eq!(
-            writer.delta_len(),
-            0,
-            "the read-back facts know the first commit"
-        );
         writer.close(Ok(())).unwrap();
 
         let mut reopened = open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
         let snapshot = reopened.snapshot().unwrap();
-        let merges = discovered_records(&snapshot)
-            .unwrap()
-            .merges()
-            .iter()
-            .filter(|merge| merge.collection() == source.handle())
-            .count();
+        let records = discovered_records(&snapshot).unwrap();
         assert_eq!(
-            merges,
-            commits / MERGE_FAN_IN + commits / (MERGE_FAN_IN * MERGE_FAN_IN),
-            "every full tier was joined by the writer"
+            records
+                .commits()
+                .iter()
+                .filter(|commit| commit.collection() == source.handle())
+                .count(),
+            units + 1,
+            "one COMMIT per unit and the vocabulary's"
         );
-        assert_eq!(
-            snapshot.collection(source).unwrap().cover().len(),
-            1 + commits % MERGE_FAN_IN,
-            "one node for the full second tier and the commits left over"
-        );
+        assert!(records.merges().is_empty(), "the writer merged");
         drop(snapshot);
         reopened.close().unwrap();
 
-        let length = std::fs::metadata(&pile).unwrap().len();
         let observed = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(observed.support().len(), commits);
+        assert_eq!(observed.support().len(), units + 1);
         assert!(observed.residual().is_empty());
-        drop(observed);
-        assert_eq!(
-            std::fs::metadata(&pile).unwrap().len(),
-            length,
-            "the next open publishes no MERGE and no MAP"
-        );
-    }
-
-    /// Between carries each commit's own Rank9 attachment joins what the
-    /// writer knows. The read-back that selects a cover over the whole
-    /// frontier, whose cost grows with every commit the collection holds,
-    /// runs once per carry and not once per commit. After every commit the
-    /// writer still knows every commit it made.
-    #[test]
-    fn a_writer_reads_its_facts_back_once_per_carry() {
-        let directory = TempDir::new().unwrap();
-        let pile = directory.path().join("archive.pile");
-        std::fs::File::create(&pile).unwrap();
-        let key = directory.path().join("archive.key");
-        initialize_archive_fixture(&pile, &key);
-
-        let unit = |index: usize| projection(&format!("session:{index}"), &format!("body {index}"));
-        let commits = 2 * CARRY_EVERY + 3;
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        let read_backs = || READ_BACKS.with(std::cell::Cell::get);
-        let before = read_backs();
-        for index in 0..commits {
-            writer.stage_fragment(unit(index)).unwrap();
-            assert!(writer.commit_unit().unwrap().is_some());
-            for known in 0..=index {
-                writer.stage_fragment(unit(known)).unwrap();
-            }
-            assert_eq!(
-                writer.delta_len(),
-                0,
-                "after commit {index} the writer knows every commit it made"
-            );
-        }
-        assert_eq!(
-            read_backs() - before,
-            commits / CARRY_EVERY,
-            "one read-back per carry over {commits} commits"
-        );
-        writer.close(Ok(())).unwrap();
+        assert_eq!(projection_ids(&observed.facts().unwrap()).len(), units);
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1719,11 +1591,11 @@ mod tests {
         let length = std::fs::metadata(&pile).unwrap().len();
         retry.stage_fragment(fragment).unwrap();
         let (_, repeated) = retry.finish(Ok(())).unwrap();
-        assert_eq!(repeated, None);
+        assert_eq!(repeated, None, "the same unit is the same COMMIT, not new");
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 1);
+        assert_eq!(snapshot.support().len(), 2, "the vocabulary and the unit");
         assert!(facts_stand_on(&snapshot, &first));
         assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 1);
     }
@@ -1753,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn growing_source_skips_known_fragments_and_keeps_new_leaf_closure() {
+    fn a_second_unit_keeps_its_whole_closure_including_shared_facts() {
         let directory = TempDir::new().unwrap();
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
@@ -1768,21 +1640,19 @@ mod tests {
 
         let second_fragment = projection("session:two", "shared");
         let mut second_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        second_writer.stage_fragment(first_fragment).unwrap();
-        assert_eq!(second_writer.delta_len(), 0, "known fragment is a replay");
         second_writer
             .stage_fragment(second_fragment.clone())
             .unwrap();
         assert_eq!(
             second_writer.delta_len(),
             second_fragment.facts().len(),
-            "a novel source unit retains its reused fact/part/block closure"
+            "a unit retains its whole closure, facts already published included"
         );
         let second = second_writer.finish(Ok(())).unwrap().1.unwrap();
         assert_ne!(first.data(), second.data());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
-        assert_eq!(snapshot.support().len(), 2);
+        assert_eq!(snapshot.support().len(), 3, "the vocabulary and two units");
         assert_eq!(projection_ids(&snapshot.facts().unwrap()).len(), 2);
         assert!(snapshot.facts().unwrap().iter().count() > first_len);
     }
@@ -1964,11 +1834,7 @@ mod tests {
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile_path, &key);
 
-        let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
-        writer
-            .stage_fragment(projection("session:index", "exact succinct"))
-            .unwrap();
-        writer.finish(Ok(())).unwrap();
+        commit_projection(&pile_path, &key, "session:index", "exact succinct");
 
         let report = ensure_succinct_index(&pile_path, Some(&key)).unwrap();
 
@@ -2025,9 +1891,7 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         for (locator, text) in [("session:alpha", "alpha"), ("session:beta", "beta")] {
-            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
-            writer.stage_fragment(projection(locator, text)).unwrap();
-            writer.finish(Ok(())).unwrap();
+            commit_projection(&pile_path, &key, locator, text);
         }
 
         let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
@@ -2076,11 +1940,11 @@ mod tests {
         initialize_archive_fixture(&pile_path, &key);
 
         for (locator, seconds) in [("session:first", 1.0), ("session:second", 2.0)] {
-            let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
-            writer
-                .stage_fragment(projection_at(locator, "shared closure needle", seconds))
-                .unwrap();
-            writer.finish(Ok(())).unwrap();
+            commit_fragment(
+                &pile_path,
+                &key,
+                projection_at(locator, "shared closure needle", seconds),
+            );
         }
 
         let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
@@ -2610,6 +2474,10 @@ mod tests {
                     ))
                     .unwrap()
             })
+            // The vocabulary's own COMMIT holds no node.
+            .filter(|facts: &TribleSet| {
+                exists!(pattern!(facts, [{ _?node @ metadata::tag: &schema::block::KIND }]))
+            })
             .collect();
         drop(snapshot);
         pile.close().unwrap();
@@ -2693,5 +2561,317 @@ mod tests {
         // share nodes.
         assert!(!tagged(&commits[0], schema::block::KIND)
             .is_disjoint(&tagged(&commits[1], schema::block::KIND)));
+    }
+
+    /// A Claude Code transcript of `turns` question/answer pairs on one chain.
+    fn claude_transcript(session: &str, turns: usize) -> String {
+        let mut out = String::new();
+        let mut parent: Option<String> = None;
+        for turn in 0..turns {
+            for kind in ["user", "assistant"] {
+                let uuid = format!("{session}-{kind}-{turn}");
+                let parent_json = parent
+                    .as_ref()
+                    .map_or("null".to_owned(), |parent| format!("\"{parent}\""));
+                let second = turn * 2 + usize::from(kind == "assistant");
+                let at = format!(
+                    "2026-03-01T{:02}:{:02}:{:02}.000Z",
+                    10 + second / 3600,
+                    (second / 60) % 60,
+                    second % 60
+                );
+                let line = if kind == "user" {
+                    format!(
+                        r#"{{"type":"user","sessionId":"{session}","uuid":"{uuid}","parentUuid":{parent_json},"timestamp":"{at}","message":{{"role":"user","content":"question {turn} of {session}"}}}}"#
+                    )
+                } else {
+                    format!(
+                        r#"{{"type":"assistant","sessionId":"{session}","uuid":"{uuid}","parentUuid":{parent_json},"timestamp":"{at}","message":{{"role":"assistant","model":"claude-opus-4","content":[{{"type":"text","text":"answer {turn} of {session}"}}]}}}}"#
+                    )
+                };
+                out.push_str(&line);
+                out.push('\n');
+                parent = Some(uuid);
+            }
+        }
+        out
+    }
+
+    /// A Codex rollout of `turns` turns, each a prompt, a reasoning summary
+    /// and an answer, stamped from `start_second` on.
+    fn codex_rollout_lines(session: &str, first_turn: usize, turns: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        for turn in first_turn..first_turn + turns {
+            let at = |offset: usize| {
+                let second = turn * 3 + offset;
+                format!(
+                    "2026-08-01T{:02}:{:02}:{:02}.000Z",
+                    10 + second / 3600,
+                    (second / 60) % 60,
+                    second % 60
+                )
+            };
+            lines.push(format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"user_message","message":"question {turn} of {session}","images":[],"local_images":[]}}}}"#,
+                at(0)
+            ));
+            lines.push(format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"agent_reasoning","text":"weighing question {turn} of {session}"}}}}"#,
+                at(1)
+            ));
+            lines.push(format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"agent_message","message":"answer {turn} of {session}"}}}}"#,
+                at(2)
+            ));
+        }
+        lines
+    }
+
+    fn codex_parent(turns: usize) -> String {
+        let mut text = String::from(concat!(
+            r#"{"timestamp":"2026-08-01T09:59:59.000Z","type":"session_meta","payload":{"id":"piece-parent","session_id":"piece-parent"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-01T09:59:59.500Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+            "\n",
+        ));
+        for line in codex_rollout_lines("piece-parent", 0, turns) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
+    }
+
+    /// A fork as Codex writes one: its own session record, every parent
+    /// record again under the copy's timestamp, then turns of its own.
+    fn codex_fork(parent: &str, own_turns: usize, parent_turns: usize) -> String {
+        let mut fork = String::from(concat!(
+            r#"{"timestamp":"2026-08-03T09:00:00.000Z","type":"session_meta","payload":{"id":"piece-fork","session_id":"piece-parent","forked_from_id":"piece-parent"}}"#,
+            "\n"
+        ));
+        for line in parent.lines() {
+            let (_, rest) = line.split_once(r#"","type""#).unwrap();
+            fork.push_str(r#"{"timestamp":"2026-08-03T09:00:00.500Z","type""#);
+            fork.push_str(rest);
+            fork.push('\n');
+        }
+        fork.push_str(
+            r#"{"timestamp":"2026-08-03T09:00:05.000Z","type":"turn_context","payload":{"model":"gpt-test"}}"#,
+        );
+        fork.push('\n');
+        for line in codex_rollout_lines("piece-fork", parent_turns + 2000, own_turns) {
+            // Own turns start after the fork's creation.
+            let (_, rest) = line.split_once(r#"","type""#).unwrap();
+            fork.push_str(r#"{"timestamp":"2026-08-03T10:00:00.000Z","type""#);
+            fork.push_str(rest);
+            fork.push('\n');
+        }
+        fork
+    }
+
+    fn import_source(
+        pile: &std::path::Path,
+        key: &std::path::Path,
+        name: &str,
+        text: &str,
+    ) -> Option<CollectionCommit> {
+        let mut writer = ArchiveImportWriter::open(pile, Some(key)).unwrap();
+        // One piece per sixteen nodes on average, so small fixtures cut.
+        writer.set_piece_bits(4);
+        let bytes = Bytes::from_source(text.as_bytes().to_vec());
+        let projection = if name.starts_with("rollout") {
+            crate::archive_codex::project_bytes(name, bytes, |projected| {
+                writer.stage_fragment(projected.fragment)
+            })
+            .map(drop)
+        } else {
+            crate::archive_claude_code::project_bytes(name, bytes, |projected| {
+                writer.stage_fragment(projected.fragment)
+            })
+            .map(drop)
+        };
+        writer.finish(projection).unwrap().1
+    }
+
+    fn pile_length(pile: &std::path::Path) -> u64 {
+        std::fs::metadata(pile).unwrap().len()
+    }
+
+    /// The data handles of every Archive COMMIT in the pile.
+    fn archive_commit_data(
+        pile: &std::path::Path,
+        key: &std::path::Path,
+    ) -> BTreeSet<CollectionData> {
+        let signer = load_signer(pile, Some(key)).unwrap();
+        let mut store = open_pile_strict_as(pile, signer.verifying_key()).unwrap();
+        let source = test_source(&mut store, pile, key);
+        let snapshot = store.snapshot().unwrap();
+        let commits = discovered_records(&snapshot)
+            .unwrap()
+            .commits()
+            .iter()
+            .filter(|commit| commit.collection() == source.handle())
+            .map(|commit| commit.data())
+            .collect();
+        drop(snapshot);
+        store.close().unwrap();
+        commits
+    }
+
+    /// The node ids every given COMMIT's data holds.
+    fn blocks_in_commits(
+        pile: &std::path::Path,
+        commits: &BTreeSet<CollectionData>,
+    ) -> BTreeSet<Id> {
+        let mut store = open_pile_strict(pile).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let mut blocks = BTreeSet::new();
+        for data in commits {
+            let facts: TribleSet = snapshot
+                .get::<TribleSet, SimpleArchive>(Handle::<SimpleArchive>::from_hash(*data))
+                .unwrap();
+            blocks.extend(find!(
+                block: Id,
+                pattern!(&facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+            ));
+        }
+        drop(snapshot);
+        store.close().unwrap();
+        blocks
+    }
+
+    fn fresh_archive(directory: &TempDir, name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let pile = directory.path().join(format!("{name}.pile"));
+        let key = directory.path().join(format!("{name}.key"));
+        std::fs::File::create(&pile).unwrap();
+        initialize_archive_fixture(&pile, &key);
+        (pile, key)
+    }
+
+    #[test]
+    fn reimporting_an_unchanged_session_adds_no_bytes() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let transcript = claude_transcript("unchanged", 300);
+        import_source(&pile, &key, "unchanged.jsonl", &transcript);
+        let length = pile_length(&pile);
+        let commits = archive_commit_data(&pile, &key);
+        import_source(&pile, &key, "unchanged.jsonl", &transcript);
+        assert_eq!(pile_length(&pile), length, "the second import added bytes");
+        assert_eq!(archive_commit_data(&pile, &key), commits);
+    }
+
+    #[test]
+    fn reimporting_an_unchanged_rollout_adds_no_bytes() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let rollout = codex_parent(300);
+        import_source(&pile, &key, "rollout-unchanged.jsonl", &rollout);
+        let length = pile_length(&pile);
+        import_source(&pile, &key, "rollout-unchanged.jsonl", &rollout);
+        assert_eq!(pile_length(&pile), length, "the second import added bytes");
+    }
+
+    #[test]
+    fn a_grown_session_republishes_only_its_tail() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let empty = pile_length(&pile);
+        import_source(&pile, &key, "grown.jsonl", &claude_transcript("grown", 400));
+        let first = pile_length(&pile) - empty;
+        let before = archive_commit_data(&pile, &key);
+        import_source(&pile, &key, "grown.jsonl", &claude_transcript("grown", 410));
+        let added = pile_length(&pile) - empty - first;
+        let novel: BTreeSet<_> = archive_commit_data(&pile, &key)
+            .difference(&before)
+            .copied()
+            .collect();
+        let republished = blocks_in_commits(&pile, &novel);
+        // 20 new nodes; the rest is the tail piece the growth reopened.
+        assert!(
+            republished.len() < 20 + 200,
+            "{} nodes republished for 20 new ones",
+            republished.len()
+        );
+        assert!(added * 3 < first, "{added} bytes added after {first}");
+    }
+
+    #[test]
+    fn a_codex_fork_converges_with_its_parent_pieces() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let parent = codex_parent(300);
+        let fork = codex_fork(&parent, 5, 300);
+        import_source(&pile, &key, "rollout-parent.jsonl", &parent);
+        let before = archive_commit_data(&pile, &key);
+        let parent_blocks = blocks_in_commits(&pile, &before);
+        assert!(parent_blocks.len() >= 900, "{}", parent_blocks.len());
+        import_source(&pile, &key, "rollout-fork.jsonl", &fork);
+        let novel: BTreeSet<_> = archive_commit_data(&pile, &key)
+            .difference(&before)
+            .copied()
+            .collect();
+        let again: BTreeSet<_> = blocks_in_commits(&pile, &novel)
+            .intersection(&parent_blocks)
+            .copied()
+            .collect();
+        assert!(
+            again.len() < 200,
+            "the fork republished {} of the parent's {} nodes",
+            again.len(),
+            parent_blocks.len()
+        );
+    }
+
+    #[test]
+    fn import_needs_no_other_archive_body() {
+        let directory = TempDir::new().unwrap();
+        let (full, key) = fresh_archive(&directory, "full");
+        import_source(
+            &full,
+            &key,
+            "elsewhere.jsonl",
+            &claude_transcript("elsewhere", 20),
+        );
+        let commits: Vec<CollectionCommit> = {
+            let signer = load_signer(&full, Some(&key)).unwrap();
+            let mut store = open_pile_strict_as(&full, signer.verifying_key()).unwrap();
+            let source = test_source(&mut store, &full, &key);
+            let snapshot = store.snapshot().unwrap();
+            let commits = discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .filter(|commit| commit.collection() == source.handle())
+                .copied()
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            commits
+        };
+        assert!(!commits.is_empty());
+
+        // The same signer's pile holding those COMMIT records and none of
+        // their bodies: what a host sees before sync hands the bytes over.
+        let thin = directory.path().join("thin.pile");
+        std::fs::File::create(&thin).unwrap();
+        {
+            let signer = load_signer(&thin, Some(&key)).unwrap();
+            let mut store = open_pile_strict_as(&thin, signer.verifying_key()).unwrap();
+            test_source(&mut store, &thin, &key);
+            for commit in &commits {
+                CollectionStore::insert(&mut store, CollectionRecord::Commit(*commit)).unwrap();
+            }
+            store.close().unwrap();
+        }
+        let commit = import_source(&thin, &key, "here.jsonl", &claude_transcript("here", 20));
+        assert!(commit.is_some());
+        let observed = pollster::block_on(ensure_local(&thin, Some(&key))).unwrap();
+        let facts = observed.facts().unwrap();
+        let blocks: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(&facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+        )
+        .collect();
+        assert_eq!(blocks.len(), 40, "the local import reads back whole");
     }
 }

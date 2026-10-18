@@ -38,10 +38,10 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub(super) enum Command {
-    /// Project one or more sources into the Archive, publishing one COMMIT each.
+    /// Project one or more sources into the Archive as content-defined pieces.
     ///
     /// Several PATHS are projected in ONE process: the pile is opened once and
-    /// each source still gets its own signed commit. Atomicity is per source,
+    /// each source still gets its own signed commits. Atomicity is per source,
     /// not per process — and the open costs ~9.3 s on the live pile against ~1 s
     /// of projection for a small rollout, so a per-file process put a 3,161-file
     /// Codex backfill at ~8.2 hours of pure opening.
@@ -151,7 +151,7 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
     });
 }
 
-/// Import every PATH through ONE opened writer, one signed COMMIT per path.
+/// Import every PATH through ONE opened writer, one unit of pieces per path.
 ///
 /// The open is paid once for the whole command, whatever the source. Opening
 /// grows with the pile (~9.3 s per open on the 44 GB live pile, 2026-09-01)
@@ -185,11 +185,10 @@ pub(super) fn import_paths(
     writer.close(result)
 }
 
-/// Project one source PATH into the open writer and publish it as one COMMIT.
+/// Project one source PATH into the open writer and publish its pieces.
 ///
-/// `commit_unit` folds what it publishes into the writer's known facts, so a
-/// later path skips whatever an earlier one already carried, just as a fresh
-/// open would have: an unchanged source stages nothing and publishes nothing.
+/// The writer reads nothing back: an unchanged source cuts into the pieces it
+/// cut before, and publishing them again appends nothing to the pile.
 fn import_into(
     writer: &mut ArchiveImportWriter,
     path: &Path,

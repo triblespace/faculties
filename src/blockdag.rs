@@ -518,10 +518,10 @@ pub fn block_source_projection(source_namespace: Id, block: Fragment) -> Result<
 /// One source occurrence of a [`block_source_projection`] receipt, as a
 /// fragment of its own.
 ///
-/// It holds only annotations of `receipt`. Keeping it apart from the
-/// receipt's intrinsic closure lets an import skip that closure whole when it
-/// is already known, and stage just the new annotations. No source bytes are
-/// part of an occurrence.
+/// It holds only annotations of `receipt`, all of them occurrence facts
+/// ([`is_occurrence_attribute`]): the import writer publishes them apart from
+/// the receipt's intrinsic closure, which stays the same bytes wherever the
+/// node is read. No source bytes are part of an occurrence.
 pub fn source_occurrence(receipt: Id, annotations: ProjectionAnnotations) -> Result<Fragment> {
     annotate_source_projection(Fragment::rooted(receipt, TribleSet::new()), annotations)
 }
@@ -575,6 +575,42 @@ pub fn annotate_source_projection(
     };
     debug_assert_eq!(projection.root(), Some(root));
     Ok(projection)
+}
+
+/// Whether `attribute` carries occurrence evidence: what one reading of one
+/// source says about a node or receipt it projected, never what the node or
+/// receipt is.
+///
+/// These are the node's timestamp annotation ([`block`]) and every
+/// annotation [`annotate_source_projection`] and [`select_resolution`] write.
+/// The same node read from another file, a fork's replay or a later version
+/// of the same file can carry different values for them (a Codex fork
+/// carries no copy times; a file's leaf moves as it grows), while
+/// everything else about the node is fixed by its identity. The Archive
+/// import writer publishes the two kinds as separate COMMITs so that the
+/// intrinsic one is the same bytes wherever the node is read.
+///
+/// `source_locator` is also part of a producer-native receipt's identity
+/// ([`source_projection`]); importers never write those, and splitting one
+/// across two COMMITs changes no union.
+pub fn is_occurrence_attribute(attribute: Id) -> bool {
+    [
+        schema::block::timestamp.id(),
+        schema::source_projection::semantic_predecessor_support.id(),
+        schema::source_projection::source_timestamp.id(),
+        schema::source_projection::author.id(),
+        schema::source_projection::experiencer.id(),
+        schema::source_projection::raw_author.id(),
+        schema::source_projection::raw_role.id(),
+        schema::source_projection::raw_model.id(),
+        schema::source_projection::source_locator.id(),
+        schema::source_projection::source_detail.id(),
+        schema::source_projection::importer_revision.id(),
+        schema::source_projection::resolution.id(),
+        files_schema::file::source_path.id(),
+        metadata::name.id(),
+    ]
+    .contains(&attribute)
 }
 
 fn values_by_entity<T: Ord>(rows: impl IntoIterator<Item = (Id, T)>) -> BTreeMap<Id, BTreeSet<T>> {

@@ -6,7 +6,7 @@
 //! caller-provided sink. A child
 //! fragment may name a predecessor catalog entity carried by another emitted
 //! fragment, so callers must stage the complete emitted union through
-//! `ArchiveImportWriter` and publish it with one validated COMMIT. The adapter
+//! `ArchiveImportWriter` and publish it as one unit (`commit_unit`). The adapter
 //! knows nothing about Archive's CLI, legacy repositories, branches,
 //! workspaces, or signing policy.
 //!

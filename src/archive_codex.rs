@@ -2439,8 +2439,10 @@ mod tests {
             blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
         assert_eq!(validation, blockdag::CatalogValidation::Accepted);
 
-        // Through a real writer: after the parent's commit, the fork stages
-        // the closures of its own two messages and no other.
+        // Through a real writer cutting one piece per node: the fork's
+        // replayed nodes are the parent's own intrinsic COMMITs, byte for
+        // byte, so the fork adds the intrinsic COMMITs of its own two
+        // messages and no other.
         let directory = tempfile::tempdir().unwrap();
         let pile = directory.path().join("archive.pile");
         let key = directory.path().join("archive.key");
@@ -2450,30 +2452,42 @@ mod tests {
         let fork_path = directory.path().join("fork.jsonl");
         fs::write(&parent_path, PARENT_ROLLOUT).unwrap();
         fs::write(&fork_path, &fork_text).unwrap();
+        let intrinsic_commits = |pile: &Path| -> BTreeSet<[u8; 32]> {
+            let mut store = crate::storage::open_pile_strict(pile).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let commits = crate::storage::discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .map(|commit| commit.data())
+                .filter(|data| {
+                    let facts: TribleSet = snapshot
+                        .get::<TribleSet, triblespace::core::blob::encodings::simplearchive::SimpleArchive>(
+                            Handle::from_hash(*data),
+                        )
+                        .unwrap();
+                    exists!(pattern!(&facts, [{
+                        _?block @ metadata::tag: &schema::block::KIND
+                    }]))
+                })
+                .map(|data| data.raw)
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            commits
+        };
 
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        project_path(&parent_path, |projected| {
-            writer.stage_fragment(projected.fragment)
-        })
-        .unwrap();
-        assert!(writer.commit_unit().unwrap().is_some());
-        writer.close(Ok(())).unwrap();
-
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        let mut staged_closures = 0usize;
-        project_path(&fork_path, |projected| {
-            let closure = has_tag(&projected.fragment, schema::block::KIND);
-            let before = writer.delta_len();
-            writer.stage_fragment(projected.fragment)?;
-            if closure && writer.delta_len() > before {
-                staged_closures += 1;
+        for path in [&parent_path, &fork_path] {
+            let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            writer.set_piece_bits(0);
+            project_path(path, |projected| writer.stage_fragment(projected.fragment)).unwrap();
+            assert!(writer.commit_unit().unwrap().is_some());
+            writer.close(Ok(())).unwrap();
+            if path == &parent_path {
+                assert_eq!(intrinsic_commits(&pile).len(), 3);
             }
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(staged_closures, 2);
-        assert!(writer.commit_unit().unwrap().is_some());
-        writer.close(Ok(())).unwrap();
+        }
+        assert_eq!(intrinsic_commits(&pile).len(), 3 + 2);
 
         let archive =
             pollster::block_on(crate::archive_collection::ensure_local(&pile, Some(&key))).unwrap();

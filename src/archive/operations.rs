@@ -537,9 +537,9 @@ fn print_collection_publication(published: bool, out: &mut Out<'_>) -> Result<()
     out.line(format!(
         "Archive collection: {}",
         if published {
-            "one signed COMMIT published"
+            "new pieces published"
         } else {
-            "unchanged (no novel facts)"
+            "unchanged (every piece already published)"
         }
     ))?;
     Ok(())
@@ -1556,7 +1556,7 @@ mod tests {
             .unwrap();
         assert!(receipt.commit.is_some());
         let before = archive.storage().load().unwrap();
-        assert_eq!(before.support().len(), 1);
+        assert_eq!(before.support().len(), 2, "the vocabulary and the unit");
 
         // A later operation cannot reopen this pathname, but it can borrow the
         // retained owner. Its explicit key remains at the configured location.
@@ -1580,7 +1580,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .is_err());
-        assert_eq!(archive.storage().load().unwrap().support().len(), 1);
+        assert_eq!(archive.storage().load().unwrap().support().len(), 2);
 
         let second = archive.import(
             ImportSource::ClaudeWeb,
@@ -1589,10 +1589,10 @@ mod tests {
             &BTreeMap::new(),
         ).unwrap();
         assert!(second.commit.is_some());
-        assert_eq!(archive.storage().load().unwrap().support().len(), 2);
+        assert_eq!(archive.storage().load().unwrap().support().len(), 3);
         assert_eq!(
             before.support().len(),
-            1,
+            2,
             "the earlier observation stays frozen"
         );
         assert!(!fixture.pile.exists());
@@ -1611,7 +1611,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &chatgpt, CliImportSource::ChatGpt).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 1);
+        assert_eq!(archive_root_payloads(&fixture), 2);
 
         let claude_web = fixture._directory.path().join("claude-web.json");
         fs::write(
@@ -1620,7 +1620,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &claude_web, CliImportSource::ClaudeWeb).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 2);
+        assert_eq!(archive_root_payloads(&fixture), 3);
 
         let copilot = fixture._directory.path().join("copilot.json");
         fs::write(
@@ -1629,7 +1629,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &copilot, CliImportSource::Copilot).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 3);
+        assert_eq!(archive_root_payloads(&fixture), 4);
 
         let agy = fixture._directory.path().join("transcript_full.jsonl");
         fs::write(
@@ -1641,7 +1641,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &agy, CliImportSource::Agy).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 4);
+        assert_eq!(archive_root_payloads(&fixture), 5);
 
         let gemini = fixture._directory.path().join("My Activity.html");
         fs::write(
@@ -1657,7 +1657,7 @@ mod tests {
         )
         .unwrap();
         run_import(storage(&fixture), &gemini, CliImportSource::Gemini).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 5);
+        assert_eq!(archive_root_payloads(&fixture), 6);
 
         assert_eq!(
             projection_ids(&storage(&fixture).load().unwrap().facts().unwrap()).len(),
@@ -1683,14 +1683,14 @@ mod tests {
         .unwrap();
 
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 1);
+        assert_eq!(archive_root_payloads(&fixture), 2);
         let archive = storage(&fixture).load().unwrap();
         assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
         drop(archive);
         let after_first = fs::metadata(&fixture.pile).unwrap().len();
 
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
-        assert_eq!(archive_root_payloads(&fixture), 1);
+        assert_eq!(archive_root_payloads(&fixture), 2);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
     }
 
@@ -1799,8 +1799,8 @@ mod tests {
         assert_eq!(archive_root_payloads(&fixture), 0);
     }
 
-    const PUBLISHED: &str = "one signed COMMIT published";
-    const UNCHANGED: &str = "unchanged (no novel facts)";
+    const PUBLISHED: &str = "new pieces published";
+    const UNCHANGED: &str = "unchanged (every piece already published)";
 
     /// One synthetic two-record Claude Code session in its own file.
     fn claude_code_session(directory: &Path, name: &str) -> PathBuf {
@@ -1862,7 +1862,11 @@ mod tests {
         let (result, outcomes) = import_outcomes(&fixture, &sessions);
         result.unwrap();
         assert_eq!(outcomes, [PUBLISHED; 3]);
-        assert_eq!(archive_root_payloads(&fixture), 3, "one COMMIT per path");
+        assert_eq!(
+            archive_root_payloads(&fixture),
+            4,
+            "one COMMIT per path and the vocabulary's"
+        );
         let archive = storage(&fixture).load().unwrap();
         assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 6);
         drop(archive);
@@ -1871,7 +1875,7 @@ mod tests {
         let (result, outcomes) = import_outcomes(&fixture, &sessions);
         result.unwrap();
         assert_eq!(outcomes, [UNCHANGED; 3]);
-        assert_eq!(archive_root_payloads(&fixture), 3);
+        assert_eq!(archive_root_payloads(&fixture), 4);
         assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), after_first);
 
         // Within one command a later path is judged against what the earlier
@@ -1881,7 +1885,7 @@ mod tests {
             import_outcomes(&fixture, &[sessions[0].clone(), delta.clone(), delta]);
         result.unwrap();
         assert_eq!(outcomes, [UNCHANGED, PUBLISHED, UNCHANGED]);
-        assert_eq!(archive_root_payloads(&fixture), 4);
+        assert_eq!(archive_root_payloads(&fixture), 5);
     }
 
     /// One `archive import --source chatgpt` over PATH, with its outcome.
@@ -1991,7 +1995,7 @@ mod tests {
         assert_eq!(outcomes, [PUBLISHED], "the failure stops the command");
         assert_eq!(
             archive_root_payloads(&fixture),
-            1,
+            2,
             "the earlier COMMIT stays"
         );
         let archive = storage(&fixture).load().unwrap();
@@ -2001,7 +2005,7 @@ mod tests {
         let (result, outcomes) = import_outcomes(&fixture, &[first, later]);
         result.unwrap();
         assert_eq!(outcomes, [UNCHANGED, PUBLISHED]);
-        assert_eq!(archive_root_payloads(&fixture), 2);
+        assert_eq!(archive_root_payloads(&fixture), 3);
     }
 
     #[test]
@@ -2017,7 +2021,7 @@ mod tests {
         let first =
             archive_collection::ensure_succinct_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
-        assert_eq!(first.source_elements, 1);
+        assert_eq!(first.source_elements, 2, "the vocabulary and the unit");
         assert_ne!(first.source_collection, first.target_collection);
         let before = fs::metadata(&fixture.pile).unwrap().len();
 
@@ -2041,8 +2045,8 @@ mod tests {
         let first_bm25 =
             archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
-        assert_eq!(first_bm25.source_elements, 1);
-        assert_eq!(first_bm25.cover_segments, 1);
+        assert_eq!(first_bm25.source_elements, 2);
+        assert_eq!(first_bm25.cover_segments, 2);
         let after_bm25 = fs::metadata(&fixture.pile).unwrap().len();
         assert_eq!(
             archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key),).unwrap(),
