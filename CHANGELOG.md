@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Secrets versions name no collection.** A new version's resource descriptor
+  no longer carries `resource_collection` (anchor
+  `62E951EC3ABB7F9B7F123BB7DE2F9F99`, which core retired): the grants over R
+  reach every participant of R by grant gossip, whichever collection declares
+  the version, so delivery never depended on the backlink and transport no
+  longer reads it. Descriptors written before keep the annotation and are
+  never rewritten; nothing reads it. The crate-internal `seal_version` loses
+  its collection argument. Builds against the core that retired the attribute.
+
 - **Compass `@mentions` replace tag subscriptions as Orient's way of
   addressing people.** An `@label` in a goal title or note (a persona label,
   alias or Relations group name, case-insensitive, starting the text or after

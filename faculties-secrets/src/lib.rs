@@ -748,14 +748,8 @@ mod tests {
     fn later_reader_adds_only_an_envelope_and_preserves_the_body() {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
-        let mut sealed = resource::seal_version(
-            CollectionHandle::new([1; 32]),
-            &alice,
-            "database",
-            b"unchanged ciphertext",
-            at(2),
-        )
-        .unwrap();
+        let mut sealed =
+            resource::seal_version(&alice, "database", b"unchanged ciphertext", at(2)).unwrap();
         let secret = sealed.secret;
         let original = secret_rows_for(sealed.fragment.facts(), secret)[0].body;
         let reader = sealed.fragment.blobs_mut().snapshot().unwrap();
@@ -791,14 +785,7 @@ mod tests {
     fn missing_wrap_attachment_does_not_suppress_additive_repair() {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
-        let mut sealed = resource::seal_version(
-            CollectionHandle::new([1; 32]),
-            &alice,
-            "database",
-            b"value",
-            at(3),
-        )
-        .unwrap();
+        let mut sealed = resource::seal_version(&alice, "database", b"value", at(3)).unwrap();
         let secret = sealed.secret;
         let missing = Inline::<inlineencodings::Handle<blobencodings::RawBytes>>::new([0x55; 32]);
         sealed.fragment += wrap_record(genid().id, secret, bob.verifying_key().to_bytes(), missing);

@@ -1,12 +1,14 @@
 //! Secret-specific authority carried by an immutable resource descriptor.
 //!
-//! Collection facts declare the resource for proof discovery, but never choose
-//! the delivery policy for a recovered DEK: the opened envelope supplies R.
+//! Collection facts declare which resource a version uses, but never choose the
+//! delivery policy for a recovered DEK: the opened envelope supplies R. A new R
+//! names no collection; the grants over it reach every participant of R by
+//! grant gossip, whichever collection declares the version.
 
 use std::num::NonZeroUsize;
 
 use triblespace::core::capability::policy::{
-    resource_collection, resource_handle, resource_policies, resource_policy, AdmissionPolicy,
+    resource_handle, resource_policies, resource_policy, AdmissionPolicy,
 };
 use triblespace::core::capability::{
     capability_action, capability_delegate_action, capability_quorum_authorized_subjects_if,
@@ -21,6 +23,20 @@ use super::*;
 use crate::schema::{
     delivery_expires_at, delivery_not_before, ACTION_KEY_DELIVERY, KIND_SECRET_RESOURCE,
 };
+
+/// The retired routing backlink, which versions sealed before grant gossip
+/// carry and nothing reads: declared for tests that write such an old R. It is
+/// an anchored attribute, so anchor and encoding are its identity and this
+/// declaration has the published attribute's id.
+#[cfg(test)]
+pub(crate) mod retired {
+    use triblespace::macros::attributes;
+    use triblespace::prelude::*;
+
+    attributes! {
+        "62E951EC3ABB7F9B7F123BB7DE2F9F99" as pub resource_collection: inlineencodings::Handle<blobencodings::SimpleArchive>;
+    }
+}
 
 /// The selected immutable version, or its exact resource descriptor handle.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -95,7 +111,6 @@ pub fn delivery_prefix_is_current<R: BlobStoreGet>(
 }
 
 pub(crate) fn seal_version(
-    collection: CollectionHandle,
     signer: &SigningKey,
     name: &str,
     plaintext: &[u8],
@@ -122,7 +137,6 @@ pub(crate) fn seal_version(
         metadata::tag: KIND_SECRET_RESOURCE,
         wrap_secret: secret,
         secret_body: body,
-        resource_collection: collection,
         resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
     };
     let resource = fragment.put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone());
@@ -141,10 +155,11 @@ pub(crate) fn seal_version(
     })
 }
 
-/// R's `resource_collection` routes its proofs in TribleSpace; delivery does
-/// not compare it with the configured collection, so a version carried into
-/// another collection keeps its delivery policy there. The policy grants
-/// delivery for R, not access to any collection.
+/// Delivery is decided by R's own policy and the proofs over R, never by which
+/// collection declares the version, so a version carried into another
+/// collection keeps its delivery policy there. The policy grants delivery for
+/// R, not access to any collection. An old R may still carry the retired
+/// `resource_collection` annotation; nothing reads it.
 fn policies<R: BlobStoreGet>(
     reader: &R,
     facts: &TribleSet,
@@ -332,6 +347,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::retired::resource_collection;
     use triblespace::core::collection::{
         grant_collection_write, CollectionPolicy, CollectionStoreExt,
     };
@@ -531,7 +547,8 @@ mod tests {
         let anna = SigningKey::from_bytes(&[2; 32]);
         let bob = SigningKey::from_bytes(&[3; 32]);
         let carol = SigningKey::from_bytes(&[4; 32]);
-        // R's home routes its proofs; it does not change R's audience.
+        // An old R's retired home annotation changes nothing: not R's
+        // audience, not its proofs' reach.
         for home in [
             Some(CollectionHandle::new([5; 32])),
             Some(CollectionHandle::new([7; 32])),
