@@ -2003,7 +2003,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_path_import_skips_failing_paths_and_continues() {
+    fn multi_path_import_failure_keeps_earlier_commits_and_stops() {
         let fixture = fixture();
         let directory = fixture._directory.path();
         let first = claude_code_session(directory, "first");
@@ -2019,72 +2019,34 @@ mod tests {
             r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"different"}}"#,
         )
         .unwrap();
-        let missing = directory.join("gone.jsonl");
         let later = claude_code_session(directory, "later");
 
-        let (result, outcomes) = import_outcomes(
-            &fixture,
-            &[first.clone(), conflict.clone(), missing, later.clone()],
-        );
-        assert_eq!(
-            super::super::cli::exit_status(&result),
-            super::super::cli::SKIPPED_PATHS_STATUS
-        );
+        let (result, outcomes) =
+            import_outcomes(&fixture, &[first.clone(), conflict.clone(), later.clone()]);
         let error = format!("{:#}", result.unwrap_err());
         assert!(
-            error.contains("2 of 4 path(s) could not be imported"),
+            error.contains(&format!("import {}", conflict.display())),
             "{error}"
         );
+        assert!(error.contains("conflicting semantic payloads"), "{error}");
         assert_eq!(
             appended_all(&outcomes),
-            [true, true],
-            "the paths around the failures are imported"
+            [true],
+            "the failure stops the command"
         );
         assert_eq!(
             archive_root_payloads(&fixture),
-            5,
-            "the vocabulary and two paths' two COMMITs"
+            3,
+            "the earlier COMMITs stay"
         );
         let archive = storage(&fixture).load().unwrap();
-        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 4);
+        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
         drop(archive);
 
         let (result, outcomes) = import_outcomes(&fixture, &[first, later]);
         result.unwrap();
-        assert_eq!(appended_all(&outcomes), [false, false]);
+        assert_eq!(appended_all(&outcomes), [false, true]);
         assert_eq!(archive_root_payloads(&fixture), 5);
-    }
-
-    /// A failure of the pile is no bad source: it stops the command with
-    /// status 1 at the path it struck, which is not reported as skipped, and
-    /// nothing is published.
-    #[test]
-    fn a_storage_failure_stops_the_import_instead_of_skipping_the_path() {
-        let fixture = fixture();
-        let directory = fixture._directory.path();
-        let first = claude_code_session(directory, "first");
-        let later = claude_code_session(directory, "later");
-        let mut writer =
-            archive_collection::ArchiveImportWriter::open(&fixture.pile, Some(&fixture.key))
-                .unwrap();
-        writer.fail_stages();
-        let result = super::super::cli::import_paths_with(
-            writer,
-            &fixture.pile,
-            &[first.clone(), later],
-            CliImportSource::ClaudeCode,
-            None,
-            &mut Out::new(&mut |_| Ok(())),
-        );
-        assert_eq!(super::super::cli::exit_status(&result), 1);
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("the pile refused a write"), "{error}");
-        assert!(
-            error.starts_with(&format!("import {}", first.display())),
-            "{error}"
-        );
-        assert!(!error.contains("skipped"), "{error}");
-        assert_eq!(archive_root_payloads(&fixture), 0);
     }
 
     #[test]

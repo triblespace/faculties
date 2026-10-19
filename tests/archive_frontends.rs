@@ -694,69 +694,56 @@ fn every_import_route_stages_through_the_writer() {
     }
 }
 
-/// A fill over thousands of files must not stop at one bad path: a missing
-/// file, and a source that fails to project, are reported and skipped, the
-/// rest of the list is imported, and the command still ends in an error so
-/// its status is nonzero. Lines are kept verbatim except a CRLF ending, and
-/// empty lines are skipped.
+/// List lines are kept verbatim except a CRLF ending: empty and
+/// whitespace-only lines are no paths, and spaces in or around a real name
+/// are part of it.
 #[test]
-fn paths_from_skips_failing_paths_and_reports_them() {
+fn paths_from_keeps_names_verbatim_and_skips_blank_lines() {
     let fixture = Fixture::new();
     let directory = fixture.directory.path();
     let alpha = directory.join("alpha.jsonl");
     let gamma = directory.join("with space.jsonl");
+    let padded = directory.join(" padded.jsonl ");
     fs::write(&alpha, CODE.replace("resident", "alpha")).unwrap();
     fs::write(&gamma, CODE.replace("resident", "gamma")).unwrap();
-    // Spaces around a real name are part of it.
-    let padded = directory.join(" padded.jsonl ");
     fs::write(&padded, CODE.replace("resident", "padded")).unwrap();
-    let malformed = directory.join("malformed.jsonl");
-    fs::write(&malformed, format!("{CODE}\n{{invalid\n")).unwrap();
     let list = format!(
-        "{}\r\n{}\r\n\r\n \t \n{}\r\n{}\r\n{}\n",
+        "{}\r\n\r\n \t \n{}\r\n{}\n",
         alpha.display(),
-        directory.join("missing.jsonl").display(),
-        malformed.display(),
         gamma.display(),
         padded.display(),
     );
     let list_path = directory.join("paths.txt");
     fs::write(&list_path, list).unwrap();
-    let (result, parts) = fixture.try_cli(&[
+    let parts = fixture.cli(&[
         "import",
         "--paths-from",
         list_path.to_str().unwrap(),
         "--source",
         "claude-code",
     ]);
-    assert_eq!(cli::exit_status(&result), cli::SKIPPED_PATHS_STATUS);
-    let error = format!("{:#}", result.unwrap_err());
-    assert!(
-        error.contains("2 of 5 path(s) could not be imported"),
-        "the blank and whitespace-only lines are no paths: {error}"
-    );
     assert_eq!(
         text(&parts)
             .matches("Archive collection: 1 piece(s)")
             .count(),
-        3,
-        "the three readable sessions, those with spaces in their names included"
+        3
     );
 }
 
-/// A directory that fails after its first file is staged publishes nothing
-/// of itself, under its own unit or the next path's: the archive is the one
-/// importing only the good paths makes.
+/// The first path that cannot be imported stops the command with status 1,
+/// naming the path and the reason: the paths before it stay committed, the
+/// failing path publishes nothing of what it staged, and the paths after it
+/// are not imported. The archive is the one the good prefix alone makes.
 #[test]
-fn a_path_failing_after_it_staged_leaves_the_archive_of_the_good_paths() {
+fn a_failing_path_stops_the_import_after_the_good_prefix() {
     let fixture = Fixture::new();
     let directory = fixture.directory.path();
     let alpha = directory.join("alpha.jsonl");
     let gamma = directory.join("gamma.jsonl");
     fs::write(&alpha, CODE.replace("resident", "alpha")).unwrap();
     fs::write(&gamma, CODE.replace("resident", "gamma")).unwrap();
-    // The project's first transcript projects; the second's subagent
-    // metadata is not JSON, which fails the directory after that.
+    // The project's first transcript projects and is staged; the second's
+    // subagent metadata is not JSON, which fails the directory after that.
     let project = directory.join("project");
     fs::create_dir(&project).unwrap();
     fs::write(
@@ -770,35 +757,48 @@ fn a_path_failing_after_it_staged_leaves_the_archive_of_the_good_paths() {
     )
     .unwrap();
     fs::write(project.join("b-second.meta.json"), "{not json").unwrap();
-    let path = |path: &PathBuf| path.to_str().unwrap().to_owned();
-    let (result, parts) = fixture.try_cli(&[
-        "import",
-        "--source",
-        "claude-code",
-        &path(&alpha),
-        &path(&project),
-        &path(&gamma),
-    ]);
-    assert_eq!(cli::exit_status(&result), cli::SKIPPED_PATHS_STATUS);
-    let error = format!("{:#}", result.unwrap_err());
-    assert!(error.contains("1 of 3 path(s)"), "{error}");
-    assert!(error.contains("b-second.meta.json"), "{error}");
+
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_archive"));
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("TRIBLESPACE_") {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .env_remove("PILE")
+        .env_remove("PERSONA")
+        .arg("--pile")
+        .arg(&fixture.pile)
+        .arg("--key")
+        .arg(&fixture.key)
+        .args(["import", "--source", "claude-code"])
+        .arg(&alpha)
+        .arg(&project)
+        .arg(&gamma)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!("import {}", project.display())),
+        "{stderr}"
+    );
+    assert!(stderr.contains("b-second.meta.json"), "{stderr}");
+    assert!(
+        stderr.contains("[2/3]") && !stderr.contains("[3/3]"),
+        "{stderr}"
+    );
     assert_eq!(
-        text(&parts).matches("Archive collection: ").count(),
-        2,
-        "the two good paths"
+        stdout.matches("Archive collection: ").count(),
+        1,
+        "{stdout}"
     );
 
-    let good = Fixture::new();
-    good.cli(&[
-        "import",
-        "--source",
-        "claude-code",
-        &path(&alpha),
-        &path(&gamma),
-    ]);
-    assert_eq!(fixture.facts(), good.facts());
-    assert_eq!(fixture.roots(), good.roots());
+    let prefix = Fixture::new();
+    prefix.cli(&["import", "--source", "claude-code", alpha.to_str().unwrap()]);
+    assert_eq!(fixture.facts(), prefix.facts());
+    assert_eq!(fixture.roots(), prefix.roots());
 }
 
 /// A list line that is not UTF-8 refuses the whole list, naming the line,

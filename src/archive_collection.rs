@@ -96,8 +96,6 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
     occurrence: TribleSet,
     /// Whether the vocabulary COMMIT is still to be prepared.
     vocabulary: bool,
-    /// Whether the vocabulary COMMIT is among `pending`, not yet inserted.
-    vocabulary_pending: bool,
     /// Pieces closed in the unit being staged.
     pieces: usize,
     /// Signed COMMITs of the unit's pieces, in insertion order, whose bytes
@@ -105,9 +103,6 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
     pending: Vec<CollectionCommit>,
     /// Trailing zero bits of a node id that end a piece.
     piece_bits: u32,
-    /// Fail every stage as a pile that refuses its writes would.
-    #[cfg(test)]
-    fail_stages: bool,
     /// Keeps the runtime the descriptor was acquired through alive until close.
     #[allow(dead_code)]
     runtime: Arc<tokio::runtime::Runtime>,
@@ -229,12 +224,9 @@ where
             core: TribleSet::new(),
             occurrence: TribleSet::new(),
             vocabulary: true,
-            vocabulary_pending: false,
             pieces: 0,
             pending: Vec::new(),
             piece_bits: PIECE_BITS,
-            #[cfg(test)]
-            fail_stages: false,
             runtime,
         }
     }
@@ -296,10 +288,6 @@ where
     pub fn stage(&mut self, fragment: Fragment, identity: blockdag::Identity) -> Result<()> {
         let (_, facts, _, blobs) = fragment.into_parts();
         refuse_misplaced_identity(&facts, &identity)?;
-        #[cfg(test)]
-        if self.fail_stages {
-            bail!("the pile refused a write");
-        }
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
@@ -326,12 +314,6 @@ where
     /// holding a node or any other fact of a content fact is refused.
     pub fn stage_annotations(&mut self, fragment: Fragment) -> Result<()> {
         self.stage(fragment, blockdag::Identity::none())
-    }
-
-    /// Fail every later stage as a pile that refuses its writes would.
-    #[cfg(test)]
-    pub(crate) fn fail_stages(&mut self) {
-        self.fail_stages = true;
     }
 
     /// Cut pieces at `bits` trailing zero bits instead of [`PIECE_BITS`].
@@ -369,26 +351,10 @@ where
             CollectionStore::insert(&mut self.pile, CollectionRecord::Commit(*commit))
                 .map_err(|error| anyhow!("insert an Archive piece COMMIT: {error}"))?;
         }
-        self.vocabulary_pending = false;
         Ok(UnitPublication {
             pieces: std::mem::take(&mut self.pieces),
             commits,
         })
-    }
-
-    /// Drop everything staged since the last unit ended, publishing nothing:
-    /// the unit's source failed and the next unit starts clean. Bytes the
-    /// unit already appended stay unreachable until a later COMMIT names
-    /// them; a vocabulary COMMIT it prepared is prepared again by the next.
-    pub fn abandon_unit(&mut self) {
-        self.core = TribleSet::new();
-        self.occurrence = TribleSet::new();
-        self.pending.clear();
-        self.pieces = 0;
-        if self.vocabulary_pending {
-            self.vocabulary_pending = false;
-            self.vocabulary = true;
-        }
     }
 
     /// Prepare the piece being cut, if it holds anything: its annotation
@@ -401,7 +367,6 @@ where
         }
         if self.vocabulary {
             self.vocabulary = false;
-            self.vocabulary_pending = true;
             let (_, facts, _, blobs) = blockdag::vocabulary_fragment().into_parts();
             stage_embedded_blobs(&mut self.pile, named_blobs(&facts, blobs))?;
             let (descriptions, description_blobs) = blockdag::attribute_descriptions();
@@ -3708,35 +3673,5 @@ mod tests {
         writer
             .stage_annotations(Fragment::from(resolution))
             .unwrap();
-    }
-
-    /// A unit whose source failed is abandoned: nothing it staged is
-    /// published, and the next unit starts clean, its vocabulary included.
-    #[test]
-    fn abandon_unit_publishes_nothing_and_the_next_unit_starts_clean() {
-        let directory = TempDir::new().unwrap();
-        let (pile, key) = fresh_archive(&directory, "archive");
-        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        writer.set_piece_bits(0);
-        stage_source(
-            &mut writer,
-            "abandoned.jsonl",
-            &claude_transcript("abandoned", 4),
-        )
-        .unwrap();
-        writer.abandon_unit();
-        let kept = claude_transcript("kept", 4);
-        stage_source(&mut writer, "kept.jsonl", &kept).unwrap();
-        let published = writer.commit_unit().unwrap();
-        writer.close(Ok(())).unwrap();
-        let records = archive_commit_records(&pile, &key);
-        assert_eq!(records.len(), published.commits.len());
-
-        let (alone, alone_key) = fresh_archive(&directory, "alone");
-        let mut writer = ArchiveImportWriter::open(&alone, Some(&alone_key)).unwrap();
-        writer.set_piece_bits(0);
-        stage_source(&mut writer, "kept.jsonl", &kept).unwrap();
-        writer.close(Ok(())).unwrap();
-        assert_eq!(records, archive_commit_records(&alone, &alone_key));
     }
 }
