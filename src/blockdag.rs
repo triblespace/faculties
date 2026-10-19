@@ -336,22 +336,51 @@ pub fn block(
 /// The identity half of what an importer stages, named where it is built:
 /// the nodes, and the facts their ids are derived from with their kind tags.
 /// Everything else in the staged fragment annotates them.
-#[derive(Clone, Debug, Default)]
+///
+/// Only [`block_parts`] makes a node's identity; [`Identity::combine`] joins
+/// the identities of several nodes one fragment holds, and
+/// [`Identity::none`] is the identity of a fragment that holds no node. The
+/// import writer refuses a fragment holding a node its identity does not
+/// name, and an identity naming facts its fragment does not hold.
+#[derive(Clone, Debug)]
 pub struct Identity {
     /// The nodes whose identity this is; the import writer ends a piece on
     /// them.
-    pub nodes: Vec<Id>,
+    nodes: Vec<Id>,
     /// The facts of the nodes' intrinsic cores, the content facts they hold
     /// (with the entities those name, such as a media type), and the kind
     /// tags of all of them.
-    pub facts: TribleSet,
+    facts: TribleSet,
 }
 
 impl Identity {
-    /// Add another identity: one fragment that holds several nodes.
-    pub fn absorb(&mut self, other: Identity) {
+    /// The identity of a fragment that holds no node: only annotations.
+    pub fn none() -> Self {
+        Self {
+            nodes: Vec::new(),
+            facts: TribleSet::new(),
+        }
+    }
+
+    /// Join another node's identity: one fragment that holds several nodes.
+    pub fn combine(&mut self, other: Identity) {
         self.nodes.extend(other.nodes);
         self.facts += other.facts;
+    }
+
+    /// The nodes this identity names.
+    pub fn nodes(&self) -> &[Id] {
+        &self.nodes
+    }
+
+    /// The facts of their identities.
+    pub fn facts(&self) -> &TribleSet {
+        &self.facts
+    }
+
+    /// The facts, consumed.
+    pub fn into_facts(self) -> TribleSet {
+        self.facts
     }
 }
 

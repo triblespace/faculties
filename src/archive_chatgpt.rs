@@ -118,6 +118,8 @@ where
     F: FnMut(ProjectedSource) -> Result<()>,
 {
     conversations.sort_by(|(left, _), (right, _)| left.cmp(right));
+    // Conversations with the same key emit the same facts: emit them once.
+    conversations.dedup_by(|(left, _), (right, _)| left == right);
     for (_, fragments) in conversations {
         for fragment in fragments {
             emit(fragment)?;

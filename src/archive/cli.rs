@@ -46,10 +46,19 @@ pub(super) enum Command {
     /// not per process — and the open costs ~9.3 s on the live pile against ~1 s
     /// of projection for a small rollout, so a per-file process put a 3,161-file
     /// Codex backfill at ~8.2 hours of pure opening.
+    ///
+    /// Each PATH is one unit. A directory is one unit across its files, which
+    /// cuts differently from importing those files one by one: to converge
+    /// with the daily ingest, pass the files themselves (for a long list,
+    /// through `--paths-from`).
     Import {
         /// Source files (or a directory, where the adapter accepts one).
-        #[arg(required = true, num_args = 1..)]
+        #[arg(num_args = 0..)]
         path: Vec<PathBuf>,
+        /// Read more paths from this file, one per line (`-` for standard
+        /// input), and import each as its own unit in this one process.
+        #[arg(long, value_name = "FILE")]
+        paths_from: Option<PathBuf>,
         /// Source adapter used to interpret PATH.
         #[arg(long, value_enum, default_value = "claude-code")]
         source: CliImportSource,
@@ -270,10 +279,28 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let archive = Archive::new(cli.pile.clone(), cli.key.clone());
     match command {
         Command::Import {
-            path,
+            mut path,
+            paths_from,
             source,
             finished_after,
         } => {
+            if let Some(list) = paths_from {
+                let text = if list.as_os_str() == "-" {
+                    std::io::read_to_string(std::io::stdin())
+                        .context("read paths from standard input")?
+                } else {
+                    std::fs::read_to_string(&list)
+                        .with_context(|| format!("read paths from {}", list.display()))?
+                };
+                path.extend(
+                    text.lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(PathBuf::from),
+                );
+            }
+            if path.is_empty() {
+                bail!("archive import needs at least one PATH or a --paths-from list");
+            }
             let finished_before = finished_after
                 .map(|age| {
                     std::time::SystemTime::now()

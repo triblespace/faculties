@@ -574,68 +574,135 @@ fn a_session_from_another_folder_or_through_the_api_appends_nothing() {
     }
 }
 
-/// A Claude Code session stopped right after a tool ran ends on a result the
-/// transcript cannot show complete, so it is held back unless the import is
-/// told the file is finished. The resident API never is; the daily ingest
-/// always passes `--finished-after`. The held-back projection is a prefix of
-/// the finished one: the finished import appends the tail, every node of the
-/// held-back import is among its nodes, and a repeat of either appends
-/// nothing.
+/// A Claude Code session stopped right after a tool ran: it ends on a result
+/// logged inside its last message, which the transcript cannot show complete.
+const STOPPED: &str = concat!(
+    r#"{"type":"user","sessionId":"stopped","uuid":"u","parentUuid":null,"message":{"role":"user","content":"look"}}"#,
+    "\n",
+    r#"{"type":"assistant","sessionId":"stopped","uuid":"c","parentUuid":"u","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a"}}]}}"#,
+    "\n",
+    r#"{"type":"user","sessionId":"stopped","uuid":"r","parentUuid":"c","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents of a"}]}}"#,
+    "\n",
+);
+
+/// The held-back tail is held back unless the import is told the file is
+/// finished. The resident API never is; the daily ingest always passes
+/// `--finished-after`. Each import's own output, in a pile of its own: the
+/// held-back projection is a prefix of the finished one, and a repeat of
+/// either appends nothing. In one pile, the finished import after the
+/// held-back one appends only what the tail adds.
 #[test]
 fn a_held_back_tail_is_a_prefix_of_the_finished_projection() {
-    const STOPPED: &str = concat!(
-        r#"{"type":"user","sessionId":"stopped","uuid":"u","parentUuid":null,"message":{"role":"user","content":"look"}}"#,
-        "\n",
-        r#"{"type":"assistant","sessionId":"stopped","uuid":"c","parentUuid":"u","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a"}}]}}"#,
-        "\n",
-        r#"{"type":"user","sessionId":"stopped","uuid":"r","parentUuid":"c","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents of a"}]}}"#,
-        "\n",
+    let held_back = Fixture::new();
+    let import_held = || {
+        held_back
+            .archive()
+            .import(
+                ImportSource::ClaudeCode,
+                "stopped.jsonl",
+                Bytes::from(STOPPED),
+                &BTreeMap::new(),
+            )
+            .unwrap()
+    };
+    import_held();
+    let held = blocks(&held_back);
+    let length = fs::metadata(&held_back.pile).unwrap().len();
+    import_held();
+    assert_eq!(
+        fs::metadata(&held_back.pile).unwrap().len(),
+        length,
+        "a repeat of the held-back import appended bytes"
     );
-    let fixture = Fixture::new();
-    let path = fixture.directory.path().join("stopped.jsonl");
+
+    let finished = Fixture::new();
+    let path = finished.directory.path().join("stopped.jsonl");
     fs::write(&path, STOPPED).unwrap();
-    fixture
-        .archive()
-        .import(
-            ImportSource::ClaudeCode,
-            "stopped.jsonl",
-            Bytes::from(STOPPED),
-            &BTreeMap::new(),
-        )
-        .unwrap();
-    let held = blocks(&fixture);
-    let length = fs::metadata(&fixture.pile).unwrap().len();
-    let finished = fixture.cli(&[
-        "import",
-        path.to_str().unwrap(),
-        "--source",
-        "claude-code",
-        "--finished-after",
-        "0s",
-    ]);
-    assert!(
-        !text(&finished).contains(", 0 bytes appended"),
-        "{}",
-        text(&finished)
-    );
-    let flushed = blocks(&fixture);
+    let import_finished = |fixture: &Fixture| {
+        text(&fixture.cli(&[
+            "import",
+            path.to_str().unwrap(),
+            "--source",
+            "claude-code",
+            "--finished-after",
+            "0s",
+        ]))
+    };
+    import_finished(&finished);
+    let flushed = blocks(&finished);
     assert_eq!(held.len(), 2, "the result is held back");
-    assert_eq!(flushed.len(), 3, "the finished import appends it");
-    assert!(held.is_subset(&flushed));
-    let length_after = fs::metadata(&fixture.pile).unwrap().len();
-    assert!(length_after > length);
-    let again = fixture.cli(&[
+    assert_eq!(flushed.len(), 3, "the finished import emits it");
+    assert!(
+        held.is_subset(&flushed),
+        "the held-back nodes are the finished ones"
+    );
+    assert!(import_finished(&finished).contains(", 0 bytes appended"));
+
+    // In one pile: the finished import after the held-back one.
+    assert!(!import_finished(&held_back).contains(", 0 bytes appended"));
+    assert_eq!(blocks(&held_back), flushed);
+    assert!(import_finished(&held_back).contains(", 0 bytes appended"));
+}
+
+/// Every route also goes through the writer, which refuses a fragment whose
+/// identity does not name the nodes it holds.
+#[test]
+fn every_import_route_stages_through_the_writer() {
+    let fixture = Fixture::new();
+    let root = fixture.directory.path();
+    let (claude, chatgpt, takeout, rollout) = route_fixtures(root);
+    let project = claude.join("projects/p");
+    for (path, source, finished) in [
+        (project.clone(), "claude-code", false),
+        (
+            project.join("titled/subagents/agent-a1.jsonl"),
+            "claude-code",
+            false,
+        ),
+        (claude.join("history.jsonl"), "claude-code", false),
+        (project.join("stopped.jsonl"), "claude-code", true),
+        (chatgpt.clone(), "chatgpt", false),
+        (takeout.join("My Activity.html"), "gemini", false),
+        (rollout.clone(), "codex", true),
+    ] {
+        let mut args = vec!["import", path.to_str().unwrap(), "--source", source];
+        if finished {
+            args.extend(["--finished-after", "0s"]);
+        }
+        let out = text(&fixture.cli(&args));
+        assert!(
+            out.contains("Archive collection: "),
+            "{}: {out}",
+            path.display()
+        );
+    }
+}
+
+/// A long list of paths imports per path in one process: one open of the
+/// pile, one unit per path.
+#[test]
+fn paths_from_imports_every_listed_path_as_its_own_unit() {
+    let fixture = Fixture::new();
+    let mut list = String::new();
+    for name in ["alpha", "beta", "gamma"] {
+        let path = fixture.directory.path().join(format!("{name}.jsonl"));
+        fs::write(&path, CODE.replace("resident", name)).unwrap();
+        list.push_str(path.to_str().unwrap());
+        list.push('\n');
+    }
+    let list_path = fixture.directory.path().join("paths.txt");
+    fs::write(&list_path, list).unwrap();
+    let out = text(&fixture.cli(&[
         "import",
-        path.to_str().unwrap(),
+        "--paths-from",
+        list_path.to_str().unwrap(),
         "--source",
         "claude-code",
-        "--finished-after",
-        "0s",
-    ]);
-    assert!(
-        text(&again).contains(", 0 bytes appended"),
-        "{}",
-        text(&again)
+    ]));
+    assert_eq!(
+        out.matches("Archive collection: 1 piece(s)").count(),
+        3,
+        "{out}"
     );
 }
 
@@ -784,31 +851,27 @@ const CHATGPT_TITLED: &str = r#"[{"id":"titled-chatgpt","title":"A provider titl
   "assistant-node":{"id":"assistant-node","parent":"user-node","message":{"id":"message-assistant","author":{"role":"assistant"},"create_time":1772382842,"content":{"content_type":"multimodal_text","parts":["hi!",{"content_type":"image_asset_pointer","asset_pointer":"file-service://file-abc","size_bytes":4}]},"metadata":{"model_slug":"gpt-test","attachments":[{"id":"file-abc","name":"picture.png","mime_type":"image/png","size":4}]}}}
 }}]"#;
 
-/// The routes `project_bytes` does not take: whole directories, subagent
-/// transcripts with their `meta.json`, `history.jsonl`, the finished route
-/// the daily ingest uses, sidecar and attachment files beside an export, and
-/// attachment maps. Every fixture that can carry a title carries one.
-#[test]
-fn every_import_route_writes_only_content_derived_attributes() {
-    let root = tempfile::tempdir().unwrap();
-    let finished = Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
-    let collect = |route: &str, run: &mut dyn FnMut(&mut TribleSet)| {
-        let mut facts = TribleSet::new();
-        run(&mut facts);
-        assert_content_derived(route, &facts);
-    };
-
-    // Claude Code: a project directory with a titled session and a subagent
-    // with its spawn metadata, and the prompt log beside the projects.
-    let claude = root.path().join("claude");
+/// The files every route reads, under `root`: a Claude Code project with a
+/// titled session, a subagent with its spawn metadata and a session ending
+/// on a held-back tail, the prompt log beside the projects, a titled
+/// ChatGPT export with its sidecar file, a Gemini activity page with its
+/// asset, and a Codex rollout.
+fn route_fixtures(
+    root: &std::path::Path,
+) -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let claude = root.join("claude");
     let project = claude.join("projects/p");
     let subagents = project.join("titled/subagents");
     fs::create_dir_all(&subagents).unwrap();
-    let session = project.join("titled.jsonl");
-    fs::write(&session, CODE_TITLED).unwrap();
-    let agent = subagents.join("agent-a1.jsonl");
+    fs::write(project.join("titled.jsonl"), CODE_TITLED).unwrap();
+    fs::write(project.join("stopped.jsonl"), STOPPED).unwrap();
     fs::write(
-        &agent,
+        subagents.join("agent-a1.jsonl"),
         concat!(
             r#"{"type":"user","sessionId":"titled","agentId":"a1","isSidechain":true,"uuid":"q","message":{"role":"user","content":"audit this"}}"#,
             "\n",
@@ -822,35 +885,91 @@ fn every_import_route_writes_only_content_derived_attributes() {
         r#"{"description":"Audit the code","agentType":"general-purpose"}"#,
     )
     .unwrap();
-    let history = claude.join("history.jsonl");
     fs::write(
-        &history,
+        claude.join("history.jsonl"),
         r#"{"display":"a prompt only the log keeps","timestamp":1772382841000,"sessionId":"gone"}"#
             .to_owned()
             + "\n",
     )
     .unwrap();
+    let chatgpt = root.join("chatgpt");
+    fs::create_dir_all(&chatgpt).unwrap();
+    fs::write(chatgpt.join("conversations.json"), CHATGPT_TITLED).unwrap();
+    fs::write(chatgpt.join("file-abc-picture.png"), [1, 2, 3, 4]).unwrap();
+    let takeout = root.join("gemini");
+    fs::create_dir_all(&takeout).unwrap();
+    fs::write(takeout.join("My Activity.html"), gemini_with_asset()).unwrap();
+    fs::write(takeout.join("answer.png"), b"png bytes").unwrap();
+    let rollout = root.join("rollout.jsonl");
+    fs::write(&rollout, CODEX).unwrap();
+    (claude, chatgpt, takeout, rollout)
+}
+
+fn gemini_with_asset() -> String {
+    gemini(
+        "Prompted&nbsp;hello<br>18 Sept 2025, 12:02:52 CET<br><p>world</p><img src=\"answer.png\">",
+    )
+}
+
+/// The routes `project_bytes` does not take: whole directories, subagent
+/// transcripts with their `meta.json`, `history.jsonl`, the finished route
+/// the daily ingest uses (over a session whose held-back tail it flushes),
+/// sidecar and attachment files beside an export, and attachment maps. Every
+/// fixture that can carry a title carries one. The guard is attribute-level:
+/// a path or title written into an allowed attribute's value would pass it.
+#[test]
+fn every_import_route_writes_only_content_derived_attributes() {
+    let root = tempfile::tempdir().unwrap();
+    let finished = Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3600));
+    let collect = |route: &str, run: &mut dyn FnMut(&mut TribleSet)| {
+        let mut facts = TribleSet::new();
+        run(&mut facts);
+        assert_content_derived(route, &facts);
+        facts
+    };
+    let (claude, chatgpt, takeout, rollout) = route_fixtures(root.path());
+    let project = claude.join("projects/p");
+    let session = project.join("titled.jsonl");
+    let stopped = project.join("stopped.jsonl");
+    let agent = project.join("titled/subagents/agent-a1.jsonl");
+    let history = claude.join("history.jsonl");
+    let mut flushed = TribleSet::new();
+    let mut held = TribleSet::new();
     for (route, path, finished_before) in [
         ("claude-code directory", &project, None),
         ("claude-code finished file", &session, finished),
+        ("claude-code held-back file", &stopped, None),
+        ("claude-code finished held-back file", &stopped, finished),
         ("claude-code subagent", &agent, None),
         ("claude-code history", &history, None),
     ] {
-        collect(route, &mut |facts| {
+        let facts = collect(route, &mut |facts| {
             faculties::archive_claude_code::project_path_finished(path, finished_before, |p| {
                 *facts += p.fragment.facts().clone();
                 Ok(())
             })
             .unwrap();
         });
+        if path == &stopped {
+            if finished_before.is_some() {
+                flushed = facts;
+            } else {
+                held = facts;
+            }
+        }
     }
+    let node_count = |facts: &TribleSet| {
+        find!(
+            block: Id,
+            pattern!(facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+        )
+        .count()
+    };
+    assert_eq!(node_count(&held), 2, "the tail is held back");
+    assert_eq!(node_count(&flushed), 3, "the finished route flushes it");
 
     // ChatGPT: a titled export with its sidecar file, as a directory and as
     // resident bytes with an attachment map.
-    let chatgpt = root.path().join("chatgpt");
-    fs::create_dir_all(&chatgpt).unwrap();
-    fs::write(chatgpt.join("conversations.json"), CHATGPT_TITLED).unwrap();
-    fs::write(chatgpt.join("file-abc-picture.png"), [1, 2, 3, 4]).unwrap();
     collect("chatgpt directory with sidecar", &mut |facts| {
         faculties::archive_chatgpt::project_path(&chatgpt, |p| {
             *facts += p.fragment.facts().clone();
@@ -877,14 +996,8 @@ fn every_import_route_writes_only_content_derived_attributes() {
 
     // Gemini: an activity page with its asset beside it, and as resident
     // bytes with an attachment map.
-    let takeout = root.path().join("gemini");
-    fs::create_dir_all(&takeout).unwrap();
-    let html = gemini(
-        "Prompted&nbsp;hello<br>18 Sept 2025, 12:02:52 CET<br><p>world</p><img src=\"answer.png\">",
-    );
+    let html = gemini_with_asset();
     let activity = takeout.join("My Activity.html");
-    fs::write(&activity, &html).unwrap();
-    fs::write(takeout.join("answer.png"), b"png bytes").unwrap();
     collect("gemini file with asset", &mut |facts| {
         faculties::archive_gemini::project_path(&activity, |p| {
             *facts += p.fragment.facts().clone();
@@ -907,8 +1020,6 @@ fn every_import_route_writes_only_content_derived_attributes() {
     });
 
     // Codex on the finished route.
-    let rollout = root.path().join("rollout.jsonl");
-    fs::write(&rollout, CODEX).unwrap();
     collect("codex finished file", &mut |facts| {
         faculties::archive_codex::project_path_finished(&rollout, finished, |p| {
             *facts += p.fragment.facts().clone();

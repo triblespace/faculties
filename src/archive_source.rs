@@ -598,7 +598,7 @@ pub fn content_key(projected: &[ProjectedSource]) -> ContentKey {
     let mut facts = TribleSet::new();
     let mut nodes = Vec::new();
     for fragment in projected {
-        nodes.extend(fragment.identity.nodes.iter().copied());
+        nodes.extend(fragment.identity.nodes().iter().copied());
         facts += fragment.fragment.facts().clone();
     }
     let digest: triblespace::core::blob::Blob<
@@ -615,9 +615,10 @@ pub fn content_key(projected: &[ProjectedSource]) -> ContentKey {
 /// first node follows the last nodes of the records before it. A tool
 /// result's node names the node of the call it answers through
 /// `responds_to`. Records are emitted in topological order, ties broken by
-/// the id of each record's first node, so the order is a function of the
-/// nodes: independent of source iteration order and of provider keys or raw
-/// bytes. Every emitted fragment is
+/// their content key ([`ContentKey`]); records that emit the same facts are
+/// emitted once. The order is therefore a function of the content alone:
+/// independent of source iteration order, of record positions, and of
+/// provider keys or raw bytes. Every emitted fragment is
 /// one whole node (the node and its fact) with its
 /// [`blockdag::block_source_projection`] receipt, annotated with the claims of
 /// its record; provider keys thread the graph while projecting and are never
@@ -666,15 +667,19 @@ where
     // emitted next, so wherever several records are ready (Gemini cards, the
     // roots and branches of a conversation tree) the order, and with it every
     // piece the import writer cuts, is a function of the content alone, never
-    // of provider ids, raw bytes or source order. Only records that emit the
-    // same facts can tie, and their order changes nothing. A contentless
-    // record emits nothing and releases its children at once.
+    // of provider ids, raw bytes or source order. Records that emit the same
+    // facts share their key: they are the same nodes, so they are emitted
+    // once and release their children together, and no record position
+    // decides anything. A record whose facts were already emitted emits
+    // nothing again. A contentless record emits nothing and releases its
+    // children at once.
     let mut frontiers = vec![BTreeSet::<Id>::new(); records.len()];
     let mut call_nodes = HashMap::<View<str>, Id>::new();
     let mut followed = BTreeSet::<Id>::new();
     let mut receipts = Vec::<(Id, Id)>::new();
     let mut staged: HashMap<usize, Vec<ProjectedSource>> = HashMap::new();
-    let mut ready = BTreeSet::<(ContentKey, usize)>::new();
+    let mut ready = BTreeMap::<ContentKey, Vec<usize>>::new();
+    let mut emitted_keys = BTreeSet::<ContentKey>::new();
     let mut releasable: Vec<usize> = indegree
         .iter()
         .enumerate()
@@ -765,20 +770,33 @@ where
                 frontier = BTreeSet::from([node_id]);
             }
             frontiers[index] = frontier;
-            ready.insert((content_key(&projected), index));
+            ready
+                .entry(content_key(&projected))
+                .or_default()
+                .push(index);
             staged.insert(index, projected);
         }
-        let Some((_, index)) = ready.pop_first() else {
+        let Some((key, indices)) = ready.pop_first() else {
             break;
         };
-        for projected in staged.remove(&index).unwrap_or_default() {
-            emit(projected)?;
+        let fragments = indices
+            .iter()
+            .filter_map(|index| staged.remove(index))
+            .next()
+            .unwrap_or_default();
+        if emitted_keys.insert(key) {
+            for projected in fragments {
+                emit(projected)?;
+            }
         }
-        emitted += 1;
-        for &child in &children[index] {
-            indegree[child] -= 1;
-            if indegree[child] == 0 {
-                releasable.push(child);
+        for index in indices {
+            staged.remove(&index);
+            emitted += 1;
+            for &child in &children[index] {
+                indegree[child] -= 1;
+                if indegree[child] == 0 {
+                    releasable.push(child);
+                }
             }
         }
     }
@@ -803,7 +821,7 @@ where
                     ..ProjectionAnnotations::default()
                 },
             )?,
-            identity: blockdag::Identity::default(),
+            identity: blockdag::Identity::none(),
             record: None,
         })?;
     }

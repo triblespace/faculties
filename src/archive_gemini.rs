@@ -1404,4 +1404,59 @@ mod tests {
         assert!(forward.len() >= 4, "{}", forward.len());
         assert_eq!(forward, backward);
     }
+
+    /// Two cards with the same prompt in the same second project the same
+    /// prompt node with the same receipt: their records emit the same facts.
+    /// They are emitted once and release both answers together, so the page
+    /// order of the two cards changes no COMMIT.
+    #[test]
+    fn same_second_same_prompt_cards_publish_the_same_commits_in_either_order() {
+        use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+        let first =
+            card("Prompted&nbsp;same question<br>18 Sept 2025, 12:01:52 CET<br><p>one answer</p>");
+        let second = card(
+            "Prompted&nbsp;same question<br>18 Sept 2025, 12:01:52 CET<br><p>another answer</p>",
+        );
+        let directory = TempDir::new().unwrap();
+        let commits = |name: &str, html: String| -> BTreeSet<[u8; 32]> {
+            let pile = directory.path().join(format!("{name}.pile"));
+            let key = directory.path().join(format!("{name}.key"));
+            fs::File::create(&pile).unwrap();
+            crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let mut writer =
+                crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            writer.set_piece_bits(1);
+            project_bytes(
+                "My Activity.html",
+                Bytes::from_source(html.into_bytes()),
+                &std::collections::BTreeMap::new(),
+                |projected| writer.stage(projected.fragment, projected.identity),
+            )
+            .unwrap();
+            writer.close(Ok(())).unwrap();
+            let mut store = crate::storage::open_pile_strict(&pile).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let out = crate::storage::discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .map(|commit| {
+                    let _: TribleSet =
+                        triblespace::core::repo::BlobStoreGet::get::<TribleSet, SimpleArchive>(
+                            &snapshot,
+                            triblespace::prelude::inlineencodings::Handle::from_hash(commit.data()),
+                        )
+                        .unwrap();
+                    commit.data().raw
+                })
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            out
+        };
+        let forward = commits("forward", format!("{PREFIX}{first}{second}{SUFFIX}"));
+        let backward = commits("backward", format!("{PREFIX}{second}{first}{SUFFIX}"));
+        assert!(forward.len() >= 3, "{}", forward.len());
+        assert_eq!(forward, backward);
+    }
 }

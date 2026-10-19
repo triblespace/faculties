@@ -1483,7 +1483,7 @@ where
         emit(ProjectedFile {
             source_path: source_path.to_path_buf(),
             fragment,
-            identity: blockdag::Identity::default(),
+            identity: blockdag::Identity::none(),
             stats: ProjectionStats::default(),
         })?;
         summary.fragments_emitted += 1;

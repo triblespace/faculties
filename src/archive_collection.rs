@@ -275,9 +275,38 @@ where
     /// leaves' session id and a subagent's spawn metadata) ride in the unit's
     /// last piece. Nothing is compared with what the Archive holds, or with
     /// what this writer staged before: the union absorbs every repetition.
+    ///
+    /// A wrong identity is refused, never published: a fragment holding a
+    /// node (an entity tagged as a node, or with a `previous` or `holds`
+    /// fact) that `identity` does not name, and an identity naming facts the
+    /// fragment does not hold, are errors.
     pub fn stage(&mut self, fragment: Fragment, identity: blockdag::Identity) -> Result<()> {
-        let (_, mut facts, _, blobs) = fragment.into_parts();
-        facts += identity.facts.clone();
+        let (_, facts, _, blobs) = fragment.into_parts();
+        let missing = identity.facts().difference(&facts);
+        if !missing.is_empty() {
+            bail!(
+                "an Archive identity names {} fact(s) its fragment does not hold",
+                missing.len()
+            );
+        }
+        let named: BTreeSet<Id> = identity.nodes().iter().copied().collect();
+        let held = find!(
+            node: Id,
+            pattern!(&facts, [{ ?node @ metadata::tag: &schema::block::KIND }])
+        )
+        .chain(find!(
+            node: Id,
+            pattern!(&facts, [{ ?node @ schema::block::previous: _?previous }])
+        ))
+        .chain(find!(
+            node: Id,
+            pattern!(&facts, [{ ?node @ schema::block::holds: _?fact }])
+        ));
+        for node in held {
+            if !named.contains(&node) {
+                bail!("an Archive fragment holds node {node:X} its identity does not name");
+            }
+        }
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
@@ -287,16 +316,22 @@ where
         // whose text varies with the build) are not appended.
         stage_embedded_blobs(&mut self.pile, named_blobs(&facts, blobs))?;
 
-        self.occurrence += facts.difference(&identity.facts);
-        self.core += identity.facts;
-        if identity
-            .nodes
+        self.occurrence += facts.difference(identity.facts());
+        let ends = identity
+            .nodes()
             .iter()
-            .any(|node| ends_piece(*node, self.piece_bits))
-        {
+            .any(|node| ends_piece(*node, self.piece_bits));
+        self.core += identity.into_facts();
+        if ends {
             self.publish_piece()?;
         }
         Ok(())
+    }
+
+    /// Stage a fragment that holds no node, only annotations (or facts no
+    /// node holds). A fragment holding a node is refused.
+    pub fn stage_annotations(&mut self, fragment: Fragment) -> Result<()> {
+        self.stage(fragment, blockdag::Identity::none())
     }
 
     /// Cut pieces at `bits` trailing zero bits instead of [`PIECE_BITS`].
@@ -1192,7 +1227,7 @@ mod tests {
         fn from(fragment: Fragment) -> Self {
             Self {
                 fragment,
-                identity: blockdag::Identity::default(),
+                identity: blockdag::Identity::none(),
             }
         }
     }
@@ -3293,9 +3328,9 @@ mod tests {
         let receipt =
             crate::blockdag::block_source_projection(schema::source_projection::SOURCE_CODEX, node)
                 .unwrap();
-        assert_eq!(identity.nodes.len(), 1);
-        let annotations = receipt.facts().difference(&identity.facts);
-        let identity = identity.facts;
+        assert_eq!(identity.nodes().len(), 1);
+        let annotations = receipt.facts().difference(identity.facts());
+        let identity = identity.into_facts();
         let media: Vec<Id> = find!(
             media: Id,
             pattern!(&identity, [{ _?fact @ schema::content_fact::media_type: ?media }])
@@ -3359,9 +3394,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(identity.nodes, vec![node_id]);
-        let annotations = receipt.facts().difference(&identity.facts);
-        let identity = identity.facts;
+        assert_eq!(identity.nodes(), &[node_id]);
+        let annotations = receipt.facts().difference(identity.facts());
+        let identity = identity.into_facts();
         assert!(exists!(pattern!(&identity, [{ node_id @
             schema::block::previous: &parent,
             metadata::tag: &schema::block::KIND,
