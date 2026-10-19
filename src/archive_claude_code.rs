@@ -189,6 +189,8 @@ impl ProjectionStats {
 pub struct ProjectedFile {
     pub source_path: PathBuf,
     pub fragment: Fragment,
+    /// The part of `fragment` that is node identity; the rest annotates.
+    pub identity: blockdag::Identity,
     pub stats: ProjectionStats,
 }
 
@@ -1450,10 +1452,11 @@ where
         })?;
         summary.stats.absorb(row_stats);
         let mut stats = Some(row_stats);
-        for fragment in fragments {
+        for (fragment, identity) in fragments {
             emit(ProjectedFile {
                 source_path: source_path.to_path_buf(),
                 fragment,
+                identity,
                 stats: stats.take().unwrap_or_default(),
             })?;
             summary.fragments_emitted += 1;
@@ -1480,6 +1483,7 @@ where
         emit(ProjectedFile {
             source_path: source_path.to_path_buf(),
             fragment,
+            identity: blockdag::Identity::default(),
             stats: ProjectionStats::default(),
         })?;
         summary.fragments_emitted += 1;
@@ -1580,7 +1584,7 @@ where
                 prompt.text,
             )?;
             stats.content_parts += 1;
-            let block = blockdag::block(None, prompt.timestamp, fact)?;
+            let (block, identity) = blockdag::block_parts(None, prompt.timestamp, fact)?;
             let receipt = blockdag::block_source_projection(
                 schema::source_projection::SOURCE_CLAUDE_CODE,
                 block,
@@ -1603,6 +1607,7 @@ where
             emit(ProjectedFile {
                 source_path: path.to_path_buf(),
                 fragment: receipt,
+                identity,
                 stats: ProjectionStats::default(),
             })?;
             summary.fragments_emitted += 1;
@@ -1916,7 +1921,7 @@ fn project_record(
     plan: &SourcePlan,
     receipts: &mut BTreeMap<Id, Id>,
     stats: &mut ProjectionStats,
-) -> Result<Vec<Fragment>> {
+) -> Result<Vec<(Fragment, blockdag::Identity)>> {
     // A further version of its uuid is planned under its own key.
     let Some(key) = version.cloned().or_else(|| record.source_key()) else {
         if matches!(
@@ -1973,7 +1978,8 @@ fn project_record(
     let mut previous = plan.firsts[&class].clone();
     let mut fragments = Vec::with_capacity(draft.parts.len());
     for (position, part) in draft.parts.into_iter().enumerate() {
-        let mut node = blockdag::block(previous.iter().copied(), timestamp, part.fact)?;
+        let (mut node, identity) =
+            blockdag::block_parts(previous.iter().copied(), timestamp, part.fact)?;
         let node_id = chain[position];
         if node.root() != Some(node_id) {
             bail!(
@@ -1992,7 +1998,7 @@ fn project_record(
             entry.insert(receipt.root().expect("canonical receipt is rooted"));
             stats.source_projections += 1;
         }
-        fragments.push(receipt);
+        fragments.push((receipt, identity));
         stats.content_parts += 1;
         previous = BTreeSet::from([node_id]);
     }
@@ -3188,7 +3194,10 @@ mod tests {
         for path in &paths {
             let mut writer =
                 crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-            project_path(path, |projected| writer.stage_fragment(projected.fragment)).unwrap();
+            project_path(path, |projected| {
+                writer.stage(projected.fragment, projected.identity)
+            })
+            .unwrap();
             published.push(writer.commit_unit().unwrap());
             writer.close(Ok(())).unwrap();
         }

@@ -92,39 +92,48 @@ where
     };
     let sidecars = ExportFiles::index(export_root)?;
 
+    // Every conversation of the export, from every shard, is emitted in the
+    // order of its content, not of the shard it sits in: a later export that
+    // moves a conversation to another shard cuts the same pieces.
     let mut summary = ProjectionSummary::default();
+    let mut conversations = Vec::new();
     for source_path in conversation_files {
-        let file_summary = project_file(&source_path, &sidecars, &mut emit)
+        let mapped = archive_source::map_immutable_file(&source_path)?;
+        let file_summary = project_content(&source_path, mapped, &sidecars, &mut conversations)
             .with_context(|| format!("project ChatGPT export {}", source_path.display()))?;
         summary.absorb(file_summary);
     }
+    emit_in_content_order(conversations, &mut emit)?;
     Ok(summary)
 }
 
-fn project_file<F>(
-    source_path: &Path,
-    sidecars: &ExportFiles,
+/// Emit projected conversations in the order of their [`ContentKey`]s.
+///
+/// [`ContentKey`]: archive_source::ContentKey
+fn emit_in_content_order<F>(
+    mut conversations: Vec<(archive_source::ContentKey, Vec<ProjectedSource>)>,
     emit: &mut F,
-) -> Result<ProjectionSummary>
+) -> Result<()>
 where
     F: FnMut(ProjectedSource) -> Result<()>,
 {
-    project_content(
-        source_path,
-        archive_source::map_immutable_file(source_path)?,
-        sidecars,
-        emit,
-    )
+    conversations.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (_, fragments) in conversations {
+        for fragment in fragments {
+            emit(fragment)?;
+        }
+    }
+    Ok(())
 }
-fn project_content<F>(
+
+/// Project one shard's conversations into `projected`, each with its
+/// content key; the caller orders and emits them.
+fn project_content(
     source_path: &Path,
     mapped: Bytes,
     sidecars: &ExportFiles,
-    emit: &mut F,
-) -> Result<ProjectionSummary>
-where
-    F: FnMut(ProjectedSource) -> Result<()>,
-{
+    projected: &mut Vec<(archive_source::ContentKey, Vec<ProjectedSource>)>,
+) -> Result<ProjectionSummary> {
     let conversations = scan_export(mapped)
         .map_err(|error| anyhow!(error))
         .with_context(|| format!("scan {}", source_path.display()))?;
@@ -134,10 +143,6 @@ where
         conversations_seen: conversations.len(),
         ..ProjectionSummary::default()
     };
-    // Conversations are emitted in the order of their first node's receipt,
-    // not in export order, which a later export may change: the pieces an
-    // import writer cuts are then a function of the content.
-    let mut projected = Vec::with_capacity(conversations.len());
     for conversation in conversations {
         let unit = archive_source::UnitAnnotations {
             source_locator: Some(format!("conversation/{}", conversation.id.as_ref())),
@@ -162,14 +167,8 @@ where
             },
         )?;
         summary.stats.absorb(stats);
-        if let Some(key) = fragments.first().and_then(|first| first.fragment.root()) {
-            projected.push((key, fragments));
-        }
-    }
-    projected.sort_by_key(|(key, _)| *key);
-    for (_, fragments) in projected {
-        for fragment in fragments {
-            emit(fragment)?;
+        if !fragments.is_empty() {
+            projected.push((archive_source::content_key(&fragments), fragments));
         }
     }
     Ok(summary)
@@ -194,7 +193,10 @@ where
             .map(|(name, bytes)| (PathBuf::from(name), bytes.clone()))
             .collect(),
     );
-    project_content(Path::new(source_name), bytes, &sidecars, &mut emit)
+    let mut conversations = Vec::new();
+    let summary = project_content(Path::new(source_name), bytes, &sidecars, &mut conversations)?;
+    emit_in_content_order(conversations, &mut emit)?;
+    Ok(summary)
 }
 
 #[derive(Debug)]
@@ -1676,7 +1678,10 @@ mod tests {
                 facts += projection.fragment.facts().clone();
                 Ok(())
             };
-            let summary = project_file(export, sidecars, &mut emit).unwrap();
+            let mut conversations = Vec::new();
+            let mapped = archive_source::map_immutable_file(export).unwrap();
+            let summary = project_content(export, mapped, sidecars, &mut conversations).unwrap();
+            emit_in_content_order(conversations, &mut emit).unwrap();
             let pointers = find!(
                 pointer: Inline<Handle<UTF8String>>,
                 pattern!(&facts, [{ _?fact @ schema::content_fact::asset_pointer: ?pointer }])
@@ -2063,63 +2068,60 @@ mod tests {
         fs::write(with.path().join("conversations.json"), TINY_EXPORT).unwrap();
         fs::write(without.path().join("conversations.json"), TINY_EXPORT).unwrap();
         fs::write(with.path().join("file-abc-picture.png"), [1, 2, 3, 4]).unwrap();
+        // Each variant into a pile of its own, so the COMMIT sets compare
+        // whole, not one as a subset of the other's union.
         let directory = TempDir::new().unwrap();
-        let pile = directory.path().join("archive.pile");
-        let key = directory.path().join("archive.key");
-        fs::File::create(&pile).unwrap();
-        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
-        let node_commits = |pile: &Path| -> BTreeSet<[u8; 32]> {
+        let commits = |pile: &Path| -> (BTreeSet<[u8; 32]>, BTreeSet<[u8; 32]>) {
             let mut store = crate::storage::open_pile_strict(pile).unwrap();
             let snapshot = store.snapshot().unwrap();
-            let out = crate::storage::discovered_records(&snapshot)
+            let mut identity = BTreeSet::new();
+            let mut annotations = BTreeSet::new();
+            for commit in crate::storage::discovered_records(&snapshot)
                 .unwrap()
                 .commits()
-                .iter()
-                .map(|commit| commit.data())
-                .filter(|data| {
-                    let facts: TribleSet = snapshot
-                        .get::<TribleSet, SimpleArchive>(Handle::from_hash(*data))
-                        .unwrap();
-                    exists!(pattern!(&facts, [{ _?block @ metadata::tag: &schema::block::KIND }]))
-                })
-                .map(|data| data.raw)
-                .collect();
+            {
+                let facts: TribleSet = snapshot
+                    .get::<TribleSet, SimpleArchive>(Handle::from_hash(commit.data()))
+                    .unwrap();
+                if exists!(pattern!(&facts, [{ _?block @ metadata::tag: &schema::block::KIND }])) {
+                    identity.insert(commit.data().raw);
+                } else {
+                    annotations.insert(commit.data().raw);
+                }
+            }
             drop(snapshot);
             store.close().unwrap();
-            out
+            (identity, annotations)
         };
-        let all_commits = |pile: &Path| -> BTreeSet<([u8; 32], [u8; 32])> {
-            let mut store = crate::storage::open_pile_strict(pile).unwrap();
-            let snapshot = store.snapshot().unwrap();
-            let out = crate::storage::discovered_records(&snapshot)
-                .unwrap()
-                .commits()
-                .iter()
-                .map(|commit| (commit.data().raw, commit.metadata().raw))
-                .collect();
-            drop(snapshot);
-            store.close().unwrap();
-            out
-        };
-        let mut all = Vec::new();
         let mut seen = Vec::new();
-        for root in [with.path(), without.path()] {
+        for (name, root) in [("with", with.path()), ("without", without.path())] {
+            let pile = directory.path().join(format!("{name}.pile"));
+            let key = directory.path().join(format!("{name}.key"));
+            fs::File::create(&pile).unwrap();
+            crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
             let mut writer =
                 crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
             writer.set_piece_bits(0);
-            project_path(root, |projected| writer.stage_fragment(projected.fragment)).unwrap();
+            project_path(root, |projected| {
+                writer.stage(projected.fragment, projected.identity)
+            })
+            .unwrap();
             writer.commit_unit().unwrap();
             writer.close(Ok(())).unwrap();
-            seen.push(node_commits(&pile));
-            all.push(all_commits(&pile));
+            seen.push(commits(&pile));
         }
-        let added = seen[1].difference(&seen[0]).count();
-        assert_eq!(added, 0, "the same nodes cut into a new intrinsic piece");
+        let (with_identity, with_annotations) = &seen[0];
+        let (without_identity, without_annotations) = &seen[1];
+        assert!(with_identity.len() >= 3, "one identity COMMIT per node");
+        assert_eq!(
+            with_identity, without_identity,
+            "the same nodes have the same identity COMMITs"
+        );
         // The sidecar's bytes are an annotation: without them the annotation
         // COMMITs differ while every identity COMMIT is the same. This is a
         // case the two-COMMIT split exists for.
-        assert!(
-            all[1].difference(&all[0]).count() > 0,
+        assert_ne!(
+            with_annotations, without_annotations,
             "the sidecar left the annotations unchanged"
         );
     }
@@ -2162,5 +2164,64 @@ mod tests {
         let forward = order(serde_json::json!([alpha.clone(), beta.clone()]));
         assert_eq!(forward.len(), 2);
         assert_eq!(forward, order(serde_json::json!([beta, alpha])));
+    }
+
+    /// A later export may move conversations between its shard files. The
+    /// export's conversations, from every shard, come out in the order of
+    /// their content, so the same conversations in other shards emit the
+    /// same nodes in the same order.
+    #[test]
+    fn conversations_emit_in_content_order_across_shards() {
+        let conversation = |id: &str, user: &str, text: &str| {
+            serde_json::json!({
+                "id": id,
+                "mapping": {
+                    "root": {"parent": null, "message": null},
+                    user: {"parent": "root", "message": {"id": user,
+                        "author": {"role": "user"}, "create_time": 1772382841.5,
+                        "content": {"content_type": "text", "parts": [text]}}},
+                },
+            })
+        };
+        let a = conversation("c-a", "u-a", "alpha");
+        let b = conversation("c-b", "u-b", "beta");
+        let c = conversation("c-c", "u-c", "gamma");
+        let order = |shards: Vec<serde_json::Value>| -> Vec<Id> {
+            let directory = TempDir::new().unwrap();
+            for (index, shard) in shards.into_iter().enumerate() {
+                fs::write(
+                    directory
+                        .path()
+                        .join(format!("conversations-{index:03}.json")),
+                    shard.to_string(),
+                )
+                .unwrap();
+            }
+            let mut roots = Vec::new();
+            project_path(directory.path(), |projected| {
+                if projected.record.is_some() {
+                    roots.push(projected.fragment.root().unwrap());
+                }
+                Ok(())
+            })
+            .unwrap();
+            roots
+        };
+        let x = order(vec![
+            serde_json::json!([a.clone()]),
+            serde_json::json!([b.clone(), c.clone()]),
+        ]);
+        let y = order(vec![
+            serde_json::json!([a.clone(), b.clone()]),
+            serde_json::json!([c.clone()]),
+        ]);
+        let z = order(vec![
+            serde_json::json!([c]),
+            serde_json::json!([b]),
+            serde_json::json!([a]),
+        ]);
+        assert_eq!(x.len(), 3);
+        assert_eq!(x, y);
+        assert_eq!(x, z);
     }
 }

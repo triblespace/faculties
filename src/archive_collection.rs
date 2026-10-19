@@ -73,11 +73,13 @@ type RawHandle = Inline<Handle<RawBytes>>;
 /// one costs the pieces from the first changed one on.
 ///
 /// Every piece, the unit's last one included, is two COMMITs: the identity
-/// of its nodes ([`blockdag::split_identity`]) and everything that annotates
-/// them (timestamps, receipts, roles, paths, titles). The same nodes read from
-/// another path, another host, a fork's replay or a later version of the file
-/// have the same identity COMMIT; only the annotation COMMIT differs. A unit
-/// therefore costs at least two COMMITs.
+/// of its nodes, as the importers name it when they build them
+/// ([`blockdag::Identity`]), and everything that annotates them (timestamps,
+/// receipts with their times, roles, models, session ids, a subagent's spawn
+/// metadata, recovered attachment bytes). The same nodes read from a fork's
+/// replay, from an export with or without its sidecar files, or with or
+/// without a subagent's metadata have the same identity COMMIT; only the
+/// annotation COMMIT differs. A unit therefore costs at least two COMMITs.
 ///
 /// Piece COMMITs carry empty metadata. The Archive's attribute descriptions,
 /// without anything that varies with the build, are the metadata of the
@@ -261,17 +263,21 @@ where
         }
     }
 
-    /// Add one fragment to the piece being cut, and end the piece when a node
-    /// it holds says so.
+    /// Add one fragment to the piece being cut, with the part of it that is
+    /// node identity, and end the piece when one of those nodes says so.
     ///
     /// A fragment is the importers' unit: one whole node with its receipt,
-    /// or annotations of a receipt. Only a fragment holding a node ends a
-    /// piece, so a piece never splits a node, and the annotations an importer
-    /// emits after its nodes (the leaves' session, path and title) ride in the
-    /// unit's last piece. Nothing is compared with what the Archive holds:
-    /// the union absorbs every repetition.
-    pub fn stage_fragment(&mut self, fragment: Fragment) -> Result<()> {
-        let (_, facts, _, blobs) = fragment.into_parts();
+    /// or annotations of a receipt. `identity` is what the builder that made
+    /// the nodes named as their identity ([`blockdag::block_parts`]); every
+    /// other fact of the fragment annotates. The writer classifies nothing.
+    /// Only a fragment holding a node ends a piece, so a piece never splits a
+    /// node, and the annotations an importer emits after its nodes (the
+    /// leaves' session id and a subagent's spawn metadata) ride in the unit's
+    /// last piece. Nothing is compared with what the Archive holds, or with
+    /// what this writer staged before: the union absorbs every repetition.
+    pub fn stage(&mut self, fragment: Fragment, identity: blockdag::Identity) -> Result<()> {
+        let (_, mut facts, _, blobs) = fragment.into_parts();
+        facts += identity.facts.clone();
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
@@ -279,24 +285,15 @@ where
         // unreachable until a signed COMMIT names the facts which reference
         // them. Blobs only the dropped metafacts name (attribute descriptions,
         // whose text varies with the build) are not appended.
-        let named: std::collections::HashSet<[u8; 32]> = facts
-            .iter()
-            .map(|fact| {
-                let mut value = [0u8; 32];
-                value.copy_from_slice(&fact.data[32..]);
-                value
-            })
-            .collect();
-        let referenced = embedded_blobs(blobs)
-            .into_iter()
-            .filter(|blob| named.contains(&blob.get_handle().raw))
-            .collect();
-        stage_embedded_blobs(&mut self.pile, referenced)?;
+        stage_embedded_blobs(&mut self.pile, named_blobs(&facts, blobs))?;
 
-        let (identity, annotations, nodes) = blockdag::split_identity(&facts);
-        self.core += identity;
-        self.occurrence += annotations;
-        if nodes.iter().any(|node| ends_piece(*node, self.piece_bits)) {
+        self.occurrence += facts.difference(&identity.facts);
+        self.core += identity.facts;
+        if identity
+            .nodes
+            .iter()
+            .any(|node| ends_piece(*node, self.piece_bits))
+        {
             self.publish_piece()?;
         }
         Ok(())
@@ -354,7 +351,7 @@ where
         if self.vocabulary {
             self.vocabulary = false;
             let (_, facts, _, blobs) = blockdag::vocabulary_fragment().into_parts();
-            stage_embedded_blobs(&mut self.pile, embedded_blobs(blobs))?;
+            stage_embedded_blobs(&mut self.pile, named_blobs(&facts, blobs))?;
             let (descriptions, description_blobs) = blockdag::attribute_descriptions();
             stage_embedded_blobs(&mut self.pile, description_blobs)?;
             self.prepare_commit(facts, descriptions)?;
@@ -448,6 +445,27 @@ fn embedded_blobs(mut blobs: triblespace::core::blob::MemoryBlobStore) -> Vec<Bl
     embedded.sort_unstable_by_key(|(store_key, _)| store_key.raw);
 
     embedded.into_iter().map(|(_, blob)| blob).collect()
+}
+
+/// The embedded blobs some fact of `facts` names, in handle order. Blobs only
+/// metafacts name (attribute descriptions, whose text varies with the build)
+/// are left out.
+fn named_blobs(
+    facts: &TribleSet,
+    blobs: triblespace::core::blob::MemoryBlobStore,
+) -> Vec<Blob<UnknownBlob>> {
+    let named: std::collections::HashSet<[u8; 32]> = facts
+        .iter()
+        .map(|fact| {
+            let mut value = [0u8; 32];
+            value.copy_from_slice(&fact.data[32..]);
+            value
+        })
+        .collect();
+    embedded_blobs(blobs)
+        .into_iter()
+        .filter(|blob| named.contains(&blob.get_handle().raw))
+        .collect()
 }
 
 fn close_pile<T>(pile: impl StorageClose, result: Result<T>, failure_context: &str) -> Result<T> {
@@ -1094,7 +1112,7 @@ mod tests {
                 initialize_signer(&pile, Some(&key)).unwrap();
                 let mut archive = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
                 archive
-                    .stage_fragment(projection("async-worker", "body"))
+                    .stage_fixture(projection("async-worker", "body"))
                     .unwrap();
                 assert!(!archive.finish(Ok(())).unwrap().1.is_empty());
 
@@ -1137,7 +1155,7 @@ mod tests {
         .unwrap();
         assert!(!snapshot.contains_blob(handle).unwrap());
 
-        writer.stage_fragment(fragment).unwrap();
+        writer.stage_fixture(fragment).unwrap();
         // A later exact byte is available through the still-owned Leech even
         // though the reader's facts, residency and proof observation are old.
         let fetched: View<str> = BlobStoreGet::get(&reader, handle).unwrap();
@@ -1155,7 +1173,45 @@ mod tests {
         reopened.close().unwrap();
     }
 
-    fn projection(locator: &str, text: &str) -> Fragment {
+    /// A fixture fragment with the identity its builder named.
+    #[derive(Clone)]
+    struct Staged {
+        fragment: Fragment,
+        identity: blockdag::Identity,
+    }
+
+    impl std::ops::Deref for Staged {
+        type Target = Fragment;
+        fn deref(&self) -> &Fragment {
+            &self.fragment
+        }
+    }
+
+    impl From<Fragment> for Staged {
+        /// A fragment no builder named an identity for: it holds no node.
+        fn from(fragment: Fragment) -> Self {
+            Self {
+                fragment,
+                identity: blockdag::Identity::default(),
+            }
+        }
+    }
+
+    impl From<Staged> for Fragment {
+        fn from(staged: Staged) -> Self {
+            staged.fragment
+        }
+    }
+
+    impl ArchiveImportWriter {
+        /// Stage a fixture with the identity its builder named.
+        fn stage_fixture(&mut self, fixture: impl Into<Staged>) -> Result<()> {
+            let fixture = fixture.into();
+            self.stage(fixture.fragment, fixture.identity)
+        }
+    }
+
+    fn projection(locator: &str, text: &str) -> Staged {
         let fact = blockdag::text_fact(
             schema::content_fact::modality::TEXT,
             schema::content_fact::direction::IN,
@@ -1163,17 +1219,18 @@ mod tests {
         )
         .unwrap();
         let part = fact;
-        let block = blockdag::block([], None, part).unwrap();
-        blockdag::source_projection(
+        let (block, identity) = blockdag::block_parts([], None, part).unwrap();
+        let fragment = blockdag::source_projection(
             schema::source_projection::SOURCE_CLAUDE_CODE,
             locator,
             format!("{{\\\"text\\\":{text:?}}}").into_bytes(),
             block,
         )
-        .unwrap()
+        .unwrap();
+        Staged { fragment, identity }
     }
 
-    fn projection_at(locator: &str, text: &str, unix_seconds: f64) -> Fragment {
+    fn projection_at(locator: &str, text: &str, unix_seconds: f64) -> Staged {
         projection_at_modality(
             locator,
             schema::content_fact::modality::TEXT,
@@ -1187,21 +1244,22 @@ mod tests {
         modality: Id,
         text: &str,
         unix_seconds: f64,
-    ) -> Fragment {
+    ) -> Staged {
         let fact =
             blockdag::text_fact(modality, schema::content_fact::direction::IN, text).unwrap();
         let part = fact;
         let epoch = Epoch::from_unix_seconds(unix_seconds);
         let timestamp: Inline<NsTAIInterval> =
             (epoch, epoch).try_to_inline().expect("valid test interval");
-        let block = blockdag::block([], Some(timestamp), part).unwrap();
-        blockdag::source_projection(
+        let (block, identity) = blockdag::block_parts([], Some(timestamp), part).unwrap();
+        let fragment = blockdag::source_projection(
             schema::source_projection::SOURCE_CLAUDE_CODE,
             locator,
             format!("{{\"text\":{text:?}}}").into_bytes(),
             block,
         )
-        .unwrap()
+        .unwrap();
+        Staged { fragment, identity }
     }
 
     fn projection_after_at(
@@ -1209,7 +1267,7 @@ mod tests {
         text: &str,
         unix_seconds: Option<f64>,
         predecessors: &[Id],
-    ) -> (Fragment, Id) {
+    ) -> (Staged, Id) {
         let fact = blockdag::text_fact(
             schema::content_fact::modality::TEXT,
             schema::content_fact::direction::IN,
@@ -1221,16 +1279,17 @@ mod tests {
             let epoch = Epoch::from_unix_seconds(seconds);
             (epoch, epoch).try_to_inline().expect("valid test interval")
         });
-        let block = blockdag::block(predecessors.iter().copied(), timestamp, part).unwrap();
+        let (block, identity) =
+            blockdag::block_parts(predecessors.iter().copied(), timestamp, part).unwrap();
         let block_id = block.root().unwrap();
-        let projection = blockdag::source_projection(
+        let fragment = blockdag::source_projection(
             schema::source_projection::SOURCE_CLAUDE_CODE,
             locator,
             format!("{{\"text\":{text:?}}}").into_bytes(),
             block,
         )
         .unwrap();
-        (projection, block_id)
+        (Staged { fragment, identity }, block_id)
     }
 
     fn projection_split_across_source_elements(locator: &str, text: &str) -> (Fragment, Fragment) {
@@ -1271,8 +1330,9 @@ mod tests {
     fn commit_fragment(
         pile: &std::path::Path,
         key: &std::path::Path,
-        fragment: Fragment,
+        fragment: impl Into<Fragment>,
     ) -> CollectionCommit {
+        let fragment: Fragment = fragment.into();
         let signer = load_signer(pile, Some(key)).unwrap();
         let mut store = open_pile_strict_as(pile, signer.verifying_key()).unwrap();
         let source = test_source(&mut store, pile, key);
@@ -1336,7 +1396,7 @@ mod tests {
         let fragment = projection("session:staged", "resident only after commit");
         let embedded = first_embedded_handle(&fragment);
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        writer.stage_fragment(fragment).unwrap();
+        writer.stage_fixture(fragment).unwrap();
 
         assert!(writer.delta_len() > 0);
 
@@ -1375,7 +1435,7 @@ mod tests {
         let embedded = first_embedded_handle(&fragment);
 
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        writer.stage_fragment(fragment).unwrap();
+        writer.stage_fixture(fragment).unwrap();
         let error = writer
             .finish::<()>(Err(anyhow!("source projection failed")))
             .unwrap_err();
@@ -1418,7 +1478,7 @@ mod tests {
 
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         // The fixture holds no node: every fact annotates, and nothing cuts.
-        writer.stage_fragment(fragment.clone()).unwrap();
+        writer.stage_fixture(fragment.clone()).unwrap();
         let first = writer.commit_unit().unwrap();
         assert_eq!(first.pieces, 1);
         assert_eq!(first.commits.len(), 2, "the vocabulary and the annotations");
@@ -1451,10 +1511,10 @@ mod tests {
             ))));
         // The same unit again is the same COMMIT, and adds nothing.
         let length = std::fs::metadata(&pile).unwrap().len();
-        writer.stage_fragment(fragment.clone()).unwrap();
+        writer.stage_fixture(fragment.clone()).unwrap();
         assert_eq!(writer.commit_unit().unwrap().commits, first.commits[1..]);
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
-        writer.stage_fragment(annotation.clone()).unwrap();
+        writer.stage_fixture(annotation.clone()).unwrap();
         assert!(!writer.finish(Ok(())).unwrap().1.is_empty());
 
         let snapshot = pollster::block_on(ensure_local(&pile, Some(&key))).unwrap();
@@ -1505,9 +1565,9 @@ mod tests {
         // Replaying both units republishes the same COMMITs: no bytes.
         let length = std::fs::metadata(&pile).unwrap().len();
         let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        retry.stage_fragment(fragment).unwrap();
+        retry.stage_fixture(fragment).unwrap();
         assert_eq!(retry.commit_unit().unwrap(), first);
-        retry.stage_fragment(annotation).unwrap();
+        retry.stage_fixture(annotation).unwrap();
         assert!(!retry.finish(Ok(())).unwrap().1.is_empty());
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
     }
@@ -1530,7 +1590,7 @@ mod tests {
         let source = writer.collection;
         for index in 0..units {
             writer
-                .stage_fragment(projection(
+                .stage_fixture(projection(
                     &format!("session:{index}"),
                     &format!("body {index}"),
                 ))
@@ -1614,12 +1674,12 @@ mod tests {
 
         let fragment = projection("session:one", "one");
         let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        writer.stage_fragment(fragment.clone()).unwrap();
+        writer.stage_fixture(fragment.clone()).unwrap();
         let (_, published) = writer.finish(Ok(())).unwrap();
         let first = published.last().unwrap();
         let mut retry = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         let length = std::fs::metadata(&pile).unwrap().len();
-        retry.stage_fragment(fragment).unwrap();
+        retry.stage_fixture(fragment).unwrap();
         let (_, repeated) = retry.finish(Ok(())).unwrap();
         assert_eq!(repeated, published, "the same unit is the same COMMITs");
         assert_eq!(std::fs::metadata(&pile).unwrap().len(), length);
@@ -1646,9 +1706,13 @@ mod tests {
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let collection =
             open_configured(&mut pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
-        let admitted = pile.commit(collection, &signer, fragment.clone()).unwrap();
+        let admitted = pile
+            .commit(collection, &signer, fragment.fragment.clone())
+            .unwrap();
         let foreign = SigningKey::from_bytes(&[0xA7; 32]);
-        let duplicate = pile.commit(collection, &foreign, fragment).unwrap();
+        let duplicate = pile
+            .commit(collection, &foreign, fragment.fragment)
+            .unwrap();
         assert_eq!(duplicate.data(), admitted.data());
         pile.close().unwrap();
 
@@ -1669,13 +1733,13 @@ mod tests {
         let first_fragment = projection("session:one", "shared");
         let first_len = first_fragment.facts().len();
         let mut first_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
-        first_writer.stage_fragment(first_fragment.clone()).unwrap();
+        first_writer.stage_fixture(first_fragment.clone()).unwrap();
         let first = first_writer.finish(Ok(())).unwrap().1;
 
         let second_fragment = projection("session:two", "shared");
         let mut second_writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
         second_writer
-            .stage_fragment(second_fragment.clone())
+            .stage_fixture(second_fragment.clone())
             .unwrap();
         assert_eq!(
             second_writer.delta_len(),
@@ -1779,7 +1843,7 @@ mod tests {
 
         let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         writer
-            .stage_fragment(projection_at_modality(
+            .stage_fixture(projection_at_modality(
                 "session:text",
                 schema::content_fact::modality::TEXT,
                 "spoken",
@@ -1787,7 +1851,7 @@ mod tests {
             ))
             .unwrap();
         writer
-            .stage_fragment(projection_at_modality(
+            .stage_fixture(projection_at_modality(
                 "session:tool",
                 schema::content_fact::modality::TOOL_CALL,
                 "memory context",
@@ -1837,10 +1901,10 @@ mod tests {
         let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
         // Deliberately stage out of causal and temporal order. The collection
         // is a set; replay order must come solely from canonical semantics.
-        writer.stage_fragment(regressed_child).unwrap();
-        writer.stage_fragment(independent).unwrap();
-        writer.stage_fragment(untimed).unwrap();
-        writer.stage_fragment(parent).unwrap();
+        writer.stage_fixture(regressed_child).unwrap();
+        writer.stage_fixture(independent).unwrap();
+        writer.stage_fixture(untimed).unwrap();
+        writer.stage_fixture(parent).unwrap();
         writer.finish(Ok(())).unwrap();
 
         let snapshot = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
@@ -2009,7 +2073,7 @@ mod tests {
 
         let first_fragment = projection("session:first", "alpha");
         let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
-        writer.stage_fragment(first_fragment).unwrap();
+        writer.stage_fixture(first_fragment).unwrap();
         writer.finish(Ok(())).unwrap();
         let first = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         assert_eq!(
@@ -2025,7 +2089,7 @@ mod tests {
 
         let second_fragment = projection("session:second", "beta βeta 🛰️");
         let mut writer = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
-        writer.stage_fragment(second_fragment.clone()).unwrap();
+        writer.stage_fixture(second_fragment.clone()).unwrap();
         writer.finish(Ok(())).unwrap();
 
         let extended = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
@@ -2039,7 +2103,7 @@ mod tests {
 
         let before = std::fs::metadata(&pile_path).unwrap().len();
         let mut retry = ArchiveImportWriter::open(&pile_path, Some(&key)).unwrap();
-        retry.stage_fragment(second_fragment).unwrap();
+        retry.stage_fixture(second_fragment).unwrap();
         retry.finish(Ok(())).unwrap();
         let after_retry = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         assert_eq!(
@@ -2494,7 +2558,7 @@ mod tests {
             let projection = crate::archive_claude_code::project_bytes(
                 name,
                 Bytes::from_source(transcript.as_bytes().to_vec()),
-                |projected| writer.stage_fragment(projected.fragment),
+                |projected| writer.stage(projected.fragment, projected.identity),
             );
             let (_, commit) = writer.finish(projection).unwrap();
             assert!(!commit.is_empty(), "{name} commits");
@@ -2726,12 +2790,12 @@ mod tests {
         let bytes = Bytes::from_source(text.as_bytes().to_vec());
         if name.starts_with("rollout") {
             crate::archive_codex::project_bytes(name, bytes, |projected| {
-                writer.stage_fragment(projected.fragment)
+                writer.stage(projected.fragment, projected.identity)
             })
             .map(drop)
         } else {
             crate::archive_claude_code::project_bytes(name, bytes, |projected| {
-                writer.stage_fragment(projected.fragment)
+                writer.stage(projected.fragment, projected.identity)
             })
             .map(drop)
         }
@@ -2876,7 +2940,10 @@ mod tests {
                     let (_, facts, mut metafacts, mut blobs) = projected.fragment.into_parts();
                     metafacts += other_build.facts().clone();
                     blobs.union(other_build.blobs().clone());
-                    writer.stage_fragment(Fragment::from_parts(facts, metafacts, blobs))
+                    writer.stage(
+                        Fragment::from_parts(facts, metafacts, blobs),
+                        projected.identity,
+                    )
                 },
             )
             .unwrap();
@@ -3005,45 +3072,54 @@ mod tests {
         );
     }
 
-    /// The same session read from another path, or another host, has other
-    /// leaf annotations and the same nodes: every identity COMMIT, the last
-    /// piece's included, is a record the pile already holds.
+    /// A content fact that recurs in two pieces of one unit is in both
+    /// pieces' identity COMMITs: what a piece publishes does not depend on
+    /// what an earlier piece of its unit already staged.
     #[test]
-    fn the_same_session_at_another_path_reuses_every_identity_commit() {
+    fn a_content_fact_recurring_in_two_pieces_is_in_both_identity_commits() {
         let directory = TempDir::new().unwrap();
         let (pile, key) = fresh_archive(&directory, "archive");
-        let transcript = claude_transcript("moved", 60);
-        import_source(
-            &pile,
-            &key,
-            "/Users/jp/.claude/projects/p/moved.jsonl",
-            &transcript,
-        );
-        let before = archive_commit_records(&pile, &key);
-        import_source(&pile, &key, "/srv/mirror/mac/p/moved.jsonl", &transcript);
-        let republished =
-            blocks_in_commits(&pile, &novel(archive_commit_records(&pile, &key), &before));
-        assert!(
-            republished.is_empty(),
-            "{} nodes stored again",
-            republished.len()
-        );
-    }
+        let transcript = claude_transcript("recur", 12)
+            .replace(
+                r#""text":"answer 2 of recur""#,
+                r#""text":"the same answer""#,
+            )
+            .replace(
+                r#""text":"answer 9 of recur""#,
+                r#""text":"the same answer""#,
+            );
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        // One piece per node: the two answers land in different pieces.
+        writer.set_piece_bits(0);
+        stage_source(&mut writer, "recur.jsonl", &transcript).unwrap();
+        writer.close(Ok(())).unwrap();
 
-    /// Dropping a piece's annotation COMMIT would lose its nodes' timestamps
-    /// and its receipts; every node and receipt of a multi-piece import keeps
-    /// them in the read union.
-    #[test]
-    fn every_piece_keeps_its_annotations() {
-        let directory = TempDir::new().unwrap();
-        let (pile, key) = fresh_archive(&directory, "archive");
-        let published = import_source(&pile, &key, "timed.jsonl", &claude_transcript("timed", 300));
-        assert!(published.pieces > 4, "{}", published.pieces);
-        let (blocks, timed, receipts, timed_receipts) = timed_union(&pile, &key);
-        assert_eq!(blocks.len(), 600);
-        assert_eq!(timed, blocks);
-        assert_eq!(receipts.len(), 600);
-        assert_eq!(timed_receipts, receipts);
+        let mut store = open_pile_strict(&pile).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let mut holders = 0usize;
+        for (data, _) in archive_commit_records(&pile, &key) {
+            let facts: TribleSet = snapshot
+                .get::<TribleSet, SimpleArchive>(Handle::<SimpleArchive>::from_hash(data))
+                .unwrap();
+            for (node, fact) in find!(
+                (node: Id, fact: Id),
+                pattern!(&facts, [{ ?node @ schema::block::holds: ?fact }])
+            ) {
+                holders += 1;
+                assert!(
+                    exists!(pattern!(&facts, [{
+                        fact @
+                            metadata::tag: &schema::content_fact::KIND,
+                            schema::content_fact::modality: _?modality,
+                            schema::content_fact::payload: _?payload,
+                    }])),
+                    "node {node:X} holds {fact:X} in a COMMIT without the fact"
+                );
+            }
+        }
+        drop(snapshot);
+        store.close().unwrap();
+        assert_eq!(holders, 24, "every node of the unit");
     }
 
     /// What a source publishes does not depend on what the Archive already
@@ -3100,7 +3176,7 @@ mod tests {
                 if staged == 400 {
                     bail!("the source fails here");
                 }
-                writer.stage_fragment(projected.fragment)
+                writer.stage(projected.fragment, projected.identity)
             },
         )
         .map(drop);
@@ -3213,12 +3289,13 @@ mod tests {
             "image/png",
         )
         .unwrap();
-        let node = crate::blockdag::block(None, None, fact).unwrap();
+        let (node, identity) = crate::blockdag::block_parts(None, None, fact).unwrap();
         let receipt =
             crate::blockdag::block_source_projection(schema::source_projection::SOURCE_CODEX, node)
                 .unwrap();
-        let (identity, annotations, nodes) = blockdag::split_identity(receipt.facts());
-        assert_eq!(nodes.len(), 1);
+        assert_eq!(identity.nodes.len(), 1);
+        let annotations = receipt.facts().difference(&identity.facts);
+        let identity = identity.facts;
         let media: Vec<Id> = find!(
             media: Id,
             pattern!(&identity, [{ _?fact @ schema::content_fact::media_type: ?media }])
@@ -3237,11 +3314,12 @@ mod tests {
         }])));
     }
 
-    /// A node's identity is what its id derives from: its predecessors and
-    /// the facts it holds, with their own identities and the kind tags.
-    /// Its timestamp and its receipt, with every receipt annotation, annotate.
+    /// A node's identity, as `block_parts` names it, is what its id derives
+    /// from: its predecessors and the facts it holds, with their own
+    /// identities and the kind tags. Its timestamp, and the receipt built
+    /// around it with every receipt annotation, stay outside.
     #[test]
-    fn split_identity_keeps_node_identities_and_moves_annotations() {
+    fn block_parts_names_the_node_identity() {
         let parent = blockdag::block(
             None,
             None,
@@ -3257,7 +3335,7 @@ mod tests {
         .unwrap();
         let epoch = Epoch::from_unix_seconds(1_700_000_000.0);
         let at: Inline<NsTAIInterval> = (epoch, epoch).try_to_inline().unwrap();
-        let node = blockdag::block(
+        let (node, identity) = blockdag::block_parts(
             [parent],
             Some(at),
             blockdag::text_fact(
@@ -3281,8 +3359,9 @@ mod tests {
             },
         )
         .unwrap();
-        let (identity, annotations, nodes) = blockdag::split_identity(receipt.facts());
-        assert_eq!(nodes, vec![node_id]);
+        assert_eq!(identity.nodes, vec![node_id]);
+        let annotations = receipt.facts().difference(&identity.facts);
+        let identity = identity.facts;
         assert!(exists!(pattern!(&identity, [{ node_id @
             schema::block::previous: &parent,
             metadata::tag: &schema::block::KIND,
@@ -3303,11 +3382,12 @@ mod tests {
             schema::source_projection::projects_to: node_id,
             schema::source_projection::source_timestamp: at,
         }])));
-        assert_eq!(
-            identity.len() + annotations.len(),
-            receipt.facts().len(),
-            "every fact lands on one side"
-        );
+        assert!(!exists!(
+            pattern!(&identity, [{ node_id @ schema::block::timestamp: _?any }])
+        ));
+        assert!(!exists!(pattern!(&identity, [{
+            _?receipt @ schema::source_projection::projects_to: node_id
+        }])));
     }
 
     /// A session that grows, and a Claude Code session copied into a new

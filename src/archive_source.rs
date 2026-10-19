@@ -197,6 +197,9 @@ impl SourceRecord {
 pub struct ProjectedSource {
     pub source_path: PathBuf,
     pub fragment: Fragment,
+    /// The part of `fragment` that is node identity, as the builders made it;
+    /// the rest annotates. Empty on a leaf annotation.
+    pub identity: blockdag::Identity,
     /// Key of the last record whose content this block holds, for
     /// diagnostics and tests. `None` on a leaf annotation. It is never stored.
     pub record: Option<View<str>>,
@@ -585,6 +588,25 @@ pub fn interval_hull(
     (epoch(lower), epoch(upper)).try_to_inline().ok()
 }
 
+/// What orders projected content wherever the source does not: the node ids
+/// the fragments hold, in emission order, then a digest of every fact they
+/// carry. Two keys are equal only when the fragments emit the same facts.
+pub type ContentKey = (Vec<Id>, [u8; 32]);
+
+/// The [`ContentKey`] of `projected`.
+pub fn content_key(projected: &[ProjectedSource]) -> ContentKey {
+    let mut facts = TribleSet::new();
+    let mut nodes = Vec::new();
+    for fragment in projected {
+        nodes.extend(fragment.identity.nodes.iter().copied());
+        facts += fragment.fragment.facts().clone();
+    }
+    let digest: triblespace::core::blob::Blob<
+        triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+    > = triblespace::core::blob::IntoBlob::to_blob(facts);
+    (nodes, digest.get_handle().raw)
+}
+
 /// Project a complete source graph through the canonical node DAG.
 ///
 /// Contentless records are contracted. Every other record joins the main
@@ -639,18 +661,20 @@ where
 
     // Kahn's order with ties broken by content. A record is built as soon as
     // every predecessor has been emitted, which fixes its frontier, and it
-    // then waits in `ready` under the id of its first node. The smallest id
-    // is emitted next, so wherever several records are ready (Gemini cards,
-    // the roots and branches of a conversation tree) the order, and with it
-    // every piece the import writer cuts, is a function of the nodes alone,
-    // never of provider ids or raw bytes. A contentless record emits nothing
-    // and releases its children at once.
+    // then waits in `ready` under its content key: the ids of the nodes it
+    // projects, then a digest of every fact it emits. The smallest key is
+    // emitted next, so wherever several records are ready (Gemini cards, the
+    // roots and branches of a conversation tree) the order, and with it every
+    // piece the import writer cuts, is a function of the content alone, never
+    // of provider ids, raw bytes or source order. Only records that emit the
+    // same facts can tie, and their order changes nothing. A contentless
+    // record emits nothing and releases its children at once.
     let mut frontiers = vec![BTreeSet::<Id>::new(); records.len()];
     let mut call_nodes = HashMap::<View<str>, Id>::new();
     let mut followed = BTreeSet::<Id>::new();
     let mut receipts = Vec::<(Id, Id)>::new();
     let mut staged: HashMap<usize, Vec<ProjectedSource>> = HashMap::new();
-    let mut ready = BTreeSet::<(Id, usize)>::new();
+    let mut ready = BTreeSet::<(ContentKey, usize)>::new();
     let mut releasable: Vec<usize> = indegree
         .iter()
         .enumerate()
@@ -698,14 +722,12 @@ where
                     .map(|value| value.as_ref().to_owned()),
                 ..ProjectionAnnotations::default()
             };
-            let mut first = None;
             let mut projected = Vec::with_capacity(record.parts.len());
             for (position, part) in record.parts.iter().cloned().enumerate() {
                 let (fact, resolution) = build_fact(part)?;
-                let mut node =
-                    blockdag::block(frontier.iter().copied(), record.block_timestamp, fact)?;
+                let (mut node, identity) =
+                    blockdag::block_parts(frontier.iter().copied(), record.block_timestamp, fact)?;
                 let node_id = node.root().expect("canonical node is rooted");
-                first.get_or_insert(node_id);
                 if let Some(resolution) = resolution {
                     // Facts and bytes only: the fact is not exported again.
                     let (_, facts, metafacts, blobs) = resolution.into_parts();
@@ -735,6 +757,7 @@ where
                 projected.push(ProjectedSource {
                     source_path: source_path.to_path_buf(),
                     fragment: receipt,
+                    identity,
                     record: Some(record.locator.clone()),
                 });
                 stats.projections_emitted += 1;
@@ -742,8 +765,8 @@ where
                 frontier = BTreeSet::from([node_id]);
             }
             frontiers[index] = frontier;
+            ready.insert((content_key(&projected), index));
             staged.insert(index, projected);
-            ready.insert((first.expect("a record with parts has a node"), index));
         }
         let Some((_, index)) = ready.pop_first() else {
             break;
@@ -780,6 +803,7 @@ where
                     ..ProjectionAnnotations::default()
                 },
             )?,
+            identity: blockdag::Identity::default(),
             record: None,
         })?;
     }

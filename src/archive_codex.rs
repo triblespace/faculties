@@ -118,6 +118,8 @@ pub struct ProjectionStats {
 pub struct ProjectedFile {
     pub source_path: PathBuf,
     pub fragment: Fragment,
+    /// The part of `fragment` that is node identity; the rest annotates.
+    pub identity: crate::blockdag::Identity,
     pub stats: ProjectionStats,
 }
 
@@ -328,6 +330,7 @@ where
             emit(ProjectedFile {
                 source_path: path.to_path_buf(),
                 fragment: projected.fragment,
+                identity: projected.identity,
                 stats: ProjectionStats::default(),
             })
         },
@@ -2475,7 +2478,10 @@ mod tests {
         for path in [&parent_path, &fork_path] {
             let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
             writer.set_piece_bits(0);
-            project_path(path, |projected| writer.stage_fragment(projected.fragment)).unwrap();
+            project_path(path, |projected| {
+                writer.stage(projected.fragment, projected.identity)
+            })
+            .unwrap();
             assert!(!writer.commit_unit().unwrap().is_empty());
             writer.close(Ok(())).unwrap();
             if path == &parent_path {
@@ -2764,11 +2770,15 @@ mod tests {
         fs::write(&parent_path, PARENT_ROLLOUT).unwrap();
         fs::write(&fork_path, &fork_text).unwrap();
         let mut after_parent = BTreeSet::new();
+        let mut published = Vec::new();
         for path in [&parent_path, &fork_path] {
             let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
             writer.set_piece_bits(0);
-            project_path(path, |projected| writer.stage_fragment(projected.fragment)).unwrap();
-            writer.commit_unit().unwrap();
+            project_path(path, |projected| {
+                writer.stage(projected.fragment, projected.identity)
+            })
+            .unwrap();
+            published.push(writer.commit_unit().unwrap());
             writer.close(Ok(())).unwrap();
             if path == &parent_path {
                 after_parent = commit_records(&pile);
@@ -2819,8 +2829,26 @@ mod tests {
                 }
             }
         }
+        // The fork publishes the parent's identity COMMITs, byte for byte.
+        let parent_identity: Vec<_> = published[0]
+            .commits
+            .iter()
+            .filter(|commit| {
+                exists!(pattern!(&facts_of(commit.data().raw), [{
+                    _?node @ metadata::tag: &schema::block::KIND
+                }]))
+            })
+            .copied()
+            .collect();
         drop(snapshot);
         store.close().unwrap();
+        assert_eq!(parent_identity.len(), 3, "one identity COMMIT per node");
+        for commit in &parent_identity {
+            assert!(
+                published[1].commits.contains(commit),
+                "the fork did not republish a parent identity COMMIT"
+            );
+        }
         assert_eq!(parent_nodes.len(), 3);
         assert_eq!(
             reannotated, parent_nodes,

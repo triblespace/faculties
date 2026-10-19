@@ -1351,7 +1351,7 @@ mod tests {
                     if projected.record.is_some() {
                         ids.insert(projected_block(&projected.fragment));
                     }
-                    writer.stage_fragment(projected.fragment)
+                    writer.stage(projected.fragment, projected.identity)
                 },
             )
             .unwrap();
@@ -1361,11 +1361,47 @@ mod tests {
             all.push(all_commits(&pile));
             blocks.push(ids);
         }
+        assert!(blocks[0].len() >= 40, "at least one node per card");
         assert_eq!(blocks[0], blocks[1], "the same nodes");
         let added = seen[1].difference(&seen[0]).count();
         assert_eq!(added, 0, "the same nodes cut into new pieces");
         // Markup carries no annotation either: the whole re-import is the
         // same COMMITs. The two-COMMIT split is not needed for this case.
         assert_eq!(all[1], all[0], "a markup change altered an annotation");
+    }
+
+    /// Two cards that open with the same prompt project the same first node.
+    /// The order between them is decided by the rest of their content, not
+    /// by where the page put them.
+    #[test]
+    fn cards_with_the_same_prompt_emit_in_content_order() {
+        let first =
+            card("Prompted&nbsp;same question<br>18 Sept 2025, 12:01:52 CET<br><p>one answer</p>");
+        let second = card(
+            "Prompted&nbsp;same question<br>18 Sept 2025, 12:02:52 CET<br><p>another answer</p>",
+        );
+        // Each fragment as the digest of its facts: the two prompt receipts
+        // share their node and differ in their annotations (the card times).
+        let order = |html: String| -> Vec<[u8; 32]> {
+            use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+            use triblespace::core::blob::{Blob, IntoBlob};
+            let mut fragments = Vec::new();
+            project_bytes(
+                "My Activity.html",
+                Bytes::from_source(html.into_bytes()),
+                &std::collections::BTreeMap::new(),
+                |projected| {
+                    let blob: Blob<SimpleArchive> = projected.fragment.facts().clone().to_blob();
+                    fragments.push(blob.get_handle().raw);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            fragments
+        };
+        let forward = order(format!("{PREFIX}{first}{second}{SUFFIX}"));
+        let backward = order(format!("{PREFIX}{second}{first}{SUFFIX}"));
+        assert!(forward.len() >= 4, "{}", forward.len());
+        assert_eq!(forward, backward);
     }
 }

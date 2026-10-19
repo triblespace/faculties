@@ -1,6 +1,7 @@
 //! Archive shell syntax, trace setup and explicit local source discovery.
 use super::{parse_tai_timestamp, Archive, ImportSource, ImportSummary, Publication};
 use crate::archive_collection::ArchiveImportWriter;
+use crate::blockdag::Identity;
 use crate::out::Out;
 use crate::{
     archive_agy, archive_chatgpt, archive_claude_code, archive_claude_web, archive_codex,
@@ -200,42 +201,42 @@ fn import_into(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let before = pile_length(pile)?;
-    let mut stage = |fragment: Fragment, source_path: &Path| {
+    let mut stage = |fragment: Fragment, identity: Identity, source_path: &Path| {
         writer
-            .stage_fragment(fragment)
+            .stage(fragment, identity)
             .with_context(|| format!("stage {}", source_path.display()))
     };
     let summary = match source {
         CliImportSource::Agy => {
-            archive_agy::project_path(path, |p| stage(p.fragment, &p.source_path))
+            archive_agy::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::Agy)
         }
         CliImportSource::ChatGpt => {
-            archive_chatgpt::project_path(path, |p| stage(p.fragment, &p.source_path))
+            archive_chatgpt::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::ChatGpt)
         }
         CliImportSource::ClaudeCode => {
             archive_claude_code::project_path_finished(path, finished_before, |p| {
-                stage(p.fragment, &p.source_path)
+                stage(p.fragment, p.identity, &p.source_path)
             })
             .map(ImportSummary::ClaudeCode)
         }
-        CliImportSource::ClaudeWeb => {
-            archive_claude_web::project_path(path, |p| stage(p.fragment, &p.source_path))
-                .map(ImportSummary::ClaudeWeb)
-        }
+        CliImportSource::ClaudeWeb => archive_claude_web::project_path(path, |p| {
+            stage(p.fragment, p.identity, &p.source_path)
+        })
+        .map(ImportSummary::ClaudeWeb),
         CliImportSource::Codex => {
             archive_codex::project_path_finished(path, finished_before, |p| {
-                stage(p.fragment, &p.source_path)
+                stage(p.fragment, p.identity, &p.source_path)
             })
             .map(ImportSummary::Codex)
         }
         CliImportSource::Copilot => {
-            archive_copilot::project_path(path, |p| stage(p.fragment, &p.source_path))
+            archive_copilot::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::Copilot)
         }
         CliImportSource::Gemini => {
-            archive_gemini::project_path(path, |p| stage(p.fragment, &p.source_path))
+            archive_gemini::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::Gemini)
         }
     }?;

@@ -27,7 +27,7 @@ use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
 use triblespace::prelude::*;
 
 use crate::files;
@@ -330,6 +330,46 @@ pub fn block(
     timestamp: Option<Inline<NsTAIInterval>>,
     facts: Fragment,
 ) -> Result<Fragment> {
+    block_parts(predecessors, timestamp, facts).map(|(fragment, _)| fragment)
+}
+
+/// The identity half of what an importer stages, named where it is built:
+/// the nodes, and the facts their ids are derived from with their kind tags.
+/// Everything else in the staged fragment annotates them.
+#[derive(Clone, Debug, Default)]
+pub struct Identity {
+    /// The nodes whose identity this is; the import writer ends a piece on
+    /// them.
+    pub nodes: Vec<Id>,
+    /// The facts of the nodes' intrinsic cores, the content facts they hold
+    /// (with the entities those name, such as a media type), and the kind
+    /// tags of all of them.
+    pub facts: TribleSet,
+}
+
+impl Identity {
+    /// Add another identity: one fragment that holds several nodes.
+    pub fn absorb(&mut self, other: Identity) {
+        self.nodes.extend(other.nodes);
+        self.facts += other.facts;
+    }
+}
+
+/// [`block`], returning the node's fragment with its [`Identity`]: the
+/// intrinsic core (`previous`, `holds` and the held content facts as their
+/// builders made them) and the node's kind tag. The timestamp is the only
+/// annotation `block` adds.
+///
+/// `facts` must be content facts as [`text_fact`], [`blob_fact`] and the
+/// pointer builders return them: their whole fragment is identity. An
+/// annotation of a content fact, such as [`resolve_pointer_fact`]'s
+/// resolution of a pointer built from `Fragment::rooted`, is added to the
+/// node afterwards and so stays outside the identity.
+pub fn block_parts(
+    predecessors: impl IntoIterator<Item = Id>,
+    timestamp: Option<Inline<NsTAIInterval>>,
+    facts: Fragment,
+) -> Result<(Fragment, Identity)> {
     let predecessors: Vec<_> = predecessors.into_iter().collect();
     if facts.exports().next().is_none() && (!predecessors.is_empty() || timestamp.is_some()) {
         bail!("a content-free node must be the predecessor-free, timeless canonical bottom");
@@ -366,16 +406,21 @@ pub fn block(
     // already does — `observed_at` is a BTreeSet in `annotate_chunk`, never in
     // `chunk_core` ("genuine creation/import observations, outside intrinsic
     // state").
-    let mut fragment = entity! { _ @
+    let core = entity! { _ @
         schema::block::previous*: predecessors.iter(),
         schema::block::holds*: facts,
     };
-    let root = rooted(&fragment, "block")?;
+    let root = rooted(&core, "block")?;
+    let mut fragment = attach_kind(core, schema::block::KIND, "block")?;
+    let identity = Identity {
+        nodes: vec![root],
+        facts: fragment.facts().clone(),
+    };
     fragment += entity! { ExclusiveId::force_ref(&root) @
         schema::block::timestamp?: timestamp,
     };
     debug_assert_eq!(fragment.root(), Some(root));
-    attach_kind(fragment, schema::block::KIND, "block")
+    Ok((fragment, identity))
 }
 
 /// Annotate a result node with the node of the tool call it answers.
@@ -558,7 +603,7 @@ pub fn block_source_projection(source_namespace: Id, block: Fragment) -> Result<
 /// fragment of its own.
 ///
 /// It holds only annotations of `receipt`. The import writer publishes every
-/// annotation apart from the node identities ([`split_identity`]), which stay
+/// annotation apart from the node identities ([`Identity`]), which stay
 /// the same bytes wherever the node is read. No source bytes are part of an
 /// occurrence.
 pub fn source_occurrence(receipt: Id, annotations: ProjectionAnnotations) -> Result<Fragment> {
@@ -602,133 +647,6 @@ pub fn annotate_source_projection(
     };
     debug_assert_eq!(projection.root(), Some(root));
     Ok(projection)
-}
-
-/// The intrinsic id of the facts whose `(attribute, value)` rows are `rows`,
-/// sorted and deduplicated: the root `entity!` derives for them.
-fn intrinsic_root(rows: &[[u8; 48]]) -> Option<Id> {
-    let mut hasher = blake3::Hasher::new();
-    for row in rows {
-        hasher.update(&[0u8; 16]);
-        hasher.update(row);
-    }
-    let digest = hasher.finalize();
-    let mut raw = [0u8; 16];
-    raw.copy_from_slice(&digest.as_bytes()[16..]);
-    Id::new(raw)
-}
-
-/// Attribute groups an identity search tries at most: beyond it an entity's
-/// facts are all treated as annotations.
-const IDENTITY_SEARCH_GROUPS: usize = 12;
-
-/// The rows of `facts` (all about `entity`, sorted) that `entity`'s
-/// intrinsic id is derived from, found by trying the entity's attribute
-/// groups largest set first; `None` when no subset reproduces the id (the
-/// entity is not intrinsic).
-fn identity_rows(entity: Id, facts: &[Trible]) -> Option<Vec<Trible>> {
-    let mut groups: Vec<(Id, Vec<Trible>)> = Vec::new();
-    for fact in facts {
-        match groups.last_mut() {
-            Some((attribute, rows)) if attribute == fact.a() => rows.push(*fact),
-            _ => groups.push((*fact.a(), vec![*fact])),
-        }
-    }
-    if groups.len() > IDENTITY_SEARCH_GROUPS {
-        return None;
-    }
-    let full = (1u32 << groups.len()) - 1;
-    let mut masks: Vec<u32> = (1..=full).collect();
-    masks.sort_by_key(|mask| std::cmp::Reverse(mask.count_ones()));
-    let mut rows = Vec::new();
-    for mask in masks {
-        rows.clear();
-        for (index, (_, group)) in groups.iter().enumerate() {
-            if mask & (1 << index) != 0 {
-                rows.extend(group.iter().map(|fact| {
-                    let mut row = [0u8; 48];
-                    row.copy_from_slice(&fact.data[16..]);
-                    row
-                }));
-            }
-        }
-        if intrinsic_root(&rows) == Some(entity) {
-            return Some(
-                groups
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| mask & (1 << index) != 0)
-                    .flat_map(|(_, (_, group))| group.iter().copied())
-                    .collect(),
-            );
-        }
-    }
-    None
-}
-
-/// Split one fragment's facts into the identity of the nodes it holds and
-/// everything that annotates it, structurally.
-///
-/// The nodes are the entities with a `previous` or `holds` fact. A node's
-/// identity is the subset of its facts its id is derived from (its
-/// predecessors and the facts it holds); each held entity, and each entity
-/// such an identity row names in turn (a content fact's media type), adds its
-/// own identity subset. The kind tags of those entities ride with them: a
-/// tag is attached after intrinsic construction and never varies, and a
-/// reader such as the Archive BM25 recognises a node by it. Everything else
-/// annotates: node timestamps, `responds_to`, a content fact's `resolved_to`
-/// (whether an export carried an asset file is not part of the message), and
-/// the receipts with all their facts. The same node read from another file,
-/// a fork's replay, another host or a later version of the same file has the
-/// same identity facts and may have different annotations.
-///
-/// Returns the identity facts, the annotations, and the nodes.
-pub fn split_identity(facts: &TribleSet) -> (TribleSet, TribleSet, Vec<Id>) {
-    let mut by_entity: BTreeMap<Id, Vec<Trible>> = BTreeMap::new();
-    for fact in facts.iter() {
-        by_entity.entry(*fact.e()).or_default().push(*fact);
-    }
-    for rows in by_entity.values_mut() {
-        rows.sort_unstable();
-    }
-    let previous = schema::block::previous.id();
-    let holds = schema::block::holds.id();
-    let nodes: Vec<Id> = by_entity
-        .iter()
-        .filter(|(_, rows)| {
-            rows.iter()
-                .any(|fact| *fact.a() == previous || *fact.a() == holds)
-        })
-        .map(|(entity, _)| *entity)
-        .collect();
-    let tag = metadata::tag.id();
-    let mut identity = TribleSet::new();
-    let mut visited = BTreeSet::new();
-    let mut pending: Vec<Id> = nodes.clone();
-    while let Some(entity) = pending.pop() {
-        if !visited.insert(entity) {
-            continue;
-        }
-        let Some(rows) = by_entity.get(&entity) else {
-            continue;
-        };
-        let Some(core) = identity_rows(entity, rows) else {
-            continue;
-        };
-        for fact in &core {
-            if let Ok(named) = fact.v::<GenId>().try_from_inline::<Id>() {
-                if by_entity.contains_key(&named) && !visited.contains(&named) {
-                    pending.push(named);
-                }
-            }
-            identity.insert(fact);
-        }
-        for fact in rows.iter().filter(|fact| *fact.a() == tag) {
-            identity.insert(fact);
-        }
-    }
-    let annotations = facts.difference(&identity);
-    (identity, annotations, nodes)
 }
 
 fn values_by_entity<T: Ord>(rows: impl IntoIterator<Item = (Id, T)>) -> BTreeMap<Id, BTreeSet<T>> {

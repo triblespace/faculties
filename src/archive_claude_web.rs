@@ -58,6 +58,8 @@ impl ProjectionStats {
 pub struct ProjectedFile {
     pub source_path: PathBuf,
     pub fragment: Fragment,
+    /// The part of `fragment` that is node identity; the rest annotates.
+    pub identity: crate::blockdag::Identity,
     pub stats: ProjectionStats,
 }
 
@@ -121,6 +123,7 @@ where
             emit(ProjectedFile {
                 source_path: path.to_path_buf(),
                 fragment: projected.fragment,
+                identity: projected.identity,
                 stats: ProjectionStats::default(),
             })
         },
@@ -1736,7 +1739,7 @@ mod tests {
             Bytes::from_source(EXPORT.to_owned()),
             |projected| {
                 fragments += 1;
-                writer.stage_fragment(projected.fragment)
+                writer.stage(projected.fragment, projected.identity)
             },
         )
         .unwrap();
@@ -1765,6 +1768,7 @@ mod tests {
         }
         drop(snapshot);
         store.close().unwrap();
+        assert!(nodes >= 3, "the export projects its messages");
         assert_eq!(node_commits, nodes, "one piece per node at piece_bits 0");
     }
 }

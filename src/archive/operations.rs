@@ -105,38 +105,38 @@ impl Archive {
             )?;
             let projection = match source {
                 ImportSource::Agy => archive_agy::project_bytes(source_name, bytes, |p| {
-                    writer.stage_fragment(p.fragment)
+                    writer.stage(p.fragment, p.identity)
                 })
                 .map(ImportSummary::Agy),
                 ImportSource::ChatGpt => {
                     archive_chatgpt::project_bytes(source_name, bytes, attachments, |p| {
-                        writer.stage_fragment(p.fragment)
+                        writer.stage(p.fragment, p.identity)
                     })
                     .map(ImportSummary::ChatGpt)
                 }
                 ImportSource::ClaudeCode => {
                     archive_claude_code::project_bytes(source_name, bytes, |p| {
-                        writer.stage_fragment(p.fragment)
+                        writer.stage(p.fragment, p.identity)
                     })
                     .map(ImportSummary::ClaudeCode)
                 }
                 ImportSource::ClaudeWeb => {
                     archive_claude_web::project_bytes(source_name, bytes, |p| {
-                        writer.stage_fragment(p.fragment)
+                        writer.stage(p.fragment, p.identity)
                     })
                     .map(ImportSummary::ClaudeWeb)
                 }
                 ImportSource::Codex => archive_codex::project_bytes(source_name, bytes, |p| {
-                    writer.stage_fragment(p.fragment)
+                    writer.stage(p.fragment, p.identity)
                 })
                 .map(ImportSummary::Codex),
                 ImportSource::Copilot => archive_copilot::project_bytes(source_name, bytes, |p| {
-                    writer.stage_fragment(p.fragment)
+                    writer.stage(p.fragment, p.identity)
                 })
                 .map(ImportSummary::Copilot),
                 ImportSource::Gemini => {
                     archive_gemini::project_bytes(source_name, bytes, attachments, |p| {
-                        writer.stage_fragment(p.fragment)
+                        writer.stage(p.fragment, p.identity)
                     })
                     .map(ImportSummary::Gemini)
                 }
