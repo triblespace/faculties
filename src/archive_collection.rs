@@ -96,6 +96,8 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
     occurrence: TribleSet,
     /// Whether the vocabulary COMMIT is still to be prepared.
     vocabulary: bool,
+    /// Whether the vocabulary COMMIT is among `pending`, not yet inserted.
+    vocabulary_pending: bool,
     /// Pieces closed in the unit being staged.
     pieces: usize,
     /// Signed COMMITs of the unit's pieces, in insertion order, whose bytes
@@ -224,6 +226,7 @@ where
             core: TribleSet::new(),
             occurrence: TribleSet::new(),
             vocabulary: true,
+            vocabulary_pending: false,
             pieces: 0,
             pending: Vec::new(),
             piece_bits: PIECE_BITS,
@@ -276,37 +279,17 @@ where
     /// last piece. Nothing is compared with what the Archive holds, or with
     /// what this writer staged before: the union absorbs every repetition.
     ///
-    /// A wrong identity is refused, never published: a fragment holding a
-    /// node (an entity tagged as a node, or with a `previous` or `holds`
-    /// fact) that `identity` does not name, and an identity naming facts the
-    /// fragment does not hold, are errors.
+    /// A wrong identity is refused, never published. These are errors: an
+    /// identity naming facts the fragment does not hold; a fragment holding
+    /// a node (an entity tagged as a node, or with a `previous` or `holds`
+    /// fact) that `identity` does not name; a node's tag, `previous` or
+    /// `holds` fact outside the identity; and a content fact's tag or
+    /// identity-core fact (modality, payload, blob, pointer) outside it. So
+    /// a node-free fragment ([`Self::stage_annotations`]) cannot carry a node
+    /// or a content fact at all.
     pub fn stage(&mut self, fragment: Fragment, identity: blockdag::Identity) -> Result<()> {
         let (_, facts, _, blobs) = fragment.into_parts();
-        let missing = identity.facts().difference(&facts);
-        if !missing.is_empty() {
-            bail!(
-                "an Archive identity names {} fact(s) its fragment does not hold",
-                missing.len()
-            );
-        }
-        let named: BTreeSet<Id> = identity.nodes().iter().copied().collect();
-        let held = find!(
-            node: Id,
-            pattern!(&facts, [{ ?node @ metadata::tag: &schema::block::KIND }])
-        )
-        .chain(find!(
-            node: Id,
-            pattern!(&facts, [{ ?node @ schema::block::previous: _?previous }])
-        ))
-        .chain(find!(
-            node: Id,
-            pattern!(&facts, [{ ?node @ schema::block::holds: _?fact }])
-        ));
-        for node in held {
-            if !named.contains(&node) {
-                bail!("an Archive fragment holds node {node:X} its identity does not name");
-            }
-        }
+        refuse_misplaced_identity(&facts, &identity)?;
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
@@ -328,8 +311,8 @@ where
         Ok(())
     }
 
-    /// Stage a fragment that holds no node, only annotations (or facts no
-    /// node holds). A fragment holding a node is refused.
+    /// Stage a fragment that holds no node and no content fact, only
+    /// annotations. A fragment holding either is refused.
     pub fn stage_annotations(&mut self, fragment: Fragment) -> Result<()> {
         self.stage(fragment, blockdag::Identity::none())
     }
@@ -369,10 +352,26 @@ where
             CollectionStore::insert(&mut self.pile, CollectionRecord::Commit(*commit))
                 .map_err(|error| anyhow!("insert an Archive piece COMMIT: {error}"))?;
         }
+        self.vocabulary_pending = false;
         Ok(UnitPublication {
             pieces: std::mem::take(&mut self.pieces),
             commits,
         })
+    }
+
+    /// Drop everything staged since the last unit ended, publishing nothing:
+    /// the unit's source failed and the next unit starts clean. Bytes the
+    /// unit already appended stay unreachable until a later COMMIT names
+    /// them; a vocabulary COMMIT it prepared is prepared again by the next.
+    pub fn abandon_unit(&mut self) {
+        self.core = TribleSet::new();
+        self.occurrence = TribleSet::new();
+        self.pending.clear();
+        self.pieces = 0;
+        if self.vocabulary_pending {
+            self.vocabulary_pending = false;
+            self.vocabulary = true;
+        }
     }
 
     /// Prepare the piece being cut, if it holds anything: its annotation
@@ -385,6 +384,7 @@ where
         }
         if self.vocabulary {
             self.vocabulary = false;
+            self.vocabulary_pending = true;
             let (_, facts, _, blobs) = blockdag::vocabulary_fragment().into_parts();
             stage_embedded_blobs(&mut self.pile, named_blobs(&facts, blobs))?;
             let (descriptions, description_blobs) = blockdag::attribute_descriptions();
@@ -480,6 +480,57 @@ fn embedded_blobs(mut blobs: triblespace::core::blob::MemoryBlobStore) -> Vec<Bl
     embedded.sort_unstable_by_key(|(store_key, _)| store_key.raw);
 
     embedded.into_iter().map(|(_, blob)| blob).collect()
+}
+
+/// Refuse a staged fragment whose identity is wrong: see
+/// [`ArchiveImportWriter::stage`]. Structural only: the facts of the
+/// fragment are matched against the identity's, no id is recomputed.
+fn refuse_misplaced_identity(facts: &TribleSet, identity: &blockdag::Identity) -> Result<()> {
+    let missing = identity.facts().difference(facts);
+    if !missing.is_empty() {
+        bail!(
+            "an Archive identity names {} fact(s) its fragment does not hold",
+            missing.len()
+        );
+    }
+    let named: BTreeSet<Id> = identity.nodes().iter().copied().collect();
+    let node_kind = schema::block::KIND;
+    let fact_kind = schema::content_fact::KIND;
+    let tag = metadata::tag.id();
+    let node_attributes = [schema::block::previous.id(), schema::block::holds.id()];
+    let fact_attributes = [
+        schema::content_fact::modality.id(),
+        schema::content_fact::payload.id(),
+        schema::content_fact::blob.id(),
+        schema::content_fact::asset_pointer.id(),
+    ];
+    let nodes: BTreeSet<Id> = find!(
+        node: Id,
+        pattern!(facts, [{ ?node @ metadata::tag: &node_kind }])
+    )
+    .collect();
+    let content_facts: BTreeSet<Id> = find!(
+        fact: Id,
+        pattern!(facts, [{ ?fact @ metadata::tag: &fact_kind }])
+    )
+    .collect();
+    for fact in facts.iter() {
+        let (entity, attribute) = (*fact.e(), *fact.a());
+        let node_fact =
+            node_attributes.contains(&attribute) || (attribute == tag && nodes.contains(&entity));
+        let content_fact = fact_attributes.contains(&attribute)
+            || (attribute == tag && content_facts.contains(&entity));
+        if node_fact && !named.contains(&entity) {
+            bail!("an Archive fragment holds node {entity:X} its identity does not name");
+        }
+        if (node_fact || content_fact) && !identity.facts().contains(fact) {
+            bail!(
+                "an Archive fragment carries {} fact {attribute:X} of {entity:X} outside its identity",
+                if node_fact { "node" } else { "content" }
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The embedded blobs some fact of `facts` names, in handle order. Blobs only
@@ -1491,21 +1542,22 @@ mod tests {
     }
 
     #[test]
-    fn writer_publishes_opaque_annotations_and_multiple_bodies_idempotently() {
+    fn writer_publishes_opaque_annotations_idempotently() {
         let directory = TempDir::new().unwrap();
         let pile = directory.path().join("archive.pile");
         std::fs::File::create(&pile).unwrap();
         let key = directory.path().join("archive.key");
         initialize_archive_fixture(&pile, &key);
 
+        // An opaque entity of no Archive kind: no node and no content fact,
+        // so it is all annotation, with repeated values of each attribute.
         let fact = fucid();
         let annotation_kind = fucid();
+        let other_kind = fucid();
         let fragment = entity! { &fact @
-            metadata::tag*: [&schema::content_fact::KIND, &annotation_kind.id],
+            metadata::tag*: [&other_kind.id, &annotation_kind.id],
             metadata::name*: ["first annotation", "second annotation"],
-            schema::content_fact::modality: &schema::content_fact::modality::TEXT,
-            schema::content_fact::direction: &schema::content_fact::direction::IN,
-            schema::content_fact::payload*: ["first body", "second body"],
+            metadata::description*: ["first body", "second body"],
         };
         let annotation = entity! { &fact @
             metadata::name: "later annotation",
@@ -1560,10 +1612,7 @@ mod tests {
             pattern!(&facts, [{ fact.id @ metadata::tag: ?tag }])
         )
         .collect();
-        assert_eq!(
-            tags,
-            BTreeSet::from([schema::content_fact::KIND, annotation_kind.id])
-        );
+        assert_eq!(tags, BTreeSet::from([other_kind.id, annotation_kind.id]));
         let names: BTreeSet<_> = find!(
             name: Inline<Handle<UTF8String>>,
             pattern!(&facts, [{ fact.id @ metadata::name: ?name }])
@@ -1583,7 +1632,7 @@ mod tests {
         );
         let bodies: BTreeSet<_> = find!(
             payload: Inline<Handle<UTF8String>>,
-            pattern!(&facts, [{ fact.id @ schema::content_fact::payload: ?payload }])
+            pattern!(&facts, [{ fact.id @ metadata::description: ?payload }])
         )
         .map(|handle| {
             let body: View<str> = snapshot.snapshot().get(handle).unwrap();
@@ -3450,5 +3499,151 @@ mod tests {
                 .count();
             assert_eq!(missing, 0, "{label}: closed-piece COMMITs not reused");
         }
+    }
+
+    /// Two nodes as `block_parts` builds them: the first a root, the second
+    /// following it.
+    fn two_nodes() -> (
+        (Fragment, blockdag::Identity),
+        (Fragment, blockdag::Identity),
+    ) {
+        let text = |text: &str| {
+            blockdag::text_fact(
+                schema::content_fact::modality::TEXT,
+                schema::content_fact::direction::IN,
+                text,
+            )
+            .unwrap()
+        };
+        let first = blockdag::block_parts([], None, text("first node")).unwrap();
+        let root = first.0.root().unwrap();
+        let second = blockdag::block_parts([root], None, text("second node")).unwrap();
+        (first, second)
+    }
+
+    fn refusing_writer(directory: &TempDir) -> ArchiveImportWriter {
+        let (pile, key) = fresh_archive(directory, "archive");
+        ArchiveImportWriter::open(&pile, Some(&key)).unwrap()
+    }
+
+    fn refusal(result: Result<()>) -> String {
+        format!(
+            "{:#}",
+            result.expect_err("the writer staged a wrong identity")
+        )
+    }
+
+    #[test]
+    fn stage_refuses_a_node_its_identity_does_not_name() {
+        let directory = TempDir::new().unwrap();
+        let mut writer = refusing_writer(&directory);
+        let ((first, _), (second, second_identity)) = two_nodes();
+        // No identity at all.
+        let error = refusal(writer.stage(first.clone(), blockdag::Identity::none()));
+        assert!(error.contains("its identity does not name"), "{error}");
+        // Another node's identity, beside that node.
+        let mut both = first;
+        both += second;
+        let error = refusal(writer.stage(both, second_identity));
+        assert!(error.contains("its identity does not name"), "{error}");
+        assert!(
+            writer.commit_unit().unwrap().is_empty(),
+            "a refusal staged something"
+        );
+    }
+
+    #[test]
+    fn stage_refuses_an_identity_naming_facts_the_fragment_lacks() {
+        let directory = TempDir::new().unwrap();
+        let mut writer = refusing_writer(&directory);
+        let ((first, _), (_, second_identity)) = two_nodes();
+        let error = refusal(writer.stage(first, second_identity));
+        assert!(error.contains("does not hold"), "{error}");
+    }
+
+    #[test]
+    fn stage_refuses_an_untagged_node_by_its_previous_or_holds() {
+        let directory = TempDir::new().unwrap();
+        let mut writer = refusing_writer(&directory);
+        let (_, (second, _)) = two_nodes();
+        let node = second.root().unwrap();
+        // Only the node's `previous` facts, or only its `holds` facts.
+        let untagged = |keep: Id| -> Fragment {
+            let mut facts = TribleSet::new();
+            for fact in second.facts().iter() {
+                if *fact.e() == node && *fact.a() == keep {
+                    facts.insert(fact);
+                }
+            }
+            assert!(!facts.is_empty());
+            Fragment::from(facts)
+        };
+        for keep in [schema::block::previous.id(), schema::block::holds.id()] {
+            let fragment = untagged(keep);
+            assert!(!exists!(pattern!(fragment.facts(), [{
+                node @ metadata::tag: &schema::block::KIND
+            }])));
+            let error = refusal(writer.stage(fragment, blockdag::Identity::none()));
+            assert!(error.contains("its identity does not name"), "{error}");
+        }
+    }
+
+    #[test]
+    fn stage_refuses_a_node_fact_outside_the_identity() {
+        let directory = TempDir::new().unwrap();
+        let mut writer = refusing_writer(&directory);
+        let (_, (second, second_identity)) = two_nodes();
+        let node = second.root().unwrap();
+        // A second predecessor the node's id was not derived from.
+        let mut fragment = second;
+        fragment += entity! { ExclusiveId::force_ref(&node) @
+            schema::block::previous: &fucid().id,
+        };
+        let error = refusal(writer.stage(fragment, second_identity.clone()));
+        assert!(error.contains("outside its identity"), "{error}");
+    }
+
+    #[test]
+    fn stage_annotations_refuses_a_content_fact() {
+        let directory = TempDir::new().unwrap();
+        let mut writer = refusing_writer(&directory);
+        let fact = blockdag::text_fact(
+            schema::content_fact::modality::TEXT,
+            schema::content_fact::direction::IN,
+            "a fact no node holds",
+        )
+        .unwrap();
+        let error = refusal(writer.stage_annotations(fact));
+        assert!(error.contains("outside its identity"), "{error}");
+    }
+
+    /// A unit whose source failed is abandoned: nothing it staged is
+    /// published, and the next unit starts clean, its vocabulary included.
+    #[test]
+    fn abandon_unit_publishes_nothing_and_the_next_unit_starts_clean() {
+        let directory = TempDir::new().unwrap();
+        let (pile, key) = fresh_archive(&directory, "archive");
+        let mut writer = ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+        writer.set_piece_bits(0);
+        stage_source(
+            &mut writer,
+            "abandoned.jsonl",
+            &claude_transcript("abandoned", 4),
+        )
+        .unwrap();
+        writer.abandon_unit();
+        let kept = claude_transcript("kept", 4);
+        stage_source(&mut writer, "kept.jsonl", &kept).unwrap();
+        let published = writer.commit_unit().unwrap();
+        writer.close(Ok(())).unwrap();
+        let records = archive_commit_records(&pile, &key);
+        assert_eq!(records.len(), published.commits.len());
+
+        let (alone, alone_key) = fresh_archive(&directory, "alone");
+        let mut writer = ArchiveImportWriter::open(&alone, Some(&alone_key)).unwrap();
+        writer.set_piece_bits(0);
+        stage_source(&mut writer, "kept.jsonl", &kept).unwrap();
+        writer.close(Ok(())).unwrap();
+        assert_eq!(records, archive_commit_records(&alone, &alone_key));
     }
 }

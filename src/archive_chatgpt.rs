@@ -103,23 +103,41 @@ where
             .with_context(|| format!("project ChatGPT export {}", source_path.display()))?;
         summary.absorb(file_summary);
     }
-    emit_in_content_order(conversations, &mut emit)?;
+    emit_in_content_order(conversations, &mut summary, &mut emit)?;
     Ok(summary)
 }
 
 /// Emit projected conversations in the order of their [`ContentKey`]s.
 ///
 /// [`ContentKey`]: archive_source::ContentKey
+///
+/// Conversations with the same key emit the same facts and are emitted once;
+/// the nodes of the ones left out are taken off `summary`'s counts, so it
+/// counts what was emitted.
 fn emit_in_content_order<F>(
     mut conversations: Vec<(archive_source::ContentKey, Vec<ProjectedSource>)>,
+    summary: &mut ProjectionSummary,
     emit: &mut F,
 ) -> Result<()>
 where
     F: FnMut(ProjectedSource) -> Result<()>,
 {
     conversations.sort_by(|(left, _), (right, _)| left.cmp(right));
-    // Conversations with the same key emit the same facts: emit them once.
-    conversations.dedup_by(|(left, _), (right, _)| left == right);
+    let mut kept: Vec<(archive_source::ContentKey, Vec<ProjectedSource>)> =
+        Vec::with_capacity(conversations.len());
+    for (key, fragments) in conversations {
+        if kept.last().is_some_and(|(last, _)| *last == key) {
+            let nodes = fragments
+                .iter()
+                .filter(|fragment| fragment.record.is_some())
+                .count();
+            summary.stats.projections_emitted -= nodes;
+            summary.stats.content_parts -= nodes;
+            continue;
+        }
+        kept.push((key, fragments));
+    }
+    let conversations = kept;
     for (_, fragments) in conversations {
         for fragment in fragments {
             emit(fragment)?;
@@ -196,8 +214,9 @@ where
             .collect(),
     );
     let mut conversations = Vec::new();
-    let summary = project_content(Path::new(source_name), bytes, &sidecars, &mut conversations)?;
-    emit_in_content_order(conversations, &mut emit)?;
+    let mut summary =
+        project_content(Path::new(source_name), bytes, &sidecars, &mut conversations)?;
+    emit_in_content_order(conversations, &mut summary, &mut emit)?;
     Ok(summary)
 }
 
@@ -1682,8 +1701,9 @@ mod tests {
             };
             let mut conversations = Vec::new();
             let mapped = archive_source::map_immutable_file(export).unwrap();
-            let summary = project_content(export, mapped, sidecars, &mut conversations).unwrap();
-            emit_in_content_order(conversations, &mut emit).unwrap();
+            let mut summary =
+                project_content(export, mapped, sidecars, &mut conversations).unwrap();
+            emit_in_content_order(conversations, &mut summary, &mut emit).unwrap();
             let pointers = find!(
                 pointer: Inline<Handle<UTF8String>>,
                 pattern!(&facts, [{ _?fact @ schema::content_fact::asset_pointer: ?pointer }])
@@ -2225,5 +2245,86 @@ mod tests {
         assert_eq!(x.len(), 3);
         assert_eq!(x, y);
         assert_eq!(x, z);
+    }
+
+    /// A later export can carry a conversation twice, once in each of two
+    /// shards. The two copies emit the same facts and are emitted once, so
+    /// the export cuts the same pieces as with one copy, and its summary
+    /// counts the nodes it emitted.
+    #[test]
+    fn a_conversation_in_two_shards_is_emitted_once() {
+        use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace::core::repo::BlobStoreGet;
+        let conversation = |index: usize| {
+            serde_json::json!({
+                "id": format!("c-{index}"),
+                "mapping": {
+                    "root": {"parent": null, "message": null},
+                    "u": {"parent": "root", "message": {"id": format!("u-{index}"),
+                        "author": {"role": "user"}, "create_time": 1772382841.5,
+                        "content": {"content_type": "text", "parts": [format!("question {index}")]}}},
+                    "a": {"parent": "u", "message": {"id": format!("a-{index}"),
+                        "author": {"role": "assistant"}, "create_time": 1772382842.5,
+                        "content": {"content_type": "text", "parts": [format!("answer {index}")]}}},
+                },
+            })
+        };
+        let all: Vec<_> = (0..8).map(conversation).collect();
+        let directory = TempDir::new().unwrap();
+        let import = |name: &str, shards: Vec<serde_json::Value>| {
+            let export = directory.path().join(name);
+            fs::create_dir_all(&export).unwrap();
+            for (index, shard) in shards.into_iter().enumerate() {
+                fs::write(
+                    export.join(format!("conversations-{index:03}.json")),
+                    shard.to_string(),
+                )
+                .unwrap();
+            }
+            let pile = directory.path().join(format!("{name}.pile"));
+            let key = directory.path().join(format!("{name}.key"));
+            fs::File::create(&pile).unwrap();
+            crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let mut writer =
+                crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
+            writer.set_piece_bits(2);
+            let mut emitted = 0usize;
+            let summary = project_path(&export, |projected| {
+                if projected.record.is_some() {
+                    emitted += 1;
+                }
+                writer.stage(projected.fragment, projected.identity)
+            })
+            .unwrap();
+            writer.close(Ok(())).unwrap();
+            assert_eq!(summary.stats.projections_emitted, emitted, "{name}");
+            let mut store = crate::storage::open_pile_strict(&pile).unwrap();
+            let snapshot = store.snapshot().unwrap();
+            let commits: BTreeSet<[u8; 32]> = crate::storage::discovered_records(&snapshot)
+                .unwrap()
+                .commits()
+                .iter()
+                .map(|commit| {
+                    let _: TribleSet = snapshot
+                        .get::<TribleSet, SimpleArchive>(Handle::from_hash(commit.data()))
+                        .unwrap();
+                    commit.data().raw
+                })
+                .collect();
+            drop(snapshot);
+            store.close().unwrap();
+            (commits, emitted)
+        };
+        let (once, once_nodes) = import("once", vec![serde_json::json!(all.clone())]);
+        let (twice, twice_nodes) = import(
+            "twice",
+            vec![
+                serde_json::json!(all.clone()),
+                serde_json::json!(all[2..5].to_vec()),
+            ],
+        );
+        assert_eq!(once_nodes, 16);
+        assert_eq!(twice_nodes, once_nodes);
+        assert_eq!(once, twice);
     }
 }

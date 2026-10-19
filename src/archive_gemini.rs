@@ -1494,4 +1494,30 @@ mod tests {
         }
         assert!(piece_checks > 0, "no pair exercised the COMMIT check");
     }
+
+    /// The summary counts the nodes emitted: a collapsed tie counts once.
+    #[test]
+    fn a_collapsed_tie_counts_once_in_the_summary() {
+        let first =
+            card("Prompted&nbsp;same question<br>18 Sept 2025, 12:01:52 CET<br><p>one answer</p>");
+        let second = card(
+            "Prompted&nbsp;same question<br>18 Sept 2025, 12:01:52 CET<br><p>another answer</p>",
+        );
+        let mut emitted = 0usize;
+        let summary = project_bytes(
+            "My Activity.html",
+            Bytes::from_source(format!("{PREFIX}{first}{second}{SUFFIX}").into_bytes()),
+            &std::collections::BTreeMap::new(),
+            |projected| {
+                if projected.record.is_some() {
+                    emitted += 1;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted, 3, "the shared prompt and two answers");
+        assert_eq!(summary.stats.projections_emitted, emitted);
+        assert_eq!(summary.stats.content_parts, emitted);
+    }
 }

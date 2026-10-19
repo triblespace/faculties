@@ -52,6 +52,11 @@ impl Fixture {
         parts
     }
     fn cli(&self, args: &[&str]) -> Vec<Part> {
+        let (result, parts) = self.try_cli(args);
+        result.unwrap();
+        parts
+    }
+    fn try_cli(&self, args: &[&str]) -> (anyhow::Result<()>, Vec<Part>) {
         let mut argv = vec![
             "archive",
             "--pile",
@@ -62,15 +67,14 @@ impl Fixture {
         argv.extend_from_slice(args);
         let cli = cli::Cli::try_parse_from(argv).unwrap();
         let mut parts = Vec::new();
-        cli::execute(
+        let result = cli::execute(
             cli,
             &mut Out::new(&mut |p| {
                 parts.push(p);
                 Ok(())
             }),
-        )
-        .unwrap();
-        parts
+        );
+        (result, parts)
     }
     fn projections(&self) -> Vec<Id> {
         let observed = pollster::block_on(faculties::archive_collection::ensure_local(
@@ -676,6 +680,79 @@ fn every_import_route_stages_through_the_writer() {
             path.display()
         );
     }
+}
+
+/// A fill over thousands of files must not stop at one bad path: a missing
+/// file, and a source that fails to project, are reported and skipped, the
+/// rest of the list is imported, and the command still ends in an error so
+/// its status is nonzero. Lines are kept verbatim except a CRLF ending, and
+/// empty lines are skipped.
+#[test]
+fn paths_from_skips_failing_paths_and_reports_them() {
+    let fixture = Fixture::new();
+    let directory = fixture.directory.path();
+    let alpha = directory.join("alpha.jsonl");
+    let gamma = directory.join("with space.jsonl");
+    fs::write(&alpha, CODE.replace("resident", "alpha")).unwrap();
+    fs::write(&gamma, CODE.replace("resident", "gamma")).unwrap();
+    let malformed = directory.join("malformed.jsonl");
+    fs::write(&malformed, format!("{CODE}\n{{invalid\n")).unwrap();
+    let list = format!(
+        "{}\r\n{}\r\n\r\n{}\r\n{}\r\n",
+        alpha.display(),
+        directory.join("missing.jsonl").display(),
+        malformed.display(),
+        gamma.display(),
+    );
+    let list_path = directory.join("paths.txt");
+    fs::write(&list_path, list).unwrap();
+    let (result, parts) = fixture.try_cli(&[
+        "import",
+        "--paths-from",
+        list_path.to_str().unwrap(),
+        "--source",
+        "claude-code",
+    ]);
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("2 of 4 path(s) could not be imported"),
+        "{error}"
+    );
+    assert_eq!(
+        text(&parts)
+            .matches("Archive collection: 1 piece(s)")
+            .count(),
+        2,
+        "the two readable sessions, the one with a space in its name included"
+    );
+}
+
+/// A list line that is not UTF-8 refuses the whole list, naming the line,
+/// before anything is imported.
+#[test]
+fn paths_from_refuses_a_line_that_is_not_utf8() {
+    let fixture = Fixture::new();
+    let directory = fixture.directory.path();
+    let alpha = directory.join("alpha.jsonl");
+    fs::write(&alpha, CODE).unwrap();
+    let mut list = format!("{}\n", alpha.display()).into_bytes();
+    list.extend_from_slice(b"/tmp/not\xffutf8.jsonl\n");
+    let list_path = directory.join("paths.txt");
+    fs::write(&list_path, list).unwrap();
+    let length = fs::metadata(&fixture.pile).unwrap().len();
+    let (result, _) = fixture.try_cli(&[
+        "import",
+        "--paths-from",
+        list_path.to_str().unwrap(),
+        "--source",
+        "claude-code",
+    ]);
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(
+        error.contains("--paths-from line 2 is not UTF-8"),
+        "{error}"
+    );
+    assert_eq!(fs::metadata(&fixture.pile).unwrap().len(), length);
 }
 
 /// A long list of paths imports per path in one process: one open of the

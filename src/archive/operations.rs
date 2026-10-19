@@ -2003,7 +2003,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_path_import_failure_keeps_earlier_commits_and_stops() {
+    fn multi_path_import_skips_failing_paths_and_continues() {
         let fixture = fixture();
         let directory = fixture._directory.path();
         let first = claude_code_session(directory, "first");
@@ -2019,33 +2019,35 @@ mod tests {
             r#"{"type":"user","sessionId":"shared","uuid":"message","message":{"role":"user","content":"different"}}"#,
         )
         .unwrap();
+        let missing = directory.join("gone.jsonl");
         let later = claude_code_session(directory, "later");
 
-        let (result, outcomes) =
-            import_outcomes(&fixture, &[first.clone(), conflict.clone(), later.clone()]);
+        let (result, outcomes) = import_outcomes(
+            &fixture,
+            &[first.clone(), conflict.clone(), missing, later.clone()],
+        );
         let error = format!("{:#}", result.unwrap_err());
         assert!(
-            error.contains(&format!("import {}", conflict.display())),
+            error.contains("2 of 4 path(s) could not be imported"),
             "{error}"
         );
-        assert!(error.contains("conflicting semantic payloads"), "{error}");
         assert_eq!(
             appended_all(&outcomes),
-            [true],
-            "the failure stops the command"
+            [true, true],
+            "the paths around the failures are imported"
         );
         assert_eq!(
             archive_root_payloads(&fixture),
-            3,
-            "the earlier COMMITs stay"
+            5,
+            "the vocabulary and two paths' two COMMITs"
         );
         let archive = storage(&fixture).load().unwrap();
-        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
+        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 4);
         drop(archive);
 
         let (result, outcomes) = import_outcomes(&fixture, &[first, later]);
         result.unwrap();
-        assert_eq!(appended_all(&outcomes), [false, true]);
+        assert_eq!(appended_all(&outcomes), [false, false]);
         assert_eq!(archive_root_payloads(&fixture), 5);
     }
 

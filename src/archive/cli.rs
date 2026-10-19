@@ -169,12 +169,15 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
 /// path spends most of its time opening. Atomicity is per path, never per
 /// process.
 ///
-/// A failure names the path that caused it and stops the command. Every path
-/// before it stays committed, each its own atomic publication. The failing
-/// path's staged facts are dropped unpublished: `close` commits nothing after
-/// an error, and payload bytes it already appended stay unreachable until a
-/// later COMMIT names them. Paths after it are not read; rerunning the same
-/// command republishes nothing for the paths already committed.
+/// A path whose source cannot be projected (missing, changed while it was
+/// read, malformed) is reported on standard error and skipped: its staged
+/// facts are dropped unpublished, payload bytes it already appended stay
+/// unreachable until a later COMMIT names them, and the rest of the list
+/// continues. The command then ends with an error naming how many paths it
+/// skipped, so its status is nonzero. A failure of the pile itself (staging,
+/// publishing, measuring) or of the output stops the command at once. Every
+/// path before a failure stays committed, each its own atomic publication;
+/// rerunning the same command republishes nothing for those.
 pub(super) fn import_paths(
     pile: &Path,
     key: Option<&Path>,
@@ -185,14 +188,45 @@ pub(super) fn import_paths(
 ) -> Result<()> {
     let mut writer = ArchiveImportWriter::open(pile, key)?;
     let total = paths.len();
-    let result = paths.iter().enumerate().try_for_each(|(index, path)| {
+    let mut skipped = Vec::new();
+    let mut result = Ok(());
+    for (index, path) in paths.iter().enumerate() {
         if total > 1 {
             eprintln!("[{}/{total}] {}", index + 1, path.display());
         }
-        import_into(&mut writer, pile, path, source, finished_before, out)
-            .with_context(|| format!("import {}", path.display()))
-    });
+        match import_into(&mut writer, pile, path, source, finished_before, out) {
+            Ok(()) => {}
+            Err(PathFailure::Skip(error)) => {
+                eprintln!("archive import: skipped {}: {error:#}", path.display());
+                writer.abandon_unit();
+                skipped.push(error.context(format!("import {}", path.display())));
+            }
+            Err(PathFailure::Fatal(error)) => {
+                result = Err(error.context(format!("import {}", path.display())));
+                break;
+            }
+        }
+    }
+    if result.is_ok() && !skipped.is_empty() {
+        // What was imported stays committed; the skips make the status fail.
+        writer.close(Ok(()))?;
+        let count = skipped.len();
+        let first = skipped.remove(0);
+        if total == 1 {
+            return Err(first);
+        }
+        return Err(first.context(format!(
+            "{count} of {total} path(s) could not be imported and were skipped; the first"
+        )));
+    }
     writer.close(result)
+}
+
+/// Why one path of an import failed: its source (skip it and go on), or the
+/// pile or the output (stop).
+enum PathFailure {
+    Skip(anyhow::Error),
+    Fatal(anyhow::Error),
 }
 
 /// Project one source PATH into the open writer and publish its pieces.
@@ -208,12 +242,14 @@ fn import_into(
     source: CliImportSource,
     finished_before: Option<std::time::SystemTime>,
     out: &mut Out<'_>,
-) -> Result<()> {
-    let before = pile_length(pile)?;
+) -> std::result::Result<(), PathFailure> {
+    let before = pile_length(pile).map_err(PathFailure::Fatal)?;
+    let mut storage_failed = false;
     let mut stage = |fragment: Fragment, identity: Identity, source_path: &Path| {
         writer
             .stage(fragment, identity)
             .with_context(|| format!("stage {}", source_path.display()))
+            .inspect_err(|_| storage_failed = true)
     };
     let summary = match source {
         CliImportSource::Agy => {
@@ -248,22 +284,51 @@ fn import_into(
             archive_gemini::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::Gemini)
         }
-    }?;
-    let unit = writer.commit_unit()?;
-    let appended = pile_length(pile)?.saturating_sub(before);
-    summary.write(
-        &Publication {
-            unit,
-            appended: Some(appended),
-        },
-        out,
-    )
+    };
+    let summary = summary.map_err(|error| {
+        if storage_failed {
+            PathFailure::Fatal(error)
+        } else {
+            PathFailure::Skip(error)
+        }
+    })?;
+    let unit = writer.commit_unit().map_err(PathFailure::Fatal)?;
+    let appended = pile_length(pile)
+        .map_err(PathFailure::Fatal)?
+        .saturating_sub(before);
+    summary
+        .write(
+            &Publication {
+                unit,
+                appended: Some(appended),
+            },
+            out,
+        )
+        .map_err(PathFailure::Fatal)
 }
 
 fn pile_length(pile: &Path) -> Result<u64> {
     Ok(std::fs::metadata(pile)
         .with_context(|| format!("measure pile {}", pile.display()))?
         .len())
+}
+
+/// The paths of a `--paths-from` list: one per line, kept verbatim except
+/// for a line ending's carriage return; empty lines are skipped. A line that
+/// is not UTF-8 refuses the whole list, naming the line, before anything is
+/// imported.
+fn paths_from_list(bytes: &[u8]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let line = std::str::from_utf8(line)
+            .map_err(|_| anyhow!("--paths-from line {} is not UTF-8", index + 1))?;
+        paths.push(PathBuf::from(line));
+    }
+    Ok(paths)
 }
 
 /// A `--finished-after` age such as `90s`, `1h` or `2days`.
@@ -285,18 +350,16 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             finished_after,
         } => {
             if let Some(list) = paths_from {
-                let text = if list.as_os_str() == "-" {
-                    std::io::read_to_string(std::io::stdin())
-                        .context("read paths from standard input")?
+                let bytes = if list.as_os_str() == "-" {
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+                        .context("read paths from standard input")?;
+                    bytes
                 } else {
-                    std::fs::read_to_string(&list)
+                    std::fs::read(&list)
                         .with_context(|| format!("read paths from {}", list.display()))?
                 };
-                path.extend(
-                    text.lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .map(PathBuf::from),
-                );
+                path.extend(paths_from_list(&bytes)?);
             }
             if path.is_empty() {
                 bail!("archive import needs at least one PATH or a --paths-from list");

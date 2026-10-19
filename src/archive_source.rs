@@ -765,8 +765,6 @@ where
                     identity,
                     record: Some(record.locator.clone()),
                 });
-                stats.projections_emitted += 1;
-                stats.content_parts += 1;
                 frontier = BTreeSet::from([node_id]);
             }
             frontiers[index] = frontier;
@@ -786,6 +784,9 @@ where
             .unwrap_or_default();
         if emitted_keys.insert(key) {
             for projected in fragments {
+                // Counted as emitted, so a collapsed tie counts once.
+                stats.projections_emitted += 1;
+                stats.content_parts += 1;
                 emit(projected)?;
             }
         }
