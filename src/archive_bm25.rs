@@ -746,6 +746,7 @@ mod tests {
         let host = key.verifying_key();
         let mut unread_seen = 0;
         let mut attachments_taken = 0;
+        let mut host_merges = 0;
         for seed in 0..24u64 {
             let mut random = Stream(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) + 7);
             let mut store = MemoryRepo::for_host(host);
@@ -757,7 +758,9 @@ mod tests {
             let target = store
                 .attach_with(root, ArchiveBlockTextBm25Mapping)
                 .unwrap();
-            for _ in 0..2 + random.below(8) {
+            // Enough commits that a host merge can name eight distinct nodes:
+            // the collection algebra accepts exactly eight-way MERGEs.
+            for _ in 0..8 + random.below(8) {
                 let words: Vec<&str> = (0..1 + random.below(3))
                     .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
                     .collect();
@@ -794,18 +797,16 @@ mod tests {
                 }
                 seen.into_iter().collect::<Vec<_>>()
             };
-            // Host merges over random, possibly overlapping, nodes: some hold
-            // both halves of a split block, some only one.
+            // Host merges over eight random, possibly overlapping, nodes: some
+            // hold both halves of a split block, some only one.
             for _ in 0..random.below(5) {
                 let lattice = nodes(&mut store);
-                if lattice.len() < 2 {
+                if lattice.len() < 8 {
                     break;
                 }
-                let picked: BTreeSet<CollectionData> = (0..2 + random.below(3))
-                    .map(|_| lattice[random.below(lattice.len() as u64) as usize])
-                    .collect();
-                if picked.len() < 2 {
-                    continue;
+                let mut picked: BTreeSet<CollectionData> = BTreeSet::new();
+                while picked.len() < 8 {
+                    picked.insert(lattice[random.below(lattice.len() as u64) as usize]);
                 }
                 let snapshot = store.snapshot().unwrap();
                 let blobs: Vec<Blob<SimpleArchive>> = picked
@@ -832,6 +833,7 @@ mod tests {
                         .unwrap(),
                     ))
                     .unwrap();
+                host_merges += 1;
             }
             // An attachment at random nodes, wherever one can be built.
             for node in nodes(&mut store) {
@@ -922,6 +924,7 @@ mod tests {
         // and attachments taken.
         assert!(unread_seen > 0);
         assert!(attachments_taken > 0);
+        assert!(host_merges > 0, "no seed reached an eight-way host merge");
     }
 
     // The three ignored tests below show the cover law failing when one
