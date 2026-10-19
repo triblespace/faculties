@@ -1408,17 +1408,43 @@ mod tests {
     /// Two cards with the same prompt in the same second project the same
     /// prompt node with the same receipt: their records emit the same facts.
     /// They are emitted once and release both answers together, so the page
-    /// order of the two cards changes no COMMIT.
+    /// order of the two cards changes nothing: not the emitted sequence, and
+    /// so not one COMMIT. Many prompt and answer texts are tried, because
+    /// whether a position-based order would show depends on how the answer
+    /// nodes' ids compare with the prompt's.
     #[test]
     fn same_second_same_prompt_cards_publish_the_same_commits_in_either_order() {
         use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-        let first =
-            card("Prompted&nbsp;same question<br>18 Sept 2025, 12:01:52 CET<br><p>one answer</p>");
-        let second = card(
-            "Prompted&nbsp;same question<br>18 Sept 2025, 12:01:52 CET<br><p>another answer</p>",
-        );
+        use triblespace::core::blob::{Blob, IntoBlob};
+        let emitted = |html: String| -> Vec<(Fragment, crate::blockdag::Identity)> {
+            let mut out = Vec::new();
+            project_bytes(
+                "My Activity.html",
+                Bytes::from_source(html.into_bytes()),
+                &std::collections::BTreeMap::new(),
+                |projected| {
+                    out.push((projected.fragment, projected.identity));
+                    Ok(())
+                },
+            )
+            .unwrap();
+            out
+        };
+        let digests = |sequence: &[(Fragment, crate::blockdag::Identity)]| -> Vec<[u8; 32]> {
+            sequence
+                .iter()
+                .map(|(fragment, _)| {
+                    let blob: Blob<SimpleArchive> = fragment.facts().clone().to_blob();
+                    blob.get_handle().raw
+                })
+                .collect()
+        };
+        let trailing = |node: Id| {
+            let raw: [u8; 16] = node.into();
+            u128::from_be_bytes(raw).trailing_zeros()
+        };
         let directory = TempDir::new().unwrap();
-        let commits = |name: &str, html: String| -> BTreeSet<[u8; 32]> {
+        let commits = |name: String, sequence: Vec<(Fragment, crate::blockdag::Identity)>| {
             let pile = directory.path().join(format!("{name}.pile"));
             let key = directory.path().join(format!("{name}.key"));
             fs::File::create(&pile).unwrap();
@@ -1426,37 +1452,46 @@ mod tests {
             let mut writer =
                 crate::archive_collection::ArchiveImportWriter::open(&pile, Some(&key)).unwrap();
             writer.set_piece_bits(1);
-            project_bytes(
-                "My Activity.html",
-                Bytes::from_source(html.into_bytes()),
-                &std::collections::BTreeMap::new(),
-                |projected| writer.stage(projected.fragment, projected.identity),
-            )
-            .unwrap();
-            writer.close(Ok(())).unwrap();
-            let mut store = crate::storage::open_pile_strict(&pile).unwrap();
-            let snapshot = store.snapshot().unwrap();
-            let out = crate::storage::discovered_records(&snapshot)
-                .unwrap()
-                .commits()
+            for (fragment, identity) in sequence {
+                writer.stage(fragment, identity).unwrap();
+            }
+            let (_, publication) = writer.finish(Ok(())).unwrap();
+            publication
+                .commits
                 .iter()
-                .map(|commit| {
-                    let _: TribleSet =
-                        triblespace::core::repo::BlobStoreGet::get::<TribleSet, SimpleArchive>(
-                            &snapshot,
-                            triblespace::prelude::inlineencodings::Handle::from_hash(commit.data()),
-                        )
-                        .unwrap();
-                    commit.data().raw
-                })
-                .collect();
-            drop(snapshot);
-            store.close().unwrap();
-            out
+                .map(|commit| commit.data().raw)
+                .collect::<BTreeSet<_>>()
         };
-        let forward = commits("forward", format!("{PREFIX}{first}{second}{SUFFIX}"));
-        let backward = commits("backward", format!("{PREFIX}{second}{first}{SUFFIX}"));
-        assert!(forward.len() >= 3, "{}", forward.len());
-        assert_eq!(forward, backward);
+        let mut piece_checks = 0usize;
+        for j in 0..8 {
+            for i in 0..8 {
+                let first = card(&format!(
+                    "Prompted&nbsp;same question {j}<br>18 Sept 2025, 12:01:52 CET<br><p>answer A{i}</p>"
+                ));
+                let second = card(&format!(
+                    "Prompted&nbsp;same question {j}<br>18 Sept 2025, 12:01:52 CET<br><p>answer B{i}</p>"
+                ));
+                let forward = emitted(format!("{PREFIX}{first}{second}{SUFFIX}"));
+                let backward = emitted(format!("{PREFIX}{second}{first}{SUFFIX}"));
+                assert!(forward.len() >= 3, "{}", forward.len());
+                assert_eq!(digests(&forward), digests(&backward), "j={j} i={i}");
+                // Where the prompt node ends a piece at one bit and no answer
+                // does, compare the COMMITs too.
+                let prompt = forward[0].1.nodes()[0];
+                let answers_end = forward
+                    .iter()
+                    .flat_map(|(_, identity)| identity.nodes().iter().copied())
+                    .any(|node| node != prompt && trailing(node) >= 1);
+                if piece_checks < 2 && trailing(prompt) >= 1 && !answers_end {
+                    piece_checks += 1;
+                    assert_eq!(
+                        commits(format!("forward-{j}-{i}"), forward),
+                        commits(format!("backward-{j}-{i}"), backward),
+                        "j={j} i={i}"
+                    );
+                }
+            }
+        }
+        assert!(piece_checks > 0, "no pair exercised the COMMIT check");
     }
 }
