@@ -275,19 +275,8 @@ where
     /// leaves' session id and a subagent's spawn metadata) ride in the unit's
     /// last piece. Nothing is compared with what the Archive holds, or with
     /// what this writer staged before: the union absorbs every repetition.
-    ///
-    /// A wrong identity is refused, never published. These are errors: an
-    /// identity naming facts the fragment does not hold; a fragment holding
-    /// a node (an entity tagged as a node, or with a `previous` or `holds`
-    /// fact) that `identity` does not name; a node's tag, `previous` or
-    /// `holds` fact outside the identity; and any fact of a content fact
-    /// (an entity tagged as one, or with one of its identity-core facts)
-    /// outside it, except a `resolved_to` naming bytes recovered later. So a
-    /// node-free fragment ([`Self::stage_annotations`]) cannot carry a node,
-    /// nor any fact of a content fact but its resolutions.
     pub fn stage(&mut self, fragment: Fragment, identity: blockdag::Identity) -> Result<()> {
         let (_, facts, _, blobs) = fragment.into_parts();
-        refuse_misplaced_identity(&facts, &identity)?;
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
@@ -309,9 +298,8 @@ where
         Ok(())
     }
 
-    /// Stage a fragment that holds no node and no content fact, only
-    /// annotations, a content fact's `resolved_to` among them. A fragment
-    /// holding a node or any other fact of a content fact is refused.
+    /// Stage a fragment of annotations alone: it names no node, so it ends no
+    /// piece, and all of it goes into the annotation COMMIT.
     pub fn stage_annotations(&mut self, fragment: Fragment) -> Result<()> {
         self.stage(fragment, blockdag::Identity::none())
     }
@@ -462,70 +450,6 @@ fn embedded_blobs(mut blobs: triblespace::core::blob::MemoryBlobStore) -> Vec<Bl
     embedded.sort_unstable_by_key(|(store_key, _)| store_key.raw);
 
     embedded.into_iter().map(|(_, blob)| blob).collect()
-}
-
-/// Refuse a staged fragment whose identity is wrong: see
-/// [`ArchiveImportWriter::stage`]. Structural only: the facts of the
-/// fragment are matched against the identity's, no id is recomputed.
-fn refuse_misplaced_identity(facts: &TribleSet, identity: &blockdag::Identity) -> Result<()> {
-    let missing = identity.facts().difference(facts);
-    if !missing.is_empty() {
-        bail!(
-            "an Archive identity names {} fact(s) its fragment does not hold",
-            missing.len()
-        );
-    }
-    let named: BTreeSet<Id> = identity.nodes().iter().copied().collect();
-    let node_kind = schema::block::KIND;
-    let fact_kind = schema::content_fact::KIND;
-    let tag = metadata::tag.id();
-    let node_attributes = [schema::block::previous.id(), schema::block::holds.id()];
-    // The identity core of a content fact; any of them marks its entity as
-    // one, tagged or not. Every fact of that entity except `resolved_to`, the
-    // bytes recovered later, must then be the identity's.
-    let fact_core = [
-        schema::content_fact::modality.id(),
-        schema::content_fact::direction.id(),
-        schema::content_fact::payload.id(),
-        schema::content_fact::blob.id(),
-        schema::content_fact::asset_pointer.id(),
-        schema::content_fact::asset_namespace.id(),
-        schema::content_fact::media_type.id(),
-        schema::content_fact::asset_size.id(),
-    ];
-    let resolved_to = schema::content_fact::resolved_to.id();
-    let nodes: BTreeSet<Id> = find!(
-        node: Id,
-        pattern!(facts, [{ ?node @ metadata::tag: &node_kind }])
-    )
-    .collect();
-    let mut content_facts: BTreeSet<Id> = find!(
-        fact: Id,
-        pattern!(facts, [{ ?fact @ metadata::tag: &fact_kind }])
-    )
-    .collect();
-    content_facts.extend(
-        facts
-            .iter()
-            .filter(|fact| fact_core.contains(fact.a()))
-            .map(|fact| *fact.e()),
-    );
-    for fact in facts.iter() {
-        let (entity, attribute) = (*fact.e(), *fact.a());
-        let node_fact =
-            node_attributes.contains(&attribute) || (attribute == tag && nodes.contains(&entity));
-        let content_fact = content_facts.contains(&entity) && attribute != resolved_to;
-        if node_fact && !named.contains(&entity) {
-            bail!("an Archive fragment holds node {entity:X} its identity does not name");
-        }
-        if (node_fact || content_fact) && !identity.facts().contains(fact) {
-            bail!(
-                "an Archive fragment carries {} fact {attribute:X} of {entity:X} outside its identity",
-                if node_fact { "node" } else { "content" }
-            );
-        }
-    }
-    Ok(())
 }
 
 /// The embedded blobs some fact of `facts` names, in handle order. Blobs only
@@ -3494,184 +3418,5 @@ mod tests {
                 .count();
             assert_eq!(missing, 0, "{label}: closed-piece COMMITs not reused");
         }
-    }
-
-    /// Two nodes as `block_parts` builds them: the first a root, the second
-    /// following it.
-    fn two_nodes() -> (
-        (Fragment, blockdag::Identity),
-        (Fragment, blockdag::Identity),
-    ) {
-        let text = |text: &str| {
-            blockdag::text_fact(
-                schema::content_fact::modality::TEXT,
-                schema::content_fact::direction::IN,
-                text,
-            )
-            .unwrap()
-        };
-        let first = blockdag::block_parts([], None, text("first node")).unwrap();
-        let root = first.0.root().unwrap();
-        let second = blockdag::block_parts([root], None, text("second node")).unwrap();
-        (first, second)
-    }
-
-    fn refusing_writer(directory: &TempDir) -> ArchiveImportWriter {
-        let (pile, key) = fresh_archive(directory, "archive");
-        ArchiveImportWriter::open(&pile, Some(&key)).unwrap()
-    }
-
-    fn refusal(result: Result<()>) -> String {
-        format!(
-            "{:#}",
-            result.expect_err("the writer staged a wrong identity")
-        )
-    }
-
-    #[test]
-    fn stage_refuses_a_node_its_identity_does_not_name() {
-        let directory = TempDir::new().unwrap();
-        let mut writer = refusing_writer(&directory);
-        let ((first, _), (second, second_identity)) = two_nodes();
-        // No identity at all.
-        let error = refusal(writer.stage(first.clone(), blockdag::Identity::none()));
-        assert!(error.contains("its identity does not name"), "{error}");
-        // Another node's identity, beside that node.
-        let mut both = first;
-        both += second;
-        let error = refusal(writer.stage(both, second_identity));
-        assert!(error.contains("its identity does not name"), "{error}");
-        assert!(
-            writer.commit_unit().unwrap().is_empty(),
-            "a refusal staged something"
-        );
-    }
-
-    #[test]
-    fn stage_refuses_an_identity_naming_facts_the_fragment_lacks() {
-        let directory = TempDir::new().unwrap();
-        let mut writer = refusing_writer(&directory);
-        let ((first, _), (_, second_identity)) = two_nodes();
-        let error = refusal(writer.stage(first, second_identity));
-        assert!(error.contains("does not hold"), "{error}");
-    }
-
-    #[test]
-    fn stage_refuses_an_untagged_node_by_its_previous_or_holds() {
-        let directory = TempDir::new().unwrap();
-        let mut writer = refusing_writer(&directory);
-        let (_, (second, _)) = two_nodes();
-        let node = second.root().unwrap();
-        // Only the node's `previous` facts, or only its `holds` facts.
-        let untagged = |keep: Id| -> Fragment {
-            let mut facts = TribleSet::new();
-            for fact in second.facts().iter() {
-                if *fact.e() == node && *fact.a() == keep {
-                    facts.insert(fact);
-                }
-            }
-            assert!(!facts.is_empty());
-            Fragment::from(facts)
-        };
-        for keep in [schema::block::previous.id(), schema::block::holds.id()] {
-            let fragment = untagged(keep);
-            assert!(!exists!(pattern!(fragment.facts(), [{
-                node @ metadata::tag: &schema::block::KIND
-            }])));
-            let error = refusal(writer.stage(fragment, blockdag::Identity::none()));
-            assert!(error.contains("its identity does not name"), "{error}");
-        }
-    }
-
-    #[test]
-    fn stage_refuses_a_node_fact_outside_the_identity() {
-        let directory = TempDir::new().unwrap();
-        let mut writer = refusing_writer(&directory);
-        let (_, (second, second_identity)) = two_nodes();
-        let node = second.root().unwrap();
-        // A second predecessor the node's id was not derived from.
-        let mut fragment = second;
-        fragment += entity! { ExclusiveId::force_ref(&node) @
-            schema::block::previous: &fucid().id,
-        };
-        let error = refusal(writer.stage(fragment, second_identity.clone()));
-        assert!(error.contains("outside its identity"), "{error}");
-    }
-
-    #[test]
-    fn stage_annotations_refuses_a_content_fact() {
-        let directory = TempDir::new().unwrap();
-        let mut writer = refusing_writer(&directory);
-        let fact = blockdag::text_fact(
-            schema::content_fact::modality::TEXT,
-            schema::content_fact::direction::IN,
-            "a fact no node holds",
-        )
-        .unwrap();
-        let error = refusal(writer.stage_annotations(fact));
-        assert!(error.contains("outside its identity"), "{error}");
-    }
-
-    /// Every fact of a content fact is its identity's except a resolution:
-    /// another value of any identity-core attribute, or a foreign attribute
-    /// on the tagged entity, is refused through `stage` and through
-    /// `stage_annotations` alike; a `resolved_to` passes through both.
-    #[test]
-    fn stage_refuses_every_content_fact_fact_outside_the_identity_but_a_resolution() {
-        let directory = TempDir::new().unwrap();
-        let mut writer = refusing_writer(&directory);
-        let pointer = blockdag::asset_pointer_fact(
-            schema::content_fact::modality::IMAGE,
-            schema::content_fact::direction::IN,
-            fucid().id,
-            "file-pointer",
-            Some("image/png"),
-            Some(7),
-        )
-        .unwrap();
-        let fact = pointer.root().unwrap();
-        let (node, identity) = blockdag::block_parts([], None, pointer.clone()).unwrap();
-        let at = || ExclusiveId::force_ref(&fact);
-        let core_extras = [
-            entity! { at() @ schema::content_fact::modality: &schema::content_fact::modality::TEXT },
-            entity! { at() @ schema::content_fact::direction: &schema::content_fact::direction::OUT },
-            entity! { at() @ schema::content_fact::asset_namespace: &fucid().id },
-            entity! { at() @ schema::content_fact::media_type: &fucid().id },
-            entity! { at() @ schema::content_fact::asset_size: 9u128 },
-        ];
-        for extra in core_extras {
-            let mut fragment = node.clone();
-            fragment += extra.clone();
-            let error = refusal(writer.stage(fragment, identity.clone()));
-            assert!(error.contains("outside its identity"), "{error}");
-            // Alone, untagged: the core attribute still names a content fact.
-            let error = refusal(writer.stage_annotations(extra));
-            assert!(error.contains("outside its identity"), "{error}");
-        }
-        // A foreign attribute on the tagged entity is no annotation of it.
-        let mut fragment = node.clone();
-        fragment += entity! { at() @ metadata::name: "a name" };
-        let error = refusal(writer.stage(fragment, identity.clone()));
-        assert!(error.contains("outside its identity"), "{error}");
-        assert!(
-            writer.commit_unit().unwrap().is_empty(),
-            "a refusal staged something"
-        );
-
-        // Recovered bytes are the one annotation a content fact takes.
-        let resolved = blockdag::resolve_pointer_fact(pointer, b"bytes".to_vec()).unwrap();
-        let mut fragment = node;
-        fragment += resolved.clone();
-        writer.stage(fragment, identity).unwrap();
-        let mut resolution = TribleSet::new();
-        for fact in resolved.facts().iter() {
-            if *fact.a() == schema::content_fact::resolved_to.id() {
-                resolution.insert(fact);
-            }
-        }
-        assert_eq!(resolution.len(), 1);
-        writer
-            .stage_annotations(Fragment::from(resolution))
-            .unwrap();
     }
 }

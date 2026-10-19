@@ -660,8 +660,7 @@ fn a_held_back_tail_is_a_prefix_of_the_finished_projection() {
     assert!(import_finished(&held_back).contains(", 0 bytes appended"));
 }
 
-/// Every route also goes through the writer, which refuses a fragment whose
-/// identity does not name the nodes it holds.
+/// Every route also goes through the writer.
 #[test]
 fn every_import_route_stages_through_the_writer() {
     let fixture = Fixture::new();

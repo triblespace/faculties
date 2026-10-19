@@ -339,9 +339,7 @@ pub fn block(
 ///
 /// Only [`block_parts`] makes a node's identity; [`Identity::combine`] joins
 /// the identities of several nodes one fragment holds, and
-/// [`Identity::none`] is the identity of a fragment that holds no node. The
-/// import writer refuses a fragment holding a node its identity does not
-/// name, and an identity naming facts its fragment does not hold.
+/// [`Identity::none`] is the identity of a fragment that holds no node.
 #[derive(Clone, Debug)]
 pub struct Identity {
     /// The nodes whose identity this is; the import writer ends a piece on
