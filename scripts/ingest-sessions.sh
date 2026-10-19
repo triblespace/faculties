@@ -25,6 +25,11 @@
 # The stamp ($XDG_STATE_HOME/faculties/ingest-sessions.stamp) takes the START time
 # of a run that finished without error, so a file written during a run is seen
 # by the next one. A failed run leaves the stamp alone and exits non-zero.
+# A file the importer cannot read or project is no failure of the run: the
+# importer skips it, imports the rest and exits 4, the run goes on through
+# every chunk and root, the receipt line names the skipped files, and the
+# stamp moves past them. A skipped file is read again when it next changes.
+# Any other importer status is a failure: the run stops there.
 # Without a stamp the script refuses to run until told where to begin: on a host
 # whose sessions were already imported from a copy, re-reading all of them would
 # only cost hours, and that is a decision, not a default.
@@ -94,6 +99,7 @@ touch "$START"
 t0=$(date +%s)
 pile0=$(size "$PILE")
 files=0 bytes=0 pieces=0 commits=0
+SKIPPED=()
 OUT=$(mktemp) ERR=$(mktemp)
 trap 'rm -f "$OUT" "$ERR"; [ -x "$LOCK" ] && "$LOCK" release "$HOST" "ingest-sessions-$HOST" >/dev/null' EXIT
 
@@ -109,11 +115,23 @@ run_chunk() {
   local p c
   read -r p c < <(awk '/^Archive collection: /{p+=$3; c+=$6} END{print p+0, c+0}' "$OUT")
   pieces=$(( pieces + p )) commits=$(( commits + c ))
-  if [ $rc -ne 0 ]; then
-    echo "ingest-sessions: $src import failed (rc $rc) at: $(grep -E '^\[[0-9]+/[0-9]+\] ' "$ERR" | tail -1)" >&2
-    tail -5 "$ERR" >&2
-    exit $rc
-  fi
+  # The importer names each path it skipped alone on a line.
+  local line
+  while IFS= read -r line; do
+    SKIPPED+=("${line#archive import: skipped }")
+  done < <(grep '^archive import: skipped ' "$ERR")
+  case $rc in
+    0|4) ;;  # 4: the whole chunk was tried; the skipped paths are collected above
+    *)
+      # A failure stops the importer at the path it struck: the last one it
+      # announced, or the only one it was given.
+      local at
+      at=$(grep -E '^\[[0-9]+/[0-9]+\] ' "$ERR" | tail -1 | sed -E 's/^\[[0-9]+\/[0-9]+\] //')
+      [ -n "$at" ] || at=$1
+      echo "ingest-sessions: $src import failed (rc $rc) at: $at" >&2
+      tail -5 "$ERR" >&2
+      exit $rc ;;
+  esac
 }
 
 PAIRS=("claude-code:$CLAUDE_ROOT")
@@ -132,4 +150,10 @@ for pair in "${PAIRS[@]}"; do
 done
 
 mv "$START" "$STAMP"
-echo "ingest-sessions $HOST: $files file(s), $bytes source bytes, $pieces piece(s) in $commits COMMIT(s) published, pile +$(( $(size "$PILE") - pile0 )) bytes, $(( $(date +%s) - t0 )) s"
+skipped=""
+if [ ${#SKIPPED[@]} -gt 0 ]; then
+  skipped=", ${#SKIPPED[@]} skipped:"
+  for f in "${SKIPPED[@]}"; do skipped="$skipped $f;"; done
+  skipped=${skipped%;}
+fi
+echo "ingest-sessions $HOST: $files file(s), $bytes source bytes, $pieces piece(s) in $commits COMMIT(s) published, pile +$(( $(size "$PILE") - pile0 )) bytes, $(( $(date +%s) - t0 )) s$skipped"

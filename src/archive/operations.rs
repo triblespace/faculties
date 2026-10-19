@@ -2026,6 +2026,10 @@ mod tests {
             &fixture,
             &[first.clone(), conflict.clone(), missing, later.clone()],
         );
+        assert_eq!(
+            super::super::cli::exit_status(&result),
+            super::super::cli::SKIPPED_PATHS_STATUS
+        );
         let error = format!("{:#}", result.unwrap_err());
         assert!(
             error.contains("2 of 4 path(s) could not be imported"),
@@ -2049,6 +2053,38 @@ mod tests {
         result.unwrap();
         assert_eq!(appended_all(&outcomes), [false, false]);
         assert_eq!(archive_root_payloads(&fixture), 5);
+    }
+
+    /// A failure of the pile is no bad source: it stops the command with
+    /// status 1 at the path it struck, which is not reported as skipped, and
+    /// nothing is published.
+    #[test]
+    fn a_storage_failure_stops_the_import_instead_of_skipping_the_path() {
+        let fixture = fixture();
+        let directory = fixture._directory.path();
+        let first = claude_code_session(directory, "first");
+        let later = claude_code_session(directory, "later");
+        let mut writer =
+            archive_collection::ArchiveImportWriter::open(&fixture.pile, Some(&fixture.key))
+                .unwrap();
+        writer.fail_stages();
+        let result = super::super::cli::import_paths_with(
+            writer,
+            &fixture.pile,
+            &[first.clone(), later],
+            CliImportSource::ClaudeCode,
+            None,
+            &mut Out::new(&mut |_| Ok(())),
+        );
+        assert_eq!(super::super::cli::exit_status(&result), 1);
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("the pile refused a write"), "{error}");
+        assert!(
+            error.starts_with(&format!("import {}", first.display())),
+            "{error}"
+        );
+        assert!(!error.contains("skipped"), "{error}");
+        assert_eq!(archive_root_payloads(&fixture), 0);
     }
 
     #[test]

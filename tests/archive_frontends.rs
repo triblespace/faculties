@@ -85,6 +85,18 @@ impl Fixture {
         let facts = observed.facts().unwrap();
         find!(projection:Id,pattern!(&facts,[{?projection @ metadata::tag:&schema::source_projection::KIND}])).collect()
     }
+    fn facts(&self) -> TribleSet {
+        let observed = pollster::block_on(faculties::archive_collection::ensure_local(
+            &self.pile,
+            Some(&self.key),
+        ))
+        .unwrap();
+        let mut facts = TribleSet::new();
+        for fact in observed.facts().unwrap().iter() {
+            facts.insert(&fact);
+        }
+        facts
+    }
     fn roots(&self) -> usize {
         let observed = pollster::block_on(faculties::archive_collection::ensure_local(
             &self.pile,
@@ -695,14 +707,18 @@ fn paths_from_skips_failing_paths_and_reports_them() {
     let gamma = directory.join("with space.jsonl");
     fs::write(&alpha, CODE.replace("resident", "alpha")).unwrap();
     fs::write(&gamma, CODE.replace("resident", "gamma")).unwrap();
+    // Spaces around a real name are part of it.
+    let padded = directory.join(" padded.jsonl ");
+    fs::write(&padded, CODE.replace("resident", "padded")).unwrap();
     let malformed = directory.join("malformed.jsonl");
     fs::write(&malformed, format!("{CODE}\n{{invalid\n")).unwrap();
     let list = format!(
-        "{}\r\n{}\r\n\r\n{}\r\n{}\r\n",
+        "{}\r\n{}\r\n\r\n \t \n{}\r\n{}\r\n{}\n",
         alpha.display(),
         directory.join("missing.jsonl").display(),
         malformed.display(),
         gamma.display(),
+        padded.display(),
     );
     let list_path = directory.join("paths.txt");
     fs::write(&list_path, list).unwrap();
@@ -713,18 +729,76 @@ fn paths_from_skips_failing_paths_and_reports_them() {
         "--source",
         "claude-code",
     ]);
+    assert_eq!(cli::exit_status(&result), cli::SKIPPED_PATHS_STATUS);
     let error = format!("{:#}", result.unwrap_err());
     assert!(
-        error.contains("2 of 4 path(s) could not be imported"),
-        "{error}"
+        error.contains("2 of 5 path(s) could not be imported"),
+        "the blank and whitespace-only lines are no paths: {error}"
     );
     assert_eq!(
         text(&parts)
             .matches("Archive collection: 1 piece(s)")
             .count(),
-        2,
-        "the two readable sessions, the one with a space in its name included"
+        3,
+        "the three readable sessions, those with spaces in their names included"
     );
+}
+
+/// A directory that fails after its first file is staged publishes nothing
+/// of itself, under its own unit or the next path's: the archive is the one
+/// importing only the good paths makes.
+#[test]
+fn a_path_failing_after_it_staged_leaves_the_archive_of_the_good_paths() {
+    let fixture = Fixture::new();
+    let directory = fixture.directory.path();
+    let alpha = directory.join("alpha.jsonl");
+    let gamma = directory.join("gamma.jsonl");
+    fs::write(&alpha, CODE.replace("resident", "alpha")).unwrap();
+    fs::write(&gamma, CODE.replace("resident", "gamma")).unwrap();
+    // The project's first transcript projects; the second's subagent
+    // metadata is not JSON, which fails the directory after that.
+    let project = directory.join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(
+        project.join("a-first.jsonl"),
+        CODE.replace("resident", "staged-then-dropped"),
+    )
+    .unwrap();
+    fs::write(
+        project.join("b-second.jsonl"),
+        CODE.replace("resident", "second"),
+    )
+    .unwrap();
+    fs::write(project.join("b-second.meta.json"), "{not json").unwrap();
+    let path = |path: &PathBuf| path.to_str().unwrap().to_owned();
+    let (result, parts) = fixture.try_cli(&[
+        "import",
+        "--source",
+        "claude-code",
+        &path(&alpha),
+        &path(&project),
+        &path(&gamma),
+    ]);
+    assert_eq!(cli::exit_status(&result), cli::SKIPPED_PATHS_STATUS);
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("1 of 3 path(s)"), "{error}");
+    assert!(error.contains("b-second.meta.json"), "{error}");
+    assert_eq!(
+        text(&parts).matches("Archive collection: ").count(),
+        2,
+        "the two good paths"
+    );
+
+    let good = Fixture::new();
+    good.cli(&[
+        "import",
+        "--source",
+        "claude-code",
+        &path(&alpha),
+        &path(&gamma),
+    ]);
+    assert_eq!(fixture.facts(), good.facts());
+    assert_eq!(fixture.roots(), good.roots());
 }
 
 /// A list line that is not UTF-8 refuses the whole list, naming the line,

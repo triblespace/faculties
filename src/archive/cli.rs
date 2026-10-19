@@ -51,6 +51,10 @@ pub(super) enum Command {
     /// cuts differently from importing those files one by one: to converge
     /// with the daily ingest, pass the files themselves (for a long list,
     /// through `--paths-from`).
+    ///
+    /// A path that cannot be read or projected is reported as skipped and the
+    /// rest go on; the exit status is then 4. A failure of the pile stops the
+    /// command with status 1.
     Import {
         /// Source files (or a directory, where the adapter accepts one).
         #[arg(num_args = 0..)]
@@ -173,11 +177,11 @@ fn init_tracing(enabled: bool, filter: Option<&str>) {
 /// read, malformed) is reported on standard error and skipped: its staged
 /// facts are dropped unpublished, payload bytes it already appended stay
 /// unreachable until a later COMMIT names them, and the rest of the list
-/// continues. The command then ends with an error naming how many paths it
-/// skipped, so its status is nonzero. A failure of the pile itself (staging,
-/// publishing, measuring) or of the output stops the command at once. Every
-/// path before a failure stays committed, each its own atomic publication;
-/// rerunning the same command republishes nothing for those.
+/// continues. The command then ends with a [`SkippedPaths`] error, whose
+/// status is [`SKIPPED_PATHS_STATUS`]. A failure of the pile itself (staging,
+/// publishing, measuring) or of the output stops the command at once, with
+/// status 1. Every path before a failure stays committed, each its own atomic
+/// publication; rerunning the same command republishes nothing for those.
 pub(super) fn import_paths(
     pile: &Path,
     key: Option<&Path>,
@@ -186,7 +190,19 @@ pub(super) fn import_paths(
     finished_before: Option<std::time::SystemTime>,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let mut writer = ArchiveImportWriter::open(pile, key)?;
+    let writer = ArchiveImportWriter::open(pile, key)?;
+    import_paths_with(writer, pile, paths, source, finished_before, out)
+}
+
+/// [`import_paths`] through a writer already open on `pile`.
+pub(super) fn import_paths_with(
+    mut writer: ArchiveImportWriter,
+    pile: &Path,
+    paths: &[PathBuf],
+    source: CliImportSource,
+    finished_before: Option<std::time::SystemTime>,
+    out: &mut Out<'_>,
+) -> Result<()> {
     let total = paths.len();
     let mut skipped = Vec::new();
     let mut result = Ok(());
@@ -197,7 +213,9 @@ pub(super) fn import_paths(
         match import_into(&mut writer, pile, path, source, finished_before, out) {
             Ok(()) => {}
             Err(PathFailure::Skip(error)) => {
-                eprintln!("archive import: skipped {}: {error:#}", path.display());
+                // The path alone on its line, for scripts to collect.
+                eprintln!("archive import: skipped {}", path.display());
+                eprintln!("  because: {error:#}");
                 writer.abandon_unit();
                 skipped.push(error.context(format!("import {}", path.display())));
             }
@@ -211,15 +229,50 @@ pub(super) fn import_paths(
         // What was imported stays committed; the skips make the status fail.
         writer.close(Ok(()))?;
         let count = skipped.len();
-        let first = skipped.remove(0);
-        if total == 1 {
-            return Err(first);
-        }
-        return Err(first.context(format!(
-            "{count} of {total} path(s) could not be imported and were skipped; the first"
-        )));
+        return Err(skipped.remove(0).context(SkippedPaths {
+            skipped: count,
+            total,
+        }));
     }
     writer.close(result)
+}
+
+/// The status of an import that completed with some paths skipped, told
+/// apart from 1, a failure that stopped it: a script may go on after this
+/// one and must not after the other.
+pub const SKIPPED_PATHS_STATUS: u8 = 4;
+
+/// An import that went through its whole list but skipped some paths. It is
+/// the context of the first skipped path's error.
+#[derive(Debug)]
+pub struct SkippedPaths {
+    pub skipped: usize,
+    pub total: usize,
+}
+
+impl std::fmt::Display for SkippedPaths {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.total == 1 {
+            write!(f, "the path could not be imported and was skipped")
+        } else {
+            write!(
+                f,
+                "{} of {} path(s) could not be imported and were skipped; the first",
+                self.skipped, self.total
+            )
+        }
+    }
+}
+
+/// The process status of a command's result: 0 on success,
+/// [`SKIPPED_PATHS_STATUS`] for an import that completed with skipped paths,
+/// and 1 for any other failure.
+pub fn exit_status(result: &Result<()>) -> u8 {
+    match result {
+        Ok(()) => 0,
+        Err(error) if error.downcast_ref::<SkippedPaths>().is_some() => SKIPPED_PATHS_STATUS,
+        Err(_) => 1,
+    }
 }
 
 /// Why one path of an import failed: its source (skip it and go on), or the
@@ -314,18 +367,20 @@ fn pile_length(pile: &Path) -> Result<u64> {
 }
 
 /// The paths of a `--paths-from` list: one per line, kept verbatim except
-/// for a line ending's carriage return; empty lines are skipped. A line that
+/// for a line ending's carriage return; lines that are empty or only
+/// whitespace are skipped, while a real name keeps any spaces around it. A
+/// line that
 /// is not UTF-8 refuses the whole list, naming the line, before anything is
 /// imported.
 fn paths_from_list(bytes: &[u8]) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() {
-            continue;
-        }
         let line = std::str::from_utf8(line)
             .map_err(|_| anyhow!("--paths-from line {} is not UTF-8", index + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
         paths.push(PathBuf::from(line));
     }
     Ok(paths)

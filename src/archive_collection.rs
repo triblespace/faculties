@@ -105,6 +105,9 @@ pub struct ArchiveImportWriter<P = FacultyStore> {
     pending: Vec<CollectionCommit>,
     /// Trailing zero bits of a node id that end a piece.
     piece_bits: u32,
+    /// Fail every stage as a pile that refuses its writes would.
+    #[cfg(test)]
+    fail_stages: bool,
     /// Keeps the runtime the descriptor was acquired through alive until close.
     #[allow(dead_code)]
     runtime: Arc<tokio::runtime::Runtime>,
@@ -230,6 +233,8 @@ where
             pieces: 0,
             pending: Vec::new(),
             piece_bits: PIECE_BITS,
+            #[cfg(test)]
+            fail_stages: false,
             runtime,
         }
     }
@@ -283,13 +288,18 @@ where
     /// identity naming facts the fragment does not hold; a fragment holding
     /// a node (an entity tagged as a node, or with a `previous` or `holds`
     /// fact) that `identity` does not name; a node's tag, `previous` or
-    /// `holds` fact outside the identity; and a content fact's tag or
-    /// identity-core fact (modality, payload, blob, pointer) outside it. So
-    /// a node-free fragment ([`Self::stage_annotations`]) cannot carry a node
-    /// or a content fact at all.
+    /// `holds` fact outside the identity; and any fact of a content fact
+    /// (an entity tagged as one, or with one of its identity-core facts)
+    /// outside it, except a `resolved_to` naming bytes recovered later. So a
+    /// node-free fragment ([`Self::stage_annotations`]) cannot carry a node,
+    /// nor any fact of a content fact but its resolutions.
     pub fn stage(&mut self, fragment: Fragment, identity: blockdag::Identity) -> Result<()> {
         let (_, facts, _, blobs) = fragment.into_parts();
         refuse_misplaced_identity(&facts, &identity)?;
+        #[cfg(test)]
+        if self.fail_stages {
+            bail!("the pile refused a write");
+        }
 
         // Embedded payloads can dominate an import's resident memory. Append
         // each already-constructed content-addressed dependency immediately,
@@ -312,9 +322,16 @@ where
     }
 
     /// Stage a fragment that holds no node and no content fact, only
-    /// annotations. A fragment holding either is refused.
+    /// annotations, a content fact's `resolved_to` among them. A fragment
+    /// holding a node or any other fact of a content fact is refused.
     pub fn stage_annotations(&mut self, fragment: Fragment) -> Result<()> {
         self.stage(fragment, blockdag::Identity::none())
+    }
+
+    /// Fail every later stage as a pile that refuses its writes would.
+    #[cfg(test)]
+    pub(crate) fn fail_stages(&mut self) {
+        self.fail_stages = true;
     }
 
     /// Cut pieces at `bits` trailing zero bits instead of [`PIECE_BITS`].
@@ -498,28 +515,41 @@ fn refuse_misplaced_identity(facts: &TribleSet, identity: &blockdag::Identity) -
     let fact_kind = schema::content_fact::KIND;
     let tag = metadata::tag.id();
     let node_attributes = [schema::block::previous.id(), schema::block::holds.id()];
-    let fact_attributes = [
+    // The identity core of a content fact; any of them marks its entity as
+    // one, tagged or not. Every fact of that entity except `resolved_to`, the
+    // bytes recovered later, must then be the identity's.
+    let fact_core = [
         schema::content_fact::modality.id(),
+        schema::content_fact::direction.id(),
         schema::content_fact::payload.id(),
         schema::content_fact::blob.id(),
         schema::content_fact::asset_pointer.id(),
+        schema::content_fact::asset_namespace.id(),
+        schema::content_fact::media_type.id(),
+        schema::content_fact::asset_size.id(),
     ];
+    let resolved_to = schema::content_fact::resolved_to.id();
     let nodes: BTreeSet<Id> = find!(
         node: Id,
         pattern!(facts, [{ ?node @ metadata::tag: &node_kind }])
     )
     .collect();
-    let content_facts: BTreeSet<Id> = find!(
+    let mut content_facts: BTreeSet<Id> = find!(
         fact: Id,
         pattern!(facts, [{ ?fact @ metadata::tag: &fact_kind }])
     )
     .collect();
+    content_facts.extend(
+        facts
+            .iter()
+            .filter(|fact| fact_core.contains(fact.a()))
+            .map(|fact| *fact.e()),
+    );
     for fact in facts.iter() {
         let (entity, attribute) = (*fact.e(), *fact.a());
         let node_fact =
             node_attributes.contains(&attribute) || (attribute == tag && nodes.contains(&entity));
-        let content_fact = fact_attributes.contains(&attribute)
-            || (attribute == tag && content_facts.contains(&entity));
+        let content_fact = content_facts.contains(&entity) && attribute != resolved_to;
         if node_fact && !named.contains(&entity) {
             bail!("an Archive fragment holds node {entity:X} its identity does not name");
         }
@@ -3615,6 +3645,69 @@ mod tests {
         .unwrap();
         let error = refusal(writer.stage_annotations(fact));
         assert!(error.contains("outside its identity"), "{error}");
+    }
+
+    /// Every fact of a content fact is its identity's except a resolution:
+    /// another value of any identity-core attribute, or a foreign attribute
+    /// on the tagged entity, is refused through `stage` and through
+    /// `stage_annotations` alike; a `resolved_to` passes through both.
+    #[test]
+    fn stage_refuses_every_content_fact_fact_outside_the_identity_but_a_resolution() {
+        let directory = TempDir::new().unwrap();
+        let mut writer = refusing_writer(&directory);
+        let pointer = blockdag::asset_pointer_fact(
+            schema::content_fact::modality::IMAGE,
+            schema::content_fact::direction::IN,
+            fucid().id,
+            "file-pointer",
+            Some("image/png"),
+            Some(7),
+        )
+        .unwrap();
+        let fact = pointer.root().unwrap();
+        let (node, identity) = blockdag::block_parts([], None, pointer.clone()).unwrap();
+        let at = || ExclusiveId::force_ref(&fact);
+        let core_extras = [
+            entity! { at() @ schema::content_fact::modality: &schema::content_fact::modality::TEXT },
+            entity! { at() @ schema::content_fact::direction: &schema::content_fact::direction::OUT },
+            entity! { at() @ schema::content_fact::asset_namespace: &fucid().id },
+            entity! { at() @ schema::content_fact::media_type: &fucid().id },
+            entity! { at() @ schema::content_fact::asset_size: 9u128 },
+        ];
+        for extra in core_extras {
+            let mut fragment = node.clone();
+            fragment += extra.clone();
+            let error = refusal(writer.stage(fragment, identity.clone()));
+            assert!(error.contains("outside its identity"), "{error}");
+            // Alone, untagged: the core attribute still names a content fact.
+            let error = refusal(writer.stage_annotations(extra));
+            assert!(error.contains("outside its identity"), "{error}");
+        }
+        // A foreign attribute on the tagged entity is no annotation of it.
+        let mut fragment = node.clone();
+        fragment += entity! { at() @ metadata::name: "a name" };
+        let error = refusal(writer.stage(fragment, identity.clone()));
+        assert!(error.contains("outside its identity"), "{error}");
+        assert!(
+            writer.commit_unit().unwrap().is_empty(),
+            "a refusal staged something"
+        );
+
+        // Recovered bytes are the one annotation a content fact takes.
+        let resolved = blockdag::resolve_pointer_fact(pointer, b"bytes".to_vec()).unwrap();
+        let mut fragment = node;
+        fragment += resolved.clone();
+        writer.stage(fragment, identity).unwrap();
+        let mut resolution = TribleSet::new();
+        for fact in resolved.facts().iter() {
+            if *fact.a() == schema::content_fact::resolved_to.id() {
+                resolution.insert(fact);
+            }
+        }
+        assert_eq!(resolution.len(), 1);
+        writer
+            .stage_annotations(Fragment::from(resolution))
+            .unwrap();
     }
 
     /// A unit whose source failed is abandoned: nothing it staged is
