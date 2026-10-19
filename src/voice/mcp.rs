@@ -10,7 +10,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 const TOOLS: &[Tool] = &[
-    Tool { name: "voice_synthesize", description: "Synthesize literal text with the launcher's local Qwen3-TTS model and return a WAV audio attachment. Never enumerates or plays local audio devices, changes the floor, or records a spoken utterance: this is generation, not proof anyone heard it. Requires the voice build feature and configured model/reference assets; discovery opens none.", input_schema: r#"{"type":"object","properties":{"text":{"type":"string","minLength":1}},"required":["text"],"additionalProperties":false}"# },
+    Tool { name: "voice_synthesize", description: "Synthesize literal text with the configured resident voice and return a WAV attachment, without host playback. Optional Breeze direction is delivery instruction, never spoken text; omit direction and cfg_scale to inherit startup defaults. clear_direction removes direction for this request and defaults CFG to 1; otherwise non-unit CFG requires an effective direction. Blank direction is invalid. Other backends reject delivery options. Requires configured model-asset routing and voice features; discovery opens none. No utterance is recorded as heard.", input_schema: r#"{"type":"object","properties":{"text":{"type":"string","minLength":1},"direction":{"type":"string","minLength":1,"description":"Breeze delivery instruction; omit to inherit startup direction. Conflicts with clear_direction."},"clear_direction":{"type":"boolean","default":false},"cfg_scale":{"type":"number","exclusiveMinimum":0,"description":"Finite Breeze guidance strength; omit to inherit, or 1 when clearing direction."}},"required":["text"],"additionalProperties":false}"# },
     Tool { name: "voice_route", description: "Read the latest stored private say and public shout routing policies (or built-in defaults). Metadata only: no device enumeration, Reachy probe, synthesis, or playback. Private say routing still rejects public devices even if its policy lists them.", input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"# },
     Tool { name: "voice_route_set", description: "Publish an ordered device-name preference list for local say or shout routing. Names are literal case-insensitive match patterns, not files. A new timestamped generation replaces older policy generations; exact timestamp ties are unioned. This changes future host routing only and does not play audio. The say privacy check cannot be configured away.", input_schema: r#"{"type":"object","properties":{"channel":{"type":"string","enum":["say","shout"]},"devices":{"type":"array","minItems":1,"items":{"type":"string","minLength":1}}},"required":["channel","devices"],"additionalProperties":false}"# },
 ];
@@ -18,6 +18,10 @@ const TOOLS: &[Tool] = &[
 #[serde(deny_unknown_fields)]
 struct Text {
     text: String,
+    direction: Option<String>,
+    #[serde(default)]
+    clear_direction: bool,
+    cfg_scale: Option<f32>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +32,29 @@ struct RouteSet {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthesis_transport_is_literal_and_advertises_delivery() {
+        let schema: serde_json::Value = serde_json::from_str(TOOLS[0].input_schema).unwrap();
+        for field in ["direction", "clear_direction", "cfg_scale"] {
+            assert!(schema["properties"][field].is_object());
+        }
+        let request: Text = decode_arguments(
+            r#"{"text":"(laugh) @literal","direction":"@also-literal","cfg_scale":2.5}"#
+                .to_owned()
+                .into(),
+        )
+        .unwrap();
+        assert_eq!(request.text, "(laugh) @literal");
+        assert_eq!(request.direction.as_deref(), Some("@also-literal"));
+        assert_eq!(request.cfg_scale, Some(2.5));
+        assert!(!request.clear_direction);
+    }
+}
 pub struct Voice {
     operations: Operations,
     synthesizer: Option<Synthesizer>,
@@ -72,12 +99,21 @@ impl Faculty for Voice {
             "voice_synthesize" => {
                 let args: Text = decode_arguments(arguments)?;
                 super::operations::validate_text(&args.text).map_err(invalid_arguments)?;
+                let options = super::options::SpeechOptions {
+                    direction: args.direction,
+                    clear_direction: args.clear_direction,
+                    cfg_scale: args.cfg_scale,
+                };
+                options.validate().map_err(invalid_arguments)?;
                 let synthesizer = self.synthesizer.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "voice synthesize: workspace model-asset routing is unconfigured"
                     )
                 })?;
-                let clip = synthesizer.synthesize(&args.text)?;
+                synthesizer
+                    .validate_options(&options)
+                    .map_err(invalid_arguments)?;
+                let clip = synthesizer.synthesize_with_options(&args.text, &options)?;
                 out.audio(clip.wav.clone(), super::AUDIO_WAV_MIME)?;
                 out.line(format!(
                     "{} Hz mono, {} samples ({:.2}s); no host playback",

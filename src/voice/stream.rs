@@ -44,7 +44,7 @@ trait ChunkMirror {
 }
 
 #[cfg(feature = "voice")]
-struct MarySpeech<'a>(&'a Synthesizer);
+struct MarySpeech<'a>(&'a Synthesizer, &'a super::options::SpeechOptions);
 
 #[cfg(feature = "voice")]
 struct MaryChunks(mary::speak::SpeakStream);
@@ -65,7 +65,7 @@ impl Speech for MarySpeech<'_> {
     type Chunks = MaryChunks;
 
     fn speak(&self, text: &str) -> Result<Self::Chunks> {
-        Ok(MaryChunks(self.0.start(text)?.stream))
+        Ok(MaryChunks(self.0.start_with_options(text, self.1)?.stream))
     }
 }
 
@@ -165,6 +165,27 @@ pub fn run<R: Read, W: Write>(
     input: R,
     output: W,
 ) -> Result<StreamReceipt> {
+    run_with_options(
+        voice,
+        synthesizer,
+        &super::options::SpeechOptions::default(),
+        channel,
+        soma,
+        input,
+        output,
+    )
+}
+
+pub fn run_with_options<R: Read, W: Write>(
+    voice: &Voice,
+    synthesizer: &Synthesizer,
+    options: &super::options::SpeechOptions,
+    channel: Channel,
+    soma: Option<&str>,
+    input: R,
+    output: W,
+) -> Result<StreamReceipt> {
+    synthesizer.validate_options(options)?;
     #[cfg(not(feature = "voice"))]
     {
         let _ = (voice, synthesizer, channel, soma, input, output);
@@ -194,7 +215,7 @@ pub fn run<R: Read, W: Write>(
         let framed = transduce(
             input,
             output,
-            &MarySpeech(synthesizer),
+            &MarySpeech(synthesizer, options),
             &mut mirror,
             |text, audio| {
                 jobs.send((text.to_owned(), audio.wav.as_ref().to_vec()))

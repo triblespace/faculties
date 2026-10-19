@@ -1,6 +1,7 @@
 //! Explicit CLI UX: named-device speech remains a host operation; synthesis
 //! can instead return audio to Drive without playing anything on the host.
 use super::device::{Device, DEFAULT_DAEMON};
+use super::options::SpeechOptions;
 use super::synthesis::{ModelSources, Synthesizer};
 use super::{Channel, Voice};
 use anyhow::Result;
@@ -38,6 +39,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delivery_flags_are_carried_by_each_speech_command() {
+        for command in ["say", "shout", "synthesize", "stream"] {
+            let mut args = vec![
+                "voice",
+                "--pile",
+                "unused",
+                command,
+                "--direction",
+                "Plain and warm",
+                "--cfg-scale",
+                "2.5",
+            ];
+            if command != "stream" {
+                args.push("(laugh) Hello.");
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            let options = match cli.command.unwrap() {
+                Command::Say { options, .. }
+                | Command::Shout { options, .. }
+                | Command::Synthesize { options, .. }
+                | Command::Stream { options, .. } => options,
+                _ => unreachable!(),
+            };
+            assert_eq!(options.direction.as_deref(), Some("Plain and warm"));
+            assert_eq!(options.cfg_scale, Some(2.5));
+        }
+        assert!(Cli::try_parse_from([
+            "voice",
+            "--pile",
+            "unused",
+            "synthesize",
+            "hello",
+            "--direction",
+            "soft",
+            "--clear-direction"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn stream_accepts_drive_argument_order() {
         let cli = Cli::try_parse_from([
             "voice",
@@ -60,6 +101,8 @@ enum Command {
     /// targeted, prints the text instead of playing aloud. Recorded on the
     /// fixed Voice collection.
     Say {
+        #[command(flatten)]
+        options: SpeechOptions,
         /// What to say.
         text: String,
         /// Resolve routing and report the target (or text-fallback) WITHOUT
@@ -78,6 +121,8 @@ enum Command {
     /// and audible host-device fallbacks. Recorded on the fixed Voice
     /// collection.
     Shout {
+        #[command(flatten)]
+        options: SpeechOptions,
         /// What to shout.
         text: String,
         /// Resolve routing and report the target WITHOUT synthesizing/playing.
@@ -93,6 +138,8 @@ enum Command {
     /// become 24 kHz mono PCM records on stdout and, for public `shout`, stream
     /// to a configured Soma body through the same resident Mary session.
     Stream {
+        #[command(flatten)]
+        options: SpeechOptions,
         /// Channel under which completed sentences are recorded.
         #[arg(long, default_value = "shout")]
         channel: String,
@@ -116,6 +163,8 @@ enum Command {
     },
     /// Synthesize a resident WAV without playing any local device.
     Synthesize {
+        #[command(flatten)]
+        options: SpeechOptions,
         /// Literal prose, @file, @- stdin, or @@escaped leading at-sign.
         text: String,
         /// Also save the original WAV here (recommended without Drive).
@@ -151,23 +200,26 @@ fn execute_stream(cli: Cli) -> Result<()> {
     let Some(Command::Stream {
         channel,
         pause_file,
+        options,
     }) = command
     else {
         anyhow::bail!("Voice framed execution requires the stream command");
     };
     let channel = Channel::parse(&channel)?;
+    let synthesizer = Synthesizer::new(ModelSources::from_environment(Some(&pile)));
+    synthesizer.validate_options(&options)?;
     let _pause = pause_file.as_deref().map(|path| {
         eprintln!("  [half-duplex] holding {}", path.display());
         crate::turntaking::PauseGuard::hold(path)
     });
-    let synthesizer = Synthesizer::new(ModelSources::from_environment(Some(&pile)));
     let storage = crate::storage::Storage::shared(pile, key);
     let voice = Voice::with_storage(storage.clone());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    let result = super::stream::run(
+    let result = super::stream::run_with_options(
         &voice,
         &synthesizer,
+        &options,
         channel,
         soma.as_deref(),
         stdin.lock(),
@@ -187,20 +239,38 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             text,
             dry_run,
             pause_file,
+            options,
         }) => {
+            synthesizer.validate_options(&options)?;
             let text = crate::text_arg(&text, "voice text")?;
             device
-                .speak(Channel::Say, &text, dry_run, pause_file.as_deref(), out)?
+                .speak_with_options(
+                    Channel::Say,
+                    &text,
+                    &options,
+                    dry_run,
+                    pause_file.as_deref(),
+                    out,
+                )?
                 .emit(Channel::Say, out)
         }
         Some(Command::Shout {
             text,
             dry_run,
             pause_file,
+            options,
         }) => {
+            synthesizer.validate_options(&options)?;
             let text = crate::text_arg(&text, "voice text")?;
             device
-                .speak(Channel::Shout, &text, dry_run, pause_file.as_deref(), out)?
+                .speak_with_options(
+                    Channel::Shout,
+                    &text,
+                    &options,
+                    dry_run,
+                    pause_file.as_deref(),
+                    out,
+                )?
                 .emit(Channel::Shout, out)
         }
         Some(Command::Stream { .. }) => {
@@ -220,13 +290,18 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Synthesize { text, out: path }) => {
+        Some(Command::Synthesize {
+            text,
+            out: path,
+            options,
+        }) => {
+            synthesizer.validate_options(&options)?;
             anyhow::ensure!(
                 cfg!(feature = "voice"),
                 "speech synthesis requires a build with the `voice` feature"
             );
             let text = crate::text_arg(&text, "voice text")?;
-            let clip = synthesizer.synthesize(&text)?;
+            let clip = synthesizer.synthesize_with_options(&text, &options)?;
             if let Some(path) = path {
                 clip.save(&path)?;
                 out.line(path.display().to_string())?;

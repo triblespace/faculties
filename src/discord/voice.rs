@@ -41,8 +41,10 @@
 use super::gateway;
 use super::intake::Inbox;
 use super::live::{Beside, StateDir};
+use crate::voice::options::SpeechOptions;
 use crate::voice::synthesis::{prebuffer_target_secs, ModelSources, Synthesizer};
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::input::RawAdapter;
@@ -76,6 +78,61 @@ const FAST_ENOUGH_RATE: f64 = 1.5;
 /// The synthesizer's PCM: 24 kHz mono.
 const SAMPLE_RATE: u32 = mary::speak::SpeakStream::SAMPLE_RATE;
 
+/// Ephemeral queue transport, not voice identity or a pile schema. The suffix
+/// selects the format: existing .txt is always literal; .toml is never speech.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct QueuedSpeech {
+    text: String,
+    #[serde(default)]
+    options: SpeechOptions,
+}
+
+impl QueuedSpeech {
+    fn read(path: &Path) -> Result<Self> {
+        let contents = std::fs::read_to_string(path).context("read the queued line")?;
+        let request = match path.extension().and_then(|suffix| suffix.to_str()) {
+            Some("txt") => Self::from(contents),
+            Some("toml") => toml::from_str(&contents).context("parse the queued speech request")?,
+            _ => anyhow::bail!("unsupported speech queue suffix"),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.text.trim().is_empty(),
+            "a line to say must not be empty"
+        );
+        self.options.validate()
+    }
+
+    fn pieces(&self) -> Vec<Self> {
+        pieces(&self.text)
+            .into_iter()
+            .map(|text| Self {
+                text,
+                options: self.options.clone(),
+            })
+            .collect()
+    }
+}
+
+impl From<String> for QueuedSpeech {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            options: SpeechOptions::default(),
+        }
+    }
+}
+impl From<&str> for QueuedSpeech {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 /// The state directory's queue: `say/` holds queued lines, `said/` spoken
 /// ones and `failed/` the ones that could not be spoken.
 impl StateDir {
@@ -86,7 +143,25 @@ impl StateDir {
     /// Queue one line: written beside the queue under a dot name, then
     /// renamed in, so the resident process never reads half a line.
     pub fn enqueue(&self, text: &str) -> Result<PathBuf> {
-        anyhow::ensure!(!text.trim().is_empty(), "a line to say must not be empty");
+        self.enqueue_with_options(text, &SpeechOptions::default())
+    }
+
+    pub fn enqueue_with_options(&self, text: &str, options: &SpeechOptions) -> Result<PathBuf> {
+        let request = QueuedSpeech {
+            text: text.to_owned(),
+            options: options.clone(),
+        };
+        request.validate()?;
+        // Plain requests remain readable by an older resident. Styled requests
+        // wait for a TOML-aware resident, never becoming audible metadata.
+        let (suffix, contents) = if options.is_default() {
+            ("txt", text.to_owned())
+        } else {
+            (
+                "toml",
+                toml::to_string(&request).context("encode speech request")?,
+            )
+        };
         let queue = self.queue();
         std::fs::create_dir_all(&queue)
             .with_context(|| format!("create the voice queue {}", queue.display()))?;
@@ -94,9 +169,9 @@ impl StateDir {
             .duration_since(std::time::UNIX_EPOCH)
             .context("read the clock")?
             .as_nanos();
-        let name = format!("{stamp:024}-{}.txt", std::process::id());
+        let name = format!("{stamp:024}-{}.{suffix}", std::process::id());
         let staging = queue.join(format!(".{name}"));
-        std::fs::write(&staging, text)
+        std::fs::write(&staging, contents)
             .with_context(|| format!("write the queued line {}", staging.display()))?;
         let queued = queue.join(name);
         std::fs::rename(&staging, &queued)
@@ -121,7 +196,7 @@ impl StateDir {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            if !name.starts_with('.') && name.ends_with(".txt") {
+            if !name.starts_with('.') && (name.ends_with(".txt") || name.ends_with(".toml")) {
                 lines.push(path);
             }
         }
@@ -834,9 +909,9 @@ enum Spoken {
 }
 
 async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> Spoken {
-    let text = match std::fs::read_to_string(queued) {
-        Ok(text) => text,
-        Err(error) => return Spoken::Failed(anyhow!(error).context("read the queued line")),
+    let request = match QueuedSpeech::read(queued) {
+        Ok(request) => request,
+        Err(error) => return Spoken::Failed(error),
     };
     // A line is spoken in pieces of whole sentences up to MAX_PIECE_CHARS,
     // usually one piece, and a piece while it is synthesized: it starts
@@ -845,7 +920,7 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
     // is synthesized once it is. The line is still the unit of the queue: a
     // piece that fails or is interrupted settles the whole line, and an
     // interrupted line is spoken again from its start.
-    let sentences = pieces(&text);
+    let sentences = request.pieces();
     let asked = std::time::Instant::now();
     let mut next = sentences.first().map(|first| speech.request(first.clone()));
     for (index, sentence) in sentences.iter().enumerate() {
@@ -867,7 +942,7 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
             index + 1,
             sentences.len(),
             asked.elapsed().as_secs_f64(),
-            sentence
+            sentence.text
         );
         match play(voice, buffered, synthesis).await {
             Spoken::Heard => {}
@@ -1226,7 +1301,7 @@ struct SpeechWorker {
 
 enum Request {
     Ready(oneshot::Sender<Result<()>>),
-    Speak(String, mpsc::UnboundedSender<Piece>),
+    Speak(QueuedSpeech, mpsc::UnboundedSender<Piece>),
 }
 
 /// What the speech thread sends of one sentence, in order: its estimated
@@ -1265,7 +1340,7 @@ trait Voicing {
     fn prime(&self) -> Result<()>;
     /// Start synthesizing `text`: its estimated length in seconds, and its
     /// PCM to come.
-    fn start(&self, text: &str) -> Result<(f32, Self::Utterance)>;
+    fn start(&self, text: &str, options: &SpeechOptions) -> Result<(f32, Self::Utterance)>;
 }
 
 /// One sentence's PCM as it is decoded.
@@ -1282,8 +1357,8 @@ impl Voicing for Synthesizer {
         Synthesizer::prime(self)
     }
 
-    fn start(&self, text: &str) -> Result<(f32, Self::Utterance)> {
-        let prepared = Synthesizer::start(self, text)?;
+    fn start(&self, text: &str, options: &SpeechOptions) -> Result<(f32, Self::Utterance)> {
+        let prepared = Synthesizer::start_with_options(self, text, options)?;
         Ok((prepared.estimated_seconds, prepared.stream))
     }
 }
@@ -1320,10 +1395,10 @@ impl SpeechWorker {
                                 Some(error) => Err(anyhow!("load the voice model: {error}")),
                             });
                         }
-                        Request::Speak(text, pieces) => {
+                        Request::Speak(request, pieces) => {
                             let spoken =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    synthesize(&voicing, &text, &pieces)
+                                    synthesize(&voicing, &request, &pieces)
                                 }));
                             let Ok(spoken) = spoken else {
                                 // A panic can leave the resident synthesizer
@@ -1358,9 +1433,9 @@ impl SpeechWorker {
 
     /// Ask for `text` now, without waiting: the thread synthesizes it after
     /// what was asked for before, while the caller plays.
-    fn request(&self, text: String) -> Synthesis {
+    fn request(&self, request: QueuedSpeech) -> Synthesis {
         let (pieces, receiver) = mpsc::unbounded_channel();
-        let sent = self.requests.send(Request::Speak(text, pieces)).is_ok();
+        let sent = self.requests.send(Request::Speak(request, pieces)).is_ok();
         Synthesis {
             pieces: sent.then_some(receiver),
             requested: std::time::Instant::now(),
@@ -1375,10 +1450,11 @@ impl SpeechWorker {
 /// Synthesize `text` into `pieces` as it is decoded.
 fn synthesize<V: Voicing>(
     voicing: &V,
-    text: &str,
+    request: &QueuedSpeech,
     pieces: &mpsc::UnboundedSender<Piece>,
 ) -> Result<()> {
-    let (estimate, mut utterance) = voicing.start(text)?;
+    request.validate()?;
+    let (estimate, mut utterance) = voicing.start(&request.text, &request.options)?;
     let _ = pieces.send(Piece::Estimate(estimate));
     let mut samples = 0;
     while let Some(chunk) = utterance.next_chunk() {
@@ -1539,6 +1615,98 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn queue_roundtrips_delivery_and_never_sniffs_literal_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = StateDir::new(directory.path().to_owned());
+        let options = SpeechOptions {
+            direction: Some("Warm\nSay it \"professionally\".".into()),
+            cfg_scale: Some(2.5),
+            ..Default::default()
+        };
+        let text = "(laugh) Hello, \"you\".\n(sigh) A second line.";
+        let path = state.enqueue_with_options(text, &options).unwrap();
+        assert_eq!(path.extension().unwrap(), "toml");
+        assert_eq!(
+            QueuedSpeech::read(&path).unwrap(),
+            QueuedSpeech {
+                text: text.into(),
+                options
+            }
+        );
+        let literal = "text = \"Do not decode me\"\n{\"direction\": \"nor me\"} (sigh)";
+        let old = state.enqueue(literal).unwrap();
+        assert_eq!(old.extension().unwrap(), "txt");
+        assert_eq!(QueuedSpeech::read(&old).unwrap(), literal.into());
+        let bad = state.queue().join("malformed.toml");
+        std::fs::write(&bad, "text = [oops").unwrap();
+        assert!(QueuedSpeech::read(&bad).is_err());
+        assert_eq!(state.pending().unwrap().len(), 3);
+        let invalid = SpeechOptions {
+            direction: Some(" ".into()),
+            ..Default::default()
+        };
+        assert!(state.enqueue_with_options(text, &invalid).is_err());
+        assert_eq!(state.pending().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn first_prefetched_and_next_request_keep_their_own_options() {
+        struct RecordingVoice(Arc<std::sync::Mutex<Vec<QueuedSpeech>>>);
+        impl Voicing for RecordingVoice {
+            type Utterance = FakeUtterance;
+            fn prime(&self) -> Result<()> {
+                Ok(())
+            }
+            fn start(&self, text: &str, options: &SpeechOptions) -> Result<(f32, Self::Utterance)> {
+                self.0.lock().unwrap().push(QueuedSpeech {
+                    text: text.into(),
+                    options: options.clone(),
+                });
+                FakeVoice::new(vec![vec![0.1; 240]], &Arc::default()).start(text, options)
+            }
+        }
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let speech = SpeechWorker::spawn(move || RecordingVoice(log));
+        let options = SpeechOptions {
+            direction: Some("Professional".into()),
+            cfg_scale: Some(2.0),
+            ..Default::default()
+        };
+        let line = QueuedSpeech {
+            text: format!(
+                "(laugh) {}. (sigh) {}.",
+                "word ".repeat(70),
+                "next ".repeat(70)
+            ),
+            options: options.clone(),
+        };
+        let sentences = line.pieces();
+        assert!(sentences.len() >= 2);
+        let mut first = speech.request(sentences[0].clone());
+        let mut prefetched = speech.request(sentences[1].clone());
+        drain(&mut first).await.unwrap();
+        drain(&mut prefetched).await.unwrap();
+        let invalid = QueuedSpeech {
+            text: "Not spoken".into(),
+            options: SpeechOptions {
+                direction: Some(" ".into()),
+                ..Default::default()
+            },
+        };
+        assert!(drain(&mut speech.request(invalid)).await.is_err());
+        drain(&mut speech.request("Plain next request.".into()))
+            .await
+            .unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0], sentences[0]);
+        assert_eq!(seen[1], sentences[1]);
+        assert!(seen[2].options.is_default());
+        assert!(seen[0].text.contains("(laugh)"));
+        assert!(seen[1].text.contains("(sigh)"));
+    }
     use serde_json::json;
     use std::io::Read;
 
@@ -2158,7 +2326,7 @@ mod tests {
             Ok(())
         }
 
-        fn start(&self, text: &str) -> Result<(f32, FakeUtterance)> {
+        fn start(&self, text: &str, _options: &SpeechOptions) -> Result<(f32, FakeUtterance)> {
             assert_ne!(text, "panic", "a synthesis that panics");
             Ok((
                 2.0,

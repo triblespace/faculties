@@ -1,4 +1,5 @@
 //! Explicit resident speech backend, drained into existing audio/host sinks.
+use super::options::SpeechOptions;
 use anybytes::Bytes;
 use anyhow::{ensure, Context, Result};
 use std::ffi::OsString;
@@ -235,7 +236,15 @@ impl Synthesizer {
     /// Finite audio synthesis only. Never enumerates, selects, or plays devices,
     /// creates a pause file, writes a journal, or saves audio on the host.
     pub fn synthesize(&self, text: &str) -> Result<AudioClip> {
+        self.synthesize_with_options(text, &SpeechOptions::default())
+    }
+    pub fn synthesize_with_options(
+        &self,
+        text: &str,
+        options: &SpeechOptions,
+    ) -> Result<AudioClip> {
         super::operations::validate_text(text)?;
+        self.validate_options(options)?;
         self.sources.check_backend()?;
         #[cfg(not(feature = "voice"))]
         anyhow::bail!("speech synthesis requires a build with the `voice` feature");
@@ -245,13 +254,45 @@ impl Synthesizer {
                 mut stream,
                 sample_rate,
                 ..
-            } = self.start(text)?;
+            } = self.start_with_options(text, options)?;
             let mut samples = Vec::new();
             for chunk in stream.by_ref() {
                 samples.extend_from_slice(&chunk);
             }
             stream.finish()?;
             AudioClip::from_samples(&samples, sample_rate)
+        }
+    }
+    /// Validate request shape and backend support before any model acquisition.
+    pub fn validate_options(&self, options: &SpeechOptions) -> Result<()> {
+        options.validate()?;
+        if options.is_default() {
+            return Ok(());
+        }
+        match &self.sources {
+            ModelSources::Breeze(source) => {
+                let direction = if options.clear_direction {
+                    None
+                } else {
+                    options.direction.as_deref().or(source.direction.as_deref())
+                };
+                let scale = options.cfg_scale.unwrap_or(if options.clear_direction {
+                    1.0
+                } else {
+                    source.cfg_scale
+                });
+                ensure!(
+                    scale.is_finite() && scale > 0.0,
+                    "CFG scale must be finite and positive"
+                );
+                ensure!(
+                    scale == 1.0 || direction.is_some_and(|text| !text.trim().is_empty()),
+                    "non-unit CFG requires a nonblank direction"
+                );
+                Ok(())
+            }
+            ModelSources::Invalid(error) => anyhow::bail!("invalid speech configuration: {error}"),
+            _ => anyhow::bail!("delivery options require a Breeze voice"),
         }
     }
     /// Start the resident model loader once, without queuing an utterance.
@@ -275,8 +316,13 @@ impl Synthesizer {
         }
     }
     #[cfg(feature = "voice")]
-    pub(crate) fn start(&self, text: &str) -> Result<PreparedSpeech> {
+    pub(crate) fn start_with_options(
+        &self,
+        text: &str,
+        options: &SpeechOptions,
+    ) -> Result<PreparedSpeech> {
         super::operations::validate_text(text)?;
+        self.validate_options(options)?;
         self.prime()?;
         let resident = self
             .resident
@@ -289,7 +335,9 @@ impl Synthesizer {
             resident.reference_chars,
         );
         let started = std::time::Instant::now();
-        let stream = resident.session.speak(text)?;
+        let stream = resident
+            .session
+            .speak_with_options(text, &options.native())?;
         Ok(PreparedSpeech {
             stream,
             sample_rate: mary::speak::SpeakStream::SAMPLE_RATE,
@@ -526,6 +574,51 @@ pub(crate) fn prebuffer_target_secs(total_est_secs: f32, production_rate: f32) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_checks_use_startup_defaults_without_acquiring_or_changing_them() {
+        let mut settings = breeze_settings();
+        settings.push(("FACULTIES_BREEZE_DIRECTION", "Warm".into()));
+        settings.push(("FACULTIES_BREEZE_CFG_SCALE", "3".into()));
+        let voice = Synthesizer::new(parse_settings(&settings).unwrap());
+        let directed = SpeechOptions {
+            direction: Some("Professional".into()),
+            cfg_scale: Some(2.0),
+            ..Default::default()
+        };
+        voice.validate_options(&directed).unwrap();
+        voice
+            .validate_options(&SpeechOptions {
+                clear_direction: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(voice
+            .validate_options(&SpeechOptions {
+                direction: Some(" ".into()),
+                ..Default::default()
+            })
+            .is_err());
+        voice.validate_options(&SpeechOptions::default()).unwrap();
+        let ModelSources::Breeze(source) = &voice.sources else {
+            unreachable!()
+        };
+        assert_eq!(source.direction.as_deref(), Some("Warm"));
+        assert_eq!(source.cfg_scale, 3.0);
+        let qwen = Synthesizer::new(parse_settings(&[]).unwrap());
+        assert!(qwen
+            .validate_options(&directed)
+            .unwrap_err()
+            .to_string()
+            .contains("Breeze"));
+        assert!(qwen
+            .validate_options(&SpeechOptions {
+                cfg_scale: Some(1.0),
+                ..Default::default()
+            })
+            .is_err());
+        qwen.validate_options(&SpeechOptions::default()).unwrap();
+    }
 
     fn breeze_settings() -> Vec<(&'static str, OsString)> {
         vec![

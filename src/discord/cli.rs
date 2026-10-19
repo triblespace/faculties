@@ -69,6 +69,8 @@ enum Command {
     Say {
         #[command(flatten)]
         state: StateArg,
+        #[command(flatten)]
+        options: crate::voice::options::SpeechOptions,
         /// What to say, spoken after everything queued before it.
         text: String,
     },
@@ -233,7 +235,11 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let command = match command {
         Command::Collection(command) => command,
         Command::Live(args) => return run_live(&cli, args),
-        Command::Say { state, text } => return say(state.state_dir, &text, out),
+        Command::Say {
+            state,
+            text,
+            options,
+        } => return say(state.state_dir, &text, &options, out),
         Command::Warm { text, hear } => return warm(cli.pile.as_deref(), &text, hear, out),
         #[cfg(feature = "discord-hearing")]
         Command::Hear { wav } => {
@@ -465,13 +471,25 @@ fn hear(pile: &std::path::Path, wav: &std::path::Path, out: &mut Out<'_>) -> Res
 
 /// `discord say`: queue one line for the voice connection to speak.
 #[cfg(feature = "discord-voice")]
-fn say(state_dir: Option<PathBuf>, text: &str, out: &mut Out<'_>) -> Result<()> {
-    let queued = StateDir::resolve(state_dir)?.enqueue(text)?;
+fn say(
+    state_dir: Option<PathBuf>,
+    text: &str,
+    options: &crate::voice::options::SpeechOptions,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    options.validate()?;
+    let queued = StateDir::resolve(state_dir)?.enqueue_with_options(text, options)?;
     out.line(format!("queued {}", queued.display()))
 }
 
 #[cfg(not(feature = "discord-voice"))]
-fn say(_: Option<PathBuf>, _: &str, _: &mut Out<'_>) -> Result<()> {
+fn say(
+    _: Option<PathBuf>,
+    _: &str,
+    options: &crate::voice::options::SpeechOptions,
+    _: &mut Out<'_>,
+) -> Result<()> {
+    options.validate()?;
     bail!(NO_VOICE)
 }
 
@@ -586,6 +604,68 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn say_parses_delivery_without_changing_message_send() {
+        let cli = Cli::try_parse_from([
+            "discord",
+            "say",
+            "(laugh) Hello.",
+            "--direction",
+            "Warm, professional",
+            "--cfg-scale",
+            "2.5",
+        ])
+        .unwrap();
+        let Some(Command::Say { text, options, .. }) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(text, "(laugh) Hello.");
+        assert_eq!(options.direction.as_deref(), Some("Warm, professional"));
+        assert_eq!(options.cfg_scale, Some(2.5));
+        assert!(Cli::try_parse_from([
+            "discord",
+            "say",
+            "hello",
+            "--direction",
+            "warm",
+            "--clear-direction"
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["discord", "send", "1", "hello", "--direction", "warm"]).is_err()
+        );
+    }
+
+    #[cfg(feature = "discord-voice")]
+    #[test]
+    fn say_cli_serializes_options_without_auth_or_synthesis() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from([
+            "discord",
+            "say",
+            "--state-dir",
+            directory.path().to_str().unwrap(),
+            "(sigh) Hello.",
+            "--direction",
+            "Warm",
+            "--cfg-scale",
+            "2.5",
+        ])
+        .unwrap();
+        execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+        let path = std::fs::read_dir(directory.path().join("say"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(path.extension().unwrap(), "toml");
+        let value: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["text"].as_str(), Some("(sigh) Hello."));
+        assert_eq!(value["options"]["direction"].as_str(), Some("Warm"));
+        assert_eq!(value["options"]["cfg_scale"].as_float(), Some(2.5));
+    }
     #[test]
     fn live_and_say_parse_beside_the_collection_commands() {
         Cli::command().debug_assert();
@@ -635,9 +715,15 @@ mod tests {
             assert_eq!((text.as_str(), hear), ("hello", true));
         }
         let cli = Cli::try_parse_from(["discord", "say", "--state-dir", "/s", "hello"]).unwrap();
-        let Some(Command::Say { state, text }) = cli.command else {
+        let Some(Command::Say {
+            state,
+            text,
+            options,
+        }) = cli.command
+        else {
             panic!("say parses as say");
         };
+        assert!(options.is_default());
         assert_eq!(
             (state.state_dir, text),
             (Some(PathBuf::from("/s")), "hello".to_owned())
@@ -740,7 +826,12 @@ mod tests {
             ]);
             assert_eq!(voice, NO_VOICE);
             let state_dir = Some(PathBuf::from("/nonexistent"));
-            let said = say(state_dir, "hello", &mut Out::new(&mut |_| Ok(())));
+            let said = say(
+                state_dir,
+                "hello",
+                &crate::voice::options::SpeechOptions::default(),
+                &mut Out::new(&mut |_| Ok(())),
+            );
             assert_eq!(said.unwrap_err().to_string(), NO_VOICE);
         }
     }

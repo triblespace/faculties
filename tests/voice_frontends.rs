@@ -90,6 +90,11 @@ fn malformed_requests_and_discovery_do_not_acquire_models_or_storage() {
     assert_eq!(adapter.tools().len(), 3);
     for (name, arguments) in [
         ("voice_synthesize", r#"{"text":"   "}"#),
+        ("voice_synthesize", r#"{"text":"hi","direction":"  "}"#),
+        ("voice_synthesize", r#"{"text":"hi","direction":"soft","clear_direction":true}"#),
+        ("voice_synthesize", r#"{"text":"hi","clear_direction":true,"cfg_scale":2}"#),
+        ("voice_synthesize", r#"{"text":"hi","cfg_scale":0}"#),
+        ("voice_synthesize", r#"{"text":"hi","cfg_scale":1e100}"#),
         ("voice_synthesize", r#"{"text":"a","text":"b"}"#),
         (
             "voice_synthesize",

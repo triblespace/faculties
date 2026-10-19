@@ -186,6 +186,7 @@ fn speak_and_play(
     text: &str,
     out: &Path,
     synthesizer: &Synthesizer,
+    options: &super::options::SpeechOptions,
     output: &mut Out<'_>,
 ) -> Result<Spoken> {
     let super::synthesis::PreparedSpeech {
@@ -193,7 +194,7 @@ fn speak_and_play(
         sample_rate: sr,
         estimated_seconds: est_secs,
         started: t_call,
-    } = synthesizer.start(text)?;
+    } = synthesizer.start_with_options(text, options)?;
 
     let mut samples: Vec<f32> = Vec::new();
     let played: Result<()> = match routed {
@@ -493,6 +494,7 @@ fn speak_and_play(
     _text: &str,
     _out: &Path,
     _synthesizer: &Synthesizer,
+    _options: &super::options::SpeechOptions,
     _output: &mut Out<'_>,
 ) -> Result<Spoken> {
     bail!(
@@ -677,7 +679,27 @@ impl Device {
         pause_file: Option<&Path>,
         out: &mut Out<'_>,
     ) -> Result<SpeechReceipt> {
+        self.speak_with_options(
+            channel,
+            text,
+            &super::options::SpeechOptions::default(),
+            dry_run,
+            pause_file,
+            out,
+        )
+    }
+
+    pub fn speak_with_options(
+        &self,
+        channel: Channel,
+        text: &str,
+        options: &super::options::SpeechOptions,
+        dry_run: bool,
+        pause_file: Option<&Path>,
+        out: &mut Out<'_>,
+    ) -> Result<SpeechReceipt> {
         super::operations::validate_text(text)?;
+        self.synthesizer.validate_options(options)?;
         let prefs = self.voice.route(channel)?;
         let routed = match channel {
             Channel::Say => route_say(&prefs, &detect_output_devices()?),
@@ -733,6 +755,7 @@ impl Device {
             text,
             &path,
             &self.synthesizer,
+            options,
             out,
         );
         match outcome {

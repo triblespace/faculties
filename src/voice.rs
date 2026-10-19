@@ -10,6 +10,7 @@
 pub mod cli;
 pub mod device;
 pub mod mcp;
+pub mod options;
 mod operations;
 pub mod routing;
 pub mod stream;

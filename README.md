@@ -352,6 +352,46 @@ Direct Rust callers can supply explicit model-source structs. A feature flag
 does not install models or guarantee that the chosen backend/hardware can run
 them.
 
+#### Per-request Breeze delivery
+
+With a configured Breeze resident (`FACULTIES_VOICE_BACKEND=breeze` and the
+`voice-breeze` build feature), direction and guidance strength belong to each
+speech request, independently of the reference voice:
+
+```sh
+voice synthesize 'Thanks, I can explain that.' --direction 'Warm, natural conversation.' --cfg-scale 2 --out reply.wav
+discord say 'The quarterly report is ready.' --direction 'Clear, professional delivery.' --cfg-scale 2
+discord say 'Back to the reference delivery.' --clear-direction
+```
+
+The same flags work on `voice say`, `shout`, and `stream`. For a framed stream
+they apply to every sentence in that invocation. `voice_synthesize` MCP accepts
+literal `direction`, `clear_direction`, and `cfg_scale` fields alongside literal
+`text`. It still requires configured model-asset routing; exposing these fields
+does not configure an app workspace or create another resident owner. Discord
+MCP text messaging is unchanged and does not become speech.
+
+Omit both direction and strength to use the resident's exact startup defaults
+(`FACULTIES_BREEZE_DIRECTION` and `FACULTIES_BREEZE_CFG_SCALE`). A direction alone
+inherits startup strength; there is no automatic CFG 4. `--clear-direction`
+removes direction for this request and uses CFG 1 unless explicitly supplied.
+Direction and clear conflict; blank direction is an error, and non-unit CFG
+requires an effective nonblank direction. CFG must be finite and positive; larger
+values are not a promise of better delivery. Other speech backends reject these
+options. An override or failure never changes the next request's defaults.
+
+The instruction is not appended to spoken words. Inline model vocal events such
+as `(laugh)` and `(sigh)` remain in the spoken text unchanged; Faculties does not
+parse or invent an event vocabulary. Weights and encoded reference stay loaded
+when delivery changes. Identity/cadence quality still needs listening acceptance.
+
+Discord retains literal `.txt` queue files for plain requests. Styled requests
+use explicit `.toml` envelopes, atomically queued with text and options together;
+every split/prefetched sentence carries the same options. A malformed TOML
+request fails rather than becoming spoken text. Existing `.txt` contents are
+always literal, even when they look like TOML or JSON. Older residents ignore
+`.toml`, so styled requests wait for a receiver built with this support.
+
 `voice_synthesize` returns a WAV audio attachment without playing local
 speakers. `imagine_generate` returns a PNG image; optional remembering is a
 separate publication after output acceptance. `hear_once` returns ordered
