@@ -141,12 +141,13 @@ pub(crate) fn seal_version(
     })
 }
 
-/// A declaration may advertise R only in its immutable containing collection.
-/// The policy still grants delivery for R, not access to that collection.
+/// R's `resource_collection` routes its proofs in TribleSpace; delivery does
+/// not compare it with the configured collection, so a version carried into
+/// another collection keeps its delivery policy there. The policy grants
+/// delivery for R, not access to any collection.
 fn policies<R: BlobStoreGet>(
     reader: &R,
     facts: &TribleSet,
-    collection: CollectionHandle,
     bound: Option<(Id, BytesHandle)>,
 ) -> Vec<AdmissionPolicy> {
     let candidates = find!(
@@ -155,7 +156,6 @@ fn policies<R: BlobStoreGet>(
             ?entity @ metadata::tag: KIND_SECRET_RESOURCE,
             wrap_secret: ?secret,
             secret_body: ?body,
-            resource_collection: collection,
         }])
     );
     let mut policies = Vec::new();
@@ -177,7 +177,6 @@ fn policies<R: BlobStoreGet>(
 
 pub(crate) fn recipients<R>(
     reader: &R,
-    collection: CollectionHandle,
     binding: &envelope::BoundKey,
     now: Epoch,
 ) -> Result<Vec<VerifyingKey>>
@@ -193,12 +192,7 @@ where
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| anyhow!("read delivery proof: {error}"))?;
     let mut recipients = BTreeSet::new();
-    for policy in policies(
-        reader,
-        &facts,
-        collection,
-        Some((binding.secret, binding.body)),
-    ) {
+    for policy in policies(reader, &facts, Some((binding.secret, binding.body))) {
         let AdmissionPolicy::Quorum(quorum) = policy else {
             // An open policy cannot enumerate public keys for finite envelopes.
             continue;
@@ -278,7 +272,7 @@ where
         // Anybody can seal their own DEK/body to this signer and name an
         // unrelated R in that envelope. Grant-by-secret must preserve the
         // recovered S/H binding; only an explicit R target omits that check.
-        let roots = policies(&reader, &facts, secrets.collection(), bound)
+        let roots = policies(&reader, &facts, bound)
             .into_iter()
             .filter_map(|policy| match policy {
                 AdmissionPolicy::Quorum(quorum) => Some(quorum),
@@ -537,109 +531,100 @@ mod tests {
         let anna = SigningKey::from_bytes(&[2; 32]);
         let bob = SigningKey::from_bytes(&[3; 32]);
         let carol = SigningKey::from_bytes(&[4; 32]);
-        let collection = CollectionHandle::new([5; 32]);
-        let secret = genid().id;
-        let body = BytesHandle::new([6; 32]);
-        let mut store = MemoryRepo::default();
-        let definition = store
-            .put::<blobencodings::SimpleArchive, _>(key_delivery_definition().facts().clone())
-            .unwrap();
-        let descriptor = entity! {
-            metadata::tag: KIND_SECRET_RESOURCE,
-            wrap_secret: secret,
-            secret_body: body,
-            resource_collection: collection,
-            resource_policy*: AdmissionPolicy::quorum([alice.verifying_key(), anna.verifying_key()], 2, None).unwrap().binding(definition),
-        };
-        let resource = store
-            .put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone())
-            .unwrap();
-        let binding = envelope::BoundKey {
-            secret,
-            body,
-            resource,
-            dek: Key::gen(),
-        };
-        let parent = store
-            .put::<blobencodings::SimpleArchive, _>(
-                DeliveryLimits {
-                    not_before: None,
-                    expires_at: Some(Epoch::from_unix_seconds(150.0)),
-                }
-                .definition(true)
-                .unwrap()
-                .facts()
-                .clone(),
-            )
-            .unwrap();
-        let early_child = store
-            .put::<blobencodings::SimpleArchive, _>(
-                DeliveryLimits {
-                    not_before: None,
-                    expires_at: Some(Epoch::from_unix_seconds(50.0)),
-                }
-                .definition(false)
-                .unwrap()
-                .facts()
-                .clone(),
-            )
-            .unwrap();
-        let unbounded_child = store
-            .put::<blobencodings::SimpleArchive, _>(
-                DeliveryLimits::default()
+        // R's home routes its proofs; it does not change R's audience.
+        for home in [
+            Some(CollectionHandle::new([5; 32])),
+            Some(CollectionHandle::new([7; 32])),
+            None,
+        ] {
+            let secret = genid().id;
+            let body = BytesHandle::new([6; 32]);
+            let mut store = MemoryRepo::default();
+            let definition = store
+                .put::<blobencodings::SimpleArchive, _>(key_delivery_definition().facts().clone())
+                .unwrap();
+            let descriptor = entity! {
+                metadata::tag: KIND_SECRET_RESOURCE,
+                wrap_secret: secret,
+                secret_body: body,
+                resource_collection?: home,
+                resource_policy*: AdmissionPolicy::quorum([alice.verifying_key(), anna.verifying_key()], 2, None).unwrap().binding(definition),
+            };
+            let resource = store
+                .put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone())
+                .unwrap();
+            let binding = envelope::BoundKey {
+                secret,
+                body,
+                resource,
+                dek: Key::gen(),
+            };
+            let parent = store
+                .put::<blobencodings::SimpleArchive, _>(
+                    DeliveryLimits {
+                        not_before: None,
+                        expires_at: Some(Epoch::from_unix_seconds(150.0)),
+                    }
+                    .definition(true)
+                    .unwrap()
+                    .facts()
+                    .clone(),
+                )
+                .unwrap();
+            let early_child = store
+                .put::<blobencodings::SimpleArchive, _>(
+                    DeliveryLimits {
+                        not_before: None,
+                        expires_at: Some(Epoch::from_unix_seconds(50.0)),
+                    }
                     .definition(false)
                     .unwrap()
                     .facts()
                     .clone(),
-            )
-            .unwrap();
-        let resource_id = CapabilityResource::from(resource);
-        // Only the extended proofs are stored. Their Bob prefixes stay valid
-        // at t=100 even though one Carol suffix has expired.
-        store
-            .insert_proof(
-                CapabilityProof::new(resource_id, &alice, parent, bob.verifying_key())
-                    .delegate(&bob, early_child, carol.verifying_key())
-                    .unwrap(),
-            )
-            .unwrap();
-        store
-            .insert_proof(
-                CapabilityProof::new(resource_id, &anna, parent, bob.verifying_key())
-                    .delegate(&bob, unbounded_child, carol.verifying_key())
-                    .unwrap(),
-            )
-            .unwrap();
-        let current = store.snapshot().unwrap();
-        assert_eq!(
-            recipients(
-                &current,
-                collection,
-                &binding,
-                Epoch::from_unix_seconds(100.0)
-            )
-            .unwrap(),
-            vec![bob.verifying_key()]
-        );
-        // One immutable evidence view supports different delivery instants;
-        // changing evaluation time does not need a new storage observation.
-        assert!(recipients(
-            &current,
-            collection,
-            &binding,
-            Epoch::from_unix_seconds(150.0)
-        )
-        .unwrap()
-        .is_empty());
-        let audience = recipients(
-            &current,
-            collection,
-            &binding,
-            Epoch::from_unix_seconds(40.0),
-        )
-        .unwrap();
-        assert!(audience.contains(&bob.verifying_key()));
-        assert!(audience.contains(&carol.verifying_key()));
+                )
+                .unwrap();
+            let unbounded_child = store
+                .put::<blobencodings::SimpleArchive, _>(
+                    DeliveryLimits::default()
+                        .definition(false)
+                        .unwrap()
+                        .facts()
+                        .clone(),
+                )
+                .unwrap();
+            let resource_id = CapabilityResource::from(resource);
+            // Only the extended proofs are stored. Their Bob prefixes stay valid
+            // at t=100 even though one Carol suffix has expired.
+            store
+                .insert_proof(
+                    CapabilityProof::new(resource_id, &alice, parent, bob.verifying_key())
+                        .delegate(&bob, early_child, carol.verifying_key())
+                        .unwrap(),
+                )
+                .unwrap();
+            store
+                .insert_proof(
+                    CapabilityProof::new(resource_id, &anna, parent, bob.verifying_key())
+                        .delegate(&bob, unbounded_child, carol.verifying_key())
+                        .unwrap(),
+                )
+                .unwrap();
+            let current = store.snapshot().unwrap();
+            assert_eq!(
+                recipients(&current, &binding, Epoch::from_unix_seconds(100.0)).unwrap(),
+                vec![bob.verifying_key()]
+            );
+            // One immutable evidence view supports different delivery instants;
+            // changing evaluation time does not need a new storage observation.
+            assert!(
+                recipients(&current, &binding, Epoch::from_unix_seconds(150.0))
+                    .unwrap()
+                    .is_empty()
+            );
+            let audience = recipients(&current, &binding, Epoch::from_unix_seconds(40.0)).unwrap();
+            assert!(audience.contains(&bob.verifying_key()));
+            assert!(audience.contains(&carol.verifying_key()));
+        }
     }
 
     #[test]

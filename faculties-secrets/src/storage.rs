@@ -312,6 +312,10 @@ where
 /// Maintain only the selected versions/resources; an empty selection visits
 /// every bound resource this holder can open. Other writers' secrets and legacy
 /// unbound envelopes remain untouched rather than failing the whole pass.
+///
+/// Delivery proofs are read from the whole local store. Another host receives
+/// them only through R's own `resource_collection`, so a replica of just this
+/// collection delivers nothing for a version whose R names another home.
 pub fn maintain_selected_recipient_envelopes<S, R>(
     store: &mut S,
     signing_key: &SigningKey,
@@ -350,12 +354,7 @@ where
             {
                 continue;
             }
-            let recipients = super::resource::recipients(
-                secrets.store_snapshot(),
-                collection.handle(),
-                &binding,
-                now,
-            )?;
+            let recipients = super::resource::recipients(secrets.store_snapshot(), &binding, now)?;
             let envelopes =
                 super::envelope::missing(secrets.store_snapshot(), facts, &binding, recipients)?;
             count += envelopes.recipients.len();
@@ -1203,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_policy_fact_and_foreign_collection_do_not_rebind_a_real_dek() {
+    fn arbitrary_policy_fact_and_self_rooted_descriptors_do_not_rebind_a_real_dek() {
         use triblespace::core::capability::policy::{
             resource_collection, resource_handle, resource_policy,
         };
@@ -1299,19 +1298,49 @@ mod tests {
             0
         );
         assert!(current.open(secret, &attacker).is_err());
-        assert!(
+        // The attacker roots its own descriptors, so it may sign delivery for
+        // them wherever they claim to live. That authority reaches no DEK.
+        for own in [false_resource, same_collection_resource] {
             resource::grant(
                 &mut store,
                 &attacker,
                 &current,
-                SecretTarget::Resource(false_resource),
+                SecretTarget::Resource(own),
                 attacker.verifying_key(),
                 DeliveryLimits::default(),
-                false
+                false,
             )
-            .is_err(),
-            "immutable containing collection differs"
+            .unwrap();
+        }
+        for target in [
+            SecretTarget::Resource(binding.resource),
+            SecretTarget::Secret(secret),
+        ] {
+            assert!(resource::grant(
+                &mut store,
+                &attacker,
+                &current,
+                target,
+                attacker.verifying_key(),
+                DeliveryLimits::default(),
+                false,
+            )
+            .is_err());
+        }
+        let current = observed(&mut store, collection, &alice);
+        assert_eq!(
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &current,
+                collection,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
+            0
         );
+        assert!(current.open(secret, &attacker).is_err());
     }
 
     #[test]
@@ -1389,6 +1418,340 @@ mod tests {
             )
             .unwrap(),
             0
+        );
+    }
+
+    /// R names the collection its version was written in. Carrying the
+    /// version elsewhere, as adopt does, declares the same immutable R in a
+    /// second collection; delivery there is decided by R's policy and the
+    /// proofs over R, never by comparing R's home with the configured one.
+    #[test]
+    fn a_version_carried_into_another_collection_is_granted_and_maintained_there() {
+        use triblespace::core::capability::policy::resource_collection;
+        use triblespace::core::collection::descriptor::validate_proof_evidence;
+        use triblespace::core::collection::migration::{carry, survey, Scope};
+        use triblespace::prelude::*;
+        let alice = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let carol = SigningKey::generate(&mut OsRng);
+        let mallory = SigningKey::generate(&mut OsRng);
+        let reader = SigningKey::generate(&mut OsRng);
+        let writer = SigningKey::generate(&mut OsRng);
+        let delivery = SigningKey::generate(&mut OsRng);
+        let mut store = MemoryRepo::for_host(alice.verifying_key());
+        let private = SecretsCollection::register(
+            &mut store,
+            "private",
+            direct_policy(alice.verifying_key()),
+        )
+        .unwrap();
+        let shared =
+            SecretsCollection::register(&mut store, "shared", direct_policy(alice.verifying_key()))
+                .unwrap();
+        grant_collection_read(&mut store, shared.handle(), &alice, reader.verifying_key()).unwrap();
+        grant_collection_write(&mut store, shared.handle(), &alice, writer.verifying_key())
+            .unwrap();
+        grant_collection_capability(
+            &mut store,
+            shared.handle(),
+            key_delivery_capability(),
+            &alice,
+            delivery.verifying_key(),
+        )
+        .unwrap();
+        let secret = add_secret(&mut store, &alice, private, "token", b"moved", at(1)).unwrap();
+
+        let snap = store.snapshot().unwrap();
+        let carried = survey(
+            &snap,
+            &[private.handle()],
+            shared.handle(),
+            Some(alice.verifying_key()),
+        )
+        .unwrap();
+        drop(snap);
+        carry(
+            &mut store,
+            shared.handle(),
+            &alice,
+            &carried.net_new(Scope::Admitted),
+        )
+        .unwrap();
+
+        let before = observed(&mut store, shared, &alice);
+        let resource = resource_of(&before, secret, &alice);
+        let home = private.handle();
+        let facts: TribleSet = before.store_snapshot().get(resource).unwrap();
+        assert!(
+            exists!(pattern!(&facts, [{ resource_collection: home }])),
+            "R keeps naming the collection it was written in"
+        );
+
+        resource::grant(
+            &mut store,
+            &alice,
+            &before,
+            SecretTarget::Secret(secret),
+            bob.verifying_key(),
+            DeliveryLimits::default(),
+            true,
+        )
+        .unwrap();
+        let current = observed(&mut store, shared, &alice);
+        assert_eq!(
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &current,
+                shared,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
+            1
+        );
+        let after = observed(&mut store, shared, &alice);
+        assert_eq!(after.open(secret, &bob).unwrap(), b"moved");
+        assert_eq!(
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &after,
+                shared,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
+            0
+        );
+
+        // Delegation names R, wherever the version is declared.
+        resource::grant(
+            &mut store,
+            &bob,
+            &after,
+            SecretTarget::Resource(resource),
+            carol.verifying_key(),
+            DeliveryLimits::default(),
+            false,
+        )
+        .unwrap();
+        let current = observed(&mut store, shared, &alice);
+        assert_eq!(
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &current,
+                shared,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
+            1
+        );
+        let after = observed(&mut store, shared, &alice);
+        assert_eq!(after.open(secret, &carol).unwrap(), b"moved");
+
+        // READ, WRITE and a collection-wide key-delivery grant on the second
+        // collection are proofs over that collection, not over R.
+        for key in [&reader, &writer, &delivery] {
+            assert!(after.open(secret, key).is_err());
+        }
+        // Envelopes are written where maintenance ran; the home is untouched.
+        assert!(observed(&mut store, private, &alice)
+            .open(secret, &bob)
+            .is_err());
+
+        // A writer of the second collection seals its own DEK and body to
+        // alice under another secret id while naming the genuine R. The S/H
+        // binding keeps R's authority away from that version.
+        let forged = genid().id;
+        let dek = dryoc::dryocsecretbox::Key::gen();
+        let nonce = dryoc::dryocsecretbox::Nonce::gen();
+        let mut ciphertext = nonce.to_vec();
+        ciphertext.extend_from_slice(
+            &dryoc::dryocsecretbox::DryocSecretBox::encrypt_to_vecbox(b"forged", &nonce, &dek)
+                .to_vec(),
+        );
+        let mut attack = Fragment::empty();
+        let body = attack.put::<blobencodings::RawBytes, _>(ciphertext);
+        let name = attack.put("token".to_owned());
+        attack += super::super::secret_record(forged, name, body, at(2));
+        attack += super::super::envelope::fragment(
+            &super::super::envelope::BoundKey {
+                secret: forged,
+                body,
+                resource,
+                dek,
+            },
+            alice.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        store.commit(shared.source(), &writer, attack).unwrap();
+        let attacked = observed(&mut store, shared, &alice);
+        assert!(resource::grant(
+            &mut store,
+            &alice,
+            &attacked,
+            SecretTarget::Secret(forged),
+            mallory.verifying_key(),
+            DeliveryLimits::default(),
+            false,
+        )
+        .is_err());
+        assert_eq!(
+            maintain_recipient_envelopes(
+                &mut store,
+                &alice,
+                &attacked,
+                shared,
+                &alice,
+                Epoch::from_unix_seconds(10.0),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(attacked.open(forged, &bob).is_err());
+
+        // Proof transport is unchanged: a proof over R is evidence for R's
+        // immutable home only, so the second collection's readers are not
+        // sent R's roots, delegation paths or limits.
+        let snap = store.snapshot().unwrap();
+        let proofs = snap
+            .proofs()
+            .unwrap()
+            .map(|proof| proof.unwrap())
+            .filter(|proof| proof.resource() == CapabilityResource::from(resource))
+            .collect::<Vec<_>>();
+        assert!(proofs.len() >= 2);
+        let private_descriptor: TribleSet = snap.get(private.handle()).unwrap();
+        let shared_descriptor: TribleSet = snap.get(shared.handle()).unwrap();
+        for proof in &proofs {
+            assert!(
+                validate_proof_evidence(&snap, private.handle(), &private_descriptor, proof)
+                    .is_ok()
+            );
+            assert!(
+                validate_proof_evidence(&snap, shared.handle(), &shared_descriptor, proof).is_err()
+            );
+        }
+    }
+
+    /// The same R committed directly into a collection it does not name.
+    /// Delivery windows still apply, and a replica that holds only that
+    /// collection's records has no proof over R until one arrives: it
+    /// delivers nothing rather than guessing.
+    #[test]
+    fn a_version_declared_outside_its_home_keeps_its_window_and_needs_the_proofs() {
+        let alice = SigningKey::generate(&mut OsRng);
+        let bob = SigningKey::generate(&mut OsRng);
+        let mut store = MemoryRepo::for_host(alice.verifying_key());
+        let home =
+            SecretsCollection::register(&mut store, "home", direct_policy(alice.verifying_key()))
+                .unwrap();
+        let elsewhere = SecretsCollection::register(
+            &mut store,
+            "elsewhere",
+            direct_policy(alice.verifying_key()),
+        )
+        .unwrap();
+        let sealed = super::super::resource::seal_version(
+            home.handle(),
+            &alice,
+            "token",
+            b"declared",
+            at(1),
+        )
+        .unwrap();
+        let secret = sealed.secret;
+        store
+            .commit(elsewhere.source(), &alice, sealed.fragment)
+            .unwrap();
+        let before = observed(&mut store, elsewhere, &alice);
+        assert!(!observed(&mut store, home, &alice).contains(secret));
+        resource::grant(
+            &mut store,
+            &alice,
+            &before,
+            SecretTarget::Secret(secret),
+            bob.verifying_key(),
+            DeliveryLimits {
+                not_before: Some(Epoch::from_unix_seconds(50.0)),
+                expires_at: Some(Epoch::from_unix_seconds(150.0)),
+            },
+            false,
+        )
+        .unwrap();
+
+        // A replica of every record and blob, without the proofs.
+        let realized = store.snapshot().unwrap();
+        let mut replica = MemoryRepo::for_host(alice.verifying_key());
+        for info in realized.blobs() {
+            let info = info.unwrap();
+            replica
+                .put::<UnknownBlob, _>(realized.get::<Blob<UnknownBlob>, _>(info.handle).unwrap())
+                .unwrap();
+        }
+        for record in realized.records().unwrap() {
+            replica.insert(record.unwrap()).unwrap();
+        }
+        let unproven = observed(&mut replica, elsewhere, &alice);
+        assert_eq!(
+            maintain_recipient_envelopes(
+                &mut replica,
+                &alice,
+                &unproven,
+                elsewhere,
+                &alice,
+                Epoch::from_unix_seconds(100.0),
+            )
+            .unwrap(),
+            0
+        );
+        for proof in realized.proofs().unwrap() {
+            replica.insert_proof(proof.unwrap()).unwrap();
+        }
+        let proven = observed(&mut replica, elsewhere, &alice);
+        assert_eq!(
+            maintain_recipient_envelopes(
+                &mut replica,
+                &alice,
+                &proven,
+                elsewhere,
+                &alice,
+                Epoch::from_unix_seconds(100.0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            observed(&mut replica, elsewhere, &alice)
+                .open(secret, &bob)
+                .unwrap(),
+            b"declared"
+        );
+
+        for (instant, expected) in [(49.0, 0), (150.0, 0), (100.0, 1)] {
+            let current = observed(&mut store, elsewhere, &alice);
+            assert_eq!(
+                maintain_recipient_envelopes(
+                    &mut store,
+                    &alice,
+                    &current,
+                    elsewhere,
+                    &alice,
+                    Epoch::from_unix_seconds(instant),
+                )
+                .unwrap(),
+                expected,
+                "delivery at t={instant}"
+            );
+        }
+        assert_eq!(
+            observed(&mut store, elsewhere, &alice)
+                .open(secret, &bob)
+                .unwrap(),
+            b"declared"
         );
     }
 }
