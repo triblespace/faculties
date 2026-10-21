@@ -10,8 +10,10 @@ use std::process::{Command, Output};
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 use triblespace::core::collection::{
-    AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStoreExt,
+    AdmissionPolicy, CollectionCommit, CollectionPolicy, CollectionRead, CollectionRecord,
+    CollectionStore, CollectionStoreExt,
 };
+use triblespace::core::inline::Inline;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::SnapshotSource;
 
@@ -87,6 +89,24 @@ impl Fixture {
     /// COMMIT records per collection handle, read from the pile itself.
     fn commits(&self) -> std::collections::BTreeMap<String, usize> {
         commits_in(&self.pile)
+    }
+
+    /// One COMMIT signed by this host into the retired `blockdag` root, as
+    /// the old build's imports left there.
+    fn seed_blockdag(&self) {
+        let host = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
+        let mut handle = [0_u8; 32];
+        hex::decode_to_slice(&self.blockdag, &mut handle).unwrap();
+        let mut store = Pile::open(&self.pile).unwrap();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &host,
+                Inline::new(handle),
+                Inline::new([0x61; 32]),
+                Inline::new([0x62; 32]),
+            )))
+            .unwrap();
+        store.close().unwrap();
     }
 
     fn length(&self) -> u64 {
@@ -181,4 +201,33 @@ fn the_archive_variable_cannot_select_the_retired_blockdag_descriptor() {
     );
     assert_eq!(fixture.length(), before);
     assert!(fixture.commits().is_empty());
+}
+
+/// With no collection variable at all, a pile whose retired `blockdag` holds
+/// content refuses the import, naming both the old name and the variable to
+/// set, and writes no COMMIT. Before the rename the same refusal came from the
+/// same-name generation check; the rename must not turn it into a silent
+/// private `archive`. With an empty `blockdag` the import proceeds as on any
+/// fresh pile.
+#[test]
+fn no_variable_beside_a_blockdag_with_content_is_refused() {
+    let fixture = Fixture::new();
+    fixture.seed_blockdag();
+    let before = fixture.commits();
+    assert_eq!(before.get(&fixture.blockdag), Some(&1));
+    let output = fixture.import(&[]);
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(message.contains("\"blockdag\""), "{message}");
+    assert!(
+        message.contains("TRIBLESPACE_COLLECTION_ARCHIVE"),
+        "{message}"
+    );
+    assert!(message.contains(&fixture.blockdag), "{message}");
+    assert_eq!(fixture.commits(), before, "a refused import committed");
+
+    let empty = Fixture::new();
+    let output = empty.import(&[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(empty.commits().get(&empty.blockdag), None);
 }

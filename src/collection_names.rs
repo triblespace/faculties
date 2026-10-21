@@ -23,8 +23,8 @@ use triblespace::core::blob::encodings::utf8string::UTF8String;
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::collection::{
     descriptor, generation, records::CollectionHandle, AdmissionPolicy, Collection,
-    CollectionPolicy, CollectionRead, CollectionRecordSelector, CollectionRegistrationError,
-    CollectionStoreExt,
+    CollectionPolicy, CollectionRead, CollectionRecord, CollectionRecordSelector,
+    CollectionRegistrationError, CollectionStoreExt,
 };
 use triblespace::core::id::Id;
 use triblespace::core::inline::Inline;
@@ -110,10 +110,17 @@ pub fn table() -> Vec<(Id, &'static str)> {
 /// signer-private descriptor under the new name, which is a silent fork. So
 /// [`configured_handle`] refuses when a retired variable is the only one set.
 ///
+/// With no variable set, [`open_configured`] refuses to start a new private
+/// generation while a generation under a retired name holds commits.
+///
 /// The Archive scope was named `blockdag` until the fresh `archive` collection
 /// replaced it (compass bec46736, option C). The old descriptor still names
-/// itself `blockdag`, so it can never be opened under the new name either:
-/// [`open_exact_in`] checks the descriptor's own name.
+/// itself `blockdag`, so `TRIBLESPACE_COLLECTION_ARCHIVE` naming it is refused:
+/// [`open_exact_in`] checks the descriptor's own name. That holds for the
+/// environment path only. An explicit workspace route ([`open_workspace_in`],
+/// `Storage` with `collections: Some`) opens the root it names whatever that
+/// root calls itself, so a route for the Archive scope still pointing at the
+/// old descriptor keeps reading and writing it until the route is changed.
 pub fn retired_names(scope: Id) -> &'static [&'static str] {
     if scope == blockdag::DEFAULT_SCOPE_ID {
         &["blockdag"]
@@ -229,7 +236,8 @@ fn configured_handle_from(
                 "{stale} is set but {variable} is not. The {retired:?} collection is now named \
                  {:?} and this build reads only {variable}; set it to the descriptor this host \
                  should use. The {stale} value is never used, whatever it names: only \
-                 {variable} selects a descriptor, and one still named {retired:?} is refused.",
+                 {variable} selects a descriptor here, and it refuses one still named \
+                 {retired:?}.",
                 require_name(scope),
             );
         }
@@ -298,6 +306,11 @@ where
                 );
             }
         }
+        if let Some(refusal) =
+            retired_generations_with_content(&snapshot, scope, collection.handle())?
+        {
+            bail!("{refusal}");
+        }
         return Ok(collection);
     };
 
@@ -360,6 +373,84 @@ where
         .context("freeze configured collection READ evidence")?;
     let reader = crate::storage::AcquiringReader::new(snapshot, runtime.clone());
     open_exact_read_in(&reader, scope, subject, handle)
+}
+
+/// The same refusal across a rename. [`generation::named_generations`]
+/// compares descriptor names, so after a scope is renamed it no longer sees the
+/// generations under the earlier name ([`retired_names`]): a host with no
+/// configured handle would register a fresh private generation under the new
+/// name beside a retired-name generation that holds commits, and write there.
+/// That is the fork the same-name check exists to refuse, so it is refused
+/// here too, naming the earlier name and the variable to set. As there, a
+/// private generation that already holds commits is this host's own
+/// collection, reopened, and is left alone.
+fn retired_generations_with_content<S>(
+    snapshot: &S,
+    scope: Id,
+    selected: CollectionHandle,
+) -> anyhow::Result<Option<String>>
+where
+    S: CollectionRead + BlobStoreGet,
+{
+    let retired = retired_names(scope);
+    if retired.is_empty() {
+        return Ok(None);
+    }
+    let commits = |handle: CollectionHandle| -> anyhow::Result<usize> {
+        let route =
+            std::collections::BTreeSet::from([CollectionRecordSelector::Collection(handle)]);
+        let content: std::collections::BTreeSet<_> = snapshot
+            .select_records(&route)?
+            .into_iter()
+            .filter_map(|record| match record {
+                CollectionRecord::Commit(commit) => Some((commit.data(), commit.metadata())),
+                _ => None,
+            })
+            .collect();
+        Ok(content.len())
+    };
+    if commits(selected)? > 0 {
+        return Ok(None);
+    }
+    let mut holding = Vec::new();
+    for handle in snapshot.collections()? {
+        if handle == selected {
+            continue;
+        }
+        // Open world: a descriptor without a readable root name is simply not
+        // a generation of any name.
+        let Some(name) = (|| {
+            let facts: TribleSet = snapshot.get(handle).ok()?;
+            let name = descriptor::name(&facts).ok()??;
+            snapshot.get::<View<str>, UTF8String>(name).ok()
+        })() else {
+            continue;
+        };
+        if !retired.contains(&&*name) {
+            continue;
+        }
+        let held = commits(handle)?;
+        if held > 0 {
+            holding.push(format!(
+                "{:?} blake3:{} ({held} commit(s))",
+                &*name,
+                hex::encode(handle.raw)
+            ));
+        }
+    }
+    if holding.is_empty() {
+        return Ok(None);
+    }
+    let variable = override_env_name(scope);
+    Ok(Some(format!(
+        "{variable} is not configured on this host and this pile already holds {} \
+         generation(s) of {:?} under an earlier name with content: {}. Set {variable} to \
+         the {:?} descriptor this host should use instead of starting another.",
+        holding.len(),
+        require_name(scope),
+        holding.join(", "),
+        require_name(scope),
+    )))
 }
 
 /// The silent failure a re-mint produces, made audible: the configured
@@ -1222,6 +1313,71 @@ mod tests {
         assert_eq!(
             open_exact_in(&snapshot, blockdag::DEFAULT_SCOPE_ID, fresh.handle()).unwrap(),
             fresh
+        );
+    }
+
+    /// With neither variable set, a host must not start a private `archive`
+    /// beside a `blockdag` generation that holds commits: the rename must not
+    /// drop the refusal the same-name check gave before it. An empty
+    /// `blockdag`, a host reopening its own `archive` with content, and other
+    /// scopes are unaffected.
+    #[test]
+    fn no_variable_refuses_a_private_archive_beside_a_blockdag_with_content() {
+        use triblespace::core::collection::{CollectionCommit, CollectionStore};
+
+        let scope = blockdag::DEFAULT_SCOPE_ID;
+        let other = decide::DEFAULT_SCOPE_ID;
+        for variable in [
+            "TRIBLESPACE_COLLECTION_ARCHIVE".to_owned(),
+            "TRIBLESPACE_COLLECTION_BLOCKDAG".to_owned(),
+            override_env_name(other),
+        ] {
+            assert!(
+                std::env::var_os(&variable).is_none(),
+                "{variable} must be unset for this test"
+            );
+        }
+        let operator = SigningKey::from_bytes(&[0x44; 32]);
+        let host = SigningKey::from_bytes(&[0x45; 32]);
+        let mut store = MemoryRepo::default();
+        let old = store
+            .collection("blockdag", private_policy(operator.verifying_key()))
+            .unwrap();
+
+        open_configured(&mut store, scope, host.verifying_key())
+            .expect("an empty blockdag generation is not content");
+
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &operator,
+                old.handle(),
+                Inline::new([5; 32]),
+                Inline::new([6; 32]),
+            )))
+            .unwrap();
+        let error = open_configured(&mut store, scope, host.verifying_key())
+            .expect_err("a blockdag generation with content exists; refuse a private archive")
+            .to_string();
+        assert!(error.contains("TRIBLESPACE_COLLECTION_ARCHIVE"), "{error}");
+        assert!(error.contains("\"blockdag\""), "{error}");
+        assert!(error.contains(&hex::encode(old.handle().raw)), "{error}");
+
+        open_configured(&mut store, other, host.verifying_key())
+            .expect("a scope without retired names never looks at blockdag");
+
+        let own = open(&mut store, scope, host.verifying_key()).unwrap();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &host,
+                own.handle(),
+                Inline::new([7; 32]),
+                Inline::new([8; 32]),
+            )))
+            .unwrap();
+        assert_eq!(
+            open_configured(&mut store, scope, host.verifying_key()).unwrap(),
+            own,
+            "a host reopens its own archive generation that already holds commits"
         );
     }
 

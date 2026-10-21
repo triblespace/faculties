@@ -844,9 +844,15 @@ A renamed collection keeps its scope and gets a new variable. The Archive
 scope is named `archive`, read through `TRIBLESPACE_COLLECTION_ARCHIVE`; its
 earlier name `blockdag` is retired. A process whose environment still holds
 only `TRIBLESPACE_COLLECTION_BLOCKDAG` is refused rather than treated as
-unconfigured, and a descriptor still named `blockdag` is never opened as the
-Archive. Beside `TRIBLESPACE_COLLECTION_ARCHIVE` the old variable is ignored,
-so older binaries can keep reading it during a switch.
+unconfigured, and `TRIBLESPACE_COLLECTION_ARCHIVE` naming a descriptor still
+called `blockdag` is refused. A process with neither variable is refused while
+the pile holds a `blockdag` generation with commits, instead of starting a
+private `archive` beside it. Beside `TRIBLESPACE_COLLECTION_ARCHIVE` the old
+variable is ignored, so older binaries can keep reading it during a switch.
+All of this is the environment path. An explicit workspace route (as Erlkonig
+keeps per role) opens the root it names whatever that root is called, so a
+route for the Archive scope that still points at the `blockdag` descriptor
+keeps using it until the route itself is changed.
 
 ## GORBIE viewer
 
