@@ -66,7 +66,7 @@ use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
 pub fn table() -> Vec<(Id, &'static str)> {
     vec![
         (atlas::DEFAULT_SCOPE_ID, "atlas"),
-        (blockdag::DEFAULT_SCOPE_ID, "blockdag"),
+        (blockdag::DEFAULT_SCOPE_ID, "archive"),
         (body::DEFAULT_SCOPE_ID, "body"),
         (code::DEFAULT_SCOPE_ID, "code"),
         (cognition::DEFAULT_SCOPE_ID, "cognition"),
@@ -100,6 +100,26 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (web::DEFAULT_SCOPE_ID, "web"),
         (wiki::DEFAULT_SCOPE_ID, "wiki"),
     ]
+}
+
+/// Names a scope was known by before, oldest first.
+///
+/// A rename changes the scope's override variable, and a process environment
+/// is a copy taken at start: a host that still carries only the old variable
+/// would otherwise read no override at all and fall through to a fresh
+/// signer-private descriptor under the new name, which is a silent fork. So
+/// [`configured_handle`] refuses when a retired variable is the only one set.
+///
+/// The Archive scope was named `blockdag` until the fresh `archive` collection
+/// replaced it (compass bec46736, option C). The old descriptor still names
+/// itself `blockdag`, so it can never be opened under the new name either:
+/// [`open_exact_in`] checks the descriptor's own name.
+pub fn retired_names(scope: Id) -> &'static [&'static str] {
+    if scope == blockdag::DEFAULT_SCOPE_ID {
+        &["blockdag"]
+    } else {
+        &[]
+    }
 }
 
 /// The name for one scope, or `None` if this build does not know it.
@@ -145,7 +165,10 @@ pub const COLLECTION_OVERRIDE_PREFIX: &str = "TRIBLESPACE_COLLECTION_";
 
 /// Deterministic environment-variable name for one faculty collection.
 pub fn override_env_name(scope: Id) -> String {
-    let name = require_name(scope);
+    env_name_for(require_name(scope))
+}
+
+fn env_name_for(name: &str) -> String {
     let mut variable = String::with_capacity(COLLECTION_OVERRIDE_PREFIX.len() + name.len());
     variable.push_str(COLLECTION_OVERRIDE_PREFIX);
     variable.extend(name.bytes().map(|byte| match byte {
@@ -181,12 +204,37 @@ fn parse_override(variable: &str, raw: OsString) -> anyhow::Result<CollectionHan
 /// `config` collection resolves the name to -- needs a snapshot, and so lives
 /// in [`open_configured`], which already has one. Keeping this function
 /// storage-free is what lets callers that hold no pile still ask the question.
+///
+/// A variable left over from a name the scope no longer has
+/// ([`retired_names`]) is refused when it is the only one set, so a stale
+/// environment fails loudly instead of quietly opening a new private
+/// descriptor. Set beside the current variable it is ignored: that is the
+/// switch window, when older binaries still read it.
 pub fn configured_handle(scope: Id) -> anyhow::Result<Option<CollectionHandle>> {
+    configured_handle_from(scope, |variable| std::env::var_os(variable))
+}
+
+fn configured_handle_from(
+    scope: Id,
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> anyhow::Result<Option<CollectionHandle>> {
     let variable = override_env_name(scope);
-    match std::env::var_os(&variable) {
-        Some(raw) => Ok(Some(parse_override(&variable, raw)?)),
-        None => Ok(None),
+    if let Some(raw) = lookup(&variable) {
+        return Ok(Some(parse_override(&variable, raw)?));
     }
+    for retired in retired_names(scope) {
+        let stale = env_name_for(retired);
+        if lookup(&stale).is_some() {
+            bail!(
+                "{stale} is set but {variable} is not. The {retired:?} collection is now named \
+                 {:?} and this build reads only {variable}; set it to the descriptor this host \
+                 should use. The {stale} value is never used, whatever it names: only \
+                 {variable} selects a descriptor, and one still named {retired:?} is refused.",
+                require_name(scope),
+            );
+        }
+    }
+    Ok(None)
 }
 
 /// Open the operator-selected exact descriptor, or construct the ordinary
@@ -1076,6 +1124,105 @@ mod tests {
         );
         assert!(parse_override(&variable, OsString::from("ab")).is_err());
         assert!(parse_override(&variable, OsString::from("zz".repeat(32))).is_err());
+    }
+
+    /// The Archive scope is named `archive`, so its override variable is
+    /// `TRIBLESPACE_COLLECTION_ARCHIVE`, and that variable alone selects it.
+    #[test]
+    fn the_archive_scope_is_named_archive_and_reads_its_own_variable() {
+        let scope = blockdag::DEFAULT_SCOPE_ID;
+        assert_eq!(require_name(scope), "archive");
+        assert_eq!(override_env_name(scope), "TRIBLESPACE_COLLECTION_ARCHIVE");
+        let raw = "cd".repeat(32);
+        let selected = configured_handle_from(scope, |variable| {
+            (variable == "TRIBLESPACE_COLLECTION_ARCHIVE").then(|| OsString::from(&raw))
+        })
+        .unwrap()
+        .expect("the ARCHIVE variable selects the archive descriptor");
+        assert_eq!(selected.raw, [0xcd; 32]);
+    }
+
+    /// A stale environment that carries only the retired BLOCKDAG variable is
+    /// refused, naming both variables, instead of reading as "no override"
+    /// and quietly opening a fresh private `archive` descriptor. Beside the
+    /// ARCHIVE variable it is ignored (the switch window), and it never
+    /// affects any other scope.
+    #[test]
+    fn a_retired_variable_alone_is_refused_and_never_selects_a_handle() {
+        let scope = blockdag::DEFAULT_SCOPE_ID;
+        let old = "ab".repeat(32);
+        let new = "cd".repeat(32);
+        let only_old = |variable: &str| {
+            (variable == "TRIBLESPACE_COLLECTION_BLOCKDAG").then(|| OsString::from(&old))
+        };
+        let error = configured_handle_from(scope, only_old)
+            .expect_err("a retired variable alone must not read as unconfigured")
+            .to_string();
+        assert!(error.contains("TRIBLESPACE_COLLECTION_BLOCKDAG"), "{error}");
+        assert!(error.contains("TRIBLESPACE_COLLECTION_ARCHIVE"), "{error}");
+
+        let both = |variable: &str| match variable {
+            "TRIBLESPACE_COLLECTION_BLOCKDAG" => Some(OsString::from(&old)),
+            "TRIBLESPACE_COLLECTION_ARCHIVE" => Some(OsString::from(&new)),
+            _ => None,
+        };
+        assert_eq!(
+            configured_handle_from(scope, both).unwrap().unwrap().raw,
+            [0xcd; 32],
+            "only the ARCHIVE value is ever used"
+        );
+        assert!(configured_handle_from(scope, |_| None).unwrap().is_none());
+        assert!(configured_handle_from(wiki::DEFAULT_SCOPE_ID, only_old)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A retired name must never be a current name or normalize to a current
+    /// variable: then the guard would refuse a live configuration.
+    #[test]
+    fn retired_names_never_shadow_a_current_name() {
+        let current: BTreeSet<String> = table()
+            .into_iter()
+            .map(|(scope, _)| override_env_name(scope))
+            .collect();
+        let mut retired_any = false;
+        for (scope, name) in table() {
+            for retired in retired_names(scope) {
+                retired_any = true;
+                assert_ne!(*retired, name);
+                assert!(
+                    !current.contains(&env_name_for(retired)),
+                    "retired {retired:?} shadows a current variable"
+                );
+            }
+        }
+        assert!(retired_any);
+        assert_eq!(retired_names(blockdag::DEFAULT_SCOPE_ID), ["blockdag"]);
+    }
+
+    /// The new name never opens the old descriptor: a descriptor that names
+    /// itself `blockdag` is refused under the Archive scope, so neither
+    /// variable can route archive reads or writes to the retired collection.
+    #[test]
+    fn the_archive_scope_refuses_a_descriptor_still_named_blockdag() {
+        let operator = SigningKey::from_bytes(&[0x43; 32]);
+        let mut store = MemoryRepo::default();
+        let old = store
+            .collection("blockdag", private_policy(operator.verifying_key()))
+            .unwrap();
+        let fresh = store
+            .collection("archive", private_policy(operator.verifying_key()))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let error = open_exact_in(&snapshot, blockdag::DEFAULT_SCOPE_ID, old.handle())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("\"blockdag\""), "{error}");
+        assert!(error.contains("not expected faculty collection"), "{error}");
+        assert_eq!(
+            open_exact_in(&snapshot, blockdag::DEFAULT_SCOPE_ID, fresh.handle()).unwrap(),
+            fresh
+        );
     }
 
     #[test]

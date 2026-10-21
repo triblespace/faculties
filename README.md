@@ -840,6 +840,14 @@ malformed, wrongly typed, wrongly named, or non-writable exact descriptor is an
 error before publication; Faculties never silently invents a signer-private
 replacement or appends an inert COMMIT.
 
+A renamed collection keeps its scope and gets a new variable. The Archive
+scope is named `archive`, read through `TRIBLESPACE_COLLECTION_ARCHIVE`; its
+earlier name `blockdag` is retired. A process whose environment still holds
+only `TRIBLESPACE_COLLECTION_BLOCKDAG` is refused rather than treated as
+unconfigured, and a descriptor still named `blockdag` is never opened as the
+Archive. Beside `TRIBLESPACE_COLLECTION_ARCHIVE` the old variable is ignored,
+so older binaries can keep reading it during a switch.
+
 ## GORBIE viewer
 
 The `viewer` binary composes the full [GORBIE] faculty dashboard against one pile.
