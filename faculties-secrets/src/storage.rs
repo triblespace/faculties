@@ -274,13 +274,7 @@ pub fn add_secret<S>(
 where
     S: Store + CollectionStoreExt,
 {
-    let sealed = super::resource::seal_version(
-        collection.handle(),
-        signing_key,
-        name,
-        plaintext,
-        created_at,
-    )?;
+    let sealed = super::resource::seal_version(signing_key, name, plaintext, created_at)?;
     let secret = sealed.secret;
     store
         .commit(collection.source, signing_key, sealed.fragment)
@@ -314,8 +308,10 @@ where
 /// unbound envelopes remain untouched rather than failing the whole pass.
 ///
 /// Delivery proofs are read from the whole local store. Another host receives
-/// them only through R's own `resource_collection`, so a replica of just this
-/// collection delivers nothing for a version whose R names another home.
+/// them by grant gossip when it takes part in R (a root of R or a key named on
+/// a grant over R), whichever collection declares the version; a replica of
+/// this collection's records alone holds no proof over R and delivers nothing
+/// until one arrives.
 pub fn maintain_selected_recipient_envelopes<S, R>(
     store: &mut S,
     signing_key: &SigningKey,
@@ -1203,9 +1199,8 @@ mod tests {
 
     #[test]
     fn arbitrary_policy_fact_and_self_rooted_descriptors_do_not_rebind_a_real_dek() {
-        use triblespace::core::capability::policy::{
-            resource_collection, resource_handle, resource_policy,
-        };
+        use crate::resource::retired::resource_collection;
+        use triblespace::core::capability::policy::{resource_handle, resource_policy};
         use triblespace::prelude::*;
         let alice = SigningKey::generate(&mut OsRng);
         let attacker = SigningKey::generate(&mut OsRng);
@@ -1421,14 +1416,13 @@ mod tests {
         );
     }
 
-    /// R names the collection its version was written in. Carrying the
-    /// version elsewhere, as adopt does, declares the same immutable R in a
-    /// second collection; delivery there is decided by R's policy and the
-    /// proofs over R, never by comparing R's home with the configured one.
+    /// R names no collection. Carrying the version elsewhere, as adopt does,
+    /// declares the same immutable R in a second collection; delivery there
+    /// is decided by R's policy and the proofs over R, which reach every
+    /// participant of R by grant gossip, whichever collection declares it.
     #[test]
     fn a_version_carried_into_another_collection_is_granted_and_maintained_there() {
-        use triblespace::core::capability::policy::resource_collection;
-        use triblespace::core::collection::descriptor::validate_proof_evidence;
+        use crate::resource::retired::resource_collection;
         use triblespace::core::collection::migration::{carry, survey, Scope};
         use triblespace::prelude::*;
         let alice = SigningKey::generate(&mut OsRng);
@@ -1480,11 +1474,13 @@ mod tests {
 
         let before = observed(&mut store, shared, &alice);
         let resource = resource_of(&before, secret, &alice);
-        let home = private.handle();
         let facts: TribleSet = before.store_snapshot().get(resource).unwrap();
         assert!(
-            exists!(pattern!(&facts, [{ resource_collection: home }])),
-            "R keeps naming the collection it was written in"
+            !exists!(
+                (home: Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>),
+                pattern!(&facts, [{ resource_collection: ?home }])
+            ),
+            "a new R names no collection"
         );
 
         resource::grant(
@@ -1612,63 +1608,37 @@ mod tests {
             0
         );
         assert!(attacked.open(forged, &bob).is_err());
-
-        // Proof transport is unchanged: a proof over R is evidence for R's
-        // immutable home only, so the second collection's readers are not
-        // sent R's roots, delegation paths or limits.
-        let snap = store.snapshot().unwrap();
-        let proofs = snap
-            .proofs()
-            .unwrap()
-            .map(|proof| proof.unwrap())
-            .filter(|proof| proof.resource() == CapabilityResource::from(resource))
-            .collect::<Vec<_>>();
-        assert!(proofs.len() >= 2);
-        let private_descriptor: TribleSet = snap.get(private.handle()).unwrap();
-        let shared_descriptor: TribleSet = snap.get(shared.handle()).unwrap();
-        for proof in &proofs {
-            assert!(
-                validate_proof_evidence(&snap, private.handle(), &private_descriptor, proof)
-                    .is_ok()
-            );
-            assert!(
-                validate_proof_evidence(&snap, shared.handle(), &shared_descriptor, proof).is_err()
-            );
-        }
     }
 
-    /// The same R committed directly into a collection it does not name.
+    /// A version committed directly into one collection and no other.
     /// Delivery windows still apply, and a replica that holds only that
     /// collection's records has no proof over R until one arrives: it
     /// delivers nothing rather than guessing.
     #[test]
-    fn a_version_declared_outside_its_home_keeps_its_window_and_needs_the_proofs() {
+    fn a_version_declared_in_one_collection_keeps_its_window_and_needs_the_proofs() {
         let alice = SigningKey::generate(&mut OsRng);
         let bob = SigningKey::generate(&mut OsRng);
         let mut store = MemoryRepo::for_host(alice.verifying_key());
-        let home =
-            SecretsCollection::register(&mut store, "home", direct_policy(alice.verifying_key()))
-                .unwrap();
+        let unrelated = SecretsCollection::register(
+            &mut store,
+            "unrelated",
+            direct_policy(alice.verifying_key()),
+        )
+        .unwrap();
         let elsewhere = SecretsCollection::register(
             &mut store,
             "elsewhere",
             direct_policy(alice.verifying_key()),
         )
         .unwrap();
-        let sealed = super::super::resource::seal_version(
-            home.handle(),
-            &alice,
-            "token",
-            b"declared",
-            at(1),
-        )
-        .unwrap();
+        let sealed =
+            super::super::resource::seal_version(&alice, "token", b"declared", at(1)).unwrap();
         let secret = sealed.secret;
         store
             .commit(elsewhere.source(), &alice, sealed.fragment)
             .unwrap();
         let before = observed(&mut store, elsewhere, &alice);
-        assert!(!observed(&mut store, home, &alice).contains(secret));
+        assert!(!observed(&mut store, unrelated, &alice).contains(secret));
         resource::grant(
             &mut store,
             &alice,

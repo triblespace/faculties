@@ -1696,17 +1696,23 @@ mod tests {
             Inline::new([2; 32]),
             empty_metadata_handle(),
         );
+        // A MERGE joins exactly eight distinct inputs: each scope's commit
+        // payload and seven opaque handles of its own.
         let target_merge = CollectionMerge::sign(
             &signer,
             target,
-            [target_commit.data(), Inline::new([4; 32])],
+            [target_commit.data()]
+                .into_iter()
+                .chain([4, 20, 21, 22, 23, 24, 25].map(|input| Inline::new([input; 32]))),
             Inline::new([5; 32]),
         )
         .unwrap();
         let other_merge = CollectionMerge::sign(
             &signer,
             other,
-            [other_commit.data(), Inline::new([7; 32])],
+            [other_commit.data()]
+                .into_iter()
+                .chain([7, 30, 31, 32, 33, 34, 35].map(|input| Inline::new([input; 32]))),
             Inline::new([8; 32]),
         )
         .unwrap();
@@ -2016,6 +2022,7 @@ mod tests {
     fn fact_read_stands_for_nothing_beneath_unadmitted_commits_and_reads_the_rollup_once_they_are_admitted(
     ) {
         use triblespace::core::blob::IntoBlob;
+        use triblespace::core::collection::MERGE_INPUTS;
         use triblespace::core::repo::BlobStorePut;
 
         let owner = SigningKey::from_bytes(&[7; 32]);
@@ -2028,10 +2035,17 @@ mod tests {
             owner.verifying_key(),
         )
         .unwrap();
-        let left = entity! { metadata::name: "left" };
-        let right = entity! { metadata::name: "right" };
-        let expected = (left.clone() + right.clone()).facts().clone();
-        let commits: Vec<_> = [left, right]
+        // A MERGE joins exactly eight distinct inputs: eight commits, all
+        // signed by the same unadmitted author.
+        let names = [
+            "left", "right", "third", "fourth", "fifth", "sixth", "seventh", "eighth",
+        ];
+        assert_eq!(names.len(), MERGE_INPUTS);
+        let fragments = names.map(|name| entity! { metadata::name: name });
+        let expected = fragments.iter().fold(TribleSet::new(), |union, fragment| {
+            union + fragment.facts().clone()
+        });
+        let commits: Vec<_> = fragments
             .into_iter()
             .map(|fragment| {
                 let blob = IntoBlob::<SimpleArchive>::to_blob(fragment.facts().clone());
@@ -2052,7 +2066,7 @@ mod tests {
                 CollectionMerge::sign(
                     &owner,
                     collection.handle(),
-                    [commits[0].data(), commits[1].data()],
+                    commits.iter().map(|commit| commit.data()),
                     Handle::<SimpleArchive>::to_hash(joined),
                 )
                 .unwrap(),
@@ -2086,7 +2100,7 @@ mod tests {
                 .unwrap();
         }
         let snapshot = store.snapshot().unwrap();
-        assert_eq!(collection.admitted(&snapshot).unwrap().len(), 2);
+        assert_eq!(collection.admitted(&snapshot).unwrap().len(), MERGE_INPUTS);
         for commit in &commits {
             assert!(!snapshot
                 .contains_blob(Handle::<SimpleArchive>::from_hash(commit.data()))
@@ -2094,7 +2108,7 @@ mod tests {
         }
         let (facts, support) = read_fact_collection(collection, &snapshot).unwrap();
         assert_eq!(facts, expected);
-        assert_eq!(support.len(), 2);
+        assert_eq!(support.len(), MERGE_INPUTS);
     }
 
     #[test]
