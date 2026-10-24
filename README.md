@@ -746,6 +746,9 @@ included. The standalone API, format and minted marker provenance are in
 
 ### Native 1Password import
 
+The CLI import below is **ordinary node/agent-readable encryption**, not
+user-held protection. It is not the local app's protected import route.
+
 `secrets import-1password ./export.1pux --check` validates a bounded 1PUX version
 3 ZIP in memory and reports counts only, without opening the destination pile
 or signing key. Omit `--check` to publish one coherent source commit: one raw
@@ -794,6 +797,40 @@ bindings before reusing any body/resource. Receipts use native queries and opaqu
 IDs, not a unique imported catalog. Extra public facts cannot expand delivery;
 concurrent imports may legitimately produce duplicate versions. Maintenance
 failure after publication is reported as pending, not rolled back.
+
+The separate library operation `Secrets::import_1password_protected` accepts
+local bytes, limits, `Protection` and an optional previous receipt ID. The local
+app collects the file and password outside tool arguments. It prepares the
+byte-exact original, the same structured native item/attachment projection and
+an encrypted receipt with user-held envelopes only, outside the live store
+lease, then publishes one source commit. Public labels are fixed neutral text;
+exact item titles are encrypted fields. Passwords, source filenames, vault and
+account details, and source digests are never public import metadata. Ciphertext
+lengths, timestamps, opaque IDs and graph topology remain visible. An optional
+device envelope is additional recovery, never a node-key envelope or key-delivery
+policy. Argon2id work currently scales with the number of protected artifacts.
+
+With no previous receipt the call explicitly makes a **new import**; it does
+not promise global content deduplication. Retain its returned opaque receipt for
+retry: supplying it requires the correct password, an admitted importer-signed
+source publication coupling the exact receipt/body/resource/envelope, byte-exact
+original equality, and every receipt-pinned item/attachment child. Wrong
+passwords, ordinary receipts, missing evidence and substitutions fail without
+creating another copy. No public content fingerprint or signing-seed-derived
+equality oracle is used. A successful retry appends nothing. An uncertain
+publication/durability error carries the planned receipt in
+`ProtectedImportPublicationError`; a successful commit with pending derived-view
+maintenance returns its normal report. Retry is explicit, never an automatic
+replay. Previously ordinary imports remain node-readable: this neither converts
+nor retrospectively revokes those copies.
+
+Prepublication rejections expose `ProtectedImportRejection`: finite static
+`stage`/`code` values distinguish parse format/limit failures, destination
+observation, encryption, receipt verification and other preparation failures.
+An optional positive `os_error_code` preserves a numeric OS cause when one is
+still available; it is not an inferred diagnosis. No underlying error message,
+path, source text, password or cause chain is retained. This does not relax
+input limits or alter import/encryption/admission behavior.
 
 No audience is inferred. Repeated explicit `--recipient ED25519_PUBLIC_KEY`
 options issue non-delegating native grants and deliver only the exact archive

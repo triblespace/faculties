@@ -33,7 +33,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import a bounded 1PUX archive as native encrypted items; retain exact source.
+    /// Ordinary node/agent-readable 1PUX import; retains exact source and public item titles.
+    /// For user-held protection, use the separate local app import instead.
     #[command(name = "import-1password")]
     Import1password {
         /// Local unencrypted export. Read in memory, never extracted or removed.

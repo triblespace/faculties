@@ -1,5 +1,70 @@
 # Typed encrypted item blobs
 
+## User-protected versions
+
+`protected::prepare_raw` and `prepare_item` generate a fresh random DEK and
+retain the existing raw SecretBox or structured `Encrypted<T>` body format.
+They publish **no signing-key recipient envelope**. The immutable protected
+resource has no ordinary key-delivery policy; signing a publication is not
+possession of its DEK. Ordinary `add`, recipient grants, possession-based
+opening and delivery maintenance retain their existing meanings. A protected
+version is not a migration of, or a way to revoke, an old node-readable version.
+
+The separate protected-envelope format is:
+
+```text
+magic16 | S16 | H32 | R32 | body-kind1 | reserved-zero7
+Argon2id t u32 LE | memory-KiB u32 LE | lanes u32 LE
+salt16 | nonce24 | device-key-ID length u32 LE | device-cipher length u32 LE
+reserved-zero8 | device-key-ID bytes | device-cipher bytes
+password-encrypted DEK32 | Poly1305 tag16
+```
+
+The fixed password profile is dryoc's libsodium-compatible Argon2id v19,
+t=3, 64 MiB, lanes=1, salt16, output32. It is not the RFC 9106 p=4 profile.
+Readers reject other profiles and bound lengths before deriving a key. All
+bytes before the password ciphertext are XChaCha20-Poly1305 associated data.
+The optional platform envelope seals the exact `magic/S/H/R/body-kind/reserved`
+104-byte binding followed by the DEK32; the platform must enforce user presence
+at its private-key operation, not return an unbound authentication boolean.
+The password path remains independent recovery when that device key is lost.
+Offline password guessing remains possible; use a strong independent passphrase.
+
+`ProtectedAccess` is detached ciphertext plus exact request metadata; it carries
+no store lease. Its opaque, non-Clone `Unlocked` is bound to one preparation
+nonce, collection, version, body, resource, envelope and output purpose. The
+configured Secrets facade prepares under its existing admitted view, releases
+the lease before its optional `Storage::with_protected_access` callback, then
+reopens and revalidates those immutable selectors before doing that one read.
+SDK callers must call `Unlocked::validate` against the **original** request
+first (including its ephemeral nonce), then pass the freshly prepared admitted
+binding to the consuming `open_raw`/`open_item`. The fresh preparation has its
+own nonce and is used for binding comparison, not a second user approval.
+No generic tool is retried. No key is persisted or cached between calls.
+Unavailable local UI or denied requests fail closed. Raw get, exact private
+body opening, inspect, typed child export and TOTP use this path. Public lists
+and protected body-alternative listing do not unlock. Multiple matching
+envelopes remain valid data but require an explicit envelope selector not yet
+provided by this first facade; it refuses rather than selecting by iteration.
+
+Direct snapshot consumers such as mail/teams/web are not automatically adapted:
+their ordinary node-key opening cannot open these versions. Platform prompting
+is limited to the explicit configured Secrets facade in this slice. Passwords,
+device operations and decrypted keys must stay in the local application, never
+MCP arguments. An approved export deliberately discloses plaintext to its caller;
+this protects against node-key possession, not a malicious replacement of the
+trusted application, process inspection, OS compromise or retention after export.
+
+IDs minted using installed `trible genid` on 2026-10-23:
+
+| Meaning | Exact minted value |
+| --- | --- |
+| protected_envelope attribute anchor | `7BD1A72C9E4200DD281ED868B222106E` |
+| protected envelope format | `B071EBD51A3CF3474B6F5C0166CEF54D` |
+| protected resource kind | `BB3B50C0EB9FE11E8DD911F76FD2C738` |
+
+## Existing typed body format
+
 `encrypted::Encrypted<T: BlobEncoding>` is a typed XChaCha20-Poly1305 envelope
 implemented with RustCrypto `chacha20poly1305 0.10.1`. Its immutable bytes are:
 

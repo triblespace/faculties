@@ -4,6 +4,9 @@ use crate::secrets::encrypted::Encrypted;
 use triblespace::prelude::*;
 
 pub const KIND_1PASSWORD_IMPORT: Id = id_hex!("4101B50F70312052067291E5DA690757");
+/// Separate from ordinary node-readable imports. Minted with installed
+/// `trible genid` on 2026-10-23: D4374D8D09F82D060C074E9F9860EE84.
+pub const KIND_PROTECTED_1PASSWORD_IMPORT: Id = id_hex!("D4374D8D09F82D060C074E9F9860EE84");
 
 attributes! {
     /// Public equality locator only, never authority to reuse or disclose.

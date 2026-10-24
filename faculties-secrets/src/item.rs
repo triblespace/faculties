@@ -69,6 +69,17 @@ pub fn prepare(
     input: ItemInput<'_>,
     created_at: IntervalValue,
 ) -> Result<SealedVersion> {
+    prepare_using(public_label, input, created_at, |key, bundle| {
+        super::resource::seal_item_bundle(signer, public_label, key, bundle, created_at)
+    })
+}
+
+pub(crate) fn prepare_using(
+    public_label: &str,
+    input: ItemInput<'_>,
+    created_at: IntervalValue,
+    finish: impl FnOnce(ItemKey, Bundle<Encrypted<SimpleArchive>>) -> Result<SealedVersion>,
+) -> Result<SealedVersion> {
     validate_name("public item label", public_label)?;
     point_value("item creation time", created_at)?;
     let key = ItemKey::generate(genid().id);
@@ -111,17 +122,17 @@ pub fn prepare(
     let private = entity! { metadata::tag: KIND_ITEM,
     item_field*: fields, item_attachment*: attachments };
     let bundle = sealer.finish_facts(private.into_facts())?;
-    super::resource::seal_item_bundle(signer, public_label, key, bundle, created_at)
+    finish(key, bundle)
 }
 
 /// A decrypted relation plus its held key and fixed reader, not an eager field
 /// catalog. The backing decrypted blob zeroizes; decoded relations and caller
 /// copies cannot be promised erased. Do not print this object as metadata.
 pub struct OpenedItem<R> {
-    reader: R,
-    key: ItemKey,
-    facts: TribleSet,
-    body: ItemBody,
+    pub(crate) reader: R,
+    pub(crate) key: ItemKey,
+    pub(crate) facts: TribleSet,
+    pub(crate) body: ItemBody,
 }
 
 impl<R: BlobStoreGet> OpenedItem<R> {

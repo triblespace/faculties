@@ -62,6 +62,9 @@ pub const ROLE_NOTES: Id = id_hex!("4D5B2D703075E182BCA7B175EAB7F314");
 pub const ROLE_CUSTOM: Id = id_hex!("79E38C701F519597B83ADB569A69B5C8");
 
 attributes! {
+    /// Password/device envelopes; never a node-recipient DEK wrap. Minted 2026-10-23.
+    "7BD1A72C9E4200DD281ED868B222106E" as pub protected_envelope:
+        inlineencodings::Handle<blobencodings::RawBytes>;
     // Explicit anchors minted with installed `trible genid`, 2026-10-17.
     /// Public root of a structured encrypted immutable version, not a raw body.
     "E7261A95940626523600E19D172B5563" as pub structured_body:

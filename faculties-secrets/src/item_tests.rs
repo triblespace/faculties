@@ -117,7 +117,6 @@ fn carried_structured_version_uses_its_resource_policy_not_a_home_collection() {
         (home: CollectionHandle),
         pattern!(&descriptor, [{ resource_collection: ?home }])
     ));
-    assert_eq!(carried.open_item(id, &alice).unwrap().len(), 1);
     resource::grant(
         &mut store,
         &alice,
@@ -128,6 +127,7 @@ fn carried_structured_version_uses_its_resource_policy_not_a_home_collection() {
         false,
     )
     .unwrap();
+    assert_eq!(carried.open_item(id, &alice).unwrap().len(), 1);
     let granted =
         pollster::block_on(storage::ensure_and_snapshot(&mut store, target, &alice)).unwrap();
     assert_eq!(
@@ -273,7 +273,6 @@ fn native_fields_binary_and_private_names_survive_commit_reopen_and_blind_traver
         },
     ];
     let sealed = prepare(
-        collection.handle(),
         &signer,
         "public fixture",
         ItemInput {
@@ -774,7 +773,6 @@ fn valid_competing_bodies_are_disclosed_and_missing_or_foreign_resources_do_not_
     );
     let delivered =
         pollster::block_on(storage::ensure_and_snapshot(&mut store, collection, &alice)).unwrap();
-    assert_eq!(delivered.open_item(first, &bob).unwrap().len(), 1);
     let retired_home_grants = resource::grant(
         &mut store,
         &alice,
@@ -786,4 +784,5 @@ fn valid_competing_bodies_are_disclosed_and_missing_or_foreign_resources_do_not_
     )
     .unwrap();
     assert_eq!(retired_home_grants.len(), 1);
+    assert_eq!(delivered.open_item(first, &bob).unwrap().len(), 1);
 }

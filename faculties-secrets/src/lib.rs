@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 pub mod encrypted;
 mod envelope;
 pub mod item;
+pub mod protected;
 pub mod resource;
 pub mod schema;
 pub mod storage;

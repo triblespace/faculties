@@ -128,7 +128,13 @@ pub struct Storage {
     expected_signer: Option<VerifyingKey>,
     local_only: bool,
     shared: Option<Arc<Mutex<Option<Session>>>>,
+    protected_access: Option<Arc<ProtectedResolver>>,
 }
+
+/// An application-owned local prompt. Called only outside a store lease by
+/// explicit Secrets operations; never by raw snapshots or delivery maintenance.
+pub type ProtectedResolver = dyn Fn(&crate::secrets::protected::ProtectedAccess)
+    -> Result<crate::secrets::protected::Unlocked> + Send + Sync;
 
 struct Session {
     store: Option<FacultyStore>,
@@ -197,6 +203,7 @@ impl Storage {
             expected_signer: None,
             local_only: false,
             shared: None,
+            protected_access: None,
         }
     }
 
@@ -212,6 +219,7 @@ impl Storage {
             expected_signer: None,
             local_only: false,
             shared: Some(Arc::new(Mutex::new(None))),
+            protected_access: None,
         }
     }
 
@@ -233,11 +241,25 @@ impl Storage {
             expected_signer: None,
             local_only: false,
             shared: Some(Arc::new(Mutex::new(None))),
+            protected_access: None,
         }
     }
 
     pub fn path(&self) -> &Path {
         &self.pile
+    }
+
+    pub fn with_protected_access(mut self, resolver: Arc<ProtectedResolver>) -> Self {
+        self.protected_access = Some(resolver);
+        self
+    }
+
+    pub(crate) fn resolve_protected(
+        &self,
+        access: &crate::secrets::protected::ProtectedAccess,
+    ) -> Result<crate::secrets::protected::Unlocked> {
+        self.protected_access.as_ref()
+            .ok_or_else(|| anyhow!("protected secret needs a local Erlkonig unlock; no node-key fallback"))?(access)
     }
 
     /// One resident-only application owner. Exact missing bytes fail; neither

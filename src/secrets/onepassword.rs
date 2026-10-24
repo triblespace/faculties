@@ -21,6 +21,12 @@ use triblespace::core::repo::{BlobStoreGet, Store, StoreRead};
 use triblespace::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
+mod protected_import;
+pub use protected_import::{PreparedProtectedImport, ProtectedImportPublicationError};
+mod rejection;
+pub use rejection::{ProtectedImportCode, ProtectedImportRejection, ProtectedImportStage};
+use rejection::parse_error;
+
 /// Limits apply before publication. Larger exports require an explicit caller
 /// choice; ZIP64 directories and multi-disk archives are not supported.
 #[derive(Clone, Copy, Debug)]
@@ -122,18 +128,18 @@ impl Drop for SensitiveJson {
 impl<'a> OnePasswordArchive<'a> {
     pub fn parse(original: &'a [u8], limits: ImportLimits) -> Result<Self> {
         if original.len() > limits.archive_bytes {
-            bail!("1Password import: archive byte limit exceeded");
+            return Err(parse_error(ProtectedImportCode::ArchiveByteLimit, "1Password import: archive byte limit exceeded"));
         }
         let declared_entries = standard_zip_entry_count(original)?;
         if declared_entries > limits.entries {
-            bail!("1Password import: archive entry limit exceeded");
+            return Err(parse_error(ProtectedImportCode::ArchiveEntryLimit, "1Password import: archive entry limit exceeded"));
         }
         let mut archive = zip::ZipArchive::new(Cursor::new(original))
-            .map_err(|_| anyhow::anyhow!("1Password import: invalid ZIP archive"))?;
+            .map_err(|_| parse_error(ProtectedImportCode::ZipArchive, "1Password import: invalid ZIP archive"))?;
         // zip 2 collapses duplicate central-directory names into an IndexMap.
         // Compare with the original EOCD count, not the already-collapsed names.
         if archive.len() != declared_entries || archive.offset() != 0 {
-            bail!("1Password import: duplicate entries or unsupported ZIP layout");
+            return Err(parse_error(ProtectedImportCode::ZipLayout, "1Password import: duplicate entries or unsupported ZIP layout"));
         }
         let mut data = None;
         let mut attributes = None;
@@ -143,11 +149,11 @@ impl<'a> OnePasswordArchive<'a> {
         for index in 0..archive.len() {
             let mut member = archive
                 .by_index(index)
-                .map_err(|_| anyhow::anyhow!("1Password import: unreadable ZIP member"))?;
+                .map_err(|_| parse_error(ProtectedImportCode::ZipMember, "1Password import: unreadable ZIP member"))?;
             let name = std::str::from_utf8(member.name_raw())
-                .map_err(|_| anyhow::anyhow!("1Password import: invalid member path"))?;
+                .map_err(|_| parse_error(ProtectedImportCode::InvalidMemberPath, "1Password import: invalid member path"))?;
             if !safe_member_path(name) || member.is_symlink() || member.encrypted() {
-                bail!("1Password import: unsafe or encrypted ZIP member");
+                return Err(parse_error(ProtectedImportCode::UnsafeMember, "1Password import: unsafe or encrypted ZIP member"));
             }
             let is_data = name == "export.data";
             let is_attributes = name == "export.attributes";
@@ -160,7 +166,7 @@ impl<'a> OnePasswordArchive<'a> {
                 limits.member_bytes
             };
             if member.size() > limit {
-                bail!("1Password import: member byte limit exceeded");
+                return Err(parse_error(ProtectedImportCode::MemberByteLimit, "1Password import: member byte limit exceeded"));
             }
             let declared_size = member.size();
             let mut content = Zeroizing::new(Vec::new());
@@ -168,25 +174,25 @@ impl<'a> OnePasswordArchive<'a> {
             loop {
                 let read = member
                     .read(&mut buffer)
-                    .map_err(|_| anyhow::anyhow!("1Password import: ZIP integrity check failed"))?;
+                    .map_err(|_| parse_error(ProtectedImportCode::ZipIntegrity, "1Password import: ZIP integrity check failed"))?;
                 if read == 0 {
                     break;
                 }
                 size = size.checked_add(read as u64).ok_or_else(|| {
-                    anyhow::anyhow!("1Password import: member byte limit exceeded")
+                    parse_error(ProtectedImportCode::MemberByteLimit, "1Password import: member byte limit exceeded")
                 })?;
                 expanded = expanded.checked_add(read as u64).ok_or_else(|| {
-                    anyhow::anyhow!("1Password import: expanded byte limit exceeded")
+                    parse_error(ProtectedImportCode::ExpandedByteLimit, "1Password import: expanded byte limit exceeded")
                 })?;
                 if size > limit || expanded > limits.expanded_bytes {
-                    bail!("1Password import: expanded byte limit exceeded");
+                    return Err(parse_error(ProtectedImportCode::ExpandedByteLimit, "1Password import: expanded byte limit exceeded"));
                 }
                 if retain {
                     content.extend_from_slice(&buffer[..read]);
                 }
             }
             if size != declared_size || (directory && size != 0) {
-                bail!("1Password import: ZIP member size mismatch");
+                return Err(parse_error(ProtectedImportCode::MemberSizeMismatch, "1Password import: ZIP member size mismatch"));
             }
             if is_data {
                 data = Some(content);
@@ -197,13 +203,13 @@ impl<'a> OnePasswordArchive<'a> {
             }
         }
         let attributes = attributes
-            .ok_or_else(|| anyhow::anyhow!("1Password import: missing export attributes"))?;
+            .ok_or_else(|| parse_error(ProtectedImportCode::MissingAttributes, "1Password import: missing export attributes"))?;
         let attributes = parse_json(&attributes)?;
         if attributes.0.get("version").and_then(Value::as_u64) != Some(3) {
-            bail!("1Password import: unsupported export format version");
+            return Err(parse_error(ProtectedImportCode::UnsupportedVersion, "1Password import: unsupported export format version"));
         }
         let data = parse_json(
-            &data.ok_or_else(|| anyhow::anyhow!("1Password import: missing export data"))?,
+            &data.ok_or_else(|| parse_error(ProtectedImportCode::MissingData, "1Password import: missing export data"))?,
         )?;
         let mut parsed = Self {
             original,
@@ -220,11 +226,11 @@ impl<'a> OnePasswordArchive<'a> {
             for vault in vaults {
                 for item in required_array(vault, "items")? {
                     if !item.is_object() {
-                        bail!("1Password import: invalid item structure");
+                        return Err(parse_error(ProtectedImportCode::InvalidStructure, "1Password import: invalid item structure"));
                     }
                     counts.items += 1;
                     if counts.items > limits.items {
-                        bail!("1Password import: item count limit exceeded");
+                        return Err(parse_error(ProtectedImportCode::ItemCountLimit, "1Password import: item count limit exceeded"));
                     }
                 }
             }
@@ -895,11 +901,11 @@ fn scalar_count(value: &Value) -> usize {
 fn parse_json(bytes: &[u8]) -> Result<SensitiveJson> {
     serde_json::from_slice(bytes)
         .map(SensitiveJson)
-        .map_err(|_| anyhow::anyhow!("1Password import: malformed export JSON"))
+        .map_err(|_| parse_error(ProtectedImportCode::MalformedJson, "1Password import: malformed export JSON"))
 }
 
 fn charge_projected(total: &mut u64, amount: usize, limit: u64) -> Result<()> {
-    let error = || anyhow!("1Password import: projected byte budget exceeded");
+    let error = || parse_error(ProtectedImportCode::ProjectedByteLimit, "1Password import: projected byte budget exceeded");
     let amount = u64::try_from(amount).map_err(|_| error())?;
     *total = total
         .checked_add(amount)
@@ -913,7 +919,7 @@ fn required_array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value]> {
         .get(field)
         .and_then(Value::as_array)
         .map(Vec::as_slice)
-        .ok_or_else(|| anyhow::anyhow!("1Password import: invalid account/vault/item structure"))
+        .ok_or_else(|| parse_error(ProtectedImportCode::InvalidStructure, "1Password import: invalid account/vault/item structure"))
 }
 
 fn safe_member_path(name: &str) -> bool {
@@ -927,7 +933,7 @@ fn safe_member_path(name: &str) -> bool {
 // A narrow EOCD check, not a second ZIP parser. zip 2 owns entry parsing,
 // decompression, sizes and CRC validation. ZIP64/multidisk are refused explicitly.
 fn standard_zip_entry_count(bytes: &[u8]) -> Result<usize> {
-    let invalid = || anyhow::anyhow!("1Password import: unsupported or malformed ZIP directory");
+    let invalid = || parse_error(ProtectedImportCode::ZipDirectory, "1Password import: unsupported or malformed ZIP directory");
     let lower = bytes.len().saturating_sub(22 + u16::MAX as usize);
     let end = bytes.len().checked_sub(22).ok_or_else(invalid)?;
     let position = (lower..=end)
@@ -1738,5 +1744,60 @@ pub(crate) mod tests {
             bytes[eocd + offset] = value;
             error(&bytes, ImportLimits::default());
         }
+    }
+
+    #[test]
+    fn zip_layout_refusal_characterizes_name_collapse_and_offset_reinterpretation() {
+        fn rejection(bytes: &[u8]) -> ProtectedImportCode {
+            ProtectedImportRejection::parse(
+                OnePasswordArchive::parse(bytes, ImportLimits::default()).err().unwrap(),
+            ).code
+        }
+        // Even harmless-looking repeated empty directory entries are collapsed
+        // by zip2. This does NOT establish the contents of any real export.
+        for directory in [false, true] {
+            let first = if directory { "files/a/" } else { "files/a" };
+            let second = if directory { "files/b/" } else { "files/b" };
+            let mut bytes = zip(&[
+                ("export.attributes", br#"{"version":3}"#),
+                ("export.data", br#"{"accounts":[]}"#),
+                (first, b""), (second, b""),
+            ]);
+            let positions: Vec<_> = bytes.windows(second.len()).enumerate()
+                .filter_map(|(index, name)| (name == second.as_bytes()).then_some(index)).collect();
+            assert_eq!(positions.len(), 2); // local and central headers
+            for position in positions { bytes[position + 6] = b'a'; }
+            let reader = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            assert_eq!(standard_zip_entry_count(&bytes).unwrap(), 4);
+            assert_eq!(reader.len(), 3);
+            assert_eq!(reader.offset(), 0);
+            assert_eq!(rejection(&bytes), ProtectedImportCode::ZipLayout);
+        }
+
+        let plain = zip(&[
+            ("export.attributes", br#"{"version":3}"#),
+            ("export.data", br#"{"accounts":[]}"#),
+        ]);
+        let prefix = b"synthetic-prefix";
+        let mut prefixed = prefix.to_vec();
+        prefixed.extend_from_slice(&plain);
+        let reader = zip::ZipArchive::new(Cursor::new(&prefixed)).unwrap();
+        assert_eq!(reader.len(), 2);
+        assert_eq!(reader.offset(), prefix.len() as u64);
+        // Ordinary relative-offset prepending is already rejected by the EOCD
+        // bounds predicate, before the later zip_layout check is reached.
+        assert_eq!(rejection(&prefixed), ProtectedImportCode::ZipDirectory);
+
+        // An overstated directory size can satisfy that arithmetic while the
+        // zip reader relocates the actual headers. This reaches the OTHER arm
+        // of zip_layout with no duplicate names; it is not a reason to relax it.
+        let eocd = prefixed.len() - 22;
+        let size = u32::from_le_bytes(prefixed[eocd + 12..eocd + 16].try_into().unwrap());
+        prefixed[eocd + 12..eocd + 16].copy_from_slice(&(size + prefix.len() as u32).to_le_bytes());
+        let reader = zip::ZipArchive::new(Cursor::new(&prefixed)).unwrap();
+        assert_eq!(standard_zip_entry_count(&prefixed).unwrap(), 2);
+        assert_eq!(reader.len(), 2);
+        assert_eq!(reader.offset(), prefix.len() as u64);
+        assert_eq!(rejection(&prefixed), ProtectedImportCode::ZipLayout);
     }
 }
