@@ -702,6 +702,113 @@ CLI and MCP use the same operations: `secrets_grant` accepts `secret` or
 `resource`, and `secrets_maintain` accepts `secrets` and `resources` arrays.
 No command here silently grants replication access or creates a new inbox.
 
+### Structured Secrets
+
+`faculties-secrets` also supports native private item relations: repeated
+username/password/URL/notes/custom fields, inline integers/flags, and binary
+attachments with encrypted filenames. The explicit public label is the only
+user-supplied display metadata published in clear. One fresh key per immutable
+version opens the whole item, not selected fields. Key identity, lengths and
+ciphertext graph topology remain visible. Existing raw `add/get/list` and their
+consumers keep their original format and behavior.
+
+```sh
+umask 077
+secrets add-login --label public-reference --password-file - \
+  --username-file ./private-username --attachment ./private-document
+secrets items
+secrets item-open --secret VERSION_ID
+secrets item-inspect --secret VERSION_ID --body CIPHERTEXT_BODY_HANDLE
+secrets item-open --secret VERSION_ID --body CIPHERTEXT_BODY_HANDLE > private-facts.archive
+secrets item-export --secret VERSION_ID --body CIPHERTEXT_BODY_HANDLE \
+  --child CIPHERTEXT_CHILD_HANDLE --text
+```
+
+Inputs are files or one stdin stream, never secret literal argv values. The
+last two commands explicitly export plaintext to stdout; choose a private
+destination yourself (for example, set `umask 077` before shell redirection).
+`item-open` without `--body` lists all decryptable body alternatives. An
+authorized writer can append another body under the same opaque version ID;
+neither the library nor CLI silently picks one. Native facts are canonical
+SimpleArchive bytes; use the library's `find!`/`pattern!` on `OpenedItem::facts()`
+to select typed child handles. Opening one child does not load all fields or
+attachments. A missing unrelated child does not prevent opening the root.
+
+Configured Rust operations are `Secrets::{add_item,list_items,open_item,
+open_item_body,open_item_child,inspect_item}`. Item metadata includes exact body
+handles and explicit unavailable public labels. Inspection names known roles and
+shows typed ciphertext value/name handles without opening those values. MCP
+offers read-only `secrets_items`, `secrets_item_open`, `secrets_item_inspect`, and
+`secrets_item_export`; explicit exports are binary resources, not perception.
+No structured MCP value-entry schema, app popup, adoption or deployment is
+included. The standalone API, format and minted marker provenance are in
+[`faculties-secrets/README.md`](faculties-secrets/README.md).
+
+### Native 1Password import
+
+`secrets import-1password ./export.1pux --check` validates a bounded 1PUX version
+3 ZIP in memory and reports counts only, without opening the destination pile
+or signing key. Omit `--check` to publish one coherent source commit: one raw
+encrypted copy of the exact original archive, native encrypted item versions,
+and an owner-only encrypted native SimpleArchive retry receipt. No per-item or
+login JSON is persisted. Reports go directly to private stdout, never Drive or
+perception; they contain counts and opaque IDs only, not titles or source paths.
+Item titles themselves are public item labels (trimmed/fallback only when the
+core label rules require it; exact original title bytes then stay in an encrypted
+custom field). Exact-source fingerprints reveal
+equality of archives; ciphertext lengths, key IDs and topology remain public.
+
+The mapping follows [1Password's documented 1PUX format](https://support.1password.com/1pux-format/).
+Native projection includes account/vault/item identifiers (item UUID is scoped
+by account and vault), account email and vault name, category/trash/favorite
+and source state/timestamp scalars, designated and arbitrary scalar login fields, URLs, notes, known scalar
+section-value variants, and exact referenced document/file attachments. Unknown
+roles become custom fields, not an invented credential type. Filenames, private
+labels and text values are encrypted children; integers and flags stay inside
+the encrypted native root. Password history, unknown/complex fields, icons,
+other vendor metadata and unsupported members remain preserved in the exact
+original archive. There is no claim of universal native projection. The
+archive-only scalar count measures unmapped scalar leaves of `export.data`
+(including metadata), not structure, `export.attributes`, or all archive members.
+The archive-only file count names unprojected `files/` members by count only.
+
+All members are read through size/expanded/entry/item bounds and CRC validation;
+unsafe paths, duplicate names, symlinks, encrypted members, ZIP64 directories and multi-disk
+archives are refused. Nothing is extracted, removed or modified. Larger limits
+are an explicit library caller choice through `onepassword::ImportLimits`.
+
+Before any sealing, a separate 2 GiB default projected-payload budget charges
+the original archive, every appearance of projected plaintext (including repeated
+account/vault context and attachment references), public labels, plus conservative
+per-field, per-attachment, item/root and receipt overhead. Checked arithmetic
+rejects overflow or excess before publication. This is an authored-payload budget,
+not a promise about peak process memory; ZIP/JSON/expanded-byte limits remain
+independent. Library callers may explicitly choose a different projected budget.
+
+Exact-byte retry requires an admitted source COMMIT by the current importer key
+that signs the exact receipt S/H/R association, then opens and queries that
+encrypted native receipt. Possession of a receipt sealed to a public key alone
+does not authenticate its author. Retry compares the
+original archive bytes, and checks exact S/H/R possession and immutable source
+bindings before reusing any body/resource. Receipts use native queries and opaque
+IDs, not a unique imported catalog. Extra public facts cannot expand delivery;
+concurrent imports may legitimately produce duplicate versions. Maintenance
+failure after publication is reported as pending, not rolled back.
+
+No audience is inferred. Repeated explicit `--recipient ED25519_PUBLIC_KEY`
+options issue non-delegating native grants and deliver only the exact archive
+and item resources pinned by that receipt, never competing bodies under the same
+opaque item ID. The retry receipt stays owner-only. Collection READ/WRITE is not
+granted. Selected resource maintenance also honors any recipients previously
+authorized for those exact resources; explicit new recipients do not revoke or
+restrict earlier authority. Delivery is additive and separately retryable; the original archive
+reveals all original export material to a chosen recipient. Only use recipients
+authorized to receive that entire export.
+
+Reusable entry points are `onepassword::OnePasswordArchive::{parse,counts,import}`,
+`Secrets::import_1password`, and explicit finite `Secrets::grant_selected`.
+There is no importer MCP subprocess shim or implicit live-vault access.
+
 ## Notes on piles & collections
 
 Pile-backed commands honor `PILE`; `--pile <path>` overrides it for one

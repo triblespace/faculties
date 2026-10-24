@@ -28,10 +28,13 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 use zeroize::Zeroizing;
 
+pub mod encrypted;
 mod envelope;
+pub mod item;
 pub mod resource;
 pub mod schema;
 pub mod storage;
+pub mod totp;
 
 pub use self::schema::{key_delivery_capability, key_delivery_definition, DEFAULT_SCOPE_ID};
 

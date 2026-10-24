@@ -15,10 +15,18 @@ path = "src/lib.rs"
 anyhow = "1.0"
 anybytes = { version = "0.20.3", path = "../../anybytes" }
 dryoc = "0.8"           # secrets (libsodium-compatible pure-Rust crypto)
+chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 # DEKs are sealed to key-delivery recipients' durable pile signing keys, so the core
 # uses the same Ed25519 type the signing-key file yields.
 ed25519-dalek = "2.1.1"
 hifitime = "4.2.3"
+# TOTP: existing locked RustCrypto primitives and standard encoding/URI parsers.
+hmac = "=0.12.1"
+sha1 = "=0.10.7"
+sha2 = "=0.10.9"
+data-encoding = "=2.11.1"
+url = "=2.5.8"
+percent-encoding = "=2.3.2"
 triblespace = { version = "0.47.0", path = "../../triblespace-rs" }
 zeroize = "1.9"
 

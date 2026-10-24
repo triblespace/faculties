@@ -282,6 +282,31 @@ where
     Ok(secret)
 }
 
+/// Publish a structured item and all its ciphertext dependencies in one COMMIT.
+pub fn add_item<S>(
+    store: &mut S,
+    signing_key: &SigningKey,
+    collection: SecretsCollection,
+    public_label: &str,
+    input: super::item::ItemInput<'_>,
+    created_at: IntervalValue,
+) -> Result<triblespace::core::id::Id>
+where
+    S: Store + CollectionStoreExt,
+{
+    let sealed = super::item::prepare(
+        signing_key,
+        public_label,
+        input,
+        created_at,
+    )?;
+    let secret = sealed.secret;
+    store
+        .commit(collection.source, signing_key, sealed.fragment)
+        .map_err(|error| anyhow!("publish encrypted structured item: {error}"))?;
+    Ok(secret)
+}
+
 /// Add missing envelopes across every secret in one policy boundary.
 ///
 /// The supplied snapshot fixes both the secrets and self-contained key-delivery
@@ -337,11 +362,15 @@ where
             ?id @ triblespace::core::metadata::tag: super::schema::KIND_SECRET,
         }])
     )
+    .chain(find!(id: triblespace::core::id::Id,
+        pattern!(facts, [{ ?id @ triblespace::core::metadata::tag: super::schema::KIND_ITEM_VERSION }])))
     .collect::<std::collections::BTreeSet<_>>();
     let mut fragment = triblespace::core::trible::Fragment::empty();
     let mut count = 0usize;
     for secret in secret_ids {
-        for binding in super::envelope::recover(secrets.store_snapshot(), facts, secret, holder)? {
+        for binding in
+            super::envelope::recover_all(secrets.store_snapshot(), facts, secret, holder)?
+        {
             if !selected.is_empty()
                 && !selected.iter().any(|target| match target {
                     SecretTarget::Secret(id) => *id == secret,

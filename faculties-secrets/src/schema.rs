@@ -1,5 +1,6 @@
 //! Stable wire schema for immutable encrypted secret versions and recipient wraps.
 
+use crate::encrypted::Encrypted;
 use triblespace::core::capability::{capability_action, CapabilityHandle};
 use triblespace::macros::{attributes, id_hex};
 use triblespace::prelude::*;
@@ -51,7 +52,34 @@ pub const KIND_SECRET_RESOURCE: Id = id_hex!("8DE676F5445D85A874435C68C9C387E4")
 /// Bound recipient-envelope format. Minted with `trible genid` on 2026-09-14.
 pub const BOUND_ENVELOPE_MAGIC: [u8; 16] = id_hex!("0AFF57FBB4533A0E74171F2B7893BDC9").raw();
 
+// Structured item markers/roles minted with installed `trible genid`, 2026-10-17.
+pub const KIND_ITEM: Id = id_hex!("BA875912DAD2AF6779DC00175D2942AF");
+pub const KIND_ITEM_VERSION: Id = id_hex!("103651E249CC495CE716A26C3689B26D");
+pub const ROLE_USERNAME: Id = id_hex!("385C89355B86672AA44A5E2BDC1B6336");
+pub const ROLE_PASSWORD: Id = id_hex!("09E876C9EC08BD88342D5DC28FB7A2A4");
+pub const ROLE_URL: Id = id_hex!("6A5BF630C2CE6387652C0D120B56C415");
+pub const ROLE_NOTES: Id = id_hex!("4D5B2D703075E182BCA7B175EAB7F314");
+pub const ROLE_CUSTOM: Id = id_hex!("79E38C701F519597B83ADB569A69B5C8");
+
 attributes! {
+    // Explicit anchors minted with installed `trible genid`, 2026-10-17.
+    /// Public root of a structured encrypted immutable version, not a raw body.
+    "E7261A95940626523600E19D172B5563" as pub structured_body:
+        inlineencodings::Handle<Encrypted<blobencodings::SimpleArchive>>;
+    /// Repeated private field nodes, inside the encrypted archive only.
+    "0544A812AB6D17B3576B64A1A663F5CF" as pub item_field: inlineencodings::GenId;
+    /// Repeated private attachment nodes, inside the encrypted archive only.
+    "47E02C07D70AF3EA1BF425E8A5F54767" as pub item_attachment: inlineencodings::GenId;
+    "2EE309C1273C5433CC8C24F7F710DC13" as pub field_role: inlineencodings::GenId;
+    "C12F9DBCFE8D377A87B1DE5C12F37A88" as pub field_text:
+        inlineencodings::Handle<Encrypted<blobencodings::UTF8String>>;
+    "9B6273023FB3BC8716C1FF734382FB3C" as pub attachment_bytes:
+        inlineencodings::Handle<Encrypted<blobencodings::RawBytes>>;
+    /// A private custom-field label or attachment filename, never a public label.
+    "535EF6AFCC5A1985AF7403BF18F0985F" as pub private_name:
+        inlineencodings::Handle<Encrypted<blobencodings::UTF8String>>;
+    "B686FF41C1BDA50B2406181AF600BBF4" as pub field_integer: inlineencodings::I256BE;
+    "7A8D777ADAD7EEBA662445ED2AE6FC08" as pub field_flag: inlineencodings::Boolean;
     "7FC38805FDC9FA4D8449497B298B51BB" unsafe as pub secret_body:
         inlineencodings::Handle<blobencodings::RawBytes>;
     "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC" unsafe as pub wrap_secret:

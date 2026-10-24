@@ -110,7 +110,10 @@ pub fn delivery_prefix_is_current<R: BlobStoreGet>(
     })
 }
 
-pub(crate) fn seal_version(
+/// Prepare one bound raw secret and its signer-only envelope without publishing.
+/// The immutable resource binds the opaque secret id and exact body.
+/// Callers may compose its fragment with dependent facts before one commit.
+pub fn seal_version(
     signer: &SigningKey,
     name: &str,
     plaintext: &[u8],
@@ -155,6 +158,50 @@ pub(crate) fn seal_version(
     })
 }
 
+/// Same immutable S/H/R/DEK envelope contract, with a distinct typed body.
+pub(crate) fn seal_item_bundle(
+    signer: &SigningKey,
+    name: &str,
+    key: crate::encrypted::ItemKey,
+    bundle: Bundle<crate::encrypted::Encrypted<SimpleArchive>>,
+    created_at: IntervalValue,
+) -> Result<SealedVersion> {
+    use crate::schema::{structured_body, KIND_ITEM_VERSION};
+    let secret = key.id();
+    let body = bundle.root();
+    let mut fragment = entity! { ExclusiveId::force_ref(&secret) @
+        metadata::tag: KIND_ITEM_VERSION,
+        metadata::name: name.to_owned(),
+        metadata::created_at: created_at,
+        structured_body*: bundle,
+    };
+    let definition = key_delivery_definition();
+    let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
+    fragment += definition;
+    let descriptor = entity! {
+        metadata::tag: KIND_SECRET_RESOURCE,
+        wrap_secret: secret,
+        structured_body: body,
+        resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+    };
+    let resource = fragment.put::<SimpleArchive, _>(descriptor.facts().clone());
+    fragment += entity! { ExclusiveId::force_ref(&secret) @ resource_handle: resource };
+    fragment += envelope::fragment(
+        &envelope::BoundKey {
+            secret,
+            body: body.transmute(),
+            resource,
+            dek: key.into_dek(),
+        },
+        signer.verifying_key().to_bytes(),
+    )?;
+    Ok(SealedVersion {
+        fragment,
+        secret,
+        recipients: vec![signer.verifying_key()],
+    })
+}
+
 /// Delivery is decided by R's own policy and the proofs over R, never by which
 /// collection declares the version, so a version carried into another
 /// collection keeps its delivery policy there. The policy grants delivery for
@@ -165,7 +212,7 @@ fn policies<R: BlobStoreGet>(
     facts: &TribleSet,
     bound: Option<(Id, BytesHandle)>,
 ) -> Vec<AdmissionPolicy> {
-    let candidates = find!(
+    let raw = find!(
         (entity: Id, secret: Id, body: BytesHandle),
         pattern!(facts, [{
             ?entity @ metadata::tag: KIND_SECRET_RESOURCE,
@@ -173,6 +220,13 @@ fn policies<R: BlobStoreGet>(
             secret_body: ?body,
         }])
     );
+    let structured = find!(
+        (entity: Id, secret: Id, body: crate::item::ItemBody),
+        pattern!(facts, [{ ?entity @ metadata::tag: KIND_SECRET_RESOURCE,
+            wrap_secret: ?secret, crate::schema::structured_body: ?body }])
+    )
+    .map(|(entity, secret, body)| (entity, secret, body.transmute()));
+    let candidates = raw.chain(structured);
     let mut policies = Vec::new();
     for (entity, secret, body) in candidates {
         if bound.is_some_and(|expected| expected != (secret, body)) {
@@ -234,6 +288,40 @@ where
         .collect())
 }
 
+/// Whether this holder has an authenticated envelope for exactly S/H/R and can
+/// open that body. This reads possession evidence only: it grants no admission,
+/// key delivery or onward delegation and does not infer R from public edges.
+pub fn holder_has_binding<R: BlobStoreGet, P: TriblePattern>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    body: BytesHandle,
+    resource: CollectionHandle,
+    holder: &SigningKey,
+) -> Result<bool> {
+    Ok(envelope::recover_all(reader, facts, secret, holder)?
+        .into_iter()
+        .any(|binding| binding.body == body && binding.resource == resource))
+}
+
+/// Open exactly one authenticated raw S/H/R binding held by this key. Other
+/// raw bodies under S neither replace nor veto this explicit selection. This
+/// is possession-based reading, not an admission or key-delivery grant.
+pub fn open_bound_raw<R: BlobStoreGet, P: TriblePattern>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    body: BytesHandle,
+    resource: CollectionHandle,
+    holder: &SigningKey,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let binding = envelope::recover(reader, facts, secret, holder)?
+        .into_iter()
+        .find(|binding| binding.body == body && binding.resource == resource)
+        .ok_or_else(|| anyhow!("no usable exact raw body/resource binding for this holder"))?;
+    envelope::decrypt_body(reader, binding.body, &binding.dek)
+}
+
 pub fn grant<S, R>(
     store: &mut S,
     signer: &SigningKey,
@@ -257,7 +345,7 @@ where
             let facts = secrets
                 .facts()
                 .ok_or_else(|| anyhow!("secret {secret} not found"))?;
-            envelope::recover(secrets.store_snapshot(), facts, secret, signer)?
+            envelope::recover_all(secrets.store_snapshot(), facts, secret, signer)?
                 .into_iter()
                 .map(|binding| (binding.resource, Some((binding.secret, binding.body))))
                 .collect()
@@ -281,9 +369,11 @@ where
         .map_err(|error| anyhow!("read delivery proof: {error}"))?;
     let mut issued = Vec::new();
     for (resource, bound) in resources {
-        let facts: TribleSet = reader
-            .get(resource)
-            .context("read selected secret resource")?;
+        let facts: TribleSet = match reader.get(resource) {
+            Ok(facts) => facts,
+            Err(_) if bound.is_some() => continue,
+            Err(error) => return Err(error).context("read selected secret resource"),
+        };
         // Anybody can seal their own DEK/body to this signer and name an
         // unrelated R in that envelope. Grant-by-secret must preserve the
         // recovered S/H binding; only an explicit R target omits that check.
@@ -652,6 +742,130 @@ mod tests {
             expires_at: Some(instant)
         }
         .definition(false)
+        .is_err());
+    }
+
+    #[test]
+    fn exact_raw_binding_opens_one_valid_body_without_competing_body_veto() {
+        use crate::storage::{self, SecretsCollection};
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        let alice = SigningKey::from_bytes(&[81; 32]);
+        let bob = SigningKey::from_bytes(&[82; 32]);
+        let mut store = MemoryRepo::for_host(alice.verifying_key());
+        let collection = SecretsCollection::register(
+            &mut store,
+            "exact raw synthetic fixture",
+            CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(alice.verifying_key()),
+            ),
+        )
+        .unwrap();
+        let at = {
+            let epoch = Epoch::from_unix_seconds(1.0);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let first = storage::add_secret(
+            &mut store,
+            &alice,
+            collection,
+            "first public",
+            b"synthetic first",
+            at,
+        )
+        .unwrap();
+        let second = storage::add_secret(
+            &mut store,
+            &alice,
+            collection,
+            "second public",
+            b"synthetic second",
+            at,
+        )
+        .unwrap();
+        let observed = storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
+        let original = envelope::recover(
+            observed.store_snapshot(),
+            observed.facts().unwrap(),
+            first,
+            &alice,
+        )
+        .unwrap()
+        .remove(0);
+        let second = envelope::recover(
+            observed.store_snapshot(),
+            observed.facts().unwrap(),
+            second,
+            &alice,
+        )
+        .unwrap()
+        .remove(0);
+        let mut fragment = entity! { ExclusiveId::force_ref(&first) @ metadata::tag: KIND_SECRET,
+        metadata::name: "competing public", metadata::created_at: at, secret_body: second.body };
+        let capability = fragment.put::<SimpleArchive, _>(key_delivery_definition().into_facts());
+        let descriptor = entity! { metadata::tag: KIND_SECRET_RESOURCE,
+        wrap_secret: first, secret_body: second.body, resource_collection: collection.handle(),
+        resource_policy*: AdmissionPolicy::direct(alice.verifying_key()).binding(capability) };
+        let competing_resource = fragment.put::<SimpleArchive, _>(descriptor.into_facts());
+        fragment +=
+            entity! { ExclusiveId::force_ref(&first) @ resource_handle: competing_resource };
+        fragment += envelope::fragment(
+            &envelope::BoundKey {
+                secret: first,
+                body: second.body,
+                resource: competing_resource,
+                dek: second.dek,
+            },
+            alice.verifying_key().to_bytes(),
+        )
+        .unwrap();
+        store.commit(collection.source(), &alice, fragment).unwrap();
+        let observed = storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
+        assert!(
+            observed.open(first, &alice).is_err(),
+            "old raw open still reports competing values"
+        );
+        assert_eq!(
+            &*open_bound_raw(
+                observed.store_snapshot(),
+                observed.facts().unwrap(),
+                first,
+                original.body,
+                original.resource,
+                &alice
+            )
+            .unwrap(),
+            b"synthetic first"
+        );
+        assert_eq!(
+            &*open_bound_raw(
+                observed.store_snapshot(),
+                observed.facts().unwrap(),
+                first,
+                second.body,
+                competing_resource,
+                &alice
+            )
+            .unwrap(),
+            b"synthetic second"
+        );
+        assert!(open_bound_raw(
+            observed.store_snapshot(),
+            observed.facts().unwrap(),
+            first,
+            original.body,
+            competing_resource,
+            &alice
+        )
+        .is_err());
+        assert!(open_bound_raw(
+            observed.store_snapshot(),
+            observed.facts().unwrap(),
+            first,
+            original.body,
+            original.resource,
+            &bob
+        )
         .is_err());
     }
 }

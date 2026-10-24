@@ -150,9 +150,67 @@ pub(crate) fn recover<R: BlobStoreGet, P: TriblePattern>(
     secret: Id,
     holder: &SigningKey,
 ) -> Result<Vec<BoundKey>> {
+    let mut seen = BTreeSet::new();
+    Ok(candidates(reader, facts, secret, holder)?
+        .into_iter()
+        .filter(|binding| {
+            decrypt_body(reader, binding.body, &binding.dek).is_ok()
+                && seen.insert((binding.body, binding.resource))
+        })
+        .collect())
+}
+
+/// Structured bodies have a distinct codec; never pass them through the legacy
+/// nonce+SecretBox validator or change that published body's interpretation.
+pub(crate) fn recover_item<R: BlobStoreGet, P: TriblePattern>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    holder: &SigningKey,
+) -> Result<Vec<BoundKey>> {
+    use crate::encrypted::{open_blob, Encrypted, ItemKey};
+    let mut seen = BTreeSet::new();
+    Ok(candidates(reader, facts, secret, holder)?
+        .into_iter()
+        .filter(|binding| {
+            let body = binding
+                .body
+                .transmute::<inlineencodings::Handle<Encrypted<SimpleArchive>>>();
+            let Ok(blob) = reader.get::<Blob<Encrypted<SimpleArchive>>, _>(body) else {
+                return false;
+            };
+            // Cloned Dryoc key storage also zeroizes on drop.
+            let key = ItemKey::from_dek(secret, binding.dek.clone());
+            open_blob(&key, blob)
+                .and_then(|blob| {
+                    blob.try_from_blob::<TribleSet>()
+                        .map_err(|_| anyhow!("invalid structured archive"))
+                })
+                .is_ok()
+                && seen.insert((binding.body, binding.resource))
+        })
+        .collect())
+}
+
+pub(crate) fn recover_all<R: BlobStoreGet, P: TriblePattern>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    holder: &SigningKey,
+) -> Result<Vec<BoundKey>> {
+    let mut bindings = recover(reader, facts, secret, holder)?;
+    bindings.extend(recover_item(reader, facts, secret, holder)?);
+    Ok(bindings)
+}
+
+fn candidates<R: BlobStoreGet, P: TriblePattern>(
+    reader: &R,
+    facts: &P,
+    secret: Id,
+    holder: &SigningKey,
+) -> Result<Vec<BoundKey>> {
     let recipient = holder.verifying_key().to_bytes();
     let keypair = box_keypair_from_signing_key(holder)?;
-    let mut seen = BTreeSet::new();
     let mut bindings = Vec::new();
     for wrap in recipient_wraps(facts, secret, recipient) {
         let Ok(bytes) = read_bytes(reader, wrap.sealed_dek) else {
@@ -161,12 +219,6 @@ pub(crate) fn recover<R: BlobStoreGet, P: TriblePattern>(
         let Some(binding) = open(&bytes, secret, &keypair, recipient) else {
             continue;
         };
-        if seen.contains(&(binding.body, binding.resource))
-            || decrypt_body(reader, binding.body, &binding.dek).is_err()
-        {
-            continue;
-        }
-        seen.insert((binding.body, binding.resource));
         bindings.push(binding);
     }
     Ok(bindings)

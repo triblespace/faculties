@@ -46,14 +46,28 @@ All notable changes to this project will be documented in this file.
   from <author> in channel <id>: <whole text>` with an indented line per
   attachment. The stream form is unchanged.
 
+- Secrets computes current TOTP codes inside an exact selected encrypted item
+  field operation, with CLI/MCP parity, validity bounds and normalized identity
+  metadata. Seeds/full URIs stay inside Secrets; raw exports remain unchanged.
+
+- Secrets adds typed, authenticated `Encrypted<T>` blobs and native structured
+  immutable items with repeated typed fields and private binary attachments.
+  Ciphertext-only inventories compose through `Bundle` and ordinary commits;
+  raw secrets and recipient envelope bytes keep their existing meaning. Item
+  opening discloses exact body alternatives, with explicit selection for export.
+  CLI login input uses files/stdin; CLI and MCP provide metadata-only discovery
+  and explicit selected exports. No app/importer/deployment is included.
+
 - **Secrets versions name no collection.** A new version's resource descriptor
   no longer carries `resource_collection` (anchor
   `62E951EC3ABB7F9B7F123BB7DE2F9F99`, which core retired): the grants over R
   reach every participant of R by grant gossip, whichever collection declares
   the version, so delivery never depended on the backlink and transport no
   longer reads it. Descriptors written before keep the annotation and are
-  never rewritten; nothing reads it. The crate-internal `seal_version` loses
-  its collection argument. Builds against the core that retired the attribute.
+  never rewritten; nothing reads it. Raw and structured preparation lose
+  their collection argument. The private importer retains its exact
+  original-author signed COMMIT receipt predicate while following descriptor
+  S/H/R binding rather than the retired backlink.
 
 - **Compass `@mentions` replace tag subscriptions as Orient's way of
   addressing people.** An `@label` in a goal title or note (a persona label,

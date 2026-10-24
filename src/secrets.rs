@@ -4,5 +4,6 @@
 pub use faculties_secrets::*;
 pub mod cli;
 pub mod mcp;
+pub mod onepassword;
 mod operations;
-pub use operations::{SecretMetadata, Secrets};
+pub use operations::{DeliveryReport, ItemMetadata, SecretMetadata, Secrets};

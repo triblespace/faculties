@@ -100,7 +100,7 @@ fn malformed_requests_do_not_open_or_initialize_storage() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("absent.pile");
     let adapter = secrets::mcp::Secrets::new(pile.clone(), None);
-    assert_eq!(adapter.tools().len(), 5);
+    assert_eq!(adapter.tools().len(), 10);
     for (name, input) in [
         ("secrets_add", r#"{"name":"x"}"#),
         (
@@ -115,6 +115,18 @@ fn malformed_requests_do_not_open_or_initialize_storage() {
             r#"{"secret":"00000000000000000000000000000000"}"#,
         ),
         ("secrets_list", r#"{"show_secrets":true}"#),
+        (
+            "secrets_item_totp",
+            r#"{"secret":"bad","body":"bad","child":"bad"}"#,
+        ),
+        (
+            "secrets_item_totp",
+            r#"{"secret":"01010101010101010101010101010101","body":"00","child":"00"}"#,
+        ),
+        (
+            "secrets_item_totp",
+            r#"{"secret":"01010101010101010101010101010101","body":"00","child":"00","unix_seconds":59}"#,
+        ),
         ("secrets_grant", r#"{"recipient":"00"}"#),
         (
             "secrets_grant",

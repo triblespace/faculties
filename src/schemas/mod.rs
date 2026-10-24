@@ -26,6 +26,7 @@ pub mod posture;
 pub mod quota;
 pub mod reason;
 pub mod relations;
+pub mod secrets_import;
 pub mod service_events;
 pub mod status;
 /// Local daemon observations share their schema with the Core publisher.
