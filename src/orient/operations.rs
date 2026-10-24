@@ -2731,7 +2731,13 @@ fn render_native_compass_goals(
         writeln!(out, "- No goals.").unwrap();
         return Ok((out, shown));
     }
-    writeln!(out, "Doing:").unwrap();
+    writeln!(
+        out,
+        "Doing ({} of {}):",
+        doing.len().min(doing_limit),
+        doing.len()
+    )
+    .unwrap();
     if doing.is_empty() {
         writeln!(out, "- None").unwrap();
     } else {
@@ -2748,7 +2754,13 @@ fn render_native_compass_goals(
             .unwrap();
         }
     }
-    writeln!(out, "Todo:").unwrap();
+    writeln!(
+        out,
+        "Todo ({} of {}):",
+        todo.len().min(todo_limit),
+        todo.len()
+    )
+    .unwrap();
     if todo.is_empty() {
         writeln!(out, "- None").unwrap();
     } else {
