@@ -36,6 +36,13 @@
 //! anchor says which it is ([`discord::kind_voice_joined`],
 //! [`discord::kind_voice_left`]: who, in which channel, seen when).
 //!
+//! A request to speak in a voice channel ([`discord::kind_say_request`]) is
+//! a record of the collection too: `discord say` publishes it and `discord
+//! live` plays it, then records what became of it as an outcome linking the
+//! request ([`discord::kind_say_played`], [`discord::kind_say_failed`]). The
+//! words are an Archive content fact ([`discord::says`]), the shape Drive's
+//! Archive gives what she produced.
+//!
 //! Coverage says what is stored, not what was heard: `discord read` brings a
 //! channel's history in with the same observations `discord live`'s intake
 //! stores. Where a channel's live intake begins is therefore a fact of its
@@ -44,7 +51,7 @@
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, F64, U256BE};
 use triblespace::prelude::*;
 
 /// Stable extrinsic scope of the Discord observation collection.
@@ -131,6 +138,32 @@ pub mod discord {
         /// Minted with `trible genid` on 2026-10-05:
         /// `C86AF50A0542619BE20A22EFFBE15033`.
         "C86AF50A0542619BE20A22EFFBE15033" as pub utterance_audio: Handle<RawBytes>;
+        /// What a say request ([`kind_say_request`]) asks to be spoken: an
+        /// Archive content fact (`blockdag::text_fact`, modality text,
+        /// direction out), the same intrinsic entity Drive's Archive records
+        /// for words she produced.
+        ///
+        /// Minted with `trible genid` on 2026-10-24:
+        /// `13B8EC507BDA0B108B5291F26EBA0392`.
+        "13B8EC507BDA0B108B5291F26EBA0392" as pub says: GenId;
+        /// The say request an outcome ([`kind_say_started`],
+        /// [`kind_say_played`], [`kind_say_failed`]) is about.
+        ///
+        /// Minted with `trible genid` on 2026-10-24:
+        /// `B1ED1FE296DEDF5BB3948F8C6C75D773`.
+        "B1ED1FE296DEDF5BB3948F8C6C75D773" as pub say_request: GenId;
+        /// A say request's delivery direction for the voice, separate from
+        /// the words (`discord say --direction`).
+        ///
+        /// Minted with `trible genid` on 2026-10-24:
+        /// `2E6C038613864107EDD39ECB29AA320C`.
+        "2E6C038613864107EDD39ECB29AA320C" as pub speech_direction: Handle<UTF8String>;
+        /// A say request's guidance strength for the voice
+        /// (`discord say --cfg-scale`).
+        ///
+        /// Minted with `trible genid` on 2026-10-24:
+        /// `C6F9E2CBF8D18BD5D9B8B5653CEBD3FB`.
+        "C6F9E2CBF8D18BD5D9B8B5653CEBD3FB" as pub speech_cfg_scale: F64;
     }
 
     /// Root id for describing the Discord protocol in metadata.
@@ -252,4 +285,52 @@ pub mod discord {
     /// `9C753182D87C69EBC51E7265358D98C3`.
     #[allow(non_upper_case_globals)]
     pub const kind_voice_left: Id = id_hex!("9C753182D87C69EBC51E7265358D98C3");
+    /// Tag for a request that `discord live` speak something in a voice
+    /// channel: what ([`says`]), where ([`channel`], and [`guild`] when the
+    /// asker named it), when it was asked (`metadata::created_at`) and, when
+    /// known, who asked (`archive::author_name`, the requesting persona's
+    /// label). Delivery options ride along ([`speech_direction`],
+    /// [`speech_cfg_scale`], [`kind_say_clear_direction`]). The request is
+    /// never changed: what became of it is an outcome linking it through
+    /// [`say_request`].
+    ///
+    /// Minted with `trible genid` on 2026-10-24:
+    /// `AA96CD41CF099800EF790AAA1039CCCD`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_say_request: Id = id_hex!("AA96CD41CF099800EF790AAA1039CCCD");
+    /// A second tag on a say request that clears the voice's startup
+    /// delivery direction for it (`discord say --clear-direction`).
+    ///
+    /// Minted with `trible genid` on 2026-10-24:
+    /// `1B0A932B02B2B71B81DD8DA11C85EFAB`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_say_clear_direction: Id = id_hex!("1B0A932B02B2B71B81DD8DA11C85EFAB");
+    /// Tag for the outcome that a speaker took a say request and began to
+    /// play it ([`say_request`], at `metadata::created_at`). Not an outcome
+    /// that settles it: a request a process began and never settled (it
+    /// crashed between playing and recording) is failed by the next process
+    /// rather than played again, since it may have been heard.
+    ///
+    /// Minted with `trible genid` on 2026-10-24:
+    /// `E184708A64E9725BCCB982119081955C`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_say_started: Id = id_hex!("E184708A64E9725BCCB982119081955C");
+    /// Tag for the outcome that a say request's audio played to its end in
+    /// the voice channel ([`say_request`], at `metadata::created_at`): the
+    /// playback track completed. It is not evidence that anyone heard it.
+    ///
+    /// Minted with `trible genid` on 2026-10-24:
+    /// `C0F27E56706BEFDD6F9A521BFE6C8798`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_say_played: Id = id_hex!("C0F27E56706BEFDD6F9A521BFE6C8798");
+    /// Tag for the outcome that a say request will not be played
+    /// ([`say_request`], at `metadata::created_at`, why in
+    /// `metadata::description`): it could not be synthesized or played, it
+    /// was already stale when the speaker started, or a previous speaker
+    /// began it and never settled it.
+    ///
+    /// Minted with `trible genid` on 2026-10-24:
+    /// `823A05C14355BC75564304B6E38CBD20`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_say_failed: Id = id_hex!("823A05C14355BC75564304B6E38CBD20");
 }

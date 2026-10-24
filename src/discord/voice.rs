@@ -13,20 +13,22 @@
 //! working voice connection. No serenity: nothing here needs a cache,
 //! commands or events beyond those.
 //!
-//! `discord say` queues a line by writing one file into the state
-//! directory's `say/`; the speaker speaks the queue in order and moves each
-//! file to `said/` once it has played, or to `failed/` when it cannot be
-//! spoken. A line is spoken sentence by sentence, and each sentence plays
-//! while it is synthesized, from its first decoded hop of audio on. The
-//! queue is files so that any process, including a shell with nothing but
-//! the discord binary, can speak, and so that a line survives a restart of
-//! the resident process instead of vanishing with it. Speaking
-//! runs beside the gateway, never in its way: a voice server update is
-//! handled while a line plays. A line during which the voice connection was
+//! `discord say` publishes a say request into the discord collection; the
+//! speaker plays the requests for its voice channel oldest first
+//! ([`super::say`]) and records what became of each as an outcome on it:
+//! started when it takes one, then played once the playback track
+//! completed (evidence that it played, never that anyone heard it), or
+//! failed with the reason. A request is therefore played at most once
+//! across restarts, and any process that can write the collection can ask
+//! for speech. A line is spoken sentence by sentence, and each sentence
+//! plays while it is synthesized, from its first decoded hop of audio on.
+//! Speaking runs beside the gateway, never in its way: a voice server
+//! update is handled while a line plays. A line during which the voice connection was
 //! lost in any way that was observed (the bot leaving the channel, the voice
 //! server going away, the driver disconnecting, whether asked to or not, or
 //! re-establishing its connection, a new connection replacing a working one)
-//! is spoken again; a drop nobody has noticed yet when the line ends is not.
+//! is played again by the same process; a drop nobody has noticed yet when
+//! the line ends is not.
 //! A synthesizer that breaks (a panic in synthesis), or lines failing
 //! several times in a row, end the process, so that its supervisor starts it
 //! again with a fresh model.
@@ -40,25 +42,25 @@
 
 use super::gateway;
 use super::intake::Inbox;
-use super::live::{Beside, StateDir};
+use super::live::Beside;
+use super::say::SayQueue;
+use crate::discord::{PendingSay, SayOutcome};
 use crate::voice::options::SpeechOptions;
 use crate::voice::synthesis::{prebuffer_target_secs, ModelSources, Synthesizer};
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::input::RawAdapter;
 use songbird::tracks::PlayMode;
 use songbird::{ConnectionInfo, CoreEvent, Driver};
 use std::num::NonZeroU64;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::time::Instant;
 
-/// How often the speaker looks for queued lines.
+/// How often the speaker looks at the store for new say requests.
 const QUEUE_POLL: Duration = Duration::from_millis(250);
 /// How long a join may go unconfirmed by a voice connection before it is
 /// asked for again.
@@ -78,28 +80,15 @@ const FAST_ENOUGH_RATE: f64 = 1.5;
 /// The synthesizer's PCM: 24 kHz mono.
 const SAMPLE_RATE: u32 = mary::speak::SpeakStream::SAMPLE_RATE;
 
-/// Ephemeral queue transport, not voice identity or a pile schema. The suffix
-/// selects the format: existing .txt is always literal; .toml is never speech.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+/// What the synthesizer is asked to speak: a say request's words and
+/// delivery, or a piece of them.
+#[derive(Clone, Debug, PartialEq)]
 struct QueuedSpeech {
     text: String,
-    #[serde(default)]
     options: SpeechOptions,
 }
 
 impl QueuedSpeech {
-    fn read(path: &Path) -> Result<Self> {
-        let contents = std::fs::read_to_string(path).context("read the queued line")?;
-        let request = match path.extension().and_then(|suffix| suffix.to_str()) {
-            Some("txt") => Self::from(contents),
-            Some("toml") => toml::from_str(&contents).context("parse the queued speech request")?,
-            _ => anyhow::bail!("unsupported speech queue suffix"),
-        };
-        request.validate()?;
-        Ok(request)
-    }
-
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(
             !self.text.trim().is_empty(),
@@ -133,90 +122,8 @@ impl From<&str> for QueuedSpeech {
     }
 }
 
-/// The state directory's queue: `say/` holds queued lines, `said/` spoken
-/// ones and `failed/` the ones that could not be spoken.
-impl StateDir {
-    fn queue(&self) -> PathBuf {
-        self.root().join("say")
-    }
-
-    /// Queue one line: written beside the queue under a dot name, then
-    /// renamed in, so the resident process never reads half a line.
-    pub fn enqueue(&self, text: &str) -> Result<PathBuf> {
-        self.enqueue_with_options(text, &SpeechOptions::default())
-    }
-
-    pub fn enqueue_with_options(&self, text: &str, options: &SpeechOptions) -> Result<PathBuf> {
-        let request = QueuedSpeech {
-            text: text.to_owned(),
-            options: options.clone(),
-        };
-        request.validate()?;
-        // Plain requests remain readable by an older resident. Styled requests
-        // wait for a TOML-aware resident, never becoming audible metadata.
-        let (suffix, contents) = if options.is_default() {
-            ("txt", text.to_owned())
-        } else {
-            (
-                "toml",
-                toml::to_string(&request).context("encode speech request")?,
-            )
-        };
-        let queue = self.queue();
-        std::fs::create_dir_all(&queue)
-            .with_context(|| format!("create the voice queue {}", queue.display()))?;
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .context("read the clock")?
-            .as_nanos();
-        let name = format!("{stamp:024}-{}.{suffix}", std::process::id());
-        let staging = queue.join(format!(".{name}"));
-        std::fs::write(&staging, contents)
-            .with_context(|| format!("write the queued line {}", staging.display()))?;
-        let queued = queue.join(name);
-        std::fs::rename(&staging, &queued)
-            .with_context(|| format!("queue the line as {}", queued.display()))?;
-        Ok(queued)
-    }
-
-    /// Queued lines in the order they were queued.
-    fn pending(&self) -> Result<Vec<PathBuf>> {
-        let queue = self.queue();
-        let mut lines = Vec::new();
-        let entries = match std::fs::read_dir(&queue) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(lines),
-            Err(error) => {
-                return Err(error).with_context(|| format!("list {}", queue.display()));
-            }
-        };
-        for entry in entries {
-            let path = entry?.path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if !name.starts_with('.') && (name.ends_with(".txt") || name.ends_with(".toml")) {
-                lines.push(path);
-            }
-        }
-        lines.sort();
-        Ok(lines)
-    }
-
-    /// Move a line out of the queue into `into` (`said` or `failed`).
-    fn retire(&self, line: &Path, into: &str) -> Result<()> {
-        let directory = self.root().join(into);
-        std::fs::create_dir_all(&directory)
-            .with_context(|| format!("create {}", directory.display()))?;
-        let name = line.file_name().context("a queued line has a file name")?;
-        std::fs::rename(line, directory.join(name))
-            .with_context(|| format!("move {} to {into}/", line.display()))
-    }
-}
-
-/// Which voice channel to join, where the queue is, and who is told once the
-/// voice connection is up.
+/// Which voice channel to join, whose say requests are played there, and
+/// who is told once the voice connection is up.
 pub struct Config {
     pub guild: NonZeroU64,
     pub channel: NonZeroU64,
@@ -224,8 +131,9 @@ pub struct Config {
     /// up, so that people know to join.
     pub announce: Option<NonZeroU64>,
     pub greeting: String,
-    /// The state directory whose queue is spoken.
-    pub state: StateDir,
+    /// The say requests of the voice channel, read from the discord
+    /// collection.
+    pub requests: SayQueue,
     /// The bot's pile, whose model collection the Breeze voice reads.
     pub pile: Option<std::path::PathBuf>,
     /// What the channel is heard with; nobody is heard without it.
@@ -267,7 +175,7 @@ async fn run(
         channel,
         announce,
         greeting,
-        state,
+        requests,
         pile,
         #[cfg(feature = "discord-hearing")]
         hearing,
@@ -294,7 +202,7 @@ async fn run(
     let greet = announce.map(|channel| (token, channel, greeting));
     let mut speaker = tokio::spawn(speak_queue(
         SpeechWorker::start(ModelSources::from_environment(pile.as_deref())),
-        state,
+        requests,
         Voice {
             driver: driver.clone(),
             connected: is_connected,
@@ -825,12 +733,14 @@ struct Voice {
     interruptions: Arc<AtomicU64>,
 }
 
-/// Speak the queue, one line at a time, whenever the voice connection works:
-/// the greeting first, once. Fails when the speech model cannot load or
-/// breaks, or when [`FAILED_IN_A_ROW`] lines in a row could not be spoken.
+/// Play the voice channel's say requests, one at a time, whenever the voice
+/// connection works: the greeting first, once. Fails when the speech model
+/// cannot load or breaks, when [`FAILED_IN_A_ROW`] requests in a row could
+/// not be played, or when an outcome cannot be recorded (a request whose
+/// outcome cannot be written would be played again and again).
 async fn speak_queue(
     speech: SpeechWorker,
-    state: StateDir,
+    mut requests: SayQueue,
     mut voice: Voice,
     greet: Option<(String, NonZeroU64, String)>,
 ) -> Result<()> {
@@ -838,6 +748,9 @@ async fn speak_queue(
     eprintln!("[discord] speech ready");
     let mut greet = greet;
     let mut failed_in_a_row = 0;
+    // The request being played; kept across an interruption, which plays it
+    // again without looking at the store.
+    let mut current: Option<PendingSay> = None;
     loop {
         if voice.connected.wait_for(|up| *up).await.is_err() {
             return Ok(());
@@ -847,72 +760,122 @@ async fn speak_queue(
                 eprintln!("[discord] the greeting was not posted: {error:#}");
             }
         }
-        let queued = match state.pending() {
-            Ok(queued) => queued.into_iter().next(),
-            Err(error) => {
-                eprintln!("[discord] reading the queue failed: {error:#}");
+        if current.is_none() {
+            let mut queue = requests.clone();
+            let (queue, next) = blocking(move || {
+                let next = queue.next();
+                Ok((queue, next))
+            })
+            .await?;
+            requests = queue;
+            current = next.unwrap_or_else(|error| {
+                eprintln!("[discord] reading the say requests failed: {error:#}");
                 None
-            }
-        };
-        let Some(queued) = queued else {
+            });
+        }
+        let Some(say) = current.clone() else {
             tokio::time::sleep(QUEUE_POLL).await;
             continue;
         };
-        let into = match speak_line(&mut voice, &speech, &queued).await {
-            Spoken::Heard => {
+        let request = say.request;
+        // Started is recorded beside the synthesis, so that the first sound
+        // does not wait for a commit.
+        let recorder = requests.clone();
+        let started =
+            tokio::task::spawn_blocking(move || recorder.record(request, SayOutcome::Started));
+        let line = QueuedSpeech {
+            text: say.text,
+            options: say.options,
+        };
+        let spoken = speak_line(&mut voice, &speech, &line).await;
+        match started.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "[discord] say request {request:X} was not recorded as started: {error:#}"
+            ),
+            Err(error) => {
+                eprintln!("[discord] recording say request {request:X} as started stopped: {error}")
+            }
+        }
+        let reason = match spoken {
+            Spoken::Played => {
                 failed_in_a_row = 0;
-                "said"
+                None
             }
             Spoken::Failed(error) => {
-                eprintln!("[discord] line {} failed: {error:#}", queued.display());
+                eprintln!("[discord] say request {request:X} failed: {error:#}");
                 failed_in_a_row += 1;
-                "failed"
+                Some(format!("{error:#}"))
             }
             Spoken::Broken(error) => {
-                // Out of the queue first: if this line is what broke the
+                // Settled first: if this request is what broke the
                 // synthesizer, the next process must not meet it again.
-                if let Err(retire) = state.retire(&queued, "failed") {
-                    eprintln!("[discord] retiring {} failed: {retire:#}", queued.display());
+                let reason = format!("the synthesizer broke: {error:#}");
+                let recorder = requests.clone();
+                if let Err(record) =
+                    blocking(move || recorder.record(request, SayOutcome::Failed(&reason))).await
+                {
+                    eprintln!(
+                        "[discord] say request {request:X} was not recorded as failed: {record:#}"
+                    );
                 }
                 return Err(error.context("the synthesizer broke"));
             }
             Spoken::Interrupted => {
                 eprintln!(
                     "[discord] the voice connection dropped or was re-established mid-line; \
-                     it is spoken again once it works"
+                     it is played again once it works"
                 );
                 continue;
             }
         };
-        if let Err(error) = state.retire(&queued, into) {
-            // A line that cannot leave the queue would be spoken forever.
-            return Err(error.context("retire a spoken line"));
-        }
+        let recorder = requests.clone();
+        blocking(move || {
+            recorder.record(
+                request,
+                reason
+                    .as_deref()
+                    .map_or(SayOutcome::Played, SayOutcome::Failed),
+            )
+        })
+        .await
+        .context("record how a say request went")?;
+        current = None;
         if failed_in_a_row >= FAILED_IN_A_ROW {
             return Err(anyhow!(
-                "{failed_in_a_row} lines in a row could not be spoken"
+                "{failed_in_a_row} say requests in a row could not be played"
             ));
         }
     }
 }
 
+/// Run `operation` off the async workers: the store blocks.
+async fn blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| anyhow!("a store task stopped: {error}"))?
+}
+
 /// How one line went.
 enum Spoken {
-    Heard,
+    /// Its playback track completed: it played, which is no evidence that
+    /// anyone heard it.
+    Played,
     /// It cannot be spoken: unreadable, unsynthesizable, or the track failed.
     Failed(anyhow::Error),
     /// The synthesizer is gone; nothing more can be spoken by this process.
     Broken(anyhow::Error),
     /// The voice connection dropped, or was re-established, before or while
-    /// it played; it stays queued.
+    /// it played; it is played again.
     Interrupted,
 }
 
-async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> Spoken {
-    let request = match QueuedSpeech::read(queued) {
-        Ok(request) => request,
-        Err(error) => return Spoken::Failed(error),
-    };
+async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, request: &QueuedSpeech) -> Spoken {
+    if let Err(error) = request.validate() {
+        return Spoken::Failed(error);
+    }
     // A line is spoken in pieces of whole sentences up to MAX_PIECE_CHARS,
     // usually one piece, and a piece while it is synthesized: it starts
     // playing once its first hop of audio is decoded (or a little more, when
@@ -945,11 +908,11 @@ async fn speak_line(voice: &mut Voice, speech: &SpeechWorker, queued: &Path) -> 
             sentence.text
         );
         match play(voice, buffered, synthesis).await {
-            Spoken::Heard => {}
+            Spoken::Played => {}
             other => return other,
         }
     }
-    Spoken::Heard
+    Spoken::Played
 }
 
 /// Play one sentence while the rest of it is synthesized, and wait for it to
@@ -1249,7 +1212,7 @@ fn settle(ended: Ended, interrupted: bool, played: f64, stop: impl FnOnce()) -> 
         _ if interrupted => Spoken::Interrupted,
         Ended::Reported(PlayMode::End) => {
             eprintln!("[discord] played for {played:.1} s");
-            Spoken::Heard
+            Spoken::Played
         }
         Ended::Reported(state) => {
             Spoken::Failed(anyhow!("the track ended {state:?} after {played:.1} s"))
@@ -1616,41 +1579,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn queue_roundtrips_delivery_and_never_sniffs_literal_text() {
-        let directory = tempfile::tempdir().unwrap();
-        let state = StateDir::new(directory.path().to_owned());
-        let options = SpeechOptions {
-            direction: Some("Warm\nSay it \"professionally\".".into()),
-            cfg_scale: Some(2.5),
-            ..Default::default()
-        };
-        let text = "(laugh) Hello, \"you\".\n(sigh) A second line.";
-        let path = state.enqueue_with_options(text, &options).unwrap();
-        assert_eq!(path.extension().unwrap(), "toml");
-        assert_eq!(
-            QueuedSpeech::read(&path).unwrap(),
-            QueuedSpeech {
-                text: text.into(),
-                options
-            }
-        );
-        let literal = "text = \"Do not decode me\"\n{\"direction\": \"nor me\"} (sigh)";
-        let old = state.enqueue(literal).unwrap();
-        assert_eq!(old.extension().unwrap(), "txt");
-        assert_eq!(QueuedSpeech::read(&old).unwrap(), literal.into());
-        let bad = state.queue().join("malformed.toml");
-        std::fs::write(&bad, "text = [oops").unwrap();
-        assert!(QueuedSpeech::read(&bad).is_err());
-        assert_eq!(state.pending().unwrap().len(), 3);
-        let invalid = SpeechOptions {
-            direction: Some(" ".into()),
-            ..Default::default()
-        };
-        assert!(state.enqueue_with_options(text, &invalid).is_err());
-        assert_eq!(state.pending().unwrap().len(), 3);
-    }
-
     #[tokio::test]
     async fn first_prefetched_and_next_request_keep_their_own_options() {
         struct RecordingVoice(Arc<std::sync::Mutex<Vec<QueuedSpeech>>>);
@@ -1997,7 +1925,7 @@ mod tests {
             let spoken = settle(ended, interrupted, 1.0, || stopped += 1);
             assert_eq!(stopped, 1, "{case}");
             let spoken = match spoken {
-                Spoken::Heard => "heard",
+                Spoken::Played => "heard",
                 Spoken::Failed(_) => "failed",
                 Spoken::Broken(_) => "broken",
                 Spoken::Interrupted => "interrupted",
@@ -2028,7 +1956,7 @@ mod tests {
             let since = interruptions.load(Ordering::SeqCst);
             (link, connected, interruptions, since)
         };
-        let heard = |spoken: Spoken| matches!(spoken, Spoken::Heard);
+        let heard = |spoken: Spoken| matches!(spoken, Spoken::Played);
         type Lose = fn(&mut Link, Instant);
         let losses: [(&str, Lose); 4] = [
             ("left", Link::left),

@@ -553,6 +553,80 @@ impl Discord {
             format!("discord: bot account is user {user_id}"),
         )
     }
+    /// Publish a request that `discord live` speak `text` in the voice
+    /// channel `channel` ([`discord_model::say_request_fragment`]), asked
+    /// now by `persona`, and return the request's id.
+    pub fn request_speech(
+        &self,
+        guild: Option<&str>,
+        channel: &str,
+        text: &str,
+        options: &crate::voice::options::SpeechOptions,
+        persona: Option<&str>,
+    ) -> Result<Id> {
+        let (fragment, request) = discord_model::say_request_fragment(
+            guild,
+            channel,
+            text,
+            options,
+            persona,
+            discord_model::moment(crate::clock::now()?),
+        )?;
+        self.storage().publish(
+            fragment,
+            format!("discord: say request {request:X} in voice channel {channel}"),
+        )?;
+        Ok(request)
+    }
+    /// The say requests for the voice channel `channel` no outcome has
+    /// settled, oldest first ([`discord_model::unsettled_say_requests`]).
+    pub fn unsettled_speech(&self, channel: &str) -> Result<Vec<discord_model::PendingSay>> {
+        self.storage().with_session(|session| {
+            discord_model::unsettled_say_requests(&session.facts, &session.reader, channel)
+        })
+    }
+    /// Record what became of a say request, now.
+    pub fn record_speech(
+        &self,
+        request: Id,
+        outcome: discord_model::SayOutcome<'_>,
+    ) -> Result<CollectionCommit> {
+        let what = match outcome {
+            discord_model::SayOutcome::Started => "started",
+            discord_model::SayOutcome::Played => "played",
+            discord_model::SayOutcome::Failed(_) => "failed",
+        };
+        self.storage().publish(
+            discord_model::say_outcome_fragment(
+                request,
+                outcome,
+                discord_model::moment(crate::clock::now()?),
+            ),
+            format!("discord: say request {request:X} {what}"),
+        )
+    }
+    /// The reasons a say request was failed for.
+    #[cfg(test)]
+    pub(crate) fn say_failures(&self, request: Id) -> Result<Vec<String>> {
+        self.storage().with_session(|session| {
+            find!(
+                reason: discord_model::TextHandle,
+                pattern!(&session.facts, [{
+                    _?outcome @
+                    metadata::tag: discord::kind_say_failed,
+                    discord::say_request: request,
+                    metadata::description: ?reason,
+                }])
+            )
+            .map(|reason| discord_model::read_text(&session.reader, reason, "failure reason"))
+            .collect()
+        })
+    }
+    /// The store as it is now, to tell later whether anything arrived.
+    pub fn store_snapshot(&self) -> Result<crate::storage::FacultySnapshot> {
+        self.storage
+            .with_store(|store, _, _| store.snapshot().context("freeze the store"))
+    }
     /// Prove that this process can publish to the Discord collection.
     pub fn preflight_write(&self) -> Result<()> {
         self.storage().preflight_write()

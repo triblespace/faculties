@@ -7,7 +7,8 @@
 //! into the discord collection, where orient finds them. With a voice channel
 //! configured, a voice connection hangs off the same session (`voice`, built
 //! with the `discord-voice` feature): the bot joins the channel through the
-//! session and speaks what `discord say` queues in the state directory; with
+//! session and plays the say requests `discord say` publishes into the
+//! discord collection for that channel ([`super::say`]); with
 //! the `discord-hearing` feature and a model to hear with, it also hears the
 //! channel, and what is said there goes into the collection through intake.
 //! Who comes into and leaves the voice channel goes there too, with intake
@@ -18,8 +19,8 @@
 //!
 //! The process runs until the gateway session ends for good, the speech model
 //! cannot load or breaks, or it is asked to stop. Nothing else ends it:
-//! gateway reconnects, lost voice connections, a line that could not be
-//! spoken and intake failures are all recovered from.
+//! gateway reconnects, lost voice connections, a say request that could not
+//! be played and intake failures are all recovered from.
 
 #[cfg(feature = "discord-voice")]
 use super::voice;
@@ -34,10 +35,11 @@ use tokio::sync::mpsc;
 /// How long queued intake work may take to finish at shutdown.
 const INTAKE_DRAIN: Duration = Duration::from_secs(20);
 
-/// The state directory `discord live` and `discord say` share: `say/` holds
-/// queued lines, `said/` spoken ones and `failed/` the ones that could not be
-/// spoken; `intake/` is intake's, utterances that could not be stored
-/// included.
+/// The state directory of `discord live`: `intake/` is intake's (where each
+/// channel's intake begins, and what could not be stored). Speech is not
+/// here: say requests and their outcomes are records of the discord
+/// collection. A `say/`, `said/` or `failed/` left by an older build is
+/// neither read nor removed.
 #[derive(Clone, Debug)]
 pub struct StateDir {
     root: PathBuf,

@@ -9,9 +9,10 @@
 //! `discord live` ([`live`]) is the faculty's resident process: it holds
 //! Discord's one gateway session ([`gateway`]), stores the messages it reads
 //! in the collection ([`intake`]), and, with the `discord-voice` feature,
-//! joins a voice channel through the same session to speak what `discord say`
-//! queues; with the `discord-hearing` feature it also hears everybody else
-//! there ([`hearing`]), and stores what each says, transcript and audio, as
+//! joins a voice channel through the same session to play the say requests
+//! `discord say` publishes into the collection ([`say`],
+//! [`say_request_fragment`]); with the `discord-hearing` feature it also
+//! hears everybody else there ([`hearing`]), and stores what each says, transcript and audio, as
 //! messages in the voice channel ([`utterance_fragment`]). Who comes into
 //! and leaves the voice channel ([`presence`]) is stored there too, as
 //! system notices ([`presence_fragment`]).
@@ -26,6 +27,7 @@ pub mod mcp;
 pub mod operations;
 pub mod presence;
 pub mod render;
+pub mod say;
 #[cfg(feature = "discord-voice")]
 pub mod voice;
 
@@ -1068,6 +1070,264 @@ pub fn coverage_fragment(channel: Id, interval: CoverageInterval) -> Fragment {
     }
 }
 
+/// How long before the speaker starts a request may have been made and
+/// still be played: one made earlier and never settled is failed as stale
+/// instead ([`say_turn`]). Long enough to cover the resident process's own
+/// restart (systemd waits 30 s) and a voice load; short enough that a line
+/// asked for while the voice was down for a long time is not played into a
+/// conversation that has moved on.
+pub const SAY_STALE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A guild's stable anchor, as Discord's snowflake names it.
+pub fn guild_fragment(external_id: &str) -> Result<Fragment> {
+    validate_snowflake(external_id).context("invalid Discord guild id")?;
+    Ok(entity! { _ @
+        metadata::tag: discord::kind_guild,
+        discord::guild_id: external_id.to_owned(),
+    })
+}
+
+/// A request that `discord live` speak `text` in the voice channel
+/// `channel_external_id` ([`discord::kind_say_request`]), asked at `at` by
+/// `persona` when known, in `guild_external_id` when the asker named it,
+/// with its delivery `options`. The words are an Archive content fact
+/// (text, out) linked through [`discord::says`]. With the channel (and
+/// guild) anchors, so the fragment stands on its own; its root is the
+/// request.
+pub fn say_request_fragment(
+    guild_external_id: Option<&str>,
+    channel_external_id: &str,
+    text: &str,
+    options: &crate::voice::options::SpeechOptions,
+    persona: Option<&str>,
+    at: Inline<NsTAIInterval>,
+) -> Result<(Fragment, Id)> {
+    anyhow::ensure!(!text.trim().is_empty(), "a line to say must not be empty");
+    options.validate()?;
+    let mut fragment = channel_fragment(channel_external_id)?;
+    let channel = fragment.root().expect("intrinsic channel has one root");
+    let guild = match guild_external_id {
+        Some(guild) => {
+            let anchor = guild_fragment(guild)?;
+            let id = anchor.root().expect("intrinsic guild has one root");
+            fragment += anchor;
+            Some(id)
+        }
+        None => None,
+    };
+    let words = crate::blockdag::text_fact(
+        crate::schemas::blockdag::content_fact::modality::TEXT,
+        crate::schemas::blockdag::content_fact::direction::OUT,
+        text,
+    )?;
+    let says = words.root().context("a text fact has one root")?;
+    fragment += words;
+    let tags = std::iter::once(discord::kind_say_request).chain(
+        options
+            .clear_direction
+            .then_some(discord::kind_say_clear_direction),
+    );
+    let request = entity! { _ @
+        metadata::tag*: tags,
+        discord::says: says,
+        discord::channel: channel,
+        discord::guild?: guild,
+        discord::speech_direction?: options.direction.as_deref(),
+        discord::speech_cfg_scale?: options.cfg_scale.map(f64::from),
+        archive::author_name?: persona.filter(|persona| !persona.is_empty()),
+        metadata::created_at: at,
+    };
+    let id = request.root().expect("intrinsic say request has one root");
+    fragment += request;
+    Ok((fragment, id))
+}
+
+/// What became of a say request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SayOutcome<'a> {
+    /// A speaker took it and began to play it; it is not settled yet.
+    Started,
+    /// Its audio played to the end in the voice channel: the playback
+    /// track completed, which says nothing about whether anyone heard it.
+    Played,
+    /// It will not be played, for the reason given.
+    Failed(&'a str),
+}
+
+/// The outcome `outcome` of the say request `request`, recorded at `at`.
+pub fn say_outcome_fragment(
+    request: Id,
+    outcome: SayOutcome<'_>,
+    at: Inline<NsTAIInterval>,
+) -> Fragment {
+    let (tag, reason) = match outcome {
+        SayOutcome::Started => (discord::kind_say_started, None),
+        SayOutcome::Played => (discord::kind_say_played, None),
+        SayOutcome::Failed(reason) => (discord::kind_say_failed, Some(reason)),
+    };
+    entity! { _ @
+        metadata::tag: tag,
+        discord::say_request: request,
+        metadata::created_at: at,
+        metadata::description?: reason,
+    }
+}
+
+/// A say request no outcome has settled yet, as a speaker reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingSay {
+    pub request: Id,
+    pub requested_at: Inline<NsTAIInterval>,
+    pub text: String,
+    pub options: crate::voice::options::SpeechOptions,
+    /// The latest time a speaker began to play it, if one did.
+    pub started_at: Option<Inline<NsTAIInterval>>,
+}
+
+/// The say requests for the voice channel `channel_external_id` that no
+/// outcome has settled ([`discord::kind_say_played`],
+/// [`discord::kind_say_failed`]), oldest first. A request whose words
+/// cannot be read here is passed over, not refused.
+pub fn unsettled_say_requests<P>(
+    facts: &P,
+    reader: &impl BlobStoreGet,
+    channel_external_id: &str,
+) -> Result<Vec<PendingSay>>
+where
+    P: TriblePattern,
+{
+    validate_snowflake(channel_external_id).context("invalid Discord channel id")?;
+    let channel_id: TextHandle = channel_external_id.to_owned().to_blob().get_handle();
+    let mut requests: BTreeMap<Id, (Inline<NsTAIInterval>, TextHandle)> = BTreeMap::new();
+    for (request, at, text) in find!(
+        (request: Id, at: Inline<NsTAIInterval>, text: TextHandle),
+        pattern!(facts, [
+            { _?channel @ discord::channel_id: channel_id },
+            {
+                ?request @
+                metadata::tag: discord::kind_say_request,
+                discord::channel: _?channel,
+                discord::says: _?words,
+                metadata::created_at: ?at,
+            },
+            { _?words @ crate::schemas::blockdag::content_fact::payload: ?text },
+        ])
+    ) {
+        // An entity is open: should it carry two times, it was asked at
+        // the earliest.
+        let entry = requests.entry(request).or_insert((at, text));
+        if interval_key(at) < interval_key(entry.0) {
+            *entry = (at, text);
+        }
+    }
+    let mut pending = Vec::new();
+    for (request, (requested_at, text)) in requests {
+        let settled = [discord::kind_say_played, discord::kind_say_failed]
+            .into_iter()
+            .any(|settles| {
+                exists!(pattern!(facts, [{
+                    _?outcome @
+                    metadata::tag: settles,
+                    discord::say_request: request,
+                }]))
+            });
+        if settled {
+            continue;
+        }
+        let text = match read_text(reader, text, "say request words") {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!("[discord] say request {request:X} passed over: {error:#}");
+                continue;
+            }
+        };
+        let started_at = find!(
+            at: Inline<NsTAIInterval>,
+            pattern!(facts, [{
+                _?outcome @
+                metadata::tag: discord::kind_say_started,
+                discord::say_request: request,
+                metadata::created_at: ?at,
+            }])
+        )
+        .max_by_key(|at| interval_key(*at));
+        let direction = find!(
+            direction: TextHandle,
+            pattern!(facts, [{ request @ discord::speech_direction: ?direction }])
+        )
+        .next()
+        .map(|handle| read_text(reader, handle, "say request direction"))
+        .transpose()?;
+        let cfg_scale = find!(
+            scale: f64,
+            pattern!(facts, [{ request @ discord::speech_cfg_scale: ?scale }])
+        )
+        .next()
+        .map(|scale| scale as f32);
+        let clear_direction = exists!(pattern!(facts, [{
+            request @ metadata::tag: discord::kind_say_clear_direction,
+        }]));
+        pending.push(PendingSay {
+            request,
+            requested_at,
+            text,
+            options: crate::voice::options::SpeechOptions {
+                direction,
+                clear_direction,
+                cfg_scale,
+            },
+            started_at,
+        });
+    }
+    pending.sort_by_key(|say| (interval_key(say.requested_at), say.request));
+    Ok(pending)
+}
+
+/// What a speaker that started at `speaker_started` does with an unsettled
+/// request: play it, or fail it for the reason given and never play it.
+///
+/// A request a speaker began before this one started (a crash, or a restart
+/// between playing it and recording how it went) may have been heard, so it
+/// is failed rather than replayed; one asked for more than [`SAY_STALE`]
+/// before this speaker started is failed as stale. Everything else plays,
+/// including a request this same speaker began and lost the voice
+/// connection on.
+pub fn say_turn(say: &PendingSay, speaker_started: Inline<NsTAIInterval>) -> Option<String> {
+    let started = interval_key(speaker_started);
+    if let Some(began) = say
+        .started_at
+        .filter(|began| interval_key(*began) < started)
+    {
+        return Some(format!(
+            "a previous speaker began playing it at {} and never recorded how it went; it may \
+             have played, so it is not played again",
+            moment_label(began)
+        ));
+    }
+    let stale = i128::try_from(SAY_STALE.as_nanos()).expect("the stale bound fits");
+    if interval_key(say.requested_at) < started - stale {
+        return Some(format!(
+            "stale at startup: requested at {}, more than {} s before the speaker started at {}",
+            moment_label(say.requested_at),
+            SAY_STALE.as_secs(),
+            moment_label(speaker_started)
+        ));
+    }
+    None
+}
+
+/// An instant as a point interval, the way `metadata::created_at` holds one.
+pub fn moment(epoch: Epoch) -> Inline<NsTAIInterval> {
+    (epoch, epoch)
+        .try_to_inline()
+        .expect("point interval encodes")
+}
+
+fn moment_label(at: Inline<NsTAIInterval>) -> String {
+    let (lower, _): (Epoch, Epoch) = at.try_from_inline().expect("valid TAI interval");
+    format!("{lower}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1275,5 +1535,81 @@ mod tests {
                 through_inclusive: 350,
             })
         );
+    }
+
+    /// A say request records what (an Archive text fact, out), where (the
+    /// voice channel and guild), when and who asked, and its delivery; an
+    /// outcome links it and never changes it.
+    #[test]
+    fn a_say_request_carries_its_words_place_asker_and_delivery() {
+        use crate::schemas::blockdag::content_fact;
+        let at = moment(Epoch::from_unix_seconds(1_800_000_000.0));
+        let options = crate::voice::options::SpeechOptions {
+            clear_direction: true,
+            cfg_scale: Some(1.0),
+            ..Default::default()
+        };
+        let (fragment, request) = say_request_fragment(
+            Some("300"),
+            "201",
+            "Hello there.",
+            &options,
+            Some("ada"),
+            at,
+        )
+        .unwrap();
+        let facts = fragment.facts();
+        let words = find!(
+            words: Id,
+            pattern!(facts, [{ request @ discord::says: ?words }])
+        )
+        .collect::<Vec<_>>();
+        assert_eq!(words.len(), 1);
+        let words = words[0];
+        assert!(exists!(pattern!(facts, [{
+            words @
+            metadata::tag: content_fact::KIND,
+            content_fact::modality: content_fact::modality::TEXT,
+            content_fact::direction: content_fact::direction::OUT,
+        }])));
+        assert!(exists!(pattern!(facts, [
+            { _?channel @ discord::channel_id: "201".to_owned().to_blob().get_handle() },
+            { _?guild @ discord::guild_id: "300".to_owned().to_blob().get_handle() },
+            {
+                request @
+                metadata::tag: discord::kind_say_request,
+                metadata::tag: discord::kind_say_clear_direction,
+                discord::channel: _?channel,
+                discord::guild: _?guild,
+                archive::author_name: "ada".to_owned().to_blob().get_handle(),
+                metadata::created_at: at,
+            },
+        ])));
+        let mut reader = fragment.clone();
+        let reader = reader.blobs_mut().snapshot().unwrap();
+        let pending = unsettled_say_requests(facts, &reader, "201").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "Hello there.");
+        assert_eq!(pending[0].options, options);
+        assert!(unsettled_say_requests(facts, &reader, "202")
+            .unwrap()
+            .is_empty());
+
+        // An abort settles it as failed; a completed track as played.
+        let mut settled = fragment.clone();
+        settled += say_outcome_fragment(request, SayOutcome::Failed("aborted"), at);
+        assert!(unsettled_say_requests(settled.facts(), &reader, "201")
+            .unwrap()
+            .is_empty());
+        let mut played = fragment.clone();
+        played += say_outcome_fragment(request, SayOutcome::Played, at);
+        assert!(unsettled_say_requests(played.facts(), &reader, "201")
+            .unwrap()
+            .is_empty());
+        // Started alone settles nothing.
+        let mut started = fragment.clone();
+        started += say_outcome_fragment(request, SayOutcome::Started, at);
+        let pending = unsettled_say_requests(started.facts(), &reader, "201").unwrap();
+        assert_eq!(pending[0].started_at, Some(at));
     }
 }

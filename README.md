@@ -312,7 +312,7 @@ Some useful capabilities deliberately remain host interfaces:
 | Body robot/daemon/camera actions | Already acquired captures, intent state, raw exports and bounded views |
 | Hear listening; Duplex devices/ear/run loops | One resident audio clip, or finite interaction with a launcher-selected existing Duplex session |
 | Voice device probing/private-public playback | Resident speech audio plus stored routing metadata; synthesis is not evidence anyone heard it |
-| Discord's live gateway session (`discord live`: message intake, and with `discord-voice` a voice connection that speaks what `discord say` queues) | The resident chat archive intake writes, and explicit pulls/sends |
+| Discord's live gateway session (`discord live`: message intake, and with `discord-voice` a voice connection that plays the say requests `discord say` publishes into the discord collection) | The resident chat archive intake writes, and explicit pulls/sends |
 | GUI startup and filesystem/web notebook exports | Finite resident PNG capture from the shared composition |
 
 Planner's local `today`/`week` convenience commands become explicit time
@@ -334,7 +334,7 @@ discovery itself does not load weights, open devices, or start a GPU.
 | `audio` | Host device enumeration/playback plumbing, not speech-model weights |
 | `hear` | Resident audio inference using the explicitly configured model pile, configuration and tokenizer |
 | `voice` (opt-in) | Qwen3-TTS synthesis using a native model pile and voice-reference assets |
-| `discord-voice` (opt-in) | `discord live` joining a voice channel and speaking what `discord say` queues: songbird's voice driver plus the `voice` feature's synthesis |
+| `discord-voice` (opt-in) | `discord live` joining a voice channel and playing the say requests `discord say` publishes into the discord collection: songbird's voice driver plus the `voice` feature's synthesis |
 | `imagine` (opt-in) | FLUX image generation using native weights and cached model configuration/tokenizer assets |
 | `duplex` (opt-in) | Continuous host speech runtime; finite session read/say/status operations do not load that model |
 
@@ -360,9 +360,21 @@ speech request, independently of the reference voice:
 
 ```sh
 voice synthesize 'Thanks, I can explain that.' --direction 'Warm, natural conversation.' --cfg-scale 2 --out reply.wav
-discord say 'The quarterly report is ready.' --direction 'Clear, professional delivery.' --cfg-scale 2
-discord say 'Back to the reference delivery.' --clear-direction
+discord say --voice-channel 200000000000000201 'The quarterly report is ready.' --direction 'Clear, professional delivery.' --cfg-scale 2
+discord say --voice-channel 200000000000000201 'Back to the reference delivery.' --clear-direction
 ```
+
+`discord say` publishes a say request into the discord collection (the words
+as an Archive text fact, the voice channel, `--guild`, the requesting
+`PERSONA`, the delivery options and when it was asked). `DISCORD_VOICE_CHANNEL`
+and `DISCORD_GUILD` stand in for the flags. The `discord live` joined to that
+channel plays requests oldest first and records an outcome on each: started,
+then played (the playback track completed, which is no evidence that anyone
+heard it) or failed with the reason. A settled request is never played again.
+On startup, a request asked for more than two minutes earlier, or one a previous
+process began and never settled (a crash between playing and recording), is
+failed with that reason instead of played. There is no spool directory; an old
+`say/`, `said/` or `failed/` in the state directory is neither read nor removed.
 
 The same flags work on `voice say`, `shout`, and `stream`. For a framed stream
 they apply to every sentence in that invocation. `voice_synthesize` MCP accepts

@@ -169,8 +169,9 @@ duplex = ["dep:mary", "mary/personaplex", "mary/q4", "audio"]
 # driver (DAVE end-to-end encryption, mandatory on Discord since 2026-03-02),
 # speaking with one resident Qwen3-TTS synthesizer from `voice`. No serenity:
 # songbird's driver connects from the session and server details the gateway
-# hands out. Without it, `discord live` runs intake alone and `discord say`
-# says voice is not built in. Off by default: the model runtime is heavy.
+# hands out. Without it, `discord live` runs intake alone (`discord say`
+# still publishes say requests, for a voiced `discord live` to play). Off by
+# default: the model runtime is heavy.
 discord-voice = ["voice", "dep:songbird", "dep:symphonia", "dep:async-trait"]
 # Hearing in `discord live`'s voice channel: songbird's receive path decodes
 # what everybody but the bot says there, an energy segmenter cuts it into
