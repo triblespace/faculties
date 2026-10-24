@@ -3,7 +3,7 @@
 
 #[derive(Clone, Debug)]
 pub struct Archive {
-    storage: crate::storage::Storage,
+    pub(super) storage: crate::storage::Storage,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportSource {

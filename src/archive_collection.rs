@@ -263,6 +263,11 @@ where
         }
     }
 
+    /// Exact descriptor selected when this writer opened, for local progress binding.
+    pub fn collection_handle(&self) -> triblespace::core::collection::records::CollectionHandle {
+        self.collection.handle()
+    }
+
     /// Add one fragment to the piece being cut, with the part of it that is
     /// node identity, and end the piece when one of those nodes says so.
     ///

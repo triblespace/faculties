@@ -1,12 +1,9 @@
 //! Archive shell syntax, trace setup and explicit local source discovery.
-use super::{parse_tai_timestamp, Archive, ImportSource, ImportSummary, Publication};
+use super::{parse_tai_timestamp, Archive, ImportSource, Publication};
+use super::sessions::{SessionEvent, SessionOptions, SessionRoot, SessionSource, SessionStart};
 use crate::archive_collection::ArchiveImportWriter;
 use crate::blockdag::Identity;
 use crate::out::Out;
-use crate::{
-    archive_agy, archive_chatgpt, archive_claude_code, archive_claude_web, archive_codex,
-    archive_copilot, archive_gemini,
-};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
@@ -39,6 +36,43 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub(super) enum Command {
+    /// Discover and import this host's quiet Codex/Claude Code sessions.
+    ///
+    /// Defaults: ~/.claude/projects, ~/.codex*/{sessions,archived_sessions},
+    /// and both directories under CODEX_HOME. Explicit roots replace defaults.
+    /// Recursive regular JSONL files include subagents. Symlinks/special entries
+    /// and hard-linked sources are refused; same-adapter overlapping roots collapse.
+    /// Each file remains its own native import unit, including Claude sidecars.
+    ///
+    /// The checkpoint is bound to this pile, selected collection and root set;
+    /// uninitialized/changed bindings require --all or --since. Legacy script
+    /// stamps are not inherited. Success advances only through the fixed quiet
+    /// cutoff. --all removes the lower bound, NOT the quiet-window deferral.
+    /// Backdated/copied files require --all. Native tail diagnostics still apply:
+    /// success does not assert that every source byte was projected.
+    ///
+    /// No timer or scheduler runs here. Host-local ingestion contention exits 3;
+    /// other failures exit 1 without checkpoint advancement, preserving earlier
+    /// publications. This lock is NOT machine-wide GB10 admission or a resource
+    /// limit: the caller must arrange those. No build/lock scripts are launched.
+    IngestSessions {
+        #[arg(long, conflicts_with = "since")]
+        all: bool,
+        /// Provisional lower bound (RFC3339), saved only after complete success.
+        #[arg(long, value_parser = humantime::parse_rfc3339)]
+        since: Option<std::time::SystemTime>,
+        #[arg(long, default_value = "1h", value_parser = parse_finished_after)]
+        quiet: std::time::Duration,
+        /// Explicit Codex root (repeatable); replaces automatic root discovery.
+        #[arg(long)]
+        codex_root: Vec<PathBuf>,
+        /// Explicit Claude Code root (repeatable); replaces automatic discovery.
+        #[arg(long)]
+        claude_root: Vec<PathBuf>,
+        /// Host-local progress directory (default XDG_STATE_HOME/faculties/archive).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Project one or more sources into the Archive as content-defined pieces.
     ///
     /// Several PATHS are projected in ONE process: the pile is opened once and
@@ -210,45 +244,12 @@ fn import_into(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let before = pile_length(pile)?;
-    let mut stage = |fragment: Fragment, identity: Identity, source_path: &Path| {
+    let stage = |fragment: Fragment, identity: Identity, source_path: &Path| {
         writer
             .stage(fragment, identity)
             .with_context(|| format!("stage {}", source_path.display()))
     };
-    let summary = match source {
-        CliImportSource::Agy => {
-            archive_agy::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
-                .map(ImportSummary::Agy)
-        }
-        CliImportSource::ChatGpt => {
-            archive_chatgpt::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
-                .map(ImportSummary::ChatGpt)
-        }
-        CliImportSource::ClaudeCode => {
-            archive_claude_code::project_path_finished(path, finished_before, |p| {
-                stage(p.fragment, p.identity, &p.source_path)
-            })
-            .map(ImportSummary::ClaudeCode)
-        }
-        CliImportSource::ClaudeWeb => archive_claude_web::project_path(path, |p| {
-            stage(p.fragment, p.identity, &p.source_path)
-        })
-        .map(ImportSummary::ClaudeWeb),
-        CliImportSource::Codex => {
-            archive_codex::project_path_finished(path, finished_before, |p| {
-                stage(p.fragment, p.identity, &p.source_path)
-            })
-            .map(ImportSummary::Codex)
-        }
-        CliImportSource::Copilot => {
-            archive_copilot::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
-                .map(ImportSummary::Copilot)
-        }
-        CliImportSource::Gemini => {
-            archive_gemini::project_path(path, |p| stage(p.fragment, p.identity, &p.source_path))
-                .map(ImportSummary::Gemini)
-        }
-    }?;
+    let summary = super::local::project_path(path, source.into(), finished_before, stage)?;
     let unit = writer.commit_unit()?;
     let appended = pile_length(pile)?.saturating_sub(before);
     summary.write(
@@ -297,6 +298,32 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     };
     let archive = Archive::new(cli.pile.clone(), cli.key.clone());
     match command {
+        Command::IngestSessions { all, since, quiet, codex_root, claude_root, state_dir } => {
+            let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory for session discovery/state"))?;
+            let roots = if codex_root.is_empty() && claude_root.is_empty() {
+                let codex_home = std::env::var_os("CODEX_HOME").filter(|s| !s.is_empty()).map(PathBuf::from);
+                super::sessions::default_roots(&home, codex_home.as_deref())?
+            } else {
+                claude_root.into_iter().map(|path| SessionRoot { source: SessionSource::ClaudeCode, path })
+                    .chain(codex_root.into_iter().map(|path| SessionRoot { source: SessionSource::Codex, path })).collect()
+            };
+            let state_dir = state_dir.unwrap_or_else(|| std::env::var_os("XDG_STATE_HOME")
+                .filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".local/state"))
+                .join("faculties/archive"));
+            let start = if all { SessionStart::All } else if let Some(time) = since { SessionStart::Since(time) } else { SessionStart::Incremental };
+            archive.ingest_sessions(&SessionOptions { roots, state_dir, start, quiet, now: std::time::SystemTime::now() }, |event| {
+                match event {
+                    SessionEvent::Deferred(path) => out.line(format!("Deferred (quiet window): {:?}", path)),
+                    SessionEvent::Importing(path) => out.line(format!("Importing session: {:?}", path)),
+                    SessionEvent::Imported { receipt, .. } => receipt.write(out),
+                    SessionEvent::Complete(report) => out.line(format!(
+                        "Session pass: {} imported, {} deferred, {} unchanged, {} other files; {} pieces in {} COMMITs (publication work, not unique growth); collection {}; checkpoint cutoff {}. Native qualifiers above apply; not continuous/complete-byte coverage. Local ingestion lock only; host admission/resources are caller-owned.",
+                        report.imported, report.deferred, report.unchanged, report.other_files,
+                        report.pieces, report.commits, report.collection, humantime::format_rfc3339(report.cutoff))),
+                }
+            })?;
+            Ok(())
+        }
         Command::Import {
             mut path,
             paths_from,
