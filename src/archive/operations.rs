@@ -1435,10 +1435,19 @@ mod tests {
             .collect();
         assert_eq!(
             commands,
-            ["import", "index", "list", "replay", "search", "show", "thread",]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
+            [
+                "import",
+                "index",
+                "ingest-sessions",
+                "list",
+                "replay",
+                "search",
+                "show",
+                "thread",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
         );
         assert!(Cli::try_parse_from([
             "archive",
