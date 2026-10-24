@@ -257,8 +257,16 @@ where
         );
     }
 
-    // Read before the records, so a write after it can only make the file
-    // look unfinished.
+    let plan = plan_prefix(path)?;
+    let frozen = archive_source::freeze_prefix(path, plan.observed_bytes)?;
+    if frozen.digest != plan.digest {
+        bail!(
+            "Codex rollout {} changed inside its planned prefix before projection",
+            path.display()
+        );
+    }
+    // Read after the records, so a write after them can only make the file
+    // look unfinished, never flush a tail the frozen prefix leaves open.
     let finished = match finished_before {
         Some(cutoff) => {
             std::fs::metadata(path)
@@ -268,14 +276,6 @@ where
         }
         None => false,
     };
-    let plan = plan_prefix(path)?;
-    let frozen = archive_source::freeze_prefix(path, plan.observed_bytes)?;
-    if frozen.digest != plan.digest {
-        bail!(
-            "Codex rollout {} changed inside its planned prefix before projection",
-            path.display()
-        );
-    }
     project_planned(path, plan, frozen, finished, emit)
 }
 

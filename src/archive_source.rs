@@ -57,7 +57,9 @@ pub fn freeze_prefix(path: &Path, len: u64) -> Result<FrozenSource> {
     freeze_open_file(&mut source, path, len)
 }
 
-fn freeze_open_file(source: &mut File, path: &Path, len: u64) -> Result<FrozenSource> {
+/// Freeze exactly `len` leading bytes from an already open, potentially
+/// growing file; the handle stays usable for a later `fstat`.
+pub fn freeze_open_file(source: &mut File, path: &Path, len: u64) -> Result<FrozenSource> {
     let len = usize::try_from(len).with_context(|| {
         format!(
             "source prefix for {} does not fit this platform's address space",

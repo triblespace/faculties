@@ -2,6 +2,15 @@
 //! optimization, not a catalogue of Archive contents or proof of byte coverage.
 //! Moving/backdating old files requires an explicit `All` pass. Scheduling and
 //! machine-wide admission/resource limits belong to the caller.
+//!
+//! A file written within the quiet window is LIVE, not deferred: agent windows
+//! keep one conversation for ever, so their transcripts never go quiet. A live
+//! file is imported up to its last finished record (the native importer holds
+//! back a trailing partial line and whatever its message does not yet show
+//! complete) and is selected again on the next pass, because its modification
+//! time is at or after this pass's cutoff, which is where progress stops.
+//! Node identity is structural, so the next import converges with this one and
+//! only appends. Quiet age decides only when a held-back tail is flushed.
 use super::{Archive, ImportReceipt, ImportSource};
 use crate::archive_collection::ArchiveImportWriter;
 use anyhow::{anyhow, bail, Context, Result};
@@ -47,7 +56,9 @@ pub struct SessionOptions {
 #[derive(Debug)]
 pub struct SessionReport {
     pub imported: usize,
-    pub deferred: usize,
+    /// Of `imported`, files written within the quiet window: imported up to
+    /// their last finished record and selected again next pass.
+    pub live: usize,
     pub unchanged: usize,
     pub other_files: usize,
     pub pieces: usize,
@@ -57,7 +68,8 @@ pub struct SessionReport {
     pub collection: String,
 }
 pub enum SessionEvent<'a> {
-    Deferred(&'a Path),
+    /// Precedes `Importing` for a file written within the quiet window.
+    Live(&'a Path),
     Importing(&'a Path),
     Imported {
         path: &'a Path,
@@ -254,13 +266,18 @@ impl Candidate {
             s.modified.max(self.observed.modified)
         })
     }
+    /// The file is the one discovered, appended to at most. Appends during
+    /// the pass are next-pass work: they post-date the cutoff, and the
+    /// importer reads one frozen prefix. Replacement, truncation, a same-size
+    /// rewrite, or a changed sidecar abort before publication.
     fn check(&self) -> Result<()> {
         no_symlink_components(&self.path)?;
-        if observe_file(&self.path)? != self.observed
-            || sidecar(&self.path, self.source)? != self.sidecar
-        {
+        let now = observe_file(&self.path)?;
+        let appended = now.identity == self.observed.identity
+            && (now == self.observed || now.len > self.observed.len);
+        if !appended || sidecar(&self.path, self.source)? != self.sidecar {
             bail!(
-                "source or sidecar changed since discovery: {:?}; rerun explicitly",
+                "source or sidecar changed since discovery other than by appending: {:?}; rerun explicitly",
                 self.path
             );
         }
@@ -391,17 +408,15 @@ impl Archive {
                 }
             };
             if since.is_some_and(|time| time > cutoff) { bail!("session lower bound is after eligibility cutoff (clock moved backwards or --since is too recent)"); }
-            let mut report = SessionReport { imported: 0, deferred: 0, unchanged: 0, other_files,
+            let mut report = SessionReport { imported: 0, live: 0, unchanged: 0, other_files,
                 pieces: 0, commits: 0, cutoff, collection };
             for file in &files {
-                if file.modified() >= cutoff {
-                    report.deferred += 1;
-                    event(SessionEvent::Deferred(&file.path))?;
-                    continue;
-                }
                 // Inclusive lower edge intentionally rechecks the prior boundary.
+                // A file live in the previous pass is at or after it by definition.
                 if since.is_some_and(|time| file.modified() < time) { report.unchanged += 1; continue; }
+                let live = file.modified() >= cutoff;
                 let result = (|| {
+                    if live { event(SessionEvent::Live(&file.path))?; }
                     event(SessionEvent::Importing(&file.path))?;
                     file.check()?;
                     let summary = super::local::project_path(&file.path, file.source.into(), Some(cutoff), |fragment, identity, _| writer.stage(fragment, identity))?;
@@ -410,6 +425,7 @@ impl Archive {
                     report.pieces += publication.pieces;
                     report.commits += publication.commits.len();
                     report.imported += 1;
+                    report.live += usize::from(live);
                     event(SessionEvent::Imported { path: &file.path, receipt: &ImportReceipt { summary, publication } })
                 })();
                 result.with_context(|| format!("import {:?}; checkpoint unchanged", file.path))?;
@@ -534,12 +550,12 @@ mod tests {
     }
 
     #[test]
-    fn quiet_deferred_file_is_seen_next_time_without_another_write() {
+    fn live_file_is_imported_and_seen_again_next_time_without_another_write() {
         let mut f = Fixture::new();
         f.file("old.jsonl", CODEX, 1000);
         f.file("recent.jsonl", CODEX, 8000);
         let first = f.run().unwrap();
-        assert_eq!((first.imported, first.deferred), (1, 1));
+        assert_eq!((first.imported, first.live), (2, 1));
         assert_eq!(
             state_file(&f.options.state_dir.join("ingest-sessions.json"))
                 .unwrap()
@@ -550,7 +566,7 @@ mod tests {
         f.options.start = SessionStart::Incremental;
         f.options.now = time(14000);
         let next = f.run().unwrap();
-        assert_eq!((next.imported, next.deferred, next.unchanged), (1, 0, 1));
+        assert_eq!((next.imported, next.live, next.unchanged), (1, 0, 1));
     }
 
     #[test]
@@ -723,12 +739,28 @@ mod tests {
     }
 
     #[test]
-    fn mutation_after_discovery_fails_without_checkpoint_or_file_publication() {
+    fn append_after_discovery_is_next_pass_work_but_other_mutation_fails() {
+        let f = Fixture::new();
+        let path = f.file("a.jsonl", CODEX, 1000);
+        f.archive
+            .ingest_sessions(&f.options, |event| {
+                if matches!(event, SessionEvent::Importing(_)) {
+                    File::options()
+                        .append(true)
+                        .open(&path)?
+                        .write_all(b"{\"partial")?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(f.options.state_dir.join("ingest-sessions.json").exists());
+        assert!(!f.facts().is_empty());
+
         let f = Fixture::new();
         let path = f.file("a.jsonl", CODEX, 1000);
         let result = f.archive.ingest_sessions(&f.options, |event| {
             if matches!(event, SessionEvent::Importing(_)) {
-                File::options().append(true).open(&path)?.write_all(b"\n")?;
+                File::options().write(true).open(&path)?.set_len(10)?;
             }
             Ok(())
         });
@@ -768,13 +800,8 @@ mod tests {
             .set_modified(time(8000))
             .unwrap();
         f.options.start = SessionStart::Incremental;
-        assert_eq!(
-            c.archive
-                .ingest_sessions(&f.options, |_| Ok(()))
-                .unwrap()
-                .deferred,
-            1
-        );
+        let live = c.archive.ingest_sessions(&f.options, |_| Ok(())).unwrap();
+        assert_eq!((live.imported, live.live), (1, 1));
         f.options.now = time(14000);
         assert_eq!(
             c.archive
@@ -851,6 +878,215 @@ mod tests {
             })
             .unwrap();
         assert!(complete.unwrap().stats.content_parts > held.stats.content_parts);
+    }
+
+    /// Facts of `grown` beyond `whole` that are not leaf annotations: what a
+    /// fork, or a node whose identity moved, would leave behind.
+    fn beyond_annotations(
+        grown: &triblespace::core::trible::TribleSet,
+        whole: &triblespace::core::trible::TribleSet,
+    ) -> (usize, usize) {
+        use crate::schemas::blockdag::source_projection;
+        let annotation = [
+            source_projection::source_locator.id(),
+            source_projection::source_detail.id(),
+        ];
+        let extra = grown.difference(whole);
+        let annotations = extra
+            .iter()
+            .filter(|trible| annotation.contains(trible.a()))
+            .count();
+        (extra.len() - annotations, annotations)
+    }
+
+    fn live_then_quiet_converges(source: SessionSource, steps: &[&str], name: &str) {
+        let mut f = Fixture::new();
+        f.options.roots[0].source = source;
+        let mut body = String::new();
+        let mut previous = triblespace::core::trible::TribleSet::new();
+        let mut now = 10_000;
+        for (index, step) in steps.iter().enumerate() {
+            body.push_str(step);
+            // Every step but the last is written within the quiet window.
+            let last = index + 1 == steps.len();
+            f.options.now = time(now);
+            f.file(name, &body, if last { now - 7200 } else { now - 60 });
+            let report = f.run().unwrap();
+            assert_eq!(
+                (report.imported, report.live),
+                (1, usize::from(!last)),
+                "step {index}"
+            );
+            let facts = f.facts();
+            assert!(facts.len() > previous.len(), "step {index} added nothing");
+            previous = facts;
+            f.options.start = SessionStart::Incremental;
+            now += 10_000;
+        }
+        let whole = Fixture::new();
+        let mut options = whole.options.clone();
+        options.roots[0].source = source;
+        options.now = time(now);
+        let path = options.roots[0].path.join(name);
+        fs::write(&path, &body).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(time(1000))
+            .unwrap();
+        whole.archive.ingest_sessions(&options, |_| Ok(())).unwrap();
+        let whole = whole.facts();
+        assert!(
+            whole.difference(&previous).is_empty(),
+            "the live imports miss nodes"
+        );
+        let (nodes, annotations) = beyond_annotations(&previous, &whole);
+        assert_eq!(nodes, 0, "the live imports forked or moved a node");
+        // The wart: each earlier pass's leaf keeps its session annotation.
+        println!("{name}: {annotations} leaf annotations beyond a one-shot import");
+        assert!(annotations <= 2 * (steps.len() - 1));
+    }
+
+    #[test]
+    fn a_growing_claude_transcript_converges_across_live_passes() {
+        let user = |uuid: &str, parent: &str, text: &str| {
+            format!(
+                r#"{{"type":"user","sessionId":"live","uuid":"{uuid}","parentUuid":{parent},"message":{{"role":"user","content":"{text}"}}}}"#
+            )
+        };
+        let call = r#"{"type":"assistant","sessionId":"live","uuid":"c","parentUuid":"u","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a"}}]}}"#;
+        let result = r#"{"type":"user","sessionId":"live","uuid":"r","parentUuid":"c","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents of a"}]}}"#;
+        let answer = r#"{"type":"assistant","sessionId":"live","uuid":"a","parentUuid":"p","message":{"id":"msg_2","role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
+        let (head, tail) = answer.split_at(40);
+        let steps = [
+            // Ends inside msg_1: the result is held back.
+            format!("{}\n{call}\n{result}\n", user("u", "null", "look")),
+            // The prompt closes msg_1; the answer is half written.
+            format!("{}\n{head}", user("p", r#""r""#, "go on")),
+            format!("{tail}\n"),
+        ];
+        let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+        live_then_quiet_converges(SessionSource::ClaudeCode, &steps, "live.jsonl");
+
+        // The half-written line is held back, not a parse error, and the
+        // unfinished message's tail is held back too.
+        let f = Fixture::new();
+        let mut options = f.options.clone();
+        options.roots[0].source = SessionSource::ClaudeCode;
+        let path = options.roots[0].path.join("live.jsonl");
+        fs::write(&path, format!("{}{}", steps[0], head)).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(time(9000))
+            .unwrap();
+        let mut seen = None;
+        f.archive
+            .ingest_sessions(&options, |event| {
+                if let SessionEvent::Imported { receipt, .. } = event {
+                    if let ImportSummary::ClaudeCode(summary) = &receipt.summary {
+                        seen = Some((summary.stats.records_seen, summary.stats.held_back_records));
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, Some((3, 1)));
+    }
+
+    #[test]
+    fn a_growing_codex_rollout_converges_across_live_passes() {
+        let event = |minute: u32, text: &str| {
+            format!(
+                r#"{{"timestamp":"2026-08-16T08:{minute:02}:00Z","type":"event_msg","payload":{{"type":"agent_message","message":"{text}"}}}}"#
+            )
+        };
+        let second = event(2, "first answer");
+        let (head, tail) = second.split_at(50);
+        let steps = [
+            format!("{CODEX}{head}"),
+            format!("{tail}\n{}\n", event(3, "second answer")),
+            format!("{}\n", event(4, "third answer")),
+        ];
+        let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+        live_then_quiet_converges(SessionSource::Codex, &steps, "rollout.jsonl");
+    }
+
+    /// Real-data convergence of a live Claude Code session: two live passes
+    /// (a cut of the file, then the rest appended) against one live import of
+    /// the whole. Inputs are copies, never a live transcript or pile.
+    #[test]
+    #[ignore = "requires LIVE_SESSION_GROWN and LIVE_SESSION_PREFIX_LEN (bytes)"]
+    fn a_real_live_session_converges_with_its_one_shot_import() {
+        use std::time::Instant;
+        let grown = PathBuf::from(std::env::var_os("LIVE_SESSION_GROWN").unwrap());
+        let cut: u64 = std::env::var("LIVE_SESSION_PREFIX_LEN")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let live = |f: &Fixture, len: Option<u64>| {
+            let path = f.options.roots[0].path.join("live.jsonl");
+            let mut source = File::open(&grown).unwrap();
+            let mut target = File::options()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let have = target.metadata().unwrap().len();
+            std::io::Seek::seek(&mut source, std::io::SeekFrom::Start(have)).unwrap();
+            let want = len.unwrap_or(u64::MAX) - have;
+            std::io::copy(&mut source.take(want), &mut target).unwrap();
+        };
+        let pass = |f: &mut Fixture, label: &str| {
+            f.options.now = SystemTime::now();
+            let before = fs::metadata(f.archive.storage.path()).unwrap().len();
+            let started = Instant::now();
+            let mut held = (0, 0);
+            let report = f
+                .archive
+                .ingest_sessions(&f.options, |event| {
+                    if let SessionEvent::Imported { receipt, .. } = event {
+                        if let ImportSummary::ClaudeCode(s) = &receipt.summary {
+                            held = (s.stats.records_seen, s.stats.held_back_records);
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let grew = fs::metadata(f.archive.storage.path()).unwrap().len() - before;
+            println!(
+                "{label}: {:.1} s, imported {} live {}, records_seen {} held_back {}, pile +{grew} bytes",
+                started.elapsed().as_secs_f64(),
+                report.imported,
+                report.live,
+                held.0,
+                held.1
+            );
+            f.options.start = SessionStart::Incremental;
+        };
+        let mut two = Fixture::new();
+        two.options.roots[0].source = SessionSource::ClaudeCode;
+        live(&two, Some(cut));
+        pass(&mut two, "first live pass (cut)");
+        live(&two, None);
+        pass(&mut two, "second live pass (grown)");
+        pass(&mut two, "third live pass (unchanged)");
+        let mut one = Fixture::new();
+        one.options.roots[0].source = SessionSource::ClaudeCode;
+        live(&one, None);
+        pass(&mut one, "one-shot live import (grown)");
+        let (two, one) = (two.facts(), one.facts());
+        let (nodes, annotations) = beyond_annotations(&two, &one);
+        println!(
+            "facts: two-pass {} one-shot {}; missing {}; beyond: {nodes} non-annotation, {annotations} annotation",
+            two.len(),
+            one.len(),
+            one.difference(&two).len()
+        );
+        assert!(one.difference(&two).is_empty());
+        assert_eq!(nodes, 0);
     }
 
     /// Explicitly run after building only --bin archive, without Cargo's

@@ -1,6 +1,6 @@
 //! Archive shell syntax, trace setup and explicit local source discovery.
-use super::{parse_tai_timestamp, Archive, ImportSource, Publication};
 use super::sessions::{SessionEvent, SessionOptions, SessionRoot, SessionSource, SessionStart};
+use super::{parse_tai_timestamp, Archive, ImportSource, Publication};
 use crate::archive_collection::ArchiveImportWriter;
 use crate::blockdag::Identity;
 use crate::out::Out;
@@ -36,7 +36,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub(super) enum Command {
-    /// Discover and import this host's quiet Codex/Claude Code sessions.
+    /// Discover and import this host's Codex/Claude Code sessions.
     ///
     /// Defaults: ~/.claude/projects, ~/.codex*/{sessions,archived_sessions},
     /// and both directories under CODEX_HOME. Explicit roots replace defaults.
@@ -47,7 +47,11 @@ pub(super) enum Command {
     /// The checkpoint is bound to this pile, selected collection and root set;
     /// uninitialized/changed bindings require --all or --since. Legacy script
     /// stamps are not inherited. Success advances only through the fixed quiet
-    /// cutoff. --all removes the lower bound, NOT the quiet-window deferral.
+    /// cutoff. A file written within the quiet window is live: it is imported
+    /// up to its last finished record (a trailing partial line and an
+    /// unfinished message's tail are held back) and selected again next pass,
+    /// so a conversation that never goes quiet is still archived. --quiet only
+    /// decides when a file counts as finished and its held-back tail is flushed.
     /// Backdated/copied files require --all. Native tail diagnostics still apply:
     /// success does not assert that every source byte was projected.
     ///
@@ -61,6 +65,8 @@ pub(super) enum Command {
         /// Provisional lower bound (RFC3339), saved only after complete success.
         #[arg(long, value_parser = humantime::parse_rfc3339)]
         since: Option<std::time::SystemTime>,
+        /// Age after which a file counts as finished (its held-back tail is
+        /// flushed); younger files are imported live up to their last finished record.
         #[arg(long, default_value = "1h", value_parser = parse_finished_after)]
         quiet: std::time::Duration,
         /// Explicit Codex root (repeatable); replaces automatic root discovery.
@@ -298,27 +304,56 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     };
     let archive = Archive::new(cli.pile.clone(), cli.key.clone());
     match command {
-        Command::IngestSessions { all, since, quiet, codex_root, claude_root, state_dir } => {
-            let home = dirs::home_dir().ok_or_else(|| anyhow!("no home directory for session discovery/state"))?;
+        Command::IngestSessions {
+            all,
+            since,
+            quiet,
+            codex_root,
+            claude_root,
+            state_dir,
+        } => {
+            let home = dirs::home_dir()
+                .ok_or_else(|| anyhow!("no home directory for session discovery/state"))?;
             let roots = if codex_root.is_empty() && claude_root.is_empty() {
-                let codex_home = std::env::var_os("CODEX_HOME").filter(|s| !s.is_empty()).map(PathBuf::from);
+                let codex_home = std::env::var_os("CODEX_HOME")
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from);
                 super::sessions::default_roots(&home, codex_home.as_deref())?
             } else {
-                claude_root.into_iter().map(|path| SessionRoot { source: SessionSource::ClaudeCode, path })
-                    .chain(codex_root.into_iter().map(|path| SessionRoot { source: SessionSource::Codex, path })).collect()
+                claude_root
+                    .into_iter()
+                    .map(|path| SessionRoot {
+                        source: SessionSource::ClaudeCode,
+                        path,
+                    })
+                    .chain(codex_root.into_iter().map(|path| SessionRoot {
+                        source: SessionSource::Codex,
+                        path,
+                    }))
+                    .collect()
             };
-            let state_dir = state_dir.unwrap_or_else(|| std::env::var_os("XDG_STATE_HOME")
-                .filter(|s| !s.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".local/state"))
-                .join("faculties/archive"));
-            let start = if all { SessionStart::All } else if let Some(time) = since { SessionStart::Since(time) } else { SessionStart::Incremental };
+            let state_dir = state_dir.unwrap_or_else(|| {
+                std::env::var_os("XDG_STATE_HOME")
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| home.join(".local/state"))
+                    .join("faculties/archive")
+            });
+            let start = if all {
+                SessionStart::All
+            } else if let Some(time) = since {
+                SessionStart::Since(time)
+            } else {
+                SessionStart::Incremental
+            };
             archive.ingest_sessions(&SessionOptions { roots, state_dir, start, quiet, now: std::time::SystemTime::now() }, |event| {
                 match event {
-                    SessionEvent::Deferred(path) => out.line(format!("Deferred (quiet window): {:?}", path)),
+                    SessionEvent::Live(path) => out.line(format!("Live (written within the quiet window; importing up to its last finished record): {:?}", path)),
                     SessionEvent::Importing(path) => out.line(format!("Importing session: {:?}", path)),
                     SessionEvent::Imported { receipt, .. } => receipt.write(out),
                     SessionEvent::Complete(report) => out.line(format!(
-                        "Session pass: {} imported, {} deferred, {} unchanged, {} other files; {} pieces in {} COMMITs (publication work, not unique growth); collection {}; checkpoint cutoff {}. Native qualifiers above apply; not continuous/complete-byte coverage. Local ingestion lock only; host admission/resources are caller-owned.",
-                        report.imported, report.deferred, report.unchanged, report.other_files,
+                        "Session pass: {} imported ({} live), {} unchanged, {} other files; {} pieces in {} COMMITs (publication work, not unique growth); collection {}; checkpoint cutoff {}. Native qualifiers above apply; not continuous/complete-byte coverage. Local ingestion lock only; host admission/resources are caller-owned.",
+                        report.imported, report.live, report.unchanged, report.other_files,
                         report.pieces, report.commits, report.collection, humantime::format_rfc3339(report.cutoff))),
                 }
             })?;

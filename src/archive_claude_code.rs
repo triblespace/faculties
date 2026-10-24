@@ -254,12 +254,65 @@ where
         None => path.to_path_buf(),
     };
 
-    let prescan = prescan_file(path, finished_before)?;
+    let (prescan, snapshot) = freeze_and_prescan(path, finished_before)?;
     let plan = SourcePlan::from_scans(std::slice::from_ref(&prescan))
         .context("plan canonical Claude Code lineage")?;
-    let snapshot = archive_source::freeze_file(path)?;
     let meta = subagent_meta(path)?;
     project_snapshot(path, snapshot, &prescan, &plan, meta, &mut emit)
+}
+
+/// Freeze one possibly live transcript once and pre-scan exactly the frozen
+/// bytes, so a file still being written is planned and projected from one
+/// read. The modification time is read AFTER the bytes, from the same
+/// handle: a write after the freeze can only make the file look unfinished,
+/// never close a message the frozen bytes leave open. In an unfinished file a
+/// last line without its newline that does not scan as a record is one still
+/// being written: it is left out, and lands on a later import like the rest
+/// of the held-back tail. (A last line that does scan is the same record
+/// with or without its newline, so it is kept, as it always was.)
+fn freeze_and_prescan(
+    path: &Path,
+    finished_before: Option<SystemTime>,
+) -> Result<(PreScan, archive_source::FrozenSource)> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let frozen = archive_source::freeze_open_file(&mut file, path, len)?;
+    let finished = match finished_before {
+        Some(cutoff) => {
+            file.metadata()
+                .and_then(|metadata| metadata.modified())
+                .with_context(|| format!("read the modification time of {}", path.display()))?
+                < cutoff
+        }
+        None => false,
+    };
+    let complete = frozen
+        .bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |end| end + 1);
+    let partial = &frozen.bytes[complete..];
+    let writing = !finished
+        && !partial.iter().all(u8::is_ascii_whitespace)
+        && scanner_bytes(partial)
+            .ok()
+            .and_then(|mut bytes| scan_record(&mut bytes).ok())
+            .is_none();
+    let bytes = if writing {
+        frozen.bytes.slice(..complete)
+    } else {
+        frozen.bytes
+    };
+    let mut scan = prescan_reader(&mut std::io::Cursor::new(bytes.as_ref()), path)?;
+    scan.finished = finished;
+    let snapshot = archive_source::FrozenSource {
+        digest: scan.digest,
+        bytes,
+    };
+    Ok((scan, snapshot))
 }
 
 /// The prompt log Claude Code keeps beside `projects/`.
