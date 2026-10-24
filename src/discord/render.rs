@@ -157,3 +157,32 @@ fn channel_type_label(kind: i64) -> &'static str {
         _ => "other",
     }
 }
+
+/// One line per channel: who it is addressed to, and the addressing a call
+/// published when it had to publish one.
+pub fn addressed(channels: &[AddressedChannel], out: &mut Out<'_>) -> Result<()> {
+    if channels.is_empty() {
+        return out.line("(no channel is addressed to anybody)");
+    }
+    for channel in channels {
+        let whom = if channel.addressees.is_empty() {
+            "nobody in particular".to_owned()
+        } else {
+            channel
+                .addressees
+                .iter()
+                .map(|(id, label)| format!("{label} [{id:X}]"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let published = match channel.published {
+            Some(addressing) => format!(" (addressing {addressing:X})"),
+            None => String::new(),
+        };
+        out.line(format!(
+            "channel {} is addressed to {whom}{published}",
+            channel.channel_id
+        ))?;
+    }
+    Ok(())
+}

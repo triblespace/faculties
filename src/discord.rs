@@ -313,6 +313,82 @@ pub fn bot_account_fragment(user_external_id: &str) -> Result<Fragment> {
     Ok(fragment)
 }
 
+/// Who the channel `channel_external_id` is addressed to: `addressees`
+/// (Relations person anchors), the whole set, replacing the addressings of
+/// the channel `replaces` names (its current ones, [`channel_addressing`]).
+/// No addressee says the channel is addressed to nobody in particular. With
+/// the channel's anchor, so the fragment stands on its own; and the
+/// addressing's id.
+pub fn channel_addressing_fragment(
+    channel_external_id: &str,
+    addressees: impl IntoIterator<Item = Id>,
+    replaces: impl IntoIterator<Item = Id>,
+) -> Result<(Fragment, Id)> {
+    let mut fragment = channel_fragment(channel_external_id)?;
+    let channel = fragment.root().expect("intrinsic channel has one root");
+    let addressees: BTreeSet<Id> = addressees.into_iter().collect();
+    let replaces: BTreeSet<Id> = replaces.into_iter().collect();
+    let addressing = entity! { _ @
+        metadata::tag: discord::kind_channel_addressing,
+        discord::channel: channel,
+        discord::addressee*: addressees,
+        metadata::supersedes*: replaces,
+    };
+    let id = addressing
+        .root()
+        .expect("intrinsic channel addressing has one root");
+    fragment += addressing;
+    Ok((fragment, id))
+}
+
+/// Who one channel is addressed to now.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChannelAddressing {
+    /// The channel's addressings nothing replaces: ordinarily one, more when
+    /// two were made without seeing each other.
+    pub current: BTreeSet<Id>,
+    /// Everybody the current addressings name. Empty: nobody in particular.
+    pub addressees: BTreeSet<Id>,
+}
+
+/// Who each addressed channel is addressed to, by the handle of the
+/// channel's Discord id: the addressees of every addressing of the channel
+/// that no addressing replaces, all of them when two stand side by side
+/// (neither is the answer alone). A channel never addressed is not here; one
+/// whose current addressing names nobody is here with no addressee.
+pub fn channel_addressing<P: TriblePattern>(facts: &P) -> BTreeMap<TextHandle, ChannelAddressing> {
+    let records: Vec<(Id, TextHandle)> = find!(
+        (record: Id, channel_id: TextHandle),
+        pattern!(facts, [
+            {
+                ?record @
+                metadata::tag: discord::kind_channel_addressing,
+                discord::channel: _?channel,
+            },
+            { _?channel @ discord::channel_id: ?channel_id },
+        ])
+    )
+    .collect();
+    let current = latest(
+        facts,
+        metadata::supersedes.id(),
+        records.iter().map(|(record, _)| *record),
+    );
+    let mut channels: BTreeMap<TextHandle, ChannelAddressing> = BTreeMap::new();
+    for (record, channel_id) in records {
+        if !current.contains(&record) {
+            continue;
+        }
+        let entry = channels.entry(channel_id).or_default();
+        entry.current.insert(record);
+        entry.addressees.extend(find!(
+            addressee: Id,
+            pattern!(facts, [{ record @ discord::addressee: ?addressee }])
+        ));
+    }
+    channels
+}
+
 /// Discord's epoch, in milliseconds since the Unix epoch.
 pub const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 

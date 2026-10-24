@@ -236,6 +236,24 @@ enum ChannelsCommand {
         #[arg(long)]
         guild: Option<String>,
     },
+    /// Address a channel to the people it is for: what is written there then
+    /// wakes only them (orient's news), where a channel addressed to nobody
+    /// in particular wakes everybody. The people given are the whole set and
+    /// replace whoever the channel was addressed to; --nobody addresses it
+    /// to nobody in particular again. Recorded in the discord collection
+    /// (needs the pile), with no call to Discord.
+    #[command(group(clap::ArgGroup::new("whom").required(true).args(["people", "nobody"])))]
+    Address {
+        /// Channel id (global Discord snowflake).
+        channel_id: String,
+        /// Who the channel is for: Relations labels, aliases or ids.
+        people: Vec<String>,
+        /// Address the channel to nobody in particular.
+        #[arg(long)]
+        nobody: bool,
+    },
+    /// Print every addressed channel and who it is addressed to.
+    Addressed,
 }
 
 pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
@@ -340,6 +358,14 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
         CommandMode::Channels {
             command: ChannelsCommand::List { guild },
         } => render::channels(&operations.channels_list(guild.as_deref())?, out),
+        CommandMode::Channels {
+            command: ChannelsCommand::Address {
+                channel_id, people, ..
+            },
+        } => render::addressed(&[operations.address_channel(&channel_id, &people)?], out),
+        CommandMode::Channels {
+            command: ChannelsCommand::Addressed,
+        } => render::addressed(&operations.channel_addressing()?, out),
     }
 }
 pub fn run() -> Result<()> {

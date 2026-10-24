@@ -1986,12 +1986,17 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
     Ok((author, content))
 }
 
-/// Discord messages that are attention items for this pile.
+/// Discord messages that are attention items for the reader whose own
+/// identities and groups are `addressees`.
 ///
-/// Scoped exactly like Teams: Discord carries no per-reader read state, so
-/// the attention set is every message somebody other than this pile's bot
-/// wrote, and news is that set minus the persona's `Presented` ledger. There
-/// is no persona gating: one bot serves every window sharing this pile. The
+/// Scoped like Teams: Discord carries no per-reader read state, so the
+/// attention set is every message somebody other than this pile's bot
+/// wrote, and news is that set minus the persona's `Presented` ledger. One
+/// bot serves every window sharing this pile, so a message is for every
+/// reader, unless its channel is addressed to somebody
+/// ([`discord::kind_channel_addressing`]): then it is for the people the
+/// channel is addressed to, and nobody else. A channel whose current
+/// addressing names nobody is for everybody again. The
 /// bot's messages are recognised by the account facts its intake (from READY)
 /// and `discord send` record; a message edited or observed again is the same
 /// anchor, so it is news once. As with Teams, news is somebody writing: a
@@ -2013,7 +2018,21 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
 /// speaking ([`discord::kind_heard_sentence`]) is news by its own id, heard
 /// as a message is, until the utterance it belongs to is stored: that holds
 /// the sentence with the rest, and is news itself.
-fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
+fn native_discord_messages(query: &OrientQuery<'_>, addressees: &HashSet<Id>) -> BTreeSet<Id> {
+    let addressing = discord_model::channel_addressing(query.discord);
+    // A channel is the reader's when nobody in particular is its addressee
+    // or the reader is one. Joined on the channel's Discord id, the way the
+    // addressing names it.
+    let for_reader = |channel: Id| {
+        let mut named = find!(
+            handle: discord_model::TextHandle,
+            pattern!(query.discord, [{ channel @ discord::channel_id: ?handle }])
+        )
+        .filter_map(|handle| addressing.get(&handle))
+        .flat_map(|addressing| addressing.addressees.iter())
+        .peekable();
+        named.peek().is_none() || named.any(|addressee| addressees.contains(addressee))
+    };
     let own: BTreeSet<Id> = find!(
         user: Id,
         pattern!(query.discord, [{
@@ -2042,53 +2061,55 @@ fn native_discord_messages(query: &OrientQuery<'_>) -> BTreeSet<Id> {
     .filter(|anchor| !presence.contains(anchor))
     .collect();
     find!(
-        (anchor: Id, author: Id, created: IntervalValue, heard: IntervalValue),
+        (anchor: Id, channel: Id, author: Id, created: IntervalValue, heard: IntervalValue),
         pattern!(query.discord, [
             {
                 _?observation @
                 metadata::tag: archive::kind_message,
                 discord::message: ?anchor,
-                discord::channel: _?channel,
+                discord::channel: ?channel,
                 archive::author: ?author,
                 metadata::created_at: ?created,
             },
             {
                 _?intake @
                 metadata::tag: discord::kind_intake,
-                discord::channel: _?channel,
+                discord::channel: ?channel,
                 discord::heard_from: ?heard,
             },
         ])
     )
-    .filter(|(anchor, author, created, heard)| {
+    .filter(|(anchor, channel, author, created, heard)| {
         interval_key(*created) >= interval_key(*heard)
             && !own.contains(author)
             && !notices.contains(anchor)
+            && for_reader(*channel)
     })
     .map(|(anchor, ..)| anchor)
     .chain(
         find!(
-            (sentence: Id, utterance: Id, author: Id, created: IntervalValue, heard: IntervalValue),
+            (sentence: Id, utterance: Id, channel: Id, author: Id, created: IntervalValue, heard: IntervalValue),
             pattern!(query.discord, [
                 {
                     ?sentence @
                     metadata::tag: discord::kind_heard_sentence,
                     discord::message: ?utterance,
-                    discord::channel: _?channel,
+                    discord::channel: ?channel,
                     archive::author: ?author,
                     metadata::created_at: ?created,
                 },
                 {
                     _?intake @
                     metadata::tag: discord::kind_intake,
-                    discord::channel: _?channel,
+                    discord::channel: ?channel,
                     discord::heard_from: ?heard,
                 },
             ])
         )
-        .filter(|&(_, utterance, author, created, heard)| {
+        .filter(|&(_, utterance, channel, author, created, heard)| {
             interval_key(created) >= interval_key(heard)
                 && !own.contains(&author)
+                && for_reader(channel)
                 && !exists!(pattern!(query.discord, [{
                     _?observation @
                     metadata::tag: archive::kind_message,
@@ -2127,8 +2148,6 @@ struct DiscordMessageDetail {
     /// coming into or leaving one, rather than written.
     voice: bool,
     versions: Vec<DiscordVersion>,
-    /// The distinct attachment entities of those versions.
-    attachments: usize,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2331,11 +2350,6 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
             },
         );
     }
-    let attachments = versions
-        .keys()
-        .flat_map(|state| &state.attachments)
-        .collect::<BTreeSet<_>>()
-        .len();
     let mut versions: Vec<DiscordVersion> = versions.into_values().collect();
     versions.sort();
     let presence = [
@@ -2357,7 +2371,6 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
         created,
         voice,
         versions,
-        attachments,
     })
 }
 
@@ -2406,15 +2419,16 @@ fn discord_stream_text(detail: &DiscordMessageDetail, version: &DiscordVersion) 
     text
 }
 
-/// What `orient` prints of one version of a Discord message: its author,
-/// channel and whole text, which of how many versions at the newest time it
-/// is when there are more, and per attachment the `files get` that writes its
-/// stored bytes out, or the size Discord declared for one too large to store.
+/// The `News:` line of one version of a Discord message, everything there
+/// is to read of it at once: its author, channel and whole text, which of
+/// how many versions at the newest time it is when there are more, and per
+/// attachment (on a line of its own) the `files get` that writes its stored
+/// bytes out, or the size Discord declared for one too large to store.
 /// Somebody coming into or leaving the voice channel is printed as that
 /// event, never as text they wrote ([`discord_presence_text`]).
-fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion) -> String {
+fn discord_news_text(detail: &DiscordMessageDetail, version: &DiscordVersion) -> String {
     if let Some(presence) = detail.presence {
-        return format!("- {}\n", discord_presence_text(detail, presence));
+        return format!("Discord: {}\n", discord_presence_text(detail, presence));
     }
     let count = detail.versions.len();
     let of = if count > 1 {
@@ -2428,7 +2442,7 @@ fn discord_version_text(detail: &DiscordMessageDetail, version: &DiscordVersion)
         ""
     };
     let mut text = format!(
-        "- {} in channel {}{of}{speaking}: {}\n",
+        "Discord message from {} in channel {}{of}{speaking}: {}\n",
         detail.author, detail.channel, version.content
     );
     // The bytes are in the pile, stored with the message; `files get` with
@@ -2468,46 +2482,6 @@ fn discord_presence_text(
         text.push_str(&crate::discord::operations::format_interval(created));
     }
     text
-}
-
-/// `Discord message from <author> in channel <id>: <first line>`, and how
-/// many attachments come with it (and how many versions, when Discord gave
-/// more than one the same time); for somebody coming into or leaving the
-/// voice channel, `Discord: <name> joined the voice channel <id> at <time>`
-/// (or left). Best effort, like every News line: a body not yet here only
-/// shortens the line; the detail below waits for it.
-fn discord_news_line(query: &OrientQuery<'_>, anchor: Id) -> Option<String> {
-    let detail = discord_message_detail(query, anchor).ok()?;
-    if let Some(presence) = detail.presence {
-        return Some(format!(
-            "Discord: {}",
-            discord_presence_text(&detail, presence)
-        ));
-    }
-    let mut line = format!(
-        "Discord message from {} in channel {}",
-        detail.author, detail.channel
-    );
-    if detail.still_speaking {
-        line.push_str(" (still speaking)");
-    }
-    let first = detail.versions.first()?;
-    if let Some(preview) = clip_line(&first.content, NEWS_PREVIEW_CHARS) {
-        line.push_str(": ");
-        line.push_str(&preview);
-    }
-    match detail.attachments {
-        0 => {}
-        1 => line.push_str(" (1 attachment)"),
-        n => line.push_str(&format!(" ({n} attachments)")),
-    }
-    if detail.versions.len() > 1 {
-        line.push_str(&format!(
-            " ({} versions with the same time)",
-            detail.versions.len()
-        ));
-    }
-    Some(line)
 }
 
 /// Discord messages in the order they were written, said or seen: by when
@@ -3589,7 +3563,10 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
     for message in native_teams_messages(query)? {
         view.insert(AttentionEvent::Teams(message));
     }
-    for message in native_discord_messages(query) {
+    // Who may address the reader: its own identities and its groups.
+    let mut addressees = own_identities.clone();
+    addressees.extend(persona_groups(query.relations, persona_id)?);
+    for message in native_discord_messages(query, &addressees) {
         view.insert(AttentionEvent::Discord(message));
     }
 
@@ -3598,8 +3575,6 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
     // without an assignment, are addressed by `@mention` alone, and writing
     // on a goal subscribes nobody to it.
     let assignment_keys = persona_keys(query, persona_id)?;
-    let mut addressees = own_identities.clone();
-    addressees.extend(persona_groups(query.relations, persona_id)?);
 
     let mut assigned_goals = HashSet::new();
     for id in find!(id: Id, pattern!(query.compass, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
@@ -3899,113 +3874,83 @@ async fn cmd_show(
     .await
 }
 
-/// Render only the *novel* content behind the news — new peer messages, Mail
-/// and Teams messages, plus newly-arrived roster members — so a woken watcher gets what changed,
-/// not a full re-dump of the snapshot. The `News:` reason lines are rendered by
-/// the caller; this fills in the detail worth reading.
-fn render_news_detail(
+/// The [`NewsForm::Report`] form of one event: its `News:` line, carrying
+/// everything there is to read of it, so that each item is printed once. A
+/// message is `new message [<short id>] from <sender>: <body>` (the id is
+/// what `message ack` takes); Mail its sender and subject; Teams its author
+/// and text; a Discord message every distinct version at its newest time
+/// ([`discord_news_text`]); every other event its [`news_line`].
+///
+/// Bodies are read strictly, as the stream form reads them: a body not yet
+/// here withholds the report rather than shortening it.
+fn news_report_entry(
     query: &OrientQuery<'_>,
-    pending: &AttentionView,
+    event: &AttentionEvent,
     persona_id: Id,
+    mail: &mut Option<BTreeMap<Id, MailSummary>>,
 ) -> Result<String> {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    let new_msgs: Vec<Id> = pending
-        .events
-        .values()
-        .filter_map(|event| match event {
-            AttentionEvent::Message(id) => Some(*id),
-            _ => None,
-        })
-        .collect();
-    if !new_msgs.is_empty() {
-        let rows = native_message_rows(query);
-        writeln!(out, "\nNew messages:").unwrap();
-        for id in &new_msgs {
-            if let Some(row) = rows.iter().find(|r| r.id == *id) {
-                let from = read_native_person_label(query, row.from)?;
-                let body = read_utf8(&query.payloads, row.body, "Message body")?;
-                writeln!(out, "- {from}: {body}").unwrap();
+    Ok(match event {
+        AttentionEvent::Message(id) => {
+            let id = *id;
+            let row = find!(
+                (from: Id, body: message::TextHandle),
+                pattern!(query.messages, [{ id @
+                    local_message::from: ?from,
+                    local_message::body: ?body,
+                }])
+            )
+            .next();
+            match row {
+                Some((from, body)) => {
+                    let from = read_native_person_label(query, from)?;
+                    let body = read_utf8(&query.payloads, body, "Message body")?;
+                    format!(
+                        "News: new message [{}] from {from}: {body}\n",
+                        fmt_short_id(id)
+                    )
+                }
+                None => format!("News: {}\n", news_line(query, event)),
             }
         }
-    }
-    let new_mail: Vec<Id> = pending
-        .events
-        .values()
-        .filter_map(|event| match event {
-            AttentionEvent::Mail(id) => Some(*id),
-            _ => None,
-        })
-        .collect();
-    if !new_mail.is_empty() {
-        let summaries = native_unread_mail(query, persona_id)?;
-        writeln!(out, "\nNew mail:").unwrap();
-        for wire in &new_mail {
-            let summary = summaries.get(wire).ok_or_else(|| {
-                anyhow!("new Mail wire {} vanished from current view", fmt_id(*wire))
-            })?;
+        AttentionEvent::Mail(wire) => {
+            if mail.is_none() {
+                *mail = Some(native_unread_mail(query, persona_id)?);
+            }
+            let summary = mail
+                .as_ref()
+                .and_then(|summaries| summaries.get(wire))
+                .ok_or_else(|| {
+                    anyhow!("new Mail wire {} vanished from current view", fmt_id(*wire))
+                })?;
             let from = summary
                 .from
                 .map(|handle| read_utf8(&query.payloads, handle, "Mail From"))
                 .transpose()?
                 .unwrap_or_else(|| "(no From)".to_owned());
             let subject = read_utf8(&query.payloads, summary.subject, "Mail subject")?;
-            writeln!(out, "- [{}] {} — {}", fmt_id(*wire), from, subject,).unwrap();
+            format!("News: {} from {from} — {subject}\n", event.reason())
         }
-    }
-    let new_teams: Vec<Id> = pending
-        .events
-        .values()
-        .filter_map(|event| match event {
-            AttentionEvent::Teams(id) => Some(*id),
-            _ => None,
-        })
-        .collect();
-    if !new_teams.is_empty() {
-        writeln!(out, "\nNew Teams messages:").unwrap();
-        for message in &new_teams {
+        AttentionEvent::Teams(message) => {
             let (author, content) = teams_message_detail(query, *message)?;
-            writeln!(out, "- {author}: {content}").unwrap();
+            format!("News: new Teams message from {author}: {content}\n")
         }
-    }
-    let new_discord = discord_in_order(
-        query,
-        pending.events.values().filter_map(|event| match event {
-            AttentionEvent::Discord(id) => Some(*id),
-            _ => None,
-        }),
-    );
-    if !new_discord.is_empty() {
-        writeln!(out, "\nNew Discord messages:").unwrap();
-        for message in &new_discord {
-            let detail = discord_message_detail(query, *message)?;
+        AttentionEvent::Discord(anchor) => {
+            let detail = discord_message_detail(query, *anchor)?;
             // Distinct versions that print alike (they differ in a Discord
             // attachment id, say) are counted, and printed once.
             let mut printed = BTreeSet::new();
+            let mut text = String::new();
             for version in &detail.versions {
-                let text = discord_version_text(&detail, version);
-                if printed.insert(text.clone()) {
-                    out.push_str(&text);
+                let line = discord_news_text(&detail, version);
+                if printed.insert(line.clone()) {
+                    text.push_str("News: ");
+                    text.push_str(&line);
                 }
             }
+            text
         }
-    }
-    let new_people: Vec<Id> = pending
-        .events
-        .values()
-        .filter_map(|event| match event {
-            AttentionEvent::StatusWindow(id) if *id != persona_id => Some(*id),
-            _ => None,
-        })
-        .collect();
-    if !new_people.is_empty() {
-        writeln!(out, "\nNew status window(s):").unwrap();
-        for id in &new_people {
-            writeln!(out, "- {}", read_native_person_label(query, *id)?).unwrap();
-        }
-    }
-    Ok(out)
+        _ => format!("News: {}\n", news_line(query, event)),
+    })
 }
 
 /// Longest preview one `News:` line may carry from a stored body.
@@ -4121,8 +4066,9 @@ fn previous_goal_status(query: &OrientQuery<'_>, goal: Id, current: Id) -> Optio
 /// the candidate set. It therefore adds nothing to the per-goal scan
 /// `load_attention_view` already performs on every call.
 ///
-/// Mail and Teams keep their reason lines: `render_news_detail` already prints
-/// sender, subject and body for those beneath the reasons.
+/// Messages, Mail, Teams and Discord are printed whole by
+/// [`news_report_entry`], which falls back to this line only for a message
+/// whose envelope it cannot find.
 fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
     match event {
         AttentionEvent::Message(id) => {
@@ -4209,11 +4155,8 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
             Ok(label) => format!("new status window {label}"),
             Err(_) => event.reason(),
         },
-        AttentionEvent::Discord(message) => match discord_news_line(query, *message) {
-            Some(line) => line,
-            None => event.reason(),
-        },
-        AttentionEvent::Mail(_)
+        AttentionEvent::Discord(_)
+        | AttentionEvent::Mail(_)
         | AttentionEvent::Teams(_)
         | AttentionEvent::Health { .. }
         | AttentionEvent::ServiceFailure { .. } => event.reason(),
@@ -4362,8 +4305,6 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
     if pending.is_empty() {
         return Ok(News::Quiet);
     }
-    use std::fmt::Write as _;
-
     // Discord's news comes after the rest, in the order it happened: the
     // other events are by id, which says nothing of time.
     let discord = discord_in_order(
@@ -4381,10 +4322,10 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
         .chain(discord.into_iter().map(AttentionEvent::Discord))
         .collect();
     let mut text = String::new();
+    let mut mail = None;
     for event in &ordered {
-        writeln!(text, "News: {}", news_line(query, event)).unwrap();
+        text.push_str(&news_report_entry(query, event, persona_id, &mut mail)?);
     }
-    text.push_str(&render_news_detail(query, &pending, persona_id)?);
     let stream = render_news_stream(query, &ordered, persona_id)?;
     Ok(News::Report {
         text,
@@ -5596,7 +5537,7 @@ async fn cmd_observe(
         return Ok(());
     }
     if outcome.news_printed {
-        // Terse path: the News: reasons and the novel detail were already
+        // Terse path: the News: lines, each item whole, were already
         // printed inside the wait loop — don't re-dump the full snapshot.
         return Ok(());
     }
@@ -9660,7 +9601,7 @@ mod tests {
     }
 
     /// Discord is read like Teams: a message somebody else wrote is news with
-    /// its author, channel, first line and attachments; the bot's own message
+    /// its author, channel, whole text and attachments, once; the bot's own message
     /// and a system notice are not; and a presented message never repeats,
     /// not even once edited.
     #[test]
@@ -9741,20 +9682,15 @@ mod tests {
                 panic!("a Discord message from somebody else is news");
             };
             assert_eq!(events.len(), 1, "{text}");
-            assert!(
-                text.contains(&format!(
-                    "News: Discord message from Ada in channel {channel}: look at this… (1 attachment)"
-                )),
-                "{text}"
-            );
-            // The attachment is named by the handle of its stored bytes.
+            // The message once, whole: its author, channel, every line, and
+            // the attachment named by the handle of its stored bytes.
             let photo: Blob<blobencodings::RawBytes> = b"image".to_vec().to_blob();
             let photo = crate::files::content_hash_hex(photo.get_handle());
-            assert!(
-                text.contains(&format!(
-                    "New Discord messages:\n- Ada in channel {channel}: look at this\nsecond line\n  attachment photo.png: files get files:{photo} @-"
-                )),
-                "{text}"
+            assert_eq!(
+                text,
+                &format!(
+                    "News: Discord message from Ada in channel {channel}: look at this\nsecond line\n  attachment photo.png: files get files:{photo} @-\n"
+                ),
             );
             assert!(!text.contains("my own reply"), "{text}");
             // The stream form: the one item on one line, the body whole, the
@@ -9864,19 +9800,12 @@ mod tests {
                 panic!("a sentence heard while speaking is news");
             };
             assert_eq!(events.len(), 1, "{text}");
-            assert!(
-                text.contains(&format!(
+            assert_eq!(
+                text,
+                &format!(
                     "News: Discord message from {speaker} in channel {channel} (still speaking): \
-                     Hello there."
-                )),
-                "{text}"
-            );
-            assert!(
-                text.contains(&format!(
-                    "New Discord messages:\n- {speaker} in channel {channel} (still speaking): \
                      Hello there.\n"
-                )),
-                "{text}"
+                ),
             );
             let mut output = Vec::new();
             apply_news_to_writer(
@@ -9917,12 +9846,12 @@ mod tests {
                 panic!("the utterance is news of its own");
             };
             assert_eq!(events.len(), 1, "{text}");
-            assert!(
-                text.contains(&format!(
-                    "New Discord messages:\n- {speaker} in channel {channel}: Hello there. How \
+            assert_eq!(
+                text,
+                &format!(
+                    "News: Discord message from {speaker} in channel {channel}: Hello there. How \
                      are you?\n"
-                )),
-                "{text}"
+                ),
             );
             assert!(!text.contains("still speaking"), "{text}");
             pile.close().unwrap();
@@ -9989,18 +9918,11 @@ mod tests {
                 panic!("a Discord message from somebody else is news");
             };
             assert_eq!(events.len(), 1, "{text}");
-            assert!(
-                text.contains(&format!(
-                    "News: Discord message from Ada in channel {channel}: another wording \
-                     (2 versions with the same time)"
-                )),
-                "{text}"
-            );
             for wording in ["another wording", "one wording"] {
                 assert!(
                     text.contains(&format!(
-                        "- Ada in channel {channel} (one of 2 versions with the same time): \
-                         {wording}"
+                        "News: Discord message from Ada in channel {channel} (one of 2 versions \
+                         with the same time): {wording}\n"
                     )),
                     "{text}"
                 );
@@ -10078,15 +10000,11 @@ mod tests {
                 panic!("Discord messages from somebody else are news");
             };
             assert_eq!(events.len(), 2, "{text}");
-            let line = format!(
-                "News: Discord message from Ada in channel {channel}: the report \
-                 (2 attachments) (2 versions with the same time)\n"
-            );
-            assert_eq!(text.matches(&line).count(), 2, "{text}");
             let version = |size: u64| {
                 format!(
-                    "- Ada in channel {channel} (one of 2 versions with the same time): \
-                     the report\n  attachment report.bin: {size} bytes, too large to store\n"
+                    "News: Discord message from Ada in channel {channel} (one of 2 versions \
+                     with the same time): the report\n  attachment report.bin: {size} bytes, \
+                     too large to store\n"
                 )
             };
             assert_eq!(text.matches(&version(31_000_000)).count(), 1, "{text}");
@@ -10642,18 +10560,8 @@ mod tests {
             ],
             "{text}"
         );
-        assert!(
-            text.contains(&format!(
-                "\nNew Discord messages:\n\
-                 - Ada joined the voice channel {voice} at 2026-09-26T20:41:40 UTC\n\
-                 - Ada in channel {voice}: can you hear me?\n"
-            )),
-            "{text}"
-        );
-        assert!(
-            !text.contains(&format!("- Ada in channel {voice}: \n")),
-            "{text}"
-        );
+        // Each once: the lines are the whole report.
+        assert_eq!(text.lines().count(), 2, "{text}");
 
         // Leaving is news of its own; what was presented is not news again.
         news.presence(Presence::Left, 1_790_455_302_000);
@@ -10675,9 +10583,8 @@ mod tests {
     }
 
     /// A member's comings and goings that are news together are reported in
-    /// the order they happened, in the `News:` lines and in the detail
-    /// beneath them: in another order they say the opposite of whether the
-    /// member is in the channel.
+    /// the order they happened: in another order they say the opposite of
+    /// whether the member is in the channel.
     #[test]
     fn voice_joins_and_leaves_are_news_in_the_order_they_happened() {
         use crate::discord::Presence;
@@ -10706,6 +10613,219 @@ mod tests {
         };
         let happened = ["left", "joined", "left", "joined", "left"];
         assert_eq!(verbs("News: Discord: Ada "), happened, "{text}");
-        assert_eq!(verbs("- Ada "), happened, "{text}");
+        assert_eq!(text.lines().count(), happened.len(), "{text}");
+    }
+
+    /// The windows of [`discord_addressed_news`], and their Relations.
+    struct WindowCast {
+        relations: Fragment,
+        kit: Id,
+        nell: Id,
+        oz: Id,
+    }
+
+    fn window_cast() -> WindowCast {
+        let (kit, nell, oz) = (id(130), id(131), id(132));
+        let mut relations = Fragment::empty();
+        for (person, label) in [(kit, "kit"), (nell, "nell"), (oz, "oz")] {
+            relations += relations::person_fragment(
+                person,
+                relations::ProfileInput {
+                    label: label.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0;
+        }
+        WindowCast {
+            relations,
+            kit,
+            nell,
+            oz,
+        }
+    }
+
+    /// #general and one window's own channel, both heard by intake.
+    const GENERAL_CHANNEL: &str = "100000000000000210";
+    const OWN_CHANNEL: &str = "100000000000000220";
+
+    /// Ada writes "for everybody" in #general (when `general` is set) and
+    /// "for its window" in [`OWN_CHANNEL`], with `addressing` in the
+    /// Discord collection beside them. For each reader: whether a watcher
+    /// is woken, and the report it prints.
+    fn discord_addressed_news(
+        cast: WindowCast,
+        addressing: Fragment,
+        general: bool,
+        readers: &[Id],
+    ) -> Vec<(bool, String)> {
+        crate::test_support::clear_ambient_environment();
+        runtime().unwrap().block_on(async {
+            use crate::discord::operations::observed_fragment;
+            use serde_json::json;
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, cast.relations)
+                .unwrap();
+            let message = |id: &str, channel: &str, content: &str| {
+                observed_fragment(
+                    json!({
+                        "id": id, "channel_id": channel, "guild_id": "100000000000000300",
+                        "type": 0, "content": content,
+                        "author": {
+                            "id": "100000000000000400",
+                            "username": "ada",
+                            "global_name": "Ada"
+                        },
+                        "timestamp": "2026-10-24T08:00:00Z", "edited_timestamp": null,
+                        "attachments": [],
+                    }),
+                    |_, _| Ok(Vec::new()),
+                )
+                .unwrap()
+            };
+            let mut facts = crate::discord::bot_account_fragment("100000000000000900").unwrap();
+            for channel in [GENERAL_CHANNEL, OWN_CHANNEL] {
+                facts += crate::discord::intake_fragment(channel, 100000000000000000).unwrap();
+            }
+            if general {
+                facts += message("1431000000000000001", GENERAL_CHANNEL, "for everybody");
+            }
+            facts += message("1431000000000000002", OWN_CHANNEL, "for its window");
+            facts += addressing;
+            pile.commit(sources.discord.source, &fixture.signer, facts)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let mut seen = Vec::new();
+            for reader_id in readers {
+                let news = read(&mut pile, &observation.snapshot, |reader| {
+                    let query = observation.query(reader);
+                    prepare_news_once(&query, *reader_id)
+                })
+                .await
+                .unwrap();
+                seen.push(match news {
+                    News::Report { text, .. } => (true, text),
+                    News::Quiet => (false, String::new()),
+                });
+            }
+            pile.close().unwrap();
+            seen
+        })
+    }
+
+    fn addressing(addressees: &[Id], replaces: &[Id]) -> (Fragment, Id) {
+        crate::discord::channel_addressing_fragment(
+            OWN_CHANNEL,
+            addressees.iter().copied(),
+            replaces.iter().copied(),
+        )
+        .unwrap()
+    }
+
+    /// A Discord channel nobody in particular is addressed to is for every
+    /// window, as every channel was before channels could be addressed.
+    #[test]
+    fn a_discord_channel_addressed_to_nobody_wakes_every_persona() {
+        let cast = window_cast();
+        let readers = [cast.kit, cast.nell, cast.oz];
+        for (woken, text) in discord_addressed_news(cast, Fragment::empty(), true, &readers) {
+            assert!(woken, "{text}");
+            assert!(text.contains("for everybody"), "{text}");
+            assert!(text.contains("for its window"), "{text}");
+        }
+    }
+
+    /// A channel addressed to one persona wakes only that persona's watcher;
+    /// what is written in #general still wakes every window, and the others
+    /// are told nothing of that channel (`orient wait` stays quiet for
+    /// them when nothing else is new).
+    #[test]
+    fn a_discord_channel_addressed_to_one_persona_wakes_only_it() {
+        let cast = window_cast();
+        let readers = [cast.kit, cast.nell, cast.oz];
+        let (only_cc, _) = addressing(&[cast.kit], &[]);
+        let seen = discord_addressed_news(cast, only_cc.clone(), true, &readers);
+        assert!(seen[0].1.contains("for its window"), "{}", seen[0].1);
+        assert!(seen[0].1.contains("for everybody"), "{}", seen[0].1);
+        for (woken, text) in &seen[1..] {
+            assert!(woken, "#general is for everybody");
+            assert!(text.contains("for everybody"), "{text}");
+            assert!(!text.contains("for its window"), "{text}");
+        }
+
+        let cast = window_cast();
+        let readers = [cast.kit, cast.nell, cast.oz];
+        let seen = discord_addressed_news(cast, only_cc, false, &readers);
+        assert!(seen[0].0, "its own channel wakes it");
+        assert_eq!(
+            seen[0].1,
+            format!("News: Discord message from Ada in channel {OWN_CHANNEL}: for its window\n")
+        );
+        assert_eq!(seen[1], (false, String::new()));
+        assert_eq!(seen[2], (false, String::new()));
+    }
+
+    /// A channel addressed to two personas is for both of them, and nobody
+    /// else.
+    #[test]
+    fn a_discord_channel_addressed_to_two_personas_wakes_both() {
+        let cast = window_cast();
+        let readers = [cast.kit, cast.nell, cast.oz];
+        let (both, _) = addressing(&[cast.kit, cast.nell], &[]);
+        let seen = discord_addressed_news(cast, both, false, &readers);
+        assert!(
+            seen[0].0 && seen[0].1.contains("for its window"),
+            "{}",
+            seen[0].1
+        );
+        assert!(
+            seen[1].0 && seen[1].1.contains("for its window"),
+            "{}",
+            seen[1].1
+        );
+        assert_eq!(seen[2], (false, String::new()));
+    }
+
+    /// An addressing replaces the ones of its channel it names: the channel
+    /// readdressed to another persona is that persona's alone, and addressed to
+    /// nobody in particular it is everybody's again. Two addressings made
+    /// without seeing each other both stand, and the channel is for
+    /// everybody either names.
+    #[test]
+    fn a_discord_channel_is_addressed_by_the_addressings_nothing_replaces() {
+        let cast = window_cast();
+        let readers = [cast.kit, cast.nell, cast.oz];
+        let (first, first_id) = addressing(&[cast.kit], &[]);
+        let (second, second_id) = addressing(&[cast.nell], &[first_id]);
+        let seen = discord_addressed_news(cast, first.clone() + second.clone(), false, &readers);
+        assert_eq!(seen[0], (false, String::new()));
+        assert!(seen[1].0, "readdressed to nell");
+        assert_eq!(seen[2], (false, String::new()));
+
+        let cast = window_cast();
+        let readers = [cast.kit, cast.nell, cast.oz];
+        let (cleared, _) = addressing(&[], &[second_id]);
+        let seen = discord_addressed_news(
+            cast,
+            first.clone() + second.clone() + cleared,
+            false,
+            &readers,
+        );
+        assert!(seen.iter().all(|(woken, _)| *woken), "{seen:?}");
+
+        let cast = window_cast();
+        let readers = [cast.kit, cast.nell, cast.oz];
+        let (concurrent, _) = addressing(&[cast.oz], &[first_id]);
+        let seen = discord_addressed_news(cast, first + second + concurrent, false, &readers);
+        assert_eq!(seen[0], (false, String::new()));
+        assert!(seen[1].0 && seen[2].0, "{seen:?}");
     }
 }

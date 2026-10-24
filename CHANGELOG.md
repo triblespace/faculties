@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **A Discord channel can be addressed to the people it is for.** `discord
+  channels address <CHANNEL_ID> <PERSON>...` records who a channel is for in
+  the discord collection: a channel addressing (tag
+  `831CE57DCF294A151D5817E337C1448D`) names the channel and every addressee
+  (`discord::addressee`, attribute `4C071CB746F5D24E479CDC7783E41CDC`, a
+  Relations person anchor), and replaces the channel's earlier addressings
+  through `metadata::supersedes`. `--nobody` addresses the channel to nobody
+  in particular again; `discord channels addressed` prints them all. Orient
+  then reports a message (or a sentence heard) in an addressed channel only
+  to the people its current addressings name, or groups they are in, and a
+  message in any other channel to everybody, as before. Readers without this
+  change ignore the record and keep waking everybody.
+
+- **Orient prints each news item once.** A woken watcher's report no longer
+  repeats a message under a `New messages:` (or `New mail:`, `New Teams
+  messages:`, `New Discord messages:`, `New status window(s):`) section after
+  its `News:` line: the `News:` line carries it whole. A Message-faculty
+  message is `News: new message [<short id>] from <sender>: <body>`, Mail
+  `News: new mail [<id>] from <sender> — <subject>`, Teams `News: new Teams
+  message from <author>: <text>`, and a Discord message `News: Discord message
+  from <author> in channel <id>: <whole text>` with an indented line per
+  attachment. The stream form is unchanged.
+
 - **Secrets versions name no collection.** A new version's resource descriptor
   no longer carries `resource_collection` (anchor
   `62E951EC3ABB7F9B7F123BB7DE2F9F99`, which core retired): the grants over R

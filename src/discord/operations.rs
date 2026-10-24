@@ -637,6 +637,103 @@ impl Discord {
         }
         list_channels(&self.token()?, guild)
     }
+    /// Address the channel `channel_id` to the people `people` names (Relations
+    /// labels, aliases or ids), the whole set: it replaces whoever the
+    /// channel was addressed to. No people: the channel is addressed to
+    /// nobody in particular again. Nothing is published when the channel is
+    /// already addressed to exactly them.
+    pub fn address_channel(&self, channel_id: &str, people: &[String]) -> Result<AddressedChannel> {
+        discord_model::validate_snowflake(channel_id).context("invalid Discord channel id")?;
+        self.preflight_write()?;
+        let storage = self.storage();
+        storage.with_session(|session| {
+            let (relations, reader) = storage.relations(session)?;
+            let mut addressees = BTreeMap::new();
+            for person in people {
+                let id = crate::relations::resolve_person(&reader, &relations, person, false)?
+                    .require_unique("person", person)?;
+                addressees.insert(id, person_label(&reader, &relations, id));
+            }
+            let handle: discord_model::TextHandle = channel_id.to_owned().to_blob().get_handle();
+            let before = discord_model::channel_addressing(&session.facts)
+                .remove(&handle)
+                .unwrap_or_default();
+            let wanted: BTreeSet<Id> = addressees.keys().copied().collect();
+            let settled = match before.current.len() {
+                0 => wanted.is_empty(),
+                1 => before.addressees == wanted,
+                _ => false,
+            };
+            let mut addressing = None;
+            if !settled {
+                let (fragment, id) = discord_model::channel_addressing_fragment(
+                    channel_id,
+                    wanted.iter().copied(),
+                    before.current.iter().copied(),
+                )?;
+                let whom = if addressees.is_empty() {
+                    "nobody in particular".to_owned()
+                } else {
+                    addressees.values().cloned().collect::<Vec<_>>().join(", ")
+                };
+                session.commit(
+                    fragment,
+                    format!("discord: address channel {channel_id} to {whom}"),
+                )?;
+                addressing = Some(id);
+            }
+            Ok(AddressedChannel {
+                channel_id: channel_id.to_owned(),
+                published: addressing,
+                addressees: addressees.into_iter().collect(),
+            })
+        })
+    }
+    /// Every addressed channel and who it is addressed to now, by channel id.
+    pub fn channel_addressing(&self) -> Result<Vec<AddressedChannel>> {
+        let storage = self.storage();
+        storage.with_session(|session| {
+            let (relations, reader) = storage.relations(session)?;
+            let mut channels = Vec::new();
+            for (handle, addressing) in discord_model::channel_addressing(&session.facts) {
+                channels.push(AddressedChannel {
+                    channel_id: discord_model::read_text(
+                        &session.reader,
+                        handle,
+                        "Discord channel id",
+                    )?,
+                    published: None,
+                    addressees: addressing
+                        .addressees
+                        .into_iter()
+                        .map(|id| (id, person_label(&reader, &relations, id)))
+                        .collect(),
+                });
+            }
+            channels.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
+            Ok(channels)
+        })
+    }
+}
+
+/// Who a channel is addressed to ([`Discord::address_channel`],
+/// [`Discord::channel_addressing`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressedChannel {
+    pub channel_id: String,
+    /// The addressing this call published, if it had to publish one.
+    pub published: Option<Id>,
+    /// Every addressee, with the label Relations knows them by (their id
+    /// when it knows none).
+    pub addressees: Vec<(Id, String)>,
+}
+
+/// A person's current Relations label, or their id when no profile reads.
+fn person_label(reader: &impl BlobStoreGet, relations: &FactArchive, person: Id) -> String {
+    crate::relations::current_profile(relations, person)
+        .ok()
+        .and_then(|profile| crate::relations::read_text(reader, profile.label).ok())
+        .unwrap_or_else(|| format!("{person:X}"))
 }
 
 #[derive(Clone, Copy)]
@@ -746,6 +843,39 @@ impl DiscordStorage<'_> {
             })();
             result
         })
+    }
+
+    /// The Relations collection as the session's store holds it, read only:
+    /// who a person label names. Read as maintenance left it, never
+    /// maintained here.
+    fn relations(
+        &self,
+        session: &mut DiscordSession<'_>,
+    ) -> Result<(FactArchive, AcquiringReader<FacultySnapshot>)> {
+        let source = self.storage.open_collection_read(
+            session.pile,
+            crate::schemas::relations::DEFAULT_SCOPE_ID,
+            session.signer.verifying_key(),
+            session.runtime,
+        )?;
+        let succinct = session
+            .pile
+            .attach::<SuccinctArchiveBlob>(source, ())
+            .context("register Relations Succinct collection")?;
+        let rank9 = session
+            .pile
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
+            .context("register Relations Rank9 collection")?;
+        let reader = AcquiringReader::new(
+            session
+                .pile
+                .snapshot()
+                .context("freeze Relations fact collection")?,
+            session.runtime.clone(),
+        );
+        let facts = crate::storage::acquire_facts(&reader, rank9)
+            .context("read Relations fact collection")?;
+        Ok((facts, reader))
     }
 
     fn with_session<T>(
@@ -1973,6 +2103,79 @@ mod tests {
             storage,
             collection: None,
         }
+    }
+
+    /// `discord channels address`: people are named as Relations names
+    /// them, the set given replaces the channel's addressees, saying the
+    /// same again publishes nothing, and nobody in particular is an
+    /// addressing too. A name Relations does not know publishes nothing.
+    #[test]
+    fn a_channel_is_addressed_to_people_by_their_relations_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = crate::storage::Storage::shared(pile.clone(), Some(key));
+        let relations = crate::relations::Relations::with_storage(storage.clone());
+        let person = |label: &str| {
+            relations
+                .add(
+                    crate::relations::ProfileInput {
+                        label: label.to_owned(),
+                        ..Default::default()
+                    },
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .person
+        };
+        let kit = person("kit");
+        let nell = person("nell");
+        let discord = Discord::with_storage(storage.clone());
+        let channel = "100000000000000220";
+
+        let first = discord
+            .address_channel(channel, &["kit".to_owned()])
+            .unwrap();
+        assert!(first.published.is_some());
+        assert_eq!(first.addressees, vec![(kit, "kit".to_owned())]);
+        let again = discord
+            .address_channel(channel, &["KIT".to_owned()])
+            .unwrap();
+        assert_eq!(again.published, None, "the same addressees again");
+
+        let mut both = vec![(kit, "kit".to_owned()), (nell, "nell".to_owned())];
+        both.sort();
+        let two = discord
+            .address_channel(channel, &["nell".to_owned(), "kit".to_owned()])
+            .unwrap();
+        assert!(two.published.is_some());
+        assert_eq!(two.addressees, both);
+        assert_eq!(
+            discord.channel_addressing().unwrap(),
+            vec![AddressedChannel {
+                channel_id: channel.to_owned(),
+                published: None,
+                addressees: both,
+            }]
+        );
+
+        assert!(discord
+            .address_channel(channel, &["nobody-by-this-name".to_owned()])
+            .is_err());
+        let nobody = discord.address_channel(channel, &[]).unwrap();
+        assert!(nobody.published.is_some());
+        assert_eq!(
+            discord.channel_addressing().unwrap(),
+            vec![AddressedChannel {
+                channel_id: channel.to_owned(),
+                published: None,
+                addressees: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            discord.address_channel(channel, &[]).unwrap().published,
+            None
+        );
     }
 
     #[test]

@@ -43,6 +43,11 @@
 //! words are an Archive content fact ([`discord::says`]), the shape Drive's
 //! Archive gives what she produced.
 //!
+//! Who a channel is addressed to is a record of the collection as well
+//! ([`discord::kind_channel_addressing`]): a channel of one window's own is
+//! addressed to that window's persona, so orient wakes only it for what is
+//! written there.
+//!
 //! Coverage says what is stored, not what was heard: `discord read` brings a
 //! channel's history in with the same observations `discord live`'s intake
 //! stores. Where a channel's live intake begins is therefore a fact of its
@@ -164,6 +169,13 @@ pub mod discord {
         /// Minted with `trible genid` on 2026-10-24:
         /// `C6F9E2CBF8D18BD5D9B8B5653CEBD3FB`.
         "C6F9E2CBF8D18BD5D9B8B5653CEBD3FB" as pub speech_cfg_scale: F64;
+        /// Somebody a channel is addressed to, on a channel addressing
+        /// ([`kind_channel_addressing`]): a person's Relations anchor, the
+        /// same id a Message-faculty message names as its recipient.
+        ///
+        /// Minted with `trible genid` on 2026-10-24:
+        /// `4C071CB746F5D24E479CDC7783E41CDC`.
+        "4C071CB746F5D24E479CDC7783E41CDC" as pub addressee: GenId;
     }
 
     /// Root id for describing the Discord protocol in metadata.
@@ -333,4 +345,18 @@ pub mod discord {
     /// `823A05C14355BC75564304B6E38CBD20`.
     #[allow(non_upper_case_globals)]
     pub const kind_say_failed: Id = id_hex!("823A05C14355BC75564304B6E38CBD20");
+    /// Tag for who a channel is addressed to: the [`channel`] and every
+    /// [`addressee`] of it, the whole set (a channel addressed to two people
+    /// is one addressing naming both). What is written in the channel is
+    /// for them: orient wakes only them for it, where a channel nobody is
+    /// addressed to wakes everybody. An addressing names the earlier ones
+    /// of its channel it replaces through `metadata::supersedes`, and the
+    /// channel is addressed to the addressees of those nothing replaces; one
+    /// with no addressee says the channel is addressed to nobody in
+    /// particular again (`discord channels address`).
+    ///
+    /// Minted with `trible genid` on 2026-10-24:
+    /// `831CE57DCF294A151D5817E337C1448D`.
+    #[allow(non_upper_case_globals)]
+    pub const kind_channel_addressing: Id = id_hex!("831CE57DCF294A151D5817E337C1448D");
 }
