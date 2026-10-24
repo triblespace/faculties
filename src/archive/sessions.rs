@@ -969,6 +969,42 @@ mod tests {
         let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
         live_then_quiet_converges(SessionSource::ClaudeCode, &steps, "live.jsonl");
 
+        // A compaction leaves msg_1 open on a dead branch: its result lands
+        // on the first live pass, and the passes still converge.
+        let compacted = [
+            format!(
+                "{}\n{call}\n{result}\n{}\n",
+                user("u", "null", "look"),
+                user("p", "null", "summary, then go on")
+            ),
+            format!("{answer}\n"),
+        ];
+        let compacted: Vec<&str> = compacted.iter().map(String::as_str).collect();
+        live_then_quiet_converges(SessionSource::ClaudeCode, &compacted, "compacted.jsonl");
+        let f = Fixture::new();
+        let mut options = f.options.clone();
+        options.roots[0].source = SessionSource::ClaudeCode;
+        let path = options.roots[0].path.join("compacted.jsonl");
+        fs::write(&path, compacted[0]).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(time(9000))
+            .unwrap();
+        let mut held = None;
+        f.archive
+            .ingest_sessions(&options, |event| {
+                if let SessionEvent::Imported { receipt, .. } = event {
+                    if let ImportSummary::ClaudeCode(summary) = &receipt.summary {
+                        held = Some(summary.stats.held_back_records);
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(held, Some(0));
+
         // The half-written line is held back, not a parse error, and the
         // unfinished message's tail is held back too.
         let f = Fixture::new();

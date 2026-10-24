@@ -36,7 +36,10 @@
 //! any result, so what was logged inside a message follows the whole message.
 //! A message is complete once the transcript shows a record of another
 //! message or a user prompt; until then what was logged inside it is held
-//! back, so a longer transcript only appends nodes. A tool result's node
+//! back, so a longer transcript only appends nodes. Only the branch a file
+//! wrote last is held back: a branch end written before it (the history
+//! before a compaction or a rewind) is one the file has moved on from, and
+//! its open message is complete. A tool result's node
 //! names the node of the call it answers. Each emitted fragment is one node
 //! with its fact and receipt. The session id annotates the receipts of the
 //! file's leaves only; a subagent's `.meta.json` annotates its transcript's
@@ -389,6 +392,8 @@ struct PreScan {
     /// Line numbers whose record is a further version of its uuid, with the
     /// key that version is planned under.
     versions: HashMap<usize, SourceKey>,
+    /// The last line holding each key's content.
+    last_lines: HashMap<SourceKey, usize>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -696,6 +701,20 @@ impl SourcePlan {
                 }
             }
         }
+        // The branch each unfinished file wrote last: of its branch ends, the
+        // one whose content it wrote most recently. Every other branch end of
+        // that file lies before the file's last record; the file has moved
+        // on from it (a compaction, a rewind), so its open message is done.
+        let mut trailing: HashSet<SourceKey> = HashSet::new();
+        for scan in scans.iter().filter(|scan| !scan.finished) {
+            let last = scan
+                .last_lines
+                .iter()
+                .map(|(key, line)| (canonical_key(key), *line))
+                .filter(|(class, _)| semantic.contains(class) && !children.contains_key(class))
+                .max_by_key(|(_, line)| *line);
+            trailing.extend(last.map(|(class, _)| class));
+        }
         let mut placer = Placer {
             observed: &observed,
             nodes: HashMap::with_capacity(order.len()),
@@ -758,14 +777,16 @@ impl SourcePlan {
             match children.get(key).copied().unwrap_or(0) {
                 // The branch ends here: what the open message deferred waits
                 // for the transcript to show the message complete, unless
-                // every file holding it is known finished.
+                // every file holding it is known finished or no file wrote
+                // this branch last.
                 0 => {
-                    let finished = std::iter::once(key).chain(&state.deferred).all(|class| {
-                        class_scans.get(class).is_some_and(|indices| {
-                            !indices.is_empty()
-                                && indices.iter().all(|&index| scans[index].finished)
-                        })
-                    });
+                    let finished = !trailing.contains(key)
+                        || std::iter::once(key).chain(&state.deferred).all(|class| {
+                            class_scans.get(class).is_some_and(|indices| {
+                                !indices.is_empty()
+                                    && indices.iter().all(|&index| scans[index].finished)
+                            })
+                        });
                     if finished {
                         placer.close(state)?;
                     } else {
@@ -1428,6 +1449,7 @@ fn prescan_reader<R: BufRead>(reader: &mut R, source_path: &Path) -> Result<PreS
             observation.replay_parents.extend(raw_parent);
         }
         if let Some(shape) = shape {
+            scan.last_lines.insert(key.clone(), line_number);
             let flow = match record.record_type.as_str() {
                 "assistant" => Flow::Act(
                     record
@@ -2987,6 +3009,66 @@ mod tests {
                 "the resumed session only appends to what was flushed"
             );
             assert_eq!(thread.len(), flushed_nodes.len() + 2);
+        }
+    }
+
+    #[test]
+    fn a_dead_branch_tail_lands_while_the_file_is_live() {
+        // History before a compaction ends inside msg_1, after its tool ran;
+        // the file then starts a new chain, which ends inside msg_2.
+        let dead = concat!(
+            r#"{"type":"user","sessionId":"s","uuid":"u","parentUuid":null,"message":{"role":"user","content":"look"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","uuid":"c","parentUuid":"u","message":{"id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"a"}}]}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"s","uuid":"r","parentUuid":"c","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"contents of a"}]}}"#,
+            "\n",
+        );
+        let live = format!(
+            "{dead}{}\n{}\n{}\n",
+            r#"{"type":"user","sessionId":"s","uuid":"u2","parentUuid":null,"message":{"role":"user","content":"summary, then go on"}}"#,
+            r#"{"type":"assistant","sessionId":"s","uuid":"c2","parentUuid":"u2","message":{"id":"msg_2","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file":"b"}}]}}"#,
+            r#"{"type":"user","sessionId":"s","uuid":"r2","parentUuid":"c2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"contents of b"}]}}"#,
+        );
+        let grown = format!(
+            "{live}{}\n",
+            r#"{"type":"user","sessionId":"s","uuid":"p","parentUuid":"r2","message":{"role":"user","content":"thanks"}}"#,
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("live.jsonl");
+        let project = |body: &str, finished_before: Option<SystemTime>| {
+            fs::write(&path, body).unwrap();
+            let mut fragment = Fragment::empty();
+            let summary = project_path_finished(&path, finished_before, |projected| {
+                fragment += projected.fragment;
+                Ok(())
+            })
+            .unwrap();
+            (summary, fragment)
+        };
+        let finished = Some(SystemTime::now() + std::time::Duration::from_secs(3600));
+        // Alone, the dead branch is the file's last branch: held.
+        let (alone, _) = project(dead, None);
+        assert_eq!(alone.stats.held_back_records, 1);
+        // Once the file has moved on, only the trailing branch is held.
+        let (summary, fragment) = project(&live, None);
+        assert_eq!(summary.stats.held_back_records, 1);
+        let call = block_with_payload(&fragment, r#"{"name":"Read","input":{"file":"a"}}"#);
+        let result = block_with_payload(&fragment, "contents of a");
+        assert!(exists!(pattern!(&fragment, [
+            { result @ schema::block::previous: call, schema::block::responds_to: call },
+        ])));
+        // Exactly where a finished import, and the grown file, put it.
+        let live_nodes = ids_with_tag(&fragment, schema::block::KIND);
+        for (body, finished_before) in [(live.as_str(), finished), (grown.as_str(), None)] {
+            let (later, later_fragment) = project(body, finished_before);
+            assert_eq!(later.stats.held_back_records, 0);
+            let later_nodes = ids_with_tag(&later_fragment, schema::block::KIND);
+            assert!(live_nodes.is_subset(&later_nodes));
+            assert_eq!(
+                later_nodes.len(),
+                live_nodes.len() + 1 + usize::from(finished_before.is_none())
+            );
         }
     }
 
