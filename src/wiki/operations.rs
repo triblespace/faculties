@@ -611,12 +611,24 @@ fn known_link_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
     all_selectors(facts)
 }
 
+/// The hex token of every `#link("<scheme>:...")` target in `content`, past
+/// an optional `kind:` qualifier. Only link targets are checked: a bare
+/// `<scheme>:` token in prose or code is not a link, and [`lint_fix`] has
+/// already turned every Markdown `[label](<scheme>:...)` into one.
+fn link_targets<'a>(content: &'a str, scheme: &str) -> Vec<&'a str> {
+    let re = regex::Regex::new(&format!(
+        r#"#link\("{scheme}:(?:[A-Za-z_][A-Za-z0-9_]*:)?([0-9A-Fa-f]+)""#
+    ))
+    .unwrap();
+    re.captures_iter(content)
+        .map(|captures| captures.get(1).expect("one capture group").as_str())
+        .collect()
+}
+
 fn validate_links<P: TriblePattern>(content: &str, facts: &P, allow_dangling: bool) -> Result<()> {
     let known = known_link_ids(facts);
     let mut failures = Vec::new();
-    let re = regex::Regex::new(r"wiki:(?:[A-Za-z_][A-Za-z0-9_]*:)?([0-9A-Fa-f]+)").unwrap();
-    for captures in re.captures_iter(content) {
-        let token = &captures[1];
+    for token in link_targets(content, "wiki") {
         if token.len() != 32 {
             failures.push(format!("truncated link wiki:{token}"));
         } else if let Some(id) = Id::from_hex(token) {
@@ -637,9 +649,7 @@ const TRUNCATED_DISPLAY_DIGITS: usize = 8;
 
 /// Check every `files:` link target against the Files catalog at write time.
 ///
-/// Only `#link("files:...")` targets are checked: a bare `files:` token in
-/// prose is not a link, and [`lint_fix`] has already turned every Markdown
-/// `[label](files:...)` into one. A complete content handle passes only when
+/// Only [`link_targets`] are checked. A complete content handle passes only when
 /// some file record carries it. That is catalog presence, not body residency:
 /// a catalog commit syncs as a record before its bytes, so a file whose bytes
 /// have not arrived is still a real file. A handle typed from a truncated display keeps its true prefix
@@ -654,9 +664,8 @@ fn validate_file_links<P: TriblePattern>(
     allow_dangling: bool,
 ) -> Result<()> {
     let mut failures = Vec::new();
-    let re = regex::Regex::new(r#"#link\("files:([0-9A-Fa-f]+)""#).unwrap();
-    for captures in re.captures_iter(content) {
-        let token = captures[1].to_ascii_lowercase();
+    for token in link_targets(content, "files") {
+        let token = token.to_ascii_lowercase();
         match (token.len(), files) {
             (32, _) => {}
             (64, _) if allow_dangling => {}
@@ -3494,6 +3503,24 @@ mod tests {
             &hash[..6]
         );
         validate_file_links(&content, Some(&files), false).unwrap();
+    }
+
+    #[test]
+    fn bare_wiki_tokens_in_prose_are_not_links_and_truncated_targets_are_refused() {
+        let wiki = TribleSet::new();
+        let prose = format!(
+            "prose that mentions wiki:abc, a bare wiki:{}\n```\nwiki:kind:abc\n```\n",
+            "ab".repeat(16)
+        );
+        validate_links(&prose, &wiki, false).unwrap();
+
+        let error = validate_links("#link(\"wiki:abc\")[short]", &wiki, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("truncated link wiki:abc"), "got: {error}");
+        let dangling = format!("#link(\"wiki:{}\")[gone]", "ab".repeat(16));
+        assert!(validate_links(&dangling, &wiki, false).is_err());
+        validate_links(&dangling, &wiki, true).unwrap();
     }
 
     #[test]
