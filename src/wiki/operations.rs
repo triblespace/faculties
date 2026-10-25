@@ -632,14 +632,20 @@ fn validate_links<P: TriblePattern>(content: &str, facts: &P, allow_dangling: bo
     }
 }
 
-/// Check every `files:` reference against the Files catalog at write time.
+/// A content handle is commonly shown cut to this many hex digits.
+const TRUNCATED_DISPLAY_DIGITS: usize = 8;
+
+/// Check every `files:` link target against the Files catalog at write time.
 ///
-/// A complete content handle passes only when some file record carries it.
-/// That is catalog presence, not body residency: a catalog commit syncs as a
-/// record before its bytes, so a file whose bytes have not arrived is still a
-/// real file. A handle typed from a truncated display keeps its true prefix
+/// Only `#link("files:...")` targets are checked: a bare `files:` token in
+/// prose is not a link, and [`lint_fix`] has already turned every Markdown
+/// `[label](files:...)` into one. A complete content handle passes only when
+/// some file record carries it. That is catalog presence, not body residency:
+/// a catalog commit syncs as a record before its bytes, so a file whose bytes
+/// have not arrived is still a real file. A handle typed from a truncated display keeps its true prefix
 /// and invents the rest, so the refusal names the one catalog handle sharing
-/// the longest prefix, when exactly one does, and never rewrites the link.
+/// the longest prefix, when exactly one does and the prefix is at least as
+/// long as a truncated display, and never rewrites the link.
 /// Entity ids stay direct, as in [`crate::files::resolve_reference`]. A short
 /// selector that survived [`lint_fix`] matched nothing or several things.
 fn validate_file_links<P: TriblePattern>(
@@ -648,7 +654,7 @@ fn validate_file_links<P: TriblePattern>(
     allow_dangling: bool,
 ) -> Result<()> {
     let mut failures = Vec::new();
-    let re = regex::Regex::new(r"\bfiles:([0-9A-Fa-f]+)").unwrap();
+    let re = regex::Regex::new(r#"#link\("files:([0-9A-Fa-f]+)""#).unwrap();
     for captures in re.captures_iter(content) {
         let token = captures[1].to_ascii_lowercase();
         match (token.len(), files) {
@@ -694,7 +700,7 @@ fn validate_file_links<P: TriblePattern>(
                     }
                 }
                 match nearest.len() {
-                    1 => failures.push(format!(
+                    1 if shared >= TRUNCATED_DISPLAY_DIGITS => failures.push(format!(
                         "files:{token} names no cataloged file; files:{} shares its first {shared} hex digits",
                         nearest.first().expect("one nearest handle")
                     )),
@@ -1944,7 +1950,7 @@ fn cmd_batch_export(storage: WikiStorage<'_>) -> Result<Vec<(Id, String)>> {
 }
 
 fn cmd_batch_import(storage: WikiStorage<'_>, imports: Vec<(Id, String)>) -> Result<()> {
-    let revisions = storage.views(&[], |view, _| {
+    let revisions = storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
         let mut revisions = Vec::new();
         for (revision_id, content) in &imports {
             let revision_id = *revision_id;
@@ -1957,6 +1963,8 @@ fn cmd_batch_import(storage: WikiStorage<'_>, imports: Vec<(Id, String)>) -> Res
             if content == &revision_content(&view.reader, head)? {
                 continue;
             }
+            validate_file_links(content, Some(files), false)
+                .with_context(|| format!("batch file {revision_id:x}"))?;
             revisions.push((
                 entry.clone(),
                 revision_title(&view.reader, head)?,
@@ -3443,7 +3451,8 @@ mod tests {
             .find(|digit| !first.starts_with(*digit) && !second_hash.starts_with(*digit))
             .unwrap();
         let stranger = format!("{lead}{}", "0".repeat(63));
-        let error = validate_file_links(&format!("files:{stranger}"), Some(&files), false)
+        let link = format!("#link(\"files:{stranger}\")[x]");
+        let error = validate_file_links(&link, Some(&files), false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3454,7 +3463,37 @@ mod tests {
             !error.contains(&first) && !error.contains(&second_hash),
             "got: {error}"
         );
-        assert!(validate_file_links(&format!("files:{stranger}"), Some(&files), true).is_ok());
+        assert!(validate_file_links(&link, Some(&files), true).is_ok());
+    }
+
+    #[test]
+    fn a_neighbour_sharing_less_than_a_truncated_display_is_not_named() {
+        let (files, hash) = cataloged(b"the only file", "only.txt");
+        let invented = invented_tail(&hash, 3);
+        let error = validate_file_links(
+            &format!("#link(\"files:{invented}\")[x]"),
+            Some(&files),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(&format!("files:{invented} names no cataloged file")),
+            "got: {error}"
+        );
+        assert!(!error.contains(&hash), "got: {error}");
+    }
+
+    #[test]
+    fn bare_files_tokens_in_prose_are_not_links() {
+        let (files, hash) = cataloged(b"prose", "prose.txt");
+        let content = format!(
+            "the files:export-not-a-perception URI, a bare files:{} and files:ab\n\
+             ```\nfiles:{}\n```\n",
+            invented_tail(&hash, 12),
+            &hash[..6]
+        );
+        validate_file_links(&content, Some(&files), false).unwrap();
     }
 
     #[test]
@@ -3500,5 +3539,39 @@ mod tests {
         assert!(error.contains("names no cataloged file"), "got: {error}");
         let after = storage.view(|view| Ok(view.clone())).unwrap();
         assert!(wiki_model::entries(&after.facts, &after.latest).is_empty());
+    }
+
+    #[test]
+    fn batch_import_refuses_an_uncataloged_handle_and_publishes_nothing() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let mut genesis = Fragment::empty();
+        let root = stage_revision(
+            storage,
+            &mut genesis,
+            None,
+            "root".to_owned(),
+            "body".to_owned(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        storage.publish(genesis).unwrap();
+
+        let invented = "ab".repeat(32);
+        let error = cmd_batch_import(
+            storage,
+            vec![(root, format!("#link(\"files:{invented}\")[ghost]"))],
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(&format!("batch file {root:x}")),
+            "got: {error}"
+        );
+        assert!(error.contains("names no cataloged file"), "got: {error}");
+        let after = storage.view(|view| Ok(view.clone())).unwrap();
+        let entry = wiki_model::entry(&after.facts, &after.latest, root).unwrap();
+        assert_eq!(entry.frontier.len(), 1);
+        assert_eq!(entry.frontier[0].id, root);
     }
 }
