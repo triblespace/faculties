@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+# Habit predicate: exit 0 (due) when a provider's weekly quota is under pace.
+#
+#   quota-pace --due --provider claude [--margin 5] [--cache-secs 900]
+#
+# Reads `quota show --json` (the latest recorded readings in the pile). Due when
+# some fresh weekly reading for the provider has used% more than --margin points
+# below elapsed%, and no fresh reading for it is nearly exhausted (>= 90% used,
+# e.g. the 5-hour window), since then more work cannot start anyway. A stale,
+# missing or unreadable reading is never due: no nudge from unknown utilization.
+# The answer is cached per provider for --cache-secs, because one read costs
+# seconds and habit conditions are evaluated often. Prints one line saying why.
+import json, os, shutil, subprocess, sys, time
+
+def arg(name, default):
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+provider = arg("--provider", None)
+if not provider:
+    print("quota-pace: --provider is required"); sys.exit(2)
+margin = float(arg("--margin", "5"))
+cache_secs = int(arg("--cache-secs", "900"))
+WEEK = 604800
+
+cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "quota-pace")
+cache = os.path.join(cache_dir, "%s.json" % provider)
+now = int(time.time())
+try:
+    with open(cache) as f:
+        c = json.load(f)
+    if now - int(c["at"]) < cache_secs and c.get("margin") == margin:
+        print("%s (cached %ds ago)" % (c["why"], now - int(c["at"])))
+        sys.exit(0 if c["due"] else 1)
+except Exception:
+    pass
+
+def decide():
+    quota = shutil.which("quota") or os.path.expanduser("~/.local/bin/quota")
+    if not os.access(quota, os.X_OK):
+        return False, "no quota command on this host"
+    try:
+        out = subprocess.run([quota, "show", "--json"], capture_output=True, text=True,
+                             timeout=180, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return False, "quota show failed: %s" % e
+    if out.returncode != 0:
+        return False, "quota show exited %d" % out.returncode
+    try:
+        view = json.loads(out.stdout)
+    except ValueError:
+        return False, "quota show printed no JSON"
+    fresh = [g for g in view.get("groups", [])
+             if g.get("provider") == provider and not g.get("stale")
+             and g.get("used_percent") is not None and g.get("elapsed_percent") is not None]
+    if not fresh:
+        return False, "%s: no fresh reading" % provider
+    full = [g for g in fresh if g["used_percent"] >= 90]
+    if full:
+        g = full[0]
+        return False, "%s: a %ds window is %.0f%% used" % (provider, g["window_secs"], g["used_percent"])
+    weekly = [g for g in fresh if g.get("window_secs") == WEEK]
+    if not weekly:
+        return False, "%s: no fresh weekly reading" % provider
+    behind = [g for g in weekly if g["elapsed_percent"] - g["used_percent"] > margin]
+    g = min(behind or weekly, key=lambda g: g["used_percent"] - g["elapsed_percent"])
+    why = "%s weekly: used %.0f%% with %.0f%% of the week elapsed (%s)" % (
+        provider, g["used_percent"], g["elapsed_percent"], "under pace" if behind else "not under pace")
+    return bool(behind), why
+
+due, why = decide()
+try:
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp = cache + ".tmp.%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump({"at": now, "due": due, "why": why, "margin": margin}, f)
+    os.replace(tmp, cache)
+except Exception:
+    pass
+print(why)
+sys.exit(0 if due else 1)
