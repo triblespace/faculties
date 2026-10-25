@@ -50,17 +50,6 @@ pub fn point_timestamp(interval: IntervalValue) -> Result<i128> {
     Ok(lower)
 }
 
-fn exactly_one<T>(event: Id, field: &str, values: Vec<T>) -> Result<T> {
-    let count = values.len();
-    if count != 1 {
-        bail!(
-            "Status event {} has {count} values for {field}; expected exactly one",
-            fmt_id(event)
-        );
-    }
-    Ok(values.into_iter().next().expect("one value"))
-}
-
 /// Build the canonical intrinsic record around an already-stored text handle.
 ///
 /// The stopped-world transform uses this same constructor as the live writer,
@@ -82,59 +71,6 @@ pub fn status_fragment(window: Id, text: &str, at: IntervalValue) -> Result<Frag
     let text: TextHandle = fragment.put(text.to_owned());
     fragment += status_record(window, text, at);
     Ok(fragment)
-}
-
-/// Project every tagged Status-shaped record, rejecting missing or
-/// multi-valued scalar fields rather than allowing query iteration order to
-/// choose one.
-///
-/// This is retained for explicit stopped-world validation. Ordinary readers
-/// use [`load_status_rows`] and ask only for the fields their projection needs.
-pub fn load_tagged_status_rows(facts: &TribleSet) -> Result<Vec<StatusRow>> {
-    let events: BTreeSet<Id> = find!(
-        event: Id,
-        pattern!(facts, [{ ?event @ metadata::tag: &KIND_STATUS_UPDATE }])
-    )
-    .collect();
-
-    events
-        .into_iter()
-        .map(|event| {
-            let window = exactly_one(
-                event,
-                "status::window",
-                find!(
-                    window: Id,
-                    pattern!(facts, [{ event @ status::window: ?window }])
-                )
-                .collect(),
-            )?;
-            let text = exactly_one(
-                event,
-                "status::text",
-                find!(
-                    text: TextHandle,
-                    pattern!(facts, [{ event @ status::text: ?text }])
-                )
-                .collect(),
-            )?;
-            let at = exactly_one(
-                event,
-                "metadata::created_at",
-                find!(
-                    at: IntervalValue,
-                    pattern!(facts, [{ event @ metadata::created_at: ?at }])
-                )
-                .collect(),
-            )?;
-            Ok(StatusRow {
-                event,
-                window,
-                text,
-                at,
-            })
-        })
-        .collect()
 }
 
 /// Project every complete Status event through one typed declarative query.
@@ -240,7 +176,7 @@ where
 }
 
 fn validate_structure(facts: &TribleSet) -> Result<Vec<StatusRow>> {
-    let rows = load_tagged_status_rows(facts)?;
+    let rows = load_status_rows(facts)?;
     let mut facts_by_entity = BTreeMap::<Id, usize>::new();
     for fact in facts {
         *facts_by_entity.entry(*fact.e()).or_default() += 1;
@@ -441,6 +377,32 @@ mod tests {
         outside += entity! { metadata::tag: &id(9) };
         validate_catalog(&reader, outside.facts()).unwrap();
         assert_eq!(load_status_rows(outside.facts()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn incomplete_events_are_skipped_and_repeated_fields_do_not_fail() {
+        let mut storage = MemoryRepo::default();
+        let text: TextHandle = storage.put("kept".to_owned()).unwrap();
+        let reader = storage.snapshot().unwrap();
+        let missing = ufoid();
+        let incomplete = entity! { &missing @
+            metadata::tag: &KIND_STATUS_UPDATE,
+            status::window: id(16),
+            metadata::created_at: at(70.0),
+        };
+        validate_catalog(&reader, incomplete.facts()).unwrap();
+        assert!(load_status_rows(incomplete.facts()).unwrap().is_empty());
+
+        let repeated = ufoid();
+        let doubled = entity! { &repeated @
+            metadata::tag: &KIND_STATUS_UPDATE,
+            status::window: id(17),
+            status::window: id(18),
+            status::text: text,
+            metadata::created_at: at(71.0),
+        };
+        validate_catalog(&reader, doubled.facts()).unwrap();
+        assert_eq!(load_status_rows(doubled.facts()).unwrap().len(), 2);
     }
 
     #[test]
