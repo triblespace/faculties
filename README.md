@@ -649,6 +649,7 @@ schemas describe exact arguments and effects.
 | `patience` | Explicit execution timeout-extension requests |
 | `planner` | Calendar events, recurrence windows, notes and resident iCalendar import |
 | `posture` | Disclosure candidates, coverage and policy over resident documents |
+| `quota` | Provider-reported subscription quota per window: record readings, show latest, pace and staleness |
 | `reason` | Reasoning notes and intended-action evidence |
 | `relations` | People, full profiles, groups and non-destructive identity verdicts |
 | `secrets` | Encrypted versions, resource-specific grants and explicit retrieval/maintenance |

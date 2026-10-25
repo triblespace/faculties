@@ -310,6 +310,8 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "patience_extend",
         "planner_list",
         "posture_scan",
+        "quota_record",
+        "quota_show",
         "reason_record",
         "relations_list",
         "secrets_list",

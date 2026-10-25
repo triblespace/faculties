@@ -23,6 +23,7 @@ pub mod orient;
 pub mod patience;
 pub mod planner;
 pub mod posture;
+pub mod quota;
 pub mod reason;
 pub mod relations;
 pub mod service_events;

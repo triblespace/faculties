@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- **Quota: provider-reported subscription usage in the pile.** A new `quota`
+  faculty and collection (scope `6B6C08A47B334284A56279D961255250`, name
+  `quota`) records one immutable observation per reading: provider (`claude`
+  `99B579DE6F864BDD2007148BCCDAC2A0` or `codex`
+  `A7FA0091FA5E1A63BB8F0449DB8676C0`), an opaque account digest, window
+  length, used percent as reported, reset time, observation time
+  (`metadata::created_at`) and host, tagged
+  `92B1A5113408368BF20912C6EBFAC6C1`. Attributes are anchored:
+  `quota::provider` `68C14DDE02C8C37E7A8E98AB9F6E413C`, `quota::account`
+  `23224C2886C3147A796D8B8B1BEEDA8A`, `quota::window`
+  `0B5B1040F92471A6EDB90588D56157C0` (NsDuration), `quota::used_percent`
+  `B2ECF7CAB731B61412B14E5C50202DEB` (F64), `quota::resets_at`
+  `4ACB274A8869FD5228142703EC039243`, `quota::host`
+  `905CE5FE9C7E6928F98B13DED7A26C71`. `quota record` writes one; `quota show
+  [--json]` prints the latest per provider, account and window with elapsed
+  share of the window, an under/on/over pace heuristic (5-point margin), the
+  age of the last recorded observation (STALE after 6 h, never dropped) and
+  the reset time in UTC and Europe/Berlin. MCP: `quota_record`, `quota_show`.
+
 - **A Discord channel can be addressed to the people it is for.** `discord
   channels address <CHANNEL_ID> <PERSON>...` records who a channel is for in
   the discord collection: a channel addressing (tag

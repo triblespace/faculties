@@ -92,6 +92,7 @@ pub mod planner;
 pub mod posture;
 pub mod posture_finding;
 pub mod posture_policy;
+pub mod quota;
 pub mod reason;
 pub mod relations;
 pub mod schemas;
