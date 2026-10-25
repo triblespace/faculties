@@ -281,6 +281,9 @@ enum ChatCommand {
 #[derive(Subcommand)]
 enum AttachmentsCommand {
     /// List attachments stored in the pile.
+    ///
+    /// Reads the resident archive without Graph or credential access unless
+    /// --sync is given.
     List {
         /// Filter by Teams chat id (external id).
         #[arg(long)]
@@ -294,8 +297,14 @@ enum AttachmentsCommand {
         /// Show newest attachments first.
         #[arg(long)]
         descending: bool,
+        /// Complete one Microsoft Graph delta round before reading.
+        #[arg(long)]
+        sync: bool,
     },
     /// Export a stored attachment to a local file.
+    ///
+    /// Reads the resident archive without Graph or credential access unless
+    /// --sync is given.
     Export {
         /// Attachment source id (as shown in attachments list).
         source_id: String,
@@ -313,7 +322,18 @@ enum AttachmentsCommand {
         /// Overwrite if the file already exists.
         #[arg(long)]
         overwrite: bool,
+        /// Complete one Microsoft Graph delta round before reading.
+        #[arg(long)]
+        sync: bool,
     },
+}
+
+fn archive_access(sync: bool) -> ArchiveAccess {
+    if sync {
+        ArchiveAccess::Synchronize
+    } else {
+        ArchiveAccess::Resident
+    }
 }
 
 fn host_activity<T>(result: Activity<T>) -> T {
@@ -414,6 +434,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 message_id,
                 limit,
                 descending,
+                sync,
             } => render::attachments(
                 &host_activity(operations.attachments_list(
                     AttachmentListOptions {
@@ -422,7 +443,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                         limit,
                         descending,
                     },
-                    ArchiveAccess::Synchronize,
+                    archive_access(sync),
                 )?),
                 out,
             ),
@@ -433,6 +454,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 out_dir,
                 filename,
                 overwrite,
+                sync,
             } => {
                 let value = host_activity(operations.attachment_get(
                     AttachmentGetOptions {
@@ -440,7 +462,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                         chat_id,
                         message_id,
                     },
-                    ArchiveAccess::Synchronize,
+                    archive_access(sync),
                 )?);
                 export_attachment(
                     value,
@@ -745,5 +767,33 @@ mod tests {
             "legacy",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn attachment_reads_are_resident_unless_sync_is_requested() {
+        let access = |args: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["teams", "--pile", TEST_PILE, "attachments"]
+                    .iter()
+                    .chain(args),
+            )
+            .unwrap();
+            match cli.command {
+                Some(CommandMode::Attachments {
+                    command: AttachmentsCommand::List { sync, .. },
+                })
+                | Some(CommandMode::Attachments {
+                    command: AttachmentsCommand::Export { sync, .. },
+                }) => archive_access(sync),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(access(&["list"]), ArchiveAccess::Resident);
+        assert_eq!(access(&["list", "--sync"]), ArchiveAccess::Synchronize);
+        assert_eq!(access(&["export", TEST_ID]), ArchiveAccess::Resident);
+        assert_eq!(
+            access(&["export", TEST_ID, "--sync"]),
+            ArchiveAccess::Synchronize
+        );
     }
 }
