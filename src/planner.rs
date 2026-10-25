@@ -350,50 +350,6 @@ pub fn cancellation_fragment(event_id: Id) -> Fragment {
     cancellation_record(event_id)
 }
 
-fn entity_facts(space: &TribleSet, entity: Id) -> TribleSet {
-    let mut facts = TribleSet::new();
-    for fact in space.iter().filter(|fact| fact.e() == &entity) {
-        facts.insert(fact);
-    }
-    facts
-}
-
-/// Immutable native definition facts asserted about one event.
-///
-/// Legacy event creation observations and an old scalar cancellation shadowed
-/// by the canonical cancellation assertion are excluded. This keeps exact
-/// iCalendar replay stable after an additive cutover.
-pub fn event_facts(space: &TribleSet, event: Id) -> TribleSet {
-    entity_facts(space, event)
-        .iter()
-        .filter(|fact| !legacy_event_fact_is_inert(space, event, fact))
-        .copied()
-        .collect()
-}
-
-fn has_canonical_cancellation(space: &TribleSet, event_id: Id) -> bool {
-    let expected = cancellation_record(event_id);
-    let present = expected.facts().iter().all(|fact| space.contains(fact));
-    present
-}
-
-fn legacy_event_fact_is_inert(space: &TribleSet, event_id: Id, fact: &Trible) -> bool {
-    if fact.a() == &metadata::created_at.id() {
-        return true;
-    }
-    if fact.a() != &event::status.id() || !has_canonical_cancellation(space, event_id) {
-        return false;
-    }
-    let status_count = find!(
-        value: TextHandle,
-        pattern!(space, [{ event_id @ event::status: ?value }])
-    )
-    .count();
-    status_count > 1
-        && *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>()
-            == text_handle(STATUS_CANCELLED)
-}
-
 /// IDs of all events inhabiting the typed Planner projection.
 pub fn event_ids<P>(space: &P) -> Vec<Id>
 where
