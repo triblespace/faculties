@@ -23,7 +23,7 @@ use hifitime::Epoch;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{is_missing_blob, BlobStoreGet};
 use triblespace::macros::{find, pattern};
 use triblespace::prelude::*;
 
@@ -337,43 +337,34 @@ pub fn interval_key(interval: Interval) -> i128 {
     lower.to_tai_duration().total_nanoseconds()
 }
 
-fn u256be_to_u64(entity: Id, field: &str, value: Inline<inlineencodings::U256BE>) -> Result<u64> {
+/// A value wider than u64 is not one this reader can model, so the field
+/// reads as absent rather than failing the read or wrapping.
+fn u256be_to_u64(value: Inline<inlineencodings::U256BE>) -> Option<u64> {
     let bytes = value.raw;
     if bytes[..24].iter().any(|byte| *byte != 0) {
-        bail!("Cognition entity {entity:x} has a {field} value larger than u64");
+        return None;
     }
     let mut lower = [0; 8];
     lower.copy_from_slice(&bytes[24..]);
-    Ok(u64::from_be_bytes(lower))
+    Some(u64::from_be_bytes(lower))
 }
 
-fn optional_u64(
-    entity: Id,
-    field: &str,
-    values: impl Iterator<Item = Inline<inlineencodings::U256BE>>,
-) -> Result<Option<u64>> {
-    values
-        .min()
-        .map(|value| u256be_to_u64(entity, field, value))
-        .transpose()
+fn optional_u64(values: impl Iterator<Item = Inline<inlineencodings::U256BE>>) -> Option<u64> {
+    values.min().and_then(u256be_to_u64)
 }
 
-fn optional_attempt(
-    entity: Id,
-    field: &str,
-    values: impl Iterator<Item = Inline<inlineencodings::U256BE>>,
-) -> Result<Option<u64>> {
-    optional_u64(entity, field, values)
-}
-
-fn read_text<Store>(reader: &Store, handle: TextHandle) -> Result<String>
+/// A blob that is not resident yet (a commit can sync before its blobs) reads
+/// as absent. A resident blob that fails to decode is damage and fails loudly.
+fn read_text<Store>(reader: &Store, handle: TextHandle) -> Result<Option<String>>
 where
     Store: BlobStoreGet + ?Sized,
 {
-    let view: View<str> = reader
-        .get(handle)
-        .with_context(|| format!("read UTF8String {}", hex::encode(handle.raw)))?;
-    Ok(view.to_string())
+    match reader.get::<View<str>, _>(handle) {
+        Ok(view) => Ok(Some(view.to_string())),
+        Err(error) if is_missing_blob(&error) => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("read UTF8String {}", hex::encode(handle.raw)))),
+    }
 }
 
 fn tagged_entities<P: TriblePattern>(space: &P, kind: Id) -> BTreeSet<Id> {
@@ -387,10 +378,10 @@ fn one_text<Store>(
 where
     Store: BlobStoreGet + ?Sized,
 {
-    values
-        .min()
-        .map(|handle| read_text(reader, handle))
-        .transpose()
+    Ok(match values.min() {
+        Some(handle) => read_text(reader, handle)?,
+        None => None,
+    })
 }
 
 /// Project every native Exec event exactly once by entity id.
@@ -417,11 +408,15 @@ where
         .min() else {
             continue;
         };
+        // A command whose blob has not arrived is a missing required field.
+        let Some(command) = read_text(reader, command)? else {
+            continue;
+        };
         state.requests.insert(
             id,
             ExecRequestRow {
                 id,
-                command: read_text(reader, command)?,
+                command,
                 requested_at: interval_key(requested_at),
             },
         );
@@ -440,11 +435,9 @@ where
         state.in_progress.push(ExecInProgressRow {
             id,
             about_request,
-            attempt: optional_attempt(
-                id,
-                "exec::attempt",
+            attempt: optional_u64(
                 find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }])),
-            )?,
+            ),
             started_at: interval_key(started_at),
         });
     }
@@ -460,18 +453,14 @@ where
             continue;
         };
         let exit_code = optional_u64(
-            id,
-            "exec::exit_code",
             find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::exit_code: ?value }])),
-        )?;
+        );
         state.results.push(ExecResultRow {
             id,
             about_request,
-            attempt: optional_attempt(
-                id,
-                "exec::attempt",
+            attempt: optional_u64(
                 find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }])),
-            )?,
+            ),
             finished_at: interval_key(finished_at),
             exit_code,
             stdout_text: one_text(
@@ -536,11 +525,9 @@ where
         state.in_progress.push(ModelInProgressRow {
             id,
             about_request,
-            attempt: optional_attempt(
-                id,
-                "model_chat::attempt",
+            attempt: optional_u64(
                 find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }])),
-            )?,
+            ),
             started_at: interval_key(started_at),
         });
     }
@@ -555,24 +542,19 @@ where
         .min() else {
             continue;
         };
-        let token = |field: &str,
-                     attribute: &triblespace::core::attribute::Attribute<
+        let token = |attribute: &triblespace::core::attribute::Attribute<
             inlineencodings::U256BE,
         >| {
             optional_u64(
-                id,
-                field,
                 find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ attribute: ?value }])),
             )
         };
         state.results.push(ModelResultRow {
             id,
             about_request,
-            attempt: optional_attempt(
-                id,
-                "model_chat::attempt",
+            attempt: optional_u64(
                 find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }])),
-            )?,
+            ),
             finished_at: interval_key(finished_at),
             error: one_text(
                 reader,
@@ -586,16 +568,10 @@ where
                 reader,
                 find!(value: TextHandle, pattern!(space, [{ id @ model_chat::reasoning_text: ?value }])),
             )?,
-            input_tokens: token("model_chat::input_tokens", &model_chat::input_tokens)?,
-            output_tokens: token("model_chat::output_tokens", &model_chat::output_tokens)?,
-            cache_creation_input_tokens: token(
-                "model_chat::cache_creation_input_tokens",
-                &model_chat::cache_creation_input_tokens,
-            )?,
-            cache_read_input_tokens: token(
-                "model_chat::cache_read_input_tokens",
-                &model_chat::cache_read_input_tokens,
-            )?,
+            input_tokens: token(&model_chat::input_tokens),
+            output_tokens: token(&model_chat::output_tokens),
+            cache_creation_input_tokens: token(&model_chat::cache_creation_input_tokens),
+            cache_read_input_tokens: token(&model_chat::cache_read_input_tokens),
         });
     }
     Ok(state)
@@ -1271,6 +1247,7 @@ pub fn project_scan<P: TriblePattern, R: BlobStoreGet>(
 mod tests {
     use super::*;
 
+    use anybytes::Bytes;
     use triblespace::macros::entity;
 
     fn id(byte: u8) -> Id {
@@ -1583,15 +1560,53 @@ mod tests {
     }
 
     #[test]
-    fn oversized_u256_values_are_invalid_instead_of_dropped_or_wrapped() {
+    fn oversized_u256_values_read_as_absent_without_wrapping() {
         let mut raw = [0; 32];
         raw[0] = 1;
+        // The low 64 bits alone would wrap to 7.
+        raw[31] = 7;
         let mut fragment = native_exec_fragment(Inline::<inlineencodings::U256BE>::new(raw));
         let facts = fragment.facts().clone();
         let reader = fragment.blobs_mut().snapshot().unwrap();
 
+        let state = collect_exec_state(&reader, &facts).unwrap();
+        assert_eq!(state.results.len(), 1);
+        assert_eq!(state.results[0].exit_code, None);
+        assert_eq!(state.results[0].attempt, Some(1));
+    }
+
+    #[test]
+    fn missing_text_blobs_read_as_absent_and_malformed_ones_fail() {
+        let mut fragment = native_exec_fragment(7u64.to_inline());
+        let result = id(3);
+        // A commit can sync before its blobs: this handle's blob is not here.
+        let absent: TextHandle = Fragment::empty().put("not yet synced".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&result) @ exec::stdout_text: absent };
+        let unsynced_request = id(4);
+        fragment += entity! { ExclusiveId::force_ref(&unsynced_request) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            exec::command_text: absent,
+            metadata::created_at: point(40.0),
+        };
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let state = collect_exec_state(&reader, &facts).unwrap();
+        assert_eq!(state.results[0].stdout_text, None);
+        assert_eq!(state.results[0].exit_code, Some(7));
+        assert!(state.requests.contains_key(&id(1)));
+        assert!(!state.requests.contains_key(&unsynced_request));
+
+        let mut fragment = native_exec_fragment(7u64.to_inline());
+        let invalid = Blob::<blobencodings::UTF8String>::new(Bytes::from(vec![0xFF]));
+        let malformed = invalid.get_handle();
+        fragment.blobs_mut().insert(invalid);
+        fragment += entity! { ExclusiveId::force_ref(&result) @ exec::stdout_text: malformed };
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
         let error = collect_exec_state(&reader, &facts).unwrap_err();
-        assert!(format!("{error:#}").contains("exec::exit_code value larger than u64"));
+        assert!(format!("{error:#}").contains("read UTF8String"));
     }
 
     #[test]
