@@ -350,9 +350,10 @@ fn u256be_to_u64(entity: Id, field: &str, value: Inline<inlineencodings::U256BE>
 fn optional_u64(
     entity: Id,
     field: &str,
-    values: Vec<Inline<inlineencodings::U256BE>>,
+    values: impl Iterator<Item = Inline<inlineencodings::U256BE>>,
 ) -> Result<Option<u64>> {
-    at_most_one(entity, field, values)?
+    values
+        .min()
         .map(|value| u256be_to_u64(entity, field, value))
         .transpose()
 }
@@ -360,7 +361,7 @@ fn optional_u64(
 fn optional_attempt(
     entity: Id,
     field: &str,
-    values: Vec<Inline<inlineencodings::U256BE>>,
+    values: impl Iterator<Item = Inline<inlineencodings::U256BE>>,
 ) -> Result<Option<u64>> {
     optional_u64(entity, field, values)
 }
@@ -379,44 +380,26 @@ fn tagged_entities<P: TriblePattern>(space: &P, kind: Id) -> BTreeSet<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: kind }])).collect()
 }
 
-fn exactly_one<T>(entity: Id, field: &str, values: Vec<T>) -> Result<T> {
-    let count = values.len();
-    let mut values = values.into_iter();
-    match (values.next(), count) {
-        (Some(value), 1) => Ok(value),
-        _ => bail!(
-            "Cognition entity {entity:x} has {count} values for {field}; expected exactly one"
-        ),
-    }
-}
-
-fn at_most_one<T>(entity: Id, field: &str, values: Vec<T>) -> Result<Option<T>> {
-    let count = values.len();
-    let mut values = values.into_iter();
-    match (values.next(), count) {
-        (None, 0) => Ok(None),
-        (Some(value), 1) => Ok(Some(value)),
-        _ => bail!(
-            "Cognition entity {entity:x} has {count} values for {field}; expected at most one"
-        ),
-    }
-}
-
 fn one_text<Store>(
     reader: &Store,
-    entity: Id,
-    field: &str,
-    values: Vec<TextHandle>,
+    values: impl Iterator<Item = TextHandle>,
 ) -> Result<Option<String>>
 where
     Store: BlobStoreGet + ?Sized,
 {
-    at_most_one(entity, field, values)?
+    values
+        .min()
         .map(|handle| read_text(reader, handle))
         .transpose()
 }
 
 /// Project every native Exec event exactly once by entity id.
+///
+/// The schema is open world: an event lacking a required field does not
+/// match its query and is not modelled, and a field with several values
+/// yields the byte-smallest one (the smallest tuple when required fields are
+/// read together), so the projection is deterministic without imposing
+/// cardinality in Rust.
 pub fn collect_exec_state<Store, P>(reader: &Store, space: &P) -> Result<ExecState>
 where
     Store: BlobStoreGet + ?Sized,
@@ -424,18 +407,16 @@ where
 {
     let mut state = ExecState::default();
     for id in tagged_entities(space, KIND_EXEC_REQUEST_ID) {
-        let command = exactly_one(
-            id,
-            "exec::command_text",
-            find!(value: TextHandle, pattern!(space, [{ id @ exec::command_text: ?value }]))
-                .collect(),
-        )?;
-        let requested_at = exactly_one(
-            id,
-            "metadata::created_at",
-            find!(value: Interval, pattern!(space, [{ id @ metadata::created_at: ?value }]))
-                .collect(),
-        )?;
+        let Some((command, requested_at)) = find!(
+            (command: TextHandle, requested_at: Interval),
+            pattern!(space, [{ id @
+                exec::command_text: ?command,
+                metadata::created_at: ?requested_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
         state.requests.insert(
             id,
             ExecRequestRow {
@@ -446,46 +427,42 @@ where
         );
     }
     for id in tagged_entities(space, KIND_EXEC_IN_PROGRESS_ID) {
-        let about_request = exactly_one(
-            id,
-            "exec::about_request",
-            find!(value: Id, pattern!(space, [{ id @ exec::about_request: ?value }])).collect(),
-        )?;
-        let started_at = exactly_one(
-            id,
-            "metadata::started_at",
-            find!(value: Interval, pattern!(space, [{ id @ metadata::started_at: ?value }]))
-                .collect(),
-        )?;
+        let Some((about_request, started_at)) = find!(
+            (about_request: Id, started_at: Interval),
+            pattern!(space, [{ id @
+                exec::about_request: ?about_request,
+                metadata::started_at: ?started_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
         state.in_progress.push(ExecInProgressRow {
             id,
             about_request,
             attempt: optional_attempt(
                 id,
                 "exec::attempt",
-                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }]))
-                    .collect(),
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }])),
             )?,
             started_at: interval_key(started_at),
         });
     }
     for id in tagged_entities(space, KIND_EXEC_RESULT_ID) {
-        let about_request = exactly_one(
-            id,
-            "exec::about_request",
-            find!(value: Id, pattern!(space, [{ id @ exec::about_request: ?value }])).collect(),
-        )?;
-        let finished_at = exactly_one(
-            id,
-            "metadata::finished_at",
-            find!(value: Interval, pattern!(space, [{ id @ metadata::finished_at: ?value }]))
-                .collect(),
-        )?;
+        let Some((about_request, finished_at)) = find!(
+            (about_request: Id, finished_at: Interval),
+            pattern!(space, [{ id @
+                exec::about_request: ?about_request,
+                metadata::finished_at: ?finished_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
         let exit_code = optional_u64(
             id,
             "exec::exit_code",
-            find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::exit_code: ?value }]))
-                .collect(),
+            find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::exit_code: ?value }])),
         )?;
         state.results.push(ExecResultRow {
             id,
@@ -493,44 +470,31 @@ where
             attempt: optional_attempt(
                 id,
                 "exec::attempt",
-                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }]))
-                    .collect(),
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }])),
             )?,
             finished_at: interval_key(finished_at),
             exit_code,
             stdout_text: one_text(
                 reader,
-                id,
-                "exec::stdout_text",
-                find!(value: TextHandle, pattern!(space, [{ id @ exec::stdout_text: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ exec::stdout_text: ?value }])),
             )?,
             stderr_text: one_text(
                 reader,
-                id,
-                "exec::stderr_text",
-                find!(value: TextHandle, pattern!(space, [{ id @ exec::stderr_text: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ exec::stderr_text: ?value }])),
             )?,
             error: one_text(
                 reader,
-                id,
-                "exec::error",
-                find!(value: TextHandle, pattern!(space, [{ id @ exec::error: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ exec::error: ?value }])),
             )?,
-            about_thought: at_most_one(
-                id,
-                "exec::about_thought",
-                find!(value: Id, pattern!(space, [{ id @ exec::about_thought: ?value }]))
-                    .collect(),
-            )?,
+            about_thought: find!(value: Id, pattern!(space, [{ id @ exec::about_thought: ?value }]))
+                .min(),
         });
     }
     Ok(state)
 }
 
-/// Project every native model-chat event exactly once by entity id.
+/// Project every native model-chat event exactly once by entity id, with the
+/// same open-world reading as [`collect_exec_state`].
 pub fn collect_model_chat_state<Store, P>(reader: &Store, space: &P) -> Result<ModelChatState>
 where
     Store: BlobStoreGet + ?Sized,
@@ -538,65 +502,59 @@ where
 {
     let mut state = ModelChatState::default();
     for id in tagged_entities(space, KIND_MODEL_REQUEST_ID) {
-        let requested_at = exactly_one(
-            id,
-            "metadata::created_at",
-            find!(value: Interval, pattern!(space, [{ id @ metadata::created_at: ?value }]))
-                .collect(),
-        )?;
-        let about_thought = at_most_one(
-            id,
-            "model_chat::about_thought",
-            find!(value: Id, pattern!(space, [{ id @ model_chat::about_thought: ?value }]))
-                .collect(),
-        )?;
+        let Some(requested_at) = find!(
+            value: Interval,
+            pattern!(space, [{ id @ metadata::created_at: ?value }])
+        )
+        .min() else {
+            continue;
+        };
         state.requests.insert(
             id,
             ModelRequestRow {
                 id,
                 requested_at: interval_key(requested_at),
-                about_thought,
+                about_thought: find!(
+                    value: Id,
+                    pattern!(space, [{ id @ model_chat::about_thought: ?value }])
+                )
+                .min(),
             },
         );
     }
     for id in tagged_entities(space, KIND_MODEL_IN_PROGRESS_ID) {
-        let about_request = exactly_one(
-            id,
-            "model_chat::about_request",
-            find!(value: Id, pattern!(space, [{ id @ model_chat::about_request: ?value }]))
-                .collect(),
-        )?;
-        let started_at = exactly_one(
-            id,
-            "metadata::started_at",
-            find!(value: Interval, pattern!(space, [{ id @ metadata::started_at: ?value }]))
-                .collect(),
-        )?;
+        let Some((about_request, started_at)) = find!(
+            (about_request: Id, started_at: Interval),
+            pattern!(space, [{ id @
+                model_chat::about_request: ?about_request,
+                metadata::started_at: ?started_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
         state.in_progress.push(ModelInProgressRow {
             id,
             about_request,
             attempt: optional_attempt(
                 id,
                 "model_chat::attempt",
-                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }]))
-                    .collect(),
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }])),
             )?,
             started_at: interval_key(started_at),
         });
     }
     for id in tagged_entities(space, KIND_MODEL_RESULT_ID) {
-        let about_request = exactly_one(
-            id,
-            "model_chat::about_request",
-            find!(value: Id, pattern!(space, [{ id @ model_chat::about_request: ?value }]))
-                .collect(),
-        )?;
-        let finished_at = exactly_one(
-            id,
-            "metadata::finished_at",
-            find!(value: Interval, pattern!(space, [{ id @ metadata::finished_at: ?value }]))
-                .collect(),
-        )?;
+        let Some((about_request, finished_at)) = find!(
+            (about_request: Id, finished_at: Interval),
+            pattern!(space, [{ id @
+                model_chat::about_request: ?about_request,
+                metadata::finished_at: ?finished_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
         let token = |field: &str,
                      attribute: &triblespace::core::attribute::Attribute<
             inlineencodings::U256BE,
@@ -604,8 +562,7 @@ where
             optional_u64(
                 id,
                 field,
-                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ attribute: ?value }]))
-                    .collect(),
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ attribute: ?value }])),
             )
         };
         state.results.push(ModelResultRow {
@@ -614,30 +571,20 @@ where
             attempt: optional_attempt(
                 id,
                 "model_chat::attempt",
-                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }]))
-                    .collect(),
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }])),
             )?,
             finished_at: interval_key(finished_at),
             error: one_text(
                 reader,
-                id,
-                "model_chat::error",
-                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::error: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::error: ?value }])),
             )?,
             output_text: one_text(
                 reader,
-                id,
-                "model_chat::output_text",
-                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::output_text: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::output_text: ?value }])),
             )?,
             reasoning_text: one_text(
                 reader,
-                id,
-                "model_chat::reasoning_text",
-                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::reasoning_text: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::reasoning_text: ?value }])),
             )?,
             input_tokens: token("model_chat::input_tokens", &model_chat::input_tokens)?,
             output_tokens: token("model_chat::output_tokens", &model_chat::output_tokens)?,
@@ -661,34 +608,23 @@ where
 {
     let mut rows = Vec::new();
     for id in tagged_entities(space, KIND_REASON_EVENT_ID) {
-        let created_at = at_most_one(
-            id,
-            "metadata::created_at",
-            find!(value: Interval, pattern!(space, [{ id @ metadata::created_at: ?value }]))
-                .collect(),
-        )?
-        .map(interval_key);
         rows.push(ReasonEventRow {
             id,
-            created_at,
+            created_at: find!(
+                value: Interval,
+                pattern!(space, [{ id @ metadata::created_at: ?value }])
+            )
+            .min()
+            .map(interval_key),
             text: one_text(
                 reader,
-                id,
-                "reason::text",
-                find!(value: TextHandle, pattern!(space, [{ id @ reason::text: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ reason::text: ?value }])),
             )?,
-            about_turn: at_most_one(
-                id,
-                "reason::about_turn",
-                find!(value: Id, pattern!(space, [{ id @ reason::about_turn: ?value }])).collect(),
-            )?,
+            about_turn: find!(value: Id, pattern!(space, [{ id @ reason::about_turn: ?value }]))
+                .min(),
             command_text: one_text(
                 reader,
-                id,
-                "reason::command_text",
-                find!(value: TextHandle, pattern!(space, [{ id @ reason::command_text: ?value }]))
-                    .collect(),
+                find!(value: TextHandle, pattern!(space, [{ id @ reason::command_text: ?value }])),
             )?,
         });
     }
@@ -1111,7 +1047,9 @@ pub fn project_headspace<P: TriblePattern, R: BlobStoreGet>(
     })
 }
 
-pub fn relation_state<P: TriblePattern, R: BlobStoreGet>(view: SourceView<'_, P, R>) -> Result<RelationState> {
+pub fn relation_state<P: TriblePattern, R: BlobStoreGet>(
+    view: SourceView<'_, P, R>,
+) -> Result<RelationState> {
     let mut terms = BTreeSet::new();
     let mut forked_profiles = Vec::new();
     for (person, profile) in relations_model::person_profile_views(view.reader, view.facts) {
@@ -1602,6 +1540,46 @@ mod tests {
         assert_eq!(state.in_progress[0].started_at, interval_key(point(20.0)));
         assert_eq!(state.results[0].finished_at, interval_key(point(30.0)));
         assert_eq!(state.results[0].exit_code, Some(7));
+    }
+
+    #[test]
+    fn exec_requests_lacking_a_field_are_skipped_and_repeated_fields_do_not_fail() {
+        let mut fragment = native_exec_fragment(7u64.to_inline());
+        // Cognition entity 6a1c9171 in the 2026-09-29 union had no command.
+        let missing = id(4);
+        fragment += entity! { ExclusiveId::force_ref(&missing) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            metadata::created_at: point(40.0),
+        };
+        let repeated = id(5);
+        let first = fragment.put("first".to_owned());
+        let second = fragment.put("second".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&repeated) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            exec::command_text: first,
+            exec::command_text: second,
+            metadata::created_at: point(50.0),
+            metadata::created_at: point(60.0),
+        };
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let state = collect_exec_state(&reader, &facts).unwrap();
+        assert_eq!(state.requests.len(), 2);
+        assert_eq!(state.requests[&id(1)].command, "native timestamps");
+        assert!(!state.requests.contains_key(&missing));
+        // Several values select the byte-smallest (command, created_at) pair.
+        let (command, requested_at) = [first, second]
+            .into_iter()
+            .flat_map(|command| [(command, point(50.0)), (command, point(60.0))])
+            .min()
+            .unwrap();
+        let row = &state.requests[&repeated];
+        assert_eq!(
+            row.command,
+            if command == first { "first" } else { "second" }
+        );
+        assert_eq!(row.requested_at, interval_key(requested_at));
     }
 
     #[test]
