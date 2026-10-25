@@ -46,8 +46,7 @@ enum Command {
     },
 }
 
-pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
-    let operations = Status::new(cli.pile, cli.key);
+fn execute(operations: Status, cli: Cli, output: &mut Out<'_>) -> Result<()> {
     match cli.command {
         Command::Set { text } => {
             let text = crate::text_arg(&text, "status text")?;
@@ -63,5 +62,8 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    crate::cli::with_output("status", |output| execute(cli, output))
+    crate::cli::with_output("status", |output| {
+        crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+            .scope_to_exit(|storage| execute(Status::with_storage(storage.clone()), cli, output))
+    })
 }

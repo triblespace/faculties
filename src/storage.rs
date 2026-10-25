@@ -155,6 +155,22 @@ impl Session {
             store.close().context("close shared faculty store"),
         )
     }
+
+    /// [`Self::close`], abandoning the pile's memory to process exit once its
+    /// close has succeeded ([`Pile::close_for_process_exit`]). If stopping the
+    /// host fails, the pile closes the ordinary way.
+    fn close_for_process_exit(mut self) -> Result<()> {
+        let mut store = self.store.take().expect("an open session owns its store");
+        let shutdown = store
+            .shutdown_and_join()
+            .context("stop shared faculty acquisition host");
+        let close = if shutdown.is_ok() {
+            store.into_store().close_for_process_exit()
+        } else {
+            store.close()
+        };
+        finish_close(shutdown, close.context("close shared faculty store"))
+    }
 }
 
 impl Drop for Session {
@@ -454,6 +470,35 @@ impl Storage {
         let storage = self.retained();
         let result = operation(&storage);
         storage.finish(result)
+    }
+
+    /// [`Self::scope`] for the whole body of a one-shot CLI process, which
+    /// exits once this returns. Its store is closed with
+    /// [`Pile::close_for_process_exit`]: flushed and unlocked as usual, its
+    /// memory then left to process exit rather than freed leaf by leaf.
+    /// An application owner is reused and stays open, as with [`Self::scope`],
+    /// and only the first such scope in a process abandons anything, so a
+    /// repeated call never accumulates abandoned stores.
+    pub fn scope_to_exit<T>(&self, operation: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ABANDONED: AtomicBool = AtomicBool::new(false);
+        if self.shared.is_some() || ABANDONED.swap(true, Ordering::Relaxed) {
+            return self.scope(operation);
+        }
+        let storage = self.retained();
+        let result = operation(&storage);
+        let session = storage
+            .shared
+            .as_ref()
+            .expect("a retained owner is shared")
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let close = match session {
+            Some(session) => session.close_for_process_exit(),
+            None => Ok(()),
+        };
+        finish_close(result, close)
     }
 
     /// Enter the shared session, opening its store as `host` the first time.
@@ -1590,6 +1635,49 @@ mod tests {
             .unwrap();
         assert!(owner.shared.as_ref().unwrap().lock().unwrap().is_none());
         assert!(cli.shared.is_none());
+    }
+
+    #[test]
+    fn process_exit_scope_persists_writes_and_leaves_application_owners_open() {
+        use triblespace::core::repo::BlobStorePut;
+
+        let files = TestFiles::new();
+        initialize_signer(&files.pile, Some(&files.key)).unwrap();
+        let cli = Storage::new(files.pile.clone(), Some(files.key.clone()));
+        // The first scope abandons its closed store; a repeated one closes normally.
+        let mut handles = Vec::new();
+        for text in ["first exit scope", "repeated exit scope"] {
+            let (owner, handle) = cli
+                .scope_to_exit(|storage| {
+                    let handle =
+                        storage.with_pile(|pile, _| Ok(pile.put::<UTF8String, _>(text)?))?;
+                    Ok((storage.clone(), handle))
+                })
+                .unwrap();
+            assert!(owner.shared.as_ref().unwrap().lock().unwrap().is_none());
+            handles.push(handle);
+        }
+        assert!(cli.shared.is_none());
+
+        let application = Storage::shared(files.pile.clone(), Some(files.key.clone()));
+        let peer = application
+            .scope_to_exit(|storage| storage.with_store(|store, _, _| Ok(store.id())))
+            .unwrap();
+        application
+            .with_store(|store, _, _| {
+                assert_eq!(store.id(), peer, "an application owner stays open");
+                Ok(())
+            })
+            .unwrap();
+        application.close().unwrap();
+
+        let mut reopened = open_pile_strict(&files.pile).unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        for handle in handles {
+            assert!(snapshot.contains_blob(handle).unwrap());
+        }
+        drop(snapshot);
+        reopened.close().unwrap();
     }
 
     #[test]
