@@ -2,12 +2,9 @@
 //!
 //! Body is an immutable log of deliberate captures and sparse VLA intents.
 //! Writers construct intrinsically identified records. Ordinary readers query
-//! the decodable rows they need from a shard-preserving Succinct view; the
-//! stricter whole-fragment validators below remain explicit migration and test
-//! tools rather than a gate in front of every read.
+//! the decodable rows they need from a shard-preserving Succinct view.
 
 use crate::storage::FactRead;
-use std::collections::{BTreeMap, BTreeSet};
 
 pub mod cli;
 pub mod device;
@@ -26,7 +23,7 @@ use triblespace::core::collection::{CollectionRead, CollectionSnapshotExt, Colle
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, CapabilityProofRead, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::*;
 
 use crate::collection_names::open_configured;
@@ -58,13 +55,6 @@ pub struct IntentRow {
     pub id: Id,
     pub created_at: IntervalValue,
     pub text: TextHandle,
-}
-
-/// Strict whole-fragment projection used by migrations and tests.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct BodyCatalog {
-    pub captures: BTreeMap<Id, CaptureRow>,
-    pub intents: BTreeMap<Id, IntentRow>,
 }
 
 /// One coherent Body fact view plus its maintained intent register.
@@ -145,22 +135,6 @@ fn validate_point(field: &str, interval: IntervalValue) -> Result<()> {
         bail!("{field} must be a point interval");
     }
     Ok(())
-}
-
-fn tagged_entities(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
-    find!(
-        entity: Id,
-        pattern!(facts, [{ ?entity @ metadata::tag: kind }])
-    )
-    .collect()
-}
-
-pub fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
-    facts
-        .iter()
-        .filter(|fact| fact.e() == &entity)
-        .copied()
-        .collect()
 }
 
 /// Build the canonical intrinsic record around already-stored capture
@@ -314,170 +288,6 @@ pub fn decode_intent<P: TriblePattern>(space: &P, id: Id) -> Result<Option<Inten
     };
     validate_point("intent creation time", row.created_at)?;
     Ok(Some(row))
-}
-
-fn load_capture(space: &TribleSet, id: Id) -> Result<Option<CaptureRow>> {
-    let Some(row) = decode_capture(space, id)? else {
-        return Ok(None);
-    };
-    let expected = capture_record(&row);
-    let canonical = expected
-        .root()
-        .expect("canonical capture record has one intrinsic root");
-    if canonical != id {
-        bail!(
-            "Body capture {} is not intrinsic; canonical identity is {}",
-            fmt_id(id),
-            fmt_id(canonical)
-        );
-    }
-    if entity_facts(space, id) != *expected.facts() {
-        bail!(
-            "Body capture {} has facts outside its canonical immutable record",
-            fmt_id(id)
-        );
-    }
-    Ok(Some(row))
-}
-
-fn load_intent(space: &TribleSet, id: Id) -> Result<Option<IntentRow>> {
-    let Some(row) = decode_intent(space, id)? else {
-        return Ok(None);
-    };
-    let expected = intent_record(&row);
-    let canonical = expected
-        .root()
-        .expect("canonical intent record has one intrinsic root");
-    if canonical != id {
-        bail!(
-            "Body intent {} is not intrinsic; canonical identity is {}",
-            fmt_id(id),
-            fmt_id(canonical)
-        );
-    }
-    if entity_facts(space, id) != *expected.facts() {
-        bail!(
-            "Body intent {} has facts outside its canonical immutable record",
-            fmt_id(id)
-        );
-    }
-    Ok(Some(row))
-}
-
-/// Strictly project the complete collection ontology without dereferencing
-/// payloads.
-pub fn load_catalog(space: &TribleSet) -> Result<BodyCatalog> {
-    let capture_ids = tagged_entities(space, KIND_CAPTURE);
-    let intent_ids = tagged_entities(space, KIND_INTENT);
-    if let Some(id) = capture_ids.intersection(&intent_ids).next() {
-        bail!(
-            "Body entity {} is both a capture and an intent",
-            fmt_id(*id)
-        );
-    }
-
-    let mut catalog = BodyCatalog::default();
-    for id in capture_ids {
-        if let Some(row) = load_capture(space, id)? {
-            catalog.captures.insert(id, row);
-        }
-    }
-    for id in intent_ids {
-        if let Some(row) = load_intent(space, id)? {
-            catalog.intents.insert(id, row);
-        }
-    }
-
-    let accounted: usize = catalog
-        .captures
-        .keys()
-        .chain(catalog.intents.keys())
-        .map(|id| entity_facts(space, *id).len())
-        .sum();
-    if accounted != space.len() {
-        bail!(
-            "Body collection has {} facts outside canonical capture and intent records",
-            space.len().saturating_sub(accounted)
-        );
-    }
-    Ok(catalog)
-}
-
-fn read_text_from<B: BlobStoreGet>(reader: &B, handle: TextHandle) -> Result<()> {
-    let _: anybytes::View<str> = reader.get(handle).context("read Body text")?;
-    Ok(())
-}
-
-fn read_raw_from<B: BlobStoreGet>(reader: &B, handle: RawHandle) -> Result<()> {
-    let _: anybytes::Bytes = reader.get(handle).context("read Body frame")?;
-    Ok(())
-}
-
-fn validate_catalog_payloads<B: BlobStoreGet>(reader: &B, catalog: &BodyCatalog) -> Result<()> {
-    for row in catalog.captures.values() {
-        if let Some(frame) = row.frame {
-            read_raw_from(reader, frame)
-                .with_context(|| format!("read frame of Body capture {}", fmt_id(row.id)))?;
-        }
-        if let Some(note) = row.note {
-            read_text_from(reader, note)
-                .with_context(|| format!("read note of Body capture {}", fmt_id(row.id)))?;
-        }
-        read_text_from(reader, row.pose)
-            .with_context(|| format!("read pose of Body capture {}", fmt_id(row.id)))?;
-    }
-    for row in catalog.intents.values() {
-        read_text_from(reader, row.text)
-            .with_context(|| format!("read Body intent {}", fmt_id(row.id)))?;
-    }
-    Ok(())
-}
-
-/// Validate the exact Body ontology and all referenced payloads.
-pub fn validate_catalog(reader: &PileSnapshot, space: &TribleSet) -> Result<BodyCatalog> {
-    let catalog = load_catalog(space)?;
-    validate_catalog_payloads(reader, &catalog)?;
-    Ok(catalog)
-}
-
-/// Validate a prospective Body fragment against a current materialized union.
-/// Staged attachments are read from the fragment first; unchanged handles may
-/// already exist in the durable reader.
-pub fn validate_candidate(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<BodyCatalog> {
-    let mut union = current.clone();
-    union += fragment.facts().clone();
-    let catalog = load_catalog(&union)?;
-
-    let mut local = fragment.blobs().clone();
-    let local_reader = local.snapshot().context("snapshot staged Body payloads")?;
-    for row in catalog.captures.values() {
-        if let Some(frame) = row.frame {
-            if local_reader.metadata(frame)?.is_some() {
-                read_raw_from(&local_reader, frame)?;
-            } else {
-                read_raw_from(reader, frame)?;
-            }
-        }
-        for text in [row.note, Some(row.pose)].into_iter().flatten() {
-            if local_reader.metadata(text)?.is_some() {
-                read_text_from(&local_reader, text)?;
-            } else {
-                read_text_from(reader, text)?;
-            }
-        }
-    }
-    for row in catalog.intents.values() {
-        if local_reader.metadata(row.text)?.is_some() {
-            read_text_from(&local_reader, row.text)?;
-        } else {
-            read_text_from(reader, row.text)?;
-        }
-    }
-    Ok(catalog)
 }
 
 /// Project the latest decodable intent through the exact maintained register.
@@ -710,67 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_catalog_accepts_canonical_capture_and_intent_records() {
-        let mut all = vision();
-        let pose = all.put::<blobencodings::UTF8String, _>("touch".to_owned());
-        all += capture_record(&CaptureRow {
-            id: KIND_CAPTURE,
-            created_at: at(2.0),
-            frame: None,
-            mime: None,
-            width: None,
-            height: None,
-            modality: text_handle("touch"),
-            note: None,
-            pose,
-        });
-        let audio = all.put::<blobencodings::RawBytes, _>(vec![4, 5]);
-        let pose = all.put::<blobencodings::UTF8String, _>("audio-pose".to_owned());
-        all += capture_record(&CaptureRow {
-            id: KIND_CAPTURE,
-            created_at: at(3.0),
-            frame: Some(audio),
-            mime: Some(text_handle("audio/wav")),
-            width: None,
-            height: None,
-            modality: text_handle("audio"),
-            note: None,
-            pose,
-        });
-        let text = all.put::<blobencodings::UTF8String, _>("lean in".to_owned());
-        all += intent_record(&IntentRow {
-            id: KIND_INTENT,
-            created_at: at(4.0),
-            text,
-        });
-
-        let catalog = load_catalog(all.facts()).unwrap();
-        assert_eq!(catalog.captures.len(), 3);
-        assert_eq!(catalog.intents.len(), 1);
-    }
-
-    #[test]
-    fn strict_catalog_rejects_noncanonical_identity_and_unknown_vocabulary() {
-        let canonical = vision();
-        let wrong = Id::new([0xA1; 16]).unwrap();
-        let mut forced = TribleSet::new();
-        for fact in canonical.facts() {
-            let mut raw = fact.data;
-            raw[..16].copy_from_slice(&wrong[..]);
-            forced.insert(&Trible::force_raw(raw).unwrap());
-        }
-        let error = load_catalog(&forced).unwrap_err();
-        assert!(error.to_string().contains("is not intrinsic"));
-
-        let unknown = entity! {
-            metadata::tag: &Id::new([0xB2; 16]).unwrap(),
-        };
-        let error = load_catalog(unknown.facts()).unwrap_err();
-        assert!(error.to_string().contains("outside canonical"));
-    }
-
-    #[test]
-    fn strict_catalog_rejects_capture_shape_conflicts() {
+    fn decoding_rejects_capture_shape_conflicts() {
         let pose: TextHandle = Inline::new([0xC3; 32]);
         let malformed = entity! {
             metadata::tag: &KIND_CAPTURE,
@@ -779,20 +529,9 @@ mod tests {
             capture::pose: pose,
             capture::mime: "image/png",
         };
-        let error = load_catalog(malformed.facts()).unwrap_err();
+        let id = malformed.root().unwrap();
+        let error = decode_capture(malformed.facts(), id).unwrap_err();
         assert!(error.to_string().contains("touch capture"));
-    }
-
-    #[test]
-    fn strict_catalog_rejects_extra_fact_on_canonical_entity() {
-        let canonical = vision();
-        let id = canonical.root().unwrap();
-        let mut facts = canonical.facts().clone();
-        facts += entity! { ExclusiveId::force_ref(&id) @
-            metadata::created_at: at(9.0),
-        };
-        let error = load_catalog(&facts).unwrap_err().to_string();
-        assert!(error.contains("is not intrinsic") || error.contains("outside its canonical"));
     }
 
     #[test]
