@@ -122,28 +122,6 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn exactly_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "planner entity {} has {} values for {field}; expected exactly one",
-            fmt_id(entity),
-            values.len()
-        );
-    }
-    Ok(values.pop().expect("length checked above"))
-}
-
-fn at_most_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<Option<T>> {
-    if values.len() > 1 {
-        bail!(
-            "planner entity {} has {} values for {field}; expected at most one",
-            fmt_id(entity),
-            values.len()
-        );
-    }
-    Ok(values.pop())
-}
-
 fn validate_label(field: &str, value: &str) -> Result<()> {
     if value.as_bytes().contains(&0) {
         bail!("{field} contains a NUL byte");
@@ -469,7 +447,7 @@ fn legacy_event_fact_is_inert(space: &TribleSet, event_id: Id, fact: &Trible) ->
             == text_handle(STATUS_CANCELLED)
 }
 
-fn native_event_status(space: &TribleSet, id: Id) -> Result<TextHandle> {
+fn native_event_status(space: &TribleSet, id: Id) -> Option<TextHandle> {
     let mut values: Vec<TextHandle> = find!(
         value: TextHandle,
         pattern!(space, [{ id @ event::status: ?value }])
@@ -479,57 +457,43 @@ fn native_event_status(space: &TribleSet, id: Id) -> Result<TextHandle> {
         let cancelled = text_handle(STATUS_CANCELLED);
         values.retain(|value| *value != cancelled);
     }
-    exactly_one(id, "event::status", values)
+    values.into_iter().min()
 }
 
-fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
+/// An event lacking a required field is not one and is skipped; a field with
+/// several values yields the byte-smallest one (the smallest tuple for the
+/// required fields), and the exact-record comparison below still reports it.
+fn load_validated_event(space: &TribleSet, id: Id) -> Result<Option<EventRow>> {
+    let Some((uid, summary, time, transp)) = find!(
+        (uid: TextHandle, summary: TextHandle, time: IntervalValue, transp: TextHandle),
+        pattern!(space, [{ id @
+            event::ical_uid: ?uid,
+            event::summary: ?summary,
+            event::time: ?time,
+            event::transp: ?transp,
+        }])
+    )
+    .min() else {
+        return Ok(None);
+    };
+    let Some(status) = native_event_status(space, id) else {
+        return Ok(None);
+    };
     let row = EventRow {
         id,
-        uid: exactly_one(
-            id,
-            "event::ical_uid",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::ical_uid: ?value }])
-            )
-            .collect(),
-        )?,
-        summary: exactly_one(
-            id,
-            "event::summary",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::summary: ?value }])
-            )
-            .collect(),
-        )?,
-        description: at_most_one(
-            id,
-            "event::description",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::description: ?value }])
-            )
-            .collect(),
-        )?,
-        time: exactly_one(
-            id,
-            "event::time",
-            find!(
-                value: IntervalValue,
-                pattern!(space, [{ id @ event::time: ?value }])
-            )
-            .collect(),
-        )?,
-        rrule: at_most_one(
-            id,
-            "event::rrule",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::rrule: ?value }])
-            )
-            .collect(),
-        )?,
+        uid,
+        summary,
+        description: find!(
+            value: TextHandle,
+            pattern!(space, [{ id @ event::description: ?value }])
+        )
+        .min(),
+        time,
+        rrule: find!(
+            value: TextHandle,
+            pattern!(space, [{ id @ event::rrule: ?value }])
+        )
+        .min(),
         rdates: find!(
             value: IntervalValue,
             pattern!(space, [{ id @ event::rdate: ?value }])
@@ -540,44 +504,24 @@ fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
             pattern!(space, [{ id @ event::exdate: ?value }])
         )
         .collect(),
-        location: at_most_one(
-            id,
-            "event::location",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::location: ?value }])
-            )
-            .collect(),
-        )?,
-        status: native_event_status(space, id)?,
-        transp: exactly_one(
-            id,
-            "event::transp",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::transp: ?value }])
-            )
-            .collect(),
-        )?,
+        location: find!(
+            value: TextHandle,
+            pattern!(space, [{ id @ event::location: ?value }])
+        )
+        .min(),
+        status,
+        transp,
         attendees: find!(
             value: Id,
             pattern!(space, [{ id @ event::attendee: ?value }])
         )
         .collect(),
-        organizer: at_most_one(
-            id,
-            "event::organizer",
-            find!(value: Id, pattern!(space, [{ id @ event::organizer: ?value }])).collect(),
-        )?,
-        sequence: at_most_one(
-            id,
-            "event::sequence",
-            find!(
-                value: SequenceValue,
-                pattern!(space, [{ id @ event::sequence: ?value }])
-            )
-            .collect(),
-        )?,
+        organizer: find!(value: Id, pattern!(space, [{ id @ event::organizer: ?value }])).min(),
+        sequence: find!(
+            value: SequenceValue,
+            pattern!(space, [{ id @ event::sequence: ?value }])
+        )
+        .min(),
     };
     validate_event_values(&row)?;
     let expected = event_record(
@@ -617,39 +561,26 @@ fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
             fmt_id(id)
         );
     }
-    Ok(row)
+    Ok(Some(row))
 }
 
-fn load_validated_note(space: &TribleSet, id: Id) -> Result<NoteRow> {
+fn load_validated_note(space: &TribleSet, id: Id) -> Result<Option<NoteRow>> {
+    let Some((event, text, created_at)) = find!(
+        (event: Id, text: TextHandle, created_at: IntervalValue),
+        pattern!(space, [{ id @
+            note::note_about: ?event,
+            note::note_text: ?text,
+            metadata::created_at: ?created_at,
+        }])
+    )
+    .min() else {
+        return Ok(None);
+    };
     let row = NoteRow {
         id,
-        event: exactly_one(
-            id,
-            "note::note_about",
-            find!(
-                value: Id,
-                pattern!(space, [{ id @ note::note_about: ?value }])
-            )
-            .collect(),
-        )?,
-        text: exactly_one(
-            id,
-            "note::note_text",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ note::note_text: ?value }])
-            )
-            .collect(),
-        )?,
-        created_at: exactly_one(
-            id,
-            "metadata::created_at",
-            find!(
-                value: IntervalValue,
-                pattern!(space, [{ id @ metadata::created_at: ?value }])
-            )
-            .collect(),
-        )?,
+        event,
+        text,
+        created_at,
     };
     validate_point("note creation time", row.created_at)?;
     let expected = note_record(row.event, row.text, row.created_at);
@@ -667,22 +598,18 @@ fn load_validated_note(space: &TribleSet, id: Id) -> Result<NoteRow> {
             fmt_id(id)
         );
     }
-    Ok(row)
+    Ok(Some(row))
 }
 
-fn load_validated_cancellation(space: &TribleSet, id: Id) -> Result<CancellationRow> {
-    let row = CancellationRow {
-        id,
-        event: exactly_one(
-            id,
-            "cancellation::event",
-            find!(
-                value: Id,
-                pattern!(space, [{ id @ cancellation::event: ?value }])
-            )
-            .collect(),
-        )?,
+fn load_validated_cancellation(space: &TribleSet, id: Id) -> Result<Option<CancellationRow>> {
+    let Some(event) = find!(
+        value: Id,
+        pattern!(space, [{ id @ cancellation::event: ?value }])
+    )
+    .min() else {
+        return Ok(None);
     };
+    let row = CancellationRow { id, event };
     let expected = cancellation_record(row.event);
     let canonical = expected
         .root()
@@ -700,7 +627,7 @@ fn load_validated_cancellation(space: &TribleSet, id: Id) -> Result<Cancellation
             fmt_id(id)
         );
     }
-    Ok(row)
+    Ok(Some(row))
 }
 
 /// Strictly project the native collection ontology without dereferencing
@@ -720,10 +647,14 @@ fn load_validated_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
 
     let mut catalog = PlannerCatalog::default();
     for id in event_ids {
-        catalog.events.insert(id, load_validated_event(space, id)?);
+        if let Some(row) = load_validated_event(space, id)? {
+            catalog.events.insert(id, row);
+        }
     }
     for id in note_ids {
-        let row = load_validated_note(space, id)?;
+        let Some(row) = load_validated_note(space, id)? else {
+            continue;
+        };
         if !catalog.events.contains_key(&row.event) {
             bail!(
                 "planner note {} refers to missing event {}",
@@ -734,7 +665,9 @@ fn load_validated_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
         catalog.notes.insert(id, row);
     }
     for id in cancellation_ids {
-        let row = load_validated_cancellation(space, id)?;
+        let Some(row) = load_validated_cancellation(space, id)? else {
+            continue;
+        };
         if !catalog.events.contains_key(&row.event) {
             bail!(
                 "planner cancellation {} refers to missing event {}",
@@ -1113,7 +1046,27 @@ mod tests {
 
         assert!(load_catalog(&facts).unwrap().events.contains_key(&event_id));
         let error = load_validated_catalog(&facts).unwrap_err();
-        assert!(format!("{error:#}").contains("2 values for event::summary"));
+        assert!(format!("{error:#}").contains("outside its canonical immutable record"));
+    }
+
+    #[test]
+    fn strict_validation_skips_an_event_lacking_a_required_field() {
+        let event = event_fragment(&draft("bare@example", "meeting")).unwrap();
+        let event_id = event.root().unwrap();
+        let uid = find!(
+            value: TextHandle,
+            pattern!(event.facts(), [{ event_id @ event::ical_uid: ?value }])
+        )
+        .next()
+        .unwrap();
+        let mut facts = event_identity(uid).into_facts();
+        facts += event_fragment(&draft("kept@example", "meeting"))
+            .unwrap()
+            .into_facts();
+
+        let catalog = load_validated_catalog(&facts).unwrap();
+        assert_eq!(catalog.events.len(), 1);
+        assert!(!catalog.events.contains_key(&event_id));
     }
 
     #[test]
