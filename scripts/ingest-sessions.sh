@@ -42,9 +42,12 @@ set -uo pipefail
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/faculties
 STAMP=$STATE/ingest-sessions.stamp
 # A host that has run the native `archive ingest-sessions` keeps its progress in
-# archive/ingest-sessions.json, and native passes never move the legacy stamp, so
-# its --due reads the native checkpoint instead (2026-10-25; on stars the legacy
-# stamp stayed at 2026-10-22 and the habit fired again after every native pass).
+# archive/ingest-sessions.json, and native passes never move the legacy stamp
+# (on stars it stayed at 2026-10-22 and the habit fired after every native pass).
+# There --due is a plain daily cadence on the checkpoint: the native pass is
+# idempotent and imports live sessions' finished prefixes itself, so a changed-file
+# test would only add blind spots (a session that never goes quiet; a file that
+# stopped between the native cutoff and the checkpoint write).
 NATIVE=$STATE/archive/ingest-sessions.json
 CLAUDE_ROOT=$HOME/.claude/projects
 CODEX_ROOTS=()
@@ -71,7 +74,7 @@ changed() {
 
 case "${1:-}" in
   --due)
-    [ -f "$NATIVE" ] && STAMP=$NATIVE
+    if [ -f "$NATIVE" ]; then [ -n "$(find "$NATIVE" -mmin +1200 -print)" ]; exit; fi
     if [ -f "$STAMP" ] && [ -z "$(find "$STAMP" -mmin +1200 -print)" ]; then exit 1; fi
     if [ ! -f "$STAMP" ]; then exit 0; fi
     hit=$(changed "$CLAUDE_ROOT" | head -1)
