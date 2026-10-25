@@ -188,6 +188,47 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The compact block Orient's overview carries: one line per group, no
+/// preamble. Empty when nothing is recorded, so the overview omits it. The
+/// account appears only when the view holds more than one.
+pub fn section(view: &QuotaView) -> String {
+    if view.groups.is_empty() {
+        return String::new();
+    }
+    let accounts: std::collections::BTreeSet<&str> = view
+        .groups
+        .iter()
+        .map(|group| group.account.as_str())
+        .collect();
+    let mut text = String::from("Quota:\n");
+    for group in &view.groups {
+        let derived = derive(view.now, group);
+        let account = if accounts.len() > 1 {
+            format!(" acct {}", short_account(&group.account))
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "- {} {}{}{}: used {}, {}; age {}{}; resets {}\n",
+            provider_label(group),
+            format_window(group.window_secs),
+            bucket_label(group.bucket.as_deref()),
+            account,
+            joined(&group.used_percent, |used| format_percent(*used)),
+            derived
+                .pace
+                .map(|pace| pace.label())
+                .unwrap_or("no verdict"),
+            format_age(derived.age_seconds),
+            if derived.stale { " STALE" } else { "" },
+            joined(&group.resets_at, |at| format_instant(
+                quota::tai_ns_to_unix(*at)
+            )),
+        ));
+    }
+    text
+}
+
 pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
     fn one_or_many<T: Clone + Into<Value>>(values: &[T]) -> Value {
         match values {
@@ -240,6 +281,7 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace::macros::id_hex;
 
     #[test]
     fn small_formatters_say_what_they_mean() {
@@ -260,5 +302,52 @@ mod tests {
             format_instant(1_792_800_000),
             "2026-10-24 00:00 UTC = Sat 2026-10-24 02:00 CEST"
         );
+    }
+
+    #[test]
+    fn the_orient_section_is_one_line_per_group() {
+        const NOW: i64 = 1_792_886_255;
+        let group =
+            |provider: &str, window_secs, bucket: Option<&str>, used, age, resets_in| QuotaGroup {
+                event: id_hex!("11111111111111111111111111111111"),
+                provider: id_hex!("22222222222222222222222222222222"),
+                provider_name: Some(provider.to_owned()),
+                account: "a1b2c3d4".to_owned(),
+                window_secs,
+                bucket: bucket.map(str::to_owned),
+                observed: quota::unix_to_tai_ns(NOW - age),
+                used_percent: vec![used],
+                resets_at: vec![quota::unix_to_tai_ns(NOW + resets_in)],
+                host: vec!["sky".to_owned()],
+            };
+        let mut view = QuotaView {
+            now: quota::unix_to_tai_ns(NOW),
+            examined: 2,
+            groups: vec![
+                group("claude", 18_000, None, 9.0, 60, 2 * 3_600),
+                group(
+                    "codex",
+                    604_800,
+                    Some("codex_other"),
+                    64.0,
+                    7 * 3_600,
+                    5 * 86_400,
+                ),
+            ],
+        };
+        let text = section(&view);
+        assert_eq!(
+            text,
+            "Quota:\n\
+             - claude 5h: used 9%, under pace; age 1m; resets 2026-10-25 01:57 UTC = Sun \
+             2026-10-25 02:57 CET\n\
+             - codex 7d bucket codex_other: used 64%, over pace; age 7h00m STALE; resets \
+             2026-10-29 23:57 UTC = Fri 2026-10-30 00:57 CET\n",
+            "{text}"
+        );
+        view.groups[1].account = "f0e1d2c3".to_owned();
+        assert!(section(&view).contains("- claude 5h acct a1b2c3d4: used 9%"));
+        view.groups.clear();
+        assert_eq!(section(&view), "");
     }
 }

@@ -99,89 +99,101 @@ impl Quota {
     /// The latest observation per group, evaluated at an explicit instant.
     pub fn show_at(&self, now: i128) -> Result<QuotaView> {
         self.storage.with_store(|pile, signer, runtime| {
-            let (facts, snapshot) = maintain_and_observe(&self.storage, pile, signer, runtime)?;
-            let rows = quota::observation_rows(&facts);
-            let examined = rows
-                .iter()
-                .map(|row| row.event)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            let mut groups = quota::latest_per_group(rows)
-                .into_values()
-                .map(|row| {
-                    let event = row.event;
-                    let provider = row.key.provider;
-                    let provider_name = match quota::known_provider_name(provider) {
-                        Some(name) => Some(name.to_owned()),
-                        None => find!(
-                            name: TextHandle,
-                            pattern!(&facts, [{ provider @ metadata::name: ?name }])
-                        )
-                        .next()
-                        .map(|name| read_text(&snapshot, name, "provider name"))
-                        .transpose()?,
-                    };
-                    let used_percent = find!(
-                        used: f64,
-                        pattern!(&facts, [{ event @ attributes::used_percent: ?used }])
-                    )
-                    .collect();
-                    let mut resets_at: Vec<i128> = find!(
-                        at: Lower,
-                        pattern!(&facts, [{ event @ attributes::resets_at: ?at }])
-                    )
-                    .map(|at| at.0)
-                    .collect();
-                    resets_at.sort_unstable();
-                    let mut host = find!(
-                        host: TextHandle,
-                        pattern!(&facts, [{ event @ attributes::host: ?host }])
-                    )
-                    .map(|host| read_text(&snapshot, host, "host"))
-                    .collect::<Result<Vec<_>>>()?;
-                    host.sort();
-                    Ok(QuotaGroup {
-                        event,
-                        provider,
-                        provider_name,
-                        account: read_text(&snapshot, row.key.account, "account")?,
-                        window_secs: i64::try_from(row.key.window / 1_000_000_000)
-                            .unwrap_or(i64::MAX),
-                        bucket: row
-                            .key
-                            .bucket
-                            .map(|bucket| read_text(&snapshot, bucket, "bucket"))
-                            .transpose()?,
-                        observed: row.observed,
-                        used_percent,
-                        resets_at,
-                        host,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            groups.sort_by(|left, right| {
-                (
-                    &left.provider_name,
-                    left.provider,
-                    &left.account,
-                    left.window_secs,
-                    &left.bucket,
-                )
-                    .cmp(&(
-                        &right.provider_name,
-                        right.provider,
-                        &right.account,
-                        right.window_secs,
-                        &right.bucket,
-                    ))
-            });
-            Ok(QuotaView {
-                now,
-                examined,
-                groups,
-            })
+            observe_at(&self.storage, pile, signer, runtime, now)
         })
     }
+}
+
+/// [`Quota::show_at`] on a store the caller already holds open, so another
+/// faculty's report (Orient's) can carry the same view. Run it outside any
+/// async runtime: the read acquires through `runtime`.
+pub fn observe_at(
+    storage: &crate::storage::Storage,
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    runtime: &Arc<tokio::runtime::Runtime>,
+    now: i128,
+) -> Result<QuotaView> {
+    let (facts, snapshot) = maintain_and_observe(storage, pile, signer, runtime)?;
+    let rows = quota::observation_rows(&facts);
+    let examined = rows
+        .iter()
+        .map(|row| row.event)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let mut groups = quota::latest_per_group(rows)
+        .into_values()
+        .map(|row| {
+            let event = row.event;
+            let provider = row.key.provider;
+            let provider_name = match quota::known_provider_name(provider) {
+                Some(name) => Some(name.to_owned()),
+                None => find!(
+                    name: TextHandle,
+                    pattern!(&facts, [{ provider @ metadata::name: ?name }])
+                )
+                .next()
+                .map(|name| read_text(&snapshot, name, "provider name"))
+                .transpose()?,
+            };
+            let used_percent = find!(
+                used: f64,
+                pattern!(&facts, [{ event @ attributes::used_percent: ?used }])
+            )
+            .collect();
+            let mut resets_at: Vec<i128> = find!(
+                at: Lower,
+                pattern!(&facts, [{ event @ attributes::resets_at: ?at }])
+            )
+            .map(|at| at.0)
+            .collect();
+            resets_at.sort_unstable();
+            let mut host = find!(
+                host: TextHandle,
+                pattern!(&facts, [{ event @ attributes::host: ?host }])
+            )
+            .map(|host| read_text(&snapshot, host, "host"))
+            .collect::<Result<Vec<_>>>()?;
+            host.sort();
+            Ok(QuotaGroup {
+                event,
+                provider,
+                provider_name,
+                account: read_text(&snapshot, row.key.account, "account")?,
+                window_secs: i64::try_from(row.key.window / 1_000_000_000).unwrap_or(i64::MAX),
+                bucket: row
+                    .key
+                    .bucket
+                    .map(|bucket| read_text(&snapshot, bucket, "bucket"))
+                    .transpose()?,
+                observed: row.observed,
+                used_percent,
+                resets_at,
+                host,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    groups.sort_by(|left, right| {
+        (
+            &left.provider_name,
+            left.provider,
+            &left.account,
+            left.window_secs,
+            &left.bucket,
+        )
+            .cmp(&(
+                &right.provider_name,
+                right.provider,
+                &right.account,
+                right.window_secs,
+                &right.bucket,
+            ))
+    });
+    Ok(QuotaView {
+        now,
+        examined,
+        groups,
+    })
 }
 
 fn read_text<Store>(reader: &Store, handle: TextHandle, what: &str) -> Result<String>

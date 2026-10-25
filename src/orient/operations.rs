@@ -119,6 +119,8 @@ impl Orient {
         out: &mut Out<'_>,
     ) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
+            // Quota acquires through the runtime, so it is read before entering it.
+            let quota = quota_section(&self.storage, pile, signer, runtime);
             runtime.block_on(cmd_show(
                 &self.storage,
                 pile,
@@ -131,6 +133,7 @@ impl Orient {
                 options.evaluate_habits,
                 self.health_max_age,
                 self.service_events_collection,
+                &quota,
                 out,
             ))
         })
@@ -269,6 +272,7 @@ use crate::schemas::message::{
     local as local_message, DEFAULT_SCOPE_ID as MESSAGE_SCOPE_ID, KIND_MESSAGE_ID, KIND_READ_ID,
 };
 use crate::schemas::orient::{presentation, KIND_PRESENTED};
+use crate::schemas::quota::DEFAULT_SCOPE_ID as QUOTA_SCOPE_ID;
 use crate::schemas::relations::{
     group as relation_group, identity as relation_identity, lifecycle as relation_lifecycle,
     profile as relation_profile, DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID, KIND_GROUP,
@@ -3762,6 +3766,7 @@ async fn cmd_show(
     evaluate_habits: bool,
     health_max_age: Duration,
     service_events_collection: Option<CollectionHandle>,
+    quota: &str,
     output: &mut Out<'_>,
 ) -> Result<()> {
     use std::fmt::Write as _;
@@ -3863,6 +3868,7 @@ async fn cmd_show(
         report.push_str(&habits);
         report.push_str(&goals);
         report.push_str(&window_status);
+        report.push_str(quota);
 
         write_complete_report(output, &report, "Orient overview")?;
 
@@ -3872,6 +3878,28 @@ async fn cmd_show(
         Ok(())
     }
     .await
+}
+
+/// The latest Quota readings as an overview section, or nothing.
+///
+/// Quota is a glance, never an input the overview depends on: a host with no
+/// routed Quota collection, or one holding no readings, omits the section, and
+/// a failed read is one line rather than a failed overview.
+fn quota_section(
+    routing: &Storage,
+    pile: &mut FacultyStore,
+    signer: &SigningKey,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+) -> String {
+    if !matches!(routing.collection_handle(QUOTA_SCOPE_ID), Ok(Some(_))) {
+        return String::new();
+    }
+    match clock::tai_nanoseconds_now()
+        .and_then(|now| crate::quota::operations::observe_at(routing, pile, signer, runtime, now))
+    {
+        Ok(view) => crate::quota::render::section(&view),
+        Err(error) => format!("Quota:\n- (unreadable: {error:#})\n"),
+    }
 }
 
 /// The [`NewsForm::Report`] form of one event: its `News:` line, carrying
