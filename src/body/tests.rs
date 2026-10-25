@@ -121,7 +121,9 @@ fn equal_time_intents_coexist_and_higher_event_id_wins() {
             assert_eq!(jit_id, expected_id);
             assert_eq!(selected_id, expected_id);
             assert_eq!(
-                body_model::decode_intent(snapshot.facts(), selected_id)?.text,
+                body_model::decode_intent(snapshot.facts(), selected_id)?
+                    .expect("decodable intent")
+                    .text,
                 jit_handle
             );
             assert_eq!(selected_text, expected_text);

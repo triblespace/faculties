@@ -137,28 +137,6 @@ fn fmt_id(id: Id) -> String {
     format!("{id:x}")
 }
 
-fn exactly_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "Body entity {} has {} values for {field}; expected exactly one",
-            fmt_id(entity),
-            values.len()
-        );
-    }
-    Ok(values.pop().expect("length checked above"))
-}
-
-fn at_most_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<Option<T>> {
-    if values.len() > 1 {
-        bail!(
-            "Body entity {} has {} values for {field}; expected at most one",
-            fmt_id(entity),
-            values.len()
-        );
-    }
-    Ok(values.pop())
-}
-
 fn validate_point(field: &str, interval: IntervalValue) -> Result<()> {
     let (start, end): (i128, i128) = interval
         .try_from_inline()
@@ -267,114 +245,81 @@ fn validate_capture_shape(row: &CaptureRow) -> Result<()> {
     Ok(())
 }
 
-pub fn decode_capture<P: TriblePattern>(space: &P, id: Id) -> Result<CaptureRow> {
+/// Decode one capture open-world: a capture lacking a required field is not
+/// one (`None`), and a field with several values yields the byte-smallest one
+/// (the smallest tuple for the required fields).
+pub fn decode_capture<P: TriblePattern>(space: &P, id: Id) -> Result<Option<CaptureRow>> {
+    let Some((created_at, modality, pose)) = find!(
+        (created_at: IntervalValue, modality: TextHandle, pose: TextHandle),
+        pattern!(space, [{ id @
+            metadata::created_at: ?created_at,
+            capture::modality: ?modality,
+            capture::pose: ?pose,
+        }])
+    )
+    .min() else {
+        return Ok(None);
+    };
     let row = CaptureRow {
         id,
-        created_at: exactly_one(
-            id,
-            "metadata::created_at",
-            find!(
-                value: IntervalValue,
-                pattern!(space, [{ id @ metadata::created_at: ?value }])
-            )
-            .collect(),
-        )?,
-        frame: at_most_one(
-            id,
-            "capture::frame",
-            find!(
-                value: RawHandle,
-                pattern!(space, [{ id @ capture::frame: ?value }])
-            )
-            .collect(),
-        )?,
-        mime: at_most_one(
-            id,
-            "capture::mime",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ capture::mime: ?value }])
-            )
-            .collect(),
-        )?,
-        width: at_most_one(
-            id,
-            "capture::width",
-            find!(
-                value: DimensionValue,
-                pattern!(space, [{ id @ capture::width: ?value }])
-            )
-            .collect(),
-        )?,
-        height: at_most_one(
-            id,
-            "capture::height",
-            find!(
-                value: DimensionValue,
-                pattern!(space, [{ id @ capture::height: ?value }])
-            )
-            .collect(),
-        )?,
-        modality: exactly_one(
-            id,
-            "capture::modality",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ capture::modality: ?value }])
-            )
-            .collect(),
-        )?,
-        note: at_most_one(
-            id,
-            "capture::note",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ capture::note: ?value }])
-            )
-            .collect(),
-        )?,
-        pose: exactly_one(
-            id,
-            "capture::pose",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ capture::pose: ?value }])
-            )
-            .collect(),
-        )?,
+        created_at,
+        frame: find!(
+            value: RawHandle,
+            pattern!(space, [{ id @ capture::frame: ?value }])
+        )
+        .min(),
+        mime: find!(
+            value: TextHandle,
+            pattern!(space, [{ id @ capture::mime: ?value }])
+        )
+        .min(),
+        width: find!(
+            value: DimensionValue,
+            pattern!(space, [{ id @ capture::width: ?value }])
+        )
+        .min(),
+        height: find!(
+            value: DimensionValue,
+            pattern!(space, [{ id @ capture::height: ?value }])
+        )
+        .min(),
+        modality,
+        note: find!(
+            value: TextHandle,
+            pattern!(space, [{ id @ capture::note: ?value }])
+        )
+        .min(),
+        pose,
     };
     validate_capture_shape(&row)?;
-    Ok(row)
+    Ok(Some(row))
 }
 
-pub fn decode_intent<P: TriblePattern>(space: &P, id: Id) -> Result<IntentRow> {
+/// Decode one intent with the same open-world reading as [`decode_capture`].
+pub fn decode_intent<P: TriblePattern>(space: &P, id: Id) -> Result<Option<IntentRow>> {
+    let Some((created_at, text)) = find!(
+        (created_at: IntervalValue, text: TextHandle),
+        pattern!(space, [{ id @
+            metadata::created_at: ?created_at,
+            intent::text: ?text,
+        }])
+    )
+    .min() else {
+        return Ok(None);
+    };
     let row = IntentRow {
         id,
-        created_at: exactly_one(
-            id,
-            "metadata::created_at",
-            find!(
-                value: IntervalValue,
-                pattern!(space, [{ id @ metadata::created_at: ?value }])
-            )
-            .collect(),
-        )?,
-        text: exactly_one(
-            id,
-            "intent::text",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ intent::text: ?value }])
-            )
-            .collect(),
-        )?,
+        created_at,
+        text,
     };
     validate_point("intent creation time", row.created_at)?;
-    Ok(row)
+    Ok(Some(row))
 }
 
-fn load_capture(space: &TribleSet, id: Id) -> Result<CaptureRow> {
-    let row = decode_capture(space, id)?;
+fn load_capture(space: &TribleSet, id: Id) -> Result<Option<CaptureRow>> {
+    let Some(row) = decode_capture(space, id)? else {
+        return Ok(None);
+    };
     let expected = capture_record(&row);
     let canonical = expected
         .root()
@@ -392,11 +337,13 @@ fn load_capture(space: &TribleSet, id: Id) -> Result<CaptureRow> {
             fmt_id(id)
         );
     }
-    Ok(row)
+    Ok(Some(row))
 }
 
-fn load_intent(space: &TribleSet, id: Id) -> Result<IntentRow> {
-    let row = decode_intent(space, id)?;
+fn load_intent(space: &TribleSet, id: Id) -> Result<Option<IntentRow>> {
+    let Some(row) = decode_intent(space, id)? else {
+        return Ok(None);
+    };
     let expected = intent_record(&row);
     let canonical = expected
         .root()
@@ -414,7 +361,7 @@ fn load_intent(space: &TribleSet, id: Id) -> Result<IntentRow> {
             fmt_id(id)
         );
     }
-    Ok(row)
+    Ok(Some(row))
 }
 
 /// Strictly project the complete collection ontology without dereferencing
@@ -431,10 +378,14 @@ pub fn load_catalog(space: &TribleSet) -> Result<BodyCatalog> {
 
     let mut catalog = BodyCatalog::default();
     for id in capture_ids {
-        catalog.captures.insert(id, load_capture(space, id)?);
+        if let Some(row) = load_capture(space, id)? {
+            catalog.captures.insert(id, row);
+        }
     }
     for id in intent_ids {
-        catalog.intents.insert(id, load_intent(space, id)?);
+        if let Some(row) = load_intent(space, id)? {
+            catalog.intents.insert(id, row);
+        }
     }
 
     let accounted: usize = catalog
@@ -840,7 +791,31 @@ mod tests {
         facts += entity! { ExclusiveId::force_ref(&id) @
             metadata::created_at: at(9.0),
         };
-        let error = load_catalog(&facts).unwrap_err();
-        assert!(error.to_string().contains("expected exactly one"));
+        let error = load_catalog(&facts).unwrap_err().to_string();
+        assert!(error.contains("is not intrinsic") || error.contains("outside its canonical"));
+    }
+
+    #[test]
+    fn decoding_skips_a_capture_lacking_a_field_and_picks_among_repeated_values() {
+        let canonical = vision();
+        let id = canonical.root().unwrap();
+        let bare = Id::new([0xD4; 16]).unwrap();
+        let mut facts = canonical.facts().clone();
+        facts += entity! { ExclusiveId::force_ref(&bare) @
+            metadata::tag: &KIND_CAPTURE,
+            metadata::created_at: at(2.0),
+            capture::modality: "touch",
+        };
+        facts += entity! { ExclusiveId::force_ref(&id) @
+            metadata::created_at: at(9.0),
+            capture::note: "second",
+        };
+        assert!(decode_capture(&facts, bare).unwrap().is_none());
+        let row = decode_capture(&facts, id).unwrap().unwrap();
+        assert_eq!(row.created_at, at(1.0).min(at(9.0)));
+        let notes: Vec<TextHandle> =
+            find!(value: TextHandle, pattern!(&facts, [{ id @ capture::note: ?value }])).collect();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(row.note, notes.into_iter().min());
     }
 }
