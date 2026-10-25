@@ -7,8 +7,7 @@
 //! by choosing one of several scalar `status` values.
 //!
 //! Ordinary readers query the maintained fact archive directly and skip rows
-//! they cannot decode. Exact identity and fact-set checks remain isolated to
-//! explicit migration validation.
+//! they cannot decode.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,8 +20,7 @@ pub use operations::*;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 use crate::schemas::planner::{
@@ -116,32 +114,6 @@ impl PlannerCatalog {
     pub fn notes_for(&self, event: Id) -> impl Iterator<Item = &NoteRow> {
         self.notes.values().filter(move |row| row.event == event)
     }
-}
-
-fn fmt_id(id: Id) -> String {
-    format!("{id:x}")
-}
-
-fn exactly_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "planner entity {} has {} values for {field}; expected exactly one",
-            fmt_id(entity),
-            values.len()
-        );
-    }
-    Ok(values.pop().expect("length checked above"))
-}
-
-fn at_most_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<Option<T>> {
-    if values.len() > 1 {
-        bail!(
-            "planner entity {} has {} values for {field}; expected at most one",
-            fmt_id(entity),
-            values.len()
-        );
-    }
-    Ok(values.pop())
 }
 
 fn validate_label(field: &str, value: &str) -> Result<()> {
@@ -399,53 +371,6 @@ pub fn event_facts(space: &TribleSet, event: Id) -> TribleSet {
         .collect()
 }
 
-fn canonical_event_entities(space: &TribleSet) -> BTreeSet<Id> {
-    find!(
-        (entity: Id, uid: TextHandle),
-        pattern!(space, [{ ?entity @
-            metadata::tag: &KIND_EVENT_ID,
-            event::ical_uid: ?uid,
-        }])
-    )
-    .filter_map(|(entity, uid)| (event_identity(uid).root() == Some(entity)).then_some(entity))
-    .collect()
-}
-
-fn canonical_note_entities(space: &TribleSet) -> BTreeSet<Id> {
-    find!(
-        (
-            entity: Id,
-            event_id: Id,
-            text: TextHandle,
-            created_at: IntervalValue,
-        ),
-        pattern!(space, [{ ?entity @
-            metadata::tag: &KIND_NOTE_ID,
-            metadata::created_at: ?created_at,
-            note::note_about: ?event_id,
-            note::note_text: ?text,
-        }])
-    )
-    .filter_map(|(entity, event_id, text, created_at)| {
-        (note_record(event_id, text, created_at).root() == Some(entity)).then_some(entity)
-    })
-    .collect()
-}
-
-fn canonical_cancellation_entities(space: &TribleSet) -> BTreeSet<Id> {
-    find!(
-        (entity: Id, event_id: Id),
-        pattern!(space, [{ ?entity @
-            metadata::tag: &KIND_CANCELLATION_ID,
-            cancellation::event: ?event_id,
-        }])
-    )
-    .filter_map(|(entity, event_id)| {
-        (cancellation_record(event_id).root() == Some(entity)).then_some(entity)
-    })
-    .collect()
-}
-
 fn has_canonical_cancellation(space: &TribleSet, event_id: Id) -> bool {
     let expected = cancellation_record(event_id);
     let present = expected.facts().iter().all(|fact| space.contains(fact));
@@ -467,285 +392,6 @@ fn legacy_event_fact_is_inert(space: &TribleSet, event_id: Id, fact: &Trible) ->
     status_count > 1
         && *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>()
             == text_handle(STATUS_CANCELLED)
-}
-
-fn native_event_status(space: &TribleSet, id: Id) -> Result<TextHandle> {
-    let mut values: Vec<TextHandle> = find!(
-        value: TextHandle,
-        pattern!(space, [{ id @ event::status: ?value }])
-    )
-    .collect();
-    if values.len() == 2 && has_canonical_cancellation(space, id) {
-        let cancelled = text_handle(STATUS_CANCELLED);
-        values.retain(|value| *value != cancelled);
-    }
-    exactly_one(id, "event::status", values)
-}
-
-fn load_validated_event(space: &TribleSet, id: Id) -> Result<EventRow> {
-    let row = EventRow {
-        id,
-        uid: exactly_one(
-            id,
-            "event::ical_uid",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::ical_uid: ?value }])
-            )
-            .collect(),
-        )?,
-        summary: exactly_one(
-            id,
-            "event::summary",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::summary: ?value }])
-            )
-            .collect(),
-        )?,
-        description: at_most_one(
-            id,
-            "event::description",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::description: ?value }])
-            )
-            .collect(),
-        )?,
-        time: exactly_one(
-            id,
-            "event::time",
-            find!(
-                value: IntervalValue,
-                pattern!(space, [{ id @ event::time: ?value }])
-            )
-            .collect(),
-        )?,
-        rrule: at_most_one(
-            id,
-            "event::rrule",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::rrule: ?value }])
-            )
-            .collect(),
-        )?,
-        rdates: find!(
-            value: IntervalValue,
-            pattern!(space, [{ id @ event::rdate: ?value }])
-        )
-        .collect(),
-        exdates: find!(
-            value: IntervalValue,
-            pattern!(space, [{ id @ event::exdate: ?value }])
-        )
-        .collect(),
-        location: at_most_one(
-            id,
-            "event::location",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::location: ?value }])
-            )
-            .collect(),
-        )?,
-        status: native_event_status(space, id)?,
-        transp: exactly_one(
-            id,
-            "event::transp",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ event::transp: ?value }])
-            )
-            .collect(),
-        )?,
-        attendees: find!(
-            value: Id,
-            pattern!(space, [{ id @ event::attendee: ?value }])
-        )
-        .collect(),
-        organizer: at_most_one(
-            id,
-            "event::organizer",
-            find!(value: Id, pattern!(space, [{ id @ event::organizer: ?value }])).collect(),
-        )?,
-        sequence: at_most_one(
-            id,
-            "event::sequence",
-            find!(
-                value: SequenceValue,
-                pattern!(space, [{ id @ event::sequence: ?value }])
-            )
-            .collect(),
-        )?,
-    };
-    validate_event_values(&row)?;
-    let expected = event_record(
-        row.uid,
-        row.summary,
-        row.description,
-        row.time,
-        row.rrule,
-        &row.rdates,
-        &row.exdates,
-        row.location,
-        row.status,
-        row.transp,
-        &row.attendees,
-        row.organizer,
-        row.sequence,
-    );
-    let canonical = expected
-        .root()
-        .expect("canonical event record has one root");
-    if canonical != id {
-        bail!(
-            "planner event {} is not the canonical UID-derived identity {}",
-            fmt_id(id),
-            fmt_id(canonical)
-        );
-    }
-    let actual = entity_facts(space, id);
-    let missing = expected.facts().difference(&actual);
-    let unexpected = actual.difference(expected.facts());
-    let unexpected_is_legacy_noise = unexpected
-        .iter()
-        .all(|fact| legacy_event_fact_is_inert(space, id, fact));
-    if !missing.is_empty() || !unexpected_is_legacy_noise {
-        bail!(
-            "planner event {} has facts outside its canonical immutable record",
-            fmt_id(id)
-        );
-    }
-    Ok(row)
-}
-
-fn load_validated_note(space: &TribleSet, id: Id) -> Result<NoteRow> {
-    let row = NoteRow {
-        id,
-        event: exactly_one(
-            id,
-            "note::note_about",
-            find!(
-                value: Id,
-                pattern!(space, [{ id @ note::note_about: ?value }])
-            )
-            .collect(),
-        )?,
-        text: exactly_one(
-            id,
-            "note::note_text",
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ id @ note::note_text: ?value }])
-            )
-            .collect(),
-        )?,
-        created_at: exactly_one(
-            id,
-            "metadata::created_at",
-            find!(
-                value: IntervalValue,
-                pattern!(space, [{ id @ metadata::created_at: ?value }])
-            )
-            .collect(),
-        )?,
-    };
-    validate_point("note creation time", row.created_at)?;
-    let expected = note_record(row.event, row.text, row.created_at);
-    let canonical = expected.root().expect("canonical note has one root");
-    if canonical != id {
-        bail!(
-            "planner note {} is not intrinsic; canonical identity is {}",
-            fmt_id(id),
-            fmt_id(canonical)
-        );
-    }
-    if entity_facts(space, id) != *expected.facts() {
-        bail!(
-            "planner note {} has facts outside its canonical immutable record",
-            fmt_id(id)
-        );
-    }
-    Ok(row)
-}
-
-fn load_validated_cancellation(space: &TribleSet, id: Id) -> Result<CancellationRow> {
-    let row = CancellationRow {
-        id,
-        event: exactly_one(
-            id,
-            "cancellation::event",
-            find!(
-                value: Id,
-                pattern!(space, [{ id @ cancellation::event: ?value }])
-            )
-            .collect(),
-        )?,
-    };
-    let expected = cancellation_record(row.event);
-    let canonical = expected
-        .root()
-        .expect("canonical cancellation has one root");
-    if canonical != id {
-        bail!(
-            "planner cancellation {} is not intrinsic; canonical identity is {}",
-            fmt_id(id),
-            fmt_id(canonical)
-        );
-    }
-    if entity_facts(space, id) != *expected.facts() {
-        bail!(
-            "planner cancellation {} has facts outside its canonical assertion",
-            fmt_id(id)
-        );
-    }
-    Ok(row)
-}
-
-/// Strictly project the native collection ontology without dereferencing
-/// payloads.
-///
-/// Selection starts from each record's intrinsic identity, not merely its kind
-/// tag. This is important for additive stopped-world cutovers: historical
-/// random-id Planner facts remain in the collection as immutable provenance,
-/// while only UID-derived events and intrinsic notes/cancellations participate
-/// in the live catalog. Once selected, a native entity is validated exactly
-/// apart from the two explicit legacy event residues handled above: creation
-/// observations and a shadowed scalar cancellation.
-fn load_validated_catalog(space: &TribleSet) -> Result<PlannerCatalog> {
-    let event_ids = canonical_event_entities(space);
-    let note_ids = canonical_note_entities(space);
-    let cancellation_ids = canonical_cancellation_entities(space);
-
-    let mut catalog = PlannerCatalog::default();
-    for id in event_ids {
-        catalog.events.insert(id, load_validated_event(space, id)?);
-    }
-    for id in note_ids {
-        let row = load_validated_note(space, id)?;
-        if !catalog.events.contains_key(&row.event) {
-            bail!(
-                "planner note {} refers to missing event {}",
-                fmt_id(id),
-                fmt_id(row.event)
-            );
-        }
-        catalog.notes.insert(id, row);
-    }
-    for id in cancellation_ids {
-        let row = load_validated_cancellation(space, id)?;
-        if !catalog.events.contains_key(&row.event) {
-            bail!(
-                "planner cancellation {} refers to missing event {}",
-                fmt_id(id),
-                fmt_id(row.event)
-            );
-        }
-        catalog.cancellations.insert(id, row);
-    }
-
-    Ok(catalog)
 }
 
 /// IDs of all events inhabiting the typed Planner projection.
@@ -771,8 +417,7 @@ where
 ///
 /// Unknown facts and unrelated extensions remain invisible. Where this
 /// version of the Planner model exposes a scalar field, the first value in
-/// pattern order is its deterministic presentation choice; strict
-/// stopped-world validation is reserved for migration boundaries.
+/// pattern order is its deterministic presentation choice.
 pub fn event<P>(space: &P, id: Id) -> Option<EventRow>
 where
     P: TriblePattern + ?Sized,
@@ -973,64 +618,6 @@ pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<Strin
     Ok(text.to_string())
 }
 
-/// Validate every selected native record and all of its referenced text
-/// payloads. Preserved legacy and unrelated generic collection facts are not
-/// part of this semantic view.
-pub fn validate_catalog(reader: &PileSnapshot, space: &TribleSet) -> Result<PlannerCatalog> {
-    let catalog = load_validated_catalog(space)?;
-    for row in catalog.events.values() {
-        let uid = read_text(reader, row.uid)
-            .with_context(|| format!("read UID of planner event {}", fmt_id(row.id)))?;
-        validate_uid(&uid)
-            .with_context(|| format!("validate UID of planner event {}", fmt_id(row.id)))?;
-        if let Some(description) = row.description {
-            read_text(reader, description)
-                .with_context(|| format!("read description of planner event {}", fmt_id(row.id)))?;
-        }
-    }
-    for row in catalog.notes.values() {
-        read_text(reader, row.text)
-            .with_context(|| format!("read planner note {}", fmt_id(row.id)))?;
-    }
-    Ok(catalog)
-}
-
-/// Strictly validate a prospective legacy-migration fragment against a frozen
-/// source union. Ordinary authored publication does not use this closed-world
-/// check; constructors establish the local fragment invariants directly.
-pub fn validate_candidate(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<PlannerCatalog> {
-    let mut local = fragment.blobs().clone();
-    let local_reader = local
-        .snapshot()
-        .context("snapshot staged Planner payloads")?;
-    for fact in fragment.facts() {
-        if fact.a() == &event::ical_uid.id()
-            || fact.a() == &event::description.id()
-            || fact.a() == &note::note_text.id()
-        {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
-            let text: anybytes::View<str> = if local_reader.metadata(handle)?.is_some() {
-                local_reader
-                    .get(handle)
-                    .context("read staged Planner text")?
-            } else {
-                reader.get(handle).context("read existing Planner text")?
-            };
-            if fact.a() == &event::ical_uid.id() {
-                validate_uid(&text)?;
-            }
-        }
-    }
-
-    let mut union = current.clone();
-    union += fragment.facts().clone();
-    load_validated_catalog(&union)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_projection_survives_extra_values_while_strict_validation_rejects_them() {
+    fn ordinary_projection_survives_extra_values() {
         let event = event_fragment(&draft("fork@example", "meeting")).unwrap();
         let event_id = event.root().unwrap();
         let mut facts = event.into_facts();
@@ -1112,8 +699,26 @@ mod tests {
         };
 
         assert!(load_catalog(&facts).unwrap().events.contains_key(&event_id));
-        let error = load_validated_catalog(&facts).unwrap_err();
-        assert!(format!("{error:#}").contains("2 values for event::summary"));
+    }
+
+    #[test]
+    fn ordinary_projection_skips_an_event_lacking_a_required_field() {
+        let event = event_fragment(&draft("bare@example", "meeting")).unwrap();
+        let event_id = event.root().unwrap();
+        let uid = find!(
+            value: TextHandle,
+            pattern!(event.facts(), [{ event_id @ event::ical_uid: ?value }])
+        )
+        .next()
+        .unwrap();
+        let mut facts = event_identity(uid).into_facts();
+        facts += event_fragment(&draft("kept@example", "meeting"))
+            .unwrap()
+            .into_facts();
+
+        let catalog = load_catalog(&facts).unwrap();
+        assert_eq!(catalog.events.len(), 1);
+        assert!(!catalog.events.contains_key(&event_id));
     }
 
     #[test]
@@ -1127,17 +732,6 @@ mod tests {
 
         assert_eq!(catalog.events[&event_id].attendees, input.attendees);
         assert_eq!(catalog.events[&event_id].rdates, input.rdates);
-    }
-
-    #[test]
-    fn note_and_cancellation_must_reference_an_event_in_the_union() {
-        let note = note_fragment(id(3), "orphan", interval(1, 1)).unwrap();
-        let note_error = load_validated_catalog(note.facts()).unwrap_err();
-        assert!(format!("{note_error:#}").contains("refers to missing event"));
-
-        let cancellation = cancellation_fragment(id(4));
-        let cancellation_error = load_validated_catalog(cancellation.facts()).unwrap_err();
-        assert!(format!("{cancellation_error:#}").contains("refers to missing event"));
     }
 
     #[test]
@@ -1164,19 +758,12 @@ mod tests {
         };
         facts += entity! { ExclusiveId::force_ref(&KIND_EVENT_ID) @ metadata::tag: &id(11) };
 
-        let catalog = load_validated_catalog(&facts).unwrap();
+        let catalog = load_catalog(&facts).unwrap();
         assert_eq!(
             catalog.events.keys().copied().collect::<Vec<_>>(),
             vec![event_id]
         );
         assert!(catalog.notes.is_empty());
         assert!(catalog.cancellations.is_empty());
-
-        let mut polluted = event_fragment(&draft("polluted@example", "canonical")).unwrap();
-        let polluted_id = polluted.root().unwrap();
-        polluted += entity! { ExclusiveId::force_ref(&polluted_id) @ metadata::tag: &id(12) };
-        assert!(load_catalog(polluted.facts()).is_ok());
-        let error = load_validated_catalog(polluted.facts()).unwrap_err();
-        assert!(format!("{error:#}").contains("outside its canonical immutable record"));
     }
 }

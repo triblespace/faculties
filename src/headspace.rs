@@ -799,22 +799,6 @@ fn count_u64(value: CountValue, entity: Id, field: &str) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-fn exactly_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<T> {
-    let count = values.len();
-    if count != 1 {
-        bail!("Headspace entity {entity:x} has {count} values for {field}; expected exactly one");
-    }
-    Ok(values.into_iter().next().unwrap())
-}
-
-fn at_most_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>> {
-    let count = values.len();
-    if count > 1 {
-        bail!("Headspace entity {entity:x} has {count} values for {field}; expected at most one");
-    }
-    Ok(values.into_iter().next())
-}
-
 fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
     let mut values: Vec<_> = values.into_iter().collect();
     values.sort_unstable();
@@ -843,135 +827,101 @@ pub fn active_facts(facts: &TribleSet) -> TribleSet {
         .collect()
 }
 
-fn raw_profile<P>(facts: &P, id: Id) -> Result<RawProfileSnapshot>
+/// Read one profile snapshot open-world: a snapshot lacking a required field
+/// is not one, and a field with several values yields the byte-smallest one
+/// (the smallest tuple for the required fields).
+fn raw_profile<P>(facts: &P, id: Id) -> Option<RawProfileSnapshot>
 where
     P: TriblePattern + ?Sized,
 {
-    Ok(RawProfileSnapshot {
-        anchor: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::model_profile_id: ?v }]))
-                .collect(),
-            id,
-            "model_profile_id",
-        )?,
-        name: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ metadata::name: ?v }])).collect(),
-            id,
-            "metadata::name",
-        )?,
-        model: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::model_name: ?v }]))
-                .collect(),
-            id,
-            "model_name",
-        )?,
-        base_url: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::model_base_url: ?v }]))
-                .collect(),
-            id,
-            "model_base_url",
-        )?,
-        model_secret_version: at_most_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::model_secret_version: ?v }]))
-                .collect(),
-            id,
-            "model_secret_version",
-        )?,
-        reasoning_effort: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::model_reasoning_effort: ?v }])).collect(),
-            id,
-            "model_reasoning_effort",
-        )?,
-        stream: exactly_one(
-            find!(v: CountValue, pattern!(facts, [{ id @ playground_config::model_stream: ?v }]))
-                .collect(),
-            id,
-            "model_stream",
-        )?,
-        context_window_tokens: exactly_one(
-            find!(v: CountValue, pattern!(facts, [{ id @ playground_config::model_context_window_tokens: ?v }])).collect(),
-            id,
-            "model_context_window_tokens",
-        )?,
-        max_output_tokens: exactly_one(
-            find!(v: CountValue, pattern!(facts, [{ id @ playground_config::model_max_output_tokens: ?v }])).collect(),
-            id,
-            "model_max_output_tokens",
-        )?,
-        context_safety_margin_tokens: exactly_one(
-            find!(v: CountValue, pattern!(facts, [{ id @ playground_config::model_context_safety_margin_tokens: ?v }])).collect(),
-            id,
-            "model_context_safety_margin_tokens",
-        )?,
-        chars_per_token: exactly_one(
-            find!(v: CountValue, pattern!(facts, [{ id @ playground_config::model_chars_per_token: ?v }])).collect(),
-            id,
-            "model_chars_per_token",
-        )?,
+    let (
+        anchor,
+        name,
+        model,
+        base_url,
+        stream,
+        context_window_tokens,
+        max_output_tokens,
+        context_safety_margin_tokens,
+        chars_per_token,
+    ) = find!(
+        (
+            anchor: Id,
+            name: TextHandle,
+            model: TextHandle,
+            base_url: TextHandle,
+            stream: CountValue,
+            context_window_tokens: CountValue,
+            max_output_tokens: CountValue,
+            context_safety_margin_tokens: CountValue,
+            chars_per_token: CountValue,
+        ),
+        pattern!(facts, [{ id @
+            playground_config::model_profile_id: ?anchor,
+            metadata::name: ?name,
+            playground_config::model_name: ?model,
+            playground_config::model_base_url: ?base_url,
+            playground_config::model_stream: ?stream,
+            playground_config::model_context_window_tokens: ?context_window_tokens,
+            playground_config::model_max_output_tokens: ?max_output_tokens,
+            playground_config::model_context_safety_margin_tokens: ?context_safety_margin_tokens,
+            playground_config::model_chars_per_token: ?chars_per_token,
+        }])
+    )
+    .min()?;
+    Some(RawProfileSnapshot {
+        anchor,
+        name,
+        model,
+        base_url,
+        model_secret_version: find!(v: Id, pattern!(facts, [{ id @ playground_config::model_secret_version: ?v }])).min(),
+        reasoning_effort: find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::model_reasoning_effort: ?v }])).min(),
+        stream,
+        context_window_tokens,
+        max_output_tokens,
+        context_safety_margin_tokens,
+        chars_per_token,
         predecessors: sorted_ids(find!(v: Id, pattern!(facts, [{ id @ metadata::supersedes: ?v }]))),
     })
 }
 
-fn raw_config<P>(facts: &P, id: Id) -> Result<RawConfigSnapshot>
+/// Read one config snapshot with the same open-world reading as
+/// [`raw_profile`].
+fn raw_config<P>(facts: &P, id: Id) -> Option<RawConfigSnapshot>
 where
     P: TriblePattern + ?Sized,
 {
-    Ok(RawConfigSnapshot {
-        active_profile: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::active_model_profile_id: ?v }])).collect(),
-            id,
-            "active_model_profile_id",
-        )?,
-        system_prompt: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::system_prompt: ?v }])).collect(),
-            id,
-            "system_prompt",
-        )?,
-        cognition_scope: exactly_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::cognition_scope: ?v }])).collect(),
-            id,
-            "cognition_scope",
-        )?,
-        author: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::author: ?v }])).collect(),
-            id,
-            "author",
-        )?,
-        author_role: exactly_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::author_role: ?v }])).collect(),
-            id,
-            "author_role",
-        )?,
-        persona: at_most_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::persona_id: ?v }])).collect(),
-            id,
-            "persona_id",
-        )?,
-        poll_ms: exactly_one(
-            find!(v: CountValue, pattern!(facts, [{ id @ playground_config::poll_ms: ?v }])).collect(),
-            id,
-            "poll_ms",
-        )?,
-        tavily_secret_version: at_most_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::tavily_secret_version: ?v }])).collect(),
-            id,
-            "tavily_secret_version",
-        )?,
-        exa_secret_version: at_most_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::exa_secret_version: ?v }])).collect(),
-            id,
-            "exa_secret_version",
-        )?,
-        exec_default_cwd: at_most_one(
-            find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::exec_default_cwd: ?v }])).collect(),
-            id,
-            "exec_default_cwd",
-        )?,
-        exec_sandbox_profile: at_most_one(
-            find!(v: Id, pattern!(facts, [{ id @ playground_config::exec_sandbox_profile: ?v }])).collect(),
-            id,
-            "exec_sandbox_profile",
-        )?,
+    let (active_profile, system_prompt, cognition_scope, author, author_role, poll_ms) = find!(
+        (
+            active_profile: Id,
+            system_prompt: TextHandle,
+            cognition_scope: Id,
+            author: TextHandle,
+            author_role: TextHandle,
+            poll_ms: CountValue,
+        ),
+        pattern!(facts, [{ id @
+            playground_config::active_model_profile_id: ?active_profile,
+            playground_config::system_prompt: ?system_prompt,
+            playground_config::cognition_scope: ?cognition_scope,
+            playground_config::author: ?author,
+            playground_config::author_role: ?author_role,
+            playground_config::poll_ms: ?poll_ms,
+        }])
+    )
+    .min()?;
+    Some(RawConfigSnapshot {
+        active_profile,
+        system_prompt,
+        cognition_scope,
+        author,
+        author_role,
+        persona: find!(v: Id, pattern!(facts, [{ id @ playground_config::persona_id: ?v }])).min(),
+        poll_ms,
+        tavily_secret_version: find!(v: Id, pattern!(facts, [{ id @ playground_config::tavily_secret_version: ?v }])).min(),
+        exa_secret_version: find!(v: Id, pattern!(facts, [{ id @ playground_config::exa_secret_version: ?v }])).min(),
+        exec_default_cwd: find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::exec_default_cwd: ?v }])).min(),
+        exec_sandbox_profile: find!(v: Id, pattern!(facts, [{ id @ playground_config::exec_sandbox_profile: ?v }])).min(),
         predecessors: sorted_ids(find!(v: Id, pattern!(facts, [{ id @ metadata::supersedes: ?v }]))),
     })
 }
@@ -1075,7 +1025,9 @@ where
     let mut raw = RawCatalog::default();
     let mut profile_graphs: BTreeMap<Id, BTreeMap<Id, Vec<Id>>> = BTreeMap::new();
     for id in profile_ids {
-        let snapshot = raw_profile(facts, id)?;
+        let Some(snapshot) = raw_profile(facts, id) else {
+            continue;
+        };
         if !anchors.contains(&snapshot.anchor) {
             bail!(
                 "profile snapshot {id:x} names undeclared anchor {:x}",
@@ -1100,7 +1052,9 @@ where
 
     let mut config_graph = BTreeMap::new();
     for id in config_ids {
-        let snapshot = raw_config(facts, id)?;
+        let Some(snapshot) = raw_config(facts, id) else {
+            continue;
+        };
         if !anchors.contains(&snapshot.active_profile) {
             bail!(
                 "config snapshot {id:x} names undeclared active profile {:x}",
@@ -1649,6 +1603,49 @@ mod tests {
                     == BTreeSet::from([left_join_id, right_join_id])
         ));
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn snapshots_lacking_a_field_are_skipped_and_repeated_fields_do_not_fail() {
+        let anchor = test_id(0x24);
+        let (mut fragment, profile_id, config_id) = add_profile_fragment(
+            &default_profile(anchor, "open-world"),
+            &default_config(anchor),
+            &[],
+        )
+        .unwrap();
+        let missing = test_id(0x25);
+        fragment += entity! { ExclusiveId::force_ref(&missing) @
+            metadata::tag: &KIND_LIVE_RECORD,
+            metadata::tag: &KIND_CONFIG_ID,
+            playground_config::active_model_profile_id: &anchor,
+        };
+        let default_model = find!(
+            v: TextHandle,
+            pattern!(fragment.facts(), [{ profile_id @ playground_config::model_name: ?v }])
+        )
+        .next()
+        .unwrap();
+        let other: TextHandle = fragment.put("other".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&profile_id) @
+            playground_config::model_name: other,
+        };
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let catalog = project_result(&reader, &facts).unwrap();
+        assert!(matches!(catalog.config, Resolution::Unique(ref head) if head.id == config_id));
+        assert!(!catalog.snapshot_ids().contains(&missing));
+        let Resolution::Unique(ref profile) = catalog.profiles[&anchor] else {
+            panic!("one profile head");
+        };
+        // Several values select the byte-smallest model handle.
+        let expected = if other < default_model {
+            "other"
+        } else {
+            DEFAULT_MODEL
+        };
+        assert_eq!(profile.value.model, expected);
     }
 
     #[test]
