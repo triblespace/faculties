@@ -18,7 +18,9 @@ use std::sync::OnceLock;
 use crate::clock;
 #[cfg(test)]
 use crate::collection_names::open_configured;
+use crate::files::{content_hash_hex, ContentHandle};
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
+use crate::schemas::files::{file, KIND_FILE};
 use crate::schemas::wiki::{self as schema, extract_link_targets};
 use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use crate::wiki::{
@@ -630,6 +632,92 @@ fn validate_links<P: TriblePattern>(content: &str, facts: &P, allow_dangling: bo
     }
 }
 
+/// Check every `files:` reference against the Files catalog at write time.
+///
+/// A complete content handle passes only when some file record carries it.
+/// That is catalog presence, not body residency: a catalog commit syncs as a
+/// record before its bytes, so a file whose bytes have not arrived is still a
+/// real file. A handle typed from a truncated display keeps its true prefix
+/// and invents the rest, so the refusal names the one catalog handle sharing
+/// the longest prefix, when exactly one does, and never rewrites the link.
+/// Entity ids stay direct, as in [`crate::files::resolve_reference`]. A short
+/// selector that survived [`lint_fix`] matched nothing or several things.
+fn validate_file_links<P: TriblePattern>(
+    content: &str,
+    files: Option<&P>,
+    allow_dangling: bool,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    let re = regex::Regex::new(r"\bfiles:([0-9A-Fa-f]+)").unwrap();
+    for captures in re.captures_iter(content) {
+        let token = captures[1].to_ascii_lowercase();
+        match (token.len(), files) {
+            (32, _) => {}
+            (64, _) if allow_dangling => {}
+            (64, None) => failures.push(format!(
+                "cannot check files:{token} without the Files collection"
+            )),
+            (64, Some(files)) => {
+                let hash = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&token)
+                    .map_err(|_| anyhow!("invalid content hash '{token}'"))?;
+                let handle: ContentHandle = inlineencodings::Handle::from_hash(hash);
+                if exists!(
+                    (),
+                    pattern!(files, [{
+                        _?file @ metadata::tag: &KIND_FILE,
+                        file::content: &handle,
+                    }])
+                ) {
+                    continue;
+                }
+                let mut nearest = BTreeSet::new();
+                let mut shared = 0;
+                for content in find!(
+                    content: ContentHandle,
+                    pattern!(files, [{
+                        _?file @ metadata::tag: &KIND_FILE,
+                        file::content: ?content,
+                    }])
+                ) {
+                    let hex = content_hash_hex(content);
+                    let common = hex
+                        .bytes()
+                        .zip(token.bytes())
+                        .take_while(|(left, right)| left == right)
+                        .count();
+                    if common > shared {
+                        shared = common;
+                        nearest.clear();
+                    }
+                    if common == shared && common > 0 {
+                        nearest.insert(hex);
+                    }
+                }
+                match nearest.len() {
+                    1 => failures.push(format!(
+                        "files:{token} names no cataloged file; files:{} shares its first {shared} hex digits",
+                        nearest.first().expect("one nearest handle")
+                    )),
+                    _ => failures.push(format!("files:{token} names no cataloged file")),
+                }
+            }
+            (_, None) => failures.push(format!("truncated link files:{token}")),
+            (_, Some(files)) => match crate::files::resolve_reference(files, &token) {
+                Ok(reference) => failures.push(format!(
+                    "truncated link files:{token} (expands to files:{})",
+                    reference.hex()
+                )),
+                Err(error) => failures.push(format!("truncated link files:{token}: {error}")),
+            },
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("Files link validation failed:\n  {}", failures.join("\n  "))
+    }
+}
+
 struct ReferenceResolver<'a, P: TriblePattern> {
     wiki: &'a P,
     files: Option<&'a P>,
@@ -794,6 +882,7 @@ fn prepare_content(
     let content = lint_fix(raw, ReferenceResolver { wiki, files });
     validate_typst(&content)?;
     validate_links(&content, wiki, allow_dangling)?;
+    validate_file_links(&content, files, allow_dangling)?;
     Ok(content)
 }
 
@@ -3279,5 +3368,137 @@ mod tests {
             reported.contains("no fragment has ever had it") && !reported.contains("ANCHOR"),
             "an id no fragment ever had must not be called an anchor; got: {reported}"
         );
+    }
+
+    /// One file's catalog facts, without its bytes: a `TribleSet` holds no
+    /// blobs, which is exactly a catalog record that synced ahead of its body.
+    fn cataloged(bytes: &[u8], name: &str) -> (TribleSet, String) {
+        let fragment = crate::files::stage(bytes.to_vec(), name, "text/plain").unwrap();
+        let content = find!(
+            content: ContentHandle,
+            pattern!(&fragment, [{ _?file @ file::content: ?content }])
+        )
+        .next()
+        .unwrap();
+        let mut facts = TribleSet::new();
+        facts += fragment;
+        (facts, content_hash_hex(content))
+    }
+
+    /// The same length, every digit after `keep` replaced by a different one.
+    fn invented_tail(hash: &str, keep: usize) -> String {
+        let tail: String = hash[keep..]
+            .chars()
+            .map(|digit| if digit == '0' { '1' } else { '0' })
+            .collect();
+        format!("{}{tail}", &hash[..keep])
+    }
+
+    #[test]
+    fn a_cataloged_handle_passes_without_its_body() {
+        let (files, hash) = cataloged(b"catalog only", "note.txt");
+        let content = format!("#link(\"files:{}\")[note]", hash.to_ascii_uppercase());
+        validate_file_links(&content, Some(&files), false).unwrap();
+    }
+
+    #[test]
+    fn an_invented_tail_is_refused_and_names_the_file_it_was_typed_from() {
+        let (mut files, hash) = cataloged(b"the real file", "real.txt");
+        let (other, other_hash) = cataloged(b"an unrelated file", "other.txt");
+        files += other;
+        let keep = 12;
+        let shared_with_other = other_hash
+            .bytes()
+            .zip(hash.bytes())
+            .take_while(|(left, right)| left == right)
+            .count();
+        assert!(
+            shared_with_other < keep,
+            "fixture hashes share {keep} digits"
+        );
+        let invented = invented_tail(&hash, keep);
+        let error = validate_file_links(
+            &format!("#link(\"files:{invented}\")[real]"),
+            Some(&files),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(&format!("files:{invented}")), "got: {error}");
+        assert!(error.contains(&format!("files:{hash}")), "got: {error}");
+        assert!(
+            error.contains(&format!("first {keep} hex digits")),
+            "got: {error}"
+        );
+        assert!(!error.contains(&other_hash), "got: {error}");
+    }
+
+    #[test]
+    fn an_uncataloged_handle_without_a_unique_neighbour_is_refused_bare() {
+        let (mut files, first) = cataloged(b"first file", "first.txt");
+        let (second, second_hash) = cataloged(b"second file", "second.txt");
+        files += second;
+        let lead = "0123456789abcdef"
+            .chars()
+            .find(|digit| !first.starts_with(*digit) && !second_hash.starts_with(*digit))
+            .unwrap();
+        let stranger = format!("{lead}{}", "0".repeat(63));
+        let error = validate_file_links(&format!("files:{stranger}"), Some(&files), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("files:{stranger} names no cataloged file")),
+            "got: {error}"
+        );
+        assert!(
+            !error.contains(&first) && !error.contains(&second_hash),
+            "got: {error}"
+        );
+        assert!(validate_file_links(&format!("files:{stranger}"), Some(&files), true).is_ok());
+    }
+
+    #[test]
+    fn a_unique_short_prefix_still_expands_and_a_dead_one_is_refused() {
+        let (files, hash) = cataloged(b"short prefix", "short.txt");
+        let wiki = TribleSet::new();
+        let resolver = ReferenceResolver {
+            wiki: &wiki,
+            files: Some(&files),
+        };
+        let fixed = lint_fix(&format!("[short](files:{})", &hash[..10]), resolver);
+        assert_eq!(fixed, format!("#link(\"files:{hash}\")[short]"));
+        validate_file_links(&fixed, Some(&files), false).unwrap();
+
+        let dead = (0..16)
+            .map(|digit| format!("{digit:x}"))
+            .find(|digit| crate::files::resolve_reference(&files, digit).is_err())
+            .unwrap();
+        let fixed = lint_fix(&format!("[dead](files:{dead})"), resolver);
+        let error = validate_file_links(&fixed, Some(&files), true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("truncated link files:{dead}")),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn create_refuses_an_uncataloged_handle_and_publishes_nothing() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let invented = "ab".repeat(32);
+        let error = cmd_create(
+            storage,
+            "cites a ghost".to_owned(),
+            format!("#link(\"files:{invented}\")[ghost]"),
+            Vec::new(),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("names no cataloged file"), "got: {error}");
+        let after = storage.view(|view| Ok(view.clone())).unwrap();
+        assert!(wiki_model::entries(&after.facts, &after.latest).is_empty());
     }
 }
