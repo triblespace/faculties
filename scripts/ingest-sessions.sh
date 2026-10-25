@@ -41,6 +41,11 @@ set -uo pipefail
 
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/faculties
 STAMP=$STATE/ingest-sessions.stamp
+# A host that has run the native `archive ingest-sessions` keeps its progress in
+# archive/ingest-sessions.json, and native passes never move the legacy stamp, so
+# its --due reads the native checkpoint instead (2026-10-25; on stars the legacy
+# stamp stayed at 2026-10-22 and the habit fired again after every native pass).
+NATIVE=$STATE/archive/ingest-sessions.json
 CLAUDE_ROOT=$HOME/.claude/projects
 CODEX_ROOTS=()
 for d in "$HOME"/.codex*/sessions ${CODEX_HOME:+"$CODEX_HOME/sessions"}; do
@@ -66,6 +71,7 @@ changed() {
 
 case "${1:-}" in
   --due)
+    [ -f "$NATIVE" ] && STAMP=$NATIVE
     if [ -f "$STAMP" ] && [ -z "$(find "$STAMP" -mmin +1200 -print)" ]; then exit 1; fi
     if [ ! -f "$STAMP" ]; then exit 0; fi
     hit=$(changed "$CLAUDE_ROOT" | head -1)
