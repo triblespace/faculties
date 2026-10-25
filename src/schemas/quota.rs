@@ -4,9 +4,10 @@
 //! (an opaque digest the caller supplies, never a raw account id or email),
 //! the window's length, the used percentage exactly as the provider reported
 //! it, when that window resets, when the reading was observed, and on which
-//! host. The current reading for a `(provider, account, window)` is a pure
-//! maximum over `(observed time, event id)`; every older observation stays in
-//! the set as history.
+//! host. The current reading for a `(provider, account, window, bucket)` is a
+//! pure maximum over `(observed time, event id)`, where an observation without
+//! a bucket is its own bucket value; every older observation stays in the set
+//! as history.
 //!
 //! The observation time is `metadata::created_at`, the canonical point-time
 //! attribute Status also uses for its events. The reset time is its own
@@ -17,6 +18,8 @@
 //!
 //! Every id below was minted with `trible genid` on 2026-10-25. Attributes use
 //! the explicit-anchor form, so each value encoding participates in identity.
+//! `quota::bucket` (`89BD8E51C098EEAFF7D740DB3962882D`) was minted later on
+//! 2026-10-25, so two allowances with the same window length stay apart.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
@@ -69,5 +72,10 @@ pub mod quota {
         "4ACB274A8869FD5228142703EC039243" as resets_at: inlineencodings::NsTAIInterval;
         /// Host that made the observation.
         "905CE5FE9C7E6928F98B13DED7A26C71" as host: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// Optional provider-side name of the allowance this window belongs
+        /// to, e.g. a key of Codex's `rateLimitsByLimitId`. Part of the
+        /// grouping key, so two allowances with equal window lengths never
+        /// merge; an observation without one groups as "no bucket".
+        "89BD8E51C098EEAFF7D740DB3962882D" as bucket: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }

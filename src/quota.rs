@@ -3,9 +3,11 @@
 //! An observation is the intrinsic identity of its exact facts, so recording
 //! the same reading twice converges on one event. That is idempotence and
 //! nothing more: nothing here computes an observation id in order to find one.
-//! The current reading per `(provider, account, window)` is a pure maximum
-//! over `(observed time, event id)`, which is permutation-independent and
-//! commutes with collection union.
+//! The current reading per `(provider, account, window, bucket)` is a pure
+//! maximum over `(observed time, event id)`, which is permutation-independent
+//! and commutes with collection union. An observation without a bucket is its
+//! own bucket value, so readings recorded before buckets existed group as
+//! they always did.
 //!
 //! Reads are typed queries at the point of use. A fact this build does not
 //! model is ignored, and a record missing a field it does not need for
@@ -55,6 +57,8 @@ pub struct Observation {
     /// Unix seconds.
     pub observed_at: i64,
     pub host: String,
+    /// Provider-side allowance name, when the provider keys windows by one.
+    pub bucket: Option<String>,
 }
 
 /// The provider id this build writes under `name`, case-insensitively.
@@ -117,6 +121,13 @@ pub fn validate(observation: &Observation) -> Result<()> {
     if observation.host.trim().is_empty() {
         bail!("host is empty");
     }
+    if observation
+        .bucket
+        .as_deref()
+        .is_some_and(|bucket| bucket.trim().is_empty())
+    {
+        bail!("bucket is empty; omit it instead");
+    }
     Ok(())
 }
 
@@ -155,6 +166,10 @@ pub fn observation_fragment(observation: &Observation) -> Result<(Fragment, Id)>
     let mut fragment = Fragment::empty();
     let account: TextHandle = fragment.put(observation.account.clone());
     let host: TextHandle = fragment.put(observation.host.trim().to_owned());
+    let bucket: Option<TextHandle> = observation
+        .bucket
+        .as_ref()
+        .map(|bucket| fragment.put(bucket.clone()));
     let record = entity! {
         metadata::tag: &KIND_QUOTA_OBSERVATION,
         quota::provider: provider,
@@ -164,6 +179,7 @@ pub fn observation_fragment(observation: &Observation) -> Result<(Fragment, Id)>
         quota::resets_at: resets_at,
         metadata::created_at: observed_at,
         quota::host: host,
+        quota::bucket?: bucket,
     };
     let event = record
         .root()
@@ -183,6 +199,8 @@ pub struct GroupKey {
     pub account: TextHandle,
     /// Window length in nanoseconds.
     pub window: i128,
+    /// The allowance's name; `None` is the "no bucket" key value.
+    pub bucket: Option<TextHandle>,
 }
 
 /// One grouped observation: its key, its id, and when it was observed.
@@ -196,11 +214,15 @@ pub struct ObservationRow {
 
 /// Every observation that carries the grouping fields, through one typed
 /// query. Anything else in the collection is not this read type.
+///
+/// The bucket is optional, so it is asked per observation: none gives one
+/// row keyed "no bucket", and an observation carrying several buckets gives
+/// one row in each.
 pub fn observation_rows<P>(facts: &P) -> Vec<ObservationRow>
 where
     P: TriblePattern + ?Sized,
 {
-    find!(
+    let rows: Vec<_> = find!(
         (event: Id, provider: Id, account: TextHandle, window: i128, observed: Lower),
         pattern!(facts, [{ ?event @
             metadata::tag: &KIND_QUOTA_OBSERVATION,
@@ -210,18 +232,30 @@ where
             metadata::created_at: ?observed,
         }])
     )
-    .map(
-        |(event, provider, account, window, observed)| ObservationRow {
-            event,
-            key: GroupKey {
-                provider,
-                account,
-                window,
-            },
-            observed: observed.0,
-        },
-    )
-    .collect()
+    .collect();
+    rows.into_iter()
+        .flat_map(|(event, provider, account, window, observed)| {
+            let mut buckets: Vec<Option<TextHandle>> = find!(
+                bucket: TextHandle,
+                pattern!(facts, [{ event @ quota::bucket: ?bucket }])
+            )
+            .map(Some)
+            .collect();
+            if buckets.is_empty() {
+                buckets.push(None);
+            }
+            buckets.into_iter().map(move |bucket| ObservationRow {
+                event,
+                key: GroupKey {
+                    provider,
+                    account,
+                    window,
+                    bucket,
+                },
+                observed: observed.0,
+            })
+        })
+        .collect()
 }
 
 /// The latest observation per group: larger observed time wins, the larger
@@ -328,6 +362,7 @@ mod tests {
             resets_at: 1_792_894_800,
             observed_at: 1_792_886_255,
             host: "sky".to_owned(),
+            bucket: None,
         }
     }
 
@@ -405,6 +440,25 @@ mod tests {
         let rows = observation_rows(bare.facts());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event, event);
+        assert_eq!(rows[0].key.bucket, None);
+    }
+
+    #[test]
+    fn a_bucket_joins_the_key_and_an_absent_one_writes_nothing() {
+        let (bare, bare_id) = observation_fragment(&observation()).unwrap();
+        let mut bucketed = observation();
+        bucketed.bucket = Some("codex".to_owned());
+        let (with_bucket, bucket_id) = observation_fragment(&bucketed).unwrap();
+        assert_ne!(bare_id, bucket_id);
+        let bare_facts = bare.facts();
+        assert!(!exists!(
+            pattern!(bare_facts, [{ bare_id @ quota::bucket: _?bucket }])
+        ));
+        let bare_rows = observation_rows(bare_facts);
+        let bucket_rows = observation_rows(with_bucket.facts());
+        assert_eq!(bare_rows[0].key.bucket, None);
+        assert!(bucket_rows[0].key.bucket.is_some());
+        assert_ne!(bare_rows[0].key, bucket_rows[0].key);
     }
 
     #[test]
@@ -427,6 +481,12 @@ mod tests {
         let mut over = observation();
         over.used_percent = 104.5;
         assert!(observation_fragment(&over).is_ok());
+        let mut empty_bucket = observation();
+        empty_bucket.bucket = Some(String::new());
+        assert!(observation_fragment(&empty_bucket).is_err());
+        let mut blank_bucket = observation();
+        blank_bucket.bucket = Some("  ".to_owned());
+        assert!(observation_fragment(&blank_bucket).is_err());
         assert!(provider_id("Claude").is_ok());
         assert!(provider_id("gemini").is_err());
     }
@@ -437,6 +497,7 @@ mod tests {
             provider: PROVIDER_CLAUDE,
             account: Inline::new([1; 32]),
             window: 10,
+            bucket: None,
         };
         let row = |event: u8, observed: i128| ObservationRow {
             event: Id::new([event; 16]).unwrap(),

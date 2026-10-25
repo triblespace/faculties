@@ -67,6 +67,13 @@ fn provider_label(group: &QuotaGroup) -> String {
         .unwrap_or_else(|| format!("{:x}", group.provider))
 }
 
+/// " bucket <name>" when the observation names an allowance, else nothing.
+fn bucket_label(bucket: Option<&str>) -> String {
+    bucket
+        .map(|bucket| format!(" bucket {bucket}"))
+        .unwrap_or_default()
+}
+
 fn short_account(account: &str) -> String {
     if account.chars().count() > 12 {
         format!("{}…", account.chars().take(12).collect::<String>())
@@ -122,9 +129,10 @@ pub fn record(receipt: &RecordedObservation, output: &mut Out<'_>) -> Result<()>
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{:x}", observation.provider));
     output.line(format!(
-        "recorded {:x}: {provider} {} acct {} used {} resets {} observed {} host {}",
+        "recorded {:x}: {provider} {}{} acct {} used {} resets {} observed {} host {}",
         receipt.event,
         format_window(observation.window_secs as i64),
+        bucket_label(observation.bucket.as_deref()),
         short_account(&observation.account),
         format_percent(observation.used_percent),
         format_instant(observation.resets_at),
@@ -135,8 +143,8 @@ pub fn record(receipt: &RecordedObservation, output: &mut Out<'_>) -> Result<()>
 
 pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
     output.line(format!(
-        "quota: {} observations examined, {} groups shown (the latest per provider, account \
-         and window, by observed time)",
+        "quota: {} observations examined, {} groups shown (the latest per provider, account, \
+         window and bucket, by observed time)",
         view.examined,
         view.groups.len()
     ))?;
@@ -161,9 +169,10 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
             .unwrap_or("no verdict");
         let stale = if derived.stale { " STALE" } else { "" };
         output.line(format!(
-            "{} {} acct {}: used {}, elapsed {}, {}; age {}{}; resets {}; host {}",
+            "{} {}{} acct {}: used {}, elapsed {}, {}; age {}{}; resets {}; host {}",
             provider_label(group),
             format_window(group.window_secs),
+            bucket_label(group.bucket.as_deref()),
             short_account(&group.account),
             joined(&group.used_percent, |used| format_percent(*used)),
             elapsed,
@@ -204,6 +213,7 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
                 "provider_id": format!("{:x}", group.provider),
                 "account": group.account,
                 "window_secs": group.window_secs,
+                "bucket": group.bucket,
                 "used_percent": one_or_many(&group.used_percent),
                 "elapsed_percent": derived.elapsed,
                 "pace": derived.pace.map(Pace::label),

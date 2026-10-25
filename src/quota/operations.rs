@@ -1,8 +1,8 @@
 //! `quota` — immutable provider-reported quota observations.
 //!
 //! Live data is one fixed native collection, `quota`. `record` publishes one
-//! observation; `show` reads the latest per `(provider, account, window)`
-//! from one frozen view and reports how many observations it examined.
+//! observation; `show` reads the latest per `(provider, account, window,
+//! bucket)` from one frozen view and reports how many observations it examined.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,7 +37,7 @@ pub struct RecordedObservation {
     pub observation: Observation,
 }
 
-/// The latest observation of one `(provider, account, window)`.
+/// The latest observation of one `(provider, account, window, bucket)`.
 ///
 /// Fields other than the grouping key are lists because the schema does not
 /// constrain cardinality: normally each holds one value, an empty list means
@@ -49,6 +49,8 @@ pub struct QuotaGroup {
     pub provider_name: Option<String>,
     pub account: String,
     pub window_secs: i64,
+    /// The allowance's name; `None` groups the observations without one.
+    pub bucket: Option<String>,
     /// TAI nanoseconds.
     pub observed: i128,
     pub used_percent: Vec<f64>,
@@ -145,6 +147,11 @@ impl Quota {
                         account: read_text(&snapshot, row.key.account, "account")?,
                         window_secs: i64::try_from(row.key.window / 1_000_000_000)
                             .unwrap_or(i64::MAX),
+                        bucket: row
+                            .key
+                            .bucket
+                            .map(|bucket| read_text(&snapshot, bucket, "bucket"))
+                            .transpose()?,
                         observed: row.observed,
                         used_percent,
                         resets_at,
@@ -158,12 +165,14 @@ impl Quota {
                     left.provider,
                     &left.account,
                     left.window_secs,
+                    &left.bucket,
                 )
                     .cmp(&(
                         &right.provider_name,
                         right.provider,
                         &right.account,
                         right.window_secs,
+                        &right.bucket,
                     ))
             });
             Ok(QuotaView {
@@ -287,6 +296,7 @@ mod tests {
             resets_at: NOW + 2 * HOUR,
             observed_at,
             host: "sky".to_owned(),
+            bucket: None,
         }
     }
 
@@ -370,6 +380,100 @@ mod tests {
                 (Some("codex"), 604_800)
             ]
         );
+    }
+
+    fn codex_reading(bucket: Option<&str>, used: f64) -> Observation {
+        let mut codex = reading(604_800, used, NOW - 60);
+        codex.provider = PROVIDER_CODEX;
+        codex.bucket = bucket.map(str::to_owned);
+        codex
+    }
+
+    #[test]
+    fn two_buckets_with_the_same_window_are_separate_groups() {
+        let fixture = fixture();
+        fixture
+            .quota
+            .record(codex_reading(Some("codex"), 21.0))
+            .unwrap();
+        fixture
+            .quota
+            .record(codex_reading(Some("codex_other"), 64.0))
+            .unwrap();
+
+        let view = fixture.quota.show_at(now()).unwrap();
+        assert_eq!(view.examined, 2);
+        let shape: Vec<(Option<&str>, i64, Vec<f64>)> = view
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.bucket.as_deref(),
+                    group.window_secs,
+                    group.used_percent.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (Some("codex"), 604_800, vec![21.0]),
+                (Some("codex_other"), 604_800, vec![64.0])
+            ]
+        );
+        let text = rendered(&view);
+        assert!(text.contains("codex 7d bucket codex acct "), "{text}");
+        assert!(text.contains("codex 7d bucket codex_other acct "), "{text}");
+    }
+
+    #[test]
+    fn no_bucket_and_a_bucket_are_separate_groups() {
+        let fixture = fixture();
+        fixture.quota.record(codex_reading(None, 21.0)).unwrap();
+        fixture
+            .quota
+            .record(codex_reading(Some("codex"), 30.0))
+            .unwrap();
+
+        let view = fixture.quota.show_at(now()).unwrap();
+        assert_eq!(view.examined, 2);
+        let shape: Vec<(Option<&str>, Vec<f64>)> = view
+            .groups
+            .iter()
+            .map(|group| (group.bucket.as_deref(), group.used_percent.clone()))
+            .collect();
+        assert_eq!(shape, vec![(None, vec![21.0]), (Some("codex"), vec![30.0])]);
+        let text = rendered(&view);
+        assert!(text.contains("codex 7d acct "), "{text}");
+        let mut json = String::new();
+        crate::quota::render::show_json(
+            &view,
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text: part } = part {
+                    json.push_str(&part);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        let document: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let buckets: Vec<&serde_json::Value> = document["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| &group["bucket"])
+            .collect();
+        assert_eq!(
+            buckets,
+            vec![&serde_json::Value::Null, &serde_json::json!("codex")]
+        );
+    }
+
+    #[test]
+    fn an_empty_bucket_is_refused() {
+        let fixture = fixture();
+        assert!(fixture.quota.record(codex_reading(Some(""), 21.0)).is_err());
+        assert_eq!(fixture.quota.show_at(now()).unwrap().examined, 0);
     }
 
     #[test]

@@ -50,8 +50,13 @@ enum Command {
         /// Observing host. Default: this machine's short host name.
         #[arg(long)]
         host: Option<String>,
+        /// Provider-side allowance name (e.g. a Codex rateLimitsByLimitId
+        /// key). Joins the grouping key, so two allowances with the same
+        /// window length stay apart. Omit it when the provider has none.
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        bucket: Option<String>,
     },
-    /// Show the latest reading per provider, account and window.
+    /// Show the latest reading per provider, account, window and bucket.
     Show {
         /// Print one JSON document instead of text.
         #[arg(long)]
@@ -70,6 +75,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             resets_at,
             observed_at,
             host,
+            bucket,
         } => {
             let observed_at = match observed_at {
                 Some(seconds) => seconds,
@@ -87,6 +93,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                 resets_at,
                 observed_at,
                 host,
+                bucket,
             };
             render::record(&operations.record(observation)?, output)
         }
@@ -104,4 +111,39 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     crate::cli::with_output("quota", |output| execute(cli, output))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record_args(bucket: Option<&str>) -> Vec<&str> {
+        let mut args = vec![
+            "quota",
+            "--pile",
+            "unused.pile",
+            "record",
+            "--provider",
+            "codex",
+            "--account",
+            "a1b2c3",
+            "--window-secs",
+            "604800",
+            "--used",
+            "21",
+            "--resets-at",
+            "1792894800",
+        ];
+        if let Some(bucket) = bucket {
+            args.extend(["--bucket", bucket]);
+        }
+        args
+    }
+
+    #[test]
+    fn bucket_is_optional_and_an_empty_one_is_refused() {
+        assert!(Cli::try_parse_from(record_args(None)).is_ok());
+        assert!(Cli::try_parse_from(record_args(Some("codex"))).is_ok());
+        assert!(Cli::try_parse_from(record_args(Some(""))).is_err());
+    }
 }
