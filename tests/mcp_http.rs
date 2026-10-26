@@ -3,7 +3,7 @@
 //! non-Sync adapter. Blocking work is controlled with bounded channels.
 
 use std::cell::Cell;
-use std::io::{BufRead, BufReader, Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -277,6 +277,147 @@ fn raw_post(stream: &mut TcpStream, addr: SocketAddr, session: &str, body: &str)
         body.len(),
     ).unwrap();
     stream.flush().unwrap();
+}
+
+fn raw_get(stream: &mut TcpStream, addr: SocketAddr) {
+    write!(stream,
+        "GET / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {TOKEN}\r\nConnection: keep-alive\r\n\r\n",
+    ).unwrap();
+    stream.flush().unwrap();
+}
+
+fn read_keepalive_get(stream: &mut TcpStream) {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.starts_with("HTTP/1.1 405 "), "{line}");
+    let mut length = None;
+    loop {
+        line.clear();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        if line == "\r\n" {
+            break;
+        }
+        let line = line.to_ascii_lowercase();
+        assert_ne!(line.trim(), "connection: close");
+        if let Some(value) = line.strip_prefix("content-length:") {
+            length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let length = length.expect("fixed native response length");
+    assert!(length < 4096);
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+}
+
+fn assert_awaiting_accept(stream: &TcpStream) {
+    stream.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+    let result = stream.peek(&mut [0]);
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    assert!(matches!(result, Err(error) if matches!(error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "excess client got a response or closure while accepted slots were full");
+}
+
+#[test]
+fn connection_cap_holds_across_keepalive_and_closing_one_admits_one_queued_client() {
+    let mut bounded = config();
+    bounded.max_connections = 2;
+    let endpoint = TestEndpoint::new(bounded, Fixture::default());
+    let mut first = endpoint.connect_raw();
+    let mut second = endpoint.connect_raw();
+    for stream in [&mut first, &mut second] {
+        raw_get(stream, endpoint.addr);
+        read_keepalive_get(stream);
+    }
+    let mut queued: Vec<_> = (0..8).map(|_| {
+        let mut stream = endpoint.connect_raw();
+        raw_get(&mut stream, endpoint.addr);
+        stream
+    }).collect();
+    for stream in &queued {
+        assert_awaiting_accept(stream);
+    }
+    // More requests on either admitted stream must not acquire another permit
+    // or release the existing one between requests.
+    for _ in 0..3 {
+        for stream in [&mut first, &mut second] {
+            raw_get(stream, endpoint.addr);
+            read_keepalive_get(stream);
+        }
+    }
+    for stream in &queued {
+        assert_awaiting_accept(stream);
+    }
+    drop(first);
+    // Do not assume an OS backlog ordering. Exactly one waiting connection
+    // can now receive its response while the other admitted stream lives.
+    let deadline = Instant::now() + WAIT;
+    let ready = loop {
+        if let Some(index) = queued.iter().position(|stream| {
+            stream.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+            let ready = matches!(stream.peek(&mut [0]), Ok(count) if count > 0);
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+            ready
+        }) {
+            break index;
+        }
+        assert!(Instant::now() < deadline, "closing a client did not admit queued work");
+    };
+    let mut replacement = queued.swap_remove(ready);
+    read_keepalive_get(&mut replacement);
+    for stream in &queued {
+        assert_awaiting_accept(stream);
+    }
+    drop(replacement);
+    drop(queued);
+    drop(second);
+}
+
+#[test]
+fn malformed_http_releases_the_connection_slot_for_the_next_client() {
+    let mut bounded = config();
+    bounded.max_connections = 1;
+    let endpoint = TestEndpoint::new(bounded, Fixture::default());
+    let mut malformed = endpoint.connect_raw();
+    malformed.write_all(b"GET / HTTP/NOT-A-VERSION\r\n\r\n").unwrap();
+    let mut response = Vec::new();
+    // Invalid HTTP can end in clean EOF or a TCP reset (notably on macOS).
+    // This checks connection-slot release, not a particular error response.
+    match malformed.read_to_end(&mut response) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error) => panic!("malformed HTTP did not close its transport: {error}"),
+    }
+    // Keep the client handle alive: server-side protocol-error drop, not
+    // closing our client object, must release connection admission.
+    let mut next = endpoint.connect_raw();
+    raw_get(&mut next, endpoint.addr);
+    read_keepalive_get(&mut next);
+    drop(next);
+    drop(malformed);
+}
+
+#[test]
+fn shutdown_cancels_saturated_connection_admission() {
+    let mut bounded = config();
+    bounded.max_connections = 1;
+    let mut endpoint = TestEndpoint::new(bounded, Fixture::default());
+    let mut admitted = endpoint.connect_raw();
+    raw_get(&mut admitted, endpoint.addr);
+    read_keepalive_get(&mut admitted);
+    let mut queued = endpoint.connect_raw();
+    raw_get(&mut queued, endpoint.addr);
+    assert_awaiting_accept(&queued);
+    endpoint.shutdown.take().unwrap().send(()).unwrap();
+    drop(admitted);
+    drop(queued);
+    let deadline = Instant::now() + WAIT;
+    while !endpoint.worker.as_ref().unwrap().is_finished() {
+        assert!(Instant::now() < deadline, "shutdown waited on connection admission");
+        thread::sleep(Duration::from_millis(5));
+    }
+    endpoint.worker.take().unwrap().join().unwrap().unwrap();
 }
 
 #[test]

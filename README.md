@@ -246,11 +246,17 @@ The transport validates every present Origin against the exact repeatable
 allowlist; absent Origin is supported for server-to-server clients. No wildcard
 origins or browser CORS access are installed.
 
-Defaults are 64 sessions, 30-minute session idle expiry, 16 admitted requests
+Defaults are 64 accepted TCP connections per endpoint, 64 sessions,
+30-minute session idle expiry, 16 admitted requests
 (body reads + queued/running calls + retained response bodies), and a 30-second
 body-read timeout. Work is executed outside the HTTP I/O runtime, preserving
 blocking native APIs and
-adapters that are not Send/Sync. Saturation is rejected before dispatch; a
+adapters that are not Send/Sync. Connection admission is reserved before accept
+and held until the stream drops, including idle/pre-header and keepalive time.
+At capacity, new connections wait in the kernel backlog (or fail there), not as
+accepted process descriptors. Idle clients can occupy every connection slot;
+this is not an idle timeout or a whole-process FD limit. Request-admission
+saturation is rejected before dispatch; a
 disconnect after admission does not cancel or retry a call. Shutdown drains
 admitted work, so an uninterruptible native call or slow response consumer can
 delay shutdown. These are transport bounds, not limits on model allocations,

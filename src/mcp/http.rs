@@ -19,10 +19,12 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::Read;
+use std::io::{self, IoSlice, Read};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -30,8 +32,10 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::serve::Listener;
 use axum::{routing::any, Router};
 use rand_core::RngCore;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use zeroize::Zeroizing;
 
@@ -88,6 +92,9 @@ pub struct Config {
     /// Origin must be allowed; no CORS or wildcard access is installed.
     pub allowed_origins: Vec<String>,
     pub limits: Limits,
+    /// Accepted TCP streams per endpoint, including idle/pre-header clients.
+    /// Full capacity stops accepting; it does not reject or cancel native work.
+    pub max_connections: usize,
     pub max_sessions: usize,
     pub session_idle_timeout: Duration,
     pub max_requests: usize,
@@ -101,6 +108,7 @@ impl Config {
             token,
             allowed_origins: Vec::new(),
             limits: Limits::default(),
+            max_connections: 64,
             max_sessions: 64,
             session_idle_timeout: Duration::from_secs(30 * 60),
             max_requests: 16,
@@ -109,13 +117,15 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.max_sessions == 0
+        if self.max_connections == 0
+            || self.max_connections > Semaphore::MAX_PERMITS
+            || self.max_sessions == 0
             || self.max_requests == 0
             || self.max_requests > Semaphore::MAX_PERMITS
             || self.session_idle_timeout.is_zero()
             || self.body_timeout.is_zero()
         {
-            bail!("MCP HTTP session/admission limits and timeouts must be positive");
+            bail!("MCP HTTP connection/session/admission limits and timeouts must be positive and supported");
         }
         Server::with_limits(&[], self.limits)?;
         for origin in &self.allowed_origins {
@@ -127,6 +137,68 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+/// Reserve before calling the underlying accept: clients waiting in the
+/// kernel backlog must not become unbounded accepted process descriptors.
+/// Axum can cancel this future on shutdown, releasing any reserved permit.
+struct ConnectionListener<L> {
+    inner: L,
+    admission: Arc<Semaphore>,
+}
+
+impl<L: Listener> Listener for ConnectionListener<L> {
+    type Io = AdmittedIo<L::Io>;
+    type Addr = L::Addr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let admission = self.admission.clone().acquire_owned().await
+            .expect("private connection semaphore is never closed");
+        // Retain Axum's ordinary socket-error retry behavior. Cancellation at
+        // either await drops the permit; successful accept moves it with I/O.
+        let (io, addr) = self.inner.accept().await;
+        (AdmittedIo { io, _admission: admission }, addr)
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+/// The stream, not a request/session/handler, owns connection admission.
+/// Field order closes I/O before releasing its slot. Keepalive requests keep
+/// the same permit; every connection exit path drops it with the stream.
+struct AdmittedIo<T> {
+    io: T,
+    _admission: OwnedSemaphorePermit,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for AdmittedIo<T> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for AdmittedIo<T> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
     }
 }
 
@@ -191,7 +263,10 @@ impl Endpoint {
         std::thread::scope(|scope| {
             let io = scope.spawn(move || {
                 runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(self.listener)?;
+                    let listener = ConnectionListener {
+                        inner: tokio::net::TcpListener::from_std(self.listener)?,
+                        admission: Arc::new(Semaphore::new(self.config.max_connections)),
+                    };
                     axum::serve(listener, app)
                         .with_graceful_shutdown(shutdown)
                         .await
@@ -605,8 +680,74 @@ fn method_not_allowed() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TOKEN: &str = "unit-test-only-token-0123456789abcdef";
+
+    struct CountAccepts {
+        calls: Arc<AtomicUsize>,
+        pending: bool,
+    }
+
+    impl Listener for CountAccepts {
+        type Io = tokio::io::DuplexStream;
+        type Addr = ();
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            (tokio::io::duplex(64).0, ())
+        }
+
+        fn local_addr(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_admission_precedes_accept_and_lives_until_io_drop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(Semaphore::new(2));
+        let mut listener = ConnectionListener {
+            inner: CountAccepts { calls: calls.clone(), pending: false },
+            admission: admission.clone(),
+        };
+        let (first, ()) = listener.accept().await;
+        let (second, ()) = listener.accept().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(admission.available_permits(), 0);
+        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        // In particular, a third stream was not accepted and then parked
+        // awaiting a permit: the underlying listener was never called.
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        drop(first);
+        let (third, ()) = listener.accept().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(admission.available_permits(), 0);
+        drop((second, third));
+        assert_eq!(admission.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_accept_releases_its_reserved_connection_slot() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let admission = Arc::new(Semaphore::new(1));
+        let mut listener = ConnectionListener {
+            inner: CountAccepts { calls: calls.clone(), pending: true },
+            admission: admission.clone(),
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[test]
+    fn connection_default_is_per_endpoint_sixty_four() {
+        let config = Config::new("127.0.0.1:0".parse().unwrap(), BearerToken::new(TOKEN).unwrap());
+        assert_eq!(config.max_connections, 64);
+    }
 
     #[test]
     fn bearer_file_is_bounded_and_accepts_only_one_final_line_ending() {
@@ -666,6 +807,12 @@ mod tests {
             candidate.allowed_origins.push(origin.into());
             assert!(Endpoint::bind(candidate).is_err());
         }
+        let mut candidate = config();
+        candidate.max_connections = 0;
+        assert!(Endpoint::bind(candidate).is_err());
+        let mut candidate = config();
+        candidate.max_connections = usize::MAX;
+        assert!(Endpoint::bind(candidate).is_err());
         let mut candidate = config();
         candidate.max_requests = usize::MAX;
         assert!(Endpoint::bind(candidate).is_err());
