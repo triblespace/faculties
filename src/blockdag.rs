@@ -1043,18 +1043,16 @@ where
         attachments.media_type_names.insert(name);
     }
 
+    // A vendor model's id is derived from its label, which buys idempotence
+    // and nothing to check here: take its tag and whatever names it carries.
     for id in &vendor_models {
-        let name = one_required(&media_names, *id, "vendor model name")?;
-        let core = entity! {
+        let names = values_for(&media_names, *id);
+        attachments.texts.extend(names.iter().copied());
+        expected += entity! { ExclusiveId::force_ref(id) @
             metadata::tag: &schema::vendor_model::KIND,
-            metadata::name: name,
-        };
-        let expected_id = core.root().expect("vendor model core has one root");
-        if expected_id != *id {
-            bail!("vendor model {id:x} does not match intrinsic root {expected_id:x}");
+            metadata::name*: names.iter(),
         }
-        expected += core.into_facts();
-        attachments.texts.insert(name);
+        .into_facts();
     }
 
     // Once vocabulary annotation is present, require the complete canonical
