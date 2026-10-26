@@ -873,8 +873,8 @@ fn blocks(fixture: &Fixture) -> std::collections::BTreeSet<Id> {
 /// Fail on any attribute an importer writes outside the identity of nodes,
 /// content facts and receipts, and the annotations the session's own content
 /// carries. A file path, a provider's title or an importer revision is none
-/// of these. `metadata::name` is allowed on media types only, whose identity
-/// it is.
+/// of these. `metadata::name` is allowed on media types and vendor models
+/// only, whose identity it is.
 fn assert_content_derived(route: &str, facts: &TribleSet) {
     use faculties::schemas::files::KIND_MEDIA_TYPE;
     let allowed: Vec<Id> = vec![
@@ -902,6 +902,7 @@ fn assert_content_derived(route: &str, facts: &TribleSet) {
         schema::source_projection::raw_author.id(),
         schema::source_projection::raw_role.id(),
         schema::source_projection::raw_model.id(),
+        schema::source_projection::generated_by.id(),
         schema::source_projection::source_locator.id(),
         schema::source_projection::source_detail.id(),
         schema::source_projection::resolution.id(),
@@ -912,11 +913,17 @@ fn assert_content_derived(route: &str, facts: &TribleSet) {
         pattern!(facts, [{ ?media @ metadata::tag: &KIND_MEDIA_TYPE }])
     )
     .collect();
+    let vendor_models: std::collections::BTreeSet<Id> = find!(
+        model: Id,
+        pattern!(facts, [{ ?model @ metadata::tag: &schema::vendor_model::KIND }])
+    )
+    .collect();
     for fact in facts.iter() {
         let attribute = *fact.a();
-        let media_name = attribute == metadata::name.id() && media_types.contains(fact.e());
+        let identity_name = attribute == metadata::name.id()
+            && (media_types.contains(fact.e()) || vendor_models.contains(fact.e()));
         assert!(
-            allowed.contains(&attribute) || media_name,
+            allowed.contains(&attribute) || identity_name,
             "{route} writes attribute {attribute:X} on {:X}",
             fact.e()
         );
