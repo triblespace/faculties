@@ -322,6 +322,8 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "viewer_capture",
         "voice_synthesize",
         "web_search",
+        "world_look",
+        "world_move_to",
     ] {
         assert!(names.contains(name), "missing native tool {name}");
     }

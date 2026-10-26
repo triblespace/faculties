@@ -42,6 +42,12 @@ enum Command {
         hear_config_json: Option<PathBuf>,
         #[arg(long, env = "HEAR_TOKENIZER_JSON", requires = "hear_model_pile")]
         hear_tokenizer_json: Option<PathBuf>,
+        /// World server base URL for the world tools (default localhost:8080).
+        #[arg(long, env = "WORLD_URL")]
+        world_url: Option<String>,
+        /// Session file shared with the `world` CLI; in memory when unset.
+        #[arg(long, env = "WORLD_SESSION_FILE")]
+        world_session_file: Option<PathBuf>,
         /// Bind a Streamable HTTP listener instead of using stdio.
         #[arg(long, value_name = "ADDR", requires = "http_token_file")]
         http_listen: Option<SocketAddr>,
@@ -72,6 +78,8 @@ fn main() -> Result<()> {
             hear_model,
             hear_config_json,
             hear_tokenizer_json,
+            world_url,
+            world_session_file,
             http_listen,
             http_token_file,
             http_origin,
@@ -94,6 +102,8 @@ fn main() -> Result<()> {
                 linkedin_token,
                 duplex_session,
                 hear,
+                world_url,
+                world_session: world_session_file,
             });
             let registrations = catalog.registrations();
             let result = match http_listen {

@@ -13,7 +13,7 @@ use crate::{
     archive, atlas, body, bootstrap, code, cognition, compass, decide, discord, duplex, files,
     gauge, habits, headspace, hear, imagine, linkedin, mail, memory, message, orient, patience,
     planner, posture, quota, reason, relations, secrets, status, teams, triage, viewer, voice, web,
-    wiki,
+    wiki, world,
 };
 
 /// Trusted launcher configuration, never supplied as MCP tool arguments.
@@ -24,6 +24,10 @@ pub struct Config {
     pub linkedin_token: Option<String>,
     pub duplex_session: Option<PathBuf>,
     pub hear: Option<hear::ModelConfig>,
+    /// World server base URL; the world faculty's default when unset.
+    pub world_url: Option<String>,
+    /// Session file shared with the `world` CLI; in memory when unset.
+    pub world_session: Option<PathBuf>,
 }
 
 impl Config {
@@ -36,6 +40,8 @@ impl Config {
             linkedin_token: None,
             duplex_session: None,
             hear: None,
+            world_url: None,
+            world_session: None,
         }
     }
 }
@@ -62,6 +68,8 @@ impl Catalog {
             linkedin_token,
             duplex_session,
             hear: hear_config,
+            world_url,
+            world_session,
         } = config;
         let discord = discord::mcp::Discord::with_storage(storage.clone());
         let linkedin = linkedin::mcp::LinkedIn::with_storage(storage.clone());
@@ -105,6 +113,7 @@ impl Catalog {
             Box::new(voice::mcp::Voice::with_storage(storage.clone())),
             Box::new(web::mcp::Web::with_storage(storage.clone())),
             Box::new(wiki::mcp::Wiki::with_storage(storage.clone())),
+            Box::new(world::mcp::WorldTools::new(world_url, world_session)),
         ];
         Self { faculties, storage }
     }

@@ -11,4 +11,6 @@
 //! Every other verb is an action whose printed result is the observation.
 
 pub mod cli;
+pub mod mcp;
+pub mod operations;
 pub mod render;

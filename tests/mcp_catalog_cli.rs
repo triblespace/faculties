@@ -115,6 +115,8 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
     config.key = Some(directory.path().join("office.key"));
     config.linkedin_token = Some("discovery-must-not-reveal-linkedin-token".into());
     config.duplex_session = Some(directory.path().join("duplex-session"));
+    config.world_url = Some("http://discovery-must-not-contact.invalid".into());
+    config.world_session = Some(directory.path().join("world-session"));
     config.hear = Some(ModelConfig {
         pile: directory.path().join("hear.pile"),
         model: "discovery-must-not-load-model".into(),
@@ -165,6 +167,7 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
             "voice",
             "web",
             "wiki",
+            "world",
         ]
     );
     let mut server = Server::new(&registrations).unwrap();
@@ -204,7 +207,7 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
     assert!(!response.contains("discovery-must-not-"));
     let response: Value = serde_json::from_str(&response).unwrap();
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 238);
+    assert_eq!(tools.len(), 248);
     for name in [
         "files_index",
         "quota_record",
@@ -437,7 +440,7 @@ mod http_process {
             .json()
             .unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 238);
+        assert_eq!(tools.len(), 248);
         for name in [
             "files_index",
             "quota_record",
