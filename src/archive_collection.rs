@@ -1777,6 +1777,7 @@ mod tests {
             .query()
             .unwrap()
             .query_multi(&hash_tokens("anything"))
+            .unwrap()
             .is_empty());
     }
 
@@ -1827,6 +1828,7 @@ mod tests {
             .query()
             .unwrap()
             .query_multi(&hash_tokens("anything"))
+            .unwrap()
             .is_empty());
     }
 
@@ -2029,8 +2031,8 @@ mod tests {
 
         let search = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         let query = search.1.query().unwrap();
-        assert_eq!(query.query_multi(&hash_tokens("alpha")).len(), 1);
-        assert_eq!(query.query_multi(&hash_tokens("beta")).len(), 1);
+        assert_eq!(query.query_multi(&hash_tokens("alpha")).unwrap().len(), 1);
+        assert_eq!(query.query_multi(&hash_tokens("beta")).unwrap().len(), 1);
     }
 
     #[test]
@@ -2056,7 +2058,8 @@ mod tests {
             .1
             .query()
             .unwrap()
-            .query_multi(&hash_tokens("shared closure needle"));
+            .query_multi(&hash_tokens("shared closure needle"))
+            .unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -2079,6 +2082,7 @@ mod tests {
                 .query()
                 .unwrap()
                 .query_multi(&hash_tokens("alpha"))
+                .unwrap()
                 .len(),
             1
         );
@@ -2092,9 +2096,9 @@ mod tests {
         let extended = pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         {
             let query = extended.1.query().unwrap();
-            assert_eq!(query.query_multi(&hash_tokens("alpha")).len(), 1);
-            assert_eq!(query.query_multi(&hash_tokens("beta")).len(), 1);
-            assert_eq!(query.query_multi(&hash_tokens("🛰️")).len(), 1);
+            assert_eq!(query.query_multi(&hash_tokens("alpha")).unwrap().len(), 1);
+            assert_eq!(query.query_multi(&hash_tokens("beta")).unwrap().len(), 1);
+            assert_eq!(query.query_multi(&hash_tokens("🛰️")).unwrap().len(), 1);
         }
         drop(extended);
 
@@ -2109,6 +2113,7 @@ mod tests {
                 .query()
                 .unwrap()
                 .query_multi(&hash_tokens("beta"))
+                .unwrap()
                 .len(),
             1
         );
@@ -2170,8 +2175,20 @@ mod tests {
             pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         assert!(lag.is_current(), "{lag:?}");
         let query = index.query().unwrap();
-        assert_eq!(query.query_multi(&hash_tokens("whole haystack")).len(), 1);
-        assert_eq!(query.query_multi(&hash_tokens("closure needle")).len(), 1);
+        assert_eq!(
+            query
+                .query_multi(&hash_tokens("whole haystack"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            query
+                .query_multi(&hash_tokens("closure needle"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     /// Eight commits fill the root's lowest tier, so the carry joins them
@@ -2266,7 +2283,11 @@ mod tests {
         assert_eq!(index.segments().len(), 1);
         let query = index.query().unwrap();
         for word in words {
-            assert_eq!(query.query_multi(&hash_tokens(word)).len(), 1, "{word}");
+            assert_eq!(
+                query.query_multi(&hash_tokens(word)).unwrap().len(),
+                1,
+                "{word}"
+            );
         }
     }
 

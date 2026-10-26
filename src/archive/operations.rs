@@ -1147,6 +1147,7 @@ fn run_search(
     let mut shown = BTreeSet::new();
     let hits = query
         .query_multi(&hash_tokens(&text))
+        .context("score Archive BM25 query")?
         .into_iter()
         .flat_map(|(payload, score)| {
             find!(
@@ -2181,7 +2182,8 @@ mod tests {
             .1
             .query()
             .unwrap()
-            .query_multi(&hash_tokens("quasar"));
+            .query_multi(&hash_tokens("quasar"))
+            .unwrap();
         assert_eq!(hits.len(), 1);
         let payload = hits[0].0;
         let found: Vec<_> = find!(
@@ -2234,7 +2236,11 @@ mod tests {
         ))
         .unwrap();
         assert!(lag.is_current(), "{lag:?}");
-        let hits = index.query().unwrap().query_multi(&hash_tokens("quasar"));
+        let hits = index
+            .query()
+            .unwrap()
+            .query_multi(&hash_tokens("quasar"))
+            .unwrap();
         assert_eq!(hits.len(), 1, "one text, indexed once");
         let payload = hits[0].0;
         drop(index);

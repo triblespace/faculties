@@ -573,6 +573,7 @@ mod tests {
                 .query()
                 .unwrap()
                 .query_multi(&hash_tokens("quasar"))
+                .unwrap()
                 .len(),
             1
         );
@@ -687,6 +688,7 @@ mod tests {
         view.query()
             .unwrap()
             .query_multi(&hash_tokens(query))
+            .unwrap()
             .into_iter()
             .map(|(document, score)| (document.raw, (f64::from(score) * 1e4).round() as i64))
             .collect()

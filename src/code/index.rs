@@ -335,7 +335,9 @@ impl Code {
                     attached.read_acquiring::<CodeBM25View>()?,
                 )?;
                 let query = view.query().context("prepare Code BM25 query")?;
-                for (document, score) in query.query_multi(&terms) {
+                for (document, score) in
+                    query.query_multi(&terms).context("score Code BM25 query")?
+                {
                     let id = Id::try_from_inline(&document).map_err(|error| {
                         anyhow!("Code BM25 document is not an entity id: {error:?}")
                     })?;
