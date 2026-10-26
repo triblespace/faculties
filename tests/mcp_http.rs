@@ -162,12 +162,14 @@ struct TestEndpoint {
     client: Client,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     worker: Option<JoinHandle<Result<()>>>,
+    connections: faculties::mcp::http::ConnectionMetrics,
 }
 
 impl TestEndpoint {
     fn new(config: Config, faculty: Fixture) -> Self {
         let endpoint = Endpoint::bind(config).unwrap();
         let addr = endpoint.local_addr().unwrap();
+        let connections = endpoint.connection_metrics();
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let worker = thread::spawn(move || {
             endpoint.serve_until(&[&faculty], async move {
@@ -185,6 +187,7 @@ impl TestEndpoint {
                 .unwrap(),
             shutdown: Some(shutdown),
             worker: Some(worker),
+            connections,
         }
     }
 
@@ -338,6 +341,7 @@ fn connection_cap_holds_across_keepalive_and_closing_one_admits_one_queued_clien
     for stream in &queued {
         assert_awaiting_accept(stream);
     }
+    assert_eq!(endpoint.connections.accepted_streams(), 2);
     // More requests on either admitted stream must not acquire another permit
     // or release the existing one between requests.
     for _ in 0..3 {
@@ -366,6 +370,7 @@ fn connection_cap_holds_across_keepalive_and_closing_one_admits_one_queued_clien
     };
     let mut replacement = queued.swap_remove(ready);
     read_keepalive_get(&mut replacement);
+    assert_eq!(endpoint.connections.accepted_streams(), 2);
     for stream in &queued {
         assert_awaiting_accept(stream);
     }
@@ -394,6 +399,7 @@ fn malformed_http_releases_the_connection_slot_for_the_next_client() {
     let mut next = endpoint.connect_raw();
     raw_get(&mut next, endpoint.addr);
     read_keepalive_get(&mut next);
+    assert_eq!(endpoint.connections.accepted_streams(), 1);
     drop(next);
     drop(malformed);
 }
@@ -418,6 +424,7 @@ fn shutdown_cancels_saturated_connection_admission() {
         thread::sleep(Duration::from_millis(5));
     }
     endpoint.worker.take().unwrap().join().unwrap().unwrap();
+    assert_eq!(endpoint.connections.accepted_streams(), 0);
 }
 
 #[test]

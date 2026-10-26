@@ -24,6 +24,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
@@ -146,6 +147,38 @@ impl Config {
 struct ConnectionListener<L> {
     inner: L,
     admission: Arc<Semaphore>,
+    metrics: ConnectionMetrics,
+}
+
+/// One endpoint's accepted stream lifetimes, not requests, sessions, reserved
+/// permits, kernel backlog, or all process sockets. Cloning only shares the
+/// gauge. Reads allocate nothing and acquire no locks; they are not atomic
+/// with an OS descriptor census. No addresses or descriptor numbers are kept.
+#[derive(Clone)]
+pub struct ConnectionMetrics(Arc<AtomicUsize>);
+
+impl ConnectionMetrics {
+    fn new() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+
+    pub fn accepted_streams(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn enter(&self) -> LiveConnection {
+        // Admission bounds this by Semaphore::MAX_PERMITS, well below usize.
+        self.0.fetch_add(1, Ordering::Relaxed);
+        LiveConnection(self.clone())
+    }
+}
+
+struct LiveConnection(ConnectionMetrics);
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl<L: Listener> Listener for ConnectionListener<L> {
@@ -158,7 +191,7 @@ impl<L: Listener> Listener for ConnectionListener<L> {
         // Retain Axum's ordinary socket-error retry behavior. Cancellation at
         // either await drops the permit; successful accept moves it with I/O.
         let (io, addr) = self.inner.accept().await;
-        (AdmittedIo { io, _admission: admission }, addr)
+        (AdmittedIo { io, _live: self.metrics.enter(), _admission: admission }, addr)
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -171,6 +204,8 @@ impl<L: Listener> Listener for ConnectionListener<L> {
 /// the same permit; every connection exit path drops it with the stream.
 struct AdmittedIo<T> {
     io: T,
+    // Field order closes I/O, decrements the gauge, then releases admission.
+    _live: LiveConnection,
     _admission: OwnedSemaphorePermit,
 }
 
@@ -207,6 +242,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for AdmittedIo<T> {
 pub struct Endpoint {
     listener: TcpListener,
     config: Config,
+    metrics: ConnectionMetrics,
 }
 
 impl Endpoint {
@@ -214,7 +250,13 @@ impl Endpoint {
         config.validate()?;
         let listener = TcpListener::bind(config.bind).context("bind MCP HTTP listener")?;
         listener.set_nonblocking(true)?;
-        Ok(Self { listener, config })
+        Ok(Self { listener, config, metrics: ConnectionMetrics::new() })
+    }
+
+    /// Observe this exact endpoint, including after it moves into serve_until.
+    /// A retained handle does not keep its listener or streams alive.
+    pub fn connection_metrics(&self) -> ConnectionMetrics {
+        self.metrics.clone()
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -266,6 +308,7 @@ impl Endpoint {
                     let listener = ConnectionListener {
                         inner: tokio::net::TcpListener::from_std(self.listener)?,
                         admission: Arc::new(Semaphore::new(self.config.max_connections)),
+                        metrics: self.metrics,
                     };
                     axum::serve(listener, app)
                         .with_graceful_shutdown(shutdown)
@@ -710,36 +753,99 @@ mod tests {
     async fn connection_admission_precedes_accept_and_lives_until_io_drop() {
         let calls = Arc::new(AtomicUsize::new(0));
         let admission = Arc::new(Semaphore::new(2));
+        let metrics = ConnectionMetrics::new();
         let mut listener = ConnectionListener {
             inner: CountAccepts { calls: calls.clone(), pending: false },
             admission: admission.clone(),
+            metrics: metrics.clone(),
         };
         let (first, ()) = listener.accept().await;
         let (second, ()) = listener.accept().await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(admission.available_permits(), 0);
+        assert_eq!(metrics.accepted_streams(), 2);
+        assert_eq!(metrics.clone().accepted_streams(), 2);
         assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
         // In particular, a third stream was not accepted and then parked
         // awaiting a permit: the underlying listener was never called.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         drop(first);
+        assert_eq!(metrics.accepted_streams(), 1);
         let (third, ()) = listener.accept().await;
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(admission.available_permits(), 0);
         drop((second, third));
         assert_eq!(admission.available_permits(), 2);
+        assert_eq!(metrics.accepted_streams(), 0);
     }
 
     #[tokio::test]
     async fn cancelling_an_accept_releases_its_reserved_connection_slot() {
         let calls = Arc::new(AtomicUsize::new(0));
         let admission = Arc::new(Semaphore::new(1));
+        let metrics = ConnectionMetrics::new();
         let mut listener = ConnectionListener {
             inner: CountAccepts { calls: calls.clone(), pending: true },
             admission: admission.clone(),
+            metrics: metrics.clone(),
         };
-        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        let mut accepting = Box::pin(listener.accept());
+        std::future::poll_fn(|cx| {
+            assert!(accepting.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+        assert_eq!(admission.available_permits(), 0);
+        assert_eq!(metrics.accepted_streams(), 0, "reserved pre-accept slot is not a stream");
+        drop(accepting);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(metrics.accepted_streams(), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_gauge_survives_endpoint_drop_and_releases_on_io_error_unwind() {
+        let endpoint = Endpoint::bind(Config::new("127.0.0.1:0".parse().unwrap(), BearerToken::new(TOKEN).unwrap())).unwrap();
+        let retained = endpoint.connection_metrics();
+        drop(endpoint);
+        assert_eq!(retained.accepted_streams(), 0);
+        let metrics = ConnectionMetrics::new();
+        let admission = Arc::new(Semaphore::new(1));
+        let mut listener = ConnectionListener {
+            inner: CountAccepts { calls: Arc::new(AtomicUsize::new(0)), pending: false },
+            admission: admission.clone(), metrics: metrics.clone(),
+        };
+        let (mut stream, ()) = listener.accept().await;
+        // CountAccepts drops the duplex peer; writing must fail, but only
+        // dropping the owned I/O (not an error/request) ends its lifetime.
+        use tokio::io::AsyncWriteExt;
+        assert!(stream.write_all(b"x").await.is_err());
+        assert_eq!(metrics.accepted_streams(), 1);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _stream = stream;
+            panic!("synthetic connection task unwind");
+        })).is_err());
+        assert_eq!(metrics.accepted_streams(), 0);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_io_drops_before_gauge_and_permit() {
+        struct CheckDrop(ConnectionMetrics, Arc<Semaphore>);
+        impl Drop for CheckDrop {
+            fn drop(&mut self) {
+                assert_eq!(self.0.accepted_streams(), 1);
+                assert_eq!(self.1.available_permits(), 0);
+            }
+        }
+        let metrics = ConnectionMetrics::new();
+        let admission = Arc::new(Semaphore::new(1));
+        let stream = AdmittedIo {
+            io: CheckDrop(metrics.clone(), admission.clone()),
+            _live: metrics.enter(),
+            _admission: admission.clone().acquire_owned().await.unwrap(),
+        };
+        drop(stream);
+        assert_eq!(metrics.accepted_streams(), 0);
         assert_eq!(admission.available_permits(), 1);
     }
 
