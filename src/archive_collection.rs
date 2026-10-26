@@ -655,7 +655,7 @@ fn bm25_target(
     pile: &mut Pile,
     source: Collection<SimpleArchive>,
 ) -> Result<Collection<PortableBM25Blob>> {
-    pile.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)
+    pile.attach_with(source, archive_bm25::ArchiveTextBm25Mapping)
         .context("attach the Archive BM25 index")
 }
 
@@ -670,7 +670,7 @@ async fn ensure_bm25(
 ) -> Result<EnsuredBm25> {
     let target = bm25_target(pile, source)?;
     crate::storage::tolerate_own_lag(
-        pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(target, signer)
+        pile.maintain_attached_with::<archive_bm25::ArchiveTextBm25Mapping>(target, signer)
             .await,
     )
     .context("maintain Archive BM25 cover")?;
@@ -722,16 +722,14 @@ pub fn ensure_bm25_index_with_storage(
             signer.verifying_key(),
             runtime,
         )?;
-        let target = store.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)?;
+        let target = store.attach_with(source, archive_bm25::ArchiveTextBm25Mapping)?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
         runtime.block_on(async {
             crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
             crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
             crate::storage::tolerate_own_lag(
                 store
-                    .maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                        target, signer,
-                    )
+                    .maintain_attached_with::<archive_bm25::ArchiveTextBm25Mapping>(target, signer)
                     .await,
             )?;
             Ok::<_, anyhow::Error>(())
@@ -815,10 +813,8 @@ pub fn ensure_search_local_with_storage(
             let (succinct, rank9) = fact_views(pile, source)?;
             drop(ensure_facts(pile, source, signer).await?);
             crate::storage::tolerate_own_lag(
-                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                    target, signer,
-                )
-                .await,
+                pile.maintain_attached_with::<archive_bm25::ArchiveTextBm25Mapping>(target, signer)
+                    .await,
             )
             .context("maintain Archive BM25 cover")?;
             // One snapshot for both views: search maintenance may have
@@ -873,7 +869,7 @@ pub(crate) fn search_views_with_storage(
             signer.verifying_key(),
             runtime,
         )?;
-        let target = store.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)?;
+        let target = store.attach_with(source, archive_bm25::ArchiveTextBm25Mapping)?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
         let after = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
         let facts = after.attached_acquiring(rank9)?;
@@ -1075,7 +1071,7 @@ mod tests {
         source: Collection<SimpleArchive>,
     ) -> Collection<PortableBM25Blob> {
         store
-            .attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)
+            .attach_with(source, archive_bm25::ArchiveTextBm25Mapping)
             .unwrap()
     }
 
@@ -2120,14 +2116,13 @@ mod tests {
     }
 
     /// The collection union is a valid Archive, but the tagged block and its
-    /// part/fact closure live in separate signed elements. Each commit is a
-    /// node of its own, and the BM25 mapping refuses the node that holds the
-    /// block without its closure: maintenance leaves that node as the
-    /// residual, attaches every other one, and a repeat publishes nothing.
-    /// Once the carry joins the two halves into one merged node, that node
-    /// holds the whole closure, and its attachment represents the block.
+    /// part/fact closure live in separate signed elements. The BM25
+    /// documents are texts, so each commit maps on its own: the block's
+    /// commit names no text and the remainder names the block's. Maintenance
+    /// attaches every node with nothing residual, a repeat publishes nothing,
+    /// and the text is found at once.
     #[test]
-    fn bm25_leaves_a_split_block_residual_until_a_merged_node_holds_it() {
+    fn bm25_indexes_a_split_block_without_waiting_for_a_merged_node() {
         let directory = TempDir::new().unwrap();
         let pile_path = directory.path().join("archive.pile");
         std::fs::File::create(&pile_path).unwrap();
@@ -2144,23 +2139,18 @@ mod tests {
         let remainder_commit = pile.commit(collection, &signer, remainder_element).unwrap();
         let target = test_target(&mut pile, collection);
         pile.close().unwrap();
-        // A whole commit after the split one: attached like any other.
+        // A whole commit after the split one.
         commit_projection(&pile_path, &key, "session:whole", "whole haystack");
-
-        let archive = pollster::block_on(ensure_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(archive.support().len(), 3);
-        assert_eq!(projection_ids(&archive.facts().unwrap()).len(), 2);
-        drop(archive);
 
         let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
         assert_eq!(report.source_elements, 3);
-        assert_eq!(report.lagging, 1, "only the split block's node is residual");
+        assert_eq!(report.lagging, 0, "a split block's node maps on its own");
         let length = std::fs::metadata(&pile_path).unwrap().len();
         assert_eq!(ensure_bm25_index(&pile_path, Some(&key)).unwrap(), report);
         assert_eq!(
             std::fs::metadata(&pile_path).unwrap().len(),
             length,
-            "a refused node publishes nothing on a later pass either"
+            "a repeat pass publishes nothing"
         );
 
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
@@ -2171,33 +2161,16 @@ mod tests {
             .filter(|map| map.attached() == target.handle())
             .map(|map| map.node())
             .collect();
-        assert!(!attached_nodes.contains(&block_commit.data()));
+        assert!(attached_nodes.contains(&block_commit.data()));
         assert!(attached_nodes.contains(&remainder_commit.data()));
-        assert_eq!(attached_nodes.len(), 2);
+        assert_eq!(attached_nodes.len(), 3);
         pile.close().unwrap();
 
         let (_, index, lag) =
             pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
-        assert_eq!(lag.index, 1);
-        assert!(lag.facts.is_current());
-        let query = index.query().unwrap();
-        assert_eq!(query.query_multi(&hash_tokens("whole haystack")).len(), 1);
-        assert!(query.query_multi(&hash_tokens("closure needle")).is_empty());
-        drop(query);
-        drop(index);
-
-        // Five more commits fill the lowest tier; the carry joins all eight
-        // into one node, which holds the block with its closure.
-        for word in ["one", "two", "three", "four", "five"] {
-            commit_projection(&pile_path, &key, &format!("session:{word}"), word);
-        }
-        let report = ensure_bm25_index(&pile_path, Some(&key)).unwrap();
-        assert_eq!(report.lagging, 0);
-        assert_eq!(report.cover_segments, 1);
-        let (_, index, lag) =
-            pollster::block_on(ensure_search_local(&pile_path, Some(&key))).unwrap();
         assert!(lag.is_current(), "{lag:?}");
         let query = index.query().unwrap();
+        assert_eq!(query.query_multi(&hash_tokens("whole haystack")).len(), 1);
         assert_eq!(query.query_multi(&hash_tokens("closure needle")).len(), 1);
     }
 
@@ -2237,7 +2210,7 @@ mod tests {
         };
         drop(
             pollster::block_on(
-                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                pile.maintain_attached_with::<archive_bm25::ArchiveTextBm25Mapping>(
                     target, &signer,
                 ),
             )
@@ -2273,7 +2246,7 @@ mod tests {
         let length = std::fs::metadata(&pile_path).unwrap().len();
         drop(
             pollster::block_on(
-                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                pile.maintain_attached_with::<archive_bm25::ArchiveTextBm25Mapping>(
                     target, &signer,
                 ),
             )
@@ -2319,7 +2292,7 @@ mod tests {
         };
         let maintain_fresh = |pile: &mut Pile, target, segments: usize| {
             let maintained = pollster::block_on(
-                pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
+                pile.maintain_attached_with::<archive_bm25::ArchiveTextBm25Mapping>(
                     target, &signer,
                 ),
             )
@@ -2395,9 +2368,7 @@ mod tests {
         drop((unusable, before));
 
         let ready_snapshot = pollster::block_on(
-            pile.maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                target, &signer,
-            ),
+            pile.maintain_attached_with::<archive_bm25::ArchiveTextBm25Mapping>(target, &signer),
         )
         .unwrap();
         let ready = ready_snapshot.attached(target).unwrap();
@@ -2527,10 +2498,10 @@ mod tests {
         );
     }
 
-    /// The Archive BM25 mapping answers like the union only for covers whose
-    /// nodes arrive with the facts they hold (see `archive_bm25`). This pins
-    /// that faculties' own importer commits each node together with its held
-    /// facts, which is that premise for data we write; it says nothing of
+    /// Faculties' own importer commits each node together with its held
+    /// facts. (The Archive BM25 mapping no longer depends on this: its
+    /// documents are texts, whole wherever they are named.) This pins that
+    /// property for data we write; it says nothing of
     /// another writer's commits or of historical input, and the writer itself
     /// checks nothing. Every commit that tags a node holds the node's `holds`
     /// facts and each held fact's tag, modality, direction and payload, and
@@ -2607,9 +2578,9 @@ mod tests {
             )
             .collect()
         };
-        // What the BM25 mapping reads of one node, as the whole collection
-        // states it: the node's tag and `holds` facts, and each held fact's
-        // tag, modality, direction and payload.
+        // One node as the whole collection states it: the node's tag and
+        // `holds` facts, and each held fact's tag, modality, direction and
+        // payload.
         let read = [
             metadata::tag.id(),
             schema::block::holds.id(),

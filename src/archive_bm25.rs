@@ -1,27 +1,27 @@
-//! Portable exact-term-frequency BM25 over canonical Archive nodes.
+//! Portable exact-term-frequency BM25 over the texts the Archive holds.
 //!
 //! This module is one concrete attached-collection mapping, not a registry.
 //! Its parent is Archive's canonical `SimpleArchive` union and its attached
-//! representation is the portable BM25 carrier. Every canonical semantic node
-//! is a document, including a genuine textless one: its document is the text
-//! of the facts it holds (one, or the set that happened at one moment). The
-//! unique content-free canonical bottom used only by raw source receipts is
-//! excluded so provenance volume cannot perturb corpus statistics. Every
-//! selected `UTF8String` payload is tokenized with [`hash_tokens`], and
-//! repeated documents join by pointwise maximum in the portable carrier.
+//! representation is the portable BM25 carrier. A document is one text
+//! payload blob, keyed by its `Handle<UTF8String>`, exactly as the semantic
+//! HNSW index keys its documents on embedding handles. A member's image is
+//! every distinct value of [`schema::content_fact::payload`] it names, each
+//! tokenized once with [`hash_tokens`] and counted with exact frequencies; an
+//! empty text is still a document.
 //!
-//! The node, not a derived act, is the document because a node and its facts
-//! are one identity, written together into one commit, so each commit maps
-//! exactly. An act is a run along the chain that can span commits (a session
-//! re-imported longer, a live writer's checkpoints), so an act document could
-//! only be assembled across members, which a per-member mapping cannot do.
-//! Readers rank nodes and widen a hit to its act with
-//! [`crate::blockdag::turn_of`] at query time.
+//! A text blob is whole by definition: its hash fixes its terms. So the same
+//! text named by several members, nodes or facts is one document with one
+//! set of frequencies, segments join as a plain union (the carrier's
+//! pointwise maximum never meets two different counts for one document), and
+//! every cover answers like the index of the union of what it reads, however
+//! a writer spreads a node's facts over commits. Readers rank texts and join
+//! each one to the Archive nodes holding it at query time, then widen a node
+//! to its act with [`crate::blockdag::turn_of`].
 //!
-//! Importer receipts are deliberately outside the projection. The mapping is
-//! an open-world typed query: unknown facts, undecodable rows and nodes in an
-//! older shape are inert. A fact a node holds must be present in that member,
-//! or the member is refused.
+//! The mapping reads the member's rows in place and never decodes them into
+//! a `TribleSet`: it needs only the payload handles, and a merge node can hold
+//! gigabytes of tribles. It is an open-world typed query: rows under other
+//! attributes, nodes and facts in any shape, and importer receipts are inert.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,42 +30,42 @@ use anyhow::{bail, Result};
 
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::utf8string::UTF8String;
-use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace::core::blob::{Blob, IntoBlob};
 use triblespace::core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace::core::collection::{CollectionData, CollectionOperationError, MapMapping};
+use triblespace::core::collection::{
+    simplearchive_union, CollectionData, CollectionOperationError, MapMapping,
+};
 use triblespace::core::id::{id_hex, Id};
-use triblespace::core::inline::encodings::genid::GenId;
 use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::{Inline, IntoInline, RawInline};
+use triblespace::core::inline::{Inline, RawInline};
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::repo::{BlobStoreGet, StoreRead};
-use triblespace::core::trible::Fragment;
-use triblespace::core::trible::TribleSet;
+use triblespace::core::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 use triblespace::macros::entity;
-use triblespace::prelude::blobencodings::RawBytes;
-use triblespace::prelude::{find, pattern};
 use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index, PortableBM25View};
 use triblespace_search::tokens::{hash_tokens, WordHash};
 
 use crate::schemas::blockdag as schema;
 
-/// Archive-node-text BM25 member mapping, version 2: one document per node.
+/// Archive-text BM25 member mapping, version 3: one document per text
+/// payload blob, keyed by its handle.
 ///
-/// Minted with `trible genid` on 2026-10-16:
-/// `C896F71EBE5FE1513424B0853F5082B7`. It replaces version 1
-/// (`4EC6991611EF484A37FBD95F6E108FC6`), whose documents were blocks of
-/// ordered content parts.
+/// Minted with `trible genid` on 2026-10-26:
+/// `7FC72BB899FC3D02777E8F0A334255A3`. It replaces version 2
+/// (`C896F71EBE5FE1513424B0853F5082B7`), whose documents were Archive nodes,
+/// and version 1 (`4EC6991611EF484A37FBD95F6E108FC6`), whose documents were
+/// blocks of ordered content parts.
 ///
-/// Changing the selected graph fields, occurrence aggregation / term-frequency
-/// law, tokenizer behavior, or document/term schemas requires a new mapping id.
-/// Joining mapped members belongs to [`PortableBM25Blob`], not this identity.
-/// BM25 `k1` / `b` scoring policy is derived query behavior and is deliberately
-/// outside the persisted collection identity.
-pub const ARCHIVE_NODE_TEXT_BM25_MAPPING_V2: Id = id_hex!("C896F71EBE5FE1513424B0853F5082B7");
+/// Changing the selected attribute, term-frequency law, tokenizer behavior,
+/// or document/term schemas requires a new mapping id. Joining mapped
+/// members belongs to [`PortableBM25Blob`], not this identity. BM25 `k1` /
+/// `b` scoring policy is derived query behavior and is deliberately outside
+/// the persisted collection identity.
+pub const ARCHIVE_TEXT_BM25_MAPPING_V3: Id = id_hex!("7FC72BB899FC3D02777E8F0A334255A3");
 
-pub type ArchiveBM25Index = PortableBM25Index<GenId, WordHash>;
+pub type ArchiveBM25Index = PortableBM25Index<Handle<UTF8String>, WordHash>;
 /// Shared carrier views for one logical Archive search cover.
-pub type ArchiveBM25View = PortableBM25View<GenId, WordHash>;
+pub type ArchiveBM25View = PortableBM25View<Handle<UTF8String>, WordHash>;
 
 #[derive(Debug)]
 enum DeriveValidation {
@@ -75,41 +75,30 @@ enum DeriveValidation {
     Rejected(String),
 }
 
-#[derive(Debug)]
-struct ProjectionPlan {
-    documents: BTreeMap<Id, Vec<Inline<Handle<UTF8String>>>>,
-}
-
-/// The archive-node-text BM25 law, as a describable type.
+/// The archive-text BM25 law, as a describable type.
 ///
 /// A descriptor embeds this rather than only naming it, so a reader holding
 /// the pile can learn what the index is without the code that built it.
-pub struct ArchiveNodeTextBm25MappingV2;
+pub struct ArchiveTextBm25MappingV3;
 
-impl MetaDescribe for ArchiveNodeTextBm25MappingV2 {
+impl MetaDescribe for ArchiveTextBm25MappingV3 {
     fn describe() -> triblespace::core::trible::Fragment {
-        let id: Id = ARCHIVE_NODE_TEXT_BM25_MAPPING_V2;
+        let id: Id = ARCHIVE_TEXT_BM25_MAPPING_V3;
         entity! {
             triblespace::core::id::ExclusiveId::force_ref(&id) @
-                metadata::name: "archive-node-text-bm25-v2",
-                metadata::description: "Canonical mapping from one Archive SimpleArchive member to one PortableBM25Blob. Every canonical semantic node in that member is one document holding the UTF8String payloads of the facts it holds; Archive's content-free bottom is excluded, payloads are tokenized with hash_tokens, repeated terms contribute exact frequencies, and repeated documents combine by pointwise maximum. PortableBM25Blob owns target-member validation and join. The k1 and b scoring parameters are deliberately absent because they are query-time behaviour.",
+                metadata::name: "archive-text-bm25-v3",
+                metadata::description: "Canonical mapping from one Archive SimpleArchive member to one PortableBM25Blob. Every distinct UTF8String handle the member names under the content-fact payload attribute is one document keyed by that handle, including an empty text; each text is tokenized with hash_tokens and repeated terms contribute exact frequencies. A text's hash fixes its terms, so members join as a plain union. PortableBM25Blob owns target-member validation and join. The k1 and b scoring parameters are deliberately absent because they are query-time behaviour.",
                 metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
 }
 
-/// Bound canonical projection from one Archive fact-set member to its
-/// portable BM25 image.
-///
-/// A node's document is the facts it holds, which are its identity and which
-/// faculties' importers commit with it, so a member that holds such a node
-/// holds its whole document and every cover answers like the union of what it
-/// reads. A writer that spreads one set node's held facts over several
-/// members breaks that premise; the ignored tests below pin the gap.
+/// Bound canonical projection from one Archive fact-set member to the
+/// portable BM25 image of the texts it names.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArchiveBlockTextBm25Mapping;
+pub struct ArchiveTextBm25Mapping;
 
-impl MapMapping for ArchiveBlockTextBm25Mapping {
+impl MapMapping for ArchiveTextBm25Mapping {
     type Target = PortableBM25Blob;
 
     fn fragment(&self) -> Fragment {
@@ -119,10 +108,10 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
     fn bind(_parent: &Fragment, attached: &Fragment) -> Result<Self, CollectionOperationError> {
         let actual = triblespace::core::collection::descriptor::mapping_algorithm(attached.facts())
             .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?;
-        if actual != Some(ARCHIVE_NODE_TEXT_BM25_MAPPING_V2) {
+        if actual != Some(ARCHIVE_TEXT_BM25_MAPPING_V3) {
             return Err(CollectionOperationError::Fatal(format!(
-                "Archive BM25 mapping algorithm {:?} does not match archive-block-text-v1 \
-                 {ARCHIVE_NODE_TEXT_BM25_MAPPING_V2:X}",
+                "Archive BM25 mapping algorithm {:?} does not match archive-text-bm25-v3 \
+                 {ARCHIVE_TEXT_BM25_MAPPING_V3:X}",
                 actual.map(|id| format!("{id:X}")),
             )));
         }
@@ -132,13 +121,7 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
     /// Map one parent node, classifying what stops it by what could still
     /// change the answer. A selected text payload that is not here is a
     /// dependency the store may fetch, after which the map runs again. A
-    /// collection node holding an Archive node whose held fact is absent or
-    /// untyped there is refused as that collection node's capacity:
-    /// maintenance descends to the collection nodes beneath it, and a merged
-    /// one above that holds the whole closure represents it. Not every split
-    /// is refused: a collection node holding an Archive node with only some
-    /// of its `holds` facts, or a `holds` fact without the node's tag, is
-    /// mapped from what it holds (see the type's documentation).
+    /// payload whose bytes are not UTF-8 is refused as that node's capacity.
     /// Only a failure to read the store is fatal, because that is the one
     /// thing no other node can get around.
     fn map<R: StoreRead>(
@@ -147,7 +130,7 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
         _siblings: &[CollectionData],
         reader: &R,
     ) -> Result<Blob<PortableBM25Blob>, CollectionOperationError> {
-        match derive_for_validation(reader, node.clone()) {
+        match derive_for_validation(reader, node) {
             Ok(DeriveValidation::Ready(blob)) => Ok(blob),
             Ok(DeriveValidation::Pending(payload)) => Err(
                 CollectionOperationError::MissingDependency(Inline::new(payload.raw)),
@@ -163,7 +146,7 @@ impl MapMapping for ArchiveBlockTextBm25Mapping {
 fn mapping_fragment() -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_MAPPING,
-        mapping_algorithm*: <ArchiveNodeTextBm25MappingV2 as MetaDescribe>::describe(),
+        mapping_algorithm*: <ArchiveTextBm25MappingV3 as MetaDescribe>::describe(),
     }
 }
 
@@ -176,7 +159,7 @@ pub fn derive_element<R>(reader: &R, source: Blob<SimpleArchive>) -> Result<Blob
 where
     R: BlobStoreGet,
 {
-    match derive_for_validation(reader, source)? {
+    match derive_for_validation(reader, &source)? {
         DeriveValidation::Ready(blob) => Ok(blob),
         DeriveValidation::Pending(payload) => bail!(
             "Archive BM25 source has a nonresident text payload {}",
@@ -186,31 +169,25 @@ where
     }
 }
 
-fn derive_for_validation<R>(reader: &R, source: Blob<SimpleArchive>) -> Result<DeriveValidation>
+fn derive_for_validation<R>(reader: &R, source: &Blob<SimpleArchive>) -> Result<DeriveValidation>
 where
     R: BlobStoreGet,
 {
-    let plan = match projection_plan(source) {
-        Ok(plan) => plan,
+    let handles = match text_payloads(source) {
+        Ok(handles) => handles,
         Err(reason) => return Ok(DeriveValidation::Rejected(reason)),
     };
 
-    // Resolve each distinct payload once, while retaining its occurrence in
-    // every part that names it. Try every required sibling before Pending so
-    // malformed bytes cannot hide behind one unavailable payload. Do not test
-    // frozen residency first: an acquiring reader can obtain exact text even
-    // though this observation correctly keeps reporting it as nonresident.
-    // Keep each text as its view, not its tokens: a token is a 32-byte hash,
-    // several times the text it came from, and tokens of every payload of a
-    // large node held at once were most of the memory a build took.
-    let handles: BTreeSet<_> = plan
-        .documents
-        .values()
-        .flat_map(|payloads| payloads.iter().copied())
-        .collect();
-    let mut texts = BTreeMap::new();
+    // Resolve every distinct payload before counting any. Try every one
+    // before Pending so malformed bytes cannot hide behind one unavailable
+    // payload. Do not test frozen residency first: an acquiring reader can
+    // obtain exact text even though this observation correctly keeps
+    // reporting it as nonresident. Keep each text as its view, not its
+    // tokens: a token is a 32-byte hash, several times the text it came from.
+    let mut texts: Vec<(Inline<Handle<UTF8String>>, View<str>)> = Vec::with_capacity(handles.len());
     let mut missing = None;
-    for handle in handles {
+    for raw in handles {
+        let handle: Inline<Handle<UTF8String>> = Inline::new(raw);
         let blob: Blob<UTF8String> = match reader.get(handle) {
             Ok(blob) => blob,
             Err(error) if triblespace::core::repo::is_missing_blob(&error) => {
@@ -224,39 +201,35 @@ where
             Err(error) => {
                 return Ok(DeriveValidation::Rejected(format!(
                     "resident UTF8String payload {} is not UTF-8: {error}",
-                    hex::encode_upper(handle.raw),
+                    hex::encode_upper(raw),
                 )))
             }
         };
-        texts.insert(handle.raw, text);
+        texts.push((handle, text));
     }
     if let Some(payload) = missing {
         return Ok(DeriveValidation::Pending(payload));
     }
 
-    let documents: Vec<Inline<GenId>> = plan.documents.keys().map(IntoInline::to_inline).collect();
+    let documents: Vec<Inline<Handle<UTF8String>>> =
+        texts.iter().map(|(handle, _)| *handle).collect();
     let mut counts = Vec::new();
-    for (document_id, payloads) in plan.documents {
-        let document: Inline<GenId> = document_id.to_inline();
+    for (document, text) in &texts {
         let mut frequencies: BTreeMap<RawInline, u32> = BTreeMap::new();
-        for payload in payloads {
-            let text = texts
-                .get(&payload.raw)
-                .expect("all selected payloads were resolved before counting");
-            for token in hash_tokens(text.as_ref()) {
-                let frequency = frequencies.entry(token.raw).or_default();
-                let Some(incremented) = frequency.checked_add(1) else {
-                    return Ok(DeriveValidation::Rejected(format!(
-                        "term frequency overflows u32 for Archive block {document_id:X}"
-                    )));
-                };
-                *frequency = incremented;
-            }
+        for token in hash_tokens(text.as_ref()) {
+            let frequency = frequencies.entry(token.raw).or_default();
+            let Some(incremented) = frequency.checked_add(1) else {
+                return Ok(DeriveValidation::Rejected(format!(
+                    "term frequency overflows u32 for Archive text {}",
+                    hex::encode_upper(document.raw)
+                )));
+            };
+            *frequency = incremented;
         }
         counts.extend(
             frequencies
                 .into_iter()
-                .map(|(term, frequency)| (document, Inline::<WordHash>::new(term), frequency)),
+                .map(|(term, frequency)| (*document, Inline::<WordHash>::new(term), frequency)),
         );
     }
 
@@ -271,75 +244,24 @@ where
     Ok(DeriveValidation::Ready(index.to_blob()))
 }
 
-fn projection_plan(source: Blob<SimpleArchive>) -> std::result::Result<ProjectionPlan, String> {
-    let facts = TribleSet::try_from_blob(source)
+/// The distinct text payload handles a member names, read from its rows in
+/// place. A canonical `SimpleArchive` is a sorted run of 64-byte rows
+/// (entity 16, attribute 16, value 32); only the attribute is compared.
+fn text_payloads(source: &Blob<SimpleArchive>) -> std::result::Result<BTreeSet<RawInline>, String> {
+    simplearchive_union::validate_element(source)
         .map_err(|error| format!("source is not a canonical SimpleArchive: {error}"))?;
-    let block_ids: BTreeSet<Id> = find!(
-        block: Id,
-        pattern!(&facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
-    )
-    .collect();
-    let mut documents = BTreeMap::new();
-    for block_id in block_ids {
-        let fact_ids: BTreeSet<Id> = find!(
-            fact: Id,
-            pattern!(&facts, [{ block_id @ schema::block::holds: ?fact }])
-        )
-        .collect();
-        // The unique content-free bottom is not a BM25 document. Under the
-        // open-world schema, other tag-only rows (and nodes in an older
-        // shape) are simply nonmatching too; neither case licenses
-        // reconstructing or validating an entity id.
-        if fact_ids.is_empty() {
-            continue;
-        }
-
-        let mut payloads = Vec::new();
-        for fact_id in fact_ids {
-            if find!(
-                (modality: Id, direction: Id),
-                pattern!(&facts, [{
-                    fact_id @ metadata::tag: &schema::content_fact::KIND,
-                    schema::content_fact::modality: ?modality,
-                    schema::content_fact::direction: ?direction,
-                }])
-            )
-            .next()
-            .is_none()
-            {
-                return Err(format!(
-                    "Archive node {block_id:X} holds absent or untyped fact {fact_id:X}"
-                ));
-            }
-            let texts: Vec<Inline<Handle<UTF8String>>> = find!(
-                payload: Inline<Handle<UTF8String>>,
-                pattern!(&facts, [{ fact_id @ schema::content_fact::payload: ?payload }])
-            )
-            .collect();
-            let has_nontext_payload = find!(
-                _blob: Inline<Handle<RawBytes>>,
-                pattern!(&facts, [{ fact_id @ schema::content_fact::blob: ?_blob }])
-            )
-            .next()
-            .is_some()
-                || find!(
-                    _pointer: Inline<Handle<UTF8String>>,
-                    pattern!(&facts, [{
-                        fact_id @ schema::content_fact::asset_pointer: ?_pointer
-                    }])
-                )
-                .next()
-                .is_some();
-            if texts.is_empty() && !has_nontext_payload {
-                return Err(format!(
-                    "Archive content fact {fact_id:X} has no typed payload variant"
-                ));
-            }
-            payloads.extend(texts);
-        }
-        documents.insert(block_id, payloads);
-    }
-    Ok(ProjectionPlan { documents })
+    let payload = schema::content_fact::payload.id();
+    Ok(source
+        .bytes
+        .as_ref()
+        .chunks_exact(TRIBLE_LEN)
+        .filter(|row| row[A_START..V_START] == payload[..])
+        .map(|row| {
+            row[V_START..]
+                .try_into()
+                .expect("a SimpleArchive row ends in a 32-byte value")
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -354,6 +276,11 @@ mod tests {
     use triblespace::core::repo::{BlobStorePut, SnapshotSource};
     use triblespace::core::trible::Fragment;
     use triblespace::macros::entity;
+
+    use triblespace::core::blob::TryFromBlob;
+    use triblespace::core::inline::encodings::genid::GenId;
+    use triblespace::core::inline::IntoInline;
+    use triblespace::core::trible::TribleSet;
 
     use super::*;
     use crate::blockdag as archive;
@@ -416,6 +343,16 @@ mod tests {
         derive_element(reader, source).unwrap()
     }
 
+    /// The document key of one text: its blob handle.
+    fn text_key(text: &str) -> RawInline {
+        let blob: Blob<UTF8String> = text.to_blob();
+        blob.get_handle().raw
+    }
+
+    fn keys(index: &ArchiveBM25Index) -> BTreeSet<RawInline> {
+        index.document_keys().map(|document| document.raw).collect()
+    }
+
     #[test]
     fn a_cold_residual_block_acquires_its_text_without_changing_residency() {
         use triblespace::core::collection::{
@@ -437,9 +374,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let target = store
-            .attach_with(root, ArchiveBlockTextBm25Mapping)
-            .unwrap();
+        let target = store.attach_with(root, ArchiveTextBm25Mapping).unwrap();
         let text: Blob<UTF8String> = "late comet comet".to_blob();
         let text_handle = text.get_handle();
         let (node, attachments) = source_and_attachments(text_block(&[(
@@ -453,7 +388,7 @@ mod tests {
         store.commit(root, &signer, facts.into()).unwrap();
         let frozen = store.snapshot().unwrap();
         assert!(matches!(
-            derive_for_validation(&frozen, node.clone()).unwrap(),
+            derive_for_validation(&frozen, &node).unwrap(),
             DeriveValidation::Pending(handle) if handle == text_handle
         ));
         // Descriptor registration may already have stored schema attachments.
@@ -471,7 +406,7 @@ mod tests {
         assert_eq!(selected.residual().len(), 1);
         let index = crate::storage::require_complete_attached_read(
             selected
-                .read_with_acquiring::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>()
+                .read_with_acquiring::<ArchiveTextBm25Mapping, ArchiveBM25View>()
                 .unwrap(),
         )
         .unwrap();
@@ -510,15 +445,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_corpus_and_semantic_textless_blocks_remain_documents() {
+    fn empty_corpus_and_empty_text_remain_documents() {
         let (empty_source, empty_attachments) = source_and_attachments(Fragment::empty());
         let empty_store = StoredBlobs::new(empty_attachments);
         let empty = parse(derive(&empty_store.reader, empty_source));
         assert_eq!(empty.doc_count(), 0);
         assert_eq!(empty.term_count(), 0);
 
+        // An empty text is a document; a node holding only a binary fact,
+        // and the content-free bottom, name no text and add none.
         let empty_text = text_block(&[(schema::content_fact::modality::TEXT, "")]);
-        let empty_text_id = empty_text.root().unwrap();
         let binary_fact = archive::blob_fact(
             schema::content_fact::modality::IMAGE,
             schema::content_fact::direction::IN,
@@ -527,7 +463,6 @@ mod tests {
         )
         .unwrap();
         let binary_block = archive::block(std::iter::empty::<Id>(), None, binary_fact).unwrap();
-        let binary_id = binary_block.root().unwrap();
         let bottom = archive::block(std::iter::empty::<Id>(), None, Fragment::empty()).unwrap();
         let mut corpus = empty_text;
         corpus += binary_block;
@@ -535,31 +470,38 @@ mod tests {
         let (source, attachments) = source_and_attachments(corpus);
         let store = StoredBlobs::new(attachments);
         let index = parse(derive(&store.reader, source));
-        let documents: BTreeSet<_> = index.document_keys().map(|doc| doc.raw).collect();
-        assert_eq!(index.doc_count(), 2);
+        assert_eq!(index.doc_count(), 1);
         assert_eq!(index.term_count(), 0);
-        let empty_text_inline: Inline<GenId> = empty_text_id.to_inline();
-        let binary_inline: Inline<GenId> = binary_id.to_inline();
-        assert_eq!(
-            documents,
-            BTreeSet::from([empty_text_inline.raw, binary_inline.raw])
-        );
+        assert_eq!(keys(&index), BTreeSet::from([text_key("")]));
     }
 
     #[test]
-    fn canonical_bottom_does_not_perturb_the_bm25_carrier() {
+    fn textless_nodes_do_not_perturb_the_bm25_carrier() {
         let semantic = text_block(&[(schema::content_fact::modality::TEXT, "stable corpus")]);
         let (semantic_source, semantic_attachments) = source_and_attachments(semantic.clone());
         let semantic_store = StoredBlobs::new(semantic_attachments);
         let semantic_index = parse(derive(&semantic_store.reader, semantic_source));
 
-        let mut with_bottom = semantic;
-        with_bottom += archive::block(std::iter::empty::<Id>(), None, Fragment::empty()).unwrap();
-        let (with_bottom_source, with_bottom_attachments) = source_and_attachments(with_bottom);
-        let with_bottom_store = StoredBlobs::new(with_bottom_attachments);
-        let with_bottom_index = parse(derive(&with_bottom_store.reader, with_bottom_source));
+        let mut with_textless = semantic;
+        with_textless += archive::block(std::iter::empty::<Id>(), None, Fragment::empty()).unwrap();
+        with_textless += archive::block(
+            std::iter::empty::<Id>(),
+            None,
+            archive::blob_fact(
+                schema::content_fact::modality::IMAGE,
+                schema::content_fact::direction::IN,
+                vec![9, 9],
+                "application/octet-stream",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (with_textless_source, with_textless_attachments) =
+            source_and_attachments(with_textless);
+        let with_textless_store = StoredBlobs::new(with_textless_attachments);
+        let with_textless_index = parse(derive(&with_textless_store.reader, with_textless_source));
 
-        assert_eq!(semantic_index, with_bottom_index);
+        assert_eq!(semantic_index, with_textless_index);
     }
 
     #[test]
@@ -579,31 +521,70 @@ mod tests {
         let (source, attachments) = source_and_attachments(corpus);
         let store = StoredBlobs::new(attachments);
         let index = parse(derive(&store.reader, source));
-        assert_eq!(index.doc_count(), 1);
-        let predecessor_inline: Inline<GenId> = predecessor_id.to_inline();
-        assert_eq!(
-            index
-                .document_keys()
-                .map(|document| document.raw)
-                .collect::<Vec<_>>(),
-            vec![predecessor_inline.raw],
-        );
+        assert_eq!(keys(&index), BTreeSet::from([text_key("parent")]));
     }
 
+    /// A text is one document however many nodes and facts name it: two
+    /// different nodes (one a root, one after another node) holding the
+    /// same text, and one set node holding that text under two modalities,
+    /// all index it once, with the frequencies of the text itself. Each
+    /// node mapped alone joins to exactly the image of their union.
     #[test]
-    fn repeated_terms_in_a_set_node_sum_across_modalities() {
-        let block = text_block(&[
-            (schema::content_fact::modality::THINKING, "echo"),
-            (schema::content_fact::modality::TOOL_RESULT, "echo"),
+    fn identical_texts_are_one_document_whoever_holds_them() {
+        let root = text_block(&[(schema::content_fact::modality::TEXT, "alpha")]);
+        let root_id = root.root().unwrap();
+        let held = archive::text_fact(
+            schema::content_fact::modality::TEXT,
+            schema::content_fact::direction::IN,
+            "echo echo quasar",
+        )
+        .unwrap();
+        let first = archive::block(std::iter::empty::<Id>(), None, held.clone()).unwrap();
+        let second = archive::block([root_id], None, held).unwrap();
+        assert_ne!(first.root(), second.root(), "two different nodes");
+        let set = text_block(&[
+            (schema::content_fact::modality::THINKING, "echo echo quasar"),
+            (
+                schema::content_fact::modality::TOOL_RESULT,
+                "echo echo quasar",
+            ),
         ]);
-        let block_id = block.root().unwrap();
-        let (source, attachments) = source_and_attachments(block);
+
+        let sources: Vec<Blob<SimpleArchive>> = [&root, &first, &second, &set]
+            .into_iter()
+            .map(|node| node.facts().clone().to_blob())
+            .collect();
+        let mut union = root;
+        union += first;
+        union += second;
+        union += set;
+        let (union_source, attachments) = source_and_attachments(union);
         let store = StoredBlobs::new(attachments);
-        let index = parse(derive(&store.reader, source));
-        let document: Inline<GenId> = block_id.to_inline();
-        let term = hash_tokens("echo")[0];
-        assert_eq!(index.term_frequency(&document, &term).unwrap(), 2);
-        assert_eq!(index.merged(&index).unwrap(), index);
+        let index = parse(derive(&store.reader, union_source));
+        assert_eq!(
+            keys(&index),
+            BTreeSet::from([text_key("alpha"), text_key("echo echo quasar")])
+        );
+        let document: Inline<Handle<UTF8String>> = Inline::new(text_key("echo echo quasar"));
+        let echo = hash_tokens("echo")[0];
+        assert_eq!(index.term_frequency(&document, &echo).unwrap(), 2);
+        assert_eq!(
+            index
+                .query()
+                .unwrap()
+                .query_multi(&hash_tokens("quasar"))
+                .len(),
+            1
+        );
+
+        let alone: Vec<ArchiveBM25Index> = sources
+            .into_iter()
+            .map(|source| parse(derive(&store.reader, source)))
+            .collect();
+        for image in &alone[1..] {
+            assert_eq!(keys(image), BTreeSet::from([text_key("echo echo quasar")]));
+        }
+        assert_eq!(ArchiveBM25Index::merge(alone.iter()).unwrap(), index);
     }
 
     #[test]
@@ -652,19 +633,10 @@ mod tests {
             source_and_attachments(graph_with_unknown_fact);
         let open_world_store = StoredBlobs::new(attachments);
         let index = parse(derive(&open_world_store.reader, graph_with_unknown_fact));
-        let block_inline: Inline<GenId> = block_id.to_inline();
         assert_eq!(
-            index.doc_count(),
-            1,
-            "unknown facts do not close the schema"
-        );
-        assert_eq!(
-            index
-                .document_keys()
-                .map(|document| document.raw)
-                .collect::<Vec<_>>(),
-            vec![block_inline.raw],
-            "the selected entity id remains opaque",
+            keys(&index),
+            BTreeSet::from([text_key("open world")]),
+            "unknown facts and opaque node ids do not close the schema"
         );
 
         let malformed = Blob::<SimpleArchive>::new(Bytes::from(vec![0xFF]));
@@ -720,20 +692,15 @@ mod tests {
             .collect()
     }
 
-    /// The cover-query equivalence law for the archive-node mapping over
-    /// the one split it refuses: an Archive node's own facts in one commit
-    /// and its held facts in another. The commit holding the node references
-    /// facts it lacks and cannot be indexed alone (`Capacity`), only from a
-    /// collection node holding both. Splits the mapping does not refuse are
-    /// the ignored tests below.
-    ///
-    /// Over random commits (some blocks split), the host's carry or not,
+    /// The cover-query equivalence law for the archive-text mapping, over
+    /// random commits (some of them an Archive node's own facts in one
+    /// commit and its held facts in another), the host's carry or not,
     /// random host merges over possibly overlapping nodes, and an attachment
-    /// at random nodes wherever the mapping can build one, the production
-    /// read -- the attached cover and the residual built in memory -- scores
-    /// every query exactly as the index of the union of every foundation it
-    /// reads. What it cannot read it names, and only a node that cannot be
-    /// indexed alone is ever unread.
+    /// at random nodes: the production read -- the attached cover and the
+    /// residual built in memory -- scores every query exactly as the index of
+    /// the union of every foundation it reads. A split node is no obstacle,
+    /// because the documents are texts and every member maps, so nothing is
+    /// ever unread.
     #[test]
     fn archive_block_covers_answer_like_the_index_of_what_they_read() {
         use ed25519_dalek::SigningKey;
@@ -747,7 +714,6 @@ mod tests {
         const WORDS: [&str; 5] = ["alpha", "bravo", "charlie", "delta", "echo"];
         let key = SigningKey::from_bytes(&[61; 32]);
         let host = key.verifying_key();
-        let mut unread_seen = 0;
         let mut attachments_taken = 0;
         let mut host_merges = 0;
         for seed in 0..24u64 {
@@ -758,9 +724,7 @@ mod tests {
             let root = store
                 .collection(&format!("archive-law-{seed}"), policy)
                 .unwrap();
-            let target = store
-                .attach_with(root, ArchiveBlockTextBm25Mapping)
-                .unwrap();
+            let target = store.attach_with(root, ArchiveTextBm25Mapping).unwrap();
             // Enough commits that a host merge can name eight distinct nodes:
             // the collection algebra accepts exactly eight-way MERGEs.
             for _ in 0..8 + random.below(8) {
@@ -847,7 +811,7 @@ mod tests {
                 let bytes: Blob<SimpleArchive> = snapshot
                     .get(Handle::<SimpleArchive>::from_hash(node))
                     .unwrap();
-                let image = ArchiveBlockTextBm25Mapping.map(&bytes, &[], &snapshot);
+                let image = ArchiveTextBm25Mapping.map(&bytes, &[], &snapshot);
                 drop(snapshot);
                 let Ok(image) = image else {
                     continue;
@@ -866,20 +830,9 @@ mod tests {
             let snapshot = store.snapshot().unwrap();
             let attached = snapshot.attached(target).unwrap();
             let read = attached
-                .read_with::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>()
+                .read_with::<ArchiveTextBm25Mapping, ArchiveBM25View>()
                 .unwrap();
-            // What is unread is only ever a node no mapping can index alone.
-            for member in read.unread().members() {
-                let bytes: Blob<SimpleArchive> = snapshot.get(member).unwrap();
-                assert!(
-                    matches!(
-                        ArchiveBlockTextBm25Mapping.map(&bytes, &[], &snapshot),
-                        Err(CollectionOperationError::Capacity(_))
-                    ),
-                    "seed {seed}"
-                );
-                unread_seen += 1;
-            }
+            assert!(read.unread().is_empty(), "seed {seed}");
             // The index of the union of every foundation the read includes.
             let mut union = TribleSet::new();
             for member in attached
@@ -893,7 +846,7 @@ mod tests {
                 let bytes: Blob<SimpleArchive> = snapshot.get(member).unwrap();
                 union += TribleSet::try_from_blob(bytes).unwrap();
             }
-            let expected = ArchiveBlockTextBm25Mapping
+            let expected = ArchiveTextBm25Mapping
                 .map(&union.to_blob(), &[], &snapshot)
                 .unwrap();
             attachments_taken += attached.cover().len();
@@ -923,21 +876,16 @@ mod tests {
                 "seed {seed}"
             );
         }
-        // The seeds exercise both sides of the law: split blocks left unread,
-        // and attachments taken.
-        assert!(unread_seen > 0);
+        // The seeds exercise attachments taken as well as residuals.
         assert!(attachments_taken > 0);
         assert!(host_merges > 0, "no seed reached an eight-way host merge");
     }
 
-    // The three ignored tests below show the cover law failing when one
-    // node's held facts span members. Faculties' importers never write that:
-    // a node and its facts are one identity, committed together, and only a
-    // simultaneous set node holds more than one fact. Another writer can
-    // still spread a set node's facts over commits; a per-fact text BM25,
-    // with nodes ranked at query time through the fact read, would close
-    // the gap. Until then this mapping's law holds only for covers whose
-    // nodes arrive whole (see `ArchiveBlockTextBm25Mapping`).
+    // The three tests below spread one node's held facts over members.
+    // Faculties' importers never write that, but another writer can. Under
+    // the node-document mapping (version 2) the cover law failed here, since
+    // a node's frequency summed over facts no single member held; with texts
+    // as documents each member's image is exact and the law holds.
 
     /// One set node of several distinct text facts, and each fact. The
     /// modality varies with the position so equal words stay distinct
@@ -1015,9 +963,7 @@ mod tests {
         let policy =
             CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
         let root = store.collection("archive-parts", policy).unwrap();
-        let target = store
-            .attach_with(root, ArchiveBlockTextBm25Mapping)
-            .unwrap();
+        let target = store.attach_with(root, ArchiveTextBm25Mapping).unwrap();
         for blob in texts {
             store.put::<UnknownBlob, _>(blob).unwrap();
         }
@@ -1026,17 +972,17 @@ mod tests {
             union += node.facts().clone();
             store.commit(root, &key, node.clone()).unwrap();
         }
-        pollster::block_on(store.ensure_attached_with::<ArchiveBlockTextBm25Mapping>(target, &key))
+        pollster::block_on(store.ensure_attached_with::<ArchiveTextBm25Mapping>(target, &key))
             .unwrap();
 
         let snapshot = store.snapshot().unwrap();
         let attached = snapshot.attached(target).unwrap();
         assert!(attached.residual().is_empty(), "every node is attached");
         let read = attached
-            .read_with::<ArchiveBlockTextBm25Mapping, ArchiveBM25View>()
+            .read_with::<ArchiveTextBm25Mapping, ArchiveBM25View>()
             .unwrap();
         assert!(read.unread().is_empty());
-        let expected = ArchiveBlockTextBm25Mapping
+        let expected = ArchiveTextBm25Mapping
             .map(&union.to_blob(), &[], &snapshot)
             .unwrap();
         drop(attached);
@@ -1054,14 +1000,9 @@ mod tests {
     }
 
     /// Two members each hold the set node and one of its two facts, each
-    /// fact with the same word. Each member maps, to a frequency of one; the
-    /// union holds both facts, a frequency of two. The cover's pointwise
-    /// maximum says one; a sum would say two here, and twice the truth
-    /// wherever the two members hold the same fact.
+    /// fact with the same word. Both facts name one text, so each member and
+    /// the union index that one text with a frequency of one.
     #[test]
-    #[ignore = "open design question: a set node's term frequency sums over its held facts, and \
-                a member holding some of them cannot tell; no combination of per-member images \
-                is exact"]
     fn a_block_whose_parts_sit_in_two_nodes_scores_like_their_union() {
         let (block, parts) = parts_block(&["echo", "echo"]);
         let (other, _) = parts_block(&["alpha"]);
@@ -1077,14 +1018,9 @@ mod tests {
 
     /// The same set node, one member holding it with its first fact and
     /// another holding only its `holds` fact for the second fact and that
-    /// fact's closure, not the node's tag. The second member has no document,
-    /// so the node is in one image only, and still its union's frequency is
-    /// larger: finding the nodes two images share cannot find every node the
-    /// cover gets wrong.
+    /// fact's closure, not the node's tag. The second member still names the
+    /// text, and the text is whole wherever it is named.
     #[test]
-    #[ignore = "open design question: a set node's term frequency sums over its held facts, and \
-                a member holding some of them cannot tell; no combination of per-member images \
-                is exact"]
     fn a_block_extended_by_a_node_without_its_tag_scores_like_their_union() {
         let (block, parts) = parts_block(&["echo", "echo"]);
         let (other, _) = parts_block(&["alpha"]);
@@ -1105,9 +1041,6 @@ mod tests {
     /// elsewhere; the pieces of different nodes share members at random.
     /// Every member maps, so the law must hold with nothing unread.
     #[test]
-    #[ignore = "open design question: a set node's term frequency sums over its held facts, and \
-                a member holding some of them cannot tell; no combination of per-member images \
-                is exact"]
     fn archive_block_covers_answer_like_the_union_when_parts_spread_over_nodes() {
         const WORDS: [&str; 4] = ["alpha", "bravo", "charlie", "echo"];
         for seed in 0..24u64 {

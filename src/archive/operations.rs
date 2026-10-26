@@ -235,7 +235,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::id::Id;
-use triblespace::core::inline::{Inline, TryFromInline, TryToInline};
+use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::Fragment;
 
@@ -1141,13 +1141,28 @@ fn run_search(
     }
     let facts = crate::storage::acquire_attached_facts(&observed)?;
     let query = index.query().context("prepare Archive BM25 query")?;
-    for (document, score) in query
+    // The documents are texts. Walk them best first and join each to the
+    // nodes holding it; a node holding several hits is shown once, at its
+    // best text's score.
+    let mut shown = BTreeSet::new();
+    let hits = query
         .query_multi(&hash_tokens(&text))
         .into_iter()
-        .take(limit)
-    {
-        let block = Id::try_from_inline(&document)
-            .map_err(|error| anyhow!("Archive BM25 document is not a block id: {error:?}"))?;
+        .flat_map(|(payload, score)| {
+            find!(
+                block: Id,
+                pattern!(&facts, [
+                    { ?block @ archive_schema::block::holds: _?fact },
+                    { _?fact @ archive_schema::content_fact::payload: payload },
+                ])
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(move |block| (block, score))
+        })
+        .filter(|(block, _)| shown.insert(*block))
+        .take(limit);
+    for (block, score) in hits {
         let receipts: BTreeSet<_> = find!(
             receipt: Id,
             pattern!(&facts, [{
@@ -2168,12 +2183,14 @@ mod tests {
             .unwrap()
             .query_multi(&hash_tokens("quasar"));
         assert_eq!(hits.len(), 1);
-        let block = Id::try_from_inline(&hits[0].0).unwrap();
+        let payload = hits[0].0;
         let found: Vec<_> = find!(
             projection: Id,
-            pattern!(&facts, [{
-                ?projection @ archive_schema::source_projection::projects_to: block
-            }])
+            pattern!(&facts, [
+                { _?block @ archive_schema::block::holds: _?fact },
+                { _?fact @ archive_schema::content_fact::payload: payload },
+                { ?projection @ archive_schema::source_projection::projects_to: _?block },
+            ])
         )
         .collect();
         assert_eq!(found, [id]);
@@ -2185,6 +2202,80 @@ mod tests {
             &mut Out::new(&mut |_| Ok(())),
         )
         .unwrap();
+    }
+
+    /// Two different nodes (each after a different first message) hold the
+    /// same text. The index holds that text once, and a search joins it back
+    /// to both nodes; the limit counts nodes, not texts.
+    #[test]
+    fn search_returns_every_node_holding_one_indexed_text() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("two.jsonl");
+        fs::write(
+            &source,
+            concat!(
+                r#"{"type":"user","sessionId":"two-a","uuid":"a1","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"alpha"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"two-a","uuid":"a2","parentUuid":"a1","timestamp":"2026-03-01T15:34:02Z","message":{"role":"user","content":"quasar needle"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"two-b","uuid":"b1","timestamp":"2026-03-01T15:35:01Z","message":{"role":"user","content":"beta"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"two-b","uuid":"b2","parentUuid":"b1","timestamp":"2026-03-01T15:35:02Z","message":{"role":"user","content":"quasar needle"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
+
+        let (_, index, lag) = pollster::block_on(archive_collection::ensure_search_local(
+            &fixture.pile,
+            Some(&fixture.key),
+        ))
+        .unwrap();
+        assert!(lag.is_current(), "{lag:?}");
+        let hits = index.query().unwrap().query_multi(&hash_tokens("quasar"));
+        assert_eq!(hits.len(), 1, "one text, indexed once");
+        let payload = hits[0].0;
+        drop(index);
+
+        let archive = storage(&fixture).load().unwrap();
+        let facts = archive.facts().unwrap();
+        let holders: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(&facts, [
+                { ?block @ archive_schema::block::holds: _?fact },
+                { _?fact @ archive_schema::content_fact::payload: payload },
+            ])
+        )
+        .collect();
+        assert_eq!(holders.len(), 2, "two different nodes hold the text");
+        drop(facts);
+        drop(archive);
+
+        let search = |limit: usize| {
+            let mut printed = String::new();
+            run_search(
+                storage(&fixture),
+                "quasar",
+                limit,
+                &mut Out::new(&mut |part| {
+                    if let crate::out::Part::Text { text } = part {
+                        printed.push_str(&text);
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap();
+            printed
+        };
+        let all = search(10);
+        for block in &holders {
+            assert!(all.contains(&short_id(*block)), "{all}");
+        }
+        assert_eq!(all.matches("quasar needle").count(), 2, "{all}");
+        let one = search(1);
+        assert_eq!(one.matches("quasar needle").count(), 1, "{one}");
     }
 
     #[test]
