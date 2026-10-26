@@ -833,6 +833,16 @@ fn render_projection(facts: &FactArchive, reader: &PileSnapshot, projection: Id)
             writeln!(out, "{label}: {}", read_text(reader, value)?)?;
         }
     }
+    for model in find!(
+        model: Id,
+        pattern!(facts, [{ projection @ archive_schema::source_projection::generated_by: ?model }])
+    ) {
+        let mut names = Vec::new();
+        for name in find!(name: TextHandle, pattern!(facts, [{ model @ metadata::name: ?name }])) {
+            names.push(read_text(reader, name)?);
+        }
+        writeln!(out, "generated_by: {model:X} {}", names.join(", "))?;
+    }
     for raw in find!(
         raw: RawHandle,
         pattern!(facts, [{ projection @ archive_schema::source_projection::raw_record: ?raw }])
