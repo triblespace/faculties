@@ -51,6 +51,38 @@ enum Command {
         #[arg(long, default_value_t = 5.0)]
         timeout: f64,
     },
+    /// Pick up the nearest entity with a name (or the thing at `<x> <z>`).
+    Pickup {
+        #[arg(allow_negative_numbers = true, required = true, num_args = 1..=2)]
+        target: Vec<String>,
+        /// Height for a coordinate target. Default: the body's current height.
+        #[arg(long)]
+        y: Option<f64>,
+    },
+    /// Put down what the body holds at `<x> <z>`.
+    Place {
+        #[arg(allow_negative_numbers = true, required = true, num_args = 2)]
+        target: Vec<String>,
+        /// Height. Default: the body's current height.
+        #[arg(long)]
+        y: Option<f64>,
+    },
+    /// Throw what the body holds along the horizontal direction `<dx> <dz>`.
+    Throw {
+        #[arg(allow_negative_numbers = true, required = true, num_args = 2)]
+        direction: Vec<f64>,
+        /// Upward part of the direction.
+        #[arg(long, default_value_t = 0.3, allow_negative_numbers = true)]
+        dy: f64,
+        #[arg(long, default_value_t = 12.0)]
+        speed: f64,
+    },
+    /// Send any input this world defines: `act <Type> [json-data]`.
+    Act {
+        kind: String,
+        /// The input's data as JSON. Default: `{}`.
+        data: Option<String>,
+    },
     /// Jump once.
     Jump,
     /// Stop moving.
@@ -193,6 +225,44 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         }
         Command::Look => out.text(render::observation(&world.observe()?)),
         Command::MoveTo { target, y, timeout } => move_to(&world, out, &target, y, timeout),
+        Command::Pickup { target, y } => {
+            let (label, at) = resolve_target(&world, &target, y)?;
+            act(
+                &world,
+                out,
+                "Pickup",
+                json!({"position": at}),
+                &format!("pickup {label}"),
+            )
+        }
+        Command::Place { target, y } => {
+            let (label, at) = resolve_target(&world, &target, y)?;
+            act(
+                &world,
+                out,
+                "Place",
+                json!({"position": at}),
+                &format!("place at {label}"),
+            )
+        }
+        Command::Throw {
+            direction,
+            dy,
+            speed,
+        } => act(
+            &world,
+            out,
+            "Throw",
+            json!({"direction": [direction[0], dy, direction[1]], "speed": speed}),
+            "throw",
+        ),
+        Command::Act { kind, data } => {
+            let data: Value = match data {
+                Some(text) => serde_json::from_str(&text).context("act data is not JSON")?,
+                None => json!({}),
+            };
+            act(&world, out, &kind, data, &kind)
+        }
         Command::Jump => {
             world.input("Jump", json!({}))?;
             out.line("jumped")?;
@@ -213,6 +283,23 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         }
         Command::Watch { every } => watch(&world, out, every),
     }
+}
+
+/// Send one input, then report what the world says became of it.
+fn act(world: &World, out: &mut Out<'_>, kind: &str, data: Value, label: &str) -> Result<()> {
+    world.input(kind, data)?;
+    let obs = world.observe()?;
+    let result = obs
+        .get("player")
+        .and_then(|p| p.get("attributes"))
+        .and_then(|a| a.get("LastActionResult"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match result {
+        Some(result) => out.line(format!("{label}: {result}"))?,
+        None => out.line(format!("{label}: sent"))?,
+    }
+    out.text(render::observation(&obs))
 }
 
 fn resolve_target(world: &World, target: &[String], y: Option<f64>) -> Result<(String, [f64; 3])> {
