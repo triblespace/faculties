@@ -729,8 +729,15 @@ where
                     .map(|value| value.as_ref().to_owned()),
                 ..ProjectionAnnotations::default()
             };
+            // The model a record names wrote only the record's `out` parts;
+            // what it perceived keeps the record's other claims alone.
+            let generator = claims
+                .raw_model
+                .as_ref()
+                .map(|label| blockdag::vendor_model(label.as_ref()));
             let mut projected = Vec::with_capacity(record.parts.len());
             for (position, part) in record.parts.iter().cloned().enumerate() {
+                let produced = part.direction() == schema::content_fact::direction::OUT;
                 let (fact, resolution) = build_fact(part)?;
                 let (mut node, identity) =
                     blockdag::block_parts(frontier.iter().copied(), record.block_timestamp, fact)?;
@@ -756,7 +763,14 @@ where
                 }
                 followed.extend(frontier.iter().copied());
                 let receipt = blockdag::block_source_projection(source_namespace, node)?;
-                let receipt = blockdag::annotate_source_projection(receipt, annotations.clone())?;
+                let receipt = match generator.as_ref().filter(|_| produced) {
+                    Some(model) => blockdag::annotate_generated_projection(
+                        receipt,
+                        annotations.clone(),
+                        model,
+                    )?,
+                    None => blockdag::annotate_source_projection(receipt, annotations.clone())?,
+                };
                 receipts.push((
                     node_id,
                     receipt.root().expect("canonical receipt is rooted"),
@@ -1168,6 +1182,63 @@ mod tests {
         .unwrap_err();
         assert_eq!(emitted, 0);
         assert!(error.to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn a_named_model_wrote_only_the_out_parts_of_its_records() {
+        // A source can name the model for a whole record or turn (Codex
+        // does). Generation is established only for what the model produced;
+        // what it perceived keeps `raw_model` as the raw claim and nothing more.
+        let mut turn = record(
+            "turn",
+            &[],
+            vec![part(IN, "the tool said hi"), part(OUT, "reply")],
+        );
+        turn.claims.raw_model = Some(owned_text("model-x"));
+        let mut later = record("later", &["turn"], vec![part(OUT, "again")]);
+        later.claims.raw_model = Some(owned_text("model-x"));
+        let unnamed = record("unnamed", &["later"], vec![part(OUT, "who wrote me")]);
+        let (_, mut union) = project(vec![turn, later, unnamed], UnitAnnotations::default());
+
+        let model = blockdag::vendor_model("model-x")
+            .root()
+            .expect("vendor model is rooted");
+        let generated: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(&union, [{
+                _?receipt @
+                schema::source_projection::projects_to: ?block,
+                schema::source_projection::generated_by: model,
+            }])
+        )
+        .collect();
+        let reply = block_with_text(&mut union, "reply");
+        let again = block_with_text(&mut union, "again");
+        let perceived = block_with_text(&mut union, "the tool said hi");
+        let unnamed = block_with_text(&mut union, "who wrote me");
+        assert_eq!(generated, BTreeSet::from([reply, again]));
+
+        let claimed: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(&union, [{
+                _?receipt @
+                schema::source_projection::projects_to: ?block,
+                schema::source_projection::raw_model: _?label,
+            }])
+        )
+        .collect();
+        assert!(claimed.contains(&perceived), "raw_model is unchanged");
+        assert!(!claimed.contains(&unnamed));
+
+        let models: Vec<Id> = find!(
+            entity: Id,
+            pattern!(&union, [{
+                ?entity @ triblespace::core::metadata::tag: schema::vendor_model::KIND
+            }])
+        )
+        .collect();
+        assert_eq!(models, vec![model], "one label, one entity");
+        blockdag::validate_catalog_structure(union.facts()).unwrap();
     }
 
     #[test]

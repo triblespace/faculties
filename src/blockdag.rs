@@ -63,6 +63,10 @@ pub struct ProjectionAnnotations {
     pub raw_role: Option<String>,
     /// Exact source spelling of the model field.
     pub raw_model: Option<String>,
+    /// Models that wrote this occurrence ([`vendor_model`] roots for
+    /// imported records, the producer's binding for native ones). Leave it
+    /// empty for anything the model perceived rather than produced.
+    pub generated_by: Vec<Id>,
     /// Provider name of the conversation this receipt belongs to (a session,
     /// rollout or conversation id). Importers attach it to the leaves of one
     /// source unit only; it never enters an identity.
@@ -139,6 +143,21 @@ pub fn vocabulary_fragment() -> Fragment {
             metadata::name: name,
         };
     }
+    fragment
+}
+
+/// The model a source names, as an intrinsic entity rooted in the returned
+/// fragment: `{ metadata::tag: vendor_model::KIND, metadata::name: label }`,
+/// the label exactly as the source spelled it. Equal labels converge on one
+/// entity; that records equal spelling, not shown equal weights (see
+/// [`schema::vendor_model`]).
+pub fn vendor_model(label: &str) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let name = fragment.put::<UTF8String, _>(label.to_owned());
+    fragment += entity! {
+        metadata::tag: &schema::vendor_model::KIND,
+        metadata::name: name,
+    };
     fragment
 }
 
@@ -669,10 +688,29 @@ pub fn annotate_source_projection(
         schema::source_projection::raw_author?: raw_author.as_ref(),
         schema::source_projection::raw_role?: raw_role.as_ref(),
         schema::source_projection::raw_model?: raw_model.as_ref(),
+        schema::source_projection::generated_by*: annotations.generated_by.iter(),
         schema::source_projection::source_locator?: source_locator.as_ref(),
         schema::source_projection::source_detail?: source_detail.as_ref(),
     };
     debug_assert_eq!(projection.root(), Some(root));
+    Ok(projection)
+}
+
+/// [`annotate_source_projection`] for an occurrence a named model wrote:
+/// `generated_by` points at `model` (a [`vendor_model`] fragment), and the
+/// model's facts and name blob ride along unexported, so the receipt keeps
+/// its one root.
+pub fn annotate_generated_projection(
+    projection: Fragment,
+    mut annotations: ProjectionAnnotations,
+    model: &Fragment,
+) -> Result<Fragment> {
+    annotations
+        .generated_by
+        .push(rooted(model, "vendor model")?);
+    let mut projection = annotate_source_projection(projection, annotations)?;
+    let (_, facts, metafacts, blobs) = model.clone().into_parts();
+    projection += Fragment::from_parts(facts, metafacts, blobs);
     Ok(projection)
 }
 
@@ -855,11 +893,13 @@ where
     let blocks = ids_of_kind(facts, schema::block::KIND);
     let projections = ids_of_kind(facts, schema::source_projection::KIND);
     let media_types = ids_of_kind(facts, files_schema::KIND_MEDIA_TYPE);
+    let vendor_models = ids_of_kind(facts, schema::vendor_model::KIND);
     require_disjoint(&[
         ("content fact", &content_facts),
         ("block", &blocks),
         ("source projection", &projections),
         ("media type", &media_types),
+        ("vendor model", &vendor_models),
     ])?;
 
     let media_names = values_by_entity(find!(
@@ -976,6 +1016,10 @@ where
         (entity: Id, value: TextHandle),
         pattern!(facts, [{ ?entity @ schema::source_projection::raw_model: ?value }])
     ));
+    let generators = values_by_entity(find!(
+        (entity: Id, value: Id),
+        pattern!(facts, [{ ?entity @ schema::source_projection::generated_by: ?value }])
+    ));
     let source_details = values_by_entity(find!(
         (entity: Id, value: TextHandle),
         pattern!(facts, [{ ?entity @ schema::source_projection::source_detail: ?value }])
@@ -997,6 +1041,20 @@ where
         expected += core.into_facts();
         attachments.texts.insert(name);
         attachments.media_type_names.insert(name);
+    }
+
+    for id in &vendor_models {
+        let name = one_required(&media_names, *id, "vendor model name")?;
+        let core = entity! {
+            metadata::tag: &schema::vendor_model::KIND,
+            metadata::name: name,
+        };
+        let expected_id = core.root().expect("vendor model core has one root");
+        if expected_id != *id {
+            bail!("vendor model {id:x} does not match intrinsic root {expected_id:x}");
+        }
+        expected += core.into_facts();
+        attachments.texts.insert(name);
     }
 
     // Once vocabulary annotation is present, require the complete canonical
@@ -1210,6 +1268,7 @@ where
         let receipt_raw_authors = values_for(&raw_authors, *id);
         let receipt_raw_roles = values_for(&raw_roles, *id);
         let receipt_raw_models = values_for(&raw_models, *id);
+        let receipt_generators = values_for(&generators, *id);
         let details = values_for(&source_details, *id);
         let selected = values_for(&receipt_resolutions, *id);
         let available: BTreeSet<RawHandle> = values_for(&node_holds, projected)
@@ -1271,6 +1330,7 @@ where
             schema::source_projection::raw_author*: receipt_raw_authors.iter(),
             schema::source_projection::raw_role*: receipt_raw_roles.iter(),
             schema::source_projection::raw_model*: receipt_raw_models.iter(),
+            schema::source_projection::generated_by*: receipt_generators.iter(),
             schema::source_projection::source_detail*: details.iter(),
             schema::source_projection::resolution*: selected.iter(),
         }
@@ -1877,6 +1937,7 @@ mod tests {
                 raw_author: Some("human".into()),
                 raw_role: Some("user".into()),
                 raw_model: Some("model-v1".into()),
+                generated_by: vec![id(11)],
                 source_locator: Some("conversation/7".into()),
                 source_detail: Some(r#"{"agentType":"general-purpose"}"#.into()),
             },
@@ -1886,6 +1947,7 @@ mod tests {
         assert!(exists!(pattern!(&annotated, [{
             root @ schema::source_projection::author: &id(9),
             schema::source_projection::experiencer: &id(10),
+            schema::source_projection::generated_by: &id(11),
         }])));
         assert!(exists!(pattern!(&annotated, [{
             root @ schema::source_projection::source_locator: _?locator

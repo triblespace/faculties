@@ -209,6 +209,13 @@ pub mod source_projection {
         /// among that fact's `resolved_to` evidence. Minted with `trible
         /// genid` on 2026-10-16.
         "29757DF0058067C0250B586810CA19E0" as pub resolution: Handle<RawBytes>;
+        /// NONIDENTITY. The model that wrote this occurrence: a
+        /// [`super::vendor_model`] entity for an imported record whose
+        /// source states the model, or the producer's own model binding for a
+        /// native one. Only on `out` occurrences the model produced, never on
+        /// what it perceived; `raw_model` stays the raw claim beside it.
+        /// Minted with `trible genid` on 2026-10-26.
+        "E7B5625D9C7A534EC2FF566AF2F9C439" as pub generated_by: GenId;
     }
 
     /// Nonidentity kind marker attached after intrinsic receipt construction.
@@ -240,4 +247,19 @@ pub mod source_projection {
     /// Native Drive cognition source namespace. Minted with `trible genid` on
     /// 2026-08-27.
     pub const SOURCE_DRIVE: Id = id_hex!("3F9B847D70B5720F81DD303499F95898");
+}
+
+/// A model as a source names it: `{ metadata::tag: KIND, metadata::name:
+/// label }`, intrinsic, with the label exactly as the source spelled it.
+///
+/// It records a claim, not an identification. Two sources writing the same
+/// label converge on one entity because the spelling is equal, which says
+/// nothing about whether they ran the same weights; nothing is normalized and
+/// no provider or family is inferred. Facts about the model, if ever known,
+/// annotate the entity and stay out of its core.
+pub mod vendor_model {
+    use super::*;
+
+    /// Identity-core kind tag. Minted with `trible genid` on 2026-10-26.
+    pub const KIND: Id = id_hex!("91BC9F19BC45C253EF16244BD198443A");
 }

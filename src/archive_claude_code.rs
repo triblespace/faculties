@@ -124,6 +124,8 @@ use crate::{archive_source, blockdag, files};
 
 const TOOL_RESULT_STATUS_OK: &str = "urn:triblespace:archive:tool-result-status:v1:ok";
 const TOOL_RESULT_STATUS_ERROR: &str = "urn:triblespace:archive:tool-result-status:v1:error";
+/// The model label Claude Code writes on assistant records it made itself.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
 /// Observable projection accounting. Missing or unresolved source evidence is
 /// counted rather than silently replaced with invented values.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2050,9 +2052,21 @@ fn project_record(
         raw_model: record.model,
         ..blockdag::ProjectionAnnotations::default()
     };
+    // The model an assistant record names wrote its `out` parts only. Claude
+    // Code itself writes some assistant records (an API error, an
+    // interruption) and labels them `<synthetic>`: no model wrote those, so
+    // they keep `raw_model` and get no `generated_by`.
+    let generator = annotations
+        .raw_model
+        .as_deref()
+        .filter(|label| *label != SYNTHETIC_MODEL)
+        .map(blockdag::vendor_model);
     let mut previous = plan.firsts[&class].clone();
     let mut fragments = Vec::with_capacity(draft.parts.len());
     for (position, part) in draft.parts.into_iter().enumerate() {
+        let produced = exists!(pattern!(&part.fact, [{
+            _?fact @ schema::content_fact::direction: schema::content_fact::direction::OUT
+        }]));
         let (mut node, identity) =
             blockdag::block_parts(previous.iter().copied(), timestamp, part.fact)?;
         let node_id = chain[position];
@@ -2067,7 +2081,12 @@ fn project_record(
         }
         let receipt =
             blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, node)?;
-        let receipt = blockdag::annotate_source_projection(receipt, annotations.clone())?;
+        let receipt = match generator.as_ref().filter(|_| produced) {
+            Some(model) => {
+                blockdag::annotate_generated_projection(receipt, annotations.clone(), model)?
+            }
+            None => blockdag::annotate_source_projection(receipt, annotations.clone())?,
+        };
         // An alias line repeats its nodes: each is counted once.
         if let std::collections::btree_map::Entry::Vacant(entry) = receipts.entry(node_id) {
             entry.insert(receipt.root().expect("canonical receipt is rooted"));
@@ -2716,6 +2735,43 @@ mod tests {
             fragment,
             stats: summary.stats,
         }
+    }
+
+    #[test]
+    fn generated_by_names_the_model_on_what_it_wrote_and_never_on_synthetic_records() {
+        let text = r#"{"type":"user","sessionId":"s","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"hello there"}}
+{"type":"assistant","sessionId":"s","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"hi!"}]}}
+{"type":"assistant","sessionId":"s","uuid":"a2","parentUuid":"a1","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error: overloaded"}]}}"#;
+        let projected = project_text(text, Path::new("synthetic.jsonl"));
+        let generators = |block: Id| -> BTreeSet<Id> {
+            find!(
+                model: Id,
+                pattern!(projected.fragment.facts(), [{
+                    _?receipt @
+                    schema::source_projection::projects_to: block,
+                    schema::source_projection::generated_by: ?model,
+                }])
+            )
+            .collect()
+        };
+        let opus = blockdag::vendor_model("claude-opus-4")
+            .root()
+            .expect("vendor model is rooted");
+        let reply = block_with_payload(&projected.fragment, "hi!");
+        let error = block_with_payload(&projected.fragment, "API Error: overloaded");
+        let prompt = block_with_payload(&projected.fragment, "hello there");
+        assert_eq!(generators(reply), BTreeSet::from([opus]));
+        assert!(
+            generators(error).is_empty(),
+            "no model wrote a synthetic record"
+        );
+        assert!(generators(prompt).is_empty(), "the prompt was perceived");
+        assert_eq!(
+            ids_with_tag(&projected.fragment, schema::vendor_model::KIND),
+            BTreeSet::from([opus])
+        );
+        let (_directory, reader) = empty_reader();
+        blockdag::validate_catalog_union(&reader, &TribleSet::new(), &projected.fragment).unwrap();
     }
 
     fn empty_reader() -> (TempDir, PileSnapshot) {
