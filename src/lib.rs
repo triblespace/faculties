@@ -110,6 +110,7 @@ pub mod web;
 pub mod wemm;
 pub mod wiki;
 pub mod wiki_additive;
+pub mod world;
 
 /// What Files, Memory and Wiki semantic commands answer in a build without
 /// the WeMM model.
