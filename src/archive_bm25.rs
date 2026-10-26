@@ -200,12 +200,15 @@ where
     // malformed bytes cannot hide behind one unavailable payload. Do not test
     // frozen residency first: an acquiring reader can obtain exact text even
     // though this observation correctly keeps reporting it as nonresident.
+    // Keep each text as its view, not its tokens: a token is a 32-byte hash,
+    // several times the text it came from, and tokens of every payload of a
+    // large node held at once were most of the memory a build took.
     let handles: BTreeSet<_> = plan
         .documents
         .values()
         .flat_map(|payloads| payloads.iter().copied())
         .collect();
-    let mut token_cache = BTreeMap::new();
+    let mut texts = BTreeMap::new();
     let mut missing = None;
     for handle in handles {
         let blob: Blob<UTF8String> = match reader.get(handle) {
@@ -225,7 +228,7 @@ where
                 )))
             }
         };
-        token_cache.insert(handle.raw, hash_tokens(text.as_ref()));
+        texts.insert(handle.raw, text);
     }
     if let Some(payload) = missing {
         return Ok(DeriveValidation::Pending(payload));
@@ -237,10 +240,10 @@ where
         let document: Inline<GenId> = document_id.to_inline();
         let mut frequencies: BTreeMap<RawInline, u32> = BTreeMap::new();
         for payload in payloads {
-            let tokens = token_cache
+            let text = texts
                 .get(&payload.raw)
                 .expect("all selected payloads were resolved before counting");
-            for token in tokens {
+            for token in hash_tokens(text.as_ref()) {
                 let frequency = frequencies.entry(token.raw).or_default();
                 let Some(incremented) = frequency.checked_add(1) else {
                     return Ok(DeriveValidation::Rejected(format!(
