@@ -204,6 +204,8 @@ fn direct_cli_and_mcp_share_frozen_queries_and_literal_content() {
         "archive_import",
         json!({"source":"claude-code","source_name":"@not-a-host-path","content":CODE}),
     );
+    // Search reads the maintained cover and never derives it.
+    fixture.call("archive_index", json!({}));
     let projection = format!("{:X}", fixture.projections()[0]);
     for (args, tool, values) in [
         (vec!["list"], "archive_list", json!({})),

@@ -1131,11 +1131,11 @@ fn run_search(
     limit: usize,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let (observed, index, lag) =
-        archive_collection::ensure_search_acquiring_with_storage(storage.storage)?;
+    let (observed, index, lag) = archive_collection::search_views_with_storage(storage.storage)?;
     if !lag.is_current() {
         out.line(format!(
-            "note: searching what is present; facts: {}; index: {} source commit(s) not yet derived",
+            "note: searching what is present; facts: {}; index: {} source commit(s) not yet \
+             derived (`archive index` derives them)",
             lag.facts, lag.index,
         ))?;
     }
@@ -2066,6 +2066,46 @@ mod tests {
         result.unwrap();
         assert_eq!(appended_all(&outcomes), [false, true]);
         assert_eq!(archive_root_payloads(&fixture), 5);
+    }
+
+    /// Search reads the BM25 cover as maintained and names its lag. Deriving
+    /// is `archive index`'s work: done inside a search over a large lag, it
+    /// mapped a whole merge node of the Archive in the searching process.
+    #[test]
+    fn search_names_an_underived_index_and_leaves_deriving_to_index() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("one.jsonl");
+        fs::write(
+            &source,
+            r#"{"type":"user","sessionId":"read","uuid":"one","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"quasar needle"}}"#,
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        let search = |text: &str| {
+            let mut printed = String::new();
+            run_search(
+                storage(&fixture),
+                text,
+                10,
+                &mut Out::new(&mut |part| {
+                    if let crate::out::Part::Text { text } = part {
+                        printed.push_str(&text);
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap();
+            printed
+        };
+
+        let before = search("quasar");
+        assert!(before.contains("not yet derived"), "{before}");
+        assert!(!before.contains("quasar needle"), "{before}");
+        archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
+
+        let after = search("quasar");
+        assert!(!after.contains("not yet derived"), "{after}");
+        assert!(after.contains("quasar needle"), "{after}");
     }
 
     #[test]

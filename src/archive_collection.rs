@@ -736,14 +736,13 @@ pub fn ensure_bm25_index_with_storage(
             )?;
             Ok::<_, anyhow::Error>(())
         })?;
+        // What maintenance left unattached is the lag. It is counted, not
+        // built again in memory to find out which of it could have been.
         let snapshot = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
         let attached = snapshot.attached_acquiring(target)?;
-        let read = attached.read_with_acquiring::<
-            archive_bm25::ArchiveBlockTextBm25Mapping, archive_bm25::ArchiveBM25View,
-        >()?;
         Ok(Bm25IndexReport {
             source_elements: snapshot.collection(source)?.support()?.len(),
-            lagging: read.unread().len(),
+            lagging: attached.residual().len(),
             cover_segments: attached.cover().len(),
             source_collection: source.handle(),
             target_collection: target.handle(),
@@ -846,10 +845,18 @@ pub fn ensure_search_local_with_storage(
     })
 }
 
-/// Acquire a query's fixed Archive fact and BM25 observations. Both views
-/// select their support at the same watermark; exact-byte arrival below does
-/// not reselect either of them. The surrounding operation owns the store.
-pub(crate) fn ensure_search_acquiring_with_storage(
+/// Acquire a query's fixed Archive fact and BM25 observations without
+/// maintaining either. Both views select their support at the same
+/// watermark; exact-byte arrival below does not reselect either of them.
+/// The surrounding operation owns the store.
+///
+/// The index is the attached BM25 cover alone. Its residual is reported as
+/// lag and never built here: only `archive index` maintains this cover, so
+/// the residual can be most of the Archive, and building it in a search
+/// costs what maintaining it costs. On 2026-10-26 a search that maintained
+/// first mapped a whole merge node of the Archive in the searching process
+/// and grew to about 62 GB.
+pub(crate) fn search_views_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<(
     AttachedSnapshot<
@@ -868,18 +875,6 @@ pub(crate) fn ensure_search_acquiring_with_storage(
         )?;
         let target = store.attach_with(source, archive_bm25::ArchiveBlockTextBm25Mapping)?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
-        runtime.block_on(async {
-            crate::storage::tolerate_own_lag(store.maintain_attached(succinct, signer).await)?;
-            crate::storage::tolerate_own_lag(store.maintain_attached(rank9, signer).await)?;
-            crate::storage::tolerate_own_lag(
-                store
-                    .maintain_attached_with::<archive_bm25::ArchiveBlockTextBm25Mapping>(
-                        target, signer,
-                    )
-                    .await,
-            )?;
-            Ok::<_, anyhow::Error>(())
-        })?;
         let after = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
         let facts = after.attached_acquiring(rank9)?;
         let search = after.attached_acquiring(target)?;
@@ -887,11 +882,9 @@ pub(crate) fn ensure_search_acquiring_with_storage(
             facts: FactLag::of(&after, source, succinct, rank9)?,
             index: search.residual().len(),
         };
-        let index = crate::storage::require_complete_attached_read(
-            search.read_with_acquiring::<
-                archive_bm25::ArchiveBlockTextBm25Mapping, archive_bm25::ArchiveBM25View,
-            >()?,
-        )?;
+        let index = search
+            .view::<archive_bm25::ArchiveBM25View>()
+            .context("read Archive BM25 cover")?;
         Ok((facts, index, lag))
     })
 }
