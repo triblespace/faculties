@@ -925,14 +925,9 @@ impl TimelineFacts for FactArchive {
         attribute: Id,
         from: RawInline,
     ) -> Box<dyn Iterator<Item = (RawInline, Id)> + 'a> {
-        // The union reads one attribute in value order but cannot seek, so
-        // the facts below `from` are decoded and passed over. Nothing is
-        // collected and no query runs for them. A seeking cursor in the
-        // engine removes this prefix.
-        Box::new(
-            self.iter_attribute_value_entities(&attribute)
-                .skip_while(move |(value, _)| *value < from),
-        )
+        // Each shard seeks its first fact at or above `from` in O(log n);
+        // nothing below the cursor is decoded.
+        Box::new(self.iter_attribute_value_entities_from(&attribute, &from))
     }
 }
 
@@ -961,7 +956,7 @@ fn interval_floor(lower: i128) -> RawInline {
     raw
 }
 
-fn interval_lower(raw: &RawInline) -> Option<i128> {
+pub(crate) fn interval_lower(raw: &RawInline) -> Option<i128> {
     Inline::<NsTAIInterval>::new(*raw)
         .try_from_inline::<(i128, i128)>()
         .ok()
@@ -3030,10 +3025,25 @@ mod tests {
         (facts, ids)
     }
 
+    /// The same facts as a union of three overlapping Succinct shards, as
+    /// the Archive reads them.
+    fn sharded(facts: &TribleSet) -> FactArchive {
+        use triblespace::core::blob::encodings::succinctarchive::{SuccinctArchive, UnionArchive};
+        let mut shards = [TribleSet::new(), TribleSet::new(), TribleSet::new()];
+        for (index, trible) in facts.iter().enumerate() {
+            shards[index % 3].insert(trible);
+            if index % 5 == 0 {
+                shards[(index + 1) % 3].insert(trible);
+            }
+        }
+        UnionArchive::new(shards.iter().map(SuccinctArchive::from).collect::<Vec<_>>())
+    }
+
     #[test]
     fn lazy_timeline_agrees_with_the_eager_reading_at_every_cursor() {
         for seed in 0..40 {
             let (facts, ids) = random_timeline_facts(seed, 48);
+            let union = sharded(&facts);
             let mut cursors: Vec<_> = (-4..28)
                 .map(ArchiveTimelineCursor::AfterTime)
                 .chain([
@@ -3045,6 +3055,13 @@ mod tests {
             for cursor in cursors {
                 let eager = eager_timeline_after(&facts, cursor);
                 let lazy = timeline_after(&facts, cursor);
+                assert_eq!(
+                    timeline_after(&union, cursor).map_err(|error| error.to_string()),
+                    lazy.as_ref()
+                        .map(Clone::clone)
+                        .map_err(|error| error.to_string()),
+                    "sharded, seed {seed}, cursor {cursor:?}"
+                );
                 match (eager, lazy) {
                     (Ok(eager), Ok(lazy)) => {
                         assert_eq!(lazy, eager, "seed {seed}, cursor {cursor:?}")
