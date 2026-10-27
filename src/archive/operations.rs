@@ -1183,10 +1183,19 @@ fn run_search(
             ),
             _ => String::new(),
         };
+        // Receipts are the source projections `show` and `thread` take.
+        let mut receipt_ids: Vec<String> =
+            receipts.iter().take(3).map(|id| short_id(*id)).collect();
+        if receipts.len() > 3 {
+            receipt_ids.push(format!("+{}", receipts.len() - 3));
+        }
+        if receipt_ids.is_empty() {
+            receipt_ids.push("-".to_owned());
+        }
         out.line(format!(
-            "{score:.4} {} {} receipt(s){turn} {}",
+            "{score:.4} {} receipt {}{turn} {}",
             short_id(block),
-            receipts.len(),
+            receipt_ids.join(","),
             block_snippet(&facts, observed.snapshot(), block)?,
         ))?;
     }
@@ -1249,13 +1258,10 @@ fn plan_cursor_update(
     let state = cursor_state(position, anchor);
     let predecessors = match comb_model::resolution(facts, stream, persona)? {
         None => BTreeSet::new(),
-        Some(ref resolution) => {
-            let settled = resolution.settled_state()?;
-            if matches!(resolution, CursorResolution::Unique(_)) && settled == &state {
-                return Ok(None);
-            }
-            resolution.head_ids().into_iter().collect()
-        }
+        // A forked cursor has no settled state to continue from, but a new
+        // state superseding every head is exactly how the fork is merged.
+        Some(CursorResolution::Unique(ref row)) if row.state == state => return Ok(None),
+        Some(ref resolution) => resolution.head_ids().into_iter().collect(),
     };
     let (fragment, _) = comb_model::cursor_fragment(CursorDraft {
         stream: stream.to_owned(),
@@ -2373,6 +2379,44 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "replay limit must be at least 1");
     }
+
+    #[test]
+    fn replay_start_supersedes_a_forked_cursor() {
+        let fixture = fixture();
+        // Two writers that never saw each other leave two heads.
+        for seconds in [100.0, 200.0] {
+            let (fragment, _) = comb_model::cursor_fragment(CursorDraft {
+                stream: REPLAY_STREAM.to_owned(),
+                persona: "forked".to_owned(),
+                position: cursor_state(Some(Epoch::from_tai_seconds(seconds)), None).position,
+                anchor: None,
+                grain: None,
+                predecessors: BTreeSet::new(),
+                observed_at: BTreeSet::new(),
+            })
+            .unwrap();
+            publish_cursor_update(storage(&fixture), fragment).unwrap();
+        }
+        let facts = storage(&fixture).load_comb().unwrap();
+        let forked = comb_model::resolution(&facts, REPLAY_STREAM, "forked")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(forked, CursorResolution::Forked(_)));
+        assert!(active_archive_cursor(&facts, REPLAY_STREAM, "forked").is_err());
+
+        let start = Epoch::from_tai_seconds(300.0);
+        let fragment = plan_cursor_update(&facts, REPLAY_STREAM, "forked", Some(start), None)
+            .unwrap()
+            .expect("a start over a fork writes one head superseding both");
+        publish_cursor_update(storage(&fixture), fragment).unwrap();
+        let facts = storage(&fixture).load_comb().unwrap();
+        let resolved = comb_model::resolution(&facts, REPLAY_STREAM, "forked")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(resolved, CursorResolution::Unique(_)));
+        assert!(active_archive_cursor(&facts, REPLAY_STREAM, "forked").is_ok());
+    }
+
     #[test]
     fn display_queries_keep_annotations_and_skip_undecodable_parts() {
         use crate::blockdag;
