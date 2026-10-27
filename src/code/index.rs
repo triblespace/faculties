@@ -30,9 +30,8 @@
 use crate::storage::{AcquiringReader, FacultyStore};
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use triblespace::core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
-use triblespace::core::inline::TryFromInline;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::blobencodings::SimpleArchive;
 use triblespace::prelude::*;
@@ -43,10 +42,22 @@ use triblespace_search::tokens::{code_tokens, WordHash};
 use crate::code::operations::{
     hit, keeps, placements_of_item, provenance, select_scans, Code, Filter, Hit, Provenance, Texts,
 };
+use crate::code::TextHandle;
 use crate::schemas::code::{attrs, DEFAULT_SCOPE_ID};
 use crate::storage::FactArchive;
 
-type CodeBM25View = PortableBM25View<inlineencodings::GenId, WordHash>;
+/// A Code BM25 cover ranks texts, not entities: each document is one
+/// `attrs::doc` or `attrs::source_tokens` payload, keyed by its handle.
+type CodeBM25View = PortableBM25View<inlineencodings::Handle<blobencodings::UTF8String>, WordHash>;
+
+/// Weighted BM25 scores per scored text, one map per indexed attribute. Which
+/// entities hold a text is not in the index; [`entity_scores`] joins that over
+/// the facts.
+#[derive(Debug, Default)]
+struct TextScores {
+    doc: BTreeMap<TextHandle, f32>,
+    source_tokens: BTreeMap<TextHandle, f32>,
+}
 
 /// Which text an index covers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,9 +214,10 @@ impl Code {
         top: usize,
         filter: &Filter,
     ) -> Result<SearchReport> {
-        let scores = self.bm25_scores(query, tier)?;
+        let text_scores = self.bm25_scores(query, tier)?;
         let observed = self.observe()?;
         let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let scores = entity_scores(&facts, &text_scores);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -309,7 +321,9 @@ cover is behind them: run `code index`."
 }
 
 impl Code {
-    fn bm25_scores(&self, query: &str, tier: Tier) -> Result<BTreeMap<Id, f32>> {
+    /// Weighted scores per text. The join to entities happens in the caller,
+    /// over the fact archive it already holds for placing the hits.
+    fn bm25_scores(&self, query: &str, tier: Tier) -> Result<TextScores> {
         let terms = code_tokens(query);
         self.storage().with_store(|store, signer, runtime| {
             let source = self.storage().open_collection_read(
@@ -325,10 +339,10 @@ impl Code {
                 runtime.clone(),
             );
 
-            let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
+            let mut scores = TextScores::default();
             let accumulate = |target: Collection<PortableBM25Blob>,
                               weight: f32,
-                              scores: &mut BTreeMap<Id, f32>|
+                              scores: &mut BTreeMap<TextHandle, f32>|
              -> Result<()> {
                 let attached = snapshot.attached_acquiring(target)?;
                 let view = crate::storage::require_complete_attached_read(
@@ -338,27 +352,45 @@ impl Code {
                 for (document, score) in
                     query.query_multi(&terms).context("score Code BM25 query")?
                 {
-                    let id = Id::try_from_inline(&document).map_err(|error| {
-                        anyhow!("Code BM25 document is not an entity id: {error:?}")
-                    })?;
-                    *scores.entry(id).or_insert(0.0) += score * weight;
+                    *scores.entry(document).or_insert(0.0) += score * weight;
                 }
                 Ok(())
             };
 
             if matches!(tier, Tier::Docs | Tier::Both) {
-                accumulate(doc_target, 1.0, &mut scores)?;
+                accumulate(doc_target, 1.0, &mut scores.doc)?;
             }
             if matches!(tier, Tier::Text | Tier::Both) {
                 // Prose is what answers a capability question; the token stream
                 // is the fallback for the median function, which has no prose at
                 // all. Weighting them equally would let a long body outvote the
                 // sentence that says what the file is for.
-                accumulate(text_target, 0.5, &mut scores)?;
+                accumulate(text_target, 0.5, &mut scores.source_tokens)?;
             }
             Ok(scores)
         })
     }
+}
+
+/// Every entity holding a scored text under the attribute it was indexed by
+/// receives that text's weighted score; an entity holding several scored
+/// texts receives their sum.
+fn entity_scores(facts: &FactArchive, texts: &TextScores) -> BTreeMap<Id, f32> {
+    let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
+    for (&text, &score) in &texts.doc {
+        for entity in find!(entity: Id, pattern!(facts, [{ ?entity @ attrs::doc: text }])) {
+            *scores.entry(entity).or_insert(0.0) += score;
+        }
+    }
+    for (&text, &score) in &texts.source_tokens {
+        for entity in find!(
+            entity: Id,
+            pattern!(facts, [{ ?entity @ attrs::source_tokens: text }])
+        ) {
+            *scores.entry(entity).or_insert(0.0) += score;
+        }
+    }
+    scores
 }
 
 /// The rarest import roots of each group's file, and the overlap with the
@@ -484,6 +516,32 @@ mod tests {
         assert!(!reader.contains_blob(handle).unwrap());
         assert!(store.health().started_at.is_none());
         store.close().unwrap();
+    }
+
+    #[test]
+    fn every_entity_holding_a_scored_text_receives_its_weighted_score() {
+        use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+
+        let shared = crate::code::text_handle("a GPU graph layout");
+        let alone = crate::code::text_handle("fn layout ( graph )");
+        let unscored = crate::code::text_handle("nothing matched");
+        let (first, second, third) = (fucid(), fucid(), fucid());
+        let mut facts = Fragment::empty();
+        facts += entity! { &first @ attrs::doc: shared, attrs::source_tokens: alone };
+        facts += entity! { &second @ attrs::doc: shared };
+        // A text scored under one attribute joins only through that attribute.
+        facts += entity! { &third @ attrs::source_tokens: shared, attrs::doc: unscored };
+        let archive = FactArchive::new(vec![SuccinctArchive::from(&TribleSet::from(facts))]);
+
+        let texts = TextScores {
+            doc: BTreeMap::from([(shared, 2.0)]),
+            source_tokens: BTreeMap::from([(alone, 0.5)]),
+        };
+        let scores = entity_scores(&archive, &texts);
+        assert_eq!(scores.len(), 2);
+        assert_eq!(scores[&*first], 2.5);
+        assert_eq!(scores[&*second], 2.0);
+        assert!(!scores.contains_key(&*third));
     }
 
     #[test]
