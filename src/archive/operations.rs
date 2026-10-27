@@ -235,7 +235,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::id::Id;
-use triblespace::core::inline::{Inline, TryToInline};
+use triblespace::core::inline::{Inline, RawInline, TryToInline};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::Fragment;
 
@@ -915,42 +915,117 @@ fn resolve_prefix(ids: impl IntoIterator<Item = Id>, prefix: &str) -> Result<Id>
 fn run_list(storage: ArchiveStorage<'_>, limit: usize, out: &mut Out<'_>) -> Result<()> {
     let observed = storage.load()?;
     let facts = crate::storage::acquire_attached_facts(&observed)?;
-    let mut rows = Vec::new();
-    for projection in find!(
-        projection: Id,
-        pattern!(&facts, [{
-            ?projection @ metadata::tag: &archive_schema::source_projection::KIND
-        }])
-    ) {
-        let timestamp = find!(
-            timestamp: (i128, i128),
-            pattern!(&facts, [{
-                projection @ archive_schema::source_projection::source_timestamp: ?timestamp
-            }])
-        )
-        .map(|(lower, _)| lower)
-        .min()
-        .or_else(|| {
-            find!(
-                timestamp: (i128, i128),
-                pattern!(&facts, [
-                    { projection @ archive_schema::source_projection::projects_to: _?block },
-                    { _?block @ archive_schema::block::timestamp: ?timestamp },
-                ])
-            )
-            .map(|(lower, _)| lower)
-            .min()
-        });
-        rows.push((timestamp, projection));
-    }
-    rows.sort_unstable_by(|left, right| right.cmp(left));
-    for (_, projection) in rows.into_iter().take(limit) {
+    for projection in newest_projections(&facts, limit) {
         out.line(format!(
             "{}",
             render_projection_summary(&facts, observed.snapshot(), projection)?
         ))?;
     }
     Ok(())
+}
+
+/// A source projection's time: its earliest source timestamp, falling back
+/// to the earliest timestamp of a block it projects to.
+fn projection_time(facts: &FactArchive, projection: Id) -> Option<i128> {
+    find!(
+        timestamp: (i128, i128),
+        pattern!(facts, [{
+            projection @ archive_schema::source_projection::source_timestamp: ?timestamp
+        }])
+    )
+    .map(|(lower, _)| lower)
+    .min()
+    .or_else(|| {
+        find!(
+            timestamp: (i128, i128),
+            pattern!(facts, [
+                { projection @ archive_schema::source_projection::projects_to: _?block },
+                { _?block @ archive_schema::block::timestamp: ?timestamp },
+            ])
+        )
+        .map(|(lower, _)| lower)
+        .min()
+    })
+}
+
+/// The `limit` newest source projections: descending by time, then by id,
+/// untimed ones last.
+///
+/// Times are read newest first from the receipt and block timestamp
+/// attributes and the reading stops at `limit`, so a listing costs the
+/// projections it shows and those that share their times. Untimed
+/// projections are enumerated only when fewer than `limit` are timed.
+fn newest_projections(facts: &FactArchive, limit: usize) -> Vec<Id> {
+    let mut receipts = facts
+        .iter_attribute_value_entities_rev(
+            &archive_schema::source_projection::source_timestamp.id(),
+        )
+        .peekable();
+    let mut blocks = facts
+        .iter_attribute_value_entities_rev(&archive_schema::block::timestamp.id())
+        .peekable();
+    let is_projection = |projection: Id| {
+        exists!(pattern!(facts, [{
+            projection @ metadata::tag: &archive_schema::source_projection::KIND
+        }]))
+    };
+    let mut listed = Vec::new();
+    while listed.len() < limit {
+        let Some(raw) = [receipts.peek(), blocks.peek()]
+            .into_iter()
+            .flatten()
+            .map(|(value, _)| *value)
+            .max()
+        else {
+            break;
+        };
+        let Some(lower) = archive_collection::interval_lower(&raw) else {
+            // An undecodable interval names no time, as in a typed query.
+            for stream in [&mut receipts, &mut blocks] {
+                if stream.peek().is_some_and(|(value, _)| *value == raw) {
+                    stream.next();
+                }
+            }
+            continue;
+        };
+        let at =
+            |value: &(RawInline, Id)| archive_collection::interval_lower(&value.0) == Some(lower);
+        let mut candidates = BTreeSet::new();
+        while let Some((_, projection)) = receipts.next_if(at) {
+            candidates.insert(projection);
+        }
+        while let Some((_, block)) = blocks.next_if(at) {
+            candidates.extend(find!(
+                projection: Id,
+                pattern!(facts, [{
+                    ?projection @ archive_schema::source_projection::projects_to: block
+                }])
+            ));
+        }
+        listed.extend(
+            candidates
+                .into_iter()
+                .rev()
+                .filter(|projection| {
+                    is_projection(*projection) && projection_time(facts, *projection) == Some(lower)
+                })
+                .take(limit - listed.len()),
+        );
+    }
+    if listed.len() < limit {
+        let mut untimed: Vec<Id> = find!(
+            projection: Id,
+            pattern!(facts, [{
+                ?projection @ metadata::tag: &archive_schema::source_projection::KIND
+            }])
+        )
+        .filter(|projection| projection_time(facts, *projection).is_none())
+        .collect();
+        untimed.sort_unstable_by(|left, right| right.cmp(left));
+        untimed.dedup();
+        listed.extend(untimed.into_iter().take(limit - listed.len()));
+    }
+    listed
 }
 
 fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Result<()> {
@@ -2346,6 +2421,111 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no fork is hidden"));
+    }
+
+    /// The listing as it was before it read times newest first: every
+    /// projection's time, sorted, then the first `limit`.
+    fn all_projections_newest_first(facts: &FactArchive, limit: usize) -> Vec<Id> {
+        let mut rows: Vec<_> = find!(
+            projection: Id,
+            pattern!(facts, [{
+                ?projection @ metadata::tag: &archive_schema::source_projection::KIND
+            }])
+        )
+        .map(|projection| (projection_time(facts, projection), projection))
+        .collect();
+        rows.sort_unstable_by(|left, right| right.cmp(left));
+        rows.into_iter()
+            .take(limit)
+            .map(|(_, projection)| projection)
+            .collect()
+    }
+
+    #[test]
+    fn newest_projections_agree_with_sorting_every_projection() {
+        use triblespace::core::blob::encodings::succinctarchive::{SuccinctArchive, UnionArchive};
+        use triblespace::core::trible::TribleSet;
+        use triblespace::prelude::inlineencodings::NsTAIInterval;
+        use triblespace::prelude::{entity, fucid};
+
+        let at = |lower: i128, width: i128| -> Inline<NsTAIInterval> {
+            let epoch =
+                |ns: i128| Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(ns));
+            (epoch(lower), epoch(lower + width))
+                .try_to_inline()
+                .unwrap()
+        };
+        for seed in 0..30u64 {
+            let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut next = move |bound: u64| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) % bound
+            };
+            let mut facts = TribleSet::new();
+            let mut time = |next: &mut dyn FnMut(u64) -> u64| {
+                if next(12) == 0 {
+                    // Inverted, so it decodes as no time at all.
+                    let mut raw = at(next(16) as i128, 0).raw;
+                    raw[16..32].copy_from_slice(&[0; 16]);
+                    Inline::<NsTAIInterval>::new(raw)
+                } else {
+                    at(next(16) as i128, next(3) as i128)
+                }
+            };
+            for _ in 0..30 {
+                let mut blocks = Vec::new();
+                for _ in 0..=next(2) {
+                    let block = fucid();
+                    let mut times = Vec::new();
+                    for _ in 0..next(3) {
+                        times.push(time(&mut next));
+                    }
+                    facts += entity! { &block @
+                        metadata::tag: &archive_schema::block::KIND,
+                        archive_schema::block::timestamp*: times,
+                    }
+                    .into_facts();
+                    blocks.push(block.id);
+                }
+                let projection = fucid();
+                let mut times = Vec::new();
+                if next(2) == 0 {
+                    for _ in 0..=next(2) {
+                        times.push(time(&mut next));
+                    }
+                }
+                facts += entity! { &projection @
+                    archive_schema::source_projection::projects_to*: blocks.iter(),
+                    archive_schema::source_projection::source_timestamp*: times,
+                }
+                .into_facts();
+                // A few receipts are not tagged and must never be listed.
+                if next(6) != 0 {
+                    facts += entity! { &projection @
+                        metadata::tag: &archive_schema::source_projection::KIND,
+                    }
+                    .into_facts();
+                }
+            }
+            let mut shards = [TribleSet::new(), TribleSet::new()];
+            for (index, trible) in facts.iter().enumerate() {
+                shards[index % 2].insert(trible);
+                if index % 7 == 0 {
+                    shards[(index + 1) % 2].insert(trible);
+                }
+            }
+            let facts: FactArchive =
+                UnionArchive::new(shards.iter().map(SuccinctArchive::from).collect::<Vec<_>>());
+            for limit in 0..=34 {
+                assert_eq!(
+                    newest_projections(&facts, limit),
+                    all_projections_newest_first(&facts, limit),
+                    "seed {seed}, limit {limit}"
+                );
+            }
+        }
     }
 
     #[test]
