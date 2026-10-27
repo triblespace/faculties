@@ -27,6 +27,7 @@ use triblespace::core::collection::{
     Collection, CollectionCommit, CollectionData, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::inline::encodings::UnknownInline;
+use triblespace::core::inline::RawInline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
@@ -34,6 +35,7 @@ use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store};
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
+use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 use triblespace_search::portable_bm25::PortableBM25Blob;
 
@@ -905,141 +907,437 @@ impl ArchiveTimelineBlock {
     }
 }
 
+/// Facts whose timestamp attributes can be read in ascending value order.
+///
+/// The timeline reads one attribute's `(value, entity)` facts in ascending
+/// order, starting at `from`, and stops reading when its caller stops asking.
+pub trait TimelineFacts: TriblePattern {
+    fn ascending_from<'a>(
+        &'a self,
+        attribute: Id,
+        from: RawInline,
+    ) -> Box<dyn Iterator<Item = (RawInline, Id)> + 'a>;
+}
+
+impl TimelineFacts for FactArchive {
+    fn ascending_from<'a>(
+        &'a self,
+        attribute: Id,
+        from: RawInline,
+    ) -> Box<dyn Iterator<Item = (RawInline, Id)> + 'a> {
+        // The union reads one attribute in value order but cannot seek, so
+        // the facts below `from` are decoded and passed over. Nothing is
+        // collected and no query runs for them. A seeking cursor in the
+        // engine removes this prefix.
+        Box::new(
+            self.iter_attribute_value_entities(&attribute)
+                .skip_while(move |(value, _)| *value < from),
+        )
+    }
+}
+
+impl TimelineFacts for TribleSet {
+    fn ascending_from<'a>(
+        &'a self,
+        attribute: Id,
+        from: RawInline,
+    ) -> Box<dyn Iterator<Item = (RawInline, Id)> + 'a> {
+        let mut rows: Vec<(RawInline, Id)> = self
+            .iter()
+            .filter(|trible| *trible.a() == attribute)
+            .map(|trible| (trible.v::<UnknownInline>().raw, *trible.e()))
+            .filter(|(value, _)| *value >= from)
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Box::new(rows.into_iter())
+    }
+}
+
+/// The smallest raw interval whose lower bound is `lower`.
+fn interval_floor(lower: i128) -> RawInline {
+    let mut raw = [0u8; 32];
+    raw[0..16].copy_from_slice(&((lower as u128) ^ (1u128 << 127)).to_be_bytes());
+    raw
+}
+
+fn interval_lower(raw: &RawInline) -> Option<i128> {
+    Inline::<NsTAIInterval>::new(*raw)
+        .try_from_inline::<(i128, i128)>()
+        .ok()
+        .map(|(lower, _)| lower)
+}
+
 /// Position canonical blocks in deterministic causal order. Timestamp
 /// annotations may have several values: the earliest canonical timestamp wins,
-/// falling back to the earliest source timestamp. Untimed nodes carry causal
-/// position but emit nothing. Inclusion policy belongs to the caller after
-/// positioning, so filtering cannot change cursor or predecessor semantics.
+/// falling back to the earliest source timestamp. A block's position is the
+/// latest of its own timestamp and its predecessors' positions. Untimed nodes
+/// carry causal position but emit nothing. Blocks of equal position follow
+/// their causal order, smallest id first. Inclusion policy belongs to the
+/// caller after positioning, so filtering cannot change cursor or predecessor
+/// semantics.
+///
+/// The timeline is read lazily, one position at a time. Each position is
+/// found from the timestamp facts in value order, so a batch reads the
+/// blocks it returns, their causal past, and the blocks that share their
+/// positions, not the whole Archive.
+pub fn timeline<'a, P>(
+    facts: &'a P,
+    cursor: ArchiveTimelineCursor,
+) -> Result<ArchiveTimeline<'a, P>>
+where
+    P: TimelineFacts,
+{
+    let mut timeline = ArchiveTimeline {
+        facts,
+        canonical: no_timestamps(),
+        receipts: no_timestamps(),
+        timestamps: BTreeMap::new(),
+        predecessors: BTreeMap::new(),
+        positions: BTreeMap::new(),
+        blocks: BTreeMap::new(),
+        pending: std::collections::VecDeque::new(),
+        done: false,
+        visited: 0,
+    };
+    let (floor, anchor) = match cursor {
+        ArchiveTimelineCursor::AfterTime(position) => match position.checked_add(1) {
+            Some(floor) => (floor, None),
+            None => {
+                timeline.done = true;
+                return Ok(timeline);
+            }
+        },
+        ArchiveTimelineCursor::AfterBlock(anchor) => {
+            let absent = || {
+                anyhow!("Archive timeline cursor block {anchor:X} is absent or has no timestamp")
+            };
+            if !timeline.is_block(anchor) || timeline.timestamp(anchor).is_none() {
+                return Err(absent());
+            }
+            let position = timeline.position(anchor)?.ok_or_else(absent)?;
+            (position, Some((anchor, position)))
+        }
+    };
+    let from = interval_floor(floor);
+    timeline.canonical = facts
+        .ascending_from(schema::block::timestamp.id(), from)
+        .peekable();
+    timeline.receipts = facts
+        .ascending_from(schema::source_projection::source_timestamp.id(), from)
+        .peekable();
+    if let Some((anchor, position)) = anchor {
+        let class = timeline.next_class()?;
+        let index = class
+            .iter()
+            .position(|item| item.block == anchor)
+            .filter(|_| class.first().map(|item| item.position) == Some(position))
+            .ok_or_else(|| {
+                anyhow!("Archive timeline cursor block {anchor:X} is absent or has no timestamp")
+            })?;
+        timeline.pending.extend(class.into_iter().skip(index + 1));
+    }
+    Ok(timeline)
+}
+
+/// [`timeline`], read to the end. Its cost is the whole remaining Archive;
+/// a batch reads [`timeline`] and stops.
 pub fn timeline_after<P>(
     facts: &P,
     cursor: ArchiveTimelineCursor,
 ) -> Result<Vec<ArchiveTimelineBlock>>
 where
-    P: TriblePattern,
+    P: TimelineFacts,
 {
-    let blocks: BTreeSet<Id> = find!(
-        block: Id,
-        pattern!(facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
-    )
-    .collect();
-    let mut canonical_timestamps = BTreeMap::<Id, i128>::new();
-    for (block, (lower, _)) in find!(
-        (block: Id, timestamp: (i128, i128)),
-        pattern!(facts, [{ ?block @ schema::block::timestamp: ?timestamp }])
-    ) {
-        canonical_timestamps
-            .entry(block)
-            .and_modify(|current| *current = (*current).min(lower))
-            .or_insert(lower);
+    timeline(facts, cursor)?.collect()
+}
+
+type TimestampFacts<'a> = std::iter::Peekable<Box<dyn Iterator<Item = (RawInline, Id)> + 'a>>;
+
+fn no_timestamps<'a>() -> TimestampFacts<'a> {
+    let empty: Box<dyn Iterator<Item = (RawInline, Id)> + 'a> = Box::new(std::iter::empty());
+    empty.peekable()
+}
+
+/// A lazy causal-temporal reading of the Archive. Every map below is a
+/// memo of answers already queried in this reading, never a copy of the
+/// Archive.
+pub struct ArchiveTimeline<'a, P> {
+    facts: &'a P,
+    canonical: TimestampFacts<'a>,
+    receipts: TimestampFacts<'a>,
+    timestamps: BTreeMap<Id, Option<i128>>,
+    predecessors: BTreeMap<Id, BTreeSet<Id>>,
+    positions: BTreeMap<Id, Option<i128>>,
+    blocks: BTreeMap<Id, bool>,
+    pending: std::collections::VecDeque<ArchiveTimelineBlock>,
+    done: bool,
+    visited: usize,
+}
+
+impl<P> ArchiveTimeline<'_, P>
+where
+    P: TimelineFacts,
+{
+    /// Blocks this reading has positioned so far: the work it has done.
+    pub fn visited(&self) -> usize {
+        self.visited
     }
-    let mut receipt_timestamps = BTreeMap::<Id, i128>::new();
-    for (block, (lower, _)) in find!(
-        (block: Id, timestamp: (i128, i128)),
-        pattern!(facts, [{
-            _?projection @ schema::source_projection::projects_to: ?block,
-            schema::source_projection::source_timestamp: ?timestamp
-        }])
-    ) {
-        receipt_timestamps
-            .entry(block)
-            .and_modify(|current| *current = (*current).min(lower))
-            .or_insert(lower);
+
+    fn is_block(&mut self, block: Id) -> bool {
+        let facts = self.facts;
+        *self.blocks.entry(block).or_insert_with(|| {
+            exists!(pattern!(facts, [{ block @ metadata::tag: &schema::block::KIND }]))
+        })
     }
-    let mut timestamps = BTreeMap::new();
-    let mut predecessors = BTreeMap::<Id, BTreeSet<Id>>::new();
-    let mut successors = BTreeMap::<Id, BTreeSet<Id>>::new();
-    for block in &blocks {
-        timestamps.insert(
-            *block,
-            canonical_timestamps
-                .get(block)
-                .or_else(|| receipt_timestamps.get(block))
-                .copied(),
-        );
-        let previous: BTreeSet<_> = find!(
-            predecessor: Id,
-            pattern!(facts, [{ block @ schema::block::previous: ?predecessor }])
+
+    fn timestamp(&mut self, block: Id) -> Option<i128> {
+        let facts = self.facts;
+        *self.timestamps.entry(block).or_insert_with(|| {
+            find!(
+                timestamp: (i128, i128),
+                pattern!(facts, [{ block @ schema::block::timestamp: ?timestamp }])
+            )
+            .map(|(lower, _)| lower)
+            .min()
+            .or_else(|| {
+                find!(
+                    timestamp: (i128, i128),
+                    pattern!(facts, [{
+                        _?projection @ schema::source_projection::projects_to: block,
+                        schema::source_projection::source_timestamp: ?timestamp
+                    }])
+                )
+                .map(|(lower, _)| lower)
+                .min()
+            })
+        })
+    }
+
+    fn predecessors(&mut self, block: Id) -> BTreeSet<Id> {
+        let facts = self.facts;
+        self.predecessors
+            .entry(block)
+            .or_insert_with(|| {
+                find!(
+                    predecessor: Id,
+                    pattern!(facts, [{ block @ schema::block::previous: ?predecessor }])
+                )
+                .collect()
+            })
+            .clone()
+    }
+
+    fn successors(&mut self, block: Id) -> BTreeSet<Id> {
+        let facts = self.facts;
+        let successors: BTreeSet<Id> = find!(
+            successor: Id,
+            pattern!(facts, [{ ?successor @ schema::block::previous: block }])
         )
         .collect();
-        for predecessor in &previous {
-            successors.entry(*predecessor).or_default().insert(*block);
-        }
-        predecessors.insert(*block, previous);
+        successors
+            .into_iter()
+            .filter(|successor| self.is_block(*successor))
+            .collect()
     }
-    let mut remaining: BTreeMap<Id, usize> = predecessors
-        .iter()
-        .map(|(block, previous)| (*block, previous.len()))
-        .collect();
-    let mut inherited = BTreeMap::<Id, Option<i128>>::new();
-    let mut ready_untimed = BTreeSet::new();
-    let mut ready_timed = BTreeSet::new();
-    for block in &blocks {
-        inherited.insert(*block, None);
-        if remaining[block] == 0 {
-            match timestamps[block] {
-                Some(position) => {
-                    ready_timed.insert((position, *block));
+
+    /// The block's position: the latest of its own timestamp and its
+    /// predecessors' positions, `None` when neither exists. Walks the causal
+    /// past that this reading has not positioned yet.
+    fn position(&mut self, block: Id) -> Result<Option<i128>> {
+        if let Some(position) = self.positions.get(&block) {
+            return Ok(*position);
+        }
+        let mut open = BTreeSet::new();
+        let mut stack = vec![(block, false)];
+        while let Some((node, expanded)) = stack.pop() {
+            if self.positions.contains_key(&node) {
+                continue;
+            }
+            let predecessors = self.predecessors(node);
+            if !expanded {
+                if !open.insert(node) {
+                    bail!("Archive timeline has an incomplete or cyclic predecessor graph");
                 }
-                None => {
+                stack.push((node, true));
+                for predecessor in predecessors {
+                    if self.positions.contains_key(&predecessor) {
+                        continue;
+                    }
+                    if open.contains(&predecessor) || !self.is_block(predecessor) {
+                        bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+                    }
+                    stack.push((predecessor, false));
+                }
+                continue;
+            }
+            let inherited = predecessors
+                .iter()
+                .map(|predecessor| self.positions[predecessor])
+                .max()
+                .flatten();
+            let position = match self.timestamp(node) {
+                Some(timestamp) => Some(inherited.map_or(timestamp, |value| value.max(timestamp))),
+                None => inherited,
+            };
+            open.remove(&node);
+            self.visited += 1;
+            self.positions.insert(node, position);
+        }
+        Ok(self.positions[&block])
+    }
+
+    /// The blocks of the next timestamp value in either stream.
+    fn next_value(&mut self) -> Option<(i128, BTreeSet<Id>)> {
+        loop {
+            let lower = [self.canonical.peek(), self.receipts.peek()]
+                .into_iter()
+                .flatten()
+                .map(|(value, _)| *value)
+                .min()?;
+            let Some(lower) = interval_lower(&lower) else {
+                // An undecodable interval names no time; skip it as a typed
+                // query would.
+                for stream in [&mut self.canonical, &mut self.receipts] {
+                    if stream.peek().is_some_and(|(value, _)| *value == lower) {
+                        stream.next();
+                    }
+                }
+                continue;
+            };
+            let mut blocks = BTreeSet::new();
+            while let Some((_, block)) = self
+                .canonical
+                .next_if(|(value, _)| interval_lower(value) == Some(lower))
+            {
+                blocks.insert(block);
+            }
+            let facts = self.facts;
+            while let Some((_, projection)) = self
+                .receipts
+                .next_if(|(value, _)| interval_lower(value) == Some(lower))
+            {
+                blocks.extend(find!(
+                    block: Id,
+                    pattern!(facts, [{
+                        projection @ schema::source_projection::projects_to: ?block
+                    }])
+                ));
+            }
+            return Some((lower, blocks));
+        }
+    }
+
+    /// Every timed block of the next position, in causal order.
+    fn next_class(&mut self) -> Result<Vec<ArchiveTimelineBlock>> {
+        let (position, seeds) = loop {
+            let Some((value, candidates)) = self.next_value() else {
+                return Ok(Vec::new());
+            };
+            let mut seeds = BTreeSet::new();
+            for block in candidates {
+                // A block is a seed of `value` only when `value` is its own
+                // timestamp and no predecessor lifts it later. A lifted block
+                // is reached from the block that lifts it.
+                if self.is_block(block)
+                    && self.timestamp(block) == Some(value)
+                    && self.position(block)? == Some(value)
+                {
+                    seeds.insert(block);
+                }
+            }
+            if !seeds.is_empty() {
+                break (value, seeds);
+            }
+        };
+        let mut members = seeds.clone();
+        let mut frontier: Vec<Id> = seeds.into_iter().collect();
+        while let Some(block) = frontier.pop() {
+            for successor in self.successors(block) {
+                if !members.contains(&successor) && self.position(successor)? == Some(position) {
+                    members.insert(successor);
+                    frontier.push(successor);
+                }
+            }
+        }
+        let mut remaining = BTreeMap::new();
+        let mut successors = BTreeMap::<Id, Vec<Id>>::new();
+        for block in &members {
+            let inside: Vec<Id> = self
+                .predecessors(*block)
+                .into_iter()
+                .filter(|predecessor| members.contains(predecessor))
+                .collect();
+            for predecessor in &inside {
+                successors.entry(*predecessor).or_default().push(*block);
+            }
+            remaining.insert(*block, inside.len());
+        }
+        let mut ready_untimed = BTreeSet::new();
+        let mut ready_timed = BTreeSet::new();
+        for (block, count) in &remaining {
+            if *count == 0 {
+                if self.timestamp(*block).is_some() {
+                    ready_timed.insert(*block);
+                } else {
                     ready_untimed.insert(*block);
                 }
             }
         }
-    }
-    let mut positioned = Vec::new();
-    let mut visited = 0usize;
-    while visited < blocks.len() {
-        let (block, position, emits) = if let Some(block) = ready_untimed.pop_first() {
-            (block, inherited[&block], false)
-        } else if let Some((position, block)) = ready_timed.pop_first() {
-            (block, Some(position), true)
-        } else {
-            bail!("Archive timeline has an incomplete or cyclic predecessor graph");
-        };
-        visited += 1;
-        if let Some(position) = position.filter(|_| emits) {
-            positioned.push(ArchiveTimelineBlock { position, block });
-        }
-        for successor in successors.get(&block).into_iter().flatten() {
-            if let Some(position) = position {
-                let inherited = inherited
+        let mut class = Vec::new();
+        let mut visited = 0usize;
+        while visited < members.len() {
+            let block = if let Some(block) = ready_untimed.pop_first() {
+                block
+            } else if let Some(block) = ready_timed.pop_first() {
+                class.push(ArchiveTimelineBlock { position, block });
+                block
+            } else {
+                bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+            };
+            visited += 1;
+            for successor in successors.get(&block).into_iter().flatten() {
+                let count = remaining
                     .get_mut(successor)
-                    .expect("every successor belongs to the canonical block set");
-                *inherited = Some(inherited.map_or(position, |current| current.max(position)));
-            }
-            let count = remaining
-                .get_mut(successor)
-                .expect("every successor has a dependency count");
-            *count -= 1;
-            if *count == 0 {
-                let inherited = inherited[successor];
-                match timestamps[successor] {
-                    Some(timestamp) => {
-                        ready_timed.insert((
-                            inherited.map_or(timestamp, |value| value.max(timestamp)),
-                            *successor,
-                        ));
-                    }
-                    None => {
+                    .expect("every successor belongs to the class");
+                *count -= 1;
+                if *count == 0 {
+                    if self.timestamp(*successor).is_some() {
+                        ready_timed.insert(*successor);
+                    } else {
                         ready_untimed.insert(*successor);
                     }
                 }
             }
         }
+        Ok(class)
     }
-    let start = match cursor {
-        ArchiveTimelineCursor::AfterTime(position) => {
-            positioned.partition_point(|candidate| candidate.position <= position)
+}
+
+impl<P> Iterator for ArchiveTimeline<'_, P>
+where
+    P: TimelineFacts,
+{
+    type Item = Result<ArchiveTimelineBlock>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(item) = self.pending.pop_front() {
+                return Some(Ok(item));
+            }
+            if self.done {
+                return None;
+            }
+            match self.next_class() {
+                Ok(class) if class.is_empty() => self.done = true,
+                Ok(class) => self.pending.extend(class),
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            }
         }
-        ArchiveTimelineCursor::AfterBlock(anchor) => positioned
-            .iter()
-            .position(|candidate| candidate.block == anchor)
-            .map(|index| index + 1)
-            .ok_or_else(|| {
-                anyhow!("Archive timeline cursor block {anchor:X} is absent or has no timestamp")
-            })?,
-    };
-    Ok(positioned.into_iter().skip(start).collect())
+    }
 }
 
 #[cfg(test)]
@@ -2516,6 +2814,289 @@ mod tests {
                 position: 4,
                 block: block.id
             }]
+        );
+    }
+
+    /// The eager reading this module had before the timeline became lazy:
+    /// every block positioned, then the cursor applied. It is the oracle the
+    /// lazy reading must agree with.
+    fn eager_timeline_after<P>(
+        facts: &P,
+        cursor: ArchiveTimelineCursor,
+    ) -> Result<Vec<ArchiveTimelineBlock>>
+    where
+        P: TriblePattern,
+    {
+        let blocks: BTreeSet<Id> = find!(
+            block: Id,
+            pattern!(facts, [{ ?block @ metadata::tag: &schema::block::KIND }])
+        )
+        .collect();
+        let mut canonical_timestamps = BTreeMap::<Id, i128>::new();
+        for (block, (lower, _)) in find!(
+            (block: Id, timestamp: (i128, i128)),
+            pattern!(facts, [{ ?block @ schema::block::timestamp: ?timestamp }])
+        ) {
+            canonical_timestamps
+                .entry(block)
+                .and_modify(|current| *current = (*current).min(lower))
+                .or_insert(lower);
+        }
+        let mut receipt_timestamps = BTreeMap::<Id, i128>::new();
+        for (block, (lower, _)) in find!(
+            (block: Id, timestamp: (i128, i128)),
+            pattern!(facts, [{
+                _?projection @ schema::source_projection::projects_to: ?block,
+                schema::source_projection::source_timestamp: ?timestamp
+            }])
+        ) {
+            receipt_timestamps
+                .entry(block)
+                .and_modify(|current| *current = (*current).min(lower))
+                .or_insert(lower);
+        }
+        let mut timestamps = BTreeMap::new();
+        let mut predecessors = BTreeMap::<Id, BTreeSet<Id>>::new();
+        let mut successors = BTreeMap::<Id, BTreeSet<Id>>::new();
+        for block in &blocks {
+            timestamps.insert(
+                *block,
+                canonical_timestamps
+                    .get(block)
+                    .or_else(|| receipt_timestamps.get(block))
+                    .copied(),
+            );
+            let previous: BTreeSet<_> = find!(
+                predecessor: Id,
+                pattern!(facts, [{ block @ schema::block::previous: ?predecessor }])
+            )
+            .collect();
+            for predecessor in &previous {
+                successors.entry(*predecessor).or_default().insert(*block);
+            }
+            predecessors.insert(*block, previous);
+        }
+        let mut remaining: BTreeMap<Id, usize> = predecessors
+            .iter()
+            .map(|(block, previous)| (*block, previous.len()))
+            .collect();
+        let mut inherited = BTreeMap::<Id, Option<i128>>::new();
+        let mut ready_untimed = BTreeSet::new();
+        let mut ready_timed = BTreeSet::new();
+        for block in &blocks {
+            inherited.insert(*block, None);
+            if remaining[block] == 0 {
+                match timestamps[block] {
+                    Some(position) => {
+                        ready_timed.insert((position, *block));
+                    }
+                    None => {
+                        ready_untimed.insert(*block);
+                    }
+                }
+            }
+        }
+        let mut positioned = Vec::new();
+        let mut visited = 0usize;
+        while visited < blocks.len() {
+            let (block, position, emits) = if let Some(block) = ready_untimed.pop_first() {
+                (block, inherited[&block], false)
+            } else if let Some((position, block)) = ready_timed.pop_first() {
+                (block, Some(position), true)
+            } else {
+                bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+            };
+            visited += 1;
+            if let Some(position) = position.filter(|_| emits) {
+                positioned.push(ArchiveTimelineBlock { position, block });
+            }
+            for successor in successors.get(&block).into_iter().flatten() {
+                if let Some(position) = position {
+                    let inherited = inherited
+                        .get_mut(successor)
+                        .expect("every successor belongs to the canonical block set");
+                    *inherited = Some(inherited.map_or(position, |current| current.max(position)));
+                }
+                let count = remaining
+                    .get_mut(successor)
+                    .expect("every successor has a dependency count");
+                *count -= 1;
+                if *count == 0 {
+                    let inherited = inherited[successor];
+                    match timestamps[successor] {
+                        Some(timestamp) => {
+                            ready_timed.insert((
+                                inherited.map_or(timestamp, |value| value.max(timestamp)),
+                                *successor,
+                            ));
+                        }
+                        None => {
+                            ready_untimed.insert(*successor);
+                        }
+                    }
+                }
+            }
+        }
+        let start = match cursor {
+            ArchiveTimelineCursor::AfterTime(position) => {
+                positioned.partition_point(|candidate| candidate.position <= position)
+            }
+            ArchiveTimelineCursor::AfterBlock(anchor) => positioned
+                .iter()
+                .position(|candidate| candidate.block == anchor)
+                .map(|index| index + 1)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Archive timeline cursor block {anchor:X} is absent or has no timestamp"
+                    )
+                })?,
+        };
+        Ok(positioned.into_iter().skip(start).collect())
+    }
+
+    fn at(lower: i128, width: i128) -> Inline<NsTAIInterval> {
+        let epoch =
+            |ns: i128| Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(ns));
+        (epoch(lower), epoch(lower + width))
+            .try_to_inline()
+            .expect("valid test interval")
+    }
+
+    /// A random block DAG with ties, untimed conduits, regressed children,
+    /// receipt-only times, several timestamps per block, and receipts that a
+    /// canonical timestamp overrides.
+    fn random_timeline_facts(seed: u64, blocks: usize) -> (TribleSet, Vec<Id>) {
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut next = move |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        let mut facts = TribleSet::new();
+        let mut ids: Vec<Id> = Vec::new();
+        for index in 0..blocks {
+            let block = fucid();
+            let mut previous = BTreeSet::new();
+            if index > 0 {
+                match next(10) {
+                    0..=1 => {}
+                    2..=7 => {
+                        previous.insert(ids[index - 1]);
+                    }
+                    _ => {
+                        previous.insert(ids[next(index as u64) as usize]);
+                        previous.insert(ids[next(index as u64) as usize]);
+                    }
+                }
+            }
+            let mut canonical = Vec::new();
+            let mut receipts = Vec::new();
+            match next(10) {
+                0..=1 => {}
+                2..=5 => {
+                    for _ in 0..=next(2) {
+                        canonical.push(at(next(24) as i128 - 2, next(3) as i128));
+                    }
+                }
+                6..=8 => {
+                    for _ in 0..=next(2) {
+                        receipts.push(at(next(24) as i128 - 2, next(3) as i128));
+                    }
+                }
+                _ => {
+                    canonical.push(at(next(24) as i128 - 2, 0));
+                    receipts.push(at(next(24) as i128 - 2, 0));
+                }
+            }
+            facts += entity! { &block @
+                metadata::tag: &schema::block::KIND,
+                schema::block::previous*: previous.iter(),
+                schema::block::timestamp*: canonical,
+            }
+            .into_facts();
+            for timestamp in receipts {
+                let projection = fucid();
+                facts += entity! { &projection @
+                    schema::source_projection::projects_to: &block.id,
+                    schema::source_projection::source_timestamp: timestamp,
+                }
+                .into_facts();
+            }
+            ids.push(block.id);
+        }
+        (facts, ids)
+    }
+
+    #[test]
+    fn lazy_timeline_agrees_with_the_eager_reading_at_every_cursor() {
+        for seed in 0..40 {
+            let (facts, ids) = random_timeline_facts(seed, 48);
+            let mut cursors: Vec<_> = (-4..28)
+                .map(ArchiveTimelineCursor::AfterTime)
+                .chain([
+                    ArchiveTimelineCursor::AfterTime(i128::MIN),
+                    ArchiveTimelineCursor::AfterTime(i128::MAX),
+                ])
+                .collect();
+            cursors.extend(ids.iter().copied().map(ArchiveTimelineCursor::AfterBlock));
+            for cursor in cursors {
+                let eager = eager_timeline_after(&facts, cursor);
+                let lazy = timeline_after(&facts, cursor);
+                match (eager, lazy) {
+                    (Ok(eager), Ok(lazy)) => {
+                        assert_eq!(lazy, eager, "seed {seed}, cursor {cursor:?}")
+                    }
+                    (Err(eager), Err(lazy)) => assert_eq!(
+                        lazy.to_string(),
+                        eager.to_string(),
+                        "seed {seed}, cursor {cursor:?}"
+                    ),
+                    (eager, lazy) => {
+                        panic!("seed {seed}, cursor {cursor:?}: eager {eager:?}, lazy {lazy:?}")
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_timeline_batch_reads_its_causal_past_and_not_the_archive() {
+        // Twenty sessions of twenty turns each, interleaved in time: session
+        // `s` speaks at `20 * turn + s`. A batch late in the Archive positions
+        // the batch's own sessions up to the batch and nothing else.
+        let mut facts = TribleSet::new();
+        for session in 0..20i128 {
+            let mut previous: Option<Id> = None;
+            for turn in 0..20i128 {
+                let block = fucid();
+                facts += entity! { &block @
+                    metadata::tag: &schema::block::KIND,
+                    schema::block::previous*: previous.iter(),
+                    schema::block::timestamp: at(20 * turn + session, 0),
+                }
+                .into_facts();
+                previous = Some(block.id);
+            }
+        }
+        let cursor = ArchiveTimelineCursor::AfterTime(300);
+        let mut lazy = timeline(&facts, cursor).unwrap();
+        let batch: Vec<_> = lazy.by_ref().take(3).collect::<Result<_>>().unwrap();
+        let eager = eager_timeline_after(&facts, cursor).unwrap();
+        assert_eq!(batch, eager[..3]);
+        assert_eq!(
+            batch.iter().map(|item| item.position).collect::<Vec<_>>(),
+            [301, 302, 303]
+        );
+        // Three sessions, each read up to its sixteenth turn, plus the next
+        // turn of each, which shows its position's class is complete. The
+        // eager reading positions all 400.
+        assert!(
+            lazy.visited() <= 3 * 17,
+            "a batch of three positioned {} of 400 blocks",
+            lazy.visited()
         );
     }
 

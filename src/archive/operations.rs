@@ -1325,13 +1325,21 @@ fn publish_cursor_update(storage: ArchiveStorage<'_>, fragment: Fragment) -> Res
 
 const REPLAY_STREAM: &str = "archive-replay";
 
+/// The first `limit` blocks of a lazy timeline, and whether more follow.
+/// It reads one block past the batch and no further.
 fn split_replay_batch(
-    timeline: Vec<ArchiveTimelineBlock>,
+    timeline: impl IntoIterator<Item = Result<ArchiveTimelineBlock>>,
     limit: usize,
-) -> (Vec<ArchiveTimelineBlock>, usize) {
-    let remaining = timeline.len().saturating_sub(limit);
-    let selected = timeline.into_iter().take(limit).collect();
-    (selected, remaining)
+) -> Result<(Vec<ArchiveTimelineBlock>, bool)> {
+    let mut selected = Vec::new();
+    for item in timeline {
+        let item = item?;
+        if selected.len() == limit {
+            return Ok((selected, true));
+        }
+        selected.push(item);
+    }
+    Ok((selected, false))
 }
 
 fn run_replay(
@@ -1348,18 +1356,17 @@ fn run_replay(
     let replay = storage.load_replay()?;
     let cursor = active_archive_cursor(&replay.comb_facts, REPLAY_STREAM, persona)?;
     let facts = crate::storage::acquire_attached_facts(&replay.archive)?;
-    let timeline = archive_collection::timeline_after(&facts, cursor)?
-        .into_iter()
-        .filter(|item| {
-            with_tools
-                || exists!(pattern!(&facts, [
+    let timeline = archive_collection::timeline(&facts, cursor)?.filter(|item| {
+        with_tools
+            || item.as_ref().map_or(true, |item| {
+                exists!(pattern!(&facts, [
                     { item.block @ archive_schema::block::holds: _?fact },
                     { _?fact @ archive_schema::content_fact::modality:
                         &archive_schema::content_fact::modality::TEXT },
                 ]))
-        })
-        .collect();
-    let (selected, remaining) = split_replay_batch(timeline, limit);
+            })
+    });
+    let (selected, more) = split_replay_batch(timeline, limit)?;
     if selected.is_empty() {
         out.line(format!(
             "replay complete: nothing after the cursor. The past is read."
@@ -1387,10 +1394,14 @@ fn run_replay(
     .ok_or_else(|| anyhow!("replay emitted blocks without advancing its cursor"))?;
     publish_cursor_update(storage, fragment)?;
     out.line(format!(
-        "batch: {} block(s); cursor -> {}; {} remaining",
+        "batch: {} block(s); cursor -> {}; {}",
         selected.len(),
         last_epoch,
-        remaining,
+        if more {
+            "more remain"
+        } else {
+            "nothing remains"
+        },
     ))?;
     Ok(())
 }
@@ -2362,9 +2373,9 @@ mod tests {
         assert_eq!(timeline.len(), 3);
         assert_eq!(timeline[0].position, timeline[1].position);
         let first_cursor = timeline[0].cursor();
-        let (selected, remaining) = split_replay_batch(timeline, 1);
+        let (selected, more) = split_replay_batch(timeline.into_iter().map(Ok), 1).unwrap();
         assert_eq!(selected.len(), 1);
-        assert_eq!(remaining, 2);
+        assert!(more);
 
         let resumed = archive_collection::timeline_after(&facts, first_cursor).unwrap();
         assert_eq!(resumed.len(), 2, "the equal-time peer is not skipped");
