@@ -229,8 +229,10 @@ struct Checkpoint {
     #[serde(default)]
     last: Option<LastPublication>,
 }
-/// The newest COMMIT a successful pass published, by its data member and its
-/// record fingerprint.
+/// The newest COMMIT a successful pass appended, by its data member and its
+/// record fingerprint. Only a COMMIT the pile did not hold before its pass
+/// counts: identical COMMITs deduplicate, so a republished one sits at an old
+/// position and is no evidence of what was appended after it.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct LastPublication {
     data: String,
@@ -249,21 +251,31 @@ impl LastPublication {
         snapshot: &S,
         collection: CollectionHandle,
     ) -> Result<bool> {
-        let data: [u8; 32] = hex::decode(&self.data)
-            .ok()
-            .and_then(|raw| raw.try_into().ok())
-            .ok_or_else(|| anyhow!("session checkpoint names a malformed last publication"))?;
-        let selectors = BTreeSet::from([CollectionRecordSelector::CommitMember(
-            collection,
-            CollectionData::new(data),
-        )]);
-        let records = snapshot
-            .select_records(&selectors)
-            .map_err(|error| anyhow!("look up the checkpoint's last publication: {error}"))?;
-        Ok(records
-            .iter()
-            .any(|record| hex::encode(record.fingerprint().raw()) == self.fingerprint))
+        let raw = |hex_text: &str| -> Result<[u8; 32]> {
+            hex::decode(hex_text)
+                .ok()
+                .and_then(|raw| raw.try_into().ok())
+                .ok_or_else(|| anyhow!("session checkpoint names a malformed last publication"))
+        };
+        let (data, fingerprint) = (raw(&self.data)?, raw(&self.fingerprint)?);
+        holds(snapshot, collection, CollectionData::new(data), fingerprint)
     }
+}
+/// Whether the snapshot holds the COMMIT with this data member and record
+/// fingerprint, answered from the member index.
+fn holds<S: CollectionRead>(
+    snapshot: &S,
+    collection: CollectionHandle,
+    data: CollectionData,
+    fingerprint: [u8; 32],
+) -> Result<bool> {
+    let selectors = BTreeSet::from([CollectionRecordSelector::CommitMember(collection, data)]);
+    let records = snapshot
+        .select_records(&selectors)
+        .map_err(|error| anyhow!("look up a published COMMIT: {error}"))?;
+    Ok(records
+        .iter()
+        .any(|record| record.fingerprint().raw() == fingerprint))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -470,9 +482,11 @@ impl Archive {
                     Some(previous.through)
                 }
             };
-            drop(start);
             if since.is_some_and(|time| time > cutoff) { bail!("session lower bound is after eligibility cutoff (clock moved backwards or --since is too recent)"); }
-            let mut last = previous.as_ref().filter(|p| p.binding.collection == binding.collection).and_then(|p| p.last.clone());
+            let mut last = previous
+                .as_ref()
+                .filter(|p| p.binding.collection == binding.collection && p.binding.pile.name == binding.pile.name)
+                .and_then(|p| p.last.clone());
             let mut report = SessionReport { imported: 0, live: 0, unchanged: 0, other_files,
                 pieces: 0, commits: 0, cutoff, collection, rebound };
             for file in &files {
@@ -487,7 +501,12 @@ impl Archive {
                     let summary = super::local::project_path(&file.path, file.source.into(), Some(cutoff), |fragment, identity, _| writer.stage(fragment, identity))?;
                     file.check()?;
                     let publication = writer.commit_unit()?;
-                    if let Some(commit) = publication.last() { last = Some(LastPublication::of(&commit)); }
+                    for commit in publication.commits.iter().rev() {
+                        if !holds(&start, commit.collection(), commit.data(), commit.fingerprint().raw())? {
+                            last = Some(LastPublication::of(commit));
+                            break;
+                        }
+                    }
                     report.pieces += publication.pieces;
                     report.commits += publication.commits.len();
                     report.imported += 1;
@@ -717,6 +736,33 @@ mod tests {
         let empty = f.directory.path().join("empty.pile");
         File::create(&empty).unwrap();
         fs::rename(&empty, &pile).unwrap();
+        assert!(f.run().unwrap_err().to_string().contains("destination"));
+        assert_eq!(f.checkpoint(), before);
+    }
+
+    #[test]
+    fn a_republished_commit_is_not_evidence_of_the_newer_appends() {
+        // Identical COMMITs deduplicate, so a pass whose last file only
+        // republishes may end on a record the pile held long before. An older
+        // file at the path holds that record but not the pass's new appends.
+        let mut f = Fixture::new();
+        f.file("a.jsonl", CODEX, 1000);
+        // Same content: z's COMMITs are a's, so z only ever republishes.
+        f.file("z.jsonl", CODEX, 1000);
+        f.run().unwrap();
+        let pile = f.archive.storage.path().to_owned();
+        let older = f.directory.path().join("older.pile");
+        fs::copy(&pile, &older).unwrap();
+        let grown = format!(
+            "{CODEX}{}",
+            "{\"timestamp\":\"2026-08-16T08:02:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"a later line\"}}\n"
+        );
+        f.file("a.jsonl", &grown, 2000);
+        f.run().unwrap();
+        let before = f.checkpoint();
+        fs::rename(&older, &pile).unwrap();
+        f.options.start = SessionStart::Incremental;
+        f.options.now = time(14000);
         assert!(f.run().unwrap_err().to_string().contains("destination"));
         assert_eq!(f.checkpoint(), before);
     }
