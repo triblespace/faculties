@@ -15,10 +15,14 @@ use super::{Archive, ImportReceipt, ImportSource};
 use crate::archive_collection::ArchiveImportWriter;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use triblespace::core::collection::{
+    CollectionCommit, CollectionData, CollectionHandle, CollectionRead, CollectionRecordSelector,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum SessionSource {
@@ -66,6 +70,10 @@ pub struct SessionReport {
     pub commits: usize,
     pub cutoff: SystemTime,
     pub collection: String,
+    /// The pile at the bound path is a different file than last time (a
+    /// compaction swap) and still holds the last COMMIT this checkpoint
+    /// published, so progress continued and the checkpoint now names it.
+    pub rebound: bool,
 }
 pub enum SessionEvent<'a> {
     /// Precedes `Importing` for a file written within the quiet window.
@@ -216,6 +224,46 @@ struct Binding {
 struct Checkpoint {
     binding: Binding,
     through: SystemTime,
+    /// What the pile must still hold for this progress to carry over to a new
+    /// file at the same path. Absent in checkpoints written before it existed.
+    #[serde(default)]
+    last: Option<LastPublication>,
+}
+/// The newest COMMIT a successful pass published, by its data member and its
+/// record fingerprint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LastPublication {
+    data: String,
+    fingerprint: String,
+}
+impl LastPublication {
+    fn of(commit: &CollectionCommit) -> Self {
+        Self {
+            data: hex::encode(commit.data().raw),
+            fingerprint: hex::encode(commit.fingerprint().raw()),
+        }
+    }
+    /// Whether this exact signed COMMIT is among the snapshot's records.
+    fn held_by<S: CollectionRead>(
+        &self,
+        snapshot: &S,
+        collection: CollectionHandle,
+    ) -> Result<bool> {
+        let data: [u8; 32] = hex::decode(&self.data)
+            .ok()
+            .and_then(|raw| raw.try_into().ok())
+            .ok_or_else(|| anyhow!("session checkpoint names a malformed last publication"))?;
+        let selectors = BTreeSet::from([CollectionRecordSelector::CommitMember(
+            collection,
+            CollectionData::new(data),
+        )]);
+        let records = snapshot
+            .select_records(&selectors)
+            .map_err(|error| anyhow!("look up the checkpoint's last publication: {error}"))?;
+        Ok(records
+            .iter()
+            .any(|record| hex::encode(record.fingerprint().raw()) == self.fingerprint))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -395,21 +443,38 @@ impl Archive {
         let (files, other_files) = discover(&roots)?;
         let pile_binding = bound_path(self.storage.path())?;
         let (report, checkpoint) = self.storage.with_store(|store, signer, runtime| {
+            use triblespace::core::repo::SnapshotSource;
+            let start = store.snapshot().context("freeze the pile before the session pass")?;
             let mut writer = ArchiveImportWriter::from_store_with_storage(&mut *store, signer, runtime.clone(), &self.storage)?;
             let collection = hex::encode(writer.collection_handle().raw);
             let binding = Binding { pile: pile_binding, collection: collection.clone(), roots: root_binding };
+            let mut rebound = false;
             let since = match options.start {
                 SessionStart::All => None,
                 SessionStart::Since(time) => Some(time),
                 SessionStart::Incremental => {
                     let previous = previous.as_ref().expect("checked checkpoint");
-                    if previous.binding != binding { bail!("session destination or roots changed; choose --all or --since explicitly"); }
+                    if previous.binding != binding {
+                        // A compaction swap puts a new file at the same path. The
+                        // progress still holds if that file holds what it published.
+                        let same_place = previous.binding.pile.name == binding.pile.name
+                            && previous.binding.collection == binding.collection
+                            && previous.binding.roots == binding.roots;
+                        let held = match &previous.last {
+                            Some(last) if same_place => last.held_by(&start, writer.collection_handle())?,
+                            _ => false,
+                        };
+                        if !held { bail!("session destination or roots changed; choose --all or --since explicitly"); }
+                        rebound = true;
+                    }
                     Some(previous.through)
                 }
             };
+            drop(start);
             if since.is_some_and(|time| time > cutoff) { bail!("session lower bound is after eligibility cutoff (clock moved backwards or --since is too recent)"); }
+            let mut last = previous.as_ref().filter(|p| p.binding.collection == binding.collection).and_then(|p| p.last.clone());
             let mut report = SessionReport { imported: 0, live: 0, unchanged: 0, other_files,
-                pieces: 0, commits: 0, cutoff, collection };
+                pieces: 0, commits: 0, cutoff, collection, rebound };
             for file in &files {
                 // Inclusive lower edge intentionally rechecks the prior boundary.
                 // A file live in the previous pass is at or after it by definition.
@@ -422,6 +487,7 @@ impl Archive {
                     let summary = super::local::project_path(&file.path, file.source.into(), Some(cutoff), |fragment, identity, _| writer.stage(fragment, identity))?;
                     file.check()?;
                     let publication = writer.commit_unit()?;
+                    if let Some(commit) = publication.last() { last = Some(LastPublication::of(&commit)); }
                     report.pieces += publication.pieces;
                     report.commits += publication.commits.len();
                     report.imported += 1;
@@ -442,7 +508,7 @@ impl Archive {
             // cases, not an inference from the closure returning successfully.
             use triblespace::core::repo::StorageFlush;
             store.flush().context("flush session publications before checkpoint")?;
-            Ok((report, Checkpoint { binding, through: cutoff }))
+            Ok((report, Checkpoint { binding, through: cutoff, last }))
         })?;
         // Explicit flush, one-shot close (if owned), and caller output precede progress.
         event(SessionEvent::Complete(&report))?;
@@ -629,6 +695,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("destination"));
+        assert_eq!(f.checkpoint(), before);
+    }
+
+    #[test]
+    fn a_new_pile_file_at_the_bound_path_carries_progress_only_if_it_holds_the_last_publication() {
+        let mut f = Fixture::new();
+        f.file("a.jsonl", CODEX, 1000);
+        f.run().unwrap();
+        let pile = f.archive.storage.path().to_owned();
+        // A compaction swap: the same records in a new file at the same path.
+        let copy = f.directory.path().join("copy.pile");
+        fs::copy(&pile, &copy).unwrap();
+        fs::rename(&copy, &pile).unwrap();
+        f.options.start = SessionStart::Incremental;
+        f.options.now = time(14000);
+        assert!(f.run().unwrap().rebound);
+        assert!(!f.run().unwrap().rebound);
+        // A new file that holds nothing this checkpoint published stays refused.
+        let before = f.checkpoint();
+        let empty = f.directory.path().join("empty.pile");
+        File::create(&empty).unwrap();
+        fs::rename(&empty, &pile).unwrap();
+        assert!(f.run().unwrap_err().to_string().contains("destination"));
         assert_eq!(f.checkpoint(), before);
     }
 

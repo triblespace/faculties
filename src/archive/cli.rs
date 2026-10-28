@@ -352,9 +352,10 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
                     SessionEvent::Importing(path) => out.line(format!("Importing session: {:?}", path)),
                     SessionEvent::Imported { receipt, .. } => receipt.write(out),
                     SessionEvent::Complete(report) => out.line(format!(
-                        "Session pass: {} imported ({} live), {} unchanged, {} other files; {} pieces in {} COMMITs (publication work, not unique growth); collection {}; checkpoint cutoff {}. Native qualifiers above apply; not continuous/complete-byte coverage. Local ingestion lock only; host admission/resources are caller-owned.",
+                        "Session pass: {} imported ({} live), {} unchanged, {} other files; {} pieces in {} COMMITs (publication work, not unique growth); collection {}; checkpoint cutoff {}.{} Native qualifiers above apply; not continuous/complete-byte coverage. Local ingestion lock only; host admission/resources are caller-owned.",
                         report.imported, report.live, report.unchanged, report.other_files,
-                        report.pieces, report.commits, report.collection, humantime::format_rfc3339(report.cutoff))),
+                        report.pieces, report.commits, report.collection, humantime::format_rfc3339(report.cutoff),
+                        if report.rebound { " The pile at the bound path is a different file than last pass and still holds the checkpoint's last published COMMIT; the checkpoint now names this file." } else { "" })),
                 }
             })?;
             Ok(())
