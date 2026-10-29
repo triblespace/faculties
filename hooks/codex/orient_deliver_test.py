@@ -122,6 +122,11 @@ class Server:
                 "wrong_version": "codex/0.159.0",
                 "incidental_version": "probe/0.159.0 (client 0.160.1)",
                 "alternate_product": "astra-recovery-probe/0.160.1 (Ubuntu; aarch64) unknown (codex-tui; 0.160.1)",
+                "product_spaces": "Astra Recovery Probe/0.160.1 (Ubuntu; aarch64)",
+                "product_cr": "probe\rspoof/0.160.1",
+                "product_lf": "probe\nspoof/0.160.1",
+                "version_cr": "probe/0.160.1\r(client 0.160.1)",
+                "version_lf": "probe/0.160.1\n(client 0.160.1)",
                 "malformed_ua": "client has 0.160.1 but no primary version",
             }.get(self.case, "codex/0.160.1")
             return {"codexHome": "/wrong" if self.case == "wrong_home" else "/test/codex",
@@ -134,8 +139,20 @@ class Server:
                 return {"data": ["other"], "nextCursor": "last" if request["params"]["cursor"] is None else None}
             if self.case == "bad_page":
                 return {"data": [42], "nextCursor": None}
-            if self.case == "missing_cursor":
+            if self.case == "absent_missing_cursor":
                 return {"data": []}
+            if self.case == "present_missing_cursor":
+                return {"data": ["owner"]}
+            if self.case == "present_more_pages":
+                return {"data": ["owner"], "nextCursor": "unused"}
+            if self.case == "present_paged":
+                return {"data": ["other"], "nextCursor": "last"} if request["params"]["cursor"] is None else {"data": ["owner"]}
+            if self.case == "malformed_cursor":
+                return {"data": ["owner"], "nextCursor": 42}
+            if self.case == "empty_cursor":
+                return {"data": ["owner"], "nextCursor": ""}
+            if self.case == "repeat_cursor_with_owner":
+                return {"data": [] if request["params"]["cursor"] is None else ["owner"], "nextCursor": "loop"}
             if self.case == "loop_cursor":
                 return {"data": [], "nextCursor": "loop"}
             return {"data": [] if self.case == "not_loaded" else ["owner"], "nextCursor": None}
@@ -270,6 +287,7 @@ class DeliveryTests(unittest.TestCase):
 
     def test_private_state_required(self):
         Path(self.args.state_dir).mkdir(mode=0o755)
+        Path(self.args.state_dir).chmod(0o755)
         with self.assertRaisesRegex(delivery.Failure, "private"):
             delivery.deliver(self.args, "report", time.monotonic() + 2)
 
@@ -300,9 +318,11 @@ class DeliveryTests(unittest.TestCase):
             ("not_loaded", 75), ("absent_paged", 75),
             ("stale", 75), ("system_error", 75), ("wrong_version", 78),
             ("incidental_version", 78), ("malformed_ua", 1),
+            ("product_cr", 1), ("product_lf", 1), ("version_cr", 1), ("version_lf", 1),
             ("wrong_home", 1), ("wrong_thread", 1), ("unknown_status", 1),
-            ("no_input", 1), ("bad_page", 1), ("missing_cursor", 1),
-            ("loop_cursor", 1),
+            ("no_input", 1), ("bad_page", 1), ("absent_missing_cursor", 75),
+            ("loop_cursor", 1), ("malformed_cursor", 1), ("empty_cursor", 1),
+            ("repeat_cursor_with_owner", 1),
         ]:
             with self.subTest(case=case):
                 server = Server(self.args.socket, case)
@@ -314,6 +334,23 @@ class DeliveryTests(unittest.TestCase):
                     server.finish()
                 self.assertFalse(any(req.get("method") == "turn/start" for req in server.requests))
                 self.assertIsNone(self.state())
+
+    def test_optional_cursor_present_owner_and_pagination(self):
+        for case, pages in [("present_missing_cursor", 1), ("present_more_pages", 1),
+                            ("present_paged", 2), ("active", 1)]:
+            with self.subTest(case=case):
+                server = Server(self.args.socket, case)
+                try:
+                    delivery.deliver(self.args, "fixed", time.monotonic() + 2)
+                finally:
+                    server.finish()
+                self.assertEqual(sum(req.get("method") == "thread/loaded/list" for req in server.requests), pages)
+                self.assertEqual(sum(req.get("method") == "turn/start" for req in server.requests), 1)
+                self.assertEqual(self.state()["status"], "accepted")
+
+    def test_primary_product_may_contain_spaces(self):
+        self.assertEqual(len(self.run_case("product_spaces")), 1)
+        self.assertEqual(self.state()["status"], "accepted")
 
     def native(self):
         return subprocess.run(
@@ -329,9 +366,13 @@ class DeliveryTests(unittest.TestCase):
         for case, expected in [
             ("active", 0), ("not_loaded", 75), ("absent_paged", 75),
             ("alternate_product", 0), ("incidental_version", 78), ("malformed_ua", 1),
+            ("product_spaces", 0), ("product_cr", 1), ("product_lf", 1),
+            ("version_cr", 1), ("version_lf", 1),
             ("stale", 75), ("system_error", 75), ("wrong_version", 78),
             ("wrong_home", 1), ("wrong_thread", 1), ("unknown_status", 1),
-            ("bad_page", 1), ("missing_cursor", 1), ("loop_cursor", 1),
+            ("bad_page", 1), ("absent_missing_cursor", 75), ("loop_cursor", 1),
+            ("present_missing_cursor", 0), ("present_more_pages", 0), ("present_paged", 0),
+            ("malformed_cursor", 1), ("empty_cursor", 1), ("repeat_cursor_with_owner", 1),
             ("no_input", 1), ("internal", 1), ("failed_start", 1),
         ]:
             with self.subTest(case=case):

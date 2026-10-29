@@ -229,7 +229,7 @@ def check_owner(rpc, args):
     # OS/client suffixes. Product name is not fixed: the pinned server's
     # retained global originator can differ (observed on Stars 0.163.0).
     user_agent = hello.get("userAgent")
-    primary = re.match(r"^[^\s/]+/(\d+\.\d+\.\d+)(?=\s|$)", user_agent) if isinstance(user_agent, str) else None
+    primary = re.match(r"\A[^/\r\n]+/([0-9]+\.[0-9]+\.[0-9]+)(?=[ \t]|\Z)", user_agent) if isinstance(user_agent, str) else None
     if primary is None:
         raise Failure("malformed server primary userAgent version")
     version = primary.group(1)
@@ -243,9 +243,10 @@ def check_owner(rpc, args):
         data = page.get("data")
         if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
             raise Failure("malformed loaded thread list")
-        if "nextCursor" not in page:
-            raise Failure("loaded thread pagination is missing its terminal cursor")
-        cursor = page["nextCursor"]
+        # Pinned 0.163 ThreadLoadedListResponse requires only data; an omitted
+        # nextCursor is None/exhausted. Validate any supplied cursor even when
+        # this page contains the owner, but do not exhaust later pages then.
+        cursor = page.get("nextCursor")
         if cursor is not None and (not isinstance(cursor, str) or not cursor or cursor in seen):
             raise Failure("invalid loaded thread pagination")
         if args.thread in data:
