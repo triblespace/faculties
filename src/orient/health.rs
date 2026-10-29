@@ -13,6 +13,7 @@ use crate::schemas::orient::{
 use crate::schemas::swarm_health::{self as schema, attrs};
 use std::sync::{Arc, Mutex};
 use triblespace::core::collection::descriptor;
+use triblespace::macros::id_hex;
 use triblespace_net::telemetry;
 
 pub(super) struct HealthSources {
@@ -243,7 +244,8 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
-        self.poll_in(pile, signer, input, peek, NewsForm::Report, output).await
+        self.poll_in(pile, signer, input, peek, NewsForm::Report, output)
+            .await
     }
 
     /// [`Self::poll`], writing any report in `form`.
@@ -291,7 +293,8 @@ impl HealthSources {
             form,
             output,
             &mut path_observer(self.news_path_target()),
-        ).await?;
+        )
+        .await?;
         Ok((fired, report.next_change))
     }
 
@@ -403,7 +406,19 @@ impl HealthSources {
 /// Writer cadence of a continuous observer's news-path beat (writer policy).
 pub(super) const NEWS_PATH_BEAT_EVERY: Duration = Duration::from_secs(5 * 60);
 /// Reader policy: a news path whose latest beat is older than this is silent.
+/// So is one whose latest RETRY's next try is overdue by this much.
 pub(super) const NEWS_PATH_MAX_AGE: Duration = Duration::from_secs(20 * 60);
+/// Reader policy: a stretch still degraded, silent or exited this long after
+/// it began is said to peers once more.
+pub(super) const NEWS_PATH_ESCALATE_AFTER: Duration = Duration::from_secs(60 * 60);
+/// Tag of the escalation event that follows a stretch's first event.
+///
+/// Minted with `trible genid` on 2026-10-29.
+const NEWS_PATH_ESCALATION: Id = id_hex!("5FEBE690EA87EC872B5A16396D11F631");
+/// Tag of the silence event that follows an overdue RETRY.
+///
+/// Minted with `trible genid` on 2026-10-29.
+const NEWS_PATH_OVERDUE: Id = id_hex!("BF769540B346A0B226F41700C40ECCE5");
 /// The exit reason is one line of an error chain, not a log.
 const NEWS_PATH_REASON_CHARS: usize = 400;
 
@@ -906,21 +921,57 @@ fn render_news_paths(
         let label = person_label(people, snapshot, window);
         if exit {
             let reason = exit_reason(facts, snapshot, record);
-            lines.push(format!("{label}: exited at {}: {reason}", utc(created.1)));
+            let exited = format!("exited at {}: {reason}", utc(created.1));
+            lines.push(format!("{label}: {exited}"));
             report.attention.insert(AttentionEvent::NewsPath {
                 event: record,
                 window,
                 detail: format!(
-                    "news path of {label} exited at {}: {reason}. Nothing restarts it automatically.",
-                    utc(created.1)
+                    "news path of {label} {exited}. Nothing restarts it automatically."
                 ),
+            });
+            escalate(report, window, record, created.1, now, || {
+                format!(
+                    "news path of {label} still exited after {}: {exited}. Nothing restarts it automatically.",
+                    escalation_span()
+                )
             });
             continue;
         }
         if retry {
             // Beats stop while a delivery is deferred, so a latest RETRY is
-            // degraded at any age, until DELIVERED or an exit follows it.
-            degraded(report, &mut lines, facts, snapshot, &label, window, record);
+            // degraded until DELIVERED or an exit follows it, or until its
+            // next try is overdue by the silence threshold: then no newer
+            // retry has been observed, and the path reads as silent with no
+            // new record. Only a RETRY that is the window's latest record
+            // can be overdue; a newer beat reaches `degraded` below instead.
+            let next_try = find!(
+                next: (Epoch, Epoch),
+                pattern!(facts, [{ record @ metadata::expires_at: ?next }])
+            )
+            .map(|next| next.1)
+            .max();
+            match next_try {
+                Some(next) if now >= next + span(NEWS_PATH_MAX_AGE) => {
+                    let silence = Silence {
+                        retry: record,
+                        created: created.1,
+                        next,
+                    };
+                    overdue(
+                        report, &mut lines, facts, snapshot, &label, window, silence, now,
+                    );
+                }
+                _ => {
+                    report.next_change = earliest(
+                        report.next_change,
+                        next_try.map(|next| next + span(NEWS_PATH_MAX_AGE)),
+                    );
+                    degraded(
+                        report, &mut lines, facts, snapshot, &label, window, record, now,
+                    );
+                }
+            }
             continue;
         }
         let age = format_age(now_key, created.1.to_tai_duration().total_nanoseconds());
@@ -939,6 +990,13 @@ fn render_news_paths(
                     "news path of {label} has not beaten since {} ({age} ago); that window may not be hearing news. Nothing restarts it automatically.",
                     utc(created.1)
                 ),
+            });
+            escalate(report, window, record, created.1, now, || {
+                format!(
+                    "news path of {label} still silent after {}: has not beaten since {} ({age} ago). Nothing restarts it automatically.",
+                    escalation_span(),
+                    utc(created.1)
+                )
             });
             continue;
         }
@@ -964,7 +1022,9 @@ fn render_news_paths(
             (Some((retry, retried)), delivered)
                 if delivered.is_none_or(|(id, at)| (retried.1, retry) > (at.1, id)) =>
             {
-                degraded(report, &mut lines, facts, snapshot, &label, window, retry);
+                degraded(
+                    report, &mut lines, facts, snapshot, &label, window, retry, now,
+                );
             }
             (_, Some((delivered, _))) => {
                 lines.push(format!("{label}: callback accepting, last beat {age} ago"));
@@ -1020,8 +1080,9 @@ fn render_news_paths(
 }
 
 /// Say one deferred attempt: since when, which attempt, why, and when next.
-/// The dashboard line follows the attempt; the attention event is the
+/// The dashboard line follows the attempt; the attention events are the
 /// stretch's.
+#[allow(clippy::too_many_arguments)]
 fn degraded(
     report: &mut HealthReport,
     lines: &mut Vec<String>,
@@ -1030,6 +1091,7 @@ fn degraded(
     label: &str,
     window: Id,
     retry: Id,
+    now: Epoch,
 ) {
     let key = |at: (Epoch, Epoch)| at.1.to_tai_duration().total_nanoseconds();
     let summary = retry_summary(facts, snapshot, retry);
@@ -1044,6 +1106,90 @@ fn degraded(
     .min()
     .unwrap_or_default();
     lines.push(format!("{label}: degraded {summary}{next}"));
+    let (episode, since) = stretch(facts, window, retry);
+    report.attention.insert(AttentionEvent::NewsPath {
+        event: episode,
+        window,
+        detail: format!("news path of {label} degraded {summary}{next}"),
+    });
+    if let Some(since) = since {
+        escalate(report, window, episode, since, now, || {
+            format!(
+                "news path of {label} still degraded after {} (degraded {summary})",
+                escalation_span()
+            )
+        });
+    }
+}
+
+/// A latest RETRY whose next try has not been observed.
+struct Silence {
+    retry: Id,
+    created: Epoch,
+    next: Epoch,
+}
+
+/// Say a latest RETRY overdue by the silence threshold as silence: no newer
+/// retry has been observed. That is missing evidence, not proof the daemon
+/// died. Its time is the RETRY's own `created_at`, the last instant the path
+/// is known to have been alive; the next try was only an intention. The
+/// silence stays in the RETRY's stretch, so it escalates on that start.
+#[allow(clippy::too_many_arguments)]
+fn overdue(
+    report: &mut HealthReport,
+    lines: &mut Vec<String>,
+    facts: &FactArchive,
+    snapshot: &impl BlobStoreGet,
+    label: &str,
+    window: Id,
+    silence: Silence,
+    now: Epoch,
+) {
+    let key = |at: Epoch| at.to_tai_duration().total_nanoseconds();
+    let Silence {
+        retry,
+        created,
+        next,
+    } = silence;
+    let age = format_age(key(now), key(created));
+    let summary = retry_summary(facts, snapshot, retry);
+    lines.push(format!(
+        "{label}: silent, no retry since {} (next try was due {})",
+        utc(created),
+        utc(next)
+    ));
+    report.attention.insert(AttentionEvent::NewsPath {
+        // Not the RETRY's own id: a stretch of one attempt already used that
+        // for its degraded event, which this silence must not hide behind.
+        event: follow_up(NEWS_PATH_OVERDUE, retry),
+        window,
+        detail: format!(
+            "news path of {label} has not beaten, and no retry since {} ({age} ago): the next try due at {} has not been observed, after delivery degraded {summary}; that window may not be hearing news. Nothing restarts it automatically.",
+            utc(created),
+            utc(next)
+        ),
+    });
+    let (episode, since) = stretch(facts, window, retry);
+    if let Some(since) = since {
+        escalate(report, window, episode, since, now, || {
+            format!(
+                "news path of {label} still silent after {}: no beat, and no retry since {} (delivery degraded {summary}). Nothing restarts it automatically.",
+                escalation_span(),
+                utc(created)
+            )
+        });
+    }
+}
+
+/// The stretch a RETRY belongs to: the stretch's first RETRY, which names
+/// its events, and when the stretch began.
+fn stretch(facts: &FactArchive, window: Id, retry: Id) -> (Id, Option<Epoch>) {
+    let since = find!(
+        at: (Epoch, Epoch),
+        pattern!(facts, [{ retry @ metadata::started_at: ?at }])
+    )
+    .map(|at| at.1)
+    .min();
     // Every attempt of one degraded stretch carries its start, across
     // restarts that never accept too, so the stretch's first RETRY names the
     // event: peers hear of a stretch once, not of each attempt.
@@ -1061,11 +1207,61 @@ fn degraded(
     )
     .min_by_key(|(first, created)| (created.1, *first))
     .map_or(retry, |(first, _)| first);
+    (episode, since)
+}
+
+/// Tell peers once more about a stretch still unresolved
+/// [`NEWS_PATH_ESCALATE_AFTER`] after `start`, whatever it reads as now.
+/// Before then, wake readers at that instant, so a daemon that writes
+/// nothing more is escalated by the deadline alone.
+///
+/// The stretch is the episode its first event already names; nothing here
+/// carries one further. A degraded stretch (and the silence of its overdue
+/// RETRY) runs from the RETRY's `started_at`, which restarts carry until an
+/// acceptance. An EXIT is its own episode: its hour runs from the EXIT, and
+/// it neither inherits nor stops the clock of a stretch it ended (one that
+/// already escalated stays said). A silent beat or acceptance runs from that
+/// record. A restart's resumed polling is not escalated; its next RETRY
+/// rejoins the carried stretch. An acceptance ends a degraded stretch, so
+/// the reader no longer reaches this for it.
+fn escalate(
+    report: &mut HealthReport,
+    window: Id,
+    episode: Id,
+    start: Epoch,
+    now: Epoch,
+    detail: impl FnOnce() -> String,
+) {
+    let due = start + span(NEWS_PATH_ESCALATE_AFTER);
+    if now < due {
+        report.next_change = earliest(report.next_change, Some(due));
+        return;
+    }
     report.attention.insert(AttentionEvent::NewsPath {
-        event: episode,
+        event: follow_up(NEWS_PATH_ESCALATION, episode),
         window,
-        detail: format!("news path of {label} degraded {summary}{next}"),
+        detail: detail(),
     });
+}
+
+fn escalation_span() -> String {
+    format!("{} min", NEWS_PATH_ESCALATE_AFTER.as_secs() / 60)
+}
+
+/// The id of an attention event that has no record of its own: the
+/// escalation of a stretch, or the silence of an overdue RETRY. It folds
+/// `tag` and the record it follows into an intrinsic id that is never
+/// written, so every render names the event the same way and a presented
+/// one is not said again. That idempotence is its only purpose: a fresh
+/// random id would break nothing but the once-only wake, and nothing
+/// computes it to look a record up.
+fn follow_up(tag: Id, record: Id) -> Id {
+    entity! {
+        metadata::tag: &tag,
+        metadata::supersedes: &record,
+    }
+    .root()
+    .expect("one follow-up entity")
 }
 
 /// "since T: attempt n, <reason>" for one retry record.
@@ -1716,8 +1912,12 @@ mod tests {
     impl HealthSources {
         // Synthetic synchronous callers only; production poll remains async.
         fn poll_test(
-            &mut self, pile: &mut FacultyStore, signer: &SigningKey, input: &str,
-            peek: bool, output: &mut Out<'_>,
+            &mut self,
+            pile: &mut FacultyStore,
+            signer: &SigningKey,
+            input: &str,
+            peek: bool,
+            output: &mut Out<'_>,
         ) -> Result<(bool, Option<Epoch>)> {
             test_block_on(self.poll(pile, signer, input, peek, output))
         }
@@ -2500,6 +2700,435 @@ mod tests {
             "a new stretch has its own start: {text}"
         );
         assert_ne!(events, vec![first_id]);
+    }
+
+    /// The one news event a peer has not been shown yet.
+    fn only_news(observed: &HealthObservation, reader: Id) -> (String, Id) {
+        let (text, events) = news_text(observed.news(reader, &observed.attention()))
+            .expect("one new news-path event");
+        assert_eq!(events.len(), 1, "{text}");
+        (text, events[0])
+    }
+
+    fn quiet(observed: &HealthObservation, reader: Id) -> bool {
+        matches!(observed.news(reader, &observed.attention()), News::Quiet)
+    }
+
+    const MIN: f64 = 60.0;
+
+    #[test]
+    fn an_overdue_retry_reads_as_silent_from_its_next_try() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        let reader = *fucid();
+        f.publish(path_beat(window, session, at(0.0)));
+        f.publish(path_delivered(window, session, at(5.0), None));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        // Written at 20 s; its next try falls at T = 80 s and never comes.
+        let retry = path_retry(window, session, at(20.0), at(20.0), 1, 60.0, reason);
+        let retry_id = retry.root().unwrap();
+        f.publish(retry);
+        let next_try = 80.0;
+
+        let degraded = f.observe_at(at(next_try + 19.0 * MIN));
+        let report = degraded.attention();
+        assert_eq!(
+            report.next_change,
+            Some(at(next_try + 20.0 * MIN)),
+            "a reader wakes when the retry becomes overdue"
+        );
+        let (text, event) = only_news(&degraded, reader);
+        assert!(text.contains("degraded since"), "{text}");
+        assert_eq!(event, retry_id);
+        present(&mut f, vec![event]);
+        assert!(degraded.report().text.contains("degraded since"));
+
+        let silent = f.observe_at(at(next_try + 21.0 * MIN));
+        let full = silent.report().text;
+        assert!(
+            full.contains(&format!("silent, no retry since {}", utc(at(20.0)))),
+            "{full}"
+        );
+        assert!(!full.contains(": degraded since"), "{full}");
+        let (text, event) = only_news(&silent, reader);
+        assert!(text.contains("has not beaten"), "{text}");
+        assert!(
+            text.contains(&format!("no retry since {}", utc(at(20.0)))),
+            "{text}"
+        );
+        assert!(
+            !text.contains("dead"),
+            "missing evidence, not death: {text}"
+        );
+        assert!(!text.contains("still"), "not yet an escalation: {text}");
+        assert_ne!(
+            event, retry_id,
+            "silence is news after the degraded stretch was told"
+        );
+        assert!(quiet(&silent, window), "a window is not told about itself");
+        // The stretch's escalation deadline is still ahead.
+        assert_eq!(silent.attention().next_change, Some(at(20.0 + 60.0 * MIN)));
+        present(&mut f, vec![event]);
+        assert!(quiet(&f.observe_at(at(next_try + 30.0 * MIN)), reader));
+    }
+
+    #[test]
+    fn a_degraded_stretch_escalates_once_after_an_hour() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        let reader = *fucid();
+        f.publish(path_beat(window, session, at(0.0)));
+        f.publish(path_delivered(window, session, at(5.0), None));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let first = path_retry(window, session, at(20.0), at(20.0), 1, 60.0, reason);
+        let first_id = first.root().unwrap();
+        f.publish(first);
+        let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
+        assert_eq!(event, first_id);
+        present(&mut f, vec![event]);
+
+        // Still retrying a minute before the hour: nothing new, and the
+        // reader's next wake is the hour itself.
+        f.publish(path_retry(
+            window,
+            session,
+            at(3560.0),
+            at(20.0),
+            60,
+            60.0,
+            reason,
+        ));
+        let before = f.observe_at(at(3561.0));
+        assert!(quiet(&before, reader));
+        assert_eq!(before.attention().next_change, Some(at(20.0 + 60.0 * MIN)));
+
+        // The hour passes with no new record: one more event.
+        let after = f.observe_at(at(3621.0));
+        let (text, escalation) = only_news(&after, reader);
+        assert!(text.contains("still degraded after 60 min"), "{text}");
+        assert!(text.contains(&utc(at(20.0))), "{text}");
+        assert_ne!(escalation, first_id);
+        assert!(quiet(&after, window), "a window is not told about itself");
+        present(&mut f, vec![escalation]);
+
+        // Later attempts and renders add nothing.
+        for attempt in 61..=63u128 {
+            let created = 3560.0 + 60.0 * (attempt - 60) as f64;
+            f.publish(path_retry(
+                window,
+                session,
+                at(created),
+                at(20.0),
+                attempt,
+                60.0,
+                reason,
+            ));
+            let observed = f.observe_at(at(created + 1.0));
+            assert!(quiet(&observed, reader), "attempt {attempt}");
+            assert!(observed.report().text.contains("degraded since"));
+        }
+    }
+
+    #[test]
+    fn a_stretch_carried_across_restarts_escalates_once() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let reader = *fucid();
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let first = path_retry(window, *fucid(), at(20.0), at(20.0), 1, 60.0, reason);
+        let first_id = first.root().unwrap();
+        f.publish(first);
+        let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
+        assert_eq!(event, first_id);
+        present(&mut f, vec![event]);
+
+        // Each restart resumes polling without an acceptance, then defers
+        // again under the same stretch start.
+        let mut escalations = Vec::new();
+        for (resumed, deferred) in [(100.0, 110.0), (3500.0, 3610.0), (3700.0, 3710.0)] {
+            let session = *fucid();
+            f.publish(entity! {
+                metadata::tag*: [KIND_NEWS_PATH_BEAT, schema::KIND_RECOVERED],
+                attrs::node: &window,
+                attrs::session: &session,
+                metadata::created_at: clock::point(at(resumed)).unwrap(),
+                metadata::supersedes: &first_id,
+            });
+            let resumption = f.observe_at(at(resumed + 1.0));
+            if let News::Report { events, .. } = resumption.news(reader, &resumption.attention()) {
+                present(&mut f, events.into_iter().collect());
+            }
+            f.publish(path_retry(
+                window,
+                session,
+                at(deferred),
+                at(20.0),
+                1,
+                60.0,
+                reason,
+            ));
+            let observed = f.observe_at(at(deferred + 30.0));
+            match observed.news(reader, &observed.attention()) {
+                News::Quiet => {}
+                News::Report { text, events, .. } => {
+                    assert!(text.contains("still degraded after 60 min"), "{text}");
+                    escalations.extend(events.iter().copied());
+                    present(&mut f, events.into_iter().collect());
+                }
+            }
+        }
+        assert_eq!(escalations.len(), 1, "one escalation for the whole stretch");
+        assert_ne!(escalations[0], first_id);
+    }
+
+    #[test]
+    fn silent_and_exited_paths_escalate_an_hour_after_their_record() {
+        let mut f = Fixture::new();
+        let silent = *fucid();
+        let exited = *fucid();
+        let reader = *fucid();
+        let beat = path_beat(silent, *fucid(), at(0.0));
+        let beat_id = beat.root().unwrap();
+        f.publish(beat);
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback failed".to_owned())
+            .unwrap();
+        let exit = path_exit(exited, *fucid(), at(10.0), reason);
+        let exit_id = exit.root().unwrap();
+        f.publish(exit);
+
+        let first = f.observe_at(at(21.0 * MIN));
+        let (_, events) = news_text(first.news(reader, &first.attention())).unwrap();
+        assert_eq!(
+            events.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([beat_id, exit_id])
+        );
+        assert_eq!(first.attention().next_change, Some(at(60.0 * MIN)));
+        present(&mut f, events);
+
+        let before = f.observe_at(at(60.0 * MIN - 1.0));
+        assert!(quiet(&before, reader), "not before the hour");
+
+        let silent_hour = f.observe_at(at(60.0 * MIN + 1.0));
+        assert_eq!(
+            silent_hour.attention().next_change,
+            Some(at(10.0 + 60.0 * MIN))
+        );
+        let (text, event) = only_news(&silent_hour, reader);
+        assert!(text.contains("still silent after 60 min"), "{text}");
+        assert_ne!(event, beat_id);
+        present(&mut f, vec![event]);
+
+        let exit_hour = f.observe_at(at(10.0 + 60.0 * MIN + 1.0));
+        let (text, event) = only_news(&exit_hour, reader);
+        assert!(text.contains("still exited after 60 min"), "{text}");
+        assert!(text.contains("callback failed"), "{text}");
+        assert_ne!(event, exit_id);
+        present(&mut f, vec![event]);
+
+        assert!(quiet(&f.observe_at(at(120.0 * MIN)), reader), "said once");
+    }
+
+    #[test]
+    fn a_stopped_deferral_escalates_through_its_deadlines_alone() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let reader = *fucid();
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let retry = path_retry(window, *fucid(), at(20.0), at(20.0), 1, 60.0, reason);
+        f.publish(retry);
+        // No record follows: each wake below comes from a deadline.
+        let degraded = f.observe_at(at(21.0));
+        let mut seen = Vec::new();
+        let (_, event) = only_news(&degraded, reader);
+        seen.push(event);
+        present(&mut f, vec![event]);
+        let overdue = degraded
+            .attention()
+            .next_change
+            .expect("an overdue deadline");
+        assert_eq!(overdue, at(80.0 + 20.0 * MIN));
+
+        let silent = f.observe_at(overdue);
+        let (text, event) = only_news(&silent, reader);
+        assert!(text.contains("has not beaten"), "{text}");
+        seen.push(event);
+        present(&mut f, vec![event]);
+        let hour = silent
+            .attention()
+            .next_change
+            .expect("an escalation deadline");
+        assert_eq!(hour, at(20.0 + 60.0 * MIN));
+
+        let escalated = f.observe_at(hour);
+        let (text, event) = only_news(&escalated, reader);
+        assert!(text.contains("still silent after 60 min"), "{text}");
+        assert!(!seen.contains(&event));
+        present(&mut f, vec![event]);
+        assert!(quiet(&f.observe_at(at(5.0 * 60.0 * MIN)), reader));
+    }
+
+    #[test]
+    fn an_acceptance_before_the_hour_prevents_escalation_and_a_later_stretch_has_its_own() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        let reader = *fucid();
+        f.publish(path_beat(window, session, at(0.0)));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let retry = path_retry(window, session, at(20.0), at(20.0), 1, 60.0, reason);
+        let retry_id = retry.root().unwrap();
+        f.publish(retry);
+        let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
+        present(&mut f, vec![event]);
+
+        let delivered = path_delivered(window, session, at(600.0), Some(retry_id));
+        f.publish(delivered);
+        let (text, event) = only_news(&f.observe_at(at(601.0)), reader);
+        assert!(text.contains("callback accepting again"), "{text}");
+        present(&mut f, vec![event]);
+        f.publish(path_beat(window, session, at(3500.0)));
+        let past_hour = f.observe_at(at(3700.0));
+        assert!(
+            quiet(&past_hour, reader),
+            "an accepted stretch does not escalate"
+        );
+
+        // A new stretch after the acceptance escalates on its own clock.
+        let next = path_retry(window, session, at(4000.0), at(4000.0), 1, 60.0, reason);
+        let next_id = next.root().unwrap();
+        f.publish(next);
+        let (_, event) = only_news(&f.observe_at(at(4001.0)), reader);
+        assert_eq!(event, next_id);
+        present(&mut f, vec![event]);
+        f.publish(path_retry(
+            window,
+            session,
+            at(7550.0),
+            at(4000.0),
+            60,
+            60.0,
+            reason,
+        ));
+        let before = f.observe_at(at(7551.0));
+        assert!(quiet(&before, reader));
+        assert_eq!(
+            before.attention().next_change,
+            Some(at(4000.0 + 60.0 * MIN))
+        );
+        let (text, _) = only_news(&f.observe_at(at(7601.0)), reader);
+        assert!(text.contains("still degraded after 60 min"), "{text}");
+        assert!(text.contains(&utc(at(4000.0))), "{text}");
+    }
+
+    #[test]
+    fn a_fresh_beat_after_an_old_retry_is_never_read_as_overdue() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        let reader = *fucid();
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        // The retry's next try (80 s) is overdue from 1280 s, but the session
+        // beats after it: newer polling evidence.
+        f.publish(path_retry(
+            window,
+            session,
+            at(20.0),
+            at(20.0),
+            1,
+            60.0,
+            reason,
+        ));
+        f.publish(path_beat(window, session, at(1300.0)));
+        let observed = f.observe_at(at(1400.0));
+        let full = observed.report().text;
+        assert!(full.contains(": degraded since"), "{full}");
+        assert!(!full.contains("silent"), "{full}");
+        assert!(!full.contains("no retry since"), "{full}");
+        let (text, _) = only_news(&observed, reader);
+        assert!(text.contains("degraded since"), "{text}");
+        assert!(!text.contains("has not beaten"), "{text}");
+        assert!(!text.contains("no retry since"), "{text}");
+        // The beat's own staleness comes first, then the stretch's hour.
+        assert_eq!(
+            observed.attention().next_change,
+            Some(at(1300.0 + 20.0 * MIN))
+        );
+    }
+
+    #[test]
+    fn an_exit_starts_its_own_hour() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        let reader = *fucid();
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        f.publish(path_retry(
+            window,
+            session,
+            at(20.0),
+            at(20.0),
+            1,
+            60.0,
+            reason,
+        ));
+        let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
+        present(&mut f, vec![event]);
+        let gone = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback failed".to_owned())
+            .unwrap();
+        let exit = path_exit(window, session, at(3000.0), gone);
+        let exit_id = exit.root().unwrap();
+        f.publish(exit);
+        let (_, event) = only_news(&f.observe_at(at(3001.0)), reader);
+        assert_eq!(event, exit_id);
+        present(&mut f, vec![event]);
+
+        // Past the degraded stretch's hour: the exit ended that stretch and
+        // its own hour runs from the exit.
+        let past = f.observe_at(at(3621.0));
+        assert!(quiet(&past, reader));
+        assert_eq!(past.attention().next_change, Some(at(3000.0 + 60.0 * MIN)));
+        let (text, _) = only_news(&f.observe_at(at(3000.0 + 60.0 * MIN)), reader);
+        assert!(text.contains("still exited after 60 min"), "{text}");
+    }
+
+    #[test]
+    fn a_window_is_not_told_about_its_own_escalation() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        f.publish(path_beat(window, *fucid(), at(0.0)));
+        let observed = f.observe_at(at(61.0 * MIN));
+        let (text, events) = news_text(observed.news(*fucid(), &observed.attention()))
+            .expect("a peer hears the silence and its escalation");
+        assert_eq!(events.len(), 2, "{text}");
+        assert!(text.contains("still silent after 60 min"), "{text}");
+        assert!(quiet(&observed, window));
     }
 
     #[test]
