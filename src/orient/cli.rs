@@ -7,7 +7,7 @@ use chrono::{
 use clap::{CommandFactory, Parser, Subcommand};
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use triblespace::core::collection::records::CollectionHandle;
 
 #[path = "callback.rs"]
@@ -153,6 +153,9 @@ enum Command {
         /// Maximum time for each callback, including writing its input
         #[arg(long, default_value = "30s", value_parser = parse_positive_duration)]
         callback_timeout: Duration,
+        /// Trust callback exit 75 as known-not-submitted and retry this report.
+        #[arg(long)]
+        retry_known_not_submitted: bool,
         /// Stop observing after this duration (otherwise run until interrupted)
         #[arg(long, value_parser = parse_positive_duration)]
         run_for: Option<Duration>,
@@ -441,12 +444,19 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             callback,
             callback_args,
             callback_timeout,
+            retry_known_not_submitted,
             run_for,
             poll_ms,
         } => {
             let persona = cli.persona.as_deref().ok_or_else(|| {
                 anyhow!("daemon requires a persona (pass --persona <label-or-hex> or set $PERSONA)")
             })?;
+            let deadline = run_for.map(|duration| Instant::now().checked_add(duration)
+                .ok_or_else(|| anyhow!("Orient run-for deadline is out of range"))).transpose()?;
+            let mut retry = super::delivery::RetryPolicy::new(retry_known_not_submitted, deadline);
+            // Only this daemon sink decorates reports. One ephemeral immutable
+            // buffer survives known-unsent attempts; ordinary CLI/wake is unchanged.
+            let mut pending_report: Option<String> = None;
             let mut deliver = |part| match part {
                 crate::out::Part::Text { text } if text.starts_with("note: ") => {
                     // Maintenance diagnostics are not attention reports and
@@ -456,17 +466,27 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     Ok(())
                 }
                 crate::out::Part::Text { text } => {
-                    callback::deliver(&callback, &callback_args, callback_timeout, &text)
+                    let timeout = retry.attempt_timeout(callback_timeout)?;
+                    if pending_report.is_none() {
+                        pending_report = Some(prepare_daemon_report(&text, crate::clock::now()?)?);
+                    }
+                    let result = retry.observed(callback::deliver(
+                        &callback, &callback_args, timeout, pending_report.as_deref().unwrap()));
+                    if result.is_ok() {
+                        pending_report = None;
+                    }
+                    result
                 }
                 _ => bail!("Orient daemon callback requires a complete text report"),
             };
-            orient.daemon(
+            orient.daemon_until(
                 persona,
                 &WaitOptions {
                     timeout: run_for,
                     poll_interval: Duration::from_millis(poll_ms.max(1)),
                     form: NewsForm::Report,
                 },
+                deadline,
                 &mut crate::out::Out::new(&mut deliver),
             )
         }
@@ -483,9 +503,27 @@ pub fn run() -> Result<()> {
     crate::cli::with_output("orient", |out| execute(cli, out))
 }
 
+fn prepare_daemon_report(text: &str, prepared: hifitime::Epoch) -> Result<String> {
+    let seconds = prepared.to_unix_seconds();
+    if !seconds.is_finite() || seconds < i64::MIN as f64 || seconds > i64::MAX as f64 {
+        bail!("Orient report preparation time is outside the UTC display range");
+    }
+    let stamp = chrono::Utc.timestamp_opt(seconds.floor() as i64, 0).single()
+        .ok_or_else(|| anyhow!("Orient report preparation time is outside the UTC display range"))?;
+    Ok(format!("Orient report prepared at {} UTC; delivery may be delayed.\n\n{text}",
+        stamp.format("%Y-%m-%dT%H:%M:%S")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_report_discloses_preparation_time_without_refreshing_facts() {
+        let report = prepare_daemon_report("frozen health/habit observation\n",
+            hifitime::Epoch::from_unix_seconds(1_700_000_000.0)).unwrap();
+        assert_eq!(report, "Orient report prepared at 2023-11-14T22:13:20 UTC; delivery may be delayed.\n\nfrozen health/habit observation\n");
+    }
 
     #[test]
     fn wait_stream_is_a_flag_that_keeps_an_optional_bound() {
@@ -567,6 +605,7 @@ mod tests {
             callback,
             callback_args,
             callback_timeout,
+            retry_known_not_submitted,
             run_for,
             poll_ms,
         }) = cli.command
@@ -582,6 +621,7 @@ mod tests {
             ]
         );
         assert_eq!(callback_timeout, Duration::from_secs(2));
+        assert!(!retry_known_not_submitted);
         assert_eq!(run_for, Some(Duration::from_secs(60)));
         assert_eq!(poll_ms, 25);
     }
@@ -601,6 +641,14 @@ mod tests {
             ])
             .is_err());
         }
+    }
+
+    #[test]
+    fn daemon_retry_requires_the_explicit_opt_in() {
+        let cli = Cli::try_parse_from(["orient", "--pile", "unused.pile", "daemon",
+            "--callback", "/bin/true", "--retry-known-not-submitted"]).unwrap();
+        assert!(matches!(cli.command,
+            Some(Command::Daemon { retry_known_not_submitted: true, .. })));
     }
 
     #[test]

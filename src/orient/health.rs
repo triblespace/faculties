@@ -227,7 +227,7 @@ impl HealthSources {
 
     /// Health is delivered before any ordinary source or payload acquisition.
     /// An unresolved resident persona leaves the normal resolution path intact.
-    pub(super) fn poll(
+    pub(super) async fn poll(
         &mut self,
         pile: &mut FacultyStore,
         signer: &SigningKey,
@@ -235,11 +235,11 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
-        self.poll_in(pile, signer, input, peek, NewsForm::Report, output)
+        self.poll_in(pile, signer, input, peek, NewsForm::Report, output).await
     }
 
     /// [`Self::poll`], writing any report in `form`.
-    pub(super) fn poll_in(
+    pub(super) async fn poll_in(
         &mut self,
         pile: &mut FacultyStore,
         signer: &SigningKey,
@@ -281,7 +281,8 @@ impl HealthSources {
             "",
             form,
             output,
-        )?;
+            &mut |_, _, _| {},
+        ).await?;
         Ok((fired, report.next_change))
     }
 
@@ -965,6 +966,16 @@ fn render_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl HealthSources {
+        // Synthetic synchronous callers only; production poll remains async.
+        fn poll_test(
+            &mut self, pile: &mut FacultyStore, signer: &SigningKey, input: &str,
+            peek: bool, output: &mut Out<'_>,
+        ) -> Result<(bool, Option<Epoch>)> {
+            test_block_on(self.poll(pile, signer, input, peek, output))
+        }
+    }
     use schema::{Component, Condition, Evidence, Measurement, Recorder, State};
     use triblespace::core::blob::Blob;
     use triblespace::core::collection::{
@@ -1296,7 +1307,7 @@ mod tests {
         };
         let (fired, _) = f
             .sources
-            .poll(
+            .poll_test(
                 &mut f.store,
                 &reader_key,
                 &fmt_id(persona),
@@ -1382,7 +1393,7 @@ mod tests {
         };
         let (fired, _) = f
             .sources
-            .poll(
+            .poll_test(
                 &mut f.store,
                 &f.signer,
                 &fmt_id(persona),
@@ -1421,7 +1432,7 @@ mod tests {
             };
             let (fired, _) = f
                 .sources
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     "unused-quiet-persona",
@@ -1465,7 +1476,7 @@ mod tests {
         };
         assert!(f
             .sources
-            .poll(
+            .poll_test(
                 &mut f.store,
                 &f.signer,
                 "unused-error-persona",
@@ -1505,7 +1516,7 @@ mod tests {
         };
         assert!(
             f.sources
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     &fmt_id(persona),
@@ -1531,7 +1542,7 @@ mod tests {
         };
         assert!(
             f.sources
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     &fmt_id(persona),
@@ -1559,7 +1570,7 @@ mod tests {
         };
         assert!(
             !rearmed
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     &fmt_id(persona),
@@ -1612,7 +1623,7 @@ mod tests {
                 Ok(())
             };
             let (fired, _) = sources
-                .poll(
+                .poll_test(
                     store,
                     &f.signer,
                     &fmt_id(persona),

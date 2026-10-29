@@ -221,6 +221,19 @@ impl Orient {
     /// returns through the ordinary checked storage-close path. A synchronous
     /// output sink must bound its own execution time.
     pub fn daemon(&self, persona: &str, options: &WaitOptions, out: &mut Out<'_>) -> Result<()> {
+        let deadline = options.timeout.map(|duration| Instant::now().checked_add(duration)
+            .ok_or_else(|| anyhow!("Orient run-for deadline is out of range"))).transpose()?;
+        self.daemon_until(persona, options, deadline, out)
+    }
+
+    /// Share one monotonic deadline with the callback, including its backoff.
+    pub(crate) fn daemon_until(
+        &self,
+        persona: &str,
+        options: &WaitOptions,
+        deadline: Option<Instant>,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(async {
                 #[cfg(unix)]
@@ -236,12 +249,19 @@ impl Orient {
                     tokio::signal::ctrl_c().await?;
                     Ok::<(), anyhow::Error>(())
                 };
-                tokio::select! {
+                let result = tokio::select! {
                     result = stop => result,
                     result = cmd_observe(
                         &self.storage, pile, signer, self.storage.path(), Some(persona), options,
-                        self.health_max_age, self.service_events_collection, true, out,
+                        self.health_max_age, self.service_events_collection, true, deadline, out,
                     ) => result,
+                };
+                match result {
+                    Err(error) if error.is::<super::delivery::DeliveryDeadline>() => {
+                        eprintln!("{error}");
+                        Ok(())
+                    }
+                    result => result,
                 }
             })
         })
@@ -3778,7 +3798,7 @@ async fn cmd_show(
             .await?;
         let health = health_sources.observe_acquiring(pile, signer).await?;
         let health_report = health.report_acquiring().await?;
-        write_complete_report(output, &health_report.text, "local swarm health overview")?;
+        write_complete_report(output, &health_report.text, "local swarm health overview", &mut |_| {}).await?;
         if let Some(input) = persona {
             match health.persona_acquiring(pile, input).await {
                 Ok(_) => save_presentations(
@@ -3870,7 +3890,7 @@ async fn cmd_show(
         report.push_str(&window_status);
         report.push_str(quota);
 
-        write_complete_report(output, &report, "Orient overview")?;
+        write_complete_report(output, &report, "Orient overview", &mut |_| {}).await?;
 
         if persona_id.is_some() {
             save_presentations(pile, signer, sources.presentations.source, shown)?;
@@ -4318,13 +4338,16 @@ fn render_news_stream(
     Ok(out)
 }
 
-fn write_complete_report(output: &mut Out<'_>, report: &str, description: &str) -> Result<()> {
+async fn write_complete_report(
+    output: &mut Out<'_>,
+    report: &str,
+    description: &str,
+    on_delivery: &mut dyn FnMut(super::delivery::DeliveryNotice),
+) -> Result<()> {
     // An accepted complete native Part is the delivery boundary. The CLI sink
     // flushes it before returning. A collecting frontend accepts it into its
     // response; this is deliberately not a remote receipt or processing ack.
-    output
-        .text(report)
-        .with_context(|| format!("deliver complete {description}"))
+    super::delivery::complete_report(output, report, description, on_delivery).await
 }
 
 fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
@@ -4391,7 +4414,7 @@ fn commit_habit_receipts(
     Ok(())
 }
 
-fn apply_prepared_news(
+async fn apply_prepared_news(
     pile: &mut FacultyStore,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
@@ -4400,6 +4423,7 @@ fn apply_prepared_news(
     prefix: &str,
     form: NewsForm,
     output: &mut Out<'_>,
+    on_delivery: &mut dyn FnMut(&mut FacultyStore, &SigningKey, super::delivery::DeliveryNotice),
 ) -> Result<()> {
     match prepared {
         News::Report {
@@ -4413,26 +4437,28 @@ fn apply_prepared_news(
             };
             // Do not deliver consuming news that this principal cannot record.
             // Target production authority is independent and may be remote.
-            let receipt = if !peek && !events.is_empty() {
-                Some((
-                    presentation_collection_for_write(pile, signer, collection)?,
-                    orient_model::receipt_fragment(events.iter().copied(), clock::point_now()?),
-                ))
+            let receipt_collection = if !peek && !events.is_empty() {
+                Some(presentation_collection_for_write(pile, signer, collection)?)
             } else {
                 None
             };
             let mut complete = String::with_capacity(prefix.len() + text.len());
             complete.push_str(prefix);
             complete.push_str(text);
-            write_complete_report(output, &complete, "Orient news report")?;
-            if let Some((collection, fragment)) = receipt {
+            write_complete_report(output, &complete, "Orient news report",
+                &mut |notice| on_delivery(pile, signer, notice)).await?;
+            if let Some(collection) = receipt_collection {
+                // Observation bytes stay frozen; Presented time is after the
+                // accepted output. A failed receipt commit never replays here.
+                let fragment = orient_model::receipt_fragment(events.iter().copied(), clock::point_now()?);
                 pile.commit(collection, signer, fragment)
                     .map_err(|error| anyhow!("commit Orient presentation facts: {error}"))?;
             }
         }
         News::Quiet => {
             if !prefix.is_empty() {
-                write_complete_report(output, prefix, "Orient habit report")?;
+                write_complete_report(output, prefix, "Orient habit report",
+                    &mut |notice| on_delivery(pile, signer, notice)).await?;
             }
         }
     }
@@ -4460,7 +4486,7 @@ async fn cmd_poll(
             .await?
             .with_service_events(pile, signer, service_events_collection)
             .await?;
-        if health.poll(pile, signer, input, peek, output)?.0 {
+        if health.poll(pile, signer, input, peek, output).await?.0 {
             return Ok(());
         }
         let sources = OrientSources::open(routing, pile, signer, false).await?;
@@ -4497,8 +4523,7 @@ async fn cmd_poll(
             &news,
             "",
             NewsForm::Report,
-            output,
-        )?;
+            output, &mut |_, _, _| {}).await?;
         Ok(())
     }
     .await
@@ -4988,6 +5013,7 @@ async fn cmd_wait(
         health_max_age,
         service_events_collection,
         false,
+        None,
         output,
     )
     .await
@@ -5006,12 +5032,13 @@ async fn cmd_observe(
     health_max_age: Duration,
     service_events_collection: Option<CollectionHandle>,
     continuous: bool,
+    deadline: Option<Instant>,
     output: &mut Out<'_>,
 ) -> Result<()> {
     let Some(persona_input) = persona else {
         bail!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
-    let timeout = options.timeout;
+    let timeout = deadline.map(|end| end.saturating_duration_since(Instant::now())).or(options.timeout);
     let form = options.form;
     let result: Result<WaitOutcome> = async {
         let mut health = HealthSources::open(routing, pile, signer, health_max_age)
@@ -5020,7 +5047,8 @@ async fn cmd_observe(
             .await?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
-        let timeout_at = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+        let timeout_at = deadline.map(tokio::time::Instant::from_std)
+            .or_else(|| timeout.map(|timeout| tokio::time::Instant::now() + timeout));
         let mut view_pending;
         let mut next_health_change;
         let mut pending_frame: Option<PendingWaitFrame> = None;
@@ -5035,7 +5063,7 @@ async fn cmd_observe(
 
         let sources = loop {
             let (fired, deadline) =
-                health.poll_in(pile, signer, persona_input, false, form, output)?;
+                health.poll_in(pile, signer, persona_input, false, form, output).await?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -5058,7 +5086,7 @@ async fn cmd_observe(
         // watermark, including while their lazy payload reads are pending.
         let initial = loop {
             let (fired, deadline) =
-                health.poll_in(pile, signer, persona_input, false, form, output)?;
+                health.poll_in(pile, signer, persona_input, false, form, output).await?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -5182,8 +5210,7 @@ async fn cmd_observe(
                                 write_complete_report(
                                     output,
                                     due_report.form(form),
-                                    "Orient habit report",
-                                )?;
+                                    "Orient habit report", &mut |_| {}).await?;
                                 commit_habit_receipts(
                                     pile,
                                     signer,
@@ -5249,7 +5276,7 @@ async fn cmd_observe(
                 last_pending_sweep = Instant::now();
                 if !habit_report.is_empty() {
                     // A habit-only report acknowledges no news.
-                    write_complete_report(output, habit_report.form(form), "Orient habit report")?;
+                    write_complete_report(output, habit_report.form(form), "Orient habit report", &mut |_| {}).await?;
                     commit_habit_receipts(
                         pile,
                         signer,
@@ -5329,8 +5356,7 @@ async fn cmd_observe(
             &news,
             arm_report.form(form),
             form,
-            output,
-        )?;
+            output, &mut |_, _, _| {}).await?;
         commit_habit_receipts(pile, signer, sources.presentations.source, &arm_due_events)?;
         if (initial_report || arm_fired) && !continuous {
             return Ok(WaitOutcome {
@@ -5357,7 +5383,7 @@ async fn cmd_observe(
             });
             tokio::time::sleep(sleep).await;
             let (fired, deadline) =
-                health.poll_in(pile, signer, persona_input, false, form, output)?;
+                health.poll_in(pile, signer, persona_input, false, form, output).await?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -5460,8 +5486,7 @@ async fn cmd_observe(
                             &candidate.news,
                             habit_report.form(form),
                             form,
-                            output,
-                        )?;
+                            output, &mut |_, _, _| {}).await?;
                         commit_habit_receipts(
                             pile,
                             signer,
@@ -5544,7 +5569,7 @@ async fn cmd_observe(
             .unwrap_or_default();
             let habit_fired = !habit_report.is_empty();
             if habit_fired {
-                write_complete_report(output, habit_report.form(form), "Orient habit report")?;
+                write_complete_report(output, habit_report.form(form), "Orient habit report", &mut |_| {}).await?;
                 commit_habit_receipts(pile, signer, sources.presentations.source, &due_events)?;
             }
             habit_seen = current_habits;
@@ -5722,7 +5747,7 @@ async fn cmd_wake(
         report.push('\n');
         report.push_str(&goals);
 
-        write_complete_report(output, &report, "Orient wake report")?;
+        write_complete_report(output, &report, "Orient wake report", &mut |_| {}).await?;
         if !cover.diagnostics.is_empty() {
             output.line(format!(
                 "Memory diagnostics (outside the charged cover text):\n{}",
@@ -5950,7 +5975,7 @@ mod tests {
             writer.flush()?;
             Ok(())
         };
-        write_complete_report(&mut Out::new(&mut emit), report, description)
+        pollster::block_on(write_complete_report(&mut Out::new(&mut emit), report, description, &mut |_| {}))
     }
     fn apply_news_to_writer(
         pile: &mut FacultyStore,
@@ -5970,7 +5995,7 @@ mod tests {
             Ok(())
         };
         let collection = ReceiptSource::register(pile, signer)?.source;
-        apply_prepared_news(
+        pollster::block_on(apply_prepared_news(
             pile,
             signer,
             collection,
@@ -5978,8 +6003,7 @@ mod tests {
             news,
             prefix,
             NewsForm::Report,
-            &mut Out::new(&mut emit),
-        )
+            &mut Out::new(&mut emit), &mut |_, _, _| {}))
     }
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
@@ -6098,8 +6122,7 @@ mod tests {
                 },
                 "",
                 NewsForm::Report,
-                &mut Out::new(&mut |_| Ok(())),
-            )
+                &mut Out::new(&mut |_| Ok(())), &mut |_, _, _| {}).await
             .unwrap();
             let snapshot = pile.snapshot().unwrap();
             assert!(snapshot
@@ -7669,6 +7692,7 @@ mod tests {
                     Duration::from_secs(180),
                     None,
                     true,
+                    None,
                     &mut Out::new(&mut emit),
                 ),
             )
@@ -9128,6 +9152,67 @@ mod tests {
         let mut writer = Writer::default();
         write_report_to_writer(&mut writer, "complete", "test report").unwrap();
         assert!(writer.flushed);
+    }
+
+    #[test]
+    fn presented_timestamp_follows_acceptance_and_observer_uses_owned_store() {
+        use super::super::delivery::DeliveryNotice;
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = ReceiptSource::register(&mut pile, &fixture.signer).unwrap().source;
+        let event = id(4);
+        let news = News::Report {
+            text: "frozen report\n".to_owned(), stream: "frozen report\n".to_owned(),
+            events: vec![event],
+        };
+        let accepted_at = std::cell::Cell::new(0i128);
+        let mut notices = Vec::new();
+        let mut emit = |_| {
+            std::thread::sleep(Duration::from_millis(2));
+            accepted_at.set(clock::tai_nanoseconds_now()?);
+            Ok(())
+        };
+        pollster::block_on(apply_prepared_news(
+            &mut pile, &fixture.signer, collection, false, &news, "", NewsForm::Report,
+            &mut Out::new(&mut emit), &mut |owned, signer, notice| {
+                assert!(stored_presentations(owned, signer, id(3)).is_empty());
+                notices.push(notice);
+            },
+        )).unwrap();
+        assert_eq!(notices, [DeliveryNotice::Accepted]);
+        let snapshot = pile.snapshot().unwrap();
+        let facts = snapshot.collection(collection).unwrap().view::<TribleSet>().unwrap();
+        let stamps: Vec<IntervalValue> = find!(
+            at: IntervalValue,
+            pattern!(&facts, [{ presentation::event: &event, metadata::created_at: ?at }])
+        ).collect();
+        assert_eq!(stamps.len(), 1);
+        assert!(interval_key(stamps[0]) >= accepted_at.get());
+        drop(facts);
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn deadline_with_pending_report_has_no_presented_receipt_or_acceptance() {
+        use super::super::delivery::{DeliveryDeadline, DeliveryNotice, KnownNotSubmitted, RetryPolicy};
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = ReceiptSource::register(&mut pile, &fixture.signer).unwrap().source;
+        let news = News::Report {
+            text: "fixed\n".to_owned(), stream: "fixed\n".to_owned(), events: vec![id(4)],
+        };
+        let mut notices = Vec::new();
+        let mut emit = |_| RetryPolicy::new(true, Some(Instant::now() + Duration::from_millis(5)))
+            .observed(Err(KnownNotSubmitted.into()));
+        let error = runtime().unwrap().block_on(apply_prepared_news(
+            &mut pile, &fixture.signer, collection, false, &news, "", NewsForm::Report,
+            &mut Out::new(&mut emit), &mut |_, _, notice| notices.push(notice),
+        )).unwrap_err();
+        assert!(error.is::<DeliveryDeadline>());
+        assert!(matches!(notices.as_slice(), [DeliveryNotice::Retry(_)]));
+        assert!(stored_presentations(&mut pile, &fixture.signer, id(3)).is_empty());
+        pile.close().unwrap();
     }
 
     #[test]

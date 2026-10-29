@@ -16,6 +16,9 @@ use triblespace::prelude::*;
 use crate::schemas::orient::{presentation, KIND_PRESENTED};
 
 pub mod cli;
+pub mod delivery;
+#[cfg(all(test, unix))]
+mod process_tests;
 pub mod mcp;
 mod operations;
 pub use operations::{BaselineReceipt, NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions};
