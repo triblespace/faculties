@@ -155,8 +155,14 @@ impl Archive {
     pub fn show(&self, prefix: &str, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| run_show(storage, prefix, out))
     }
-    pub fn thread(&self, prefix: &str, limit: usize, out: &mut Out<'_>) -> Result<()> {
-        self.with_operation(|storage| run_thread(storage, prefix, limit, out))
+    pub fn thread(
+        &self,
+        prefix: &str,
+        limit: usize,
+        tail: Option<usize>,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        self.with_operation(|storage| run_thread(storage, prefix, limit, tail, out))
     }
     pub fn search(&self, text: &str, limit: usize, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| run_search(storage, text, limit, out))
@@ -1104,14 +1110,7 @@ fn load_thread(facts: &FactArchive, prefix: &str, limit: usize) -> Result<Vec<Id
     if limit == 0 {
         bail!("thread limit must be at least 1");
     }
-    let mut pending: BTreeSet<_> = match resolve_in(facts, prefix)? {
-        Named::Projection(leaf) => find!(
-            block: Id,
-            pattern!(facts, [{ leaf @ archive_schema::source_projection::projects_to: ?block }])
-        )
-        .collect(),
-        Named::Block(block) => BTreeSet::from([block]),
-    };
+    let mut pending = thread_starts(facts, prefix)?;
     let mut parents = BTreeMap::<Id, BTreeSet<Id>>::new();
     while let Some(block) = pending.pop_first() {
         if parents.contains_key(&block) {
@@ -1128,13 +1127,41 @@ fn load_thread(facts: &FactArchive, prefix: &str, limit: usize) -> Result<Vec<Id
         pending.extend(previous.iter().copied());
         parents.insert(block, previous);
     }
+    reading_order(&parents)
+}
+
+/// The nodes a thread starts from: those a projection projects to, or the
+/// node itself.
+fn thread_starts(facts: &FactArchive, prefix: &str) -> Result<BTreeSet<Id>> {
+    Ok(match resolve_in(facts, prefix)? {
+        Named::Projection(leaf) => find!(
+            block: Id,
+            pattern!(facts, [{ leaf @ archive_schema::source_projection::projects_to: ?block }])
+        )
+        .collect(),
+        Named::Block(block) => BTreeSet::from([block]),
+    })
+}
+
+/// Roots first: every node after all of its parents that are in `parents`,
+/// ties by id. A parent outside the map (beyond a tail) is not waited for.
+fn reading_order(parents: &BTreeMap<Id, BTreeSet<Id>>) -> Result<Vec<Id>> {
     let mut indegree: BTreeMap<Id, usize> = parents
         .iter()
-        .map(|(block, previous)| (*block, previous.len()))
+        .map(|(block, previous)| {
+            let present = previous
+                .iter()
+                .filter(|parent| parents.contains_key(*parent))
+                .count();
+            (*block, present)
+        })
         .collect();
     let mut children = BTreeMap::<Id, BTreeSet<Id>>::new();
-    for (block, previous) in &parents {
-        for parent in previous {
+    for (block, previous) in parents {
+        for parent in previous
+            .iter()
+            .filter(|parent| parents.contains_key(*parent))
+        {
             children.entry(*parent).or_default().insert(*block);
         }
     }
@@ -1159,6 +1186,68 @@ fn load_thread(facts: &FactArchive, prefix: &str, limit: usize) -> Result<Vec<Id
         bail!("Archive thread contains a block cycle");
     }
     Ok(ordered)
+}
+
+/// The newest nodes of a thread, as `thread --tail` shows them.
+#[derive(Debug)]
+struct Tail {
+    /// Reading order, roots first.
+    blocks: Vec<Id>,
+    /// Ancestors known to exist: those taken, and those reached but left out.
+    at_least: usize,
+    /// Whether the tail is the whole ancestry.
+    complete: bool,
+}
+
+/// The `tail` nodes of a thread the fewest steps back from its start.
+///
+/// The walk is breadth-first along `previous`, one step at a time, ids in
+/// order within a step, and it stops once `tail` nodes are taken: it reads
+/// the parents of at most `tail` nodes, never the whole ancestry. On a
+/// single chain that is exactly the full thread's last `tail` nodes. Across
+/// a fork it is a definition: an old node reached in few steps along a short
+/// branch is taken before newer nodes many steps back along a long one. The
+/// last `tail` nodes of the full reading order could not be known without
+/// walking every ancestor, since a node reads only after all of its
+/// descendants in the thread.
+fn thread_tail(facts: &FactArchive, starts: BTreeSet<Id>, tail: usize) -> Result<Tail> {
+    if tail == 0 {
+        bail!("thread tail must be at least 1");
+    }
+    let mut parents = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut step = starts.clone();
+    'walk: while !step.is_empty() {
+        let mut next = BTreeSet::new();
+        for block in step {
+            if parents.contains_key(&block) {
+                continue;
+            }
+            if parents.len() == tail {
+                break 'walk;
+            }
+            let previous: BTreeSet<_> = find!(
+                previous: Id,
+                pattern!(facts, [{ block @ archive_schema::block::previous: ?previous }])
+            )
+            .collect();
+            next.extend(previous.iter().copied());
+            parents.insert(block, previous);
+        }
+        step = next;
+    }
+    // Nodes reached but not taken: parents of taken nodes, and starts.
+    let left_out: BTreeSet<Id> = parents
+        .values()
+        .flatten()
+        .chain(starts.iter())
+        .filter(|block| !parents.contains_key(*block))
+        .copied()
+        .collect();
+    Ok(Tail {
+        blocks: reading_order(&parents)?,
+        at_least: parents.len() + left_out.len(),
+        complete: left_out.is_empty(),
+    })
 }
 
 fn render_block(
@@ -1231,11 +1320,29 @@ fn run_thread(
     storage: ArchiveStorage<'_>,
     prefix: &str,
     limit: usize,
+    tail: Option<usize>,
     out: &mut Out<'_>,
 ) -> Result<()> {
     let observed = storage.load()?;
     let facts = crate::storage::acquire_attached_facts(&observed)?;
-    for (index, block) in load_thread(&facts, prefix, limit)?.into_iter().enumerate() {
+    let blocks = match tail {
+        None => load_thread(&facts, prefix, limit)?,
+        Some(tail) => {
+            let tail = thread_tail(&facts, thread_starts(&facts, prefix)?, tail)?;
+            out.line(if tail.complete {
+                format!("thread: all {} ancestor block(s)", tail.blocks.len())
+            } else {
+                format!(
+                    "thread: the last {} of at least {} ancestor block(s); older ancestors exist",
+                    tail.blocks.len(),
+                    tail.at_least
+                )
+            })?;
+            out.line("---")?;
+            tail.blocks
+        }
+    };
+    for (index, block) in blocks.into_iter().enumerate() {
         if index != 0 {
             out.line(format!("---"))?;
         }
@@ -2547,7 +2654,7 @@ mod tests {
         let (block, receipts) = (words[1], words[3]);
         assert_eq!(words[2], "receipt", "{hit}");
 
-        let thread = printed(|out| run_thread(storage(&fixture), block, 10, out)).unwrap();
+        let thread = printed(|out| run_thread(storage(&fixture), block, 10, None, out)).unwrap();
         assert_eq!(thread.matches("block: ").count(), 2, "{thread}");
         assert!(
             thread.contains("alpha"),
@@ -2562,7 +2669,7 @@ mod tests {
         let receipts: Vec<&str> = receipts.split(',').collect();
         assert_eq!(receipts.len(), 1, "{hit}");
         let by_receipt =
-            printed(|out| run_thread(storage(&fixture), receipts[0], 10, out)).unwrap();
+            printed(|out| run_thread(storage(&fixture), receipts[0], 10, None, out)).unwrap();
         assert_eq!(thread, by_receipt, "a node's thread is its receipt's");
     }
 
@@ -2611,6 +2718,150 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("no fork is hidden"));
+    }
+
+    /// A tail is the nodes the fewest steps back from the start. Across a
+    /// fork that is a definition, not a reading-order suffix: here the root
+    /// is two steps back along the short branch and four along the long one,
+    /// so it enters the tail before the long branch's older nodes.
+    #[test]
+    fn a_thread_tail_takes_the_fewest_steps_back_across_a_fork() {
+        use triblespace::core::blob::encodings::succinctarchive::{SuccinctArchive, UnionArchive};
+        use triblespace::core::trible::TribleSet;
+        use triblespace::prelude::{entity, fucid};
+
+        let mut facts = TribleSet::new();
+        let mut node = |parents: Vec<Id>| -> Id {
+            let block = fucid();
+            facts += entity! { &block @
+                metadata::tag: &archive_schema::block::KIND,
+                archive_schema::block::previous*: parents,
+            }
+            .into_facts();
+            block.id
+        };
+        // start -> {a, x}; a -> b -> c -> root; x -> root.
+        let root = node(vec![]);
+        let c = node(vec![root]);
+        let b = node(vec![c]);
+        let a = node(vec![b]);
+        let x = node(vec![root]);
+        let start = node(vec![a, x]);
+        let facts: FactArchive = UnionArchive::new(vec![SuccinctArchive::from(&facts)]);
+        let tail = |n: usize| thread_tail(&facts, BTreeSet::from([start]), n).unwrap();
+        let set = |blocks: &[Id]| blocks.iter().copied().collect::<BTreeSet<_>>();
+        // Reading order: every node after its parents that are shown.
+        let in_order = |blocks: &[Id]| {
+            let at = |id: Id| blocks.iter().position(|block| *block == id);
+            for (child, parents) in [
+                (start, vec![a, x]),
+                (a, vec![b]),
+                (b, vec![c]),
+                (c, vec![root]),
+                (x, vec![root]),
+            ] {
+                for parent in parents {
+                    if let (Some(child), Some(parent)) = (at(child), at(parent)) {
+                        assert!(parent < child, "{blocks:?}");
+                    }
+                }
+            }
+            assert_eq!(blocks.last(), Some(&start), "the start reads last");
+        };
+
+        let three = tail(3);
+        assert_eq!(set(&three.blocks), BTreeSet::from([start, a, x]));
+        in_order(&three.blocks);
+        assert!(!three.complete);
+        assert_eq!(three.at_least, 5, "b and root were reached and left out");
+
+        // Two steps back are b and root; one slot is left, taken by id.
+        let four = tail(4);
+        assert_eq!(
+            set(&four.blocks),
+            BTreeSet::from([start, a, x, b.min(root)])
+        );
+        in_order(&four.blocks);
+
+        let five = tail(5);
+        assert_eq!(set(&five.blocks), BTreeSet::from([start, a, x, b, root]));
+        in_order(&five.blocks);
+        assert!(!five.complete);
+        assert_eq!(five.at_least, 6, "c is older and exists");
+
+        for n in [6, 7, 100] {
+            let all = tail(n);
+            assert!(all.complete, "{n}");
+            assert_eq!(all.at_least, 6);
+            assert_eq!(set(&all.blocks).len(), 6);
+            in_order(&all.blocks);
+        }
+        assert!(thread_tail(&facts, BTreeSet::from([start]), 0).is_err());
+    }
+
+    /// A session longer than --limit: the full thread refuses, and a tail
+    /// reads as the full thread's last nodes, whatever the limit.
+    #[test]
+    fn a_thread_tail_reads_a_session_longer_than_the_limit() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("long.jsonl");
+        let mut lines = String::new();
+        for index in 0..120 {
+            let parent = if index == 0 {
+                String::new()
+            } else {
+                format!(r#","parentUuid":"m{}""#, index - 1)
+            };
+            lines.push_str(&format!(
+                r#"{{"type":"user","sessionId":"long","uuid":"m{index}"{parent},"timestamp":"2026-03-01T15:{:02}:{:02}Z","message":{{"role":"user","content":"line {index} of the long session"}}}}"#,
+                index / 60,
+                index % 60
+            ));
+            lines.push('\n');
+        }
+        fs::write(&source, lines).unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        let archive = storage(&fixture).load().unwrap();
+        let facts = archive.facts().unwrap();
+        let last = projection_ids(&facts)
+            .into_iter()
+            .find(|id| {
+                render_projection_summary(&facts, archive.snapshot(), *id)
+                    .unwrap()
+                    .contains("line 119 of")
+            })
+            .unwrap();
+        drop(facts);
+        drop(archive);
+        let last = format!("{last:X}");
+        let thread = |limit: usize, tail: Option<usize>| {
+            printed(|out| run_thread(storage(&fixture), &last, limit, tail, out))
+        };
+
+        let refused = thread(100, None).unwrap_err().to_string();
+        assert!(refused.contains("no fork is hidden"), "{refused}");
+        let full = thread(1000, None).unwrap();
+        let nodes: Vec<&str> = full.split("---\n").collect();
+        assert_eq!(nodes.len(), 120);
+
+        let five = thread(100, Some(5)).unwrap();
+        let (header, body) = five.split_once("---\n").unwrap();
+        assert_eq!(
+            header,
+            "thread: the last 5 of at least 6 ancestor block(s); older ancestors exist\n"
+        );
+        assert_eq!(
+            body,
+            nodes[115..].join("---\n"),
+            "the full thread's last five"
+        );
+        assert!(body.contains("line 119 of") && !body.contains("line 114 of"));
+
+        // A tail past the limit, and past the session, is the whole thread.
+        let all = thread(100, Some(200)).unwrap();
+        let (header, body) = all.split_once("---\n").unwrap();
+        assert_eq!(header, "thread: all 120 ancestor block(s)\n");
+        assert_eq!(body, full);
     }
 
     /// The listing as it was before it read times newest first: every

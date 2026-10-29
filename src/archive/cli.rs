@@ -129,6 +129,11 @@ pub(super) enum Command {
         /// silently hiding one fork.
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        /// Show only the newest N ancestors instead: those the fewest steps
+        /// back from the start (ties by id), in reading order. The walk stops
+        /// after N, so --limit does not apply.
+        #[arg(long)]
+        tail: Option<usize>,
     },
     /// Search canonical block text through an exact portable BM25 cover.
     Search {
@@ -402,7 +407,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         }
         Command::List { limit } => archive.list(limit, out),
         Command::Show { id } => archive.show(&id, out),
-        Command::Thread { id, limit } => archive.thread(&id, limit, out),
+        Command::Thread { id, limit, tail } => archive.thread(&id, limit, tail, out),
         Command::Search { text, limit } => {
             archive.search(&crate::text_arg(&text, "search text")?, limit, out)
         }
