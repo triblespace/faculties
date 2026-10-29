@@ -10,7 +10,9 @@
 //! the join is asked for again after a new session, when the bot is taken out
 //! of the channel, when the driver loses its connection and does not get it
 //! back once handed it again, and whenever a join is not confirmed by a
-//! working voice connection. No serenity: nothing here needs a cache,
+//! working voice connection. When the details the driver connects with stop
+//! working while the bot is still in the channel, the bot leaves the channel
+//! and joins it again, for new ones. No serenity: nothing here needs a cache,
 //! commands or events beyond those.
 //!
 //! `discord say` publishes a say request into the discord collection; the
@@ -279,13 +281,26 @@ async fn run(
                     }
                 }
             }
-            Some(reason) = losses.recv() => {
+            Some((reason, gone)) = losses.recv() => {
                 eprintln!("[discord] the voice connection dropped ({reason})");
-                if let Some(again) = link.lost(Instant::now()) {
+                let again = if gone {
+                    link.invalid(Instant::now())
+                } else {
+                    link.lost(Instant::now())
+                };
+                if let Some(again) = again {
                     hand(again).await;
                 }
             }
             _ = ticker.tick() => {
+                if link.leave(Instant::now()) {
+                    eprintln!(
+                        "[discord] the voice connection is stale; leaving voice channel {channel} \
+                         to join it again with a new voice session"
+                    );
+                    let _ = commands.send(gateway::voice_state(guild, None));
+                    continue;
+                }
                 let (join, again) = link.tick(Instant::now());
                 if join {
                     let _ = commands.send(gateway::voice_state(guild, Some(channel)));
@@ -345,8 +360,16 @@ fn voice_driver(
 /// A join the gateway is asked for again hands the driver the last
 /// connection again too, as songbird's own `Call` does for the channel it is
 /// in, since Discord need not answer a join to the channel the bot is
-/// already in. The bot leaving the channel or the voice server going away
-/// ends that connection: nothing is handed again until a new one comes.
+/// already in. That holds only while the connection can still work. One
+/// that failed two attempts in a row, or was lost because Discord no longer
+/// knows its voice session or server, is stale: handed again, it would be
+/// dialled for as long as Discord keeps the bot in the channel (for four
+/// hours on 2026-10-29, every attempt failing to resolve the host of an
+/// endpoint that no longer existed). A stale connection is dropped, and each
+/// join until a new connection comes leaves the channel first, so that
+/// Discord ends the voice session and answers the join with a new session
+/// and server. The bot leaving the channel or the voice server going away
+/// ends a connection too: nothing is handed again until a new one comes.
 /// songbird 0.6.0 cannot call off a reconnect it has under way when the
 /// driver is told to leave; a connection it makes to a server that went away
 /// is not counted as working, and the new server's connection replaces it.
@@ -368,6 +391,15 @@ struct Link {
     /// reports meanwhile are of the server that went away, and do not bring
     /// the join forward.
     reallocating: bool,
+    /// The last connection failed its newest attempt: one more failure in
+    /// a row and it is stale.
+    failed: bool,
+    /// The last connection went stale and no new one has come, while the
+    /// bot is in the channel as far as Discord is concerned: each join
+    /// leaves the channel first.
+    rejoining: bool,
+    /// A rejoin's leave went out and its join has not yet.
+    leaving: bool,
 }
 
 impl Link {
@@ -379,6 +411,9 @@ impl Link {
             attempt: 0,
             info: None,
             reallocating: false,
+            failed: false,
+            rejoining: false,
+            leaving: false,
         }
     }
 
@@ -400,6 +435,9 @@ impl Link {
             self.down();
         }
         self.reallocating = false;
+        self.failed = false;
+        self.rejoining = false;
+        self.leaving = false;
         self.info = Some(info.clone());
         self.attempt += 1;
         (self.attempt, info)
@@ -434,10 +472,41 @@ impl Link {
     }
 
     /// The bot is out of the channel: its connection is over, and a join is
-    /// asked for soon.
+    /// asked for soon. During a rejoin (most often, this is the answer to its
+    /// leave) a join is due already, and it no longer needs to leave first.
     fn left(&mut self, now: Instant) {
         self.over();
         self.reallocating = false;
+        self.leaving = false;
+        if !std::mem::take(&mut self.rejoining) {
+            self.join.soon(now);
+        }
+    }
+
+    /// The driver lost its connection because Discord no longer knows its
+    /// voice session or server (see [`session_gone`]): a loss, after which
+    /// the connection is stale on its first failure. Handed again at once,
+    /// it is answered at once if what was lost is an older connection the
+    /// driver was still reconnecting to (see [`Link::lost`]), and fails
+    /// otherwise; with the backoff running, it is stale at once.
+    fn invalid(&mut self, now: Instant) -> Option<(u64, ConnectionInfo)> {
+        let again = self.lost(now);
+        if again.is_some() {
+            self.failed = true;
+        } else if self.info.is_some() {
+            self.stale(now);
+        }
+        again
+    }
+
+    /// The last connection is stale: it is never handed again, every
+    /// attempt in flight is outdated, and after the current backoff the
+    /// channel is left and joined again.
+    fn stale(&mut self, now: Instant) {
+        self.info = None;
+        self.failed = false;
+        self.attempt += 1;
+        self.rejoining = true;
         self.join.soon(now);
     }
 
@@ -457,27 +526,50 @@ impl Link {
     }
 
     /// A connection attempt's result, which counts (the return) only for the
-    /// newest attempt.
+    /// newest attempt. A connection whose second attempt in a row failed is
+    /// stale.
     fn result(&mut self, attempt: u64, connected: bool, now: Instant) -> bool {
         if attempt != self.attempt {
             return false;
         }
         if connected {
+            self.failed = false;
             self.connected.send_replace(true);
             self.join.confirmed(now);
         } else {
             self.down();
-            self.join.soon(now);
+            if std::mem::replace(&mut self.failed, true) {
+                self.stale(now);
+            } else {
+                self.join.soon(now);
+            }
         }
         true
     }
 
+    /// Whether to ask the gateway to leave the channel now: a rejoin's join
+    /// is due, and its leave has not gone out. The join follows with a later
+    /// tick, not with the leave: the gateway sends only the newest of the
+    /// voice state updates it holds at once.
+    fn leave(&mut self, now: Instant) -> bool {
+        if !self.rejoining || self.leaving || self.join.due.is_none_or(|due| now < due) {
+            return false;
+        }
+        self.leaving = true;
+        true
+    }
+
     /// Whether to ask the gateway to join now, and the last connection to
-    /// hand the driver again with it.
+    /// hand the driver again with it, while there is one. During a rejoin,
+    /// a join goes out only after its leave.
     fn tick(&mut self, now: Instant) -> (bool, Option<(u64, ConnectionInfo)>) {
+        if self.rejoining && !self.leaving {
+            return (false, None);
+        }
         if !self.join.take(now, self.connected()) {
             return (false, None);
         }
+        self.leaving = false;
         (true, self.again())
     }
 }
@@ -686,7 +778,9 @@ impl VoiceJoin {
 /// heard, and a connection it lost is reported to the voice task.
 #[derive(Clone)]
 struct VoiceEvents {
-    lost: mpsc::UnboundedSender<String>,
+    /// Each loss: what the driver said, and whether Discord no longer knows
+    /// the connection's voice session or server.
+    lost: mpsc::UnboundedSender<(String, bool)>,
     interruptions: Arc<AtomicU64>,
 }
 
@@ -705,9 +799,10 @@ impl songbird::EventHandler for VoiceEvents {
                     Some(songbird::events::context_data::DisconnectReason::Requested)
                 );
                 if is_loss(data.kind, requested) {
-                    let _ = self
-                        .lost
-                        .send(format!("{:?}: {:?}", data.kind, data.reason));
+                    let _ = self.lost.send((
+                        format!("{:?}: {:?}", data.kind, data.reason),
+                        session_gone(data.reason),
+                    ));
                 }
             }
             _ => {}
@@ -722,6 +817,23 @@ impl songbird::EventHandler for VoiceEvents {
 /// and handing it again on its failure would retry it forever.
 fn is_loss(kind: songbird::events::context_data::DisconnectKind, requested: bool) -> bool {
     !requested && kind != songbird::events::context_data::DisconnectKind::Connect
+}
+
+/// Whether a driver disconnect says that Discord no longer knows the voice
+/// session (close code 4006) or the voice server (4011) the connection was
+/// made with: connecting with the same details cannot work again, and the
+/// bot, in the channel as far as Discord is concerned, needs a new voice
+/// session and server. A voice server that crashed (4015) or a session that
+/// timed out (4009) can be resumed, and are ordinary losses.
+fn session_gone(reason: Option<songbird::events::context_data::DisconnectReason>) -> bool {
+    use songbird::events::context_data::DisconnectReason;
+    use songbird::model::CloseCode;
+    matches!(
+        reason,
+        Some(DisconnectReason::WsClosed(Some(
+            CloseCode::SessionInvalid | CloseCode::ServerNotFound
+        )))
+    )
 }
 
 /// What the speaker needs of the voice connection: the driver, whether it
@@ -1892,6 +2004,163 @@ mod tests {
             assert!(link.join.due.is_none());
             assert_eq!(link.tick(at(server + 600)), (false, None));
         }
+    }
+
+    /// A connection whose voice server no longer exists: the driver lost it
+    /// and every attempt with it fails (the endpoint's host does not
+    /// resolve), while Discord, which still has the bot in the channel,
+    /// answers a join to that channel with nothing. Handed again at once and
+    /// with the next join, it fails twice, and is then never handed again:
+    /// the joins leave the channel first, backing off, until Discord answers
+    /// with a new voice session and server.
+    #[test]
+    fn a_connection_that_keeps_failing_is_dropped_and_the_channel_left_and_joined_again() {
+        let (sender, connected) = watch::channel(false);
+        let mut link = Link::new(sender, Arc::default());
+        let mut at = Instant::now();
+        let stale = connection("t1", "gone.example:443");
+        let (attempt, _) = link.connect(stale.clone());
+        assert!(link.result(attempt, true, at));
+        at += JOIN_CONFIRM;
+        let (again, handed) = link.lost(at).expect("handed again at once");
+        assert_eq!(handed, stale);
+        at += Duration::from_secs(1);
+        assert!(link.result(again, false, at));
+        assert!(!link.rejoining, "one failure is not yet a rejoin");
+        let due = link.join.due.expect("a join is due");
+        assert!(!link.leave(due));
+        let (join, again) = link.tick(due);
+        assert!(join);
+        let (again, handed) = again.expect("the last connection, once more");
+        assert_eq!(handed, stale);
+        assert!(!link.rejoining);
+        at = due + Duration::from_secs(1);
+        assert!(link.result(again, false, at));
+        assert!(link.rejoining, "the next join leaves first");
+        assert!(link.again().is_none(), "the stale connection is dropped");
+        let mut last = at;
+        for _ in 0..4 {
+            let due = link.join.due.expect("a join is due");
+            assert!(due > last);
+            assert!(!link.leave(due - Duration::from_millis(1)));
+            assert_eq!(link.tick(due), (false, None), "no join before the leave");
+            assert!(link.leave(due), "the channel is left first");
+            assert!(!link.leave(due), "once");
+            // The join goes out with a later tick, apart from the leave: the
+            // gateway sends only the newest voice state update it holds.
+            let then = due + Duration::from_secs(1);
+            assert_eq!(link.tick(then), (true, None), "then joined, nothing handed");
+            assert!(link.rejoining, "unanswered, the next join leaves too");
+            last = then;
+        }
+        assert!(!*connected.borrow());
+    }
+
+    /// The answer to a rejoin: the bot's own voice state out of the channel
+    /// (the leave), then a voice state in it and a new voice server (the
+    /// join). The leave's answer neither brings another join forward nor
+    /// keeps the joins leaving; the new server is handed and its success
+    /// confirms the join.
+    #[test]
+    fn a_rejoin_s_new_voice_server_is_handed_and_confirms_it() {
+        let mut voice = join();
+        voice.observe(&ready("42"));
+        voice.observe(&state("42", "s1"));
+        let Some(VoiceChange::Connect(stale)) =
+            voice.observe(&server("t1", json!("gone.example:443")))
+        else {
+            panic!("a connection");
+        };
+        let (sender, connected) = watch::channel(false);
+        let mut link = Link::new(sender, Arc::default());
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        link.join.now(start);
+        assert!(link.tick(start).0);
+        let (attempt, _) = link.connect(stale);
+        assert!(link.result(attempt, true, at(1)));
+        let (again, _) = link.lost(at(100)).expect("handed again at once");
+        assert!(link.result(again, false, at(101)));
+        let (join, again) = link.tick(link.join.due.expect("a join is due"));
+        assert!(join);
+        let (again, _) = again.expect("the last connection, once more");
+        assert!(link.result(again, false, at(110)));
+        let due = link.join.due.expect("a join is due");
+        assert!(link.rejoining);
+        assert!(link.leave(due), "the channel is left first");
+
+        // The leave is answered before the next tick: the join goes out with
+        // it, as the plain join it now is, and is the only one.
+        let out = json!({"t": "VOICE_STATE_UPDATE", "d": {
+            "guild_id": "7", "channel_id": null, "user_id": "42", "session_id": "s1"
+        }});
+        assert!(matches!(voice.observe(&out), Some(VoiceChange::Left)));
+        link.left(due + Duration::from_millis(200));
+        assert!(!link.rejoining, "the bot is out: a join suffices");
+        assert_eq!(link.join.due, Some(due), "the leave asks for no other join");
+        assert!(!link.leave(due + Duration::from_secs(1)));
+        assert_eq!(link.tick(due + Duration::from_secs(1)), (true, None));
+        assert!(voice.observe(&state("42", "s1")).is_none());
+        let Some(VoiceChange::Connect(fresh)) =
+            voice.observe(&server("t2", json!("new.example:443")))
+        else {
+            panic!("the new voice server connects");
+        };
+        let (attempt, handed) = link.connect(fresh);
+        assert_eq!(handed.endpoint, "new.example:443");
+        assert!(link.result(attempt, true, due + Duration::from_secs(1)));
+        assert!(*connected.borrow());
+        assert!(link.join.due.is_none());
+        assert_eq!(link.tick(due + Duration::from_secs(600)), (false, None));
+    }
+
+    /// A loss whose reason says Discord no longer knows the voice session
+    /// (close code 4006) or its server (4011): the connection is handed
+    /// again at once only as an ordinary loss would be, which the driver
+    /// answers at once if the loss was of an older connection; its first
+    /// failure makes it stale. While the backoff runs, it is stale at once.
+    #[test]
+    fn a_loss_of_the_voice_session_leaves_and_joins_again() {
+        use songbird::events::context_data::DisconnectReason;
+        use songbird::model::CloseCode;
+        let closed = |code| Some(DisconnectReason::WsClosed(Some(code)));
+        assert!(session_gone(closed(CloseCode::SessionInvalid)));
+        assert!(session_gone(closed(CloseCode::ServerNotFound)));
+        assert!(!session_gone(closed(CloseCode::VoiceServerCrash)));
+        assert!(!session_gone(Some(DisconnectReason::WsClosed(None))));
+        assert!(!session_gone(Some(DisconnectReason::Io)));
+        assert!(!session_gone(None));
+
+        let (sender, _connected) = watch::channel(false);
+        let mut link = Link::new(sender, Arc::default());
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let stale = connection("t1", "gone.example:443");
+        let (attempt, _) = link.connect(stale.clone());
+        assert!(link.result(attempt, true, at(1)));
+        let (again, handed) = link.invalid(at(100)).expect("handed again at once");
+        assert_eq!(handed, stale);
+        assert!(!link.rejoining);
+        assert!(link.result(again, false, at(101)));
+        assert!(link.rejoining, "its first failure makes it stale");
+        assert!(link.again().is_none());
+        let due = link.join.due.expect("a join is due");
+        assert!(link.leave(due));
+        assert_eq!(link.tick(due + Duration::from_secs(1)), (true, None));
+        let due = due + Duration::from_secs(1);
+
+        // Connected again only briefly: the backoff runs, nothing is handed
+        // at once, and the next join leaves first.
+        let (attempt, _) = link.connect(stale.clone());
+        assert!(!link.rejoining);
+        assert!(link.result(attempt, true, due));
+        assert!(link.invalid(due + Duration::from_secs(1)).is_none());
+        assert!(link.rejoining);
+        assert!(link.again().is_none());
+        let due = link.join.due.expect("a join is due");
+        assert_eq!(link.tick(due), (false, None), "no join before the leave");
+        assert!(link.leave(due));
+        assert_eq!(link.tick(due + Duration::from_secs(1)), (true, None));
     }
 
     /// A connection songbird gave up on while connecting is the attempt's
