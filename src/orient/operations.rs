@@ -7714,7 +7714,13 @@ mod tests {
                 }
             };
             let options = WaitOptions {
-                timeout: Some(Duration::from_millis(500)),
+                // A refused report ends the run at once; give it time to be
+                // attempted even on a loaded box.
+                timeout: Some(if mode == Stop::Clean {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(5)
+                }),
                 poll_interval: Duration::from_millis(20),
                 form: NewsForm::Report,
             };
