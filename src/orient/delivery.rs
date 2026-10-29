@@ -267,9 +267,10 @@ mod tests {
                 }.into())
             };
             let mut output = crate::out::Out::new(&mut emit);
+            let mut on_delivery = |_| {};
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {},
-                _ = complete_report(&mut output, "fixed", "fixture", &mut |_| {}) => panic!("must remain deferred"),
+                _ = complete_report(&mut output, "fixed", "fixture", &mut on_delivery) => panic!("must remain deferred"),
             }
             drop(output);
             drop(emit);
