@@ -1,0 +1,62 @@
+Known-not-submitted callback contract (source candidate; unvalidated)
+
+Only exit 75 may opt in to repeated in-daemon delivery of the SAME report.
+It promises no accepting turn/start was attempted. The adapter consumes all
+stdin first, checks existing unresolved dispatch before connecting, verifies
+server CODEX_HOME and leading UA product/version, then proves either:
+  * exact target absent from an exhausted, well-formed loaded list; or
+  * exact thread/read identity has notLoaded or systemError status.
+Pause is checked before connecting, before each readiness75, and before final
+75 classification. No thread resume, new owner, settings change or queue.
+
+Exit 78: operator pause or supported-version mismatch (terminal, no retry).
+Exit 1: socket/RPC/identity/pagination/status errors, no direct input,
+post-submit rejection/unknown acceptance, and all other failures.
+Unknown dispatch blocks even a later readiness75, until manual reconciliation.
+Native callback75 is typed only after full stdin was written and before its
+deadline. Partial stdin, EPIPE, timeout, signal and all other exits are fatal.
+
+Native retry is explicit --retry-known-not-submitted, default false. Backoff
+5/20/60 seconds saturates, not a finite number of attempts. The same report
+stays pending; no poll/refresh, new message selection or beat while awaiting it.
+One daemon-only UTC preparation header is frozen with the report before first
+attempt; it warns delivery may be delayed and does not date underlying facts.
+Accepted is actual complete output Ok, not handled. Presented is authored
+after acceptance. Receipt failure is fatal, never an automatic replay.
+
+delivery::DeliveryNotice::{Retry(RetryNotice), Accepted} is the observer seam.
+RetryNotice has per-report attempt:u64, fixed reason:&'static str, delay:Duration.
+write_complete_report accepts FnMut(DeliveryNotice); apply_prepared_news accepts
+FnMut(&mut FacultyStore, &SigningKey, DeliveryNotice). Synchronous observer
+receives the already-owned store, must not re-enter Storage or affect delivery.
+CC liveness integration is NOT included here. Every report path has a hook,
+including health-only and habit-only. Retry precedes sleep; every Ok emits
+Accepted, including A accepted, B retries, B accepted in the same session.
+
+One absolute --run-for deadline caps attempts and backoff. Async sleep yields
+to the existing SIGTERM/SIGINT selector. A running synchronous callback still
+has its bounded subprocess timeout; unrelated synchronous store/upkeep work
+is not made hard-interruptible. A clean stop with pending unsent news writes
+no Presented. Service Restart=no is retained (no service files in candidate).
+
+ADOPTION PREREQUISITE, NOT IMPLEMENTED HERE:
+Existing orient-ready.py ExecStartPre maps absent/notLoaded to exit1 and can
+block entry to the daemon. A reviewed readiness-gate successor must keep exact
+identity/version/pause/unknown guards, allowing ONLY typed known-unsent readiness
+to enter the persistent daemon. No generic readiness failure may be ignored.
+Installed adapter, launcher, unit, owner thread and pause state are untouched.
+
+Provenance:
+Managed adapter baseline is installed Stars orient_deliver.py SHA256
+0b0a18f4f8ab0e8588234c5f5725d89d7fe4942294c7025b73134ff227437adf.
+Original retained candidate was commit7fd830a32c6e7d028be337254e8d0611c2d751b3;
+only known installed delta allowed version0.163.0 instead of0.162.1.
+Supported choices stay0.160.1/0.163.0; Mac0.165 adoption belongs Sol.
+Leading UA grammar is conservative product/numeric-version followed by space
+or end, not a complete protocol grammar. Actual Stars response was observed
+once by independent reviewer08:52:31Z, response SHA256
+39ea19a4bda8477b242ac4d2d83f917dbf82539c08ef7628ae9413897a8f24b5:
+astra-recovery-probe/0.163.0 (Ubuntu 24.4.0; aarch64) unknown (codex-tui; 0.163.0).
+No live accepting RPC was part of this implementation. Current official docs
+https://developers.openai.com/codex/app-server were cross-checked using OpenAI
+Docs; they do not replace the pinned implementation/observed response.

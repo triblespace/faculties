@@ -95,6 +95,12 @@ pub(super) fn deliver(
             // group afterward: the numeric identity is no longer reserved.
             owned.reaped = true;
             if !status.success() {
+                if status.code() == Some(super::super::delivery::KNOWN_NOT_SUBMITTED_EXIT.into())
+                    && written == bytes.len()
+                    && Instant::now() < deadline
+                {
+                    return Err(super::super::delivery::KnownNotSubmitted.into());
+                }
                 bail!("Orient delivery callback failed ({status})");
             }
             if written != bytes.len() {
@@ -185,6 +191,26 @@ mod tests {
             "news"
         )
         .is_err());
+    }
+
+    #[test]
+    fn callback_75_is_typed_only_after_complete_stdin() {
+        let error = shell("cat >/dev/null; exit 75", &[], Duration::from_secs(3), "fixed report").unwrap_err();
+        assert!(error.is::<super::super::super::delivery::KnownNotSubmitted>());
+        let error = shell("exit 75", &[], Duration::from_secs(3), &"x".repeat(4 * 1024 * 1024)).unwrap_err();
+        assert!(!error.is::<super::super::super::delivery::KnownNotSubmitted>());
+    }
+
+    #[test]
+    fn callback_epipe_timeout_and_signal_are_never_typed_75() {
+        for (script, timeout, report) in [
+            ("exec 0<&-; sleep 1; exit 75", Duration::from_secs(3), "x".repeat(4 * 1024 * 1024)),
+            ("cat >/dev/null; sleep 1; exit 75", Duration::from_millis(50), "fixed".to_owned()),
+            ("cat >/dev/null; kill -TERM $$", Duration::from_secs(3), "fixed".to_owned()),
+        ] {
+            let error = shell(script, &[], timeout, &report).unwrap_err();
+            assert!(!error.is::<super::super::super::delivery::KnownNotSubmitted>());
+        }
     }
 
     #[test]

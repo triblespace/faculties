@@ -407,7 +407,7 @@ mod tests {
         let (_, news) = f.news();
         assert_eq!(events(&news), BTreeSet::from([first.id]));
         let mut failed_parts = Vec::new();
-        let error = apply_prepared_news(
+        let error = test_block_on(apply_prepared_news(
             &mut f.store,
             &f.signer,
             f.sources.presentations.source,
@@ -418,8 +418,7 @@ mod tests {
             &mut Out::new(&mut |part| {
                 failed_parts.push(part);
                 bail!("fixture callback rejected complete stdin report")
-            }),
-        )
+            }), &mut |_, _, _| {}))
         .unwrap_err();
         assert!(format!("{error:#}").contains("fixture callback rejected"));
         assert_eq!(
@@ -431,7 +430,7 @@ mod tests {
         assert_eq!(events(&f.news().1), BTreeSet::from([first.id]));
 
         let mut accepted = Vec::new();
-        apply_prepared_news(
+        test_block_on(apply_prepared_news(
             &mut f.store,
             &f.signer,
             f.sources.presentations.source,
@@ -442,8 +441,7 @@ mod tests {
             &mut Out::new(&mut |part| {
                 accepted.push(part);
                 Ok(())
-            }),
-        )
+            }), &mut |_, _, _| {}))
         .unwrap();
         assert_eq!(accepted, failed_parts);
         assert!(f.presented(first.id));
@@ -504,7 +502,7 @@ mod tests {
         assert!(report.attention.is_empty());
         assert!(events(&news).is_empty());
         let mut output = Vec::new();
-        apply_prepared_news(
+        test_block_on(apply_prepared_news(
             &mut f.store,
             &f.signer,
             f.sources.presentations.source,
@@ -515,8 +513,7 @@ mod tests {
             &mut Out::new(&mut |part| {
                 output.push(part);
                 Ok(())
-            }),
-        )
+            }), &mut |_, _, _| {}))
         .unwrap();
         assert!(output.is_empty());
         assert!(!f.presented(event.id));

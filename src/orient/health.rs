@@ -235,7 +235,7 @@ impl HealthSources {
 
     /// Health is delivered before any ordinary source or payload acquisition.
     /// An unresolved resident persona leaves the normal resolution path intact.
-    pub(super) fn poll(
+    pub(super) async fn poll(
         &mut self,
         pile: &mut FacultyStore,
         signer: &SigningKey,
@@ -243,11 +243,11 @@ impl HealthSources {
         peek: bool,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
-        self.poll_in(pile, signer, input, peek, NewsForm::Report, output)
+        self.poll_in(pile, signer, input, peek, NewsForm::Report, output).await
     }
 
     /// [`Self::poll`], writing any report in `form`.
-    pub(super) fn poll_in(
+    pub(super) async fn poll_in(
         &mut self,
         pile: &mut FacultyStore,
         signer: &SigningKey,
@@ -290,7 +290,8 @@ impl HealthSources {
             "",
             form,
             output,
-        )?;
+            &mut path_observer(self.news_path_target()),
+        ).await?;
         Ok((fired, report.next_change))
     }
 
@@ -482,7 +483,6 @@ pub(super) fn record_news_path_retry(
 
 /// One delivery observation from the complete-report seam, in plain fields
 /// so it is independent of the seam's own notice type.
-#[allow(dead_code)] // Constructed by the delivery seam's notice callback.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum NewsPathNotice<'a> {
     /// The callback deferred this attempt; the next try follows `delay`.
@@ -498,9 +498,6 @@ pub(super) enum NewsPathNotice<'a> {
 
 /// The single wiring point for the delivery seam: each notice maps to exactly
 /// one of the two record functions.
-// The delivery seam's notice callback calls this; until that seam lands it
-// is reached only from tests.
-#[allow(dead_code)]
 pub(super) fn on_delivery_notice(
     store: &mut FacultyStore,
     signer: &SigningKey,
@@ -514,6 +511,32 @@ pub(super) fn on_delivery_notice(
             delay,
         } => record_news_path_retry(store, signer, path, attempt, reason, delay),
         NewsPathNotice::Accepted => record_news_path_delivered(store, signer, path),
+    }
+}
+
+/// The observer a complete-report seam calls with the store it already owns.
+/// It captures only a clone of health state (no Storage owner), maps each
+/// notice to its record, and never fails or delays the delivery: a record
+/// that cannot be written is noted on stderr. No news path, no records.
+pub(super) fn path_observer(
+    target: Option<NewsPathTarget>,
+) -> impl FnMut(&mut FacultyStore, &SigningKey, crate::orient::delivery::DeliveryNotice) {
+    use crate::orient::delivery::DeliveryNotice;
+    move |store: &mut FacultyStore, signer: &SigningKey, notice: DeliveryNotice| {
+        let Some(target) = target.as_ref() else {
+            return;
+        };
+        let notice = match notice {
+            DeliveryNotice::Retry(retry) => NewsPathNotice::Retry {
+                attempt: retry.attempt,
+                reason: retry.reason,
+                delay: retry.delay,
+            },
+            DeliveryNotice::Accepted => NewsPathNotice::Accepted,
+        };
+        if let Err(error) = on_delivery_notice(store, signer, target, notice) {
+            eprintln!("note: news-path delivery record not written ({error:#})");
+        }
     }
 }
 
@@ -580,7 +603,6 @@ impl HealthSources {
 
     /// The target a delivery seam records retries and acceptances against,
     /// once this observer's persona has resolved.
-    #[allow(dead_code)] // Taken by the delivery seam's notice callback.
     pub(super) fn news_path_target(&self) -> Option<NewsPathTarget> {
         let path = self.news_path.as_ref()?;
         Some(NewsPathTarget {
@@ -1586,6 +1608,16 @@ fn render_health(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl HealthSources {
+        // Synthetic synchronous callers only; production poll remains async.
+        fn poll_test(
+            &mut self, pile: &mut FacultyStore, signer: &SigningKey, input: &str,
+            peek: bool, output: &mut Out<'_>,
+        ) -> Result<(bool, Option<Epoch>)> {
+            test_block_on(self.poll(pile, signer, input, peek, output))
+        }
+    }
     use schema::{Component, Condition, Evidence, Measurement, Recorder, State};
     use triblespace::core::blob::Blob;
     use triblespace::core::collection::{
@@ -2008,7 +2040,7 @@ mod tests {
         let mut emit = |_part| Ok(());
         let mut out = crate::out::Out::new(&mut emit);
         f.sources
-            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
             .unwrap();
         let path = f.sources.news_path_target().expect("persona resolved");
 
@@ -2081,7 +2113,7 @@ mod tests {
         let mut out = crate::out::Out::new(&mut emit);
         // Select a view without beating, then start this observer's session.
         f.sources
-            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
             .unwrap();
         f.sources.start_beating();
         let now = clock::now().unwrap();
@@ -2127,10 +2159,10 @@ mod tests {
         };
         let mut out = crate::out::Out::new(&mut emit);
         f.sources
-            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
             .unwrap();
         f.sources
-            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
             .unwrap();
         let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
         let beats: Vec<(Id, Id)> = find!(
@@ -2178,7 +2210,7 @@ mod tests {
         ))
         .unwrap();
         next.start_beating();
-        next.poll(&mut f.store, &f.signer, &input, false, &mut out)
+        next.poll_test(&mut f.store, &f.signer, &input, false, &mut out)
             .unwrap();
         let observed = next.observe(&mut f.store, &f.signer).unwrap();
         let recovered: Vec<Id> = find!(
@@ -2360,7 +2392,7 @@ mod tests {
         };
         let (fired, _) = f
             .sources
-            .poll(
+            .poll_test(
                 &mut f.store,
                 &reader_key,
                 &fmt_id(persona),
@@ -2446,7 +2478,7 @@ mod tests {
         };
         let (fired, _) = f
             .sources
-            .poll(
+            .poll_test(
                 &mut f.store,
                 &f.signer,
                 &fmt_id(persona),
@@ -2485,7 +2517,7 @@ mod tests {
             };
             let (fired, _) = f
                 .sources
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     "unused-quiet-persona",
@@ -2529,7 +2561,7 @@ mod tests {
         };
         assert!(f
             .sources
-            .poll(
+            .poll_test(
                 &mut f.store,
                 &f.signer,
                 "unused-error-persona",
@@ -2569,7 +2601,7 @@ mod tests {
         };
         assert!(
             f.sources
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     &fmt_id(persona),
@@ -2595,7 +2627,7 @@ mod tests {
         };
         assert!(
             f.sources
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     &fmt_id(persona),
@@ -2623,7 +2655,7 @@ mod tests {
         };
         assert!(
             !rearmed
-                .poll(
+                .poll_test(
                     &mut f.store,
                     &f.signer,
                     &fmt_id(persona),
@@ -2676,7 +2708,7 @@ mod tests {
                 Ok(())
             };
             let (fired, _) = sources
-                .poll(
+                .poll_test(
                     store,
                     &f.signer,
                     &fmt_id(persona),
