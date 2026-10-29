@@ -429,7 +429,8 @@ struct DeliveryState {
     proven: bool,
     /// The exit, silence or retry the next DELIVERED record resolves.
     resolves: Option<Id>,
-    /// When the current run of retries began.
+    /// When the current run of retries began, or the start of the run a
+    /// carried retry belongs to: only an acceptance ends a run.
     degraded_since: Option<Epoch>,
 }
 
@@ -693,6 +694,19 @@ impl HealthSources {
                 .winner(window)
                 .and_then(|record| session_prior(facts, window, record, now)),
         };
+        // A carried retry's stretch continues in this session until an
+        // acceptance, so this session's retries keep its start.
+        let carried_since = prior.and_then(|prior| {
+            find!(
+                since: (Epoch, Epoch),
+                pattern!(facts, [{ prior @
+                    metadata::tag: &KIND_NEWS_PATH_RETRY,
+                    metadata::started_at: ?since,
+                }])
+            )
+            .map(|since| since.1)
+            .min()
+        });
         path.last_attempt = Some(now);
         let tags =
             std::iter::once(KIND_NEWS_PATH_BEAT).chain(prior.map(|_| schema::KIND_RECOVERED));
@@ -715,6 +729,9 @@ impl HealthSources {
                         .expect("delivery state is not poisoned");
                     if !delivery.proven {
                         delivery.resolves.get_or_insert(prior);
+                        if let Some(since) = carried_since {
+                            delivery.degraded_since.get_or_insert(since);
+                        }
                     }
                 }
             }
@@ -1003,6 +1020,8 @@ fn render_news_paths(
 }
 
 /// Say one deferred attempt: since when, which attempt, why, and when next.
+/// The dashboard line follows the attempt; the attention event is the
+/// stretch's.
 fn degraded(
     report: &mut HealthReport,
     lines: &mut Vec<String>,
@@ -1025,8 +1044,25 @@ fn degraded(
     .min()
     .unwrap_or_default();
     lines.push(format!("{label}: degraded {summary}{next}"));
+    // Every attempt of one degraded stretch carries its start, across
+    // restarts that never accept too, so the stretch's first RETRY names the
+    // event: peers hear of a stretch once, not of each attempt.
+    let episode = find!(
+        (first: Id, created: (Epoch, Epoch)),
+        pattern!(facts, [
+            { retry @ metadata::started_at: _?since },
+            { ?first @
+                metadata::tag: &KIND_NEWS_PATH_RETRY,
+                attrs::node: &window,
+                metadata::started_at: _?since,
+                metadata::created_at: ?created,
+            },
+        ])
+    )
+    .min_by_key(|(first, created)| (created.1, *first))
+    .map_or(retry, |(first, _)| first);
     report.attention.insert(AttentionEvent::NewsPath {
-        event: retry,
+        event: episode,
         window,
         detail: format!("news path of {label} degraded {summary}{next}"),
     });
@@ -2291,6 +2327,179 @@ mod tests {
             .expect("the restart is news for a peer");
         assert!(text.contains("polling resumed"), "{text}");
         assert!(text.contains("delivery degraded since"), "{text}");
+    }
+
+    /// Record that `events` were shown, as a watcher does after news.
+    fn present(f: &mut Fixture, events: Vec<Id>) {
+        f.store
+            .commit(
+                f.sources.presentations.source,
+                &f.signer,
+                orient_model::receipt_fragment(events, clock::point_now().unwrap()),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn repeated_attempts_of_one_deferral_wake_peers_once() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        let reader = *fucid();
+        f.publish(path_beat(window, session, at(0.0)));
+        f.publish(path_delivered(window, session, at(5.0), None));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let first = path_retry(window, session, at(20.0), at(20.0), 1, 60.0, reason);
+        let first_id = first.root().unwrap();
+        f.publish(first);
+        let degraded = f.observe_at(at(21.0));
+        let (text, events) =
+            news_text(degraded.news(reader, &degraded.attention())).expect("a deferral is news");
+        assert!(text.contains("attempt 1"), "{text}");
+        assert_eq!(events, vec![first_id]);
+        present(&mut f, events);
+
+        // Later attempts of the same stretch: the dashboard follows each
+        // one, and none is news again.
+        let mut last = first_id;
+        for attempt in 2..=4u128 {
+            let created = 20.0 + 60.0 * (attempt - 1) as f64;
+            let retry = path_retry(
+                window,
+                session,
+                at(created),
+                at(20.0),
+                attempt,
+                60.0,
+                reason,
+            );
+            last = retry.root().unwrap();
+            f.publish(retry);
+            let observed = f.observe_at(at(created + 1.0));
+            let full = observed.report().text;
+            assert!(
+                full.contains(&format!(
+                    "degraded since {}: attempt {attempt}, ",
+                    utc(at(20.0))
+                )),
+                "{full}"
+            );
+            assert!(full.contains("next try in 1m"), "{full}");
+            assert!(
+                matches!(observed.news(reader, &observed.attention()), News::Quiet),
+                "attempt {attempt} of a presented deferral is not news again"
+            );
+        }
+
+        // An acceptance ends the stretch and is news of its own.
+        let delivered = path_delivered(window, session, at(300.0), Some(last));
+        let delivered_id = delivered.root().unwrap();
+        f.publish(delivered);
+        let accepting = f.observe_at(at(301.0));
+        let (text, events) = news_text(accepting.news(reader, &accepting.attention()))
+            .expect("an acceptance is news");
+        assert!(text.contains("callback accepting again"), "{text}");
+        assert_eq!(events, vec![delivered_id]);
+        present(&mut f, events);
+
+        // The first deferral after it starts a new stretch, and wakes again.
+        let next = path_retry(window, session, at(400.0), at(400.0), 1, 60.0, reason);
+        let next_id = next.root().unwrap();
+        f.publish(next);
+        let again = f.observe_at(at(401.0));
+        let (text, events) = news_text(again.news(reader, &again.attention()))
+            .expect("a new deferral after an acceptance is news");
+        assert!(text.contains("attempt 1"), "{text}");
+        assert_eq!(events, vec![next_id]);
+    }
+
+    #[test]
+    fn a_deferral_carried_through_restarts_stays_one_episode_until_accepted() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let old = *fucid();
+        let reader = *fucid();
+        let input = format!("{window:x}");
+        let now = clock::now().unwrap();
+        let since = now - hifitime::Duration::from_seconds(60.0);
+        // Session A deferred, was told to its peers, and stopped cleanly
+        // while its backoff was pending.
+        f.publish(path_beat(
+            window,
+            old,
+            now - hifitime::Duration::from_seconds(300.0),
+        ));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let retry = path_retry(window, old, since, since, 7, 60.0, reason);
+        let first_id = retry.root().unwrap();
+        f.publish(retry);
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let (_, events) =
+            news_text(observed.news(reader, &observed.attention())).expect("the deferral is news");
+        assert_eq!(events, vec![first_id]);
+        present(&mut f, events);
+
+        let mut emit = |_part| Ok(());
+        let mut out = crate::out::Out::new(&mut emit);
+        let deferred = |attempt| NewsPathNotice::Retry {
+            attempt,
+            reason: "callback_exit_75_known_not_submitted",
+            delay: Duration::from_secs(60),
+        };
+        // Sessions B and C restart without an acceptance and defer again.
+        for restart in ["B", "C"] {
+            f.sources.start_beating();
+            f.sources
+                .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
+                .unwrap();
+            let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+            let (text, events) = news_text(observed.news(reader, &observed.attention()))
+                .expect("the restart itself is news");
+            assert!(text.contains("polling resumed"), "{restart}: {text}");
+            present(&mut f, events);
+            let path = f.sources.news_path_target().expect("persona resolved");
+            for attempt in 1..=2 {
+                on_delivery_notice(&mut f.store, &f.signer, &path, deferred(attempt)).unwrap();
+                let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+                assert!(
+                    matches!(observed.news(reader, &observed.attention()), News::Quiet),
+                    "{restart} attempt {attempt}: a carried deferral is not a new episode"
+                );
+                let full = observed.report().text;
+                assert!(
+                    full.contains(&format!(
+                        "degraded since {}: attempt {attempt}, ",
+                        utc(since)
+                    )),
+                    "{restart}: {full}"
+                );
+            }
+        }
+
+        // An acceptance in C ends the stretch; the next deferral is new.
+        let path = f.sources.news_path_target().expect("persona resolved");
+        on_delivery_notice(&mut f.store, &f.signer, &path, NewsPathNotice::Accepted).unwrap();
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let (text, events) = news_text(observed.news(reader, &observed.attention()))
+            .expect("the acceptance is news");
+        assert!(text.contains("callback accepting again"), "{text}");
+        present(&mut f, events);
+        on_delivery_notice(&mut f.store, &f.signer, &path, deferred(1)).unwrap();
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let (text, events) = news_text(observed.news(reader, &observed.attention()))
+            .expect("a deferral after an acceptance is a new episode");
+        assert!(text.contains("attempt 1"), "{text}");
+        assert!(
+            !text.contains(&utc(since)),
+            "a new stretch has its own start: {text}"
+        );
+        assert_ne!(events, vec![first_id]);
     }
 
     #[test]
