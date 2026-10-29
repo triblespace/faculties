@@ -886,7 +886,7 @@ fn render_news_paths(
                 degraded(report, &mut lines, facts, snapshot, &label, window, retry);
             }
             (_, Some((delivered, _))) => {
-                lines.push(format!("{label}: delivering, last beat {age} ago"));
+                lines.push(format!("{label}: callback accepting, last beat {age} ago"));
                 for prior in find!(
                     prior: Id,
                     pattern!(facts, [{ delivered @ metadata::supersedes: ?prior }])
@@ -895,7 +895,7 @@ fn render_news_paths(
                         event: delivered,
                         window,
                         detail: format!(
-                            "news path of {label} recovered (session [{}]): delivery accepted after {}",
+                            "news path of {label}: callback accepting again (session [{}]) after {}",
                             fmt_id(session),
                             resolved(facts, snapshot, prior)
                         ),
@@ -904,7 +904,7 @@ fn render_news_paths(
             }
             _ => {
                 lines.push(format!(
-                    "{label}: polling, last beat {age} ago, no delivery accepted yet"
+                    "{label}: polling, last beat {age} ago, callback has not accepted a report yet"
                 ));
                 for prior in find!(
                     prior: Id,
@@ -920,7 +920,7 @@ fn render_news_paths(
                         event: session,
                         window,
                         detail: format!(
-                            "news path of {label}: polling resumed (session [{}]) after {}, no delivery accepted yet",
+                            "news path of {label}: polling resumed (session [{}]) after {}, callback has not accepted a report yet",
                             fmt_id(session),
                             resolved(facts, snapshot, prior)
                         ),
@@ -1939,10 +1939,13 @@ mod tests {
         let (text, events) =
             news_text(observed.news(*fucid(), &observed.attention())).expect("a restart is news");
         assert!(text.contains("polling resumed"), "{text}");
-        assert!(text.contains("no delivery accepted yet"), "{text}");
         assert!(
-            !text.contains("recovered"),
-            "polling is not delivery: {text}"
+            text.contains("callback has not accepted a report yet"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("accepting again") && !text.contains("recovered"),
+            "polling is not acceptance: {text}"
         );
         assert!(text.contains("thread status is not idle"), "{text}");
         assert_eq!(events, vec![second], "one resumption event per session");
@@ -1956,8 +1959,9 @@ mod tests {
         let observed = f.observe_at(at(210.0));
         let (text, events) = news_text(observed.news(*fucid(), &observed.attention()))
             .expect("an accepted delivery is news");
-        assert!(text.contains("recovered"), "{text}");
-        assert!(text.contains("delivery accepted"), "{text}");
+        // Acceptance by the configured callback, never a claim of receipt.
+        assert!(text.contains("callback accepting again"), "{text}");
+        assert!(!text.contains("recovered"), "{text}");
         assert!(text.contains("thread status is not idle"), "{text}");
         assert_eq!(events, vec![delivered_id]);
 
@@ -2011,7 +2015,8 @@ mod tests {
         let recovered = f.observe_at(at(51.0));
         let (text, events) = news_text(recovered.news(*fucid(), &recovered.attention()))
             .expect("an accepted delivery after a retry is news");
-        assert!(text.contains("recovered"), "{text}");
+        assert!(text.contains("callback accepting again"), "{text}");
+        assert!(!text.contains("recovered"), "{text}");
         assert!(!text.contains("degraded"), "{text}");
         assert_eq!(events, vec![delivered_id]);
 

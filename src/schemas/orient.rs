@@ -80,9 +80,11 @@ pub const KIND_NEWS_PATH_BEAT: Id = id_hex!("89906A65BA5779885E3A2676E4E1E767");
 /// Minted with `trible genid` on 2026-10-29.
 pub const KIND_NEWS_PATH_EXIT: Id = id_hex!("7A3221E5D3CF65B39071F2F51AF3AFBE");
 
-/// An accepted delivery on a news path after its session started or after a
-/// retry: the only record from which a reader says the path recovered. It
-/// names, with `metadata::supersedes`, the exit, silence or retry it resolves.
+/// The configured delivery callback accepted a complete report, the first
+/// time in its session or the first time after a retry. Callback acceptance
+/// only: an operator wrapper may accept a report it deliberately does not
+/// forward, so this never proves the report reached its reader. It names,
+/// with `metadata::supersedes`, the exit, silence or retry it follows.
 ///
 /// Minted with `trible genid` on 2026-10-29.
 pub const KIND_NEWS_PATH_DELIVERED: Id = id_hex!("997B750B0685B0B37110C38F693733E8");
