@@ -610,7 +610,17 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(std::fs::read_to_string(delivered).unwrap(), expected);
+        // The daemon sink discloses when it prepared a report, then the report
+        // itself, byte for byte.
+        let delivered = std::fs::read_to_string(delivered).unwrap();
+        let (preamble, report) = delivered
+            .split_once("\n\n")
+            .expect("a preparation line, then the report");
+        assert!(
+            preamble.starts_with("Orient report prepared at "),
+            "{preamble}"
+        );
+        assert_eq!(report, expected);
         assert!(
             side_output.is_empty(),
             "callback stdout is not a second news channel"
