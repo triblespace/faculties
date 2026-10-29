@@ -2398,6 +2398,8 @@ fn interval_key(interval: IntervalValue) -> i128 {
     lower
 }
 
+// Test oracles only: production readers do not assert cardinality.
+#[cfg(test)]
 fn one_required<T>(values: BTreeSet<T>, field: &str) -> Result<T>
 where
     T: Ord + Copy,
@@ -2408,6 +2410,7 @@ where
     Ok(*values.iter().next().expect("one value"))
 }
 
+#[cfg(test)]
 fn one_optional<T>(values: BTreeSet<T>, field: &str) -> Result<Option<T>>
 where
     T: Ord + Copy,
@@ -3245,29 +3248,24 @@ fn select_scan<P: TriblePattern>(space: &P, requested: Option<&str>) -> Result<O
         }
         return Ok(Some(scan));
     }
-    let mut newest: Option<(i128, Id)> = None;
-    let mut tied = Vec::new();
-    for scan in all_scan_ids(space) {
-        let created_at = one_required(
-            find!(
-                value: IntervalValue,
-                pattern!(space, [{ (scan) @ metadata::created_at: ?value }])
-            )
-            .collect(),
-            "scan created_at",
-        )?;
+    // The newest scan is the one carrying the newest timestamp. A scan with
+    // no timestamp this reader can decode is simply not a candidate; it stays
+    // selectable by id.
+    let mut newest: Option<i128> = None;
+    let mut tied = BTreeSet::new();
+    for (scan, created_at) in find!(
+        (scan: Id, created_at: IntervalValue),
+        pattern!(space, [{
+            ?scan @ metadata::tag: (&KIND_SCAN), metadata::created_at: ?created_at
+        }])
+    ) {
         let key = interval_key(created_at);
-        match newest {
-            None => {
-                newest = Some((key, scan));
-                tied = vec![scan];
-            }
-            Some((current, _)) if key > current => {
-                newest = Some((key, scan));
-                tied = vec![scan];
-            }
-            Some((current, _)) if key == current => tied.push(scan),
-            _ => {}
+        if newest.is_none_or(|current| key > current) {
+            newest = Some(key);
+            tied.clear();
+        }
+        if newest == Some(key) {
+            tied.insert(scan);
         }
     }
     if tied.len() > 1 {
@@ -3276,7 +3274,7 @@ fn select_scan<P: TriblePattern>(space: &P, requested: Option<&str>) -> Result<O
             tied.len()
         );
     }
-    Ok(newest.map(|(_, scan)| scan))
+    Ok(tied.into_iter().next())
 }
 
 /// The prose a resolution had to spell EXACTLY, before a resolution could
@@ -3602,13 +3600,14 @@ fn cmd_coverage(storage: PostureStorage<'_>, scan: Option<String>) -> Result<Opt
     let Some(scan) = select_scan(&view.facts, scan.as_deref())? else {
         return Ok(None);
     };
-    let target = one_required(
-        find!(value: TextHandle, pattern!(&view.facts, [{
-            scan @ posture::target: ?value
-        }]))
-        .collect(),
-        "scan target",
-    )?;
+    // The target is part of the scan's identity, so a second target can only
+    // come from a writer reusing the id; the smallest handle is reported.
+    // Without one the report has no subject.
+    let target = find!(value: TextHandle, pattern!(&view.facts, [{
+        scan @ posture::target: ?value
+    }]))
+    .min()
+    .ok_or_else(|| anyhow!("scan {} carries no readable target", fmt_id(scan)))?;
     let checked =
         find!(modality: Id, pattern!(&view.facts, [{ scan @ posture::checked: ?modality }]))
             .collect();
@@ -3648,23 +3647,17 @@ fn cmd_coverage(storage: PostureStorage<'_>, scan: Option<String>) -> Result<Opt
 fn cmd_scans(storage: PostureStorage<'_>) -> Result<Vec<ScanRecord>> {
     let view = storage.scan_view()?;
     let mut scans = Vec::new();
-    for scan in all_scan_ids(&view.facts) {
-        let target = one_required(
-            find!(
-                value: TextHandle,
-                pattern!(&view.facts, [{ (scan) @ posture::target: ?value }])
-            )
-            .collect(),
-            "scan target",
-        )?;
-        let created_at = one_required(
-            find!(
-                value: IntervalValue,
-                pattern!(&view.facts, [{ (scan) @ metadata::created_at: ?value }])
-            )
-            .collect(),
-            "scan created_at",
-        )?;
+    // Target and timestamp are the scan's identity: one row per scan the
+    // reader can decode.
+    for (scan, target, created_at) in find!(
+        (scan: Id, target: TextHandle, created_at: IntervalValue),
+        pattern!(&view.facts, [{
+            ?scan @
+            metadata::tag: (&KIND_SCAN),
+            posture::target: ?target,
+            metadata::created_at: ?created_at
+        }])
+    ) {
         let findings = find!(
             sighting: Id,
             pattern!(&view.facts, [{
@@ -3865,21 +3858,15 @@ fn take_exemplars_with_body(
 ) -> Result<BTreeSet<Id>> {
     let mut replaced = BTreeSet::new();
     for member in members.iter().copied() {
-        if !exists!(pattern!(space, [{
-            (member) @ metadata::tag: (&KIND_EXEMPLAR)
-        }])) {
-            continue;
-        }
-        let handle = one_required(
-            find!(
-                value: TextHandle,
-                pattern!(space, [{ (member) @ posture::term: ?value }])
-            )
-            .collect(),
-            "exemplar text",
-        )?;
-        if read_text(reader, handle, "exemplar text")? == body {
-            replaced.insert(member);
+        for handle in find!(
+            value: TextHandle,
+            pattern!(space, [{
+                (member) @ metadata::tag: (&KIND_EXEMPLAR), posture::term: ?value
+            }])
+        ) {
+            if read_text(reader, handle, "exemplar text")? == body {
+                replaced.insert(member);
+            }
         }
     }
     members.retain(|member| !replaced.contains(member));
@@ -5513,63 +5500,55 @@ fn semantic_texts(
     let mut exemplars: Vec<(bool, String, Vec<f32>)> = Vec::new();
     let mut n_protected = 0usize;
     let mut n_benign = 0usize;
+    // Text and role are the exemplar's identity, so each decodable exemplar
+    // yields one row; a member this reader cannot read as an exemplar is not
+    // compared against.
     for exemplar in members {
-        if !exists!(pattern!(&view.facts, [{
-            (exemplar) @ metadata::tag: (&KIND_EXEMPLAR)
-        }])) {
-            continue;
-        }
-        let text = one_required(
-            find!(
-                value: TextHandle,
-                pattern!(&view.facts, [{ (exemplar) @ posture::term: ?value }])
-            )
-            .collect(),
-            "exemplar text",
-        )?;
-        let role = one_required(
-            find!(
-                value: Id,
-                pattern!(&view.facts, [{ (exemplar) @ posture::role: ?value }])
-            )
-            .collect(),
-            "exemplar role",
-        )?;
-        let benign = match role {
-            EXEMPLAR_BENIGN => {
-                n_benign += 1;
-                true
-            }
-            EXEMPLAR_PROTECTED => {
-                n_protected += 1;
-                false
-            }
-            _ => bail!(
-                "exemplar {} has unknown role {}",
-                fmt_id(exemplar),
-                fmt_id(role)
-            ),
-        };
-        let vectors = find!(
-            value: Inline<inlineencodings::Handle<Embedding768>>,
+        for (text, role) in find!(
+            (text: TextHandle, role: Id),
             pattern!(&view.facts, [{
-                (exemplar) @ embeddings::attr::embedding: ?value
+                (exemplar) @
+                metadata::tag: (&KIND_EXEMPLAR),
+                posture::term: ?text,
+                posture::role: ?role
             }])
-        )
-        .collect::<BTreeSet<_>>();
-        if vectors.is_empty() {
-            bail!(
-                "exemplar {} has no embedding exhaust; semantic scan cannot examine it",
-                fmt_id(exemplar)
-            );
-        }
-        let text = read_text(&view.reader, text, "exemplar text")?;
-        for vector in vectors {
-            let vector: View<[f32]> = view
-                .reader
-                .get(vector)
-                .with_context(|| format!("read embedding for exemplar {}", fmt_id(exemplar)))?;
-            exemplars.push((benign, text.clone(), vector.to_vec()));
+        ) {
+            let benign = match role {
+                EXEMPLAR_BENIGN => {
+                    n_benign += 1;
+                    true
+                }
+                EXEMPLAR_PROTECTED => {
+                    n_protected += 1;
+                    false
+                }
+                _ => bail!(
+                    "exemplar {} has unknown role {}",
+                    fmt_id(exemplar),
+                    fmt_id(role)
+                ),
+            };
+            let vectors = find!(
+                value: Inline<inlineencodings::Handle<Embedding768>>,
+                pattern!(&view.facts, [{
+                    (exemplar) @ embeddings::attr::embedding: ?value
+                }])
+            )
+            .collect::<BTreeSet<_>>();
+            if vectors.is_empty() {
+                bail!(
+                    "exemplar {} has no embedding exhaust; semantic scan cannot examine it",
+                    fmt_id(exemplar)
+                );
+            }
+            let text = read_text(&view.reader, text, "exemplar text")?;
+            for vector in vectors {
+                let vector: View<[f32]> = view
+                    .reader
+                    .get(vector)
+                    .with_context(|| format!("read embedding for exemplar {}", fmt_id(exemplar)))?;
+                exemplars.push((benign, text.clone(), vector.to_vec()));
+            }
         }
     }
     if n_protected == 0 {
