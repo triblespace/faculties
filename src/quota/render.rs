@@ -9,6 +9,7 @@ use crate::out::Out;
 use crate::quota::status::{PageItem, STATUS_STALE_AFTER_SECONDS};
 use crate::quota::{self, Pace, PACE_MARGIN_POINTS, STALE_AFTER_SECONDS};
 use anyhow::Result;
+use triblespace::prelude::Id;
 
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
@@ -61,18 +62,9 @@ fn format_instant(seconds: i64) -> String {
     }
 }
 
-fn provider_label(group: &QuotaGroup) -> String {
-    group
-        .provider_name
-        .clone()
-        .unwrap_or_else(|| format!("{:x}", group.provider))
-}
-
-fn status_provider_label(status: &ProviderStatusView) -> String {
-    status
-        .provider_name
-        .clone()
-        .unwrap_or_else(|| format!("{:x}", status.provider))
+/// The provider's recorded name, or its id when no name was recorded.
+fn provider_label(name: &Option<String>, provider: Id) -> String {
+    name.clone().unwrap_or_else(|| format!("{provider:x}"))
 }
 
 fn status_age_seconds(now: i128, status: &ProviderStatusView) -> i64 {
@@ -197,7 +189,7 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
         let stale = if derived.stale { " STALE" } else { "" };
         output.line(format!(
             "{} {}{} acct {}: used {}, elapsed {}, {}; age {}{}; resets {}; host {}",
-            provider_label(group),
+            provider_label(&group.provider_name, group.provider),
             format_window(group.window_secs),
             bucket_label(group.bucket.as_deref()),
             short_account(&group.account),
@@ -218,6 +210,9 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
 /// The latest reading of each provider's own status page. Nothing is printed
 /// when none was ever recorded, so the quota output stays as it was.
 fn provider_statuses(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
+    if let Some(error) = &view.status_error {
+        return output.line(format!("provider status: unreadable: {error}"));
+    }
     if view.status_examined == 0 {
         return Ok(());
     }
@@ -230,38 +225,44 @@ fn provider_statuses(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
         STATUS_STALE_AFTER_SECONDS / 3_600
     ))?;
     for status in &view.statuses {
-        let age = status_age_seconds(view.now, status);
-        let mut line = format!(
-            "{} status {} ({})",
-            status_provider_label(status),
-            joined(&status.indicator, String::clone),
-            joined(&status.description, String::clone),
-        );
-        if !status.components.is_empty() {
-            line.push_str(&format!(
-                "; not operational: {}",
-                page_items(&status.components, false)
-            ));
-        }
-        if !status.incidents.is_empty() {
-            line.push_str(&format!(
-                "; incidents: {}",
-                page_items(&status.incidents, true)
-            ));
-        }
-        line.push_str(&format!(
-            "; age {}{}; host {}; provider's own status page",
-            format_age(age),
-            if age > STATUS_STALE_AFTER_SECONDS {
-                " STALE"
-            } else {
-                ""
-            },
-            joined(&status.host, String::clone),
-        ));
-        output.line(line)?;
+        output.line(status_line(view.now, status))?;
     }
     Ok(())
+}
+
+/// One provider's latest status page reading, as both `show` and the Orient
+/// section print it.
+fn status_line(now: i128, status: &ProviderStatusView) -> String {
+    let age = status_age_seconds(now, status);
+    let mut line = format!(
+        "{} status {} ({})",
+        provider_label(&status.provider_name, status.provider),
+        joined(&status.indicator, String::clone),
+        joined(&status.description, String::clone),
+    );
+    if !status.components.is_empty() {
+        line.push_str(&format!(
+            "; not operational: {}",
+            page_items(&status.components, false)
+        ));
+    }
+    if !status.incidents.is_empty() {
+        line.push_str(&format!(
+            "; incidents: {}",
+            page_items(&status.incidents, true)
+        ));
+    }
+    line.push_str(&format!(
+        "; age {}{}; host {}; provider's own status page",
+        format_age(age),
+        if age > STATUS_STALE_AFTER_SECONDS {
+            " STALE"
+        } else {
+            ""
+        },
+        joined(&status.host, String::clone),
+    ));
+    line
 }
 
 /// One line per status page: what was recorded, or a loud failure.
@@ -273,14 +274,18 @@ pub fn provider_status(outcomes: &[StatusOutcome], output: &mut Out<'_>) -> Resu
         match &outcome.result {
             Ok(receipt) => {
                 let status = &receipt.status;
+                let incidents = if status.incidents_listed {
+                    format!("{} incidents", status.incidents.len())
+                } else {
+                    "no incidents field on the page".to_owned()
+                };
                 output.line(format!(
                     "recorded {:x}: {provider} status {} ({}); {} components not operational, \
-                     {} incidents; observed {}; host {}; provider's own status page {}",
+                     {incidents}; observed {}; host {}; provider's own status page {}",
                     receipt.event,
                     status.indicator,
                     status.description,
                     status.components.len(),
-                    status.incidents.len(),
                     format_instant(status.observed_at),
                     status.host,
                     outcome.url,
@@ -295,11 +300,12 @@ pub fn provider_status(outcomes: &[StatusOutcome], output: &mut Out<'_>) -> Resu
     Ok(())
 }
 
-/// The compact block Orient's overview carries: one line per group, no
-/// preamble. Empty when nothing is recorded, so the overview omits it. The
-/// account appears only when the view holds more than one.
+/// The compact block Orient's overview carries: one line per group, then one
+/// per provider status page, no preamble. Empty when nothing is recorded, so
+/// the overview omits it. The account appears only when the view holds more
+/// than one.
 pub fn section(view: &QuotaView) -> String {
-    if view.groups.is_empty() {
+    if view.groups.is_empty() && view.statuses.is_empty() && view.status_error.is_none() {
         return String::new();
     }
     let accounts: std::collections::BTreeSet<&str> = view
@@ -317,7 +323,7 @@ pub fn section(view: &QuotaView) -> String {
         };
         text.push_str(&format!(
             "- {} {}{}{}: used {}, {}; age {}{}; resets {}\n",
-            provider_label(group),
+            provider_label(&group.provider_name, group.provider),
             format_window(group.window_secs),
             bucket_label(group.bucket.as_deref()),
             account,
@@ -332,6 +338,12 @@ pub fn section(view: &QuotaView) -> String {
                 quota::tai_ns_to_unix(*at)
             )),
         ));
+    }
+    for status in &view.statuses {
+        text.push_str(&format!("- {}\n", status_line(view.now, status)));
+    }
+    if let Some(error) = &view.status_error {
+        text.push_str(&format!("- provider status: unreadable: {error}\n"));
     }
     text
 }
@@ -357,7 +369,7 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
             let resets_text: Vec<String> = resets.iter().map(|at| format_instant(*at)).collect();
             json!({
                 "event": format!("{:x}", group.event),
-                "provider": provider_label(group),
+                "provider": provider_label(&group.provider_name, group.provider),
                 "provider_id": format!("{:x}", group.provider),
                 "account": group.account,
                 "window_secs": group.window_secs,
@@ -387,7 +399,7 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
             let age = status_age_seconds(view.now, status);
             json!({
                 "event": format!("{:x}", status.event),
-                "provider": status_provider_label(status),
+                "provider": provider_label(&status.provider_name, status.provider),
                 "provider_id": format!("{:x}", status.provider),
                 "source": "provider's own status page",
                 "indicator": one_or_many(&status.indicator),
@@ -409,6 +421,7 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
         "stale_after_secs": STALE_AFTER_SECONDS,
         "groups": groups,
         "status_examined": view.status_examined,
+        "status_error": view.status_error,
         "status_stale_after_secs": STATUS_STALE_AFTER_SECONDS,
         "provider_status": statuses,
     });
@@ -473,6 +486,7 @@ mod tests {
             ],
             status_examined: 0,
             statuses: Vec::new(),
+            status_error: None,
         };
         let text = section(&view);
         assert_eq!(
@@ -488,5 +502,26 @@ mod tests {
         assert!(section(&view).contains("- claude 5h acct a1b2c3d4: used 9%"));
         view.groups.clear();
         assert_eq!(section(&view), "");
+
+        view.statuses = vec![ProviderStatusView {
+            event: id_hex!("33333333333333333333333333333333"),
+            provider: id_hex!("22222222222222222222222222222222"),
+            provider_name: Some("codex".to_owned()),
+            observed: quota::unix_to_tai_ns(NOW - 2 * 3_600),
+            indicator: vec!["major".to_owned()],
+            description: vec!["Partial System Outage".to_owned()],
+            components: vec![PageItem {
+                name: "Codex".to_owned(),
+                status: "partial_outage".to_owned(),
+            }],
+            incidents: Vec::new(),
+            host: vec!["sky".to_owned()],
+        }];
+        assert_eq!(
+            section(&view),
+            "Quota:\n\
+             - codex status major (Partial System Outage); not operational: Codex \
+             partial_outage; age 2h00m STALE; host sky; provider's own status page\n"
+        );
     }
 }

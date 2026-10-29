@@ -73,6 +73,9 @@ pub struct ProviderStatus {
     pub components: Vec<PageItem>,
     /// Every incident the summary lists, sorted.
     pub incidents: Vec<PageItem>,
+    /// Whether the page carries an incidents field at all. status.openai.com
+    /// leaves it out, and "0 incidents" would claim more than the page said.
+    pub incidents_listed: bool,
     /// Unix seconds.
     pub observed_at: i64,
     pub host: String,
@@ -86,7 +89,7 @@ struct Summary {
     #[serde(default)]
     components: Vec<SummaryItem>,
     #[serde(default)]
-    incidents: Vec<SummaryItem>,
+    incidents: Option<Vec<SummaryItem>>,
 }
 
 #[derive(Deserialize)]
@@ -95,10 +98,35 @@ struct SummaryStatus {
     description: String,
 }
 
+/// Both fields are optional so that one malformed item is skipped rather
+/// than costing the whole reading.
 #[derive(Deserialize)]
 struct SummaryItem {
-    name: String,
-    status: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+impl SummaryItem {
+    fn item(self) -> Option<PageItem> {
+        Some(PageItem {
+            name: clean(self.name?),
+            status: clean(self.status?),
+        })
+    }
+}
+
+/// Page text goes into agent-read output, so control characters (a newline
+/// or an escape sequence that could forge a line) become spaces.
+fn clean(text: String) -> String {
+    if text.chars().any(char::is_control) {
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect()
+    } else {
+        text
+    }
 }
 
 /// Fetch one summary document over HTTPS with a short timeout.
@@ -138,35 +166,30 @@ pub fn parse_summary(
     let mut components: Vec<PageItem> = summary
         .components
         .into_iter()
+        .filter_map(SummaryItem::item)
         .filter(|component| component.status != OPERATIONAL)
-        .map(|component| PageItem {
-            name: component.name,
-            status: component.status,
-        })
         .collect();
     components.sort();
     components.dedup();
+    let incidents_listed = summary.incidents.is_some();
     let mut incidents: Vec<PageItem> = summary
         .incidents
+        .unwrap_or_default()
         .into_iter()
-        .map(|incident| PageItem {
-            name: incident.name,
-            status: incident.status,
-        })
+        .filter_map(SummaryItem::item)
         .collect();
     incidents.sort();
     incidents.dedup();
-    let status = ProviderStatus {
+    Ok(ProviderStatus {
         provider,
-        indicator: summary.status.indicator,
-        description: summary.status.description,
+        indicator: clean(summary.status.indicator),
+        description: clean(summary.status.description),
         components,
         incidents,
+        incidents_listed,
         observed_at,
         host: host.trim().to_owned(),
-    };
-    validate(&status)?;
-    Ok(status)
+    })
 }
 
 /// Writer-side checks. Readers never apply these: they show what is there.
@@ -197,7 +220,7 @@ pub fn status_fragment(status: &ProviderStatus) -> Result<(Fragment, Id)> {
     let mut fragment = Fragment::empty();
     let indicator: TextHandle = fragment.put(status.indicator.clone());
     let description: TextHandle = fragment.put(status.description.clone());
-    let host: TextHandle = fragment.put(status.host.trim().to_owned());
+    let host: TextHandle = fragment.put(status.host.clone());
     let items = |items: &[PageItem]| {
         let mut children = Fragment::empty();
         for item in items {
@@ -331,13 +354,72 @@ mod tests {
     fn a_page_without_an_indicator_is_not_a_reading() {
         assert!(parse_summary(PROVIDER_CLAUDE, b"<html>maintenance</html>", 100, "sky").is_err());
         assert!(parse_summary(PROVIDER_CLAUDE, br#"{"components": []}"#, 100, "sky").is_err());
-        assert!(parse_summary(
+        // An empty indicator parses, and the writer refuses to record it.
+        let empty = parse_summary(
             PROVIDER_CLAUDE,
             br#"{"status": {"indicator": "", "description": ""}}"#,
             100,
-            "sky"
+            "sky",
         )
-        .is_err());
+        .unwrap();
+        assert!(status_fragment(&empty).is_err());
+    }
+
+    #[test]
+    fn a_malformed_item_is_skipped_not_the_page() {
+        let status = parse_summary(
+            PROVIDER_CODEX,
+            br#"{"status": {"indicator": "minor", "description": "Partial"},
+                "components": [
+                    {"name": "Codex", "status": "degraded_performance"},
+                    {"name": "No status"},
+                    {"status": "major_outage"},
+                    {"name": "Null", "status": null},
+                    {"name": "Fine", "status": "operational"}
+                ]}"#,
+            100,
+            "sky",
+        )
+        .unwrap();
+        assert_eq!(
+            status.components,
+            vec![item("Codex", "degraded_performance")]
+        );
+    }
+
+    #[test]
+    fn a_page_without_an_incidents_field_says_so() {
+        let unlisted = parse_summary(
+            PROVIDER_CODEX,
+            br#"{"status": {"indicator": "none", "description": "Fine"}, "components": []}"#,
+            100,
+            "sky",
+        )
+        .unwrap();
+        assert!(!unlisted.incidents_listed);
+        let listed = parse_summary(
+            PROVIDER_CODEX,
+            br#"{"status": {"indicator": "none", "description": "Fine"}, "incidents": []}"#,
+            100,
+            "sky",
+        )
+        .unwrap();
+        assert!(listed.incidents_listed);
+        assert!(listed.incidents.is_empty());
+    }
+
+    #[test]
+    fn page_text_cannot_carry_control_characters() {
+        let status = parse_summary(
+            PROVIDER_CLAUDE,
+            b"{\"status\": {\"indicator\": \"none\", \"description\": \"All\\nfine\\u001b[31m\"},
+               \"incidents\": [{\"name\": \"a\\r\\nb\", \"status\": \"resolved\"}]}",
+            100,
+            "sky",
+        )
+        .unwrap();
+        assert_eq!(status.description, "All fine [31m");
+        assert_eq!(status.incidents, vec![item("a  b", "resolved")]);
     }
 
     #[test]

@@ -110,6 +110,10 @@ pub struct QuotaView {
     pub status_examined: usize,
     /// The latest status observation per provider.
     pub statuses: Vec<ProviderStatusView>,
+    /// Why the status observations could not be read, when they could not.
+    /// The quota groups are still shown: a status text that has not arrived
+    /// yet must not hide readings that are fine.
+    pub status_error: Option<String>,
 }
 
 impl Quota {
@@ -146,48 +150,51 @@ impl Quota {
         mut clock: impl FnMut() -> Result<i64>,
         host: &str,
     ) -> Result<Vec<StatusOutcome>> {
-        let mut outcomes = Vec::new();
-        let mut publish = Vec::new();
-        for &(provider, url) in &status::STATUS_PAGES {
-            let reading = fetch(url).and_then(|body| {
-                let status = status::parse_summary(provider, &body, clock()?, host)
-                    .with_context(|| format!("read {url}"))?;
-                let (fragment, event) = status::status_fragment(&status)?;
-                Ok((status, fragment, event))
-            });
-            match reading {
-                Ok(reading) => publish.push((provider, url, reading)),
-                Err(error) => outcomes.push(StatusOutcome {
-                    provider,
-                    url,
-                    result: Err(error),
-                }),
-            }
+        let readings: Vec<_> = status::STATUS_PAGES
+            .iter()
+            .map(|&(provider, url)| {
+                let reading = fetch(url).and_then(|body| {
+                    let status = status::parse_summary(provider, &body, clock()?, host)
+                        .with_context(|| format!("read {url}"))?;
+                    let (fragment, event) = status::status_fragment(&status)?;
+                    Ok((status, fragment, event))
+                });
+                (provider, url, reading)
+            })
+            .collect();
+        let outcome = |provider, url, result| StatusOutcome {
+            provider,
+            url,
+            result,
+        };
+        // Every page failed: report them without opening the pile.
+        if readings.iter().all(|(_, _, reading)| reading.is_err()) {
+            return Ok(readings
+                .into_iter()
+                .filter_map(|(provider, url, reading)| {
+                    reading
+                        .err()
+                        .map(|error| outcome(provider, url, Err(error)))
+                })
+                .collect());
         }
-        if !publish.is_empty() {
-            outcomes.extend(self.storage.with_store(|pile, signer, runtime| {
-                Ok(publish
-                    .into_iter()
-                    .map(|(provider, url, (status, fragment, event))| StatusOutcome {
-                        provider,
-                        url,
-                        result: commit_quota(&self.storage, pile, signer, fragment, runtime).map(
-                            |commit| RecordedStatus {
+        self.storage.with_store(|pile, signer, runtime| {
+            Ok(readings
+                .into_iter()
+                .map(|(provider, url, reading)| {
+                    let result = reading.and_then(|(status, fragment, event)| {
+                        commit_quota(&self.storage, pile, signer, fragment, runtime).map(|commit| {
+                            RecordedStatus {
                                 event,
                                 commit,
                                 status,
-                            },
-                        ),
-                    })
-                    .collect::<Vec<_>>())
-            })?);
-        }
-        outcomes.sort_by_key(|outcome| {
-            status::STATUS_PAGES
-                .iter()
-                .position(|(provider, _)| *provider == outcome.provider)
-        });
-        Ok(outcomes)
+                            }
+                        })
+                    });
+                    outcome(provider, url, result)
+                })
+                .collect())
+        })
     }
 
     pub fn show(&self) -> Result<QuotaView> {
@@ -278,13 +285,17 @@ pub fn observe_at(
                 &right.bucket,
             ))
     });
-    let (status_examined, statuses) = observe_statuses(&facts, &snapshot)?;
+    let (status_examined, statuses, status_error) = match observe_statuses(&facts, &snapshot) {
+        Ok((examined, statuses)) => (examined, statuses, None),
+        Err(error) => (0, Vec::new(), Some(format!("{error:#}"))),
+    };
     Ok(QuotaView {
         now,
         examined,
         groups,
         status_examined,
         statuses,
+        status_error,
     })
 }
 
