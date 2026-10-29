@@ -596,7 +596,7 @@ mod tests {
             "--callback-timeout",
             "1s",
             "--run-for",
-            "100ms",
+            "2s",
             "--poll-ms",
             "10",
         ])
