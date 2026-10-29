@@ -17,7 +17,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "quota_show",
-        description: "Show the latest reading per provider, account, window and bucket: used %, elapsed % of the window, a pace verdict (a planning heuristic with a 5-point margin), the age of the last recorded observation (STALE after 6 h, never dropped), and the reset time in UTC and Europe/Berlin. States how many observations it examined.",
+        description: "Show the latest reading per provider, account, window and bucket: used %, elapsed % of the window, a pace verdict (a planning heuristic with a 5-point margin), the age of the last recorded observation (STALE after 6 h, never dropped), and the reset time in UTC and Europe/Berlin. When any were recorded, also the latest reading of each provider's own public status page (the provider's claim, not a measurement; STALE after 1 h). States how many observations it examined.",
         input_schema: r#"{"type":"object","properties":{"json":{"type":"boolean","default":false}},"additionalProperties":false}"#,
     },
 ];

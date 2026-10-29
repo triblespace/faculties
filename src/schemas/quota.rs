@@ -20,6 +20,14 @@
 //! the explicit-anchor form, so each value encoding participates in identity.
 //! `quota::bucket` (`89BD8E51C098EEAFF7D740DB3962882D`) was minted later on
 //! 2026-10-25, so two allowances with the same window length stay apart.
+//!
+//! A provider status observation is a second record kind in the same
+//! collection: one reading of a provider's own public status page (its claim
+//! about itself, not our measurement). It reuses `quota::provider`,
+//! `quota::host`, `metadata::created_at` for the observation time and
+//! `metadata::name` for component and incident names. Its own ids, in
+//! [`provider_status`] and [`KIND_PROVIDER_STATUS_OBSERVATION`], were minted
+//! with `trible genid` on 2026-10-29.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;
@@ -35,6 +43,12 @@ pub const DEFAULT_SCOPE_ID: Id = id_hex!("6B6C08A47B334284A56279D961255250");
 /// Minted with `trible genid` on 2026-10-25:
 /// `92B1A5113408368BF20912C6EBFAC6C1`.
 pub const KIND_QUOTA_OBSERVATION: Id = id_hex!("92B1A5113408368BF20912C6EBFAC6C1");
+
+/// Kind marker carried by every provider status observation.
+///
+/// Minted with `trible genid` on 2026-10-29:
+/// `690BFDAA0BA82913B1C9D08ACDECAE78`.
+pub const KIND_PROVIDER_STATUS_OBSERVATION: Id = id_hex!("690BFDAA0BA82913B1C9D08ACDECAE78");
 
 /// The Anthropic Claude subscription (Claude Code's `rate_limits`).
 ///
@@ -77,5 +91,25 @@ pub mod quota {
         /// grouping key, so two allowances with equal window lengths never
         /// merge; an observation without one groups as "no bucket".
         "89BD8E51C098EEAFF7D740DB3962882D" as bucket: inlineencodings::Handle<blobencodings::UTF8String>;
+    }
+}
+
+pub mod provider_status {
+    use super::*;
+    attributes! {
+        /// The page's overall indicator, as it states it (Statuspage uses
+        /// none, minor, major, critical, maintenance).
+        "BF0813CC8E1E5EB6126F1E1E42E53314" as indicator: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The page's overall description, e.g. "All Systems Operational".
+        "BB0C2102FC0B7F19D976B7B596783A9E" as description: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// A component the page did not call operational: a child entity
+        /// with `metadata::name` and [`state`].
+        "A3C7327302516D7897F32F9AE1C89873" as component: inlineencodings::GenId;
+        /// An incident the page listed: a child entity with `metadata::name`
+        /// and [`state`].
+        "02D5642F13A387C39FF8FE5D9B5F9D86" as incident: inlineencodings::GenId;
+        /// The status the page gives a component or an incident, as it
+        /// states it (e.g. full_outage, identified).
+        "71B9D5CFAB1A20DEA74FC0AFEBD96D27" as state: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }

@@ -3,7 +3,7 @@
 use super::{render, Quota};
 use crate::out::Out;
 use crate::quota::{self, Observation};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -56,7 +56,17 @@ enum Command {
         #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         bucket: Option<String>,
     },
-    /// Show the latest reading per provider, account, window and bucket.
+    /// Read each provider's own public status page (Statuspage v2
+    /// summary.json for claude and codex) and record one observation per
+    /// page. A page that cannot be fetched or parsed records nothing and
+    /// makes the command fail after the others are recorded.
+    ProviderStatus {
+        /// Observing host. Default: this machine's short host name.
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Show the latest reading per provider, account, window and bucket, and
+    /// the latest reading of each provider's own status page.
     Show {
         /// Print one JSON document instead of text.
         #[arg(long)]
@@ -96,6 +106,28 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                 bucket,
             };
             render::record(&operations.record(observation)?, output)
+        }
+        Command::ProviderStatus { host } => {
+            let host = match host {
+                Some(host) => host,
+                None => quota::local_host()?,
+            };
+            let outcomes = operations.provider_status(
+                quota::status::fetch_summary,
+                || Ok(quota::tai_ns_to_unix(crate::clock::tai_nanoseconds_now()?)),
+                &host,
+            )?;
+            render::provider_status(&outcomes, output)?;
+            let failed: Vec<&str> = outcomes
+                .iter()
+                .filter(|outcome| outcome.result.is_err())
+                .map(|outcome| quota::known_provider_name(outcome.provider).unwrap_or("unknown"))
+                .collect();
+            if !failed.is_empty() {
+                let failed = failed.join(", ");
+                bail!("status page unreadable for {failed}; nothing recorded for {failed}");
+            }
+            Ok(())
         }
         Command::Show { json } => {
             let view = operations.show()?;
@@ -138,6 +170,14 @@ mod tests {
             args.extend(["--bucket", bucket]);
         }
         args
+    }
+
+    #[test]
+    fn provider_status_takes_only_an_optional_host() {
+        let base = ["quota", "--pile", "unused.pile", "provider-status"];
+        assert!(Cli::try_parse_from(base).is_ok());
+        assert!(Cli::try_parse_from(base.iter().chain(&["--host", "sky"])).is_ok());
+        assert!(Cli::try_parse_from(base.iter().chain(&["--url", "x"])).is_err());
     }
 
     #[test]

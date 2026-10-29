@@ -1,0 +1,47 @@
+{
+  "page": {
+    "id": "tymt9n04zgry",
+    "name": "Claude",
+    "url": "https://status.claude.com",
+    "time_zone": "Etc/UTC",
+    "updated_at": "2026-10-29T08:30:00.000Z"
+  },
+  "components": [
+    {
+      "id": "c-claude-ai",
+      "name": "claude.ai",
+      "status": "operational",
+      "created_at": "2023-07-11T00:00:00.000Z",
+      "updated_at": "2026-10-29T08:30:00.000Z",
+      "position": 1,
+      "description": null,
+      "showcase": true,
+      "start_date": null,
+      "group_id": null,
+      "page_id": "tymt9n04zgry",
+      "group": false,
+      "only_show_if_degraded": false
+    },
+    {
+      "id": "c-claude-code",
+      "name": "Claude Code",
+      "status": "operational",
+      "created_at": "2025-02-24T00:00:00.000Z",
+      "updated_at": "2026-10-29T08:30:00.000Z",
+      "position": 2,
+      "description": null,
+      "showcase": true,
+      "start_date": null,
+      "group_id": null,
+      "page_id": "tymt9n04zgry",
+      "group": false,
+      "only_show_if_degraded": false
+    }
+  ],
+  "incidents": [],
+  "scheduled_maintenances": [],
+  "status": {
+    "indicator": "none",
+    "description": "All Systems Operational"
+  }
+}

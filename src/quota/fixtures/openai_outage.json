@@ -1,0 +1,85 @@
+{
+  "page": {
+    "id": "01JMXXXXXXXXXXXXXXXXXXXXXX",
+    "name": "OpenAI",
+    "url": "https://status.openai.com",
+    "time_zone": "Etc/UTC",
+    "updated_at": "2026-10-29T08:41:12.000Z"
+  },
+  "status": {
+    "indicator": "critical",
+    "description": "Major System Outage"
+  },
+  "components": [
+    {
+      "id": "c-apis",
+      "name": "APIs",
+      "status": "operational",
+      "created_at": "2025-01-01T00:00:00.000Z",
+      "updated_at": "2026-10-29T08:41:12.000Z",
+      "position": 1,
+      "description": null,
+      "showcase": true,
+      "start_date": null,
+      "group_id": null,
+      "page_id": "01JMXXXXXXXXXXXXXXXXXXXXXX",
+      "group": false,
+      "only_show_if_degraded": false
+    },
+    {
+      "id": "c-codex",
+      "name": "Codex",
+      "status": "full_outage",
+      "created_at": "2025-01-01T00:00:00.000Z",
+      "updated_at": "2026-10-29T08:41:12.000Z",
+      "position": 2,
+      "description": "Codex CLI, cloud tasks and IDE extension",
+      "showcase": true,
+      "start_date": null,
+      "group_id": null,
+      "page_id": "01JMXXXXXXXXXXXXXXXXXXXXXX",
+      "group": false,
+      "only_show_if_degraded": false
+    },
+    {
+      "id": "c-chatgpt",
+      "name": "ChatGPT",
+      "status": "full_outage",
+      "created_at": "2025-01-01T00:00:00.000Z",
+      "updated_at": "2026-10-29T08:41:12.000Z",
+      "position": 3,
+      "description": null,
+      "showcase": true,
+      "start_date": null,
+      "group_id": null,
+      "page_id": "01JMXXXXXXXXXXXXXXXXXXXXXX",
+      "group": false,
+      "only_show_if_degraded": false
+    }
+  ],
+  "incidents": [
+    {
+      "id": "i-codex",
+      "name": "Issues with Codex",
+      "status": "identified",
+      "impact": "critical",
+      "created_at": "2026-10-29T08:12:00.000Z",
+      "updated_at": "2026-10-29T08:41:12.000Z",
+      "monitoring_at": null,
+      "resolved_at": null,
+      "shortlink": "https://stspg.io/example",
+      "started_at": "2026-10-29T08:10:00.000Z",
+      "page_id": "01JMXXXXXXXXXXXXXXXXXXXXXX",
+      "incident_updates": [
+        {
+          "id": "u-1",
+          "status": "identified",
+          "body": "We have identified the issue and are working on a fix.",
+          "created_at": "2026-10-29T08:41:12.000Z"
+        }
+      ],
+      "components": []
+    }
+  ],
+  "scheduled_maintenances": []
+}

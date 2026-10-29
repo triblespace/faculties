@@ -4,8 +4,9 @@ use chrono::{DateTime, Utc};
 use chrono_tz::Europe::Berlin;
 use serde_json::{json, Value};
 
-use super::{QuotaGroup, QuotaView, RecordedObservation};
+use super::{ProviderStatusView, QuotaGroup, QuotaView, RecordedObservation, StatusOutcome};
 use crate::out::Out;
+use crate::quota::status::{PageItem, STATUS_STALE_AFTER_SECONDS};
 use crate::quota::{self, Pace, PACE_MARGIN_POINTS, STALE_AFTER_SECONDS};
 use anyhow::Result;
 
@@ -65,6 +66,32 @@ fn provider_label(group: &QuotaGroup) -> String {
         .provider_name
         .clone()
         .unwrap_or_else(|| format!("{:x}", group.provider))
+}
+
+fn status_provider_label(status: &ProviderStatusView) -> String {
+    status
+        .provider_name
+        .clone()
+        .unwrap_or_else(|| format!("{:x}", status.provider))
+}
+
+fn status_age_seconds(now: i128, status: &ProviderStatusView) -> i64 {
+    i64::try_from((now - status.observed) / NANOS_PER_SECOND).unwrap_or(i64::MAX)
+}
+
+/// "Codex full_outage, ChatGPT partial_outage".
+fn page_items(items: &[PageItem], quote: bool) -> String {
+    items
+        .iter()
+        .map(|item| {
+            if quote {
+                format!("{:?} {}", item.name, item.status)
+            } else {
+                format!("{} {}", item.name, item.status)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// " bucket <name>" when the observation names an allowance, else nothing.
@@ -155,7 +182,7 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
         STALE_AFTER_SECONDS / 3_600
     ))?;
     if view.groups.is_empty() {
-        return output.line("- (no observations recorded)");
+        output.line("- (no observations recorded)")?;
     }
     for group in &view.groups {
         let derived = derive(view.now, group);
@@ -184,6 +211,86 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
             )),
             joined(&group.host, String::clone),
         ))?;
+    }
+    provider_statuses(view, output)
+}
+
+/// The latest reading of each provider's own status page. Nothing is printed
+/// when none was ever recorded, so the quota output stays as it was.
+fn provider_statuses(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
+    if view.status_examined == 0 {
+        return Ok(());
+    }
+    output.line(format!(
+        "provider status: {} observations examined, {} providers shown (the latest per \
+         provider, by observed time). Each is the provider's own status page, its claim about \
+         itself, not our measurement; STALE after {}h.",
+        view.status_examined,
+        view.statuses.len(),
+        STATUS_STALE_AFTER_SECONDS / 3_600
+    ))?;
+    for status in &view.statuses {
+        let age = status_age_seconds(view.now, status);
+        let mut line = format!(
+            "{} status {} ({})",
+            status_provider_label(status),
+            joined(&status.indicator, String::clone),
+            joined(&status.description, String::clone),
+        );
+        if !status.components.is_empty() {
+            line.push_str(&format!(
+                "; not operational: {}",
+                page_items(&status.components, false)
+            ));
+        }
+        if !status.incidents.is_empty() {
+            line.push_str(&format!(
+                "; incidents: {}",
+                page_items(&status.incidents, true)
+            ));
+        }
+        line.push_str(&format!(
+            "; age {}{}; host {}; provider's own status page",
+            format_age(age),
+            if age > STATUS_STALE_AFTER_SECONDS {
+                " STALE"
+            } else {
+                ""
+            },
+            joined(&status.host, String::clone),
+        ));
+        output.line(line)?;
+    }
+    Ok(())
+}
+
+/// One line per status page: what was recorded, or a loud failure.
+pub fn provider_status(outcomes: &[StatusOutcome], output: &mut Out<'_>) -> Result<()> {
+    for outcome in outcomes {
+        let provider = quota::known_provider_name(outcome.provider)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{:x}", outcome.provider));
+        match &outcome.result {
+            Ok(receipt) => {
+                let status = &receipt.status;
+                output.line(format!(
+                    "recorded {:x}: {provider} status {} ({}); {} components not operational, \
+                     {} incidents; observed {}; host {}; provider's own status page {}",
+                    receipt.event,
+                    status.indicator,
+                    status.description,
+                    status.components.len(),
+                    status.incidents.len(),
+                    format_instant(status.observed_at),
+                    status.host,
+                    outcome.url,
+                ))?;
+            }
+            Err(error) => output.line(format!(
+                "FAILED {provider}: {error:#}; nothing recorded for {provider} (status page {})",
+                outcome.url
+            ))?,
+        }
     }
     Ok(())
 }
@@ -267,6 +374,33 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
             })
         })
         .collect();
+    let page_items = |items: &[PageItem]| -> Vec<Value> {
+        items
+            .iter()
+            .map(|item| json!({ "name": item.name, "status": item.status }))
+            .collect()
+    };
+    let statuses: Vec<Value> = view
+        .statuses
+        .iter()
+        .map(|status| {
+            let age = status_age_seconds(view.now, status);
+            json!({
+                "event": format!("{:x}", status.event),
+                "provider": status_provider_label(status),
+                "provider_id": format!("{:x}", status.provider),
+                "source": "provider's own status page",
+                "indicator": one_or_many(&status.indicator),
+                "description": one_or_many(&status.description),
+                "components_not_operational": page_items(&status.components),
+                "incidents": page_items(&status.incidents),
+                "observed_at": quota::tai_ns_to_unix(status.observed),
+                "age_secs": age,
+                "stale": age > STATUS_STALE_AFTER_SECONDS,
+                "host": one_or_many(&status.host),
+            })
+        })
+        .collect();
     let document = json!({
         "now": quota::tai_ns_to_unix(view.now),
         "examined": view.examined,
@@ -274,6 +408,9 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
         "pace_margin_points": PACE_MARGIN_POINTS,
         "stale_after_secs": STALE_AFTER_SECONDS,
         "groups": groups,
+        "status_examined": view.status_examined,
+        "status_stale_after_secs": STATUS_STALE_AFTER_SECONDS,
+        "provider_status": statuses,
     });
     output.line(serde_json::to_string_pretty(&document)?)
 }
@@ -334,6 +471,8 @@ mod tests {
                     5 * 86_400,
                 ),
             ],
+            status_examined: 0,
+            statuses: Vec::new(),
         };
         let text = section(&view);
         assert_eq!(

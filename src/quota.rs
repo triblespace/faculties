@@ -12,13 +12,21 @@
 //! Reads are typed queries at the point of use. A fact this build does not
 //! model is ignored, and a record missing a field it does not need for
 //! grouping still shows, with that field reported as missing.
+//!
+//! The same collection also holds readings of the providers' own public
+//! status pages ([`status`]): the provider's claim about itself, shown beside
+//! the quota and never mistaken for a measurement of ours.
 
 pub mod cli;
 pub mod mcp;
 pub mod operations;
 pub mod render;
+pub mod status;
 
-pub use operations::{Quota, QuotaGroup, QuotaView, RecordedObservation};
+pub use operations::{
+    ProviderStatusView, Quota, QuotaGroup, QuotaView, RecordedObservation, RecordedStatus,
+    StatusOutcome,
+};
 
 use std::collections::BTreeMap;
 
