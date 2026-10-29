@@ -7606,6 +7606,128 @@ mod tests {
         assert_eq!(out, "ada: one ¶ two ¶ three\nbo: short\n");
     }
 
+    /// Only a genuine error reaching the observe loop is an exit; a deliberate
+    /// stop (`--run-for`, a deadline the daemon maps to Ok) records nothing.
+    #[test]
+    fn only_an_error_ending_a_news_path_writes_an_exit_record() {
+        use crate::schemas::orient::{KIND_NEWS_PATH_BEAT, KIND_NEWS_PATH_EXIT};
+        use crate::schemas::swarm_health::{attrs as health_attrs, DEFAULT_SCOPE_ID};
+
+        let observe = |failing_sink: bool| -> (usize, Vec<String>, Result<()>) {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = test_block_on(OrientSources::open(
+                &test_storage(),
+                &mut pile,
+                &fixture.signer,
+                false,
+            ))
+            .unwrap();
+            let reader = id(98);
+            let sender = id(99);
+            for (person, label) in [(reader, "exit-reader"), (sender, "exit-sender")] {
+                let (fragment, _, _) = relations::person_fragment(
+                    person,
+                    crate::relations::ProfileInput {
+                        label: label.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                pile.commit(sources.relations.source, &fixture.signer, fragment)
+                    .unwrap();
+            }
+            if failing_sink {
+                let (fragment, _) = message::message_fragment(
+                    sender,
+                    &message::Recipient::Person(reader),
+                    "news the sink refuses",
+                    clock::point_now().unwrap(),
+                );
+                pile.commit(sources.messages.source, &fixture.signer, fragment)
+                    .unwrap();
+            }
+            let mut emit = |part| {
+                let crate::out::Part::Text { text } = part else {
+                    bail!("expected text")
+                };
+                if failing_sink && !text.starts_with("note: ") {
+                    bail!("Orient delivery callback failed (exit status: 1)");
+                }
+                Ok(())
+            };
+            let options = WaitOptions {
+                timeout: Some(Duration::from_millis(500)),
+                poll_interval: Duration::from_millis(20),
+                form: NewsForm::Report,
+            };
+            let result = runtime().unwrap().block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    cmd_observe(
+                        &test_storage(),
+                        &mut pile,
+                        &fixture.signer,
+                        &fixture.path,
+                        Some("exit-reader"),
+                        &options,
+                        Duration::from_secs(180),
+                        None,
+                        true,
+                        &mut Out::new(&mut emit),
+                    ),
+                )
+                .await
+                .expect("a bounded observation ends")
+            });
+            let health = test_block_on(OrientSource::open(
+                &test_storage(),
+                &mut pile,
+                &fixture.signer,
+                DEFAULT_SCOPE_ID,
+                "Swarm health",
+            ))
+            .unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let facts = health.observe(&snapshot).unwrap();
+            let beats = find!(
+                beat: Id,
+                pattern!(facts.view(), [{ ?beat @
+                    metadata::tag: &KIND_NEWS_PATH_BEAT,
+                    health_attrs::node: &reader,
+                }])
+            )
+            .count();
+            let exits = find!(
+                reason: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+                pattern!(facts.view(), [{ _?exit @
+                    metadata::tag: &KIND_NEWS_PATH_EXIT,
+                    health_attrs::node: &reader,
+                    metadata::description: ?reason,
+                }])
+            )
+            .map(|reason| read_utf8(&snapshot, reason, "exit reason").unwrap())
+            .collect();
+            pile.close().unwrap();
+            (beats, exits, result)
+        };
+
+        let (beats, exits, result) = observe(false);
+        result.expect("a run-for deadline is a clean stop");
+        assert!(beats >= 1, "the observer beat while it ran");
+        assert!(
+            exits.is_empty(),
+            "a deliberate stop is not an exit: {exits:?}"
+        );
+
+        let (beats, exits, result) = observe(true);
+        let error = result.expect_err("the refused delivery ends the observer");
+        assert!(format!("{error:#}").contains("exit status: 1"));
+        assert!(beats >= 1);
+        assert_eq!(exits.len(), 1, "a genuine error writes one exit record");
+        assert!(exits[0].contains("exit status: 1"), "{exits:?}");
+    }
+
     /// `wait --stream`: each batch is written as it comes, one line per item
 
     /// with the body whole, and the observation waits again. What it wrote is
