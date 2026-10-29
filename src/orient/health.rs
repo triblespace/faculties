@@ -682,10 +682,9 @@ impl HealthSources {
             },
         };
         path.window = Some(window);
-        // A session's first beat names what it recovers from when this
-        // persona's latest record was an exit, or a beat a reader would
-        // already call silent: one register lookup here instead of a scan of
-        // the history by every reader.
+        // A session's first beat names what it follows (`session_prior`),
+        // from the register's latest record and that record's session: a few
+        // lookups here instead of a scan of the history by every reader.
         let facts = observation.facts.view();
         let prior = match path.published {
             true => None,
@@ -726,10 +725,15 @@ impl HealthSources {
 }
 
 /// What a new session's first beat follows, given the persona's latest record
-/// before it: an exit; an unresolved retry (the latest record, or a retry in
-/// that record's session newer than its latest DELIVERED), so a clean restart
-/// during a deferral keeps the evidence; or a beat or DELIVERED a reader
-/// would already call silent. A clean, current predecessor is followed by
+/// before it: an exit; an unresolved retry, so a clean restart during a
+/// deferral keeps the evidence; or else a beat or DELIVERED a reader would
+/// already call silent. A retry is unresolved when it is the latest record,
+/// when it is newer than the latest DELIVERED of that record's session, or
+/// when that session never had a report accepted and its first beat followed
+/// the retry. That last one is carried as the original record, so a chain of
+/// restarts that never reach an acceptance stays one hop deep. An unresolved
+/// retry outranks silence: the new session's polling ends a silence, only an
+/// acceptance ends a deferral. A clean, current predecessor is followed by
 /// nothing.
 fn session_prior(facts: &FactArchive, window: Id, record: Id, now: Epoch) -> Option<Id> {
     let tagged = |kind: Id| exists!(pattern!(facts, [{ record @ metadata::tag: &kind }]));
@@ -739,19 +743,19 @@ fn session_prior(facts: &FactArchive, window: Id, record: Id, now: Epoch) -> Opt
     if !(tagged(KIND_NEWS_PATH_BEAT) || tagged(KIND_NEWS_PATH_DELIVERED)) {
         return None;
     }
-    let stale = find!(
+    let silent = find!(
         created: (Epoch, Epoch),
         pattern!(facts, [{ record @ metadata::created_at: ?created }])
     )
-    .any(|created| created.1 + span(NEWS_PATH_MAX_AGE) <= now);
-    if stale {
-        return Some(record);
-    }
-    let session = find!(
+    .any(|created| created.1 + span(NEWS_PATH_MAX_AGE) <= now)
+    .then_some(record);
+    let Some(session) = find!(
         session: Id,
         pattern!(facts, [{ record @ attrs::session: ?session }])
     )
-    .next()?;
+    .next() else {
+        return silent;
+    };
     let newest = |kind: Id| {
         find!(
             (event: Id, at: (Epoch, Epoch)),
@@ -764,7 +768,7 @@ fn session_prior(facts: &FactArchive, window: Id, record: Id, now: Epoch) -> Opt
         )
         .max_by_key(|(event, at)| (at.1, *event))
     };
-    match (
+    let unresolved = match (
         newest(KIND_NEWS_PATH_RETRY),
         newest(KIND_NEWS_PATH_DELIVERED),
     ) {
@@ -773,8 +777,23 @@ fn session_prior(facts: &FactArchive, window: Id, record: Id, now: Epoch) -> Opt
         {
             Some(retry)
         }
+        (None, None) => find!(
+            carried: Id,
+            pattern!(facts, [
+                { _?first @
+                    metadata::tag: &KIND_NEWS_PATH_BEAT,
+                    metadata::tag: &schema::KIND_RECOVERED,
+                    attrs::node: &window,
+                    attrs::session: &session,
+                    metadata::supersedes: ?carried,
+                },
+                { ?carried @ metadata::tag: &KIND_NEWS_PATH_RETRY },
+            ])
+        )
+        .max(),
         _ => None,
-    }
+    };
+    unresolved.or(silent)
 }
 
 fn span(duration: Duration) -> hifitime::Duration {
@@ -2148,6 +2167,130 @@ mod tests {
         assert!(text.contains("callback accepting again"), "{text}");
         assert!(text.contains("delivery degraded since"), "{text}");
         assert!(!text.contains("polling resumed"), "{text}");
+    }
+
+    #[test]
+    fn a_deferral_stays_carried_through_restarts_that_never_accept() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let old = *fucid();
+        let input = format!("{window:x}");
+        let now = clock::now().unwrap();
+        let ago = |seconds: f64| now - hifitime::Duration::from_seconds(seconds);
+        // Session A: deferred, then stopped cleanly while its backoff was
+        // pending; no exit record and no later DELIVERED.
+        f.publish(path_beat(window, old, ago(300.0)));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let retry = path_retry(window, old, ago(60.0), ago(60.0), 1, 5.0, reason);
+        let retry_id = retry.root().unwrap();
+        f.publish(retry);
+
+        // Sessions B, C and D each beat once and stop cleanly, and none has a
+        // report accepted: every first beat names A's retry directly.
+        let mut emit = |_part| Ok(());
+        let mut out = crate::out::Out::new(&mut emit);
+        for restart in ["B", "C", "D"] {
+            f.sources.start_beating();
+            f.sources
+                .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
+                .unwrap();
+            let path = f.sources.news_path_target().expect("persona resolved");
+            let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+            assert!(
+                exists!(pattern!(observed.facts.view(), [{ _?first @
+                    metadata::tag: &KIND_NEWS_PATH_BEAT,
+                    metadata::tag: &schema::KIND_RECOVERED,
+                    attrs::node: &window,
+                    attrs::session: &path.session,
+                    metadata::supersedes: &retry_id,
+                }])),
+                "session {restart}'s first beat must reference A's unresolved retry"
+            );
+            let (text, _) = news_text(observed.news(*fucid(), &observed.attention()))
+                .expect("the restart is news for a peer");
+            assert!(text.contains("polling resumed"), "{restart}: {text}");
+            assert!(
+                text.contains("delivery degraded since"),
+                "{restart}: {text}"
+            );
+            assert!(
+                text.contains("callback_exit_75_known_not_submitted"),
+                "{restart}: {text}"
+            );
+        }
+
+        // An acceptance in D resolves it; the next session follows nothing.
+        let path = f.sources.news_path_target().expect("persona resolved");
+        on_delivery_notice(&mut f.store, &f.signer, &path, NewsPathNotice::Accepted).unwrap();
+        f.sources.start_beating();
+        f.sources
+            .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
+            .unwrap();
+        let next = f.sources.news_path_target().expect("persona resolved");
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        assert!(
+            !exists!(pattern!(observed.facts.view(), [{ _?first @
+                metadata::tag: &KIND_NEWS_PATH_BEAT,
+                attrs::session: &next.session,
+                metadata::supersedes: _?prior,
+            }])),
+            "a session after an acceptance follows nothing"
+        );
+    }
+
+    #[test]
+    fn a_carried_deferral_outranks_a_silent_session() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let old = *fucid();
+        let silent = *fucid();
+        let input = format!("{window:x}");
+        let now = clock::now().unwrap();
+        let ago = |seconds: f64| now - hifitime::Duration::from_seconds(seconds);
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let retry = path_retry(window, old, ago(3600.0), ago(3600.0), 1, 5.0, reason);
+        let retry_id = retry.root().unwrap();
+        f.publish(retry);
+        // Session B followed the retry, never had a report accepted, and then
+        // went silent without an exit record.
+        f.publish(entity! {
+            metadata::tag*: [KIND_NEWS_PATH_BEAT, schema::KIND_RECOVERED],
+            attrs::node: &window,
+            attrs::session: &silent,
+            metadata::created_at: clock::point(ago(1800.0)).unwrap(),
+            metadata::supersedes: &retry_id,
+        });
+
+        // Polling resuming ends the silence; only an acceptance ends the
+        // deferral, so session C still names the retry.
+        f.sources.start_beating();
+        let mut emit = |_part| Ok(());
+        let mut out = crate::out::Out::new(&mut emit);
+        f.sources
+            .poll_test(&mut f.store, &f.signer, &input, false, &mut out)
+            .unwrap();
+        let path = f.sources.news_path_target().expect("persona resolved");
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        assert!(
+            exists!(pattern!(observed.facts.view(), [{ _?first @
+                metadata::tag: &KIND_NEWS_PATH_BEAT,
+                metadata::tag: &schema::KIND_RECOVERED,
+                attrs::node: &window,
+                attrs::session: &path.session,
+                metadata::supersedes: &retry_id,
+            }])),
+            "session C's first beat must reference the retry, not B's silence"
+        );
+        let (text, _) = news_text(observed.news(*fucid(), &observed.attention()))
+            .expect("the restart is news for a peer");
+        assert!(text.contains("polling resumed"), "{text}");
+        assert!(text.contains("delivery degraded since"), "{text}");
     }
 
     #[test]
