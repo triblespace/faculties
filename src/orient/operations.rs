@@ -7695,8 +7695,10 @@ mod tests {
                 pile.commit(sources.messages.source, &fixture.signer, fragment)
                     .unwrap();
             }
+            // Long enough that the report is attempted (and deferred) before
+            // the deadline: the deadline must end a pending backoff.
             let deadline =
-                (mode == Stop::Deadline).then(|| Instant::now() + Duration::from_millis(300));
+                (mode == Stop::Deadline).then(|| Instant::now() + Duration::from_secs(3));
             let mut policy = RetryPolicy::new(true, deadline);
             let mut emit = |part| {
                 let crate::out::Part::Text { text } = part else {
