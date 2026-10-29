@@ -415,6 +415,11 @@ pub(super) const NEWS_PATH_ESCALATE_AFTER: Duration = Duration::from_secs(60 * 6
 ///
 /// Minted with `trible genid` on 2026-10-29.
 const NEWS_PATH_ESCALATION: Id = id_hex!("5FEBE690EA87EC872B5A16396D11F631");
+/// Tag of the silence event that follows a window's latest beat or
+/// acceptance.
+///
+/// Minted with `trible genid` on 2026-10-29.
+const NEWS_PATH_SILENCE: Id = id_hex!("C17110071EBCFEC8581BC6AFCFB11184");
 /// Tag of the silence event that follows an overdue RETRY.
 ///
 /// Minted with `trible genid` on 2026-10-29.
@@ -984,7 +989,10 @@ fn render_news_paths(
         if now >= stale_at {
             lines.push(format!("{label}: silent since {}", utc(created.1)));
             report.attention.insert(AttentionEvent::NewsPath {
-                event: record,
+                // Not the record's own id: an acceptance already named its
+                // "accepting again" event with it, and a presented id would
+                // swallow the silence that follows.
+                event: follow_up(NEWS_PATH_SILENCE, record),
                 window,
                 detail: format!(
                     "news path of {label} has not beaten since {} ({age} ago); that window may not be hearing news. Nothing restarts it automatically.",
@@ -1249,7 +1257,8 @@ fn escalation_span() -> String {
 }
 
 /// The id of an attention event that has no record of its own: the
-/// escalation of a stretch, or the silence of an overdue RETRY. It folds
+/// escalation of a stretch, or a silence after a beat, an acceptance or an
+/// overdue RETRY. It folds
 /// `tag` and the record it follows into an intrinsic id that is never
 /// written, so every render names the event the same way and a presented
 /// one is not said again. That idempotence is its only purpose: a fresh
@@ -2140,7 +2149,8 @@ mod tests {
         let (text, events) =
             news_text(silent.news(reader, &report)).expect("a silent path is news for a peer");
         assert!(text.contains("has not beaten"), "{text}");
-        assert_eq!(events, vec![beat_id]);
+        assert_eq!(events.len(), 1, "{text}");
+        assert_ne!(events[0], beat_id, "a silence has its own event");
         assert!(
             matches!(silent.news(window, &report), News::Quiet),
             "a window is not told about its own news path"
@@ -2150,7 +2160,7 @@ mod tests {
             .commit(
                 f.sources.presentations.source,
                 &f.signer,
-                orient_model::receipt_fragment([beat_id], clock::point_now().unwrap()),
+                orient_model::receipt_fragment(events, clock::point_now().unwrap()),
             )
             .unwrap();
         let later = f.observe_at(at(40.0 * 60.0));
@@ -2273,7 +2283,8 @@ mod tests {
         let (text, events) =
             news_text(silent.news(*fucid(), &silent.attention())).expect("silence again");
         assert!(text.contains("has not beaten"), "{text}");
-        assert_eq!(events, vec![beat_id]);
+        assert_eq!(events.len(), 1, "{text}");
+        assert_ne!(events[0], beat_id, "a silence has its own event");
     }
 
     #[test]
@@ -2911,10 +2922,9 @@ mod tests {
 
         let first = f.observe_at(at(21.0 * MIN));
         let (_, events) = news_text(first.news(reader, &first.attention())).unwrap();
-        assert_eq!(
-            events.iter().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([beat_id, exit_id])
-        );
+        assert_eq!(events.len(), 2);
+        assert!(events.contains(&exit_id));
+        assert!(!events.contains(&beat_id), "a silence has its own event");
         assert_eq!(first.attention().next_change, Some(at(60.0 * MIN)));
         present(&mut f, events);
 
@@ -3116,6 +3126,101 @@ mod tests {
         assert_eq!(past.attention().next_change, Some(at(3000.0 + 60.0 * MIN)));
         let (text, _) = only_news(&f.observe_at(at(3000.0 + 60.0 * MIN)), reader);
         assert!(text.contains("still exited after 60 min"), "{text}");
+    }
+
+    #[test]
+    fn a_silence_after_an_accepted_delivery_wakes_its_peers() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        let reader = *fucid();
+        f.publish(path_beat(window, session, at(0.0)));
+        f.publish(path_delivered(window, session, at(5.0), None));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback_exit_75_known_not_submitted".to_owned())
+            .unwrap();
+        let retry = path_retry(window, session, at(20.0), at(20.0), 1, 60.0, reason);
+        let retry_id = retry.root().unwrap();
+        f.publish(retry);
+        let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
+        present(&mut f, vec![event]);
+        let delivered = path_delivered(window, session, at(60.0), Some(retry_id));
+        let delivered_id = delivered.root().unwrap();
+        f.publish(delivered);
+        let (text, event) = only_news(&f.observe_at(at(61.0)), reader);
+        assert!(text.contains("callback accepting again"), "{text}");
+        assert_eq!(event, delivered_id);
+        present(&mut f, vec![event]);
+
+        // No beat follows the acceptance: the path goes silent.
+        let silent = f.observe_at(at(60.0 + 21.0 * MIN));
+        let (text, event) = only_news(&silent, reader);
+        assert!(text.contains("has not beaten"), "{text}");
+        assert_ne!(event, delivered_id, "the silence is not the acceptance");
+        assert!(quiet(&silent, window), "a window is not told about itself");
+        present(&mut f, vec![event]);
+        assert!(quiet(&f.observe_at(at(60.0 + 30.0 * MIN)), reader));
+    }
+
+    #[test]
+    fn a_silence_after_resumed_polling_wakes_its_peers() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let reader = *fucid();
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback failed".to_owned())
+            .unwrap();
+        let exit = path_exit(window, *fucid(), at(10.0), reason);
+        let exit_id = exit.root().unwrap();
+        f.publish(exit);
+        let (_, event) = only_news(&f.observe_at(at(11.0)), reader);
+        present(&mut f, vec![event]);
+        let resumed = *fucid();
+        let beat = entity! {
+            metadata::tag*: [KIND_NEWS_PATH_BEAT, schema::KIND_RECOVERED],
+            attrs::node: &window,
+            attrs::session: &resumed,
+            metadata::created_at: clock::point(at(100.0)).unwrap(),
+            metadata::supersedes: &exit_id,
+        };
+        let beat_id = beat.root().unwrap();
+        f.publish(beat);
+        let (text, event) = only_news(&f.observe_at(at(101.0)), reader);
+        assert!(text.contains("polling resumed"), "{text}");
+        present(&mut f, vec![event]);
+
+        // The resumed session never beats again.
+        let (text, event) = only_news(&f.observe_at(at(100.0 + 21.0 * MIN)), reader);
+        assert!(text.contains("has not beaten"), "{text}");
+        assert_ne!(event, resumed);
+        assert_ne!(event, beat_id);
+        present(&mut f, vec![event]);
+        assert!(quiet(&f.observe_at(at(100.0 + 30.0 * MIN)), reader));
+    }
+
+    #[test]
+    fn a_silence_keeps_one_id_across_renders_and_is_said_once() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let reader = *fucid();
+        f.publish(path_beat(window, *fucid(), at(0.0)));
+        let first = f.observe_at(at(21.0 * MIN));
+        let (_, event) = only_news(&first, reader);
+        let second = f.observe_at(at(25.0 * MIN));
+        assert_eq!(
+            second.attention().attention.ids().collect::<Vec<_>>(),
+            vec![event],
+            "every render names the silence the same way"
+        );
+        present(&mut f, vec![event]);
+        for minutes in [26.0, 40.0, 59.0] {
+            assert!(
+                quiet(&f.observe_at(at(minutes * MIN)), reader),
+                "said once ({minutes} min)"
+            );
+        }
     }
 
     #[test]
