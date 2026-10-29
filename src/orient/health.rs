@@ -7,9 +7,13 @@
 //! are just one report's output and attention IDs, never a second health store.
 
 use super::*;
-use crate::schemas::orient::{KIND_NEWS_PATH_BEAT, KIND_NEWS_PATH_EXIT};
+use crate::schemas::orient::{
+    KIND_NEWS_PATH_BEAT, KIND_NEWS_PATH_DELIVERED, KIND_NEWS_PATH_EXIT, KIND_NEWS_PATH_RETRY,
+};
 use crate::schemas::swarm_health::{self as schema, attrs};
+use std::sync::{Arc, Mutex};
 use triblespace::core::collection::descriptor;
+use triblespace_net::telemetry;
 
 pub(super) struct HealthSources {
     health: OrientSource,
@@ -406,7 +410,160 @@ const NEWS_PATH_REASON_CHARS: usize = 400;
 struct NewsPathBeat {
     session: Id,
     window: Option<Id>,
-    last_beat: Option<Epoch>,
+    /// The last publication attempt, successful or not: the beat interval
+    /// throttles failures too, so a refused write is not retried every poll.
+    last_attempt: Option<Epoch>,
+    /// Whether this session's first beat has been published. Only a
+    /// published first beat consumes the recovery marker.
+    published: bool,
+    delivery: Arc<Mutex<DeliveryState>>,
+}
+
+/// What this process last observed of its own deliveries. Shared with the
+/// delivery seam through [`NewsPathTarget`], so a retry or an acceptance is
+/// recorded by the store that seam already owns.
+#[derive(Debug, Default)]
+struct DeliveryState {
+    /// An accepted delivery since the session began or since the last retry.
+    proven: bool,
+    /// The exit, silence or retry the next DELIVERED record resolves.
+    resolves: Option<Id>,
+    /// When the current run of retries began.
+    degraded_since: Option<Epoch>,
+}
+
+/// Everything a news-path record needs, cloned out of the observer: the
+/// health collection, persona, session and this process's delivery state.
+#[derive(Clone, Debug)]
+pub(super) struct NewsPathTarget {
+    collection: Collection<SimpleArchive>,
+    persona: Id,
+    session: Id,
+    delivery: Arc<Mutex<DeliveryState>>,
+}
+
+/// Record one deferred attempt before its backoff. Called by the delivery
+/// seam with the store it already owns; writes nothing else and polls nothing.
+pub(super) fn record_news_path_retry(
+    store: &mut FacultyStore,
+    signer: &SigningKey,
+    path: &NewsPathTarget,
+    attempt: u64,
+    reason: &str,
+    delay: Duration,
+) -> Result<()> {
+    let now = clock::now()?;
+    let mut delivery = path
+        .delivery
+        .lock()
+        .expect("delivery state is not poisoned");
+    // The observation stands whether or not its record lands: the next
+    // acceptance is a transition either way.
+    delivery.proven = false;
+    let since = *delivery.degraded_since.get_or_insert(now);
+    let reason = store
+        .put::<blobencodings::UTF8String, _>(one_line(reason))
+        .map_err(|error| anyhow!("store retry reason: {error}"))?;
+    let retry = entity! {
+        metadata::tag: &KIND_NEWS_PATH_RETRY,
+        attrs::node: &path.persona,
+        attrs::session: &path.session,
+        metadata::created_at: clock::point(now)?,
+        metadata::started_at: clock::point(since)?,
+        metadata::expires_at: clock::point(now + span(delay))?,
+        metadata::description: reason,
+        telemetry::attrs::failed: u128::from(attempt),
+    };
+    let id = retry.root().expect("one retry entity");
+    publish(store, signer, path.collection, retry)?;
+    delivery.resolves = Some(id);
+    Ok(())
+}
+
+/// One delivery observation from the complete-report seam, in plain fields
+/// so it is independent of the seam's own notice type.
+#[allow(dead_code)] // Constructed by the delivery seam's notice callback.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum NewsPathNotice<'a> {
+    /// The callback deferred this attempt; the next try follows `delay`.
+    Retry {
+        attempt: u64,
+        reason: &'a str,
+        delay: Duration,
+    },
+    /// The callback returned a successful delivery. Not a claim that the news
+    /// was handled, nor that its receipt commit settled.
+    Accepted,
+}
+
+/// The single wiring point for the delivery seam: each notice maps to exactly
+/// one of the two record functions.
+// The delivery seam's notice callback calls this; until that seam lands it
+// is reached only from tests.
+#[allow(dead_code)]
+pub(super) fn on_delivery_notice(
+    store: &mut FacultyStore,
+    signer: &SigningKey,
+    path: &NewsPathTarget,
+    notice: NewsPathNotice<'_>,
+) -> Result<()> {
+    match notice {
+        NewsPathNotice::Retry {
+            attempt,
+            reason,
+            delay,
+        } => record_news_path_retry(store, signer, path, attempt, reason, delay),
+        NewsPathNotice::Accepted => record_news_path_delivered(store, signer, path),
+    }
+}
+
+/// Record an accepted delivery, but only on a transition: the first in the
+/// session, or the first after a retry. Any complete accepted report counts.
+pub(super) fn record_news_path_delivered(
+    store: &mut FacultyStore,
+    signer: &SigningKey,
+    path: &NewsPathTarget,
+) -> Result<()> {
+    let mut delivery = path
+        .delivery
+        .lock()
+        .expect("delivery state is not poisoned");
+    if delivery.proven {
+        return Ok(());
+    }
+    let delivered = entity! {
+        metadata::tag: &KIND_NEWS_PATH_DELIVERED,
+        attrs::node: &path.persona,
+        attrs::session: &path.session,
+        metadata::created_at: clock::point_now()?,
+        metadata::supersedes?: delivery.resolves,
+    };
+    publish(store, signer, path.collection, delivered)?;
+    *delivery = DeliveryState {
+        proven: true,
+        ..DeliveryState::default()
+    };
+    Ok(())
+}
+
+/// Commit one news-path record, refusing first when this key is not admitted
+/// to WRITE: a record readers would ignore is not a publication.
+fn publish(
+    store: &mut FacultyStore,
+    signer: &SigningKey,
+    collection: Collection<SimpleArchive>,
+    record: Fragment,
+) -> Result<()> {
+    if !collection
+        .writer_is_admitted(&store.snapshot()?, signer.verifying_key())
+        .context("check news-path WRITE admission")?
+    {
+        bail!("this key is not admitted to WRITE the swarm-health collection");
+    }
+    store
+        .commit(collection, signer, record)
+        .map_err(|error| anyhow!("commit news-path record: {error}"))?;
+    Ok(())
 }
 
 impl HealthSources {
@@ -415,8 +572,23 @@ impl HealthSources {
         self.news_path = Some(NewsPathBeat {
             session: genid().id,
             window: None,
-            last_beat: None,
+            last_attempt: None,
+            published: false,
+            delivery: Arc::default(),
         });
+    }
+
+    /// The target a delivery seam records retries and acceptances against,
+    /// once this observer's persona has resolved.
+    #[allow(dead_code)] // Taken by the delivery seam's notice callback.
+    pub(super) fn news_path_target(&self) -> Option<NewsPathTarget> {
+        let path = self.news_path.as_ref()?;
+        Some(NewsPathTarget {
+            collection: self.health.source,
+            persona: path.window?,
+            session: path.session,
+            delivery: Arc::clone(&path.delivery),
+        })
     }
 
     /// Record, best effort, that this news path ended on `error`. The caller
@@ -448,9 +620,7 @@ impl HealthSources {
                 metadata::created_at: clock::point_now()?,
                 metadata::description: reason,
             };
-            pile.commit(self.health.source, signer, exit)
-                .map_err(|error| anyhow!("commit exit record: {error}"))?;
-            Ok(())
+            publish(pile, signer, self.health.source, exit)
         };
         if let Err(note) = record() {
             let _ = output.line(format!("note: news-path exit not recorded ({note:#})"));
@@ -472,7 +642,7 @@ impl HealthSources {
         };
         // A clock that went backwards beats again rather than waiting it out.
         if path
-            .last_beat
+            .last_attempt
             .is_some_and(|last| last <= now && now < last + span(NEWS_PATH_BEAT_EVERY))
         {
             return Ok(());
@@ -495,9 +665,9 @@ impl HealthSources {
         // already call silent: one register lookup here instead of a scan of
         // the history by every reader.
         let facts = observation.facts.view();
-        let prior = match path.last_beat {
-            Some(_) => None,
-            None => observation.latest.winner(window).filter(|&record| {
+        let prior = match path.published {
+            true => None,
+            false => observation.latest.winner(window).filter(|&record| {
                 exists!(pattern!(facts, [{ record @ metadata::tag: &KIND_NEWS_PATH_EXIT }]))
                     || find!(
                         created: (Epoch, Epoch),
@@ -509,7 +679,7 @@ impl HealthSources {
                     .any(|created| created.1 + span(NEWS_PATH_MAX_AGE) <= now)
             }),
         };
-        path.last_beat = Some(now);
+        path.last_attempt = Some(now);
         let tags =
             std::iter::once(KIND_NEWS_PATH_BEAT).chain(prior.map(|_| schema::KIND_RECOVERED));
         let beat = entity! {
@@ -519,8 +689,22 @@ impl HealthSources {
             metadata::created_at: clock::point(now)?,
             metadata::supersedes?: prior,
         };
-        if let Err(error) = pile.commit(self.health.source, signer, beat) {
-            output.line(format!("note: news-path beat not recorded ({error})"))?;
+        match publish(pile, signer, self.health.source, beat) {
+            Ok(()) => {
+                path.published = true;
+                if let Some(prior) = prior {
+                    // Polling resumed after this record; the session's first
+                    // accepted delivery is what resolves it.
+                    let mut delivery = path
+                        .delivery
+                        .lock()
+                        .expect("delivery state is not poisoned");
+                    if !delivery.proven {
+                        delivery.resolves.get_or_insert(prior);
+                    }
+                }
+            }
+            Err(error) => output.line(format!("note: news-path beat not recorded ({error:#})"))?,
         }
         Ok(())
     }
@@ -575,13 +759,14 @@ fn exit_reason(facts: &FactArchive, snapshot: &impl BlobStoreGet, exit: Id) -> S
     })
     .map(|reason| reason.to_string())
     .min()
-    // Passive attention fetches nothing; an absent reason is still an exit.
+    // Passive attention fetches nothing; an absent reason is still news.
     .unwrap_or_else(|| "reason not yet resident".to_owned())
 }
 
 /// Each persona's latest news-path record, through the maintained register:
-/// readers never scan the beat history. Events about the reader's own persona
-/// are dropped later, in `news`, where the reader is known.
+/// readers never scan the beat history, only the latest record's session.
+/// Events about the reader's own persona are dropped later, in `news`, where
+/// the reader is known.
 fn render_news_paths(
     report: &mut HealthReport,
     facts: &FactArchive,
@@ -592,18 +777,49 @@ fn render_news_paths(
     detail: Detail,
 ) {
     use std::fmt::Write as _;
+    let tagged =
+        |record: Id, kind: Id| exists!(pattern!(facts, [{ record @ metadata::tag: &kind }]));
     let now_key = now.to_tai_duration().total_nanoseconds();
     let mut lines = Vec::new();
-    for (beat, window, session, created) in find!(
-        (beat: Id, window: Id, session: Id, created: (Epoch, Epoch)),
-        and!(latest.has(beat), pattern!(facts, [{ ?beat @
-            metadata::tag: &KIND_NEWS_PATH_BEAT,
+    // Health reports share this register (their node is an observer, never a
+    // persona); only the news-path kinds below are read here.
+    for (record, window, session, created) in find!(
+        (record: Id, window: Id, session: Id, created: (Epoch, Epoch)),
+        and!(latest.has(record), pattern!(facts, [{ ?record @
             attrs::node: ?window,
             attrs::session: ?session,
             metadata::created_at: ?created,
         }]))
     ) {
+        let exit = tagged(record, KIND_NEWS_PATH_EXIT);
+        let retry = tagged(record, KIND_NEWS_PATH_RETRY);
+        if !(exit
+            || retry
+            || tagged(record, KIND_NEWS_PATH_BEAT)
+            || tagged(record, KIND_NEWS_PATH_DELIVERED))
+        {
+            continue;
+        }
         let label = person_label(people, snapshot, window);
+        if exit {
+            let reason = exit_reason(facts, snapshot, record);
+            lines.push(format!("{label}: exited at {}: {reason}", utc(created.1)));
+            report.attention.insert(AttentionEvent::NewsPath {
+                event: record,
+                window,
+                detail: format!(
+                    "news path of {label} exited at {}: {reason}. Nothing restarts it automatically.",
+                    utc(created.1)
+                ),
+            });
+            continue;
+        }
+        if retry {
+            // Beats stop while a delivery is deferred, so a latest RETRY is
+            // degraded at any age, until DELIVERED or an exit follows it.
+            degraded(report, &mut lines, facts, snapshot, &label, window, record);
+            continue;
+        }
         let age = format_age(now_key, created.1.to_tai_duration().total_nanoseconds());
         if now < created.1 {
             report.next_change = earliest(report.next_change, Some(created.1));
@@ -614,7 +830,7 @@ fn render_news_paths(
         if now >= stale_at {
             lines.push(format!("{label}: silent since {}", utc(created.1)));
             report.attention.insert(AttentionEvent::NewsPath {
-                event: beat,
+                event: record,
                 window,
                 detail: format!(
                     "news path of {label} has not beaten since {} ({age} ago); that window may not be hearing news. Nothing restarts it automatically.",
@@ -624,58 +840,72 @@ fn render_news_paths(
             continue;
         }
         report.next_change = earliest(report.next_change, Some(stale_at));
-        lines.push(format!("{label}: beating, last {age} ago"));
-        for prior in find!(
-            prior: Id,
-            pattern!(facts, [{ _?first @
-                metadata::tag: &KIND_NEWS_PATH_BEAT,
-                metadata::tag: &schema::KIND_RECOVERED,
-                attrs::node: &window,
-                attrs::session: &session,
-                metadata::supersedes: ?prior,
-            }])
-        ) {
-            let before =
-                if exists!(pattern!(facts, [{ prior @ metadata::tag: &KIND_NEWS_PATH_EXIT }])) {
-                    format!("an exit: {}", exit_reason(facts, snapshot, prior))
-                } else {
-                    find!(
-                        created: (Epoch, Epoch),
-                        pattern!(facts, [{ prior @ metadata::created_at: ?created }])
-                    )
-                    .map(|created| format!("silence since {}", utc(created.1)))
-                    .min()
-                    .unwrap_or_else(|| "a silence".to_owned())
-                };
-            report.attention.insert(AttentionEvent::NewsPath {
-                event: session,
-                window,
-                detail: format!(
-                    "news path of {label} recovered (session [{}]) after {before}",
-                    fmt_id(session)
-                ),
-            });
+        // The latest record is a fresh beat or acceptance. What the session
+        // last established: a RETRY newer than its latest DELIVERED is still
+        // degraded; an older DELIVERED never clears a newer RETRY.
+        let newest = |kind: Id| {
+            find!(
+                (event: Id, at: (Epoch, Epoch)),
+                pattern!(facts, [{ ?event @
+                    metadata::tag: &kind,
+                    attrs::node: &window,
+                    attrs::session: &session,
+                    metadata::created_at: ?at,
+                }])
+            )
+            .max_by_key(|(event, at)| (at.1, *event))
+        };
+        let last_retry = newest(KIND_NEWS_PATH_RETRY);
+        let last_delivered = newest(KIND_NEWS_PATH_DELIVERED);
+        match (last_retry, last_delivered) {
+            (Some((retry, retried)), delivered)
+                if delivered.is_none_or(|(id, at)| (retried.1, retry) > (at.1, id)) =>
+            {
+                degraded(report, &mut lines, facts, snapshot, &label, window, retry);
+            }
+            (_, Some((delivered, _))) => {
+                lines.push(format!("{label}: delivering, last beat {age} ago"));
+                for prior in find!(
+                    prior: Id,
+                    pattern!(facts, [{ delivered @ metadata::supersedes: ?prior }])
+                ) {
+                    report.attention.insert(AttentionEvent::NewsPath {
+                        event: delivered,
+                        window,
+                        detail: format!(
+                            "news path of {label} recovered (session [{}]): delivery accepted after {}",
+                            fmt_id(session),
+                            resolved(facts, snapshot, prior)
+                        ),
+                    });
+                }
+            }
+            _ => {
+                lines.push(format!(
+                    "{label}: polling, last beat {age} ago, no delivery accepted yet"
+                ));
+                for prior in find!(
+                    prior: Id,
+                    pattern!(facts, [{ _?first @
+                        metadata::tag: &KIND_NEWS_PATH_BEAT,
+                        metadata::tag: &schema::KIND_RECOVERED,
+                        attrs::node: &window,
+                        attrs::session: &session,
+                        metadata::supersedes: ?prior,
+                    }])
+                ) {
+                    report.attention.insert(AttentionEvent::NewsPath {
+                        event: session,
+                        window,
+                        detail: format!(
+                            "news path of {label}: polling resumed (session [{}]) after {}, no delivery accepted yet",
+                            fmt_id(session),
+                            resolved(facts, snapshot, prior)
+                        ),
+                    });
+                }
+            }
         }
-    }
-    for (exit, window, created) in find!(
-        (exit: Id, window: Id, created: (Epoch, Epoch)),
-        and!(latest.has(exit), pattern!(facts, [{ ?exit @
-            metadata::tag: &KIND_NEWS_PATH_EXIT,
-            attrs::node: ?window,
-            metadata::created_at: ?created,
-        }]))
-    ) {
-        let label = person_label(people, snapshot, window);
-        let reason = exit_reason(facts, snapshot, exit);
-        lines.push(format!("{label}: exited at {}: {reason}", utc(created.1)));
-        report.attention.insert(AttentionEvent::NewsPath {
-            event: exit,
-            window,
-            detail: format!(
-                "news path of {label} exited at {}: {reason}. Nothing restarts it automatically.",
-                utc(created.1)
-            ),
-        });
     }
     if detail == Detail::Full && !lines.is_empty() {
         lines.sort();
@@ -683,6 +913,74 @@ fn render_news_paths(
         for line in lines {
             writeln!(report.text, "- {line}").unwrap();
         }
+    }
+}
+
+/// Say one deferred attempt: since when, which attempt, why, and when next.
+fn degraded(
+    report: &mut HealthReport,
+    lines: &mut Vec<String>,
+    facts: &FactArchive,
+    snapshot: &impl BlobStoreGet,
+    label: &str,
+    window: Id,
+    retry: Id,
+) {
+    let key = |at: (Epoch, Epoch)| at.1.to_tai_duration().total_nanoseconds();
+    let since = find!(
+        at: (Epoch, Epoch),
+        pattern!(facts, [{ retry @ metadata::started_at: ?at }])
+    )
+    .min_by_key(|at| at.1)
+    .map(|at| utc(at.1))
+    .unwrap_or_else(|| "an unknown time".to_owned());
+    let attempt = find!(
+        attempt: u128,
+        pattern!(facts, [{ retry @ telemetry::attrs::failed: ?attempt }])
+    )
+    .max()
+    .map_or_else(
+        || "an attempt".to_owned(),
+        |attempt| format!("attempt {attempt}"),
+    );
+    let next = find!(
+        (created: (Epoch, Epoch), next: (Epoch, Epoch)),
+        pattern!(facts, [{ retry @
+            metadata::created_at: ?created,
+            metadata::expires_at: ?next,
+        }])
+    )
+    .map(|(created, next)| format!(", next try in {}", format_age(key(next), key(created))))
+    .min()
+    .unwrap_or_default();
+    let reason = exit_reason(facts, snapshot, retry);
+    lines.push(format!(
+        "{label}: degraded since {since}: {attempt}, {reason}{next}"
+    ));
+    report.attention.insert(AttentionEvent::NewsPath {
+        event: retry,
+        window,
+        detail: format!("news path of {label} degraded since {since}: {attempt}, {reason}{next}"),
+    });
+}
+
+/// Describe the record an acceptance or a resumption resolves.
+fn resolved(facts: &FactArchive, snapshot: &impl BlobStoreGet, prior: Id) -> String {
+    if exists!(pattern!(facts, [{ prior @ metadata::tag: &KIND_NEWS_PATH_EXIT }])) {
+        format!("an exit: {}", exit_reason(facts, snapshot, prior))
+    } else if exists!(pattern!(facts, [{ prior @ metadata::tag: &KIND_NEWS_PATH_RETRY }])) {
+        format!(
+            "a deferred delivery: {}",
+            exit_reason(facts, snapshot, prior)
+        )
+    } else {
+        find!(
+            created: (Epoch, Epoch),
+            pattern!(facts, [{ prior @ metadata::created_at: ?created }])
+        )
+        .map(|created| format!("silence since {}", utc(created.1)))
+        .min()
+        .unwrap_or_else(|| "a silence".to_owned())
     }
 }
 
@@ -1552,8 +1850,39 @@ mod tests {
         assert!(matches!(observed.news(window, &report), News::Quiet));
     }
 
+    fn path_delivered(window: Id, session: Id, created: Epoch, resolves: Option<Id>) -> Fragment {
+        entity! {
+            metadata::tag: &KIND_NEWS_PATH_DELIVERED,
+            attrs::node: &window,
+            attrs::session: &session,
+            metadata::created_at: clock::point(created).unwrap(),
+            metadata::supersedes?: resolves,
+        }
+    }
+
+    fn path_retry(
+        window: Id,
+        session: Id,
+        created: Epoch,
+        since: Epoch,
+        attempt: u128,
+        delay: f64,
+        reason: TextHandle,
+    ) -> Fragment {
+        entity! {
+            metadata::tag: &KIND_NEWS_PATH_RETRY,
+            attrs::node: &window,
+            attrs::session: &session,
+            metadata::created_at: clock::point(created).unwrap(),
+            metadata::started_at: clock::point(since).unwrap(),
+            metadata::expires_at: clock::point(created + hifitime::Duration::from_seconds(delay)).unwrap(),
+            metadata::description: reason,
+            telemetry::attrs::failed: attempt,
+        }
+    }
+
     #[test]
-    fn a_new_session_after_an_exit_is_said_as_recovered() {
+    fn a_restart_reads_as_polling_resumed_until_a_delivery_is_accepted() {
         let mut f = Fixture::new();
         let window = *fucid();
         let first = *fucid();
@@ -1566,28 +1895,223 @@ mod tests {
         let exit = path_exit(window, first, at(10.0), reason);
         let exit_id = exit.root().unwrap();
         f.publish(exit);
-        let restart = entity! {
+        f.publish(entity! {
             metadata::tag*: [KIND_NEWS_PATH_BEAT, schema::KIND_RECOVERED],
             attrs::node: &window,
             attrs::session: &second,
             metadata::created_at: clock::point(at(100.0)).unwrap(),
             metadata::supersedes: &exit_id,
-        };
-        let restart_id = restart.root().unwrap();
-        f.publish(restart);
+        });
 
         let observed = f.observe_at(at(120.0));
         let (text, events) =
-            news_text(observed.news(*fucid(), &observed.attention())).expect("recovery is news");
-        assert!(text.contains("recovered"), "{text}");
+            news_text(observed.news(*fucid(), &observed.attention())).expect("a restart is news");
+        assert!(text.contains("polling resumed"), "{text}");
+        assert!(text.contains("no delivery accepted yet"), "{text}");
+        assert!(
+            !text.contains("recovered"),
+            "polling is not delivery: {text}"
+        );
         assert!(text.contains("thread status is not idle"), "{text}");
-        assert_eq!(events, vec![second], "recovery is one event per session");
+        assert_eq!(events, vec![second], "one resumption event per session");
 
-        let silent = f.observe_at(at(100.0 + 21.0 * 60.0));
+        let delivered = path_delivered(window, second, at(150.0), Some(exit_id));
+        let delivered_id = delivered.root().unwrap();
+        f.publish(delivered);
+        let beat = path_beat(window, second, at(200.0));
+        let beat_id = beat.root().unwrap();
+        f.publish(beat);
+        let observed = f.observe_at(at(210.0));
+        let (text, events) = news_text(observed.news(*fucid(), &observed.attention()))
+            .expect("an accepted delivery is news");
+        assert!(text.contains("recovered"), "{text}");
+        assert!(text.contains("delivery accepted"), "{text}");
+        assert!(text.contains("thread status is not idle"), "{text}");
+        assert_eq!(events, vec![delivered_id]);
+
+        let silent = f.observe_at(at(200.0 + 21.0 * 60.0));
         let (text, events) =
             news_text(silent.news(*fucid(), &silent.attention())).expect("silence again");
         assert!(text.contains("has not beaten"), "{text}");
-        assert_eq!(events, vec![restart_id]);
+        assert_eq!(events, vec![beat_id]);
+    }
+
+    #[test]
+    fn a_retry_reads_as_degraded_until_a_later_delivery_or_an_exit() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        f.publish(path_beat(window, session, at(0.0)));
+        f.publish(path_delivered(window, session, at(5.0), None));
+        let quiet = f.observe_at(at(10.0));
+        assert!(
+            quiet.attention().attention.is_empty(),
+            "a first delivery that resolves nothing is not news"
+        );
+
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("app-server notLoaded".to_owned())
+            .unwrap();
+        let retry = path_retry(window, session, at(20.0), at(20.0), 1, 5.0, reason);
+        let retry_id = retry.root().unwrap();
+        f.publish(retry);
+        let degraded = f.observe_at(at(22.0));
+        let (text, events) =
+            news_text(degraded.news(*fucid(), &degraded.attention())).expect("a retry is news");
+        assert!(text.contains("degraded since"), "{text}");
+        assert!(text.contains("attempt 1"), "{text}");
+        assert!(text.contains("app-server notLoaded"), "{text}");
+        assert!(text.contains("next try in 5s"), "{text}");
+        assert_eq!(events, vec![retry_id]);
+
+        // A later beat does not clear it, and neither does the older DELIVERED.
+        f.publish(path_beat(window, session, at(30.0)));
+        let still = f.observe_at(at(31.0));
+        let (_, events) = news_text(still.news(*fucid(), &still.attention()))
+            .expect("degraded holds past a beat");
+        assert_eq!(events, vec![retry_id]);
+
+        let delivered = path_delivered(window, session, at(40.0), Some(retry_id));
+        let delivered_id = delivered.root().unwrap();
+        f.publish(delivered);
+        f.publish(path_beat(window, session, at(50.0)));
+        let recovered = f.observe_at(at(51.0));
+        let (text, events) = news_text(recovered.news(*fucid(), &recovered.attention()))
+            .expect("an accepted delivery after a retry is news");
+        assert!(text.contains("recovered"), "{text}");
+        assert!(!text.contains("degraded"), "{text}");
+        assert_eq!(events, vec![delivered_id]);
+
+        let again = path_retry(window, session, at(60.0), at(60.0), 2, 20.0, reason);
+        f.publish(again);
+        let gone = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback failed".to_owned())
+            .unwrap();
+        let exit = path_exit(window, session, at(70.0), gone);
+        let exit_id = exit.root().unwrap();
+        f.publish(exit);
+        let exited = f.observe_at(at(71.0));
+        let (text, events) =
+            news_text(exited.news(*fucid(), &exited.attention())).expect("an exit is news");
+        assert!(text.contains("exited"), "{text}");
+        assert_eq!(events, vec![exit_id], "an exit ends the degraded state");
+    }
+
+    #[test]
+    fn delivered_is_written_on_each_acceptance_transition() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let input = format!("{window:x}");
+        f.sources.start_beating();
+        let mut emit = |_part| Ok(());
+        let mut out = crate::out::Out::new(&mut emit);
+        f.sources
+            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .unwrap();
+        let path = f.sources.news_path_target().expect("persona resolved");
+
+        // Report A accepted, then accepted again: one transition.
+        on_delivery_notice(&mut f.store, &f.signer, &path, NewsPathNotice::Accepted).unwrap();
+        on_delivery_notice(&mut f.store, &f.signer, &path, NewsPathNotice::Accepted).unwrap();
+        // Report B deferred once, then accepted: a second transition.
+        on_delivery_notice(
+            &mut f.store,
+            &f.signer,
+            &path,
+            NewsPathNotice::Retry {
+                attempt: 1,
+                reason: "notLoaded",
+                delay: Duration::from_secs(5),
+            },
+        )
+        .unwrap();
+        on_delivery_notice(&mut f.store, &f.signer, &path, NewsPathNotice::Accepted).unwrap();
+
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let facts = observed.facts.view();
+        let retries: Vec<(Id, u128, TextHandle)> = find!(
+            (retry: Id, attempt: u128, reason: TextHandle),
+            pattern!(facts, [{ ?retry @
+                metadata::tag: &KIND_NEWS_PATH_RETRY,
+                attrs::node: &window,
+                telemetry::attrs::failed: ?attempt,
+                metadata::description: ?reason,
+                metadata::started_at: _?since,
+                metadata::expires_at: _?next,
+            }])
+        )
+        .collect();
+        assert_eq!(retries.len(), 1);
+        let (retry_id, attempt, _) = retries[0];
+        assert_eq!(attempt, 1);
+        let delivered: Vec<Id> = find!(
+            delivered: Id,
+            pattern!(facts, [{ ?delivered @
+                metadata::tag: &KIND_NEWS_PATH_DELIVERED,
+                attrs::node: &window,
+            }])
+        )
+        .collect();
+        assert_eq!(
+            delivered.len(),
+            2,
+            "first acceptance and first after a retry"
+        );
+        assert!(exists!(pattern!(facts, [{ _?resolved @
+            metadata::tag: &KIND_NEWS_PATH_DELIVERED,
+            metadata::supersedes: &retry_id,
+        }])));
+    }
+
+    #[test]
+    fn a_failed_first_beat_keeps_the_recovery_marker_for_the_next() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let input = format!("{window:x}");
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("callback failed".to_owned())
+            .unwrap();
+        let exit = path_exit(window, *fucid(), clock::now().unwrap(), reason);
+        let exit_id = exit.root().unwrap();
+        f.publish(exit);
+        let mut emit = |_part| Ok(());
+        let mut out = crate::out::Out::new(&mut emit);
+        // Select a view without beating, then start this observer's session.
+        f.sources
+            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .unwrap();
+        f.sources.start_beating();
+        let now = clock::now().unwrap();
+        // A key the health collection does not admit: this publication fails.
+        let stranger = SigningKey::from_bytes(&[74; 32]);
+        f.sources
+            .beat_if_due(&mut f.store, &stranger, &input, now, &mut out)
+            .unwrap();
+        let later = now + hifitime::Duration::from_seconds(6.0 * 60.0);
+        f.sources
+            .beat_if_due(&mut f.store, &f.signer, &input, later, &mut out)
+            .unwrap();
+
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let marked: Vec<Id> = find!(
+            beat: Id,
+            pattern!(observed.facts.view(), [{ ?beat @
+                metadata::tag: &KIND_NEWS_PATH_BEAT,
+                metadata::tag: &schema::KIND_RECOVERED,
+                attrs::node: &window,
+                metadata::supersedes: &exit_id,
+                metadata::created_at: clock::point(later).unwrap(),
+            }])
+        )
+        .collect();
+        assert_eq!(
+            marked.len(),
+            1,
+            "the first PUBLISHED beat carries the marker"
+        );
     }
 
     #[test]

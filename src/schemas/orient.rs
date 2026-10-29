@@ -79,3 +79,18 @@ pub const KIND_NEWS_PATH_BEAT: Id = id_hex!("89906A65BA5779885E3A2676E4E1E767");
 ///
 /// Minted with `trible genid` on 2026-10-29.
 pub const KIND_NEWS_PATH_EXIT: Id = id_hex!("7A3221E5D3CF65B39071F2F51AF3AFBE");
+
+/// An accepted delivery on a news path after its session started or after a
+/// retry: the only record from which a reader says the path recovered. It
+/// names, with `metadata::supersedes`, the exit, silence or retry it resolves.
+///
+/// Minted with `trible genid` on 2026-10-29.
+pub const KIND_NEWS_PATH_DELIVERED: Id = id_hex!("997B750B0685B0B37110C38F693733E8");
+
+/// One deferred delivery attempt on a news path, written before its backoff:
+/// telemetry's `failed` holds the attempt number, `metadata::started_at` when
+/// the degraded episode began, `metadata::expires_at` when the next try is
+/// due and `metadata::description` the reason. It is not a Presented receipt.
+///
+/// Minted with `trible genid` on 2026-10-29.
+pub const KIND_NEWS_PATH_RETRY: Id = id_hex!("719AE92BBA347299A8FC58001303B87F");
