@@ -240,41 +240,44 @@ pub fn auth_profile_fragment(
 }
 
 /// Decode one auth-profile record without selecting a current head.
+///
+/// Every field is part of the profile's identity, so a profile id names one
+/// set of values; should a writer ever reuse the id, the smallest combination
+/// is taken. A profile without its client, user, or scopes cannot authenticate.
 pub fn auth_profile<P>(catalog: &P, id: Id) -> Result<AuthProfileRecord>
 where
     P: TriblePattern,
 {
+    let (source, client_id, user_id, scopes) = find!(
+        (source: Id, client_id: TextHandle, user_id: TextHandle, scopes: TextHandle),
+        pattern!(catalog, [{
+            id @
+            teams::source: ?source,
+            teams::auth_client_id: ?client_id,
+            teams::auth_user_id: ?user_id,
+            teams::auth_scopes: ?scopes,
+        }])
+    )
+    .min()
+    .ok_or_else(|| {
+        anyhow::anyhow!("Teams auth profile {id:x} lacks its source, client id, user id, or scopes")
+    })?;
     Ok(AuthProfileRecord {
         id,
-        source: one_required(
-            find!(value: Id, pattern!(catalog, [{ id @ teams::source: ?value }])).collect(),
-            "Teams auth-profile source",
-        )?,
-        client_id: one_required(
-            find!(value: TextHandle, pattern!(catalog, [{ id @ teams::auth_client_id: ?value }]))
-                .collect(),
-            "Teams auth-profile client id",
-        )?,
-        user_id: one_required(
-            find!(value: TextHandle, pattern!(catalog, [{ id @ teams::auth_user_id: ?value }]))
-                .collect(),
-            "Teams auth-profile user id",
-        )?,
-        scopes: one_required(
-            find!(value: TextHandle, pattern!(catalog, [{ id @ teams::auth_scopes: ?value }]))
-                .collect(),
-            "Teams auth-profile scopes",
-        )?,
-        client_secret_version: one_optional(
-            find!(value: Id, pattern!(catalog, [{ id @ teams::auth_client_secret_version: ?value }]))
-                .collect(),
-            "Teams auth-profile client-secret version",
-        )?,
-        delegated_token_version: one_optional(
-            find!(value: Id, pattern!(catalog, [{ id @ teams::auth_delegated_token_version: ?value }]))
-                .collect(),
-            "Teams auth-profile delegated-token version",
-        )?,
+        source,
+        client_id,
+        user_id,
+        scopes,
+        client_secret_version: find!(
+            value: Id,
+            pattern!(catalog, [{ id @ teams::auth_client_secret_version: ?value }])
+        )
+        .min(),
+        delegated_token_version: find!(
+            value: Id,
+            pattern!(catalog, [{ id @ teams::auth_delegated_token_version: ?value }])
+        )
+        .min(),
         predecessors: find!(
             value: Id,
             pattern!(catalog, [{ id @ metadata::supersedes: ?value }])
@@ -709,23 +712,15 @@ where
     if receipts.is_empty() {
         return Ok(None);
     }
-    let id = one_required(coverage_head_ids(catalog, source), "Teams coverage head")?;
-    let generation = inline_u256_to_u128(one_required(
-        find!(
-            generation: Inline<U256BE>,
-            pattern!(catalog, [{ id @ teams::coverage_generation: ?generation }])
-        )
-        .collect(),
-        "Teams coverage generation",
-    )?)?;
-    let cursor = one_optional(
-        find!(
-            cursor: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ id @ teams::coverage_cursor: ?cursor }])
-        )
-        .collect(),
-        "Teams coverage cursor",
-    )?
+    let id = sole_head(coverage_head_ids(catalog, source))?;
+    let generation = receipt_generation(catalog, id)?;
+    // The cursor is part of the receipt's identity; only a frozen legacy
+    // snapshot has none.
+    let cursor = find!(
+        cursor: Inline<Handle<UTF8String>>,
+        pattern!(catalog, [{ id @ teams::coverage_cursor: ?cursor }])
+    )
+    .min()
     .map(|cursor| read_utf8string(reader, cursor, "Teams coverage cursor"))
     .transpose()?;
     Ok(Some(CoverageHead {
@@ -749,7 +744,7 @@ where
     if heads.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let head = one_required(heads, "Teams coverage head")?;
+    let head = sole_head(heads)?;
 
     let mut observations = BTreeMap::new();
     let mut unreadable = BTreeSet::new();
@@ -769,24 +764,23 @@ where
         // An observation written before the state became text carries it
         // under the retired 32-byte attribute, which this reader does not
         // model; until a backfill gives it its twin it is not in the view.
-        let Some(state) = one_optional(
-            find!(
-                value: Inline<Handle<UTF8String>>,
-                pattern!(catalog, [{ observation @ teams::message_state: ?value }])
-            )
-            .collect(),
-            "Teams observation state",
-        )?
-        else {
+        // The state is an annotation: an observation any writer recorded as
+        // deleted reads as deleted.
+        let states = find!(
+            value: Inline<Handle<UTF8String>>,
+            pattern!(catalog, [{ observation @ teams::message_state: ?value }])
+        )
+        .collect::<BTreeSet<_>>();
+        if states.is_empty() {
             unreadable.insert(observation);
             continue;
-        };
+        }
         observations.insert(
             observation,
             ObservationOrder {
                 message,
                 modified: interval_key(modified),
-                deleted: state == text_handle("deleted"),
+                deleted: states.contains(&text_handle("deleted")),
             },
         );
     }
@@ -802,17 +796,9 @@ where
 
     let mut receipts = Vec::new();
     for receipt in receipt_ids(catalog, source) {
-        let generation = one_required(
-            find!(
-                value: Inline<U256BE>,
-                pattern!(catalog, [{ receipt @ teams::coverage_generation: ?value }])
-            )
-            .collect(),
-            "Teams receipt generation",
-        )?;
         receipts.push(ReceiptOrder {
             id: receipt,
-            generation: inline_u256_to_u128(generation)?,
+            generation: receipt_generation(catalog, receipt)?,
             predecessors: find!(
                 value: Id,
                 pattern!(catalog, [{ receipt @ metadata::supersedes: ?value }])
@@ -955,19 +941,19 @@ pub fn source_label<P>(reader: &impl BlobStoreGet, catalog: &P, source: Id) -> R
 where
     P: TriblePattern,
 {
-    let handle = one_required(
-        find!(
-            value: TextHandle,
-            pattern!(catalog, [{ source @ metadata::tag: teams::kind_source, teams::tenant_id: ?value }])
-        )
-        .collect(),
-        "Teams source tenant",
-    )?;
+    // The tenant is the source's identity; without it the source has no label.
+    let handle = find!(
+        value: TextHandle,
+        pattern!(catalog, [{ source @ metadata::tag: teams::kind_source, teams::tenant_id: ?value }])
+    )
+    .min()
+    .ok_or_else(|| anyhow::anyhow!("Teams source tenant is missing"))?;
     read_utf8string(reader, handle, "Teams source tenant")
 }
 
-/// Decode every source-scoped chat identity without choosing among conflicting
-/// values. Structural ambiguity is an error, not a display-name fallback.
+/// Decode every source-scoped chat identity. The external id is the chat's
+/// identity, so each chat has one; should a writer ever reuse a chat id, the
+/// smallest handle is shown.
 pub fn chat_labels<P>(
     reader: &impl BlobStoreGet,
     catalog: &P,
@@ -976,7 +962,7 @@ pub fn chat_labels<P>(
 where
     P: TriblePattern,
 {
-    let mut handles = BTreeMap::<Id, BTreeSet<TextHandle>>::new();
+    let mut handles = BTreeMap::<Id, TextHandle>::new();
     for (chat, handle) in find!(
         (chat: Id, handle: TextHandle),
         pattern!(catalog, [{
@@ -986,12 +972,14 @@ where
             teams::chat_id: ?handle,
         }])
     ) {
-        handles.entry(chat).or_default().insert(handle);
+        handles
+            .entry(chat)
+            .and_modify(|kept| *kept = (*kept).min(handle))
+            .or_insert(handle);
     }
     handles
         .into_iter()
-        .map(|(chat, values)| {
-            let handle = one_required(values, &format!("Teams chat {chat:x} external id"))?;
+        .map(|(chat, handle)| {
             Ok((
                 chat,
                 read_utf8string(reader, handle, "Teams chat external id")?,
@@ -1006,7 +994,9 @@ pub fn current_messages<P>(catalog: &P, source: Id) -> Result<Vec<CurrentMessage
 where
     P: TriblePattern,
 {
-    let mut message_chats = BTreeMap::<Id, BTreeSet<Id>>::new();
+    // The chat is part of the message's identity, so each message has one;
+    // should a writer ever reuse a message id, the smallest chat is taken.
+    let mut message_chats = BTreeMap::<Id, Id>::new();
     for (message, chat) in find!(
         (message: Id, chat: Id),
         pattern!(catalog, [
@@ -1023,15 +1013,17 @@ where
             }
         ])
     ) {
-        message_chats.entry(message).or_default().insert(chat);
+        message_chats
+            .entry(message)
+            .and_modify(|kept| *kept = (*kept).min(chat))
+            .or_insert(chat);
     }
 
     let mut rows = Vec::new();
     for (message, state) in current_message_states(catalog, source)? {
-        let chat = one_required(
-            message_chats.remove(&message).unwrap_or_default(),
-            &format!("Teams message {message:x} chat in source {source:x}"),
-        )?;
+        let chat = message_chats.get(&message).copied().ok_or_else(|| {
+            anyhow::anyhow!("Teams message {message:x} chat in source {source:x} is missing")
+        })?;
         match state {
             CurrentMessageState::Present(observation) => rows.push(current_message_record(
                 catalog,
@@ -1084,38 +1076,30 @@ where
         });
     };
 
-    let created_at = one_optional(
-        find!(
-            value: Inline<NsTAIInterval>,
-            pattern!(catalog, [{ observation_id @ metadata::created_at: ?value }])
-        )
-        .collect(),
-        "Teams message creation time",
-    )?;
-    let modified_at = one_required(
-        find!(
-            value: Inline<NsTAIInterval>,
-            pattern!(catalog, [{ observation_id @ teams::modified_at: ?value }])
-        )
-        .collect(),
-        "Teams message modification time",
-    )?;
-    let content = one_optional(
-        find!(
-            value: TextHandle,
-            pattern!(catalog, [{ observation_id @ archive::content: ?value }])
-        )
-        .collect(),
-        "Teams message content",
-    )?;
-    let author = one_optional(
-        find!(
-            value: Id,
-            pattern!(catalog, [{ observation_id @ archive::author: ?value }])
-        )
-        .collect(),
-        "Teams message author",
-    )?;
+    // The modification time is the observation's identity. Creation time,
+    // content, and author annotate it: should two writers disagree, the
+    // earliest time and the smallest handle or id are shown.
+    let created_at = find!(
+        value: Inline<NsTAIInterval>,
+        pattern!(catalog, [{ observation_id @ metadata::created_at: ?value }])
+    )
+    .min_by_key(|value| (interval_key(*value), *value));
+    let modified_at = find!(
+        value: Inline<NsTAIInterval>,
+        pattern!(catalog, [{ observation_id @ teams::modified_at: ?value }])
+    )
+    .min_by_key(|value| (interval_key(*value), *value))
+    .ok_or_else(|| anyhow::anyhow!("Teams message modification time is missing"))?;
+    let content = find!(
+        value: TextHandle,
+        pattern!(catalog, [{ observation_id @ archive::content: ?value }])
+    )
+    .min();
+    let author = find!(
+        value: Id,
+        pattern!(catalog, [{ observation_id @ archive::author: ?value }])
+    )
+    .min();
     let author_names = find!(
         value: TextHandle,
         pattern!(catalog, [{ observation_id @ teams::author_name: ?value }])
@@ -1277,18 +1261,24 @@ fn apply_page_observations(
         .into_iter()
         .max()
         .expect("page observation group is nonempty");
-    let newest = one_required(
-        page_versions
-            .iter()
-            .filter(|id| {
-                observations
-                    .get(*id)
-                    .is_some_and(|value| value.modified == newest_time)
-            })
-            .copied()
-            .collect(),
-        &format!("latest source version in one Teams page for message {message:x}"),
-    )?;
+    // Two distinct versions sharing the newest source time in one page are a
+    // real divergence between observations, not a value to choose among.
+    let latest = page_versions
+        .iter()
+        .filter(|id| {
+            observations
+                .get(*id)
+                .is_some_and(|value| value.modified == newest_time)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    let &[newest] = latest.as_slice() else {
+        bail!(
+            "latest source version in one Teams page for message {message:x} has {} values; \
+             refusing arbitrary selection",
+            latest.len()
+        );
+    };
     let order = observations
         .get(&newest)
         .expect("newest observation came from map");
@@ -1472,6 +1462,36 @@ fn inline_u256_to_u128(value: Inline<U256BE>) -> Result<u128> {
     Ok(u128::from_be_bytes(bytes))
 }
 
+/// The one head of a source's receipt DAG. Several heads are a causal fork
+/// the next pull must not hide behind a choice.
+fn sole_head(heads: BTreeSet<Id>) -> Result<Id> {
+    let mut heads = heads.into_iter();
+    match (heads.next(), heads.len()) {
+        (None, _) => bail!("Teams coverage head is missing"),
+        (Some(head), 0) => Ok(head),
+        (Some(_), rest) => bail!(
+            "Teams coverage head has {} values; refusing arbitrary selection",
+            rest + 1
+        ),
+    }
+}
+
+/// A receipt's generation is part of its identity and orders the DAG; a
+/// receipt without one cannot be placed. Should a writer ever reuse a receipt
+/// id, the smallest generation is taken.
+fn receipt_generation<P>(catalog: &P, receipt: Id) -> Result<u128>
+where
+    P: TriblePattern,
+{
+    let generation = find!(
+        value: Inline<U256BE>,
+        pattern!(catalog, [{ receipt @ teams::coverage_generation: ?value }])
+    )
+    .min()
+    .ok_or_else(|| anyhow::anyhow!("Teams receipt {receipt:x} generation is missing"))?;
+    inline_u256_to_u128(generation)
+}
+
 fn one_optional<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<Option<T>> {
     match values.len() {
         0 => Ok(None),
@@ -1534,7 +1554,15 @@ pub fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
     if receipts.is_empty() && observations.is_empty() && tombstones.is_empty() {
         return Ok(());
     }
-    let receipt = one_required(receipts, "Teams page receipt in one COMMIT")?;
+    // One page is one receipt: this counts receipt entities in the staged
+    // transaction, not values of an attribute.
+    let receipt = match receipts.len() {
+        1 => *receipts.first().expect("one receipt"),
+        0 => bail!("Teams page receipt in one COMMIT is missing"),
+        count => bail!(
+            "Teams page receipt in one COMMIT has {count} values; refusing arbitrary selection"
+        ),
+    };
     let covered = find!(
         event: Id,
         pattern!(facts, [{ receipt @ teams::coverage_observation: ?event }])
@@ -1546,19 +1574,27 @@ pub fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
         bail!("Teams page COMMIT receipt coverage does not exactly match its message events");
     }
 
-    let source = one_required(
-        find!(source: Id, pattern!(facts, [{ receipt @ teams::source: ?source }])).collect(),
-        "Teams page receipt source",
-    )?;
+    // The page carries the identity of every source its receipt names, and no
+    // other source.
+    let receipt_sources = find!(
+        source: Id,
+        pattern!(facts, [{ receipt @ teams::source: ?source }])
+    )
+    .collect::<BTreeSet<_>>();
+    if receipt_sources.is_empty() {
+        bail!("Teams page receipt source is missing");
+    }
     let sources = find!(
         value: Id,
         pattern!(facts, [{ ?value @ metadata::tag: teams::kind_source }])
     )
     .collect::<BTreeSet<_>>();
-    if sources != BTreeSet::from([source]) {
-        bail!("Teams page COMMIT must contain exactly its receipt source identity {source:x}");
+    if sources != receipt_sources {
+        bail!("Teams page COMMIT must contain exactly its receipt source identity");
     }
-    validate_source_identity(facts, source)?;
+    for source in &sources {
+        validate_source_identity(facts, *source)?;
+    }
 
     let chats = find!(
         value: Id,
@@ -1602,150 +1638,123 @@ pub fn validate_commit_fragment(facts: &TribleSet) -> Result<()> {
     validate_attachment_file_structure(facts, &attachments)
 }
 
+// A staged page must carry the identity closure of every entity it names, so
+// its history stays readable without borrowing facts from elsewhere. These are
+// presence checks: an attribute that holds more than one value is open world.
+
 fn validate_source_identity(facts: &TribleSet, source: Id) -> Result<()> {
-    let _tenant = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ source @ teams::tenant_id: ?value }])
-        )
-        .collect(),
-        "Teams source tenant",
-    )?;
+    if !exists!(pattern!(facts, [{ source @ teams::tenant_id: _?value }])) {
+        bail!("Teams source tenant is missing");
+    }
     Ok(())
 }
 
 fn validate_chat_identity(facts: &TribleSet, chat: Id, sources: &BTreeSet<Id>) -> Result<()> {
-    let source = one_required(
-        find!(value: Id, pattern!(facts, [{ chat @ teams::source: ?value }])).collect(),
-        "Teams chat source",
-    )?;
-    if !sources.contains(&source) {
+    let named = find!(value: Id, pattern!(facts, [{ chat @ teams::source: ?value }]))
+        .collect::<BTreeSet<_>>();
+    if named.is_empty() {
+        bail!("Teams chat source is missing");
+    }
+    if !named.is_subset(sources) {
         bail!("Teams chat {chat:x} names an unknown source");
     }
-    let _external = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ chat @ teams::chat_id: ?value }])
-        )
-        .collect(),
-        "Teams chat external id",
-    )?;
+    if !exists!(pattern!(facts, [{ chat @ teams::chat_id: _?value }])) {
+        bail!("Teams chat external id is missing");
+    }
     Ok(())
 }
 
 fn validate_author_identity(facts: &TribleSet, author: Id, sources: &BTreeSet<Id>) -> Result<()> {
-    let source = one_required(
-        find!(value: Id, pattern!(facts, [{ author @ teams::source: ?value }])).collect(),
-        "Teams user source",
-    )?;
-    if !sources.contains(&source) {
+    let named = find!(value: Id, pattern!(facts, [{ author @ teams::source: ?value }]))
+        .collect::<BTreeSet<_>>();
+    if named.is_empty() {
+        bail!("Teams user source is missing");
+    }
+    if !named.is_subset(sources) {
         bail!("Teams user {author:x} names an unknown source");
     }
-    let _external = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ author @ teams::user_id: ?value }])
-        )
-        .collect(),
-        "Teams user external id",
-    )?;
+    if !exists!(pattern!(facts, [{ author @ teams::user_id: _?value }])) {
+        bail!("Teams user external id is missing");
+    }
     Ok(())
 }
 
 fn validate_message_identity(facts: &TribleSet, message: Id, chats: &BTreeSet<Id>) -> Result<()> {
-    let chat = one_required(
-        find!(value: Id, pattern!(facts, [{ message @ teams::chat: ?value }])).collect(),
-        "Teams message chat",
-    )?;
-    if !chats.contains(&chat) {
+    let named = find!(value: Id, pattern!(facts, [{ message @ teams::chat: ?value }]))
+        .collect::<BTreeSet<_>>();
+    if named.is_empty() {
+        bail!("Teams message chat is missing");
+    }
+    if !named.is_subset(chats) {
         bail!("Teams message {message:x} names an unknown chat");
     }
-    let _external = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ message @ teams::message_id: ?value }])
-        )
-        .collect(),
-        "Teams message external id",
-    )?;
+    if !exists!(pattern!(facts, [{ message @ teams::message_id: _?value }])) {
+        bail!("Teams message external id is missing");
+    }
     Ok(())
 }
 
 fn validate_receipt_shape(facts: &TribleSet, receipt: Id) -> Result<()> {
-    let tag = one_required(
-        find!(value: Id, pattern!(facts, [{ receipt @ metadata::tag: ?value }])).collect(),
-        "Teams receipt kind",
-    )?;
-    let generation = one_required(
-        find!(
-            value: Inline<U256BE>,
-            pattern!(facts, [{ receipt @ teams::coverage_generation: ?value }])
-        )
-        .collect(),
-        "Teams receipt generation",
-    )?;
-    let generation_value = inline_u256_to_u128(generation)?;
-    let request = one_optional(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ receipt @ teams::coverage_request: ?value }])
-        )
-        .collect(),
-        "Teams coverage request",
-    )?;
-    let cursor = one_optional(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ receipt @ teams::coverage_cursor: ?value }])
-        )
-        .collect(),
-        "Teams coverage cursor",
-    )?;
-    let kind = one_optional(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ receipt @ teams::coverage_kind: ?value }])
-        )
-        .collect(),
-        "Teams coverage kind",
-    )?;
-    let predecessors = find!(
-        value: Id,
-        pattern!(facts, [{ receipt @ metadata::supersedes: ?value }])
+    let coverage = exists!(pattern!(facts, [{ receipt @ metadata::tag: teams::kind_coverage }]));
+    let legacy = exists!(pattern!(facts, [{
+        receipt @ metadata::tag: teams::kind_legacy_snapshot
+    }]));
+    let generations = find!(
+        value: Inline<U256BE>,
+        pattern!(facts, [{ receipt @ teams::coverage_generation: ?value }])
+    )
+    .map(inline_u256_to_u128)
+    .collect::<Result<BTreeSet<_>>>()?;
+    if generations.is_empty() {
+        bail!("Teams receipt generation is missing");
+    }
+    let request = exists!(pattern!(facts, [{ receipt @ teams::coverage_request: _?value }]));
+    let cursor = exists!(pattern!(facts, [{ receipt @ teams::coverage_cursor: _?value }]));
+    let kinds = find!(
+        value: Inline<Handle<UTF8String>>,
+        pattern!(facts, [{ receipt @ teams::coverage_kind: ?value }])
     )
     .collect::<BTreeSet<_>>();
-    let coordinate = one_optional(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(facts, [{ receipt @ teams::snapshot_source_coordinate: ?value }])
-        )
-        .collect(),
-        "Teams legacy snapshot source coordinate",
-    )?;
+    let predecessors = exists!(pattern!(facts, [{ receipt @ metadata::supersedes: _?value }]));
+    let coordinate = exists!(pattern!(facts, [{
+        receipt @ teams::snapshot_source_coordinate: _?value
+    }]));
 
-    if tag == teams::kind_coverage {
-        request.ok_or_else(|| anyhow::anyhow!("Teams coverage request is missing"))?;
-        cursor.ok_or_else(|| anyhow::anyhow!("Teams coverage cursor is missing"))?;
-        let kind = kind.ok_or_else(|| anyhow::anyhow!("Teams coverage kind is missing"))?;
-        if kind != text_handle("next") && kind != text_handle("delta") {
+    if coverage && legacy {
+        bail!("Teams receipt {receipt:x} is both a Graph coverage receipt and a legacy snapshot");
+    } else if coverage {
+        if !request {
+            bail!("Teams coverage request is missing");
+        }
+        if !cursor {
+            bail!("Teams coverage cursor is missing");
+        }
+        if kinds.is_empty() {
+            bail!("Teams coverage kind is missing");
+        }
+        if kinds
+            .iter()
+            .any(|kind| *kind != text_handle("next") && *kind != text_handle("delta"))
+        {
             bail!("invalid Teams coverage kind");
         }
-        if coordinate.is_some() {
+        if coordinate {
             bail!("Graph Teams coverage receipt carries a legacy source coordinate");
         }
-    } else if tag == teams::kind_legacy_snapshot {
-        if generation_value != 0
-            || request.is_some()
-            || cursor.is_some()
-            || kind.is_some()
-            || !predecessors.is_empty()
+    } else if legacy {
+        if generations != BTreeSet::from([0])
+            || request
+            || cursor
+            || !kinds.is_empty()
+            || predecessors
         {
             bail!("legacy Teams snapshot has Graph cursor state, a predecessor, or nonzero generation");
         }
-        coordinate
-            .ok_or_else(|| anyhow::anyhow!("legacy Teams snapshot source coordinate is missing"))?;
+        if !coordinate {
+            bail!("legacy Teams snapshot source coordinate is missing");
+        }
     } else {
-        bail!("unknown Teams receipt kind {tag:x}");
+        bail!("unknown Teams receipt kind on {receipt:x}");
     }
     Ok(())
 }
@@ -1778,37 +1787,23 @@ fn validate_attachment_file_structure(facts: &TribleSet, attachments: &BTreeSet<
         bail!("Teams facts omit attachment file {missing:x}");
     }
     for media_type in &media_types {
-        let _name = one_required(
-            find!(
-                value: Inline<Handle<UTF8String>>,
-                pattern!(facts, [{ *media_type @ metadata::name: ?value }])
-            )
-            .collect(),
-            "attachment media type name",
-        )?;
+        if !exists!(pattern!(facts, [{ *media_type @ metadata::name: _?value }])) {
+            bail!("attachment media type name is missing");
+        }
     }
     for file_id in files_present {
-        let _content = one_required(
-            find!(
-                value: Inline<Handle<RawBytes>>,
-                pattern!(facts, [{ file_id @ file::content: ?value }])
-            )
-            .collect(),
-            "attachment file content",
-        )?;
-        let _name = one_required(
-            find!(
-                value: Inline<Handle<UTF8String>>,
-                pattern!(facts, [{ file_id @ file::name: ?value }])
-            )
-            .collect(),
-            "attachment file name",
-        )?;
-        let media_type = one_required(
-            find!(value: Id, pattern!(facts, [{ file_id @ file::media_type: ?value }])).collect(),
-            "attachment file media type",
-        )?;
-        if !media_types.contains(&media_type) {
+        if !exists!(pattern!(facts, [{ file_id @ file::content: _?value }])) {
+            bail!("attachment file content is missing");
+        }
+        if !exists!(pattern!(facts, [{ file_id @ file::name: _?value }])) {
+            bail!("attachment file name is missing");
+        }
+        let named = find!(value: Id, pattern!(facts, [{ file_id @ file::media_type: ?value }]))
+            .collect::<BTreeSet<_>>();
+        if named.is_empty() {
+            bail!("attachment file media type is missing");
+        }
+        if let Some(media_type) = named.difference(&media_types).next() {
             bail!("Teams facts omit media-type identity {media_type:x}");
         }
     }
@@ -2219,66 +2214,39 @@ fn text_attributes() -> HashSet<Id> {
 }
 
 fn validate_attachment(catalog: &TribleSet, attachment: Id, messages: &BTreeSet<Id>) -> Result<()> {
-    let message = one_required(
-        find!(
-            value: Id,
-            pattern!(catalog, [{ attachment @ teams::attachment_message: ?value }])
-        )
-        .collect(),
-        "Teams attachment message",
-    )?;
-    if !messages.contains(&message) {
-        bail!("Teams attachment {attachment:x} names an unknown message");
-    }
-    let _source = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ attachment @ archive::attachment_source_id: ?value }])
-        )
-        .collect(),
-        "Teams attachment source id",
-    )?;
-    let kind = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ attachment @ teams::attachment_kind: ?value }])
-        )
-        .collect(),
-        "Teams attachment kind",
-    )?;
-    if kind != text_handle("attachment") && kind != text_handle("hosted-content") {
-        bail!("invalid Teams attachment kind");
-    }
-    let _name = one_optional(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ attachment @ archive::attachment_name: ?value }])
-        )
-        .collect(),
-        "Teams attachment name",
-    )?;
-    let _pointers = find!(
-        value: Inline<Handle<UTF8String>>,
-        pattern!(catalog, [{ attachment @ archive::attachment_source_pointer: ?value }])
+    let named = find!(
+        value: Id,
+        pattern!(catalog, [{ attachment @ teams::attachment_message: ?value }])
     )
     .collect::<BTreeSet<_>>();
-    let file = one_optional(
-        find!(
-            value: Id,
-            pattern!(catalog, [{ attachment @ archive::attachment_file: ?value }])
-        )
-        .collect(),
-        "Teams attachment file",
-    )?;
-    let size = one_optional(
-        find!(
-            value: Inline<U256BE>,
-            pattern!(catalog, [{ attachment @ archive::attachment_size_bytes: ?value }])
-        )
-        .collect(),
-        "Teams attachment size",
-    )?;
-    if file.is_some() != size.is_some() {
+    if named.is_empty() {
+        bail!("Teams attachment message is missing");
+    }
+    if !named.is_subset(messages) {
+        bail!("Teams attachment {attachment:x} names an unknown message");
+    }
+    if !exists!(pattern!(catalog, [{ attachment @ archive::attachment_source_id: _?value }])) {
+        bail!("Teams attachment source id is missing");
+    }
+    let kinds = find!(
+        value: Inline<Handle<UTF8String>>,
+        pattern!(catalog, [{ attachment @ teams::attachment_kind: ?value }])
+    )
+    .collect::<BTreeSet<_>>();
+    if kinds.is_empty() {
+        bail!("Teams attachment kind is missing");
+    }
+    if kinds
+        .iter()
+        .any(|kind| *kind != text_handle("attachment") && *kind != text_handle("hosted-content"))
+    {
+        bail!("invalid Teams attachment kind");
+    }
+    let file = exists!(pattern!(catalog, [{ attachment @ archive::attachment_file: _?value }]));
+    let size = exists!(pattern!(catalog, [{
+        attachment @ archive::attachment_size_bytes: _?value
+    }]));
+    if file != size {
         bail!("Teams attachment {attachment:x} must carry file and byte size together");
     }
     Ok(())
@@ -2291,80 +2259,44 @@ fn validate_observation(
     attachments: &BTreeSet<Id>,
     authors: &BTreeSet<Id>,
 ) -> Result<()> {
-    let message = one_required(
-        find!(value: Id, pattern!(catalog, [{ observation @ teams::message: ?value }])).collect(),
-        "Teams observation message",
-    )?;
-    if !messages.contains(&message) {
+    let named = find!(value: Id, pattern!(catalog, [{ observation @ teams::message: ?value }]))
+        .collect::<BTreeSet<_>>();
+    if named.is_empty() {
+        bail!("Teams observation message is missing");
+    }
+    if !named.is_subset(messages) {
         bail!("Teams observation {observation:x} names an unknown message");
     }
-    let state = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ observation @ teams::message_state: ?value }])
-        )
-        .collect(),
-        "Teams observation state",
-    )?;
-    let state_text = if state == text_handle("present") {
-        "present"
-    } else if state == text_handle("deleted") {
-        "deleted"
-    } else {
-        bail!("invalid Teams observation state");
-    };
-    let created = one_optional(
-        find!(
-            value: Inline<NsTAIInterval>,
-            pattern!(catalog, [{ observation @ metadata::created_at: ?value }])
-        )
-        .collect(),
-        "Teams observation created time",
-    )?;
-    let _modified = one_required(
-        find!(
-            value: Inline<NsTAIInterval>,
-            pattern!(catalog, [{ observation @ teams::modified_at: ?value }])
-        )
-        .collect(),
-        "Teams observation modified time",
-    )?;
-    let deleted = one_optional(
-        find!(
-            value: Inline<NsTAIInterval>,
-            pattern!(catalog, [{ observation @ teams::deleted_at: ?value }])
-        )
-        .collect(),
-        "Teams observation deleted time",
-    )?;
-    let author = one_optional(
-        find!(value: Id, pattern!(catalog, [{ observation @ archive::author: ?value }])).collect(),
-        "Teams observation author",
-    )?;
-    if author.is_some_and(|author| !authors.contains(&author)) {
-        bail!("Teams observation {observation:x} names an unknown author");
-    }
-    let _author_names = find!(
+    let states = find!(
         value: Inline<Handle<UTF8String>>,
-        pattern!(catalog, [{ observation @ teams::author_name: ?value }])
+        pattern!(catalog, [{ observation @ teams::message_state: ?value }])
     )
     .collect::<BTreeSet<_>>();
-    let content = one_optional(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ observation @ archive::content: ?value }])
-        )
-        .collect(),
-        "Teams observation content",
-    )?;
-    let _etag = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ observation @ teams::etag: ?value }])
-        )
-        .collect(),
-        "Teams observation etag",
-    )?;
+    if states.is_empty() {
+        bail!("Teams observation state is missing");
+    }
+    if states
+        .iter()
+        .any(|state| *state != text_handle("present") && *state != text_handle("deleted"))
+    {
+        bail!("invalid Teams observation state");
+    }
+    let present = states.contains(&text_handle("present"));
+    let deleted_state = states.contains(&text_handle("deleted"));
+    let created = exists!(pattern!(catalog, [{ observation @ metadata::created_at: _?value }]));
+    if !exists!(pattern!(catalog, [{ observation @ teams::modified_at: _?value }])) {
+        bail!("Teams observation modified time is missing");
+    }
+    let deleted = exists!(pattern!(catalog, [{ observation @ teams::deleted_at: _?value }]));
+    if find!(value: Id, pattern!(catalog, [{ observation @ archive::author: ?value }]))
+        .any(|author| !authors.contains(&author))
+    {
+        bail!("Teams observation {observation:x} names an unknown author");
+    }
+    let content = exists!(pattern!(catalog, [{ observation @ archive::content: _?value }]));
+    if !exists!(pattern!(catalog, [{ observation @ teams::etag: _?value }])) {
+        bail!("Teams observation etag is missing");
+    }
     let observation_attachments = find!(
         value: Id,
         pattern!(catalog, [{ observation @ archive::attachment: ?value }])
@@ -2374,64 +2306,54 @@ fn validate_observation(
         bail!("Teams observation {observation:x} names an unknown attachment");
     }
     for attachment in &observation_attachments {
-        let owner = one_required(
-            find!(
-                value: Id,
-                pattern!(catalog, [{ *attachment @ teams::attachment_message: ?value }])
-            )
-            .collect(),
-            "Teams attachment owner",
-        )?;
-        if owner != message {
+        let owners = find!(
+            value: Id,
+            pattern!(catalog, [{ *attachment @ teams::attachment_message: ?value }])
+        )
+        .collect::<BTreeSet<_>>();
+        if owners.is_empty() {
+            bail!("Teams attachment owner is missing");
+        }
+        if !owners.is_subset(&named) {
             bail!("Teams observation {observation:x} links an attachment owned by another message");
         }
     }
-    let raw = find!(
-        value: Inline<Handle<UTF8String>>,
-        pattern!(catalog, [{ observation @ teams::message_raw: ?value }])
-    )
-    .collect::<BTreeSet<_>>();
-    if raw.is_empty() {
+    if !exists!(pattern!(catalog, [{ observation @ teams::message_raw: _?value }])) {
         bail!("Teams observation {observation:x} has no raw source representation");
     }
-    if state_text == "present" && (created.is_none() || content.is_none()) {
+    if present && (!created || !content) {
         bail!("present Teams observation {observation:x} lacks created time or content");
     }
-    if state_text == "present" && deleted.is_some() {
+    if present && deleted {
         bail!("present Teams observation {observation:x} carries a deletion time");
     }
-    if state_text == "deleted" && deleted.is_none() {
+    if deleted_state && !deleted {
         bail!("versioned deleted Teams observation {observation:x} lacks deletedDateTime");
     }
     Ok(())
 }
 
 fn validate_tombstone(catalog: &TribleSet, tombstone: Id, messages: &BTreeSet<Id>) -> Result<()> {
-    let message = one_required(
-        find!(value: Id, pattern!(catalog, [{ tombstone @ teams::message: ?value }])).collect(),
-        "Teams tombstone message",
-    )?;
-    if !messages.contains(&message) {
+    let named = find!(value: Id, pattern!(catalog, [{ tombstone @ teams::message: ?value }]))
+        .collect::<BTreeSet<_>>();
+    if named.is_empty() {
+        bail!("Teams tombstone message is missing");
+    }
+    if !named.is_subset(messages) {
         bail!("Teams tombstone {tombstone:x} names an unknown message");
     }
-    let state = one_required(
-        find!(
-            value: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ tombstone @ teams::message_state: ?value }])
-        )
-        .collect(),
-        "Teams tombstone state",
-    )?;
-    if state != text_handle("deleted") {
+    let states = find!(
+        value: Inline<Handle<UTF8String>>,
+        pattern!(catalog, [{ tombstone @ teams::message_state: ?value }])
+    )
+    .collect::<BTreeSet<_>>();
+    if states.is_empty() {
+        bail!("Teams tombstone state is missing");
+    }
+    if states.iter().any(|state| *state != text_handle("deleted")) {
         bail!("invalid Teams tombstone state");
     }
-    if find!(
-        value: Inline<Handle<UTF8String>>,
-        pattern!(catalog, [{ tombstone @ teams::message_raw: ?value }])
-    )
-    .next()
-    .is_none()
-    {
+    if !exists!(pattern!(catalog, [{ tombstone @ teams::message_raw: _?value }])) {
         bail!("Teams tombstone {tombstone:x} has no raw source representation");
     }
     Ok(())

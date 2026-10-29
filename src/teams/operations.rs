@@ -282,7 +282,7 @@ impl Teams {
         storage(&self.config).with_session(|session| {
             let source = match self.config.tenant_selector.as_deref() {
                 Some(tenant) => source_id_for_tenant(tenant)?,
-                None => one_required(
+                None => sole(
                     teams_core::source_ids(&session.facts),
                     "Teams archive source (select a tenant when more than one exists)",
                 )?,
@@ -423,7 +423,7 @@ impl Teams {
         storage(&self.config).with_session(|session| {
             let source = match self.config.tenant_selector.as_deref() {
                 Some(tenant) => source_id_for_tenant(tenant)?,
-                None => one_required(
+                None => sole(
                     teams_core::source_ids(&session.facts),
                     "Teams source (select a tenant when more than one exists)",
                 )?,
@@ -839,7 +839,7 @@ fn selected_source(session: &TeamsSession, tenant_selector: Option<&str>) -> Res
     if let Some(tenant) = tenant_selector {
         return source_id_for_tenant(tenant);
     }
-    one_required(
+    sole(
         teams_core::auth_profile_sources(&session.facts),
         "Teams auth-profile source (set --tenant when more than one exists)",
     )
@@ -1256,28 +1256,36 @@ fn load_context<P>(
 where
     P: TriblePattern,
 {
-    let heads = current_context_head_ids(catalog, source_id);
-    let Some(context_id) = one_optional(heads, "Teams presentation-context head")? else {
+    // Concurrent context versions are resolved to the newest by the creation
+    // time each carries, then by the smallest id. Name and boundary are the
+    // version's identity; should a writer ever reuse an id, the smallest
+    // handle is shown.
+    let Some(context_id) = current_context_head_ids(catalog, source_id)
+        .into_iter()
+        .max_by_key(|head| {
+            let created = find!(
+                created: Inline<NsTAIInterval>,
+                pattern!(catalog, [{ *head @ metadata::created_at: ?created }])
+            )
+            .map(interval_key)
+            .max();
+            (created, std::cmp::Reverse(*head))
+        })
+    else {
         return Ok(PresentationContext::default());
     };
-    let name = one_optional(
-        find!(
-            name: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ context_id @ metadata::name: ?name }])
-        )
-        .collect(),
-        "Teams presentation name",
-    )?
+    let name = find!(
+        name: Inline<Handle<UTF8String>>,
+        pattern!(catalog, [{ context_id @ metadata::name: ?name }])
+    )
+    .min()
     .map(|handle| read_utf8string(reader, handle, "Teams presentation name"))
     .transpose()?;
-    let boundary = one_optional(
-        find!(
-            boundary: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ context_id @ metadata::description: ?boundary }])
-        )
-        .collect(),
-        "Teams presentation boundary",
-    )?
+    let boundary = find!(
+        boundary: Inline<Handle<UTF8String>>,
+        pattern!(catalog, [{ context_id @ metadata::description: ?boundary }])
+    )
+    .min()
     .map(|handle| read_utf8string(reader, handle, "Teams presentation boundary"))
     .transpose()?;
     Ok(PresentationContext { name, boundary })
@@ -2446,22 +2454,18 @@ fn read_message_observation<P>(
 where
     P: TriblePattern,
 {
-    let created_at = one_optional(
-        find!(
-            created: Inline<NsTAIInterval>,
-            pattern!(catalog, [{ observation_id @ metadata::created_at: ?created }])
-        )
-        .collect(),
-        "Teams message created time",
-    )?;
-    let content = one_optional(
-        find!(
-            content: Inline<Handle<UTF8String>>,
-            pattern!(catalog, [{ observation_id @ archive::content: ?content }])
-        )
-        .collect(),
-        "Teams message content",
-    )?;
+    // Creation time and content annotate the observation: should two writers
+    // disagree, the earliest time and the smallest handle are shown.
+    let created_at = find!(
+        created: Inline<NsTAIInterval>,
+        pattern!(catalog, [{ observation_id @ metadata::created_at: ?created }])
+    )
+    .min_by_key(|created| (interval_key(*created), *created));
+    let content = find!(
+        content: Inline<Handle<UTF8String>>,
+        pattern!(catalog, [{ observation_id @ archive::content: ?content }])
+    )
+    .min();
     let author_names = find!(
         name: Inline<Handle<UTF8String>>,
         pattern!(catalog, [{ observation_id @ teams::author_name: ?name }])
@@ -2470,14 +2474,13 @@ where
     if !deleted && (created_at.is_none() || content.is_none()) {
         bail!("present Teams observation {observation_id:x} lacks created time or content");
     }
-    let modified_at = one_required(
-        find!(
-            modified: Inline<NsTAIInterval>,
-            pattern!(catalog, [{ observation_id @ teams::modified_at: ?modified }])
-        )
-        .collect(),
-        "Teams message modified time",
-    )?;
+    // The modification time is the observation's identity.
+    let modified_at = find!(
+        modified: Inline<NsTAIInterval>,
+        pattern!(catalog, [{ observation_id @ teams::modified_at: ?modified }])
+    )
+    .min_by_key(|modified| (interval_key(*modified), *modified))
+    .ok_or_else(|| anyhow::anyhow!("Teams message modified time is missing"))?;
     let created_at = created_at.unwrap_or(modified_at);
     let attachments = find!(
         attachment: Id,
@@ -2718,45 +2721,37 @@ where
             continue;
         }
         for attachment_id in message.attachments {
-            let source_id = one_required(
-                find!(
-                    value: Inline<Handle<UTF8String>>,
-                    pattern!(catalog, [{ attachment_id @ archive::attachment_source_id: ?value }])
-                )
-                .collect(),
-                "Teams attachment source id",
-            )?;
+            // Source id, kind, and name are the occurrence's identity; should
+            // a writer ever reuse an id, the smallest handle is shown. An
+            // occurrence without a readable source id cannot be referenced.
+            let Some(source_id) = find!(
+                value: Inline<Handle<UTF8String>>,
+                pattern!(catalog, [{ attachment_id @ archive::attachment_source_id: ?value }])
+            )
+            .min() else {
+                continue;
+            };
             // Absent on occurrences written before the kind became text,
             // until a backfill gives them its twin.
-            let source_kind = one_optional(
-                find!(
-                    value: Inline<Handle<UTF8String>>,
-                    pattern!(catalog, [{ attachment_id @ teams::attachment_kind: ?value }])
-                )
-                .collect(),
-                "Teams attachment kind",
-            )?;
+            let source_kind = find!(
+                value: Inline<Handle<UTF8String>>,
+                pattern!(catalog, [{ attachment_id @ teams::attachment_kind: ?value }])
+            )
+            .min();
             let source_pointers = find!(
                 value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ attachment_id @ archive::attachment_source_pointer: ?value }])
             )
             .collect::<BTreeSet<_>>();
-            let file_id = one_optional(
-                find!(
-                    value: Id,
-                    pattern!(catalog, [{ attachment_id @ archive::attachment_file: ?value }])
-                )
-                .collect(),
-                "Teams attachment file",
-            )?;
-            let occurrence_name = one_optional(
-                find!(
-                    value: Inline<Handle<UTF8String>>,
-                    pattern!(catalog, [{ attachment_id @ archive::attachment_name: ?value }])
-                )
-                .collect(),
-                "Teams attachment occurrence name",
-            )?;
+            // File and size annotate the occurrence once it is materialized;
+            // should two writers disagree, the smallest file and size are
+            // shown.
+            let file_id = attachment_file(catalog, attachment_id);
+            let occurrence_name = find!(
+                value: Inline<Handle<UTF8String>>,
+                pattern!(catalog, [{ attachment_id @ archive::attachment_name: ?value }])
+            )
+            .min();
             let file_name = file_id
                 .map(|id| file_capability::name_handle(catalog, id))
                 .transpose()?
@@ -2765,14 +2760,11 @@ where
                 .map(|id| file_capability::media_type_name_handle_strict(catalog, id))
                 .transpose()?
                 .flatten();
-            let size = one_optional(
-                find!(
-                    value: Inline<U256BE>,
-                    pattern!(catalog, [{ attachment_id @ archive::attachment_size_bytes: ?value }])
-                )
-                .collect(),
-                "Teams attachment size",
-            )?;
+            let size = find!(
+                value: Inline<U256BE>,
+                pattern!(catalog, [{ attachment_id @ archive::attachment_size_bytes: ?value }])
+            )
+            .min();
             rows.push(AttachmentRow {
                 attachment_id,
                 message_id: message.message_id,
@@ -2830,15 +2822,7 @@ fn get_attachment(
         {
             continue;
         }
-        let file_id = one_optional(
-            find!(
-                file: Id,
-                pattern!(&view.facts, [{ row.attachment_id @ archive::attachment_file: ?file }])
-            )
-            .collect(),
-            "Teams attachment file",
-        )?;
-        let Some(file_id) = file_id else {
+        let Some(file_id) = attachment_file(&view.facts, row.attachment_id) else {
             continue;
         };
         let data_handle = file_capability::content_handle(&view.facts, file_id)?
@@ -3178,6 +3162,36 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
 
 type CoverageHead = teams_core::CoverageHead;
 
+/// The one candidate among distinct entities, such as the sole source when no
+/// tenant is selected or the logical message a minimal record names. Several
+/// candidates are an ambiguity for the caller to resolve, never a choice made
+/// here. This is not a check on how many values an attribute holds.
+fn sole<T: Ord>(candidates: BTreeSet<T>, what: &str) -> Result<T> {
+    let mut candidates = candidates.into_iter();
+    match (candidates.next(), candidates.len()) {
+        (None, _) => bail!("{what} is missing"),
+        (Some(candidate), 0) => Ok(candidate),
+        (Some(_), rest) => bail!(
+            "{what} has {} values; refusing arbitrary selection",
+            rest + 1
+        ),
+    }
+}
+
+/// The materialized file of an attachment occurrence, the smallest should
+/// two writers disagree.
+fn attachment_file<P>(catalog: &P, attachment: Id) -> Option<Id>
+where
+    P: TriblePattern,
+{
+    find!(
+        file: Id,
+        pattern!(catalog, [{ attachment @ archive::attachment_file: ?file }])
+    )
+    .min()
+}
+
+#[cfg(test)]
 fn one_optional<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<Option<T>> {
     match values.len() {
         0 => Ok(None),
@@ -3186,6 +3200,7 @@ fn one_optional<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<Option<T>> {
     }
 }
 
+#[cfg(test)]
 fn one_required<T: Ord>(values: BTreeSet<T>, field: &str) -> Result<T> {
     one_optional(values, field)?.ok_or_else(|| anyhow::anyhow!("{field} is missing"))
 }
@@ -3432,7 +3447,7 @@ fn resolve_message_identity(
     by_external: &BTreeMap<String, BTreeSet<KnownMessage>>,
 ) -> Result<KnownMessage> {
     if let Some(chat_external_id) = message.chat_external_id.as_deref() {
-        return one_required(
+        return sole(
             identities
                 .iter()
                 .filter(|known| {
@@ -3448,7 +3463,7 @@ fn resolve_message_identity(
         );
     }
 
-    one_required(
+    sole(
         by_external
             .get(&message.message_external_id)
             .cloned()
