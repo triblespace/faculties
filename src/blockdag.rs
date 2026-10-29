@@ -714,51 +714,6 @@ pub fn annotate_generated_projection(
     Ok(projection)
 }
 
-fn values_by_entity<T: Ord>(rows: impl IntoIterator<Item = (Id, T)>) -> BTreeMap<Id, BTreeSet<T>> {
-    let mut values = BTreeMap::new();
-    for (entity, value) in rows {
-        values
-            .entry(entity)
-            .or_insert_with(BTreeSet::new)
-            .insert(value);
-    }
-    values
-}
-
-fn values_for<T: Ord + Copy>(values: &BTreeMap<Id, BTreeSet<T>>, id: Id) -> BTreeSet<T> {
-    values.get(&id).cloned().unwrap_or_default()
-}
-
-fn one_required<T: Ord + Copy>(
-    values: &BTreeMap<Id, BTreeSet<T>>,
-    id: Id,
-    field: &str,
-) -> Result<T> {
-    let values = values_for(values, id);
-    if values.len() != 1 {
-        bail!(
-            "entity {id:x} has {} values for {field}; expected exactly one",
-            values.len()
-        );
-    }
-    Ok(*values.first().expect("one value"))
-}
-
-fn one_optional<T: Ord + Copy>(
-    values: &BTreeMap<Id, BTreeSet<T>>,
-    id: Id,
-    field: &str,
-) -> Result<Option<T>> {
-    let values = values_for(values, id);
-    if values.len() > 1 {
-        bail!(
-            "entity {id:x} has {} values for optional scalar {field}",
-            values.len()
-        );
-    }
-    Ok(values.first().copied())
-}
-
 fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
 where
     P: TriblePattern,
@@ -877,11 +832,11 @@ fn validate_dag(nodes: &BTreeMap<Id, BTreeSet<Id>>, label: &str) -> Result<()> {
 
 /// Prove the universal block-DAG denotation without reading any attachment.
 ///
-/// The proof reconstructs every intrinsic id, enforces scalar cardinality and
-/// graph closure, and then compares the reconstructed ontology with the input
-/// exactly. Vendor parsing, source-locator grammar, role mapping, MIME
-/// inference, and raw-record-to-projection equivalence intentionally remain
-/// outside this universal layer.
+/// The proof reconstructs every intrinsic id from the values that reproduce
+/// it, enforces graph closure, and then compares the reconstructed ontology
+/// with the input exactly. Vendor parsing, source-locator grammar, role
+/// mapping, MIME inference, and raw-record-to-projection equivalence
+/// intentionally remain outside this universal layer.
 fn validate_structure_with_rows<P>(
     facts: &P,
     observed: impl IntoIterator<Item = Trible>,
@@ -902,153 +857,58 @@ where
         ("vendor model", &vendor_models),
     ])?;
 
-    let media_names = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ metadata::name: ?value }])
-    ));
     let vocabulary_ids: BTreeSet<_> = schema::content_fact::modality::SPECS
         .iter()
         .chain(schema::content_fact::direction::SPECS)
         .map(|(id, _)| *id)
         .collect();
-    let has_vocabulary = vocabulary_ids.iter().any(|id| media_names.contains_key(id));
-    let modalities = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::modality: ?value }])
-    ));
-    let directions = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::direction: ?value }])
-    ));
-    let payloads = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::payload: ?value }])
-    ));
-    let blobs = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::blob: ?value }])
-    ));
-    let asset_pointers = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::asset_pointer: ?value }])
-    ));
-    let asset_namespaces = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::asset_namespace: ?value }])
-    ));
-    let fact_media_types = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::media_type: ?value }])
-    ));
-    let asset_sizes = values_by_entity(find!(
-        (entity: Id, value: SizeValue),
-        pattern!(facts, [{ ?entity @ schema::content_fact::asset_size: ?value }])
-    ));
-    let resolutions = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::resolved_to: ?value }])
-    ));
+    let has_vocabulary = vocabulary_ids
+        .iter()
+        .any(|&id| exists!(pattern!(facts, [{ id @ metadata::name: _?name }])));
 
-    let block_previous = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::block::previous: ?value }])
-    ));
-    let block_timestamps = values_by_entity(find!(
-        (entity: Id, value: IntervalValue),
-        pattern!(facts, [{ ?entity @ schema::block::timestamp: ?value }])
-    ));
-    let node_holds = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::block::holds: ?value }])
-    ));
-    let node_responses = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::block::responds_to: ?value }])
-    ));
-    let receipt_resolutions = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::resolution: ?value }])
-    ));
-
-    let source_namespaces = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_namespace: ?value }])
-    ));
-    let source_locators = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_locator: ?value }])
-    ));
-    let raw_records = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_record: ?value }])
-    ));
-    let projected_blocks = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::projects_to: ?value }])
-    ));
-    let semantic_predecessor_support = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{
-            ?entity @ schema::source_projection::semantic_predecessor_support: ?value
-        }])
-    ));
-    let source_timestamps = values_by_entity(find!(
-        (entity: Id, value: IntervalValue),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_timestamp: ?value }])
-    ));
-    let authors = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::author: ?value }])
-    ));
-    let experiencers = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::experiencer: ?value }])
-    ));
-    let raw_authors = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_author: ?value }])
-    ));
-    let raw_roles = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_role: ?value }])
-    ));
-    let raw_models = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_model: ?value }])
-    ));
-    let generators = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::generated_by: ?value }])
-    ));
-    let source_details = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_detail: ?value }])
-    ));
-
+    // Each question below is asked of one entity where it is needed. Where an
+    // id derives from some of the entity's values, the identity is the
+    // combination of its values that reproduces the id; a value outside that
+    // combination is a fact this catalog does not model, which the exact
+    // comparison at the end reports. Annotations carry every value.
     let mut expected = TribleSet::new();
     let mut attachments = AttachmentPlan::default();
     let mut referenced_media_types = BTreeSet::new();
-    for id in &media_types {
-        let name = one_required(&media_names, *id, "media type name")?;
-        let core = entity! {
-            metadata::tag: &files_schema::KIND_MEDIA_TYPE,
-            metadata::name: name,
-        };
-        let expected_id = core.root().expect("media type core has one root");
-        if expected_id != *id {
-            bail!("media type {id:x} does not match intrinsic root {expected_id:x}");
+    for &id in &media_types {
+        let mut intrinsic = None;
+        for name in find!(
+            name: TextHandle,
+            pattern!(facts, [{ id @ metadata::name: ?name }])
+        ) {
+            let core = entity! {
+                metadata::tag: &files_schema::KIND_MEDIA_TYPE,
+                metadata::name: name,
+            };
+            if core.root() == Some(id) {
+                intrinsic = Some(name);
+            }
+            expected += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name }.into_facts();
+            attachments.texts.insert(name);
         }
-        expected += core.into_facts();
-        attachments.texts.insert(name);
+        let name = intrinsic
+            .ok_or_else(|| anyhow!("media type {id:x} has no name that reproduces its id"))?;
+        expected += entity! { ExclusiveId::force_ref(&id) @
+            metadata::tag: &files_schema::KIND_MEDIA_TYPE,
+        }
+        .into_facts();
         attachments.media_type_names.insert(name);
     }
 
     // A vendor model's id is derived from its label, which buys idempotence
     // and nothing to check here: take its tag and whatever names it carries.
-    for id in &vendor_models {
-        let names = values_for(&media_names, *id);
+    for &id in &vendor_models {
+        let names: BTreeSet<TextHandle> = find!(
+            name: TextHandle,
+            pattern!(facts, [{ id @ metadata::name: ?name }])
+        )
+        .collect();
         attachments.texts.extend(names.iter().copied());
-        expected += entity! { ExclusiveId::force_ref(id) @
+        expected += entity! { ExclusiveId::force_ref(&id) @
             metadata::tag: &schema::vendor_model::KIND,
             metadata::name*: names.iter(),
         }
@@ -1061,13 +921,17 @@ where
     // A completely absent vocabulary remains valid so the writer can add the
     // bootstrap monotonically to a pre-vocabulary collection.
     if has_vocabulary {
-        for id in &vocabulary_ids {
-            let names = values_for(&media_names, *id);
+        for &id in &vocabulary_ids {
+            let names: BTreeSet<TextHandle> = find!(
+                name: TextHandle,
+                pattern!(facts, [{ id @ metadata::name: ?name }])
+            )
+            .collect();
             if names.is_empty() {
                 bail!("entity {id:x} has no Archive vocabulary name");
             }
             attachments.texts.extend(names.iter().copied());
-            expected += entity! { ExclusiveId::force_ref(id) @
+            expected += entity! { ExclusiveId::force_ref(&id) @
                 metadata::name*: names.iter(),
             }
             .into_facts();
@@ -1075,99 +939,184 @@ where
         expected += vocabulary_fragment().into_facts();
     }
 
-    for id in &content_facts {
-        let modality = one_required(&modalities, *id, "content fact modality")?;
-        if !known_modality(modality) {
-            bail!("content fact {id:x} has unknown modality {modality:x}");
+    for &id in &content_facts {
+        let has_payload =
+            exists!(pattern!(facts, [{ id @ schema::content_fact::payload: _?value }]));
+        let has_blob = exists!(pattern!(facts, [{ id @ schema::content_fact::blob: _?value }]));
+        let has_pointer = exists!(pattern!(facts, [{
+            id @ schema::content_fact::asset_pointer: _?value
+        }]));
+        if [has_payload, has_blob, has_pointer]
+            .into_iter()
+            .filter(|&has| has)
+            .count()
+            != 1
+        {
+            bail!("content fact {id:x} must have exactly one of payload, blob, or asset pointer");
         }
-        let direction = one_required(&directions, *id, "content fact direction")?;
-        if !known_direction(direction) {
-            bail!("content fact {id:x} has unknown direction {direction:x}");
-        }
-        let payload = one_optional(&payloads, *id, "content fact payload")?;
-        let blob = one_optional(&blobs, *id, "content fact blob")?;
-        let pointer = one_optional(&asset_pointers, *id, "content fact asset pointer")?;
-        let namespace = one_optional(&asset_namespaces, *id, "content fact asset namespace")?;
-        let media_type = one_optional(&fact_media_types, *id, "content fact media type")?;
-        let size = one_optional(&asset_sizes, *id, "content fact asset size")?;
-        if let Some(size) = size {
+        let has_namespace = exists!(pattern!(facts, [{
+            id @ schema::content_fact::asset_namespace: _?value
+        }]));
+        let has_media_type = exists!(pattern!(facts, [{
+            id @ schema::content_fact::media_type: _?value
+        }]));
+        let sizes: Vec<SizeValue> = find!(
+            value: SizeValue,
+            pattern!(facts, [{ id @ schema::content_fact::asset_size: ?value }])
+        )
+        .collect();
+        for size in &sizes {
             let _: u128 = size.try_from_inline().map_err(|error| {
                 anyhow!("content fact {id:x} asset size does not fit u128: {error:?}")
             })?;
         }
-        let resolved = values_for(&resolutions, *id);
+        let resolved: BTreeSet<RawHandle> = find!(
+            value: RawHandle,
+            pattern!(facts, [{ id @ schema::content_fact::resolved_to: ?value }])
+        )
+        .collect();
+        let vocabulary = |modality: Id, direction: Id| -> Result<()> {
+            if !known_modality(modality) {
+                bail!("content fact {id:x} has unknown modality {modality:x}");
+            }
+            if !known_direction(direction) {
+                bail!("content fact {id:x} has unknown direction {direction:x}");
+            }
+            Ok(())
+        };
 
-        let core = match (payload, blob, pointer) {
-            (Some(payload), None, None) => {
-                if !textual_modality(modality) {
-                    bail!("content fact {id:x} uses a text payload with a media modality");
-                }
-                if namespace.is_some()
-                    || media_type.is_some()
-                    || size.is_some()
-                    || !resolved.is_empty()
-                {
-                    bail!("text content fact {id:x} carries media-only fields");
-                }
-                attachments.texts.insert(payload);
-                entity! { _ @
+        let core = if has_payload {
+            let (modality, direction, payload, core) = find!(
+                (modality: Id, direction: Id, payload: TextHandle),
+                pattern!(facts, [{ id @
+                    schema::content_fact::modality: ?modality,
+                    schema::content_fact::direction: ?direction,
+                    schema::content_fact::payload: ?payload,
+                }])
+            )
+            .map(|(modality, direction, payload)| {
+                let core = entity! { _ @
                     schema::content_fact::modality: &modality,
                     schema::content_fact::direction: &direction,
                     schema::content_fact::payload: payload,
-                }
+                };
+                (modality, direction, payload, core)
+            })
+            .find(|(.., core)| core.root() == Some(id))
+            .ok_or_else(|| {
+                anyhow!("text content fact {id:x} has no modality, direction and payload that reproduce its id")
+            })?;
+            vocabulary(modality, direction)?;
+            if !textual_modality(modality) {
+                bail!("content fact {id:x} uses a text payload with a media modality");
             }
-            (None, Some(blob), None) => {
-                if !media_modality(modality) {
-                    bail!("content fact {id:x} uses resident bytes with a textual modality");
-                }
-                if namespace.is_some() || size.is_some() || !resolved.is_empty() {
-                    bail!("resident content fact {id:x} carries pointer-only fields");
-                }
-                let media_type = media_type.ok_or_else(|| {
-                    anyhow!("resident content fact {id:x} has no canonical media type")
-                })?;
-                if !media_types.contains(&media_type) {
-                    bail!("content fact {id:x} cites missing media type {media_type:x}");
-                }
-                referenced_media_types.insert(media_type);
-                attachments.raws.insert(blob);
-                entity! { _ @
+            if has_namespace || has_media_type || !sizes.is_empty() || !resolved.is_empty() {
+                bail!("text content fact {id:x} carries media-only fields");
+            }
+            attachments.texts.insert(payload);
+            core
+        } else if has_blob {
+            if !has_media_type {
+                bail!("resident content fact {id:x} has no canonical media type");
+            }
+            let (modality, direction, blob, media_type, core) = find!(
+                (modality: Id, direction: Id, blob: RawHandle, media_type: Id),
+                pattern!(facts, [{ id @
+                    schema::content_fact::modality: ?modality,
+                    schema::content_fact::direction: ?direction,
+                    schema::content_fact::blob: ?blob,
+                    schema::content_fact::media_type: ?media_type,
+                }])
+            )
+            .map(|(modality, direction, blob, media_type)| {
+                let core = entity! { _ @
                     schema::content_fact::modality: &modality,
                     schema::content_fact::direction: &direction,
                     schema::content_fact::blob: blob,
                     schema::content_fact::media_type: &media_type,
-                }
+                };
+                (modality, direction, blob, media_type, core)
+            })
+            .find(|(.., core)| core.root() == Some(id))
+            .ok_or_else(|| {
+                anyhow!("resident content fact {id:x} has no modality, direction, blob and media type that reproduce its id")
+            })?;
+            vocabulary(modality, direction)?;
+            if !media_modality(modality) {
+                bail!("content fact {id:x} uses resident bytes with a textual modality");
             }
-            (None, None, Some(pointer)) => {
-                if !media_modality(modality) {
-                    bail!("content fact {id:x} uses an asset pointer with a textual modality");
-                }
-                let namespace = namespace
-                    .ok_or_else(|| anyhow!("pointer content fact {id:x} has no asset namespace"))?;
-                if let Some(media_type) = media_type {
-                    if !media_types.contains(&media_type) {
-                        bail!("content fact {id:x} cites missing media type {media_type:x}");
+            if has_namespace || !sizes.is_empty() || !resolved.is_empty() {
+                bail!("resident content fact {id:x} carries pointer-only fields");
+            }
+            if !media_types.contains(&media_type) {
+                bail!("content fact {id:x} cites missing media type {media_type:x}");
+            }
+            referenced_media_types.insert(media_type);
+            attachments.raws.insert(blob);
+            core
+        } else {
+            if !has_namespace {
+                bail!("pointer content fact {id:x} has no asset namespace");
+            }
+            // Media type and size enter a pointer's identity only when known.
+            let fact_media_types: Vec<Option<Id>> = std::iter::once(None)
+                .chain(
+                    find!(
+                        value: Id,
+                        pattern!(facts, [{ id @ schema::content_fact::media_type: ?value }])
+                    )
+                    .map(Some),
+                )
+                .collect();
+            let fact_sizes: Vec<Option<SizeValue>> = std::iter::once(None)
+                .chain(sizes.iter().copied().map(Some))
+                .collect();
+            let mut matched = None;
+            for (modality, direction, pointer, namespace) in find!(
+                (modality: Id, direction: Id, pointer: TextHandle, namespace: Id),
+                pattern!(facts, [{ id @
+                    schema::content_fact::modality: ?modality,
+                    schema::content_fact::direction: ?direction,
+                    schema::content_fact::asset_pointer: ?pointer,
+                    schema::content_fact::asset_namespace: ?namespace,
+                }])
+            ) {
+                for &media_type in &fact_media_types {
+                    for &size in &fact_sizes {
+                        let core = entity! { _ @
+                            schema::content_fact::modality: &modality,
+                            schema::content_fact::direction: &direction,
+                            schema::content_fact::asset_pointer: pointer,
+                            schema::content_fact::asset_namespace: &namespace,
+                            schema::content_fact::media_type?: media_type,
+                            schema::content_fact::asset_size?: size,
+                        };
+                        if core.root() == Some(id) {
+                            matched = Some((modality, direction, pointer, media_type, core));
+                        }
                     }
-                    referenced_media_types.insert(media_type);
-                }
-                attachments.texts.insert(pointer);
-                attachments.raws.extend(resolved.iter().copied());
-                entity! { _ @
-                    schema::content_fact::modality: &modality,
-                    schema::content_fact::direction: &direction,
-                    schema::content_fact::asset_pointer: pointer,
-                    schema::content_fact::asset_namespace: &namespace,
-                    schema::content_fact::media_type?: media_type,
-                    schema::content_fact::asset_size?: size,
                 }
             }
-            _ => bail!(
-                "content fact {id:x} must have exactly one of payload, blob, or asset pointer"
-            ),
+            let (modality, direction, pointer, media_type, core) = matched.ok_or_else(|| {
+                anyhow!("pointer content fact {id:x} has no modality, direction, pointer and namespace that reproduce its id")
+            })?;
+            vocabulary(modality, direction)?;
+            if !media_modality(modality) {
+                bail!("content fact {id:x} uses an asset pointer with a textual modality");
+            }
+            if let Some(media_type) = media_type {
+                if !media_types.contains(&media_type) {
+                    bail!("content fact {id:x} cites missing media type {media_type:x}");
+                }
+                referenced_media_types.insert(media_type);
+            }
+            attachments.texts.insert(pointer);
+            attachments.raws.extend(resolved.iter().copied());
+            core
         };
         let mut canonical =
-            ensure_intrinsic_with_kind(*id, core, schema::content_fact::KIND, "content fact")?;
-        canonical += entity! { ExclusiveId::force_ref(id) @
+            ensure_intrinsic_with_kind(id, core, schema::content_fact::KIND, "content fact")?;
+        canonical += entity! { ExclusiveId::force_ref(&id) @
             schema::content_fact::resolved_to*: resolved.iter(),
         }
         .into_facts();
@@ -1176,20 +1125,32 @@ where
 
     let mut block_graph = BTreeMap::new();
     let mut referenced_content_facts = BTreeSet::new();
-    for id in &blocks {
-        let previous = values_for(&block_previous, *id);
+    for &id in &blocks {
+        let previous: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ schema::block::previous: ?value }])
+        )
+        .collect();
         for predecessor in &previous {
             if !blocks.contains(predecessor) {
                 bail!("node {id:x} cites missing predecessor {predecessor:x}");
             }
         }
-        let timestamps = values_for(&block_timestamps, *id);
+        let timestamps: BTreeSet<IntervalValue> = find!(
+            value: IntervalValue,
+            pattern!(facts, [{ id @ schema::block::timestamp: ?value }])
+        )
+        .collect();
         for timestamp in &timestamps {
             let _: (i128, i128) = timestamp.try_from_inline().map_err(|error| {
                 anyhow!("node {id:x} has invalid timestamp interval: {error:?}")
             })?;
         }
-        let held = values_for(&node_holds, *id);
+        let held: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ schema::block::holds: ?value }])
+        )
+        .collect();
         if held.is_empty() && (!previous.is_empty() || !timestamps.is_empty()) {
             bail!(
                 "content-free node {id:x} is not the predecessor-free, timeless canonical bottom"
@@ -1201,7 +1162,11 @@ where
             }
         }
         referenced_content_facts.extend(held.iter().copied());
-        let responses = values_for(&node_responses, *id);
+        let responses: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ schema::block::responds_to: ?value }])
+        )
+        .collect();
         for target in &responses {
             if !blocks.contains(target) {
                 bail!("node {id:x} responds to missing node {target:x}");
@@ -1211,73 +1176,169 @@ where
             schema::block::previous*: previous.iter(),
             schema::block::holds*: held.iter(),
         };
-        let mut canonical = ensure_intrinsic_with_kind(*id, core, schema::block::KIND, "node")?;
-        canonical += entity! { ExclusiveId::force_ref(id) @
+        let mut canonical = ensure_intrinsic_with_kind(id, core, schema::block::KIND, "node")?;
+        canonical += entity! { ExclusiveId::force_ref(&id) @
             schema::block::timestamp*: timestamps.iter(),
             schema::block::responds_to*: responses.iter(),
         }
         .into_facts();
         expected += canonical;
-        block_graph.insert(*id, previous);
+        block_graph.insert(id, previous);
     }
     validate_dag(&block_graph, "node DAG")?;
 
     let mut referenced_blocks = BTreeSet::new();
-    for id in &projections {
-        let namespace = one_required(&source_namespaces, *id, "source projection namespace")?;
-        let projected = one_required(&projected_blocks, *id, "source projection target block")?;
+    for &id in &projections {
+        // Two receipt cores share this vocabulary. A block receipt
+        // ([`block_source_projection`]) is the namespace and the block alone,
+        // and every locator and raw record annotates it. An exact-occurrence
+        // receipt ([`source_projection`]) holds its one locator and raw record
+        // in its identity.
+        let mut matched = None;
+        for (namespace, projected) in find!(
+            (namespace: Id, projected: Id),
+            pattern!(facts, [{ id @
+                schema::source_projection::source_namespace: ?namespace,
+                schema::source_projection::projects_to: ?projected,
+            }])
+        ) {
+            let block_core = entity! { _ @
+                schema::source_projection::source_namespace: &namespace,
+                schema::source_projection::projects_to: &projected,
+            };
+            if block_core.root() == Some(id) {
+                matched = Some((projected, block_core));
+                break;
+            }
+            for (locator, raw_record) in find!(
+                (locator: TextHandle, raw_record: RawHandle),
+                pattern!(facts, [{ id @
+                    schema::source_projection::source_locator: ?locator,
+                    schema::source_projection::raw_record: ?raw_record,
+                }])
+            ) {
+                let core = entity! { _ @
+                    schema::source_projection::source_namespace: &namespace,
+                    schema::source_projection::source_locator: locator,
+                    schema::source_projection::raw_record: raw_record,
+                    schema::source_projection::projects_to: &projected,
+                };
+                if core.root() == Some(id) {
+                    matched = Some((projected, core));
+                }
+            }
+            if matched.is_some() {
+                break;
+            }
+        }
+        let (projected, core) = matched.ok_or_else(|| {
+            anyhow!("source projection {id:x} has no namespace and block, with or without a locator and raw record, that reproduce its id")
+        })?;
         if !blocks.contains(&projected) {
             bail!("source projection {id:x} cites missing block {projected:x}");
         }
         referenced_blocks.insert(projected);
-        let predecessor_support = values_for(&semantic_predecessor_support, *id);
-        let direct_predecessors = block_graph
-            .get(&projected)
-            .expect("every projected block has a validated predecessor set");
-        for receipt in &predecessor_support {
-            if !projections.contains(receipt) {
+        let predecessor_support: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{
+                id @ schema::source_projection::semantic_predecessor_support: ?value
+            }])
+        )
+        .collect();
+        for &receipt in &predecessor_support {
+            if !projections.contains(&receipt) {
                 bail!(
                     "source projection {id:x} cites missing semantic-support receipt {receipt:x}"
                 );
             }
-            let supporting_block = one_required(
-                &projected_blocks,
-                *receipt,
-                "semantic-support receipt target block",
-            )?;
-            if !direct_predecessors.contains(&supporting_block) {
+            if !exists!(pattern!(facts, [
+                { receipt @ schema::source_projection::projects_to: _?block },
+                { projected @ schema::block::previous: _?block },
+            ])) {
+                let supporting: Vec<String> = find!(
+                    value: Id,
+                    pattern!(facts, [{ receipt @ schema::source_projection::projects_to: ?value }])
+                )
+                .map(|block| format!("{block:x}"))
+                .collect();
                 bail!(
-                    "source projection {id:x} cites receipt {receipt:x} for unrelated block {supporting_block:x}"
+                    "source projection {id:x} cites receipt {receipt:x} for unrelated block {}",
+                    supporting.join(", ")
                 );
             }
         }
         // Occurrence evidence is additive: a receipt observed more than once
         // carries every observation, and no annotation has a cardinality.
-        let locators = values_for(&source_locators, *id);
-        let raws = values_for(&raw_records, *id);
-        let timestamps = values_for(&source_timestamps, *id);
+        let locators: BTreeSet<TextHandle> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ schema::source_projection::source_locator: ?value }])
+        )
+        .collect();
+        let raws: BTreeSet<RawHandle> = find!(
+            value: RawHandle,
+            pattern!(facts, [{ id @ schema::source_projection::raw_record: ?value }])
+        )
+        .collect();
+        let timestamps: BTreeSet<IntervalValue> = find!(
+            value: IntervalValue,
+            pattern!(facts, [{ id @ schema::source_projection::source_timestamp: ?value }])
+        )
+        .collect();
         for timestamp in &timestamps {
             let _: (i128, i128) = timestamp.try_from_inline().map_err(|error| {
                 anyhow!("source projection {id:x} has invalid timestamp: {error:?}")
             })?;
         }
-        let receipt_authors = values_for(&authors, *id);
-        let receipt_experiencers = values_for(&experiencers, *id);
-        let receipt_raw_authors = values_for(&raw_authors, *id);
-        let receipt_raw_roles = values_for(&raw_roles, *id);
-        let receipt_raw_models = values_for(&raw_models, *id);
-        let receipt_generators = values_for(&generators, *id);
-        let details = values_for(&source_details, *id);
-        let selected = values_for(&receipt_resolutions, *id);
-        let available: BTreeSet<RawHandle> = values_for(&node_holds, projected)
-            .iter()
-            .flat_map(|fact| values_for(&resolutions, *fact))
-            .collect();
-        if let Some(resolution) = selected.difference(&available).next() {
-            bail!(
-                "source projection {id:x} selects resolution {:?} absent from its node's facts",
-                resolution.raw
-            );
+        let receipt_authors: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ schema::source_projection::author: ?value }])
+        )
+        .collect();
+        let receipt_experiencers: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ schema::source_projection::experiencer: ?value }])
+        )
+        .collect();
+        let receipt_raw_authors: BTreeSet<TextHandle> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ schema::source_projection::raw_author: ?value }])
+        )
+        .collect();
+        let receipt_raw_roles: BTreeSet<TextHandle> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ schema::source_projection::raw_role: ?value }])
+        )
+        .collect();
+        let receipt_raw_models: BTreeSet<TextHandle> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ schema::source_projection::raw_model: ?value }])
+        )
+        .collect();
+        let receipt_generators: BTreeSet<Id> = find!(
+            value: Id,
+            pattern!(facts, [{ id @ schema::source_projection::generated_by: ?value }])
+        )
+        .collect();
+        let details: BTreeSet<TextHandle> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ id @ schema::source_projection::source_detail: ?value }])
+        )
+        .collect();
+        let selected: BTreeSet<RawHandle> = find!(
+            value: RawHandle,
+            pattern!(facts, [{ id @ schema::source_projection::resolution: ?value }])
+        )
+        .collect();
+        for &resolution in &selected {
+            if !exists!(pattern!(facts, [
+                { projected @ schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::resolved_to: resolution },
+            ])) {
+                bail!(
+                    "source projection {id:x} selects resolution {:?} absent from its node's facts",
+                    resolution.raw
+                );
+            }
         }
         attachments.raws.extend(selected.iter().copied());
 
@@ -1290,34 +1351,13 @@ where
         attachments.texts.extend(receipt_raw_roles.iter().copied());
         attachments.texts.extend(receipt_raw_models.iter().copied());
 
-        // Two receipt cores share this vocabulary. A block receipt
-        // ([`block_source_projection`]) is the namespace and the block alone,
-        // and every locator and raw record annotates it. An exact-occurrence
-        // receipt ([`source_projection`]) holds its one locator and raw record
-        // in its identity.
-        let block_core = entity! { _ @
-            schema::source_projection::source_namespace: &namespace,
-            schema::source_projection::projects_to: &projected,
-        };
-        let core = if block_core.root() == Some(*id) {
-            block_core
-        } else {
-            let locator = one_required(&source_locators, *id, "source projection locator")?;
-            let raw_record = one_required(&raw_records, *id, "source projection raw record")?;
-            entity! { _ @
-                schema::source_projection::source_namespace: &namespace,
-                schema::source_projection::source_locator: locator,
-                schema::source_projection::raw_record: raw_record,
-                schema::source_projection::projects_to: &projected,
-            }
-        };
         let mut canonical = ensure_intrinsic_with_kind(
-            *id,
+            id,
             core,
             schema::source_projection::KIND,
             "source projection",
         )?;
-        canonical += entity! { ExclusiveId::force_ref(id) @
+        canonical += entity! { ExclusiveId::force_ref(&id) @
             schema::source_projection::semantic_predecessor_support*:
                 predecessor_support.iter(),
             schema::source_projection::source_locator*: locators.iter(),
@@ -2272,6 +2312,53 @@ mod tests {
         assert_eq!(projection.root(), Some(root));
         let (_, validation) =
             validate_catalog_union(&reader, &TribleSet::new(), &projection).unwrap();
+        assert_eq!(validation, CatalogValidation::Accepted);
+    }
+
+    #[test]
+    fn a_second_identity_value_is_an_unmodelled_fact_not_a_second_core() {
+        let (_directory, reader) = empty_reader();
+        let mut fragment = projection(one_part("one payload"));
+        let fact = find!(
+            fact: Id,
+            pattern!(&fragment, [{ _?node @ schema::block::holds: ?fact }])
+        )
+        .next()
+        .unwrap();
+        let other = fragment.put::<UTF8String, _>("another payload".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&fact) @
+            schema::content_fact::payload: other,
+        };
+        let (_, validation) =
+            validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
+        assert!(matches!(
+            validation,
+            CatalogValidation::Rejected(reason) if reason.contains("0 missing, 1 unexpected")
+        ));
+    }
+
+    #[test]
+    fn a_media_type_keeps_its_identity_name_and_carries_others() {
+        let (_directory, reader) = empty_reader();
+        let fact = blob_fact(
+            schema::content_fact::modality::IMAGE,
+            schema::content_fact::direction::IN,
+            b"png".as_slice(),
+            "image/png",
+        )
+        .unwrap();
+        let root = fact.root().unwrap();
+        let media_type = find!(
+            media_type: Id,
+            pattern!(&fact, [{ root @ schema::content_fact::media_type: ?media_type }])
+        )
+        .next()
+        .unwrap();
+        let mut fragment = projection(fact);
+        let alias = fragment.put::<UTF8String, _>("image/x-png".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&media_type) @ metadata::name: alias };
+        let (_, validation) =
+            validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
         assert_eq!(validation, CatalogValidation::Accepted);
     }
 
