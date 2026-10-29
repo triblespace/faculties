@@ -927,27 +927,31 @@ enum Shown {
     Block(Id),
 }
 
-/// Resolve a `show` prefix against projections and nodes together. A prefix
-/// that matches more than one id, of either kind, is refused with the count
-/// of each; it is never narrowed to one.
-fn resolve_show_prefix(
+/// Resolve a `show` prefix against projections first, then nodes. One
+/// matching projection is shown without enumerating any node: its rendering
+/// already prints its nodes, and the node scan is the expensive part. Only
+/// a prefix no projection matches is resolved against `blocks`. A prefix
+/// matching more than one id of the kind it is resolved against is refused
+/// with the count; it is never narrowed to one.
+fn resolve_show_prefix<B: IntoIterator<Item = Id>>(
     projections: impl IntoIterator<Item = Id>,
-    blocks: impl IntoIterator<Item = Id>,
+    blocks: impl FnOnce() -> B,
     prefix: &str,
 ) -> Result<Shown> {
     let prefix = normalize_prefix(prefix)?;
     let projections = matching(projections, &prefix);
-    let blocks = matching(blocks, &prefix);
-    match (projections.first(), blocks.first()) {
-        (None, None) => bail!("no Archive source projection or block matches {prefix}"),
-        (Some(projection), None) if projections.len() == 1 => Ok(Shown::Projection(*projection)),
-        (None, Some(block)) if blocks.len() == 1 => Ok(Shown::Block(*block)),
-        _ => bail!(
-            "Archive prefix {prefix} is ambiguous: it matches {} source projection(s) and {} \
-             block(s)",
-            projections.len(),
-            blocks.len()
-        ),
+    match projections.len() {
+        0 => {}
+        1 => return Ok(Shown::Projection(*projections.first().expect("one match"))),
+        many => {
+            bail!("Archive prefix {prefix} is ambiguous: it matches {many} source projection(s)")
+        }
+    }
+    let blocks = matching(blocks(), &prefix);
+    match blocks.len() {
+        0 => bail!("no Archive source projection or block matches {prefix}"),
+        1 => Ok(Shown::Block(*blocks.first().expect("one match"))),
+        many => bail!("Archive prefix {prefix} is ambiguous: it matches {many} block(s)"),
     }
 }
 
@@ -1078,10 +1082,12 @@ fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Res
             }])
         ),
         // Nodes as search finds them: whatever holds a content fact.
-        find!(
-            block: Id,
-            pattern!(&facts, [{ ?block @ archive_schema::block::holds: _?fact }])
-        ),
+        || {
+            find!(
+                block: Id,
+                pattern!(&facts, [{ ?block @ archive_schema::block::holds: _?fact }])
+            )
+        },
         prefix,
     )?;
     out.text(match shown {
@@ -2429,19 +2435,36 @@ mod tests {
     fn a_show_prefix_names_one_projection_or_one_block_and_never_picks() {
         let id = |byte: u8| Id::new([byte; 16]).unwrap();
         let (projection, block, twin) = (id(0xA1), id(0xB1), id(0xB2));
-        let resolve = |prefix: &str| resolve_show_prefix([projection], [block, twin], prefix);
+        let resolve = |prefix: &str| resolve_show_prefix([projection], || [block, twin], prefix);
         assert_eq!(resolve("a1").unwrap(), Shown::Projection(projection));
         assert_eq!(resolve("B1").unwrap(), Shown::Block(block));
         let error = resolve("B").unwrap_err().to_string();
         assert!(
-            error.contains("ambiguous") && error.contains("0 source projection(s) and 2 block(s)"),
+            error.contains("ambiguous") && error.contains("2 block(s)"),
             "{error}"
         );
-        let both = resolve_show_prefix([id(0xC1)], [id(0xC2)], "C").unwrap_err();
+        // One receipt wins over a block sharing its prefix: its projection
+        // already prints its blocks.
+        assert_eq!(
+            resolve_show_prefix([id(0xC1)], || [id(0xC2)], "C").unwrap(),
+            Shown::Projection(id(0xC1))
+        );
+        // Several receipts are refused before any block is looked at.
+        let receipts = resolve_show_prefix(
+            [id(0xE1), id(0xE2)],
+            || -> [Id; 0] { panic!("blocks enumerated") },
+            "E",
+        )
+        .unwrap_err();
         assert!(
-            both.to_string()
-                .contains("1 source projection(s) and 1 block(s)"),
-            "{both}"
+            receipts.to_string().contains("2 source projection(s)"),
+            "{receipts}"
+        );
+        // A single receipt match never enumerates the blocks.
+        let untouched = std::iter::from_fn(|| -> Option<Id> { panic!("blocks enumerated") });
+        assert_eq!(
+            resolve_show_prefix([projection], || untouched, "A1").unwrap(),
+            Shown::Projection(projection)
         );
         let none = resolve("D").unwrap_err().to_string();
         assert_eq!(none, "no Archive source projection or block matches D");
