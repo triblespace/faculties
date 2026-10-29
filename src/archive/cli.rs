@@ -117,7 +117,8 @@ pub(super) enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Show one exact source projection by id prefix.
+    /// Show one source projection (receipt) or one node by id prefix; a
+    /// search hit's leading id is a node.
     Show { id: String },
     /// Show the complete canonical ancestor DAG of one source projection.
     Thread {
