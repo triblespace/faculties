@@ -120,7 +120,9 @@ pub(super) enum Command {
     /// Show one source projection (receipt) or one node by id prefix; a
     /// search hit's leading id is a node.
     Show { id: String },
-    /// Show the complete canonical ancestor DAG of one source projection.
+    /// Show the complete canonical ancestor DAG of one source projection
+    /// (receipt) or one node, by id prefix; a search hit's leading id is a
+    /// node.
     Thread {
         id: String,
         /// Maximum accepted block count. Exceeding it is an error rather than

@@ -909,40 +909,31 @@ fn matching(ids: impl IntoIterator<Item = Id>, prefix: &str) -> BTreeSet<Id> {
         .collect()
 }
 
-fn resolve_prefix(ids: impl IntoIterator<Item = Id>, prefix: &str) -> Result<Id> {
-    let prefix = normalize_prefix(prefix)?;
-    let matches = matching(ids, &prefix);
-    match matches.len() {
-        0 => bail!("no Archive source projection matches {prefix}"),
-        1 => Ok(*matches.first().expect("one prefix match")),
-        _ => bail!("Archive projection prefix {prefix} is ambiguous"),
-    }
-}
-
-/// What a prefix given to `show` names: a source projection (a receipt), or
-/// a node, which is the id a search hit leads with.
+/// What a prefix given to `show` or `thread` names: a source projection (a
+/// receipt), or a node, which is the id a search hit leads with.
 #[derive(Debug, PartialEq)]
-enum Shown {
+enum Named {
     Projection(Id),
     Block(Id),
 }
 
-/// Resolve a `show` prefix against projections first, then nodes. One
-/// matching projection is shown without enumerating any node: its rendering
-/// already prints its nodes, and the node scan is the expensive part. Only
+/// Resolve a `show` or `thread` prefix against projections first, then
+/// nodes. One matching projection is taken without enumerating any node:
+/// what it names already reaches its nodes, and the node scan is the
+/// expensive part. Only
 /// a prefix no projection matches is resolved against `blocks`. A prefix
 /// matching more than one id of the kind it is resolved against is refused
 /// with the count; it is never narrowed to one.
-fn resolve_show_prefix<B: IntoIterator<Item = Id>>(
+fn resolve_archive_prefix<B: IntoIterator<Item = Id>>(
     projections: impl IntoIterator<Item = Id>,
     blocks: impl FnOnce() -> B,
     prefix: &str,
-) -> Result<Shown> {
+) -> Result<Named> {
     let prefix = normalize_prefix(prefix)?;
     let projections = matching(projections, &prefix);
     match projections.len() {
         0 => {}
-        1 => return Ok(Shown::Projection(*projections.first().expect("one match"))),
+        1 => return Ok(Named::Projection(*projections.first().expect("one match"))),
         many => {
             bail!("Archive prefix {prefix} is ambiguous: it matches {many} source projection(s)")
         }
@@ -950,7 +941,7 @@ fn resolve_show_prefix<B: IntoIterator<Item = Id>>(
     let blocks = matching(blocks(), &prefix);
     match blocks.len() {
         0 => bail!("no Archive source projection or block matches {prefix}"),
-        1 => Ok(Shown::Block(*blocks.first().expect("one match"))),
+        1 => Ok(Named::Block(*blocks.first().expect("one match"))),
         many => bail!("Archive prefix {prefix} is ambiguous: it matches {many} block(s)"),
     }
 }
@@ -1071,13 +1062,12 @@ fn newest_projections(facts: &FactArchive, limit: usize) -> Vec<Id> {
     listed
 }
 
-fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Result<()> {
-    let observed = storage.load()?;
-    let facts = crate::storage::acquire_attached_facts(&observed)?;
-    let shown = resolve_show_prefix(
+/// [`resolve_archive_prefix`] over the archive's projections and nodes.
+fn resolve_in(facts: &FactArchive, prefix: &str) -> Result<Named> {
+    resolve_archive_prefix(
         find!(
             projection: Id,
-            pattern!(&facts, [{
+            pattern!(facts, [{
                 ?projection @ metadata::tag: &archive_schema::source_projection::KIND
             }])
         ),
@@ -1085,40 +1075,43 @@ fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Res
         || {
             find!(
                 block: Id,
-                pattern!(&facts, [{ ?block @ archive_schema::block::holds: _?fact }])
+                pattern!(facts, [{ ?block @ archive_schema::block::holds: _?fact }])
             )
         },
         prefix,
-    )?;
-    out.text(match shown {
-        Shown::Projection(projection) => {
+    )
+}
+
+fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Result<()> {
+    let observed = storage.load()?;
+    let facts = crate::storage::acquire_attached_facts(&observed)?;
+    out.text(match resolve_in(&facts, prefix)? {
+        Named::Projection(projection) => {
             render_projection(&facts, observed.snapshot(), projection)?
         }
         // The node as `thread` prints it: its parts once, and a line for
         // every receipt that projects to it, so no receipt is picked.
-        Shown::Block(block) => render_block(&facts, observed.snapshot(), block, true)?,
+        Named::Block(block) => render_block(&facts, observed.snapshot(), block, true)?,
     })?;
     Ok(())
 }
 
-fn load_thread(facts: &FactArchive, projection_prefix: &str, limit: usize) -> Result<Vec<Id>> {
+/// The canonical ancestor DAG of the nodes `prefix` names, roots first. A
+/// projection names the nodes it projects to; a node names itself, so a
+/// node's thread is its own ancestry and needs no receipt picked among the
+/// several that may project to it.
+fn load_thread(facts: &FactArchive, prefix: &str, limit: usize) -> Result<Vec<Id>> {
     if limit == 0 {
         bail!("thread limit must be at least 1");
     }
-    let leaf = resolve_prefix(
-        find!(
-            projection: Id,
-            pattern!(facts, [{
-                ?projection @ metadata::tag: &archive_schema::source_projection::KIND
-            }])
-        ),
-        projection_prefix,
-    )?;
-    let mut pending: BTreeSet<_> = find!(
-        block: Id,
-        pattern!(facts, [{ leaf @ archive_schema::source_projection::projects_to: ?block }])
-    )
-    .collect();
+    let mut pending: BTreeSet<_> = match resolve_in(facts, prefix)? {
+        Named::Projection(leaf) => find!(
+            block: Id,
+            pattern!(facts, [{ leaf @ archive_schema::source_projection::projects_to: ?block }])
+        )
+        .collect(),
+        Named::Block(block) => BTreeSet::from([block]),
+    };
     let mut parents = BTreeMap::<Id, BTreeSet<Id>>::new();
     while let Some(block) = pending.pop_first() {
         if parents.contains_key(&block) {
@@ -1312,8 +1305,7 @@ fn run_search(
             ),
             _ => String::new(),
         };
-        // `show` takes the node's id or a receipt's; `thread` takes a
-        // receipt (a source projection).
+        // `show` and `thread` take the node's id or a receipt's.
         let mut receipt_ids: Vec<String> =
             receipts.iter().take(3).map(|id| short_id(*id)).collect();
         if receipts.len() > 3 {
@@ -2435,9 +2427,9 @@ mod tests {
     fn a_show_prefix_names_one_projection_or_one_block_and_never_picks() {
         let id = |byte: u8| Id::new([byte; 16]).unwrap();
         let (projection, block, twin) = (id(0xA1), id(0xB1), id(0xB2));
-        let resolve = |prefix: &str| resolve_show_prefix([projection], || [block, twin], prefix);
-        assert_eq!(resolve("a1").unwrap(), Shown::Projection(projection));
-        assert_eq!(resolve("B1").unwrap(), Shown::Block(block));
+        let resolve = |prefix: &str| resolve_archive_prefix([projection], || [block, twin], prefix);
+        assert_eq!(resolve("a1").unwrap(), Named::Projection(projection));
+        assert_eq!(resolve("B1").unwrap(), Named::Block(block));
         let error = resolve("B").unwrap_err().to_string();
         assert!(
             error.contains("ambiguous") && error.contains("2 block(s)"),
@@ -2446,11 +2438,11 @@ mod tests {
         // One receipt wins over a block sharing its prefix: its projection
         // already prints its blocks.
         assert_eq!(
-            resolve_show_prefix([id(0xC1)], || [id(0xC2)], "C").unwrap(),
-            Shown::Projection(id(0xC1))
+            resolve_archive_prefix([id(0xC1)], || [id(0xC2)], "C").unwrap(),
+            Named::Projection(id(0xC1))
         );
         // Several receipts are refused before any block is looked at.
-        let receipts = resolve_show_prefix(
+        let receipts = resolve_archive_prefix(
             [id(0xE1), id(0xE2)],
             || -> [Id; 0] { panic!("blocks enumerated") },
             "E",
@@ -2463,8 +2455,8 @@ mod tests {
         // A single receipt match never enumerates the blocks.
         let untouched = std::iter::from_fn(|| -> Option<Id> { panic!("blocks enumerated") });
         assert_eq!(
-            resolve_show_prefix([projection], || untouched, "A1").unwrap(),
-            Shown::Projection(projection)
+            resolve_archive_prefix([projection], || untouched, "A1").unwrap(),
+            Named::Projection(projection)
         );
         let none = resolve("D").unwrap_err().to_string();
         assert_eq!(none, "no Archive source projection or block matches D");
@@ -2525,6 +2517,53 @@ mod tests {
                 "{projection}"
             );
         }
+    }
+
+    /// A search hit's leading node id opens its thread: the node's ancestor
+    /// DAG, which is the thread of the receipt projecting to that node.
+    #[test]
+    fn thread_opens_the_block_a_search_hit_leads_with() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("thread-hit.jsonl");
+        fs::write(
+            &source,
+            concat!(
+                r#"{"type":"user","sessionId":"thread-hit","uuid":"t1","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"alpha"}}"#,
+                "\n",
+                r#"{"type":"user","sessionId":"thread-hit","uuid":"t2","parentUuid":"t1","timestamp":"2026-03-01T15:34:02Z","message":{"role":"user","content":"quasar needle"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
+
+        let search = printed(|out| run_search(storage(&fixture), "quasar", 10, out)).unwrap();
+        let hit = search
+            .lines()
+            .find(|line| line.contains("quasar needle"))
+            .unwrap_or_else(|| panic!("a hit: {search}"));
+        let words: Vec<&str> = hit.split_whitespace().collect();
+        let (block, receipts) = (words[1], words[3]);
+        assert_eq!(words[2], "receipt", "{hit}");
+
+        let thread = printed(|out| run_thread(storage(&fixture), block, 10, out)).unwrap();
+        assert_eq!(thread.matches("block: ").count(), 2, "{thread}");
+        assert!(
+            thread.contains("alpha"),
+            "the parent is in the thread: {thread}"
+        );
+        assert!(thread.contains(&format!("block: {block}")), "{thread}");
+        // The parent comes first, the hit last.
+        assert!(
+            thread.find("alpha").unwrap() < thread.find("quasar needle").unwrap(),
+            "{thread}"
+        );
+        let receipts: Vec<&str> = receipts.split(',').collect();
+        assert_eq!(receipts.len(), 1, "{hit}");
+        let by_receipt =
+            printed(|out| run_thread(storage(&fixture), receipts[0], 10, out)).unwrap();
+        assert_eq!(thread, by_receipt, "a node's thread is its receipt's");
     }
 
     #[test]
