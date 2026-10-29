@@ -50,8 +50,8 @@ mode=$2
 printf 'x\n' >> "$root/attempts"
 n=$(wc -l < "$root/attempts" | tr -d ' ')
 cat > "$root/report.$n"
-: > "$root/ready.$n"
 test ! -e "$root/paused" || exit 78
+: > "$root/ready.$n"
 case "$mode" in
   always) exit 75 ;;
   once) test "$n" -gt 1 || exit 75 ;;
