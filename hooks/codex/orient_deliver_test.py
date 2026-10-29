@@ -44,8 +44,9 @@ def frame(conn, opcode, data, final=True):
 
 
 class Server:
-    def __init__(self, path, case="active"):
+    def __init__(self, path, case="active", user_agent=None):
         self.path, self.case, self.requests, self.error = str(path), case, [], None
+        self.user_agent = user_agent
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(self.path)
         self.listener.listen(1)
@@ -130,7 +131,7 @@ class Server:
                 "malformed_ua": "client has 0.160.1 but no primary version",
             }.get(self.case, "codex/0.160.1")
             return {"codexHome": "/wrong" if self.case == "wrong_home" else "/test/codex",
-                    "userAgent": user_agent}
+                    "userAgent": user_agent if self.user_agent is None else self.user_agent}
         if method == "thread/loaded/list":
             if self.case == "pause_during_absence":
                 (Path(self.path).parent / "paused").touch()
@@ -195,8 +196,8 @@ class DeliveryTests(unittest.TestCase):
         paths = list((self.root / "state").glob("*.json"))
         return json.loads(paths[0].read_text()) if paths else None
 
-    def run_case(self, case, fails=False):
-        server = Server(self.args.socket, case)
+    def run_case(self, case, fails=False, user_agent=None):
+        server = Server(self.args.socket, case, user_agent)
         report = "News: Unicode π\n$(not shell)\n\n"
         try:
             if fails:
@@ -422,6 +423,65 @@ class DeliveryTests(unittest.TestCase):
                     delivery.deliver(self.args, "fixed", time.monotonic() + 1)
         self.assertEqual(delivery.exit_status(caught.exception), 1)
         check.assert_not_called()
+
+    def test_mac_leading_version_and_product_grammar(self):
+        self.args.probe = True
+        cases = [
+            ("0.165.0", "codex-tui/0.165.0 (Mac OS 26.4.0; arm64) unknown (codex-tui; 0.163.0)", False),
+            ("0.165.0", "Codex Desktop/0.165.0 (Mac OS; arm64) (client; 0.164.0)", False),
+            ("0.165.0", "codex-tui/0.165.0", False),
+            ("0.165.0", "codex-tui/0.165.0\t(client; 0.164.0)", False),
+            ("0.165.0", "codex-tui/0.164.0 (client; 0.165.0)", True),
+            ("0.164.0", "codex-tui/0.165.0 (client; 0.164.0)", True),
+            ("0.165.0", "codex-tui/0.165.00 (client; 0.165.0)", True),
+            ("0.165.0", "codex-tui/0.165.0-beta (client; 0.165.0)", True),
+            ("0.165.0", "codex-tui\n/0.165.0", True),
+            ("0.165.0", "codex-tui\r/0.165.0", True),
+            ("0.165.0", "codex-tui/0.165.0\n", True),
+            ("0.165.0", "codex-tui/0.165.0\r", True),
+            ("0.165.0", "codex-tui/0.165.0\n(client; 0.165.0)", True),
+        ]
+        for version, user_agent, fails in cases:
+            with self.subTest(version=version, user_agent=user_agent):
+                self.args.server_version = version
+                self.assertEqual(self.run_case("active", fails, user_agent), [])
+                self.assertFalse(Path(self.args.state_dir).exists())
+
+    def test_mac_native_cli_supports_explicit_versions_and_refuses_future(self):
+        for version in ("0.160.1", "0.162.1", "0.163.0", "0.164.0", "0.165.0"):
+            with self.subTest(version=version):
+                self.args.server_version = version
+                server = Server(self.args.socket, "active", "Codex Desktop/" + version + " (client; 0.163.0)")
+                try:
+                    result = self.native()
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                finally:
+                    server.finish()
+                self.assertEqual(sum(req.get("method") == "turn/start" for req in server.requests), 1)
+                self.assertEqual(self.state()["status"], "accepted")
+        self.args.server_version = "0.166.0"
+        result = self.native()  # No listener: argparse must refuse before any connection.
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("invalid choice", result.stderr)
+
+    def test_mac_0165_readiness75_and_unknown_precedence(self):
+        self.args.server_version = "0.165.0"
+        user_agent = "codex-tui/0.165.0 (Mac OS; arm64) (codex-tui; 0.163.0)"
+        for case in ("not_loaded", "stale", "system_error"):
+            with self.subTest(case=case):
+                server = Server(self.args.socket, case, user_agent)
+                try:
+                    result = self.native()
+                    self.assertEqual(result.returncode, 75, result.stderr)
+                finally:
+                    server.finish()
+                self.assertFalse(any(req.get("method") == "turn/start" for req in server.requests))
+                self.assertIsNone(self.state())
+        path = Path(self.args.state_dir) / (hashlib.sha256(self.args.thread.encode()).hexdigest() + ".json")
+        path.write_text(json.dumps({"thread": self.args.thread, "status": "unknown"}))
+        result = self.native()  # No listener: unresolved state must win before preflight.
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unresolved dispatch", result.stderr)
 
 
 if __name__ == "__main__":

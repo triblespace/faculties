@@ -378,7 +378,7 @@ def main():
     parser.add_argument("thread")
     parser.add_argument("--socket", required=True)
     parser.add_argument("--codex-home", required=True)
-    parser.add_argument("--server-version", required=True, choices=("0.160.1", "0.163.0"))
+    parser.add_argument("--server-version", required=True, choices=("0.160.1", "0.162.1", "0.163.0", "0.164.0", "0.165.0"))
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--pause-marker", action="append", required=True)
     parser.add_argument("--deadline", type=float, default=24.0)
