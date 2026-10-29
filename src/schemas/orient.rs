@@ -61,3 +61,21 @@ pub mod presentation {
         "6C6D4F69E59F96DD55C996CDDEDE9598" as due_at: inlineencodings::NsTAIInterval;
     }
 }
+
+/// A continuous Orient observer's liveness beat for one persona's news path.
+///
+/// Written into the shared swarm-health collection with health_record's
+/// `node` (the persona) and `session` (one observer process lifetime), so the
+/// existing latest-per-node register selects each persona's latest record.
+/// The first beat of a session after an exit or a silence also carries
+/// health_record's recovered tag and `metadata::supersedes` naming that record.
+///
+/// Minted with `trible genid` on 2026-10-29.
+pub const KIND_NEWS_PATH_BEAT: Id = id_hex!("89906A65BA5779885E3A2676E4E1E767");
+
+/// A best-effort record that a continuous Orient observer ended on an error,
+/// with the error text as `metadata::description`. It annotates the exit; it
+/// neither decides nor changes it.
+///
+/// Minted with `trible genid` on 2026-10-29.
+pub const KIND_NEWS_PATH_EXIT: Id = id_hex!("7A3221E5D3CF65B39071F2F51AF3AFBE");

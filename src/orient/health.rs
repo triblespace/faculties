@@ -7,6 +7,7 @@
 //! are just one report's output and attention IDs, never a second health store.
 
 use super::*;
+use crate::schemas::orient::{KIND_NEWS_PATH_BEAT, KIND_NEWS_PATH_EXIT};
 use crate::schemas::swarm_health::{self as schema, attrs};
 use triblespace::core::collection::descriptor;
 
@@ -27,6 +28,8 @@ pub(super) struct HealthSources {
     // One process-local observation, not another persisted health model. The
     // cached views and watermark belong to exactly the same sampled prefix.
     poll_view: Option<(FacultySnapshot, HealthObservation)>,
+    // Present only for a continuous observer, which is a window's news path.
+    news_path: Option<NewsPathBeat>,
     #[cfg(test)]
     poll_observations: usize,
     #[cfg(test)]
@@ -67,6 +70,7 @@ impl HealthSources {
             maintained_view: None,
             receipt_maintenance_note: None,
             poll_view: None,
+            news_path: None,
             #[cfg(test)]
             poll_observations: 0,
             #[cfg(test)]
@@ -255,6 +259,7 @@ impl HealthSources {
         let now = clock::now()?;
         let sampled = pile.snapshot()?;
         self.refresh_poll_view(sampled, now)?;
+        self.beat_if_due(pile, signer, input, now, output)?;
         let (_, observation) = self
             .poll_view
             .as_ref()
@@ -390,6 +395,297 @@ impl HealthSources {
     }
 }
 
+/// Writer cadence of a continuous observer's news-path beat (writer policy).
+pub(super) const NEWS_PATH_BEAT_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Reader policy: a news path whose latest beat is older than this is silent.
+pub(super) const NEWS_PATH_MAX_AGE: Duration = Duration::from_secs(20 * 60);
+/// The exit reason is one line of an error chain, not a log.
+const NEWS_PATH_REASON_CHARS: usize = 400;
+
+/// One observer process's beat state: process-local, never a loaded model.
+struct NewsPathBeat {
+    session: Id,
+    window: Option<Id>,
+    last_beat: Option<Epoch>,
+}
+
+impl HealthSources {
+    /// Mark this observer as a window's news path: it beats while it polls.
+    pub(super) fn start_beating(&mut self) {
+        self.news_path = Some(NewsPathBeat {
+            session: genid().id,
+            window: None,
+            last_beat: None,
+        });
+    }
+
+    /// Record, best effort, that this news path ended on `error`. The caller
+    /// returns its error unchanged whatever happens here: this annotates an
+    /// exit, it never decides or alters one.
+    pub(super) fn record_exit(
+        &self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        error: &anyhow::Error,
+        output: &mut Out<'_>,
+    ) {
+        let Some(NewsPathBeat {
+            session,
+            window: Some(window),
+            ..
+        }) = self.news_path.as_ref()
+        else {
+            return;
+        };
+        let mut record = || -> Result<()> {
+            let reason = pile
+                .put::<blobencodings::UTF8String, _>(one_line(&format!("{error:#}")))
+                .map_err(|error| anyhow!("store exit reason: {error}"))?;
+            let exit = entity! {
+                metadata::tag: &KIND_NEWS_PATH_EXIT,
+                attrs::node: window,
+                attrs::session: session,
+                metadata::created_at: clock::point_now()?,
+                metadata::description: reason,
+            };
+            pile.commit(self.health.source, signer, exit)
+                .map_err(|error| anyhow!("commit exit record: {error}"))?;
+            Ok(())
+        };
+        if let Err(note) = record() {
+            let _ = output.line(format!("note: news-path exit not recorded ({note:#})"));
+        }
+    }
+
+    /// One beat per interval from the poll every loop of a continuous
+    /// observer already runs; no timer, task or retry of its own.
+    fn beat_if_due(
+        &mut self,
+        pile: &mut FacultyStore,
+        signer: &SigningKey,
+        input: &str,
+        now: Epoch,
+        output: &mut Out<'_>,
+    ) -> Result<()> {
+        let Some(path) = self.news_path.as_mut() else {
+            return Ok(());
+        };
+        // A clock that went backwards beats again rather than waiting it out.
+        if path
+            .last_beat
+            .is_some_and(|last| last <= now && now < last + span(NEWS_PATH_BEAT_EVERY))
+        {
+            return Ok(());
+        }
+        let (_, observation) = self
+            .poll_view
+            .as_ref()
+            .expect("poll selected a health view");
+        let window = match path.window {
+            Some(window) => window,
+            // An unresolved persona is not yet a news path anyone could name.
+            None => match observation.persona(input) {
+                Ok(window) => window,
+                Err(_) => return Ok(()),
+            },
+        };
+        path.window = Some(window);
+        // A session's first beat names what it recovers from when this
+        // persona's latest record was an exit, or a beat a reader would
+        // already call silent: one register lookup here instead of a scan of
+        // the history by every reader.
+        let facts = observation.facts.view();
+        let prior = match path.last_beat {
+            Some(_) => None,
+            None => observation.latest.winner(window).filter(|&record| {
+                exists!(pattern!(facts, [{ record @ metadata::tag: &KIND_NEWS_PATH_EXIT }]))
+                    || find!(
+                        created: (Epoch, Epoch),
+                        pattern!(facts, [{ record @
+                            metadata::tag: &KIND_NEWS_PATH_BEAT,
+                            metadata::created_at: ?created,
+                        }])
+                    )
+                    .any(|created| created.1 + span(NEWS_PATH_MAX_AGE) <= now)
+            }),
+        };
+        path.last_beat = Some(now);
+        let tags =
+            std::iter::once(KIND_NEWS_PATH_BEAT).chain(prior.map(|_| schema::KIND_RECOVERED));
+        let beat = entity! {
+            metadata::tag*: tags,
+            attrs::node: &window,
+            attrs::session: &path.session,
+            metadata::created_at: clock::point(now)?,
+            metadata::supersedes?: prior,
+        };
+        if let Err(error) = pile.commit(self.health.source, signer, beat) {
+            output.line(format!("note: news-path beat not recorded ({error})"))?;
+        }
+        Ok(())
+    }
+}
+
+fn span(duration: Duration) -> hifitime::Duration {
+    hifitime::Duration::from_total_nanoseconds(duration.as_nanos() as i128)
+}
+
+fn one_line(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.char_indices().nth(NEWS_PATH_REASON_CHARS) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line,
+    }
+}
+
+fn utc(at: Epoch) -> String {
+    let (year, month, day, hour, minute, second, _) = at.to_gregorian_utc();
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+fn person_label(people: &FactArchive, snapshot: &impl BlobStoreGet, person: Id) -> String {
+    let heads = profile_heads(people, person);
+    let [head] = heads.as_slice() else {
+        return fmt_id(person);
+    };
+    let head = *head;
+    find!(
+        handle: relations::TextHandle,
+        pattern!(people, [{ head @ metadata::name: ?handle }])
+    )
+    .min_by_key(|handle| handle.raw)
+    .and_then(|handle| {
+        snapshot
+            .get::<View<str>, blobencodings::UTF8String>(handle)
+            .ok()
+    })
+    .map(|label| label.to_string())
+    .unwrap_or_else(|| fmt_id(person))
+}
+
+fn exit_reason(facts: &FactArchive, snapshot: &impl BlobStoreGet, exit: Id) -> String {
+    find!(
+        reason: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+        pattern!(facts, [{ exit @ metadata::description: ?reason }])
+    )
+    .filter_map(|reason| {
+        snapshot
+            .get::<View<str>, blobencodings::UTF8String>(reason)
+            .ok()
+    })
+    .map(|reason| reason.to_string())
+    .min()
+    // Passive attention fetches nothing; an absent reason is still an exit.
+    .unwrap_or_else(|| "reason not yet resident".to_owned())
+}
+
+/// Each persona's latest news-path record, through the maintained register:
+/// readers never scan the beat history. Events about the reader's own persona
+/// are dropped later, in `news`, where the reader is known.
+fn render_news_paths(
+    report: &mut HealthReport,
+    facts: &FactArchive,
+    latest: &LwwQuery,
+    people: &FactArchive,
+    snapshot: &impl BlobStoreGet,
+    now: Epoch,
+    detail: Detail,
+) {
+    use std::fmt::Write as _;
+    let now_key = now.to_tai_duration().total_nanoseconds();
+    let mut lines = Vec::new();
+    for (beat, window, session, created) in find!(
+        (beat: Id, window: Id, session: Id, created: (Epoch, Epoch)),
+        and!(latest.has(beat), pattern!(facts, [{ ?beat @
+            metadata::tag: &KIND_NEWS_PATH_BEAT,
+            attrs::node: ?window,
+            attrs::session: ?session,
+            metadata::created_at: ?created,
+        }]))
+    ) {
+        let label = person_label(people, snapshot, window);
+        let age = format_age(now_key, created.1.to_tai_duration().total_nanoseconds());
+        if now < created.1 {
+            report.next_change = earliest(report.next_change, Some(created.1));
+            lines.push(format!("{label}: latest beat is in the future"));
+            continue;
+        }
+        let stale_at = created.1 + span(NEWS_PATH_MAX_AGE);
+        if now >= stale_at {
+            lines.push(format!("{label}: silent since {}", utc(created.1)));
+            report.attention.insert(AttentionEvent::NewsPath {
+                event: beat,
+                window,
+                detail: format!(
+                    "news path of {label} has not beaten since {} ({age} ago); that window may not be hearing news. Nothing restarts it automatically.",
+                    utc(created.1)
+                ),
+            });
+            continue;
+        }
+        report.next_change = earliest(report.next_change, Some(stale_at));
+        lines.push(format!("{label}: beating, last {age} ago"));
+        for prior in find!(
+            prior: Id,
+            pattern!(facts, [{ _?first @
+                metadata::tag: &KIND_NEWS_PATH_BEAT,
+                metadata::tag: &schema::KIND_RECOVERED,
+                attrs::node: &window,
+                attrs::session: &session,
+                metadata::supersedes: ?prior,
+            }])
+        ) {
+            let before =
+                if exists!(pattern!(facts, [{ prior @ metadata::tag: &KIND_NEWS_PATH_EXIT }])) {
+                    format!("an exit: {}", exit_reason(facts, snapshot, prior))
+                } else {
+                    find!(
+                        created: (Epoch, Epoch),
+                        pattern!(facts, [{ prior @ metadata::created_at: ?created }])
+                    )
+                    .map(|created| format!("silence since {}", utc(created.1)))
+                    .min()
+                    .unwrap_or_else(|| "a silence".to_owned())
+                };
+            report.attention.insert(AttentionEvent::NewsPath {
+                event: session,
+                window,
+                detail: format!(
+                    "news path of {label} recovered (session [{}]) after {before}",
+                    fmt_id(session)
+                ),
+            });
+        }
+    }
+    for (exit, window, created) in find!(
+        (exit: Id, window: Id, created: (Epoch, Epoch)),
+        and!(latest.has(exit), pattern!(facts, [{ ?exit @
+            metadata::tag: &KIND_NEWS_PATH_EXIT,
+            attrs::node: ?window,
+            metadata::created_at: ?created,
+        }]))
+    ) {
+        let label = person_label(people, snapshot, window);
+        let reason = exit_reason(facts, snapshot, exit);
+        lines.push(format!("{label}: exited at {}: {reason}", utc(created.1)));
+        report.attention.insert(AttentionEvent::NewsPath {
+            event: exit,
+            window,
+            detail: format!(
+                "news path of {label} exited at {}: {reason}. Nothing restarts it automatically.",
+                utc(created.1)
+            ),
+        });
+    }
+    if detail == Detail::Full && !lines.is_empty() {
+        lines.sort();
+        report.text.push_str("\nNews paths (shared beats):\n");
+        for line in lines {
+            writeln!(report.text, "- {line}").unwrap();
+        }
+    }
+}
+
 pub(super) fn until(deadline: Option<Epoch>, now: Epoch) -> Option<Duration> {
     deadline.map(|deadline| {
         let ns = (deadline - now).total_nanoseconds().max(0);
@@ -442,12 +738,22 @@ impl HealthObservation {
             .service_events
             .as_ref()
             .map(|source| source.view.clone());
+        let people = self.relations.view.clone();
         tokio::task::spawn_blocking(move || {
             let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
             let mut report = render_health(&facts, &latest, &reader, now, max_age, Detail::Full);
             if let Some(facts) = service_events {
                 service_events::append_report(&mut report, &facts, &snapshot, true);
             }
+            render_news_paths(
+                &mut report,
+                &facts,
+                &latest,
+                &people,
+                &snapshot,
+                now,
+                Detail::Full,
+            );
             report
         })
         .await
@@ -520,6 +826,15 @@ impl HealthObservation {
                 detail == Detail::Full,
             );
         }
+        render_news_paths(
+            &mut report,
+            self.facts.view(),
+            &self.latest,
+            self.relations.view(),
+            &self.snapshot,
+            self.evaluated_at,
+            detail,
+        );
         report
     }
 
@@ -527,10 +842,18 @@ impl HealthObservation {
         resolve_resident_persona(self.relations.view(), &self.snapshot, input)
     }
 
-    pub(super) fn news(&self, _persona: Id, report: &HealthReport) -> News {
-        let pending = report
+    pub(super) fn news(&self, persona: Id, report: &HealthReport) -> News {
+        let mut pending = report
             .attention
             .pending_health(self.facts.view(), self.presentations.view());
+        // A window is not told about its own news path: it is the one party
+        // that cannot hear it, and its peers are the ones who can act.
+        let own = IdentityIndex::from_relations(self.relations.view())
+            .component(persona)
+            .unwrap_or_else(|_| BTreeSet::from([persona]));
+        pending.events.retain(|_, event| {
+            !matches!(event, AttentionEvent::NewsPath { window, .. } if own.contains(window))
+        });
         if pending.is_empty() {
             return News::Quiet;
         }
@@ -1128,6 +1451,223 @@ mod tests {
             state,
             alert,
         }
+    }
+
+    // News-path records as a peer's observer writes them, built here rather
+    // than by the writer under test so the reader is checked independently.
+    fn path_beat(window: Id, session: Id, created: Epoch) -> Fragment {
+        entity! {
+            metadata::tag: &KIND_NEWS_PATH_BEAT,
+            attrs::node: &window,
+            attrs::session: &session,
+            metadata::created_at: clock::point(created).unwrap(),
+        }
+    }
+
+    fn path_exit(window: Id, session: Id, created: Epoch, reason: TextHandle) -> Fragment {
+        entity! {
+            metadata::tag: &KIND_NEWS_PATH_EXIT,
+            attrs::node: &window,
+            attrs::session: &session,
+            metadata::created_at: clock::point(created).unwrap(),
+            metadata::description: reason,
+        }
+    }
+
+    type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
+
+    fn news_text(news: News) -> Option<(String, Vec<Id>)> {
+        match news {
+            News::Report { text, events, .. } => Some((text, events.into_iter().collect())),
+            News::Quiet => None,
+        }
+    }
+
+    #[test]
+    fn a_silent_news_path_is_said_once_to_other_windows() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let reader = *fucid();
+        let beat = path_beat(window, *fucid(), at(0.0));
+        let beat_id = beat.root().unwrap();
+        f.publish(beat);
+
+        let fresh = f.observe_at(at(60.0));
+        let report = fresh.attention();
+        assert!(report.attention.is_empty(), "a fresh beat is not news");
+        let deadline = report
+            .next_change
+            .expect("a fresh beat sets the stale deadline");
+        let expected = at(NEWS_PATH_MAX_AGE.as_secs_f64());
+        assert!((deadline - expected).total_nanoseconds().abs() < 1_000_000);
+
+        let silent = f.observe_at(at(21.0 * 60.0));
+        let report = silent.attention();
+        let (text, events) =
+            news_text(silent.news(reader, &report)).expect("a silent path is news for a peer");
+        assert!(text.contains("has not beaten"), "{text}");
+        assert_eq!(events, vec![beat_id]);
+        assert!(
+            matches!(silent.news(window, &report), News::Quiet),
+            "a window is not told about its own news path"
+        );
+
+        f.store
+            .commit(
+                f.sources.presentations.source,
+                &f.signer,
+                orient_model::receipt_fragment([beat_id], clock::point_now().unwrap()),
+            )
+            .unwrap();
+        let later = f.observe_at(at(40.0 * 60.0));
+        assert!(
+            matches!(later.news(reader, &later.attention()), News::Quiet),
+            "the same silence is said once"
+        );
+    }
+
+    #[test]
+    fn an_exited_news_path_carries_its_reason() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let session = *fucid();
+        f.publish(path_beat(window, session, at(0.0)));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>(
+                "deliver complete Orient habit report: Orient delivery callback failed (exit status: 1)"
+                    .to_owned(),
+            )
+            .unwrap();
+        let exit = path_exit(window, session, at(10.0), reason);
+        let exit_id = exit.root().unwrap();
+        f.publish(exit);
+
+        let observed = f.observe_at(at(30.0));
+        let report = observed.attention();
+        let (text, events) = news_text(observed.news(*fucid(), &report)).expect("exit is news");
+        assert!(text.contains("exited"), "{text}");
+        assert!(text.contains("callback failed (exit status: 1)"), "{text}");
+        assert_eq!(events, vec![exit_id]);
+        assert!(matches!(observed.news(window, &report), News::Quiet));
+    }
+
+    #[test]
+    fn a_new_session_after_an_exit_is_said_as_recovered() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let first = *fucid();
+        let second = *fucid();
+        f.publish(path_beat(window, first, at(0.0)));
+        let reason = f
+            .store
+            .put::<blobencodings::UTF8String, _>("thread status is not idle".to_owned())
+            .unwrap();
+        let exit = path_exit(window, first, at(10.0), reason);
+        let exit_id = exit.root().unwrap();
+        f.publish(exit);
+        let restart = entity! {
+            metadata::tag*: [KIND_NEWS_PATH_BEAT, schema::KIND_RECOVERED],
+            attrs::node: &window,
+            attrs::session: &second,
+            metadata::created_at: clock::point(at(100.0)).unwrap(),
+            metadata::supersedes: &exit_id,
+        };
+        let restart_id = restart.root().unwrap();
+        f.publish(restart);
+
+        let observed = f.observe_at(at(120.0));
+        let (text, events) =
+            news_text(observed.news(*fucid(), &observed.attention())).expect("recovery is news");
+        assert!(text.contains("recovered"), "{text}");
+        assert!(text.contains("thread status is not idle"), "{text}");
+        assert_eq!(events, vec![second], "recovery is one event per session");
+
+        let silent = f.observe_at(at(100.0 + 21.0 * 60.0));
+        let (text, events) =
+            news_text(silent.news(*fucid(), &silent.attention())).expect("silence again");
+        assert!(text.contains("has not beaten"), "{text}");
+        assert_eq!(events, vec![restart_id]);
+    }
+
+    #[test]
+    fn a_beating_observer_writes_one_beat_and_a_best_effort_exit() {
+        let mut f = Fixture::new();
+        let window = *fucid();
+        let input = format!("{window:x}");
+        f.sources.start_beating();
+        let mut parts = Vec::new();
+        let mut emit = |part| {
+            parts.push(part);
+            Ok(())
+        };
+        let mut out = crate::out::Out::new(&mut emit);
+        f.sources
+            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .unwrap();
+        f.sources
+            .poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .unwrap();
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let beats: Vec<(Id, Id)> = find!(
+            (beat: Id, session: Id),
+            pattern!(observed.facts.view(), [{ ?beat @
+                metadata::tag: &KIND_NEWS_PATH_BEAT,
+                attrs::node: &window,
+                attrs::session: ?session,
+            }])
+        )
+        .collect();
+        assert_eq!(beats.len(), 1, "one beat per interval, not per poll");
+        let (_, session) = beats[0];
+
+        f.sources.record_exit(
+            &mut f.store,
+            &f.signer,
+            &anyhow!("Orient delivery callback failed (exit status: 1)"),
+            &mut out,
+        );
+        let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
+        let exits: Vec<(Id, TextHandle)> = find!(
+            (exit: Id, reason: TextHandle),
+            pattern!(observed.facts.view(), [{ ?exit @
+                metadata::tag: &KIND_NEWS_PATH_EXIT,
+                attrs::node: &window,
+                attrs::session: &session,
+                metadata::description: ?reason,
+            }])
+        )
+        .collect();
+        assert_eq!(exits.len(), 1);
+        let (exit_id, reason) = exits[0];
+        let snapshot = f.store.snapshot().unwrap();
+        let reason: View<str> =
+            BlobStoreGet::get::<View<str>, blobencodings::UTF8String>(&snapshot, reason).unwrap();
+        assert!(reason.contains("exit status: 1"), "{}", &*reason);
+
+        // The next process's first beat names what it recovered from.
+        let mut next = test_block_on(HealthSources::open(
+            &test_storage(),
+            &mut f.store,
+            &f.signer,
+            Duration::from_secs(60),
+        ))
+        .unwrap();
+        next.start_beating();
+        next.poll(&mut f.store, &f.signer, &input, false, &mut out)
+            .unwrap();
+        let observed = next.observe(&mut f.store, &f.signer).unwrap();
+        let recovered: Vec<Id> = find!(
+            beat: Id,
+            pattern!(observed.facts.view(), [{ ?beat @
+                metadata::tag: &KIND_NEWS_PATH_BEAT,
+                metadata::tag: &schema::KIND_RECOVERED,
+                attrs::node: &window,
+                metadata::supersedes: &exit_id,
+            }])
+        )
+        .collect();
+        assert_eq!(recovered.len(), 1);
     }
 
     fn at(seconds: f64) -> Epoch {

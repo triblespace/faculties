@@ -3459,6 +3459,12 @@ enum AttentionEvent {
         event: Id,
         detail: String,
     },
+    /// Another window's news path stopped beating, exited, or recovered.
+    NewsPath {
+        event: Id,
+        window: Id,
+        detail: String,
+    },
 }
 
 impl AttentionEvent {
@@ -3472,7 +3478,9 @@ impl AttentionEvent {
             Self::Goal { event, .. } => *event,
             Self::Note { note, .. } => *note,
             Self::GoalMention { goal } => *goal,
-            Self::Health { event, .. } | Self::ServiceFailure { event, .. } => *event,
+            Self::Health { event, .. }
+            | Self::ServiceFailure { event, .. }
+            | Self::NewsPath { event, .. } => *event,
         }
     }
 
@@ -3506,6 +3514,7 @@ impl AttentionEvent {
             }
             Self::Health { detail, .. } => format!("swarm health: {detail}"),
             Self::ServiceFailure { detail, .. } => format!("native service failure: {detail}"),
+            Self::NewsPath { detail, .. } => detail.clone(),
         }
     }
 }
@@ -4187,7 +4196,8 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
         | AttentionEvent::Mail(_)
         | AttentionEvent::Teams(_)
         | AttentionEvent::Health { .. }
-        | AttentionEvent::ServiceFailure { .. } => event.reason(),
+        | AttentionEvent::ServiceFailure { .. }
+        | AttentionEvent::NewsPath { .. } => event.reason(),
     }
 }
 
@@ -5013,11 +5023,16 @@ async fn cmd_observe(
     };
     let timeout = options.timeout;
     let form = options.form;
+    let mut health = HealthSources::open(routing, pile, signer, health_max_age)
+        .await?
+        .with_service_events(pile, signer, service_events_collection)
+        .await?;
+    if continuous {
+        // A continuous observer is a window's news path and beats for it; a
+        // one-shot wait is not one.
+        health.start_beating();
+    }
     let result: Result<WaitOutcome> = async {
-        let mut health = HealthSources::open(routing, pile, signer, health_max_age)
-            .await?
-            .with_service_events(pile, signer, service_events_collection)
-            .await?;
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let timeout_at = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
@@ -5559,6 +5574,11 @@ async fn cmd_observe(
         }
     }
     .await;
+    if let Err(error) = &result {
+        // Best effort, beside the unchanged error: peers learn why this news
+        // path ended. Whether and how the observer exits is not decided here.
+        health.record_exit(pile, signer, error, output);
+    }
     let outcome = result?;
     if continuous {
         // Timeout/shutdown is not news and must never invoke the delivery sink.
