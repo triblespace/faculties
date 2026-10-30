@@ -353,6 +353,31 @@ pub fn resolve_selector<P: TriblePattern>(space: &P, input: &str) -> Result<Id> 
     )
 }
 
+/// The content handle of a complete 64-character digest that no file entity
+/// names, else `None`.
+///
+/// This is the open-world fallback: bytes may be resident without any Files
+/// record describing them (Discord intake, for one, keeps an attachment as a
+/// blob referenced from its own collection), and the digest alone still names
+/// them exactly. Nothing is registered or copied; readers go to the blob.
+pub fn unnamed_content<P: TriblePattern>(space: &P, input: &str) -> Result<Option<ContentHandle>> {
+    let selector = normalize_selector(input)?;
+    if selector.len() != 64 {
+        return Ok(None);
+    }
+    let hash = inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&selector)
+        .map_err(|_| anyhow!("invalid content hash '{selector}'"))?;
+    let handle: ContentHandle = inlineencodings::Handle::from_hash(hash);
+    let named = exists!(
+        (entity: Id),
+        pattern!(space, [{
+            ?entity @ metadata::tag: &KIND_FILE,
+            file::content: &handle,
+        }])
+    );
+    Ok((!named).then_some(handle))
+}
+
 /// Expand a selector to one canonical `files:` reference token.
 ///
 /// This is deliberately distinct from [`resolve_selector`]. Entity selectors

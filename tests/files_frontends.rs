@@ -722,3 +722,137 @@ fn drive_default_accepts_self_describing_wav_for_the_audio_adapter() {
         "{error}"
     );
 }
+
+/// A JPEG that no file entity names: real encoded bytes, distinct from every
+/// fixture file, so only a resident-blob fallback can find them.
+fn jpeg() -> Vec<u8> {
+    let image = image::RgbImage::from_pixel(3, 2, image::Rgb([200, 40, 10]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, image::ImageFormat::Jpeg)
+        .unwrap();
+    bytes.into_inner()
+}
+
+/// Put bytes into the pile as a bare blob, as Discord intake stores an
+/// attachment: referenced from elsewhere, never as a Files file entity.
+fn put_bare_blob(pile: &std::path::Path, bytes: Vec<u8>) -> String {
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::BlobStorePut;
+    use triblespace::prelude::blobencodings::RawBytes;
+    let mut store = Pile::open(pile).unwrap();
+    let handle = store.put::<RawBytes, _>(bytes).unwrap();
+    store.close().unwrap();
+    let hash: triblespace::prelude::Inline<
+        triblespace::prelude::inlineencodings::Hash<triblespace::prelude::inlineencodings::Blake3>,
+    > = triblespace::prelude::inlineencodings::Handle::to_hash(handle);
+    triblespace::prelude::inlineencodings::Hash::to_hex(&hash).to_ascii_lowercase()
+}
+
+#[test]
+fn a_resident_blob_without_a_file_entity_is_got_and_viewed_by_its_hash() {
+    let fixture = Fixture::new();
+    let bytes = jpeg();
+    let hex = put_bare_blob(&fixture.pile, bytes.clone());
+    let prefixed = format!("files:{hex}");
+
+    // The library and both frontends export the exact bytes, with or without
+    // the `files:` prefix that orient renders for an attachment.
+    for selector in [&hex, &prefixed] {
+        let export = fixture.files().get(selector).unwrap();
+        assert_eq!(export.bytes.as_ref(), bytes.as_slice());
+        assert_eq!(export.uri(), prefixed);
+    }
+    let exported = fixture
+        .cli()
+        .args(["get", &prefixed, "@-"])
+        .output()
+        .unwrap();
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    assert_eq!(exported.stdout, bytes);
+    let path = fixture._directory.path().join("attachment.jpg");
+    let disk = fixture
+        .cli()
+        .args(["get", &prefixed])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        disk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disk.stderr)
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let mut gotten = Vec::new();
+    fixture
+        .mcp()
+        .call(
+            "files_get",
+            serde_json::to_vec(&serde_json::json!({"id": prefixed}))
+                .unwrap()
+                .into(),
+            &mut Out::new(&mut |part| {
+                gotten.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert!(
+        matches!(&gotten[..], [Part::Blob { bytes: got, .. }] if got.as_ref() == bytes.as_slice()),
+        "{gotten:?}"
+    );
+
+    // With no entity to supply a MIME type, view sniffs it from the bytes.
+    let expected = Part::Image {
+        bytes: bytes.clone().into(),
+        mime_type: "image/jpeg".into(),
+    };
+    let mut viewed = Vec::new();
+    fixture
+        .mcp()
+        .call(
+            "files_view",
+            serde_json::to_vec(&serde_json::json!({"id": hex}))
+                .unwrap()
+                .into(),
+            &mut Out::new(&mut |part| {
+                viewed.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert_eq!(viewed, [expected]);
+    let image = fixture.cli().args(["view", &prefixed]).output().unwrap();
+    assert!(
+        image.status.success(),
+        "{}",
+        String::from_utf8_lossy(&image.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(image.stdout).unwrap(),
+        format!("[image: image/jpeg, {} bytes]\n", bytes.len())
+    );
+}
+
+#[test]
+fn a_hash_with_neither_file_entity_nor_resident_blob_says_so() {
+    let fixture = Fixture::new();
+    let absent = "ab".repeat(32);
+    for error in [
+        fixture.files().get(&absent).unwrap_err(),
+        fixture
+            .files()
+            .view(&format!("files:{absent}"), &Default::default())
+            .unwrap_err(),
+    ] {
+        assert!(
+            format!("{error:#}")
+                .contains(&format!("no file entity and no resident blob for {absent}")),
+            "{error:#}"
+        );
+    }
+}

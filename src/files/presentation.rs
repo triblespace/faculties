@@ -59,6 +59,22 @@ impl ViewOptions {
     }
 }
 
+/// The media type bytes announce about themselves, for content that no file
+/// entity describes: a recognized image container, a RIFF/WAVE stream, UTF-8
+/// text, else opaque octets that [`present`] refuses.
+pub fn sniff_media_type(bytes: &[u8]) -> String {
+    if let Ok(format) = image::guess_format(bytes) {
+        return format.to_mime_type().to_owned();
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return "audio/wav".to_owned();
+    }
+    if std::str::from_utf8(bytes).is_ok() {
+        return "text/plain;charset=utf-8".to_owned();
+    }
+    crate::files::DEFAULT_MEDIA_TYPE.to_owned()
+}
+
 /// Present bytes without changing their stored representation.
 ///
 /// Text must be valid UTF-8 and fit exactly: it is never truncated. Audio is

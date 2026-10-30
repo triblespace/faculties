@@ -1725,12 +1725,47 @@ where
             content_handle_of(space, target).context("no content for file")?
         }
     };
-    let bytes = rt.block_on(read(store, reader, |reader| {
-        reader
-            .get::<anybytes::Bytes, _>(content)
-            .context("get file blob")
-    }))?;
+    let bytes = match file_capability::unnamed_content(space, id)? {
+        Some(content) => read_unnamed(store, rt, reader, content)?,
+        None => rt.block_on(read(store, reader, |reader| {
+            reader
+                .get::<anybytes::Bytes, _>(content)
+                .context("get file blob")
+        }))?,
+    };
     Ok(Export { bytes, content })
+}
+
+/// The resident bytes of content that no file entity names; see
+/// [`file_capability::unnamed_content`]. A miss names both absences.
+fn read_unnamed<S>(
+    store: &mut S,
+    rt: &tokio::runtime::Runtime,
+    reader: &S::Snapshot,
+    content: FileHandle,
+) -> Result<anybytes::Bytes>
+where
+    S: SnapshotSource + AsyncBlobStoreAcquire,
+    S::Snapshot: BlobStoreGet + BlobStoreList,
+{
+    rt.block_on(read(store, reader, |reader| {
+        reader.get::<anybytes::Bytes, _>(content).with_context(|| {
+            format!(
+                "no file entity and no resident blob for {}",
+                handle_hex(content)
+            )
+        })
+    }))
+}
+
+fn ensure_presentable(mime_type: &str, id: &str) -> Result<()> {
+    anyhow::ensure!(
+        mime_type.starts_with("text/")
+            || mime_type.starts_with("image/")
+            || mime_type.starts_with("audio/"),
+        "cannot present MIME type {mime_type:?}; use files get {id} to extract it",
+    );
+    Ok(())
 }
 
 fn load_view<P, S>(
@@ -1745,6 +1780,13 @@ where
     S: SnapshotSource + AsyncBlobStoreAcquire,
     S::Snapshot: BlobStoreGet + BlobStoreList,
 {
+    if let Some(content) = file_capability::unnamed_content(space, id)? {
+        // No entity supplies a MIME type, so the bytes must announce one.
+        let bytes = read_unnamed(store, rt, reader, content)?;
+        let mime_type = super::presentation::sniff_media_type(&bytes);
+        ensure_presentable(&mime_type, id)?;
+        return Ok(StoredView { bytes, mime_type });
+    }
     let target = selected_target(space, id)?;
     anyhow::ensure!(
         is_file(space, target),
@@ -1754,12 +1796,7 @@ where
     rt.block_on(read(store, reader, |reader| {
         let mime_type =
             read_mime(space, reader, target)?.unwrap_or_else(|| "application/octet-stream".into());
-        anyhow::ensure!(
-            mime_type.starts_with("text/")
-                || mime_type.starts_with("image/")
-                || mime_type.starts_with("audio/"),
-            "cannot present MIME type {mime_type:?}; use files get {id} to extract it",
-        );
+        ensure_presentable(&mime_type, id)?;
         let bytes = reader
             .get::<anybytes::Bytes, _>(content)
             .context("read file content")?;
@@ -1780,6 +1817,17 @@ where
     S: SnapshotSource + AsyncBlobStoreAcquire,
     S::Snapshot: BlobStoreGet + BlobStoreList,
 {
+    if let Some(content) = file_capability::unnamed_content(space, id)? {
+        // No entity supplies a name, so the default file is named by its hash.
+        let bytes = read_unnamed(store, rt, reader, content)?;
+        let destination = destination
+            .map(Path::to_owned)
+            .unwrap_or_else(|| PathBuf::from(handle_hex(content)));
+        return Ok(Extraction {
+            writes: vec![(destination.clone(), Some(bytes))],
+            destination,
+        });
+    }
     let target = selected_target(space, id)?;
     rt.block_on(read(store, reader, |reader| {
         let destination = match destination {
