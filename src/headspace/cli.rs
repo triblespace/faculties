@@ -149,13 +149,25 @@ impl From<SecretRole> for super::SecretRole {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    crate::cli::with_output("headspace", |out| execute(cli, out))
+    crate::cli::with_output("headspace", |out| execute_to_exit(cli, out))
 }
+/// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    execute_in(&storage, cli, out)
+}
+
+/// The process's whole body: one store, closed for process exit.
+fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+        .scope_to_exit(|storage| execute_in(storage, cli, out))
+}
+
+fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return out.line(Cli::command().render_long_help().to_string());
     };
-    let headspace = Headspace::new(cli.pile, cli.key);
+    let headspace = Headspace::with_storage(storage.clone());
     match command {
         Command::Show { show_secrets } => headspace.show(show_secrets, out),
         Command::List => headspace.list(out),

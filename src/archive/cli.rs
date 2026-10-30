@@ -305,12 +305,24 @@ fn parse_finished_after(raw: &str) -> std::result::Result<std::time::Duration, S
     humantime::parse_duration(raw).map_err(|error| error.to_string())
 }
 
+/// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    execute_in(&storage, cli, out)
+}
+
+/// The process's whole body: one store, closed for process exit.
+fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+        .scope_to_exit(|storage| execute_in(storage, cli, out))
+}
+
+fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         out.line(Cli::command().render_help().to_string())?;
         return Ok(());
     };
-    let archive = Archive::new(cli.pile.clone(), cli.key.clone());
+    let archive = Archive::with_storage(storage.clone());
     match command {
         Command::IngestSessions {
             all,
@@ -453,5 +465,5 @@ pub fn run() -> Result<()> {
         println!();
         return Ok(());
     }
-    crate::cli::with_output("archive", |out| execute(cli, out))
+    crate::cli::with_output("archive", |out| execute_to_exit(cli, out))
 }

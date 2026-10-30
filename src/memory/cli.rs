@@ -54,7 +54,7 @@ pub struct Cli {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let exit_code = crate::cli::with_output("memory", |out| execute(cli, out))?;
+    let exit_code = crate::cli::with_output("memory", |out| execute_to_exit(cli, out))?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -63,13 +63,25 @@ pub fn run() -> Result<()> {
 
 /// A nonzero successful value is the hook-friendly incomplete-cover status.
 /// Output routing is finalized before run() applies that process exit code.
+/// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
+    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    execute_in(&storage, cli, out)
+}
+
+/// The process's whole body: one store, closed for process exit.
+fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
+    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+        .scope_to_exit(|storage| execute_in(storage, cli, out))
+}
+
+fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<i32> {
     if cli.ids.is_empty() {
         return out
             .line(Cli::command().render_long_help().to_string())
             .map(|()| 0);
     }
-    let memory = Memory::new(cli.pile, cli.key);
+    let memory = Memory::with_storage(storage.clone());
     let args = &cli.ids[1..];
     let one = |usage: &str| -> Result<&str> {
         if args.len() != 1 {

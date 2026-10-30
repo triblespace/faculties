@@ -129,8 +129,20 @@ fn attachment(path: &Path) -> Result<DraftAttachment> {
 fn persona() -> Result<String> {
     std::env::var("PERSONA").context("PERSONA must select an active Relations person")
 }
+/// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let operations = Mail::new(cli.pile, cli.key);
+    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    execute_in(&storage, cli, out)
+}
+
+/// The process's whole body: one store, closed for process exit.
+fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+        .scope_to_exit(|storage| execute_in(storage, cli, out))
+}
+
+fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    let operations = Mail::with_storage(storage.clone());
     match cli.command {
         Command::Account { command } => match command {
             AccountCommand::Set {
@@ -206,7 +218,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
 }
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    crate::cli::with_output("mail", |out| execute(cli, out))
+    crate::cli::with_output("mail", |out| execute_to_exit(cli, out))
 }
 fn parse_id(raw: &str) -> std::result::Result<Id, String> {
     Id::from_hex(raw.trim())

@@ -192,7 +192,7 @@ pub fn run() -> Result<()> {
         println!();
         return Ok(());
     }
-    crate::cli::with_output("posture", |out| execute(cli, out))
+    crate::cli::with_output("posture", |out| execute_to_exit(cli, out))
 }
 
 fn scan_id(raw: Option<&str>) -> Result<Option<Id>> {
@@ -200,13 +200,25 @@ fn scan_id(raw: Option<&str>) -> Result<Option<Id>> {
         .transpose()
 }
 
+/// One-shot storage: every operation opens and closes its own store.
+pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    execute_in(&storage, cli, out)
+}
+
+/// The process's whole body: one store, closed for process exit.
+fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+        .scope_to_exit(|storage| execute_in(storage, cli, out))
+}
+
 /// A parsed CLI invocation is only a frontend input. Every operation below is
 /// separately callable without Clap, argv, process output, or this enum.
-pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return out.text(Cli::command().render_help().to_string());
     };
-    let posture = Posture::new(cli.pile, cli.key);
+    let posture = Posture::with_storage(storage.clone());
     match command {
         Command::Scan { path, dry_run } => {
             presentation::scan(&posture.scan_path(&path, dry_run)?, out)
