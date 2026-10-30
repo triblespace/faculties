@@ -1333,6 +1333,14 @@ where
             schema::source_projection::resolution*: selected.iter(),
         }
         .into_facts();
+        if exists!(pattern!(facts, [{
+            id @ metadata::tag: schema::source_projection::COMPACTION_SUMMARY
+        }])) {
+            canonical += entity! { ExclusiveId::force_ref(id) @
+                metadata::tag: schema::source_projection::COMPACTION_SUMMARY,
+            }
+            .into_facts();
+        }
         expected += canonical;
     }
 

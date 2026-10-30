@@ -47,6 +47,10 @@
 //! `history.jsonl` prompts that no transcript beside it holds become nodes
 //! of their own. No source bytes are stored; [`SKIPPED_KINDS`] lists what is
 //! not projected and why.
+//! A true `isCompactSummary` marks each projected receipt as a source
+//! compaction summary. Its text remains `in`, its vendor role stays `user`,
+//! and the marker annotates rather than changes semantic identity. Neither
+//! `in` nor an unmarked `user` receipt establishes human authorship.
 
 /// Record kinds and fields that project to nothing, with the reason. Anything
 /// else of consequence is a block.
@@ -116,6 +120,7 @@ use hifitime::Epoch;
 use rayon::prelude::*;
 use triblespace::core::blob::Bytes;
 use triblespace::core::import::scanner as sc;
+use triblespace::core::metadata;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
@@ -2081,12 +2086,18 @@ fn project_record(
         }
         let receipt =
             blockdag::block_source_projection(schema::source_projection::SOURCE_CLAUDE_CODE, node)?;
-        let receipt = match generator.as_ref().filter(|_| produced) {
+        let mut receipt = match generator.as_ref().filter(|_| produced) {
             Some(model) => {
                 blockdag::annotate_generated_projection(receipt, annotations.clone(), model)?
             }
             None => blockdag::annotate_source_projection(receipt, annotations.clone())?,
         };
+        if record.is_compact_summary {
+            let receipt_id = receipt.root().expect("canonical receipt is rooted");
+            receipt += entity! { ExclusiveId::force_ref(&receipt_id) @
+                metadata::tag: schema::source_projection::COMPACTION_SUMMARY,
+            };
+        }
         // An alias line repeats its nodes: each is counted once.
         if let std::collections::btree_map::Entry::Vacant(entry) = receipts.entry(node_id) {
             entry.insert(receipt.root().expect("canonical receipt is rooted"));
@@ -2214,6 +2225,7 @@ fn epoch_interval(epoch: Epoch) -> Option<Inline<NsTAIInterval>> {
 #[derive(Default)]
 struct RawRecord {
     record_type: String,
+    is_compact_summary: bool,
     subtype: Option<String>,
     session_id: Option<String>,
     uuid: Option<String>,
@@ -2358,6 +2370,9 @@ fn scan_record(bytes: &mut Bytes) -> std::result::Result<RawRecord, sc::ScanErro
             .map_err(|_| scan_syntax("invalid UTF-8 object key"))?;
         match key.as_ref() {
             "type" => record.record_type = parse_optional_string(value)?.unwrap_or_default(),
+            "isCompactSummary" => {
+                record.is_compact_summary = parse_optional_bool(value)?.unwrap_or(false)
+            }
             "subtype" => record.subtype = parse_optional_string(value)?,
             "sessionId" => record.session_id = parse_optional_string(value)?,
             "uuid" => record.uuid = parse_optional_string(value)?,
@@ -2748,6 +2763,10 @@ mod tests {
             let source = format!(
                 r#"{{"type":"user","sessionId":"s","uuid":"u","parentUuid":null{flag},"message":{{"role":"user","content":"the same words"}}}}"#
             );
+            let source = format!(
+                "{source}\n{}",
+                r#"{"type":"assistant","sessionId":"s","uuid":"a","parentUuid":"u","message":{"role":"assistant","content":"onward"}}"#
+            );
             let projected = project_text(&source, Path::new("summary.jsonl"));
             let block = block_with_payload(&projected.fragment, "the same words");
             let receipt = projection_for_block(&projected.fragment, block);
@@ -2771,6 +2790,9 @@ mod tests {
             assert!(!exists!(pattern!(&projected.fragment, [{
                 receipt @ schema::source_projection::generated_by: _?model
             }])));
+            let (_directory, reader) = empty_reader();
+            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &projected.fragment)
+                .unwrap();
             variants.push((block, receipt, projected.fragment));
         }
         assert_eq!(
@@ -2782,6 +2804,11 @@ mod tests {
             "reimport enriches the same receipt"
         );
         assert_eq!(variants[0].2.facts(), variants[1].2.facts());
+        assert_eq!(
+            ids_with_tag(&variants[0].2, schema::block::KIND),
+            ids_with_tag(&variants[2].2, schema::block::KIND),
+            "descendants keep their identities too",
+        );
         assert!(variants[0]
             .2
             .facts()

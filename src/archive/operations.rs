@@ -637,11 +637,17 @@ fn projection_actor(facts: &FactArchive, reader: &PileSnapshot, projection: Id) 
             values.push(read_text(reader, handle)?);
         }
     }
-    Ok(if values.is_empty() {
+    let mut actor = if values.is_empty() {
         "<unattributed>".to_owned()
     } else {
         values.join("/")
-    })
+    };
+    if exists!(pattern!(facts, [{
+        projection @ metadata::tag: archive_schema::source_projection::COMPACTION_SUMMARY
+    }])) {
+        actor.push_str(" [source compaction summary]");
+    }
+    Ok(actor)
 }
 
 fn block_snippet(facts: &FactArchive, reader: &PileSnapshot, block: Id) -> Result<String> {
@@ -801,6 +807,11 @@ fn render_parts(
 fn render_projection(facts: &FactArchive, reader: &PileSnapshot, projection: Id) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "projection: {projection:X}")?;
+    if exists!(pattern!(facts, [{
+        projection @ metadata::tag: archive_schema::source_projection::COMPACTION_SUMMARY
+    }])) {
+        writeln!(out, "source_summary: compaction")?;
+    }
     for (label, attribute) in [
         (
             "source_namespace",
@@ -1967,6 +1978,66 @@ mod tests {
             projection_ids(&storage(&fixture).load().unwrap().facts().unwrap()).len(),
             7,
             "one receipt per message; envelopes store nothing"
+        );
+    }
+
+    #[test]
+    fn compaction_reimport_enriches_existing_receipts_without_replacing_nodes() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("summary.jsonl");
+        let body = |flag: &str| {
+            format!(
+                r#"{{"type":"user","sessionId":"s","uuid":"u","isCompactSummary":{flag},"message":{{"role":"user","content":"work so far"}}}}"#
+            )
+        };
+        fs::write(&source, body("false")).unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        archive_root_payloads(&fixture);
+        let before = storage(&fixture).load().unwrap();
+        let before_facts = before.facts().unwrap();
+        let receipts = projection_ids(&before_facts);
+        assert_eq!(receipts.len(), 1);
+        let receipt = receipts[0];
+        let block = find!(block: Id, pattern!(&before_facts, [{
+            receipt @ archive_schema::source_projection::projects_to: ?block
+        }]))
+        .next()
+        .unwrap();
+        assert!(
+            !render_projection(&before_facts, before.snapshot(), receipt)
+                .unwrap()
+                .contains("source_summary: compaction")
+        );
+        drop(before_facts);
+        drop(before);
+
+        fs::write(&source, body("true")).unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        let enriched_payloads = archive_root_payloads(&fixture);
+        let observed = storage(&fixture).load().unwrap();
+        let facts = observed.facts().unwrap();
+        assert_eq!(projection_ids(&facts), receipts);
+        assert!(exists!(pattern!(&facts, [{
+            receipt @ archive_schema::source_projection::projects_to: block,
+                metadata::tag: archive_schema::source_projection::COMPACTION_SUMMARY
+        }])));
+        drop(facts);
+        drop(observed);
+        let shown =
+            printed(|out| run_show(storage(&fixture), &format!("{receipt:X}"), out)).unwrap();
+        assert!(shown.contains("source_summary: compaction"));
+        assert!(shown.contains("raw_role: user"));
+        let shown = printed(|out| run_show(storage(&fixture), &format!("{block:X}"), out)).unwrap();
+        assert!(shown.contains("[source compaction summary]"));
+        let thread =
+            printed(|out| run_thread(storage(&fixture), &format!("{block:X}"), 10, None, out))
+                .unwrap();
+        assert!(thread.contains("[source compaction summary]"));
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        assert_eq!(
+            archive_root_payloads(&fixture),
+            enriched_payloads,
+            "replaying the enriched source is still idempotent"
         );
     }
 
