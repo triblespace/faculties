@@ -221,6 +221,13 @@ pub mod source_projection {
     /// Nonidentity kind marker attached after intrinsic receipt construction.
     pub const KIND: Id = id_hex!("F93BD1665DCC2A8EA75054986A2EA148");
 
+    /// NONIDENTITY receipt tag: the source explicitly identified this
+    /// occurrence as a compaction summary, not an ordinary user prompt.
+    /// Its text is still perceived (`in`), and its raw role is unchanged.
+    /// Absence does not establish human authorship. Minted with `trible
+    /// genid` on 2026-10-30; never part of a node or receipt identity.
+    pub const COMPACTION_SUMMARY: Id = id_hex!("2DB4FFBBE0F2050CE04636B145116CBA");
+
     /// Claude Code JSONL source namespace.
     pub const SOURCE_CLAUDE_CODE: Id = id_hex!("08C70B08B8F48CA5C9FAFEA714A4EACE");
 

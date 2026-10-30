@@ -3076,6 +3076,7 @@ mod tests {
         fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&projection) @
             archive_schema::source_projection::raw_author*: ["one author", "another author"],
             metadata::name: "unmodeled annotation",
+            metadata::tag: archive_schema::source_projection::COMPACTION_SUMMARY,
         };
         fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&fact_id) @
             archive_schema::content_fact::asset_pointer: "also an external interpretation",
@@ -3106,8 +3107,17 @@ mod tests {
         assert!(rendered.contains("another author"));
         assert!(rendered.contains("readable body"));
         assert!(rendered.contains("also an external interpretation"));
+        assert!(rendered.contains("source_summary: compaction"));
         assert_eq!(rendered.matches("fact: ").count(), 1);
         let summary = render_projection_summary(&facts, observed.snapshot(), projection).unwrap();
         assert!(summary.contains("readable body"));
+        assert!(summary.contains("[source compaction summary]"));
+        for include_all in [false, true] {
+            let block = render_block(&facts, observed.snapshot(), block_id, include_all).unwrap();
+            assert!(
+                block.contains("[source compaction summary]"),
+                "show, thread and replay use the same receipt rendering"
+            );
+        }
     }
 }

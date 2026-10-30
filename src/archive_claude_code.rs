@@ -2738,6 +2738,58 @@ mod tests {
     }
 
     #[test]
+    fn compact_summary_flag_is_additive_provenance_not_user_authorship() {
+        let mut variants = Vec::new();
+        for (flag, marked) in [
+            ("", false),
+            (",\"isCompactSummary\":false", false),
+            (",\"isCompactSummary\":true", true),
+        ] {
+            let source = format!(
+                r#"{{"type":"user","sessionId":"s","uuid":"u","parentUuid":null{flag},"message":{{"role":"user","content":"the same words"}}}}"#
+            );
+            let projected = project_text(&source, Path::new("summary.jsonl"));
+            let block = block_with_payload(&projected.fragment, "the same words");
+            let receipt = projection_for_block(&projected.fragment, block);
+            assert_eq!(
+                exists!(pattern!(&projected.fragment, [{
+                    receipt @ metadata::tag: schema::source_projection::COMPACTION_SUMMARY
+                }])),
+                marked,
+            );
+            assert!(exists!(pattern!(&projected.fragment, [{
+                receipt @ schema::source_projection::raw_role: "user"
+            }])));
+            assert!(exists!(pattern!(&projected.fragment, [
+                { block @ schema::block::holds: _?fact },
+                { _?fact @ schema::content_fact::modality: schema::content_fact::modality::TEXT,
+                    schema::content_fact::direction: schema::content_fact::direction::IN },
+            ])));
+            assert!(!exists!(pattern!(&projected.fragment, [{
+                receipt @ schema::source_projection::author: _?author
+            }])));
+            assert!(!exists!(pattern!(&projected.fragment, [{
+                receipt @ schema::source_projection::generated_by: _?model
+            }])));
+            variants.push((block, receipt, projected.fragment));
+        }
+        assert_eq!(
+            variants[0].0, variants[2].0,
+            "provenance does not change the node"
+        );
+        assert_eq!(
+            variants[0].1, variants[2].1,
+            "reimport enriches the same receipt"
+        );
+        assert_eq!(variants[0].2.facts(), variants[1].2.facts());
+        assert!(variants[0]
+            .2
+            .facts()
+            .iter()
+            .all(|fact| variants[2].2.facts().contains(&fact)));
+    }
+
+    #[test]
     fn generated_by_names_the_model_on_what_it_wrote_and_never_on_synthetic_records() {
         let text = r#"{"type":"user","sessionId":"s","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"hello there"}}
 {"type":"assistant","sessionId":"s","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"text","text":"hi!"}]}}
@@ -3082,7 +3134,7 @@ mod tests {
         );
         let live = format!(
             "{dead}{}\n{}\n{}\n",
-            r#"{"type":"user","sessionId":"s","uuid":"u2","parentUuid":null,"message":{"role":"user","content":"summary, then go on"}}"#,
+            r#"{"type":"user","sessionId":"s","uuid":"u2","parentUuid":null,"isCompactSummary":true,"message":{"role":"user","content":"summary, then go on"}}"#,
             r#"{"type":"assistant","sessionId":"s","uuid":"c2","parentUuid":"u2","message":{"id":"msg_2","role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file":"b"}}]}}"#,
             r#"{"type":"user","sessionId":"s","uuid":"r2","parentUuid":"c2","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"contents of b"}]}}"#,
         );
@@ -3109,6 +3161,17 @@ mod tests {
         // Once the file has moved on, only the trailing branch is held.
         let (summary, fragment) = project(&live, None);
         assert_eq!(summary.stats.held_back_records, 1);
+        let compact = block_with_payload(&fragment, "summary, then go on");
+        let receipt = projection_for_block(&fragment, compact);
+        assert!(exists!(pattern!(&fragment, [{
+            receipt @ metadata::tag: schema::source_projection::COMPACTION_SUMMARY
+        }])));
+        assert!(
+            !exists!(pattern!(&fragment, [{
+                compact @ schema::block::previous: _?parent
+            }])),
+            "the marker does not invent an edge across the physical boundary"
+        );
         let call = block_with_payload(&fragment, r#"{"name":"Read","input":{"file":"a"}}"#);
         let result = block_with_payload(&fragment, "contents of a");
         assert!(exists!(pattern!(&fragment, [
