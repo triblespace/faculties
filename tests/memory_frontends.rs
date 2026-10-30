@@ -127,7 +127,7 @@ fn distinct_reader_shows_warm_memory_without_writing_or_fetching_a_cold_root() {
                 content: ChunkDraftContent::Text("already resident history".to_owned()),
                 start_at,
                 end_at,
-                lens: None,
+                tags: BTreeSet::new(),
                 references: BTreeSet::new(),
                 about_exec_result: None,
                 about_archive_message: None,
@@ -229,7 +229,7 @@ fn library_cli_and_mcp_agree_on_resident_reads_and_exact_cover_text() {
         .create(
             "Grüße, this memory has texture.  \n",
             Some(parse_time_range(RANGE).unwrap()),
-            None,
+            &[],
         )
         .unwrap();
     let id = format!("{:x}", created.id);
@@ -312,6 +312,58 @@ fn mcp_text_is_literal_and_only_cli_expands_host_input() {
 }
 
 #[test]
+fn create_tag_is_repeatable_and_tag_lists_agree_across_cli_and_mcp() {
+    let fixture = Fixture::new();
+    let cli = receipt_id(&fixture.cli(&[
+        "create",
+        "--tag",
+        "us",
+        "--tag",
+        "Becoming-Self",
+        "2026-09-03T00:00:00..2026-09-04T00:00:00",
+        "tagged by the cli",
+    ]));
+    let mcp = receipt_id(&fixture.call(
+        "memory_create",
+        json!({"range":RANGE,"summary":"tagged by mcp","tags":["us"]}),
+    ));
+    fixture.call("memory_create", json!({"range":RANGE,"summary":"untagged"}));
+    assert_eq!(text(&fixture.cli(&["tag"])), "becoming-self  1\nus  2\n");
+    assert_eq!(fixture.cli(&["tag"]), fixture.call("memory_tag", json!({})));
+    let us = text(&fixture.cli(&["tag", "us"]));
+    assert_eq!(us, text(&fixture.call("memory_tag", json!({"tag":"us"}))));
+    assert!(us.contains(&format!("({cli})  tagged by the cli")), "{us}");
+    assert!(us.contains(&format!("({mcp})  tagged by mcp")), "{us}");
+    assert!(!us.contains("untagged"));
+    // Tagged memories are in the timeline.
+    let cover = fixture.memory().context(&CoverOpts::plain(10_000)).unwrap();
+    assert!(cover.text.contains("tagged by the cli"), "{}", cover.text);
+
+    // The retired option is refused, never stored as the memory's first word.
+    let argv = |args: &[&str]| {
+        let mut argv = vec![
+            "memory".to_owned(),
+            "--pile".into(),
+            fixture.pile.to_str().unwrap().into(),
+            "--key".into(),
+            fixture.key.to_str().unwrap().into(),
+        ];
+        argv.extend(args.iter().map(|arg| (*arg).to_owned()));
+        cli::Cli::try_parse_from(argv).unwrap()
+    };
+    let error = cli::execute(
+        argv(&["create", "--lens", "us", RANGE, "a theme"]),
+        &mut Out::new(&mut |_| Ok(())),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("unknown option --lens"),
+        "{error:#}"
+    );
+    assert!(!text(&fixture.cli(&["search", "theme"])).contains("a theme"));
+}
+
+#[test]
 fn respan_moves_coordinates_without_changing_the_episode_or_its_hard_references() {
     let fixture = Fixture::new();
     let original = fixture
@@ -319,7 +371,7 @@ fn respan_moves_coordinates_without_changing_the_episode_or_its_hard_references(
         .create(
             "immutable recollection",
             Some(parse_time_range(RANGE).unwrap()),
-            None,
+            &[],
         )
         .unwrap();
     let original_id = format!("{:x}", original.id);
@@ -395,7 +447,7 @@ fn replay_personas_are_explicit_and_a_failed_batch_output_does_not_advance() {
     let memory = fixture.memory();
     for summary in ["same-coordinate amber", "same-coordinate cobalt"] {
         memory
-            .create(summary, Some(parse_time_range(RANGE).unwrap()), None)
+            .create(summary, Some(parse_time_range(RANGE).unwrap()), &[])
             .unwrap();
     }
     fixture.call(

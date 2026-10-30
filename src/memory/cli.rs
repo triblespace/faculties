@@ -25,11 +25,12 @@ use std::path::{Path, PathBuf};
              memory search <query>           — exact lexical (BM25) search rebuilt from the frozen Memory view\n  \
              memory similar <query>           — semantic search: chunks, prose and images alike, ranked by MEANING in the one WeMM space (build/refresh with `memory index`) [needs the wemm build on a GB10 and WEMM_PILE, WEMM_ASSETS, WEMM_ROOT]\n  \
              memory index                     — derive the WeMM index over every chunk's prose and image; resumable, prints the commits still to derive [needs the wemm build on a GB10 and WEMM_PILE, WEMM_ASSETS, WEMM_ROOT]\n  \
-             memory lens [<theme>]            — thematic lenses beside the spine: list them, or print a theme's narratives (create with `create --lens <theme>`)\n  \
+             memory tag [<tag>]               — list the tags in use with their counts, or the memories carrying <tag> in time order (tag with `create --tag <tag>`)\n  \
+             memory migrate-lens-tags [--dry-run] — one-off: give every memory written with the retired `--lens <theme>` the tag of the same name (append-only)\n  \
              memory list [<grain>]            — show chunk time-ranges only: containment outline, or one zoom layer (no content)\n  \
              memory check <grain>             — report coverage gaps at a coarseness level (chunks of width <= grain)\n  \
              memory churn [--chars N] [--steps K] [--step-units U] — replay density-shaped recollection over the pile's own observation history (K diagnostic steps back, default 160): per step the fill, previous rendered prefix surviving, and any unselected stretch longer than one quarter of LIFE\n  \
-             memory create [<range>] <summary> — create a memory chunk\n  \
+             memory create [--tag <tag>]... [<range>] <summary> — create a memory chunk, optionally tagged\n  \
              memory respan <id> <from>..<to>  — the same memory over corrected time coordinates: a new chunk with the identical text supersedes the old one, which stands aside from the cover and stays readable by id\n  \
              memory respan-instants [--dry-run] — give every zero-length memory the span its own text names, or a moment ending at its stamp; turn inverted ranges forward; one commit\n  \
              memory respan-seams [--dry-run]    — close one-second and one-minute seams between arcs written with rounded edges (an hour or wider): a coordinate correction, one commit\n  \
@@ -115,7 +116,10 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         "index" => memory.index(out),
         "context" => out.text(report_text(memory.context(&context_options(args)?)?)),
         "cover" => return super::cli_cover::execute(&memory, args, out),
-        "lens" => memory.lens(args.first().map(String::as_str), out),
+        "tag" => memory.tag(args.first().map(String::as_str), out),
+        "migrate-lens-tags" => {
+            memory.migrate_lens_tags(dry_run("usage: memory migrate-lens-tags [--dry-run]")?, out)
+        }
         "list" => memory.list(args.first().map(String::as_str), out),
         "check" => memory.check(one("usage: memory check <grain>")?, out),
         "density" => memory.density(args.first().map(String::as_str), out),
@@ -146,12 +150,13 @@ fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()>
     // storing the literal "--help" as a chunk.
     if args.iter().any(|a| a == "--help" || a == "-h") {
         out.line(format!(
-            "usage: memory create [--lens <theme>] [<from>..<to>] <summary...>\n\
+            "usage: memory create [--tag <tag>]... [<from>..<to>] <summary...>\n\
              \n\
              Create a memory chunk and store it in the pile.\n\
              An optional time range as the first argument grounds the memory in\n\
-             that period; without it, defaults to now. --lens <theme> files the\n\
-             chunk as a thematic memory kept out of the chronological spine."
+             that period; without it, defaults to now. --tag <tag> (repeatable)\n\
+             tags it for `memory tag <tag>`; a tagged memory sits in the\n\
+             timeline like any other."
         ))?;
         return Ok(());
     }
@@ -171,26 +176,26 @@ fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()>
         );
     }
 
-    // Pull an optional `--lens <theme>` out first: a lens chunk is a thematic
-    // memory (e.g. "us", "becoming-self"), kept OUT of the chronological spine.
-    let mut lens: Option<String> = None;
-    let mut filtered: Vec<String> = Vec::new();
-    {
-        let mut i = 0;
-        while i < args.len() {
-            if args[i] == "--lens" && i + 1 < args.len() {
-                lens = Some(args[i + 1].clone());
-                i += 2;
-            } else {
-                filtered.push(args[i].clone());
-                i += 1;
+    // Leading `--tag <tag>` options, repeatable. An unknown leading option is
+    // refused rather than stored as the first word of the memory.
+    let mut tags: Vec<String> = Vec::new();
+    let mut args = args;
+    let is_option = |arg: &&String| {
+        arg.strip_prefix("--")
+            .is_some_and(|name| name.starts_with(|c: char| c.is_ascii_alphabetic()))
+    };
+    while let Some(first) = args.first().filter(is_option) {
+        match (first.as_str(), args.get(1)) {
+            ("--tag", Some(tag)) => {
+                tags.push(tag.clone());
+                args = &args[2..];
             }
+            _ => bail!("unknown option {first}: memory create [--tag <tag>]... [<from>..<to>] <summary...>"),
         }
     }
-    let args = &filtered[..];
     if args.is_empty() {
         bail!(
-            "summary text is required: memory create [--lens <theme>] [<from>..<to>] <summary...>"
+            "summary text is required: memory create [--tag <tag>]... [<from>..<to>] <summary...>"
         );
     }
 
@@ -231,7 +236,7 @@ fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()>
     }
 
     memory
-        .create(&summary_text, explicit_range, lens.as_deref())?
+        .create(&summary_text, explicit_range, &tags)?
         .emit(out)
 }
 

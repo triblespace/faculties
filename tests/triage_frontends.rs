@@ -175,7 +175,7 @@ fn memory_inspection_remains_read_only_and_uses_exact_episode_identity() {
         hifitime::Epoch::from_tai_seconds(31.0),
     );
     let episode = memory
-        .create("literal episodic memory", Some(range), None)
+        .create("literal episodic memory", Some(range), &[])
         .unwrap();
     let id = format!("{:x}", episode.id);
     assert_eq!(

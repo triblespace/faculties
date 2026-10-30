@@ -172,8 +172,13 @@ impl Memory {
     pub fn index(&self, _out: &mut Out<'_>) -> Result<()> {
         crate::wemm_unavailable()
     }
-    pub fn lens(&self, theme: Option<&str>, out: &mut Out<'_>) -> Result<()> {
-        self.with_operation(|storage| lens(storage, theme, out))
+    pub fn tag(&self, tag: Option<&str>, out: &mut Out<'_>) -> Result<()> {
+        self.with_operation(|storage| list_tags(storage, tag, out))
+    }
+    /// One-off: give every chunk that carries the retired `ctx::lens` the
+    /// tag of the same name. Append-only and idempotent.
+    pub fn migrate_lens_tags(&self, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
+        self.with_operation(|storage| migrate_lens_tags(storage, dry_run, out))
     }
     pub fn list(&self, grain: Option<&str>, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| list(storage, grain, out))
@@ -203,12 +208,12 @@ impl Memory {
         self.with_operation(|storage| respan_seams(storage, dry_run, out))
     }
 
-    /// Summary/lens strings are literal resident data, including @ prefixes.
+    /// Summary/tag strings are literal resident data, including @ prefixes.
     pub fn create(
         &self,
         summary: &str,
         range: Option<(Epoch, Epoch)>,
-        lens: Option<&str>,
+        tags: &[String],
     ) -> Result<CreatedMemory> {
         if summary.is_empty() {
             bail!("memory summary must not be empty");
@@ -223,7 +228,7 @@ impl Memory {
         require_duration(range)?;
         self.with_operation(|storage| {
             let loaded = storage.load()?;
-            let id = create_chunk(storage, &loaded, summary, range, lens, range.1)?;
+            let id = create_chunk(storage, &loaded, summary, range, tags, range.1)?;
             Ok(CreatedMemory {
                 id,
                 start: range.0,
@@ -368,12 +373,11 @@ fn emit_image(
     out.emit(part)
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 
-#[cfg(feature = "wemm")]
 use crate::schemas::memory::KIND_CHUNK_ID;
 use crate::schemas::memory::{
     archive_schema as legacy_archive_schema, ctx, DEFAULT_COMB_SCOPE_ID,
@@ -989,14 +993,17 @@ fn similar(
 // ---------------------------------------------------------------------------
 
 /// `memory respan <id> <from>..<to>` -- the same memory over corrected time
-/// coordinates. A new chunk with the identical text, lens, references and
+/// coordinates. A new chunk with the identical text, tags, references and
 /// provenance is written over the new range and supersedes the old one; the
 /// cover then shows the new coordinates and the old chunk stands aside, still
 /// a member of the journal and readable by id. The text cannot change here:
 /// that would be a new memory, and a journal is not a mutable fact store.
 
-/// The respan itself: the old chunk's text, lens, references and provenance
+/// The respan itself: the old chunk's text, tags, references and provenance
 /// over `range`, plus the edge. Shared by `respan` and `respan-instants`.
+/// Every `metadata::tag` of the old chunk is carried forward as it stands; a
+/// historical `ctx::lens` theme becomes a tag of the same name, since the new
+/// chunk has a new core of its own and the lens attribute is no longer written.
 fn respan_fragment(
     loaded: &LoadedMemory,
     old: Id,
@@ -1021,18 +1028,16 @@ fn respan_fragment(
     let summary: View<str> = reader
         .get(summary_handle)
         .context("read the memory's text")?;
-    let lens = match chunk_lens_handle(space, old) {
-        Some(handle) => {
-            let lens: View<str> = reader.get(handle).context("read the memory's lens")?;
-            Some(lens.as_ref().to_owned())
-        }
-        None => None,
-    };
+    let mut tags = BTreeSet::new();
+    if let Some(handle) = chunk_lens_handle(space, old) {
+        let lens: View<str> = reader.get(handle).context("read the memory's lens")?;
+        tags.insert(lens.as_ref().to_owned());
+    }
     let (mut fragment, moved) = memory_model::chunk_fragment(memory_model::ChunkDraft {
         content: memory_model::ChunkDraftContent::Text(summary.as_ref().to_owned()),
         start_at: clock::point(range.0)?,
         end_at: clock::point(range.1)?,
-        lens,
+        tags,
         references: chunk_references(space, old).into_iter().collect(),
         about_exec_result: chunk_about_exec_result(space, old),
         about_archive_message: chunk_about_archive_message(space, old),
@@ -1045,6 +1050,10 @@ fn respan_fragment(
             format_time_range(range.0, range.1)
         );
     }
+    // The old chunk's kind marker is among these; restating it is harmless.
+    let carried: BTreeSet<Id> =
+        find!(tag: Id, pattern!(space, [{ old @ metadata::tag: ?tag }])).collect();
+    fragment += entity! { ExclusiveId::force_ref(&moved) @ metadata::tag*: carried.iter() };
     fragment += memory_model::respan_edge(moved, old);
     Ok((fragment, moved))
 }
@@ -1309,7 +1318,7 @@ fn create_chunk(
     loaded: &LoadedMemory,
     summary_text: &str,
     range: (Epoch, Epoch),
-    lens: Option<&str>,
+    tags: &[String],
     observed_at: Epoch,
 ) -> Result<Id> {
     let hard_refs = scan_hard_references(summary_text);
@@ -1327,7 +1336,7 @@ fn create_chunk(
         content: memory_model::ChunkDraftContent::Text(summary_text.to_owned()),
         start_at,
         end_at,
-        lens: lens.map(str::to_owned),
+        tags: tags.iter().cloned().collect(),
         references: reference_ids,
         about_exec_result: None,
         about_archive_message: None,
@@ -1368,7 +1377,7 @@ fn create_image_chunk(
         content: memory_model::ChunkDraftContent::Image(bytes.to_vec()),
         start_at,
         end_at,
-        lens: None,
+        tags: BTreeSet::new(),
         references: BTreeSet::new(),
         about_exec_result: None,
         about_archive_message: None,
@@ -1489,71 +1498,148 @@ fn humanize_ns(ns: i128) -> String {
     }
 }
 
-/// `memory lens [<theme>]` — the thematic weave that runs beside the spine.
-/// With no theme: list every lens memory (theme · span · first line). With a
-/// theme substring: print the full text of the matching lens narratives. Lens
-/// chunks are deliberately outside the temporal cover, so they can overlap each
-/// other and the spine freely.
-fn lens(storage: MemoryStorage<'_>, theme: Option<&str>, out: &mut Out<'_>) -> Result<()> {
-    let filter = theme.map(str::to_lowercase);
+/// `memory tag [<tag>]` -- tags are for finding memories, nothing more. With
+/// no tag: every tag in use and how many memories carry it. With a tag: the
+/// memories carrying it, in time order (span, id, first line). A tag is a
+/// `metadata::tag` edge from a chunk to an entity with a `metadata::name`; the
+/// chunk's own kind marker is not one.
+fn list_tags(storage: MemoryStorage<'_>, wanted: Option<&str>, out: &mut Out<'_>) -> Result<()> {
+    type TextHandle = Inline<Handle<UTF8String>>;
+    let wanted = wanted.map(|tag| tag.trim().to_lowercase());
     let loaded = storage.load()?;
     let space = &loaded.memory.facts;
-    let mut lenses: Vec<(String, i128, i128, Id)> = Vec::new();
-    for id in all_chunk_ids(space) {
-        let Some(lh) = chunk_lens_handle(space, id) else {
+    let reader = &loaded.memory.reader;
+    let mut names: BTreeMap<TextHandle, String> = BTreeMap::new();
+    let mut tagged: BTreeMap<String, BTreeSet<Id>> = BTreeMap::new();
+    for (chunk, tag, handle) in find!(
+        (chunk: Id, tag: Id, handle: TextHandle),
+        pattern!(space, [
+            { ?chunk @ metadata::tag: &KIND_CHUNK_ID, metadata::tag: ?tag },
+            { ?tag @ metadata::name: ?handle },
+        ])
+    ) {
+        if tag == KIND_CHUNK_ID {
             continue;
-        };
-        let theme: String = loaded
-            .memory
-            .reader
-            .get::<View<str>, UTF8String>(lh)
-            .context("read lens theme")?
-            .as_ref()
-            .to_string();
-        let (Some(s), Some(e)) = (chunk_start_at(space, id), chunk_end_at(space, id)) else {
-            continue;
-        };
-        lenses.push((theme, interval_key(s), interval_key(e), id));
-    }
-    if let Some(t) = &filter {
-        lenses.retain(|(theme, _, _, _)| theme.to_lowercase().contains(t.as_str()));
-    }
-    lenses.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    if lenses.is_empty() {
-        out.line(format!(
-            "no lens memories{} — create one with `memory create --lens <theme> <from>..<to> <summary>`",
-            filter.map(|t| format!(" matching \"{t}\"")).unwrap_or_default()
-        ))?;
-        return Ok(());
-    }
-
-    if filter.is_some() {
-        for (theme, s, e, id) in &lenses {
-            out.line(format!(
-                "\n## [{theme}] {}  ({id:x})",
-                format_time_range(key_to_epoch(*s), key_to_epoch(*e))
-            ))?;
-            if let Some(h) = chunk_summary_handle(space, *id) {
-                let summary: View<str> =
-                    loaded.memory.reader.get(h).context("read lens summary")?;
-                out.line(format!("{}", summary.trim_end()))?;
+        }
+        let name = match names.get(&handle) {
+            Some(name) => name.clone(),
+            None => {
+                // A name whose bytes are not here is skipped, as any value a
+                // typed read cannot decode.
+                let Ok(text) = reader.get::<View<str>, UTF8String>(handle) else {
+                    continue;
+                };
+                let text = text.as_ref().to_owned();
+                names.insert(handle, text.clone());
+                text
             }
+        };
+        tagged.entry(name).or_default().insert(chunk);
+    }
+
+    let Some(wanted) = wanted else {
+        if tagged.is_empty() {
+            return out.line(
+                "no tagged memories -- tag one with `memory create --tag <tag> [<from>..<to>] <summary>`",
+            );
         }
-    } else {
-        out.line(format!("{} lens memor(ies):", lenses.len()))?;
-        for (theme, s, e, id) in &lenses {
-            let first = chunk_summary_handle(space, *id)
-                .and_then(|h| loaded.memory.reader.get::<View<str>, UTF8String>(h).ok())
-                .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
-                .unwrap_or_default();
-            out.line(format!(
-                "  [{theme}] {}  ({id:x})  {first}",
-                format_time_range(key_to_epoch(*s), key_to_epoch(*e))
-            ))?;
+        for (name, chunks) in &tagged {
+            out.line(format!("{name}  {}", chunks.len()))?;
         }
+        return Ok(());
+    };
+    let Some(chunks) = tagged.get(&wanted) else {
+        return out.line(format!("no memories tagged \"{wanted}\""));
+    };
+    let mut rows: Vec<(i128, i128, Id)> = chunks
+        .iter()
+        .filter_map(|&id| {
+            let start = chunk_start_at(space, id)?;
+            let end = chunk_end_at(space, id)?;
+            Some((interval_key(start), interval_key(end), id))
+        })
+        .collect();
+    rows.sort();
+    for (start, end, id) in rows {
+        let first = chunk_summary_handle(space, id)
+            .and_then(|h| reader.get::<View<str>, UTF8String>(h).ok())
+            .map(|v| v.as_ref().lines().next().unwrap_or("").to_string())
+            .unwrap_or_else(|| "[image memory]".to_owned());
+        out.line(format!(
+            "{}  ({id:x})  {first}",
+            format_time_range(key_to_epoch(start), key_to_epoch(end))
+        ))?;
     }
     Ok(())
+}
+
+/// The chunks a lens-to-tag migration still has to tag: every chunk with a
+/// historical `ctx::lens` theme that no tag of the same (normalized) name
+/// reaches yet. Pure over the facts, so it can be checked read-only.
+pub fn lens_tag_plan<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
+    reader: &B,
+) -> Result<Vec<(Id, String)>> {
+    type TextHandle = Inline<Handle<UTF8String>>;
+    let mut plan = Vec::new();
+    for (chunk, handle) in find!(
+        (chunk: Id, handle: TextHandle),
+        pattern!(space, [{ ?chunk @ metadata::tag: &KIND_CHUNK_ID, ctx::lens: ?handle }])
+    ) {
+        let theme: View<str> = reader
+            .get(handle)
+            .with_context(|| format!("read memory {chunk:x} lens theme"))?;
+        let theme = theme.as_ref().trim().to_lowercase();
+        if theme.is_empty() {
+            continue;
+        }
+        let mut present = false;
+        for name in find!(
+            name: TextHandle,
+            pattern!(space, [
+                { chunk @ metadata::tag: _?tag },
+                { _?tag @ metadata::name: ?name },
+            ])
+        ) {
+            let name: View<str> = reader.get(name).context("read tag name")?;
+            if name.as_ref() == theme {
+                present = true;
+                break;
+            }
+        }
+        if !present {
+            plan.push((chunk, theme));
+        }
+    }
+    plan.sort();
+    plan.dedup();
+    Ok(plan)
+}
+
+/// `memory migrate-lens-tags [--dry-run]` -- append, in one commit, a
+/// `metadata::tag` of the same name to every chunk still carrying only its
+/// historical `ctx::lens`. Nothing is removed: the lens fact stays in the
+/// chunk's identity core and the chunk keeps its id. Running it again finds
+/// nothing to do.
+fn migrate_lens_tags(storage: MemoryStorage<'_>, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
+    let loaded = storage.load()?;
+    let plan = lens_tag_plan(&loaded.memory.facts, &loaded.memory.reader)?;
+    if plan.is_empty() {
+        return out.line("no lens memories left to tag");
+    }
+    let mut fragment = Fragment::empty();
+    for (chunk, theme) in &plan {
+        out.line(format!("{chunk:x}  {theme}"))?;
+        fragment += memory_model::tag_fragment(*chunk, theme)?;
+    }
+    if dry_run {
+        return out.line(format!(
+            "{} memory(ies) would be tagged (dry run)",
+            plan.len()
+        ));
+    }
+    storage.publish_memory(fragment)?;
+    out.line(format!("{} memory(ies) tagged in one commit", plan.len()))
 }
 
 /// `memory list [<grain>]` — show the SHAPE of the memory as time-ranges only,
@@ -2547,7 +2633,7 @@ impl Memory {
             // this automatic write, so retrying a half-completed
             // Memory-then-Comb publication yields the same Memory data.
             let chunk_id =
-                create_chunk(storage, &loaded.memory, summary, (edge, until), None, until)?;
+                create_chunk(storage, &loaded.memory, summary, (edge, until), &[], until)?;
             comb_advance(
                 storage,
                 &loaded,
@@ -2834,12 +2920,177 @@ mod tests {
         id
     }
 
+    /// A chunk as the retired `memory create --lens` wrote it: the theme
+    /// inside the identity core.
+    fn publish_legacy_lens_chunk(
+        storage: MemoryStorage<'_>,
+        summary: &str,
+        start: &str,
+        end: &str,
+        theme: &str,
+    ) -> Id {
+        let mut fragment = Fragment::empty();
+        let summary = fragment.put::<UTF8String, _>(summary.to_owned());
+        let theme = fragment.put::<UTF8String, _>(theme.to_owned());
+        let core = entity! {
+            metadata::tag: &KIND_CHUNK_ID,
+            ctx::summary: summary,
+            ctx::start_at: point(start),
+            ctx::end_at: point(end),
+            ctx::lens: theme,
+        };
+        let id = core.root().expect("legacy lens core has one root");
+        fragment += core;
+        storage
+            .publish_memory(fragment)
+            .expect("publish legacy lens chunk");
+        id
+    }
+
+    fn run_text(f: impl FnOnce(&mut Out<'_>) -> Result<()>) -> String {
+        let mut text = String::new();
+        f(&mut Out::new(&mut |part| {
+            match part {
+                crate::out::Part::Text { text: line } => text.push_str(&line),
+                other => panic!("expected text, got {other:?}"),
+            }
+            Ok(())
+        }))
+        .expect("operation succeeds");
+        text
+    }
+
+    fn tag_names(loaded: &LoadedMemory, chunk: Id) -> BTreeSet<String> {
+        find!(
+            handle: Inline<Handle<UTF8String>>,
+            pattern!(&loaded.memory.facts, [
+                { chunk @ metadata::tag: _?tag },
+                { _?tag @ metadata::name: ?handle },
+            ])
+        )
+        .map(|handle| {
+            let name: View<str> = loaded.memory.reader.get(handle).unwrap();
+            name.as_ref().to_owned()
+        })
+        .collect()
+    }
+
+    /// A tag is only a tag: tagged memories, and memories written with the
+    /// retired lens, sit in the timeline and the recollection like any other.
+    /// The migration then tags the lens memory under its own id, append-only,
+    /// once; a respan carries the tags forward.
+    #[test]
+    fn tagged_and_lens_memories_live_in_the_timeline_and_migrate_to_tags() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let loaded = storage.load().unwrap();
+        let tagged = create_chunk(
+            storage,
+            &loaded,
+            "a tagged afternoon",
+            (
+                parse_tai_timestamp("2026-06-01T12:00:00").unwrap(),
+                parse_tai_timestamp("2026-06-01T18:00:00").unwrap(),
+            ),
+            &["Us".to_owned()],
+            parse_tai_timestamp("2026-06-01T18:00:00").unwrap(),
+        )
+        .unwrap();
+        let lens = publish_legacy_lens_chunk(
+            storage,
+            "a wide thematic arc",
+            "2026-05-01T00:00:00",
+            "2026-06-30T00:00:00",
+            "becoming-self",
+        );
+
+        let loaded = storage.load().unwrap();
+        let spans: BTreeSet<Id> = collect_chunk_spans(&loaded.memory.facts)
+            .into_iter()
+            .map(|(_, _, id)| id)
+            .collect();
+        assert_eq!(spans, BTreeSet::from([tagged, lens]));
+        let cover =
+            build_context_cover(&loaded, 10_000, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
+                .unwrap();
+        assert!(cover.contains("a tagged afternoon"), "{cover}");
+        assert!(cover.contains("a wide thematic arc"), "{cover}");
+        assert_eq!(
+            tag_names(&loaded, tagged),
+            BTreeSet::from(["us".to_owned()])
+        );
+        assert!(tag_names(&loaded, lens).is_empty());
+
+        assert_eq!(run_text(|out| list_tags(storage, None, out)), "us  1\n");
+        let dry = run_text(|out| migrate_lens_tags(storage, true, out));
+        assert!(dry.contains(&format!("{lens:x}  becoming-self")), "{dry}");
+        assert!(
+            tag_names(&storage.load().unwrap(), lens).is_empty(),
+            "dry run wrote"
+        );
+        let migrated = run_text(|out| migrate_lens_tags(storage, false, out));
+        assert!(migrated.contains("1 memory(ies) tagged"), "{migrated}");
+        assert_eq!(
+            run_text(|out| migrate_lens_tags(storage, false, out)),
+            "no lens memories left to tag\n"
+        );
+
+        let loaded = storage.load().unwrap();
+        assert_eq!(
+            tag_names(&loaded, lens),
+            BTreeSet::from(["becoming-self".to_owned()])
+        );
+        assert!(
+            chunk_lens_handle(&loaded.memory.facts, lens).is_some(),
+            "nothing is removed"
+        );
+        assert_eq!(
+            all_chunk_ids(&loaded.memory.facts),
+            {
+                let mut ids = vec![tagged, lens];
+                ids.sort();
+                ids
+            },
+            "the migration mints no chunk"
+        );
+        assert_eq!(
+            run_text(|out| list_tags(storage, None, out)),
+            "becoming-self  1\nus  1\n"
+        );
+        let listed = run_text(|out| list_tags(storage, Some(" Becoming-Self "), out));
+        assert!(
+            listed.contains(&format!("({lens:x})  a wide thematic arc")),
+            "{listed}"
+        );
+        assert!(!listed.contains("afternoon"));
+
+        // A respan of the legacy chunk: tags carried, the lens not rewritten.
+        let now = parse_tai_timestamp("2026-07-01T00:00:00").unwrap();
+        let range = (
+            parse_tai_timestamp("2026-05-02T00:00:00").unwrap(),
+            parse_tai_timestamp("2026-06-29T00:00:00").unwrap(),
+        );
+        let (fragment, moved) = respan_fragment(&loaded, lens, range, now).unwrap();
+        storage.publish_memory(fragment).unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(
+            tag_names(&loaded, moved),
+            BTreeSet::from(["becoming-self".to_owned()])
+        );
+        assert!(chunk_lens_handle(&loaded.memory.facts, moved).is_none());
+        let spans: BTreeSet<Id> = collect_chunk_spans(&loaded.memory.facts)
+            .into_iter()
+            .map(|(_, _, id)| id)
+            .collect();
+        assert_eq!(spans, BTreeSet::from([tagged, moved]));
+    }
+
     fn text_draft(summary: &str, start: &str, end: &str) -> memory_model::ChunkDraft {
         memory_model::ChunkDraft {
             content: memory_model::ChunkDraftContent::Text(summary.to_owned()),
             start_at: point(start),
             end_at: point(end),
-            lens: None,
+            tags: BTreeSet::new(),
             references: BTreeSet::new(),
             about_exec_result: None,
             about_archive_message: None,
@@ -2934,10 +3185,10 @@ mod tests {
         assert_eq!(shown, "already resident history\n");
         let range = parse_time_range("2026-09-15T05:50:00Z..2026-09-15T06:10:00Z").unwrap();
         let plain = memory
-            .create("a new journal entry", Some(range), None)
+            .create("a new journal entry", Some(range), &[])
             .unwrap();
         let linked = memory
-            .create(&format!("[earlier](memory:{warm:x})"), Some(range), None)
+            .create(&format!("[earlier](memory:{warm:x})"), Some(range), &[])
             .unwrap();
         let loaded = storage.load().unwrap();
         assert_eq!(
@@ -2953,7 +3204,7 @@ mod tests {
             .create(
                 &format!("[missing](memory:{:x})", unknown.id),
                 Some(range),
-                None,
+                &[],
             )
             .unwrap_err();
         assert!(format!("{error:#}").contains("hard reference"));
@@ -3013,7 +3264,7 @@ mod tests {
             "a later journal entry".to_owned(),
             format!("[earlier](memory:{warm:x})"),
         ] {
-            let error = memory.create(&summary, Some(range), None).unwrap_err();
+            let error = memory.create(&summary, Some(range), &[]).unwrap_err();
             let incomplete = error
                 .downcast_ref::<crate::storage::IncompleteAttachedRead>()
                 .unwrap();
@@ -3352,7 +3603,7 @@ mod tests {
             &loaded,
             "apex: two days of cover-cursor work",
             apex,
-            None,
+            &[],
             apex.1,
         )
         .expect("create apex");
@@ -3366,7 +3617,7 @@ mod tests {
             &loaded,
             "day one: built the state machine",
             day1,
-            None,
+            &[],
             day1.1,
         )
         .expect("create day one");
@@ -3380,7 +3631,7 @@ mod tests {
             &loaded,
             "day two: wired the hooks",
             day2,
-            None,
+            &[],
             day2.1,
         )
         .expect("create day two");
@@ -3528,7 +3779,16 @@ mod tests {
         let amber = "amber ".repeat(3);
         let cobalt = "cobalt ".repeat(10);
         let amber_id = write(&amber, "2026-06-01T00:00:00", "2026-06-03T00:00:00");
-        let cobalt_id = write(&cobalt, "2026-06-01T00:00:00", "2026-06-03T00:00:00");
+        // One account was written with the retired lens. It is an ordinary
+        // alternative for the same moment, both for plain recall and for
+        // situated selection.
+        let cobalt_id = publish_legacy_lens_chunk(
+            storage,
+            &cobalt,
+            "2026-06-01T00:00:00",
+            "2026-06-03T00:00:00",
+            "colours",
+        );
         write(
             &"recent ".repeat(10),
             "2026-06-03T00:00:00",

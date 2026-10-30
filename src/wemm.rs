@@ -402,7 +402,7 @@ mod tests {
         let chunks: Vec<Id> = texts
             .iter()
             .zip(1..)
-            .map(|(text, n)| memory.create(text, Some(day(n)), None).unwrap().id)
+            .map(|(text, n)| memory.create(text, Some(day(n)), &[]).unwrap().id)
             .collect();
         let crab = memory.image(&png, day(5)).unwrap().id;
         let revisions: Vec<Id> = [

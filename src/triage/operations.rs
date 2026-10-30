@@ -1228,7 +1228,7 @@ mod tests {
             content: ChunkDraftContent::Text(text.to_owned()),
             start_at: point(start),
             end_at: point(start + 1.0),
-            lens: None,
+            tags: BTreeSet::new(),
             references: BTreeSet::new(),
             about_exec_result: None,
             about_archive_message: None,

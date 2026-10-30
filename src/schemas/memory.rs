@@ -137,13 +137,15 @@ pub mod ctx {
         /// migration crate can decode historical rows; the episodic journal
         /// neither emits nor interprets it.
         "0381735B64BFE71EA0341B95EA42C984" unsafe as supersedes: GenId;
-        /// Marks this chunk as a thematic LENS rather than part of the
-        /// chronological spine; the value is the theme name. Lens chunks are
-        /// excluded from the temporal containment tree, so a wide lens (e.g. a
-        /// "story of us" over many months) can't hijack the spine by containing
-        /// the eras it overlaps. They are read on their own axis via
-        /// `memory lens <theme>`. This is what lets memory be a many-threaded
-        /// weave — overlapping views over the same time — instead of one tree.
+        /// Historical theme label from the retired lens feature (2026-06-29
+        /// to 2026-10-30); the value is the theme name. It sits in the
+        /// identity core of the chunks that carry it, so it stays readable,
+        /// but nothing writes it any more and it no longer keeps a memory out
+        /// of the timeline. Themes are tags now: `metadata::tag` edges to a
+        /// named tag entity, written by `memory create --tag` (JP,
+        /// 2026-10-30: "tags are ok, but let's call them that and include
+        /// them in the timeline"). `memory migrate-lens-tags` gives each
+        /// lens chunk the tag of the same name.
         "B53D37A3BE552B0F47E279D69AB7ECD3" unsafe as lens: Handle<UTF8String>;
         /// The raw image bytes of a WORDLESS image memory chunk. A chunk with
         /// this attribute is a memory whose content is a picture, not prose —

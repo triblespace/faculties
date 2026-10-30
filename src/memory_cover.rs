@@ -81,8 +81,9 @@ pub fn chunk_span_str<P: TriblePattern>(space: &P, id: Id) -> String {
     }
 }
 
-/// A chunk's lens-theme handle, if it is a thematic lens (not part of the
-/// chronological spine). Presence is what excludes it from the temporal cover.
+/// A chunk's historical `ctx::lens` theme, if it was written as a lens. No
+/// longer written and no longer read by the cover: such a memory sits in the
+/// timeline like any other. Read only to carry the theme forward as a tag.
 pub fn chunk_lens_handle<P: TriblePattern>(
     space: &P,
     id: Id,
@@ -202,7 +203,6 @@ pub fn collect_chunk_spans<P: TriblePattern>(space: &P) -> Vec<(i128, i128, Id)>
             ctx::end_at: ?end,
         }])
     )
-    .filter(|(id, _, _)| chunk_lens_handle(space, *id).is_none())
     .map(|(id, start, end)| (interval_key(start), interval_key(end), id))
     .filter(|(start, end, _)| start <= end)
     .collect();
@@ -627,7 +627,7 @@ pub fn silent_life_quarters(spans: &[(i128, i128, Id)], cover: &[usize]) -> Vec<
 /// Collapse memories which are interchangeable to the temporal sampler into
 /// one structural position.
 ///
-/// Recollection has one axis: chronological, non-lens memories. Exact equality
+/// Recollection has one axis: chronological memories, tagged or not. Exact equality
 /// of `(start, end)` is therefore the strongest possible structural
 /// equivalence. Every member is later assigned the class's conservative
 /// maximum rendered charge, so substituting its prose cannot alter the ideal

@@ -535,7 +535,7 @@ mod tests {
             content: memory::ChunkDraftContent::Text(summary.to_owned()),
             start_at: point(10.0),
             end_at: point(20.0),
-            lens: None,
+            tags: BTreeSet::new(),
             references: BTreeSet::new(),
             about_exec_result: None,
             about_archive_message: None,

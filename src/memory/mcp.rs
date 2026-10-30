@@ -49,7 +49,7 @@ static TOOLS: &[Tool] = &[
     Tool {
         name: "memory_create",
         description: "Journal literal resident text, optionally over an explicit positive-duration TAI range; no host file/stdin expansion.",
-        input_schema: r#"{"type":"object","properties":{"summary":{"type":"string","minLength":1},"range":{"type":"string"},"lens":{"type":"string","minLength":1}},"required":["summary"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"summary":{"type":"string","minLength":1},"range":{"type":"string"},"tags":{"type":"array","items":{"type":"string","minLength":1}}},"required":["summary"],"additionalProperties":false}"#,
     },
     Tool {
         name: "memory_image",
@@ -92,9 +92,9 @@ static TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"budget_chars":{"type":"integer","minimum":0,"default":200000},"chunk_overhead":{"type":"integer","minimum":0,"default":0},"about":{"type":"string"},"filter":{"type":"string"},"remove":{"type":"string"},"sim_threshold":{"type":"number","minimum":0,"maximum":1,"default":0.55}},"required":[],"additionalProperties":false}"#,
     },
     Tool {
-        name: "memory_lens",
-        description: "List thematic lenses or show matching literal theme narratives.",
-        input_schema: r#"{"type":"object","properties":{"theme":{"type":"string"}},"required":[],"additionalProperties":false}"#,
+        name: "memory_tag",
+        description: "List the tags in use with their counts, or the memories carrying one tag in time order.",
+        input_schema: r#"{"type":"object","properties":{"tag":{"type":"string"}},"required":[],"additionalProperties":false}"#,
     },
     Tool {
         name: "memory_list",
@@ -159,7 +159,7 @@ arguments!(Empty {});
 arguments!(Selector { selector: String });
 arguments!(Id { id: String });
 arguments!(Query { query: String });
-arguments!(Create { summary: String, range: Option<String>, lens: Option<String> });
+arguments!(Create { summary: String, range: Option<String>, tags: Option<Vec<String>> });
 arguments!(Image {
     when: String,
     data: String
@@ -170,7 +170,7 @@ arguments!(Respan {
 });
 arguments!(Repair { dry_run: Option<bool> });
 arguments!(ContextArgs { budget_chars: Option<usize>, chunk_overhead: Option<usize>, about: Option<String>, filter: Option<String>, remove: Option<String>, sim_threshold: Option<f32> });
-arguments!(Lens { theme: Option<String> });
+arguments!(Tag { tag: Option<String> });
 arguments!(Grain { grain: String });
 arguments!(OptionalGrain { grain: Option<String> });
 arguments!(Churn { budget_chars: Option<usize>, steps: Option<usize>, step_units: Option<i128> });
@@ -219,7 +219,7 @@ impl Faculty for Memory {
                     .transpose()
                     .map_err(invalid_arguments)?;
                 memory
-                    .create(&args.summary, range, args.lens.as_deref())?
+                    .create(&args.summary, range, &args.tags.unwrap_or_default())?
                     .emit(out)
             }
             "memory_image" => {
@@ -280,9 +280,9 @@ impl Faculty for Memory {
                     .unwrap_or(crate::memory_cover::DEFAULT_SIM_THRESHOLD);
                 emit_context(memory.context(&options)?, out)
             }
-            "memory_lens" => {
-                let args: Lens = decode_arguments(arguments)?;
-                memory.lens(args.theme.as_deref(), out)
+            "memory_tag" => {
+                let args: Tag = decode_arguments(arguments)?;
+                memory.tag(args.tag.as_deref(), out)
             }
             "memory_list" => {
                 let args: OptionalGrain = decode_arguments(arguments)?;

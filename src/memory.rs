@@ -65,7 +65,9 @@ pub struct ChunkDraft {
     pub content: ChunkDraftContent,
     pub start_at: IntervalValue,
     pub end_at: IntervalValue,
-    pub lens: Option<String>,
+    /// Tag names, attached as `metadata::tag` annotations outside the
+    /// identity core (see [`tag_fragment`]).
+    pub tags: BTreeSet<String>,
     pub references: BTreeSet<Id>,
     pub about_exec_result: Option<Id>,
     pub about_archive_message: Option<Id>,
@@ -92,7 +94,6 @@ fn chunk_core(
     content: ChunkContent,
     start_at: IntervalValue,
     end_at: IntervalValue,
-    lens: Option<TextHandle>,
     references: &BTreeSet<Id>,
     about_exec_result: Option<Id>,
     about_archive_message: Option<Id>,
@@ -112,7 +113,6 @@ fn chunk_core(
         ctx::image?: image.as_ref(),
         ctx::start_at: start_at,
         ctx::end_at: end_at,
-        ctx::lens?: lens.as_ref(),
         ctx::reference*: references.iter(),
         ctx::about_exec_result?: about_exec_result.as_ref(),
         ctx::about_archive_message?: about_archive_message.as_ref(),
@@ -124,10 +124,14 @@ fn annotate_chunk(
     mut fragment: Fragment,
     observed_at: &BTreeSet<IntervalValue>,
     aliases: &BTreeSet<Id>,
-) -> Fragment {
+    tags: &BTreeSet<String>,
+) -> Result<(Fragment, Id)> {
     let id = fragment
         .root()
         .expect("canonical Memory chunk core has one intrinsic root");
+    for tag in tags {
+        fragment += tag_fragment(id, tag)?;
+    }
     for at in observed_at {
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: at };
     }
@@ -135,7 +139,23 @@ fn annotate_chunk(
         let alias = inlineencodings::GenId::inline_from(*alias);
         fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::anchor: alias };
     }
-    fragment
+    // A tag record exports its own intrinsic root, so the chunk's id is the
+    // core's root, taken before any tag joins the fragment.
+    Ok((fragment, id))
+}
+
+/// Tag a chunk: the canonical `metadata::tag` edge to a tag entity named by
+/// `metadata::name`, the same tag record the Wiki writes, so one name is one
+/// tag across faculties. The edge annotates the chunk; it is not part of the
+/// identity core, so tagging an existing memory keeps its id, and a tag is
+/// only a tag: it neither moves the memory in time nor files it elsewhere.
+pub fn tag_fragment(chunk: Id, name: &str) -> Result<Fragment> {
+    if name.trim().is_empty() {
+        bail!("memory tag must not be empty");
+    }
+    let (mut fragment, tag, _) = crate::wiki::tag_record(name)?;
+    fragment += entity! { ExclusiveId::force_ref(&chunk) @ metadata::tag: &tag };
+    Ok(fragment)
 }
 
 /// The edge a respan writes: `newer` is the same memory as `older`, over
@@ -154,9 +174,6 @@ pub fn chunk_fragment(draft: ChunkDraft) -> Result<(Fragment, Id)> {
     for at in &draft.observed_at {
         point_bounds(None, "chunk observation time", *at)?;
     }
-    if draft.lens.as_ref().is_some_and(|lens| lens.is_empty()) {
-        bail!("memory lens must not be empty");
-    }
 
     let mut fragment = Fragment::empty();
     let content = match draft.content {
@@ -173,13 +190,11 @@ pub fn chunk_fragment(draft: ChunkDraft) -> Result<(Fragment, Id)> {
             ChunkContent::Image(fragment.put::<blobencodings::RawBytes, _>(image))
         }
     };
-    let lens = draft.lens.map(|lens| fragment.put(lens));
-    fragment += annotate_chunk(
+    let (annotated, id) = annotate_chunk(
         chunk_core(
             content,
             draft.start_at,
             draft.end_at,
-            lens,
             &draft.references,
             draft.about_exec_result,
             draft.about_archive_message,
@@ -187,10 +202,9 @@ pub fn chunk_fragment(draft: ChunkDraft) -> Result<(Fragment, Id)> {
         ),
         &draft.observed_at,
         &draft.aliases,
-    );
-    let id = fragment
-        .root()
-        .ok_or_else(|| anyhow!("Memory chunk fragment has no unique intrinsic root"))?;
+        &draft.tags,
+    )?;
+    fragment += annotated;
     Ok((fragment, id))
 }
 
@@ -297,7 +311,7 @@ mod tests {
             content: ChunkDraftContent::Text(summary.to_owned()),
             start_at: point(10.0),
             end_at: point(20.0),
-            lens: None,
+            tags: BTreeSet::new(),
             references: BTreeSet::new(),
             about_exec_result: None,
             about_archive_message: None,
@@ -309,12 +323,11 @@ mod tests {
     fn historical_chunk(summary: &str, predecessors: BTreeSet<Id>) -> (Fragment, Id) {
         let mut fragment = Fragment::empty();
         let content = ChunkContent::Text(fragment.put(summary.to_owned()));
-        fragment += annotate_chunk(
+        let (annotated, id) = annotate_chunk(
             chunk_core(
                 content,
                 point(10.0),
                 point(20.0),
-                None,
                 &BTreeSet::new(),
                 None,
                 None,
@@ -322,8 +335,10 @@ mod tests {
             ),
             &BTreeSet::from([point(30.0)]),
             &BTreeSet::new(),
-        );
-        let id = fragment.root().expect("historical chunk has one root");
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        fragment += annotated;
         (fragment, id)
     }
 
@@ -344,6 +359,50 @@ mod tests {
         let replay = chunk_fragment(replay).unwrap();
         assert_eq!(first.1, replay.1);
         assert_ne!(first.0, replay.0);
+    }
+
+    /// `--tag` writes the canonical `metadata::tag` edge to a named tag
+    /// entity, beside the chunk kind, and leaves the chunk's identity alone.
+    #[test]
+    fn tags_are_canonical_metadata_tags_outside_the_identity_core() {
+        let (plain, plain_id) = chunk_fragment(draft("tagged")).unwrap();
+        let mut tagged = draft("tagged");
+        tagged.tags = BTreeSet::from(["Us".to_owned(), "becoming-self".to_owned()]);
+        let (tagged, id) = chunk_fragment(tagged).unwrap();
+        assert_eq!(plain_id, id, "a tag annotates; it is not identity");
+        assert!(plain.facts().len() < tagged.facts().len());
+
+        let mut store = tagged.clone();
+        let reader = store.blobs_mut().snapshot().unwrap();
+        let mut names = BTreeSet::new();
+        for (tag, handle) in find!(
+            (tag: Id, handle: TextHandle),
+            pattern!(tagged.facts(), [
+                { id @ metadata::tag: ?tag },
+                { ?tag @ metadata::name: ?handle },
+            ])
+        ) {
+            assert_ne!(tag, KIND_CHUNK_ID);
+            names.insert(read_text(&reader, handle).unwrap());
+        }
+        assert_eq!(
+            names,
+            BTreeSet::from(["us".to_owned(), "becoming-self".to_owned()]),
+            "the same normalized tag record the Wiki writes"
+        );
+        let (_, wiki_us, _) = crate::wiki::tag_record("us").unwrap();
+        assert!(exists!(
+            (),
+            pattern!(tagged.facts(), [{ id @ metadata::tag: &wiki_us }])
+        ));
+        assert!(exists!(
+            (),
+            pattern!(tagged.facts(), [{ id @ metadata::tag: &KIND_CHUNK_ID }])
+        ));
+
+        let mut empty = draft("tagged");
+        empty.tags.insert("  ".to_owned());
+        assert!(chunk_fragment(empty).is_err());
     }
 
     #[test]
