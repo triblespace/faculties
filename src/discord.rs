@@ -129,8 +129,11 @@ pub fn message_anchor_fragment(external_id: &str) -> Result<Fragment> {
 /// Something said in a voice channel, as a message there: the stable anchor
 /// of who spoke in which channel from when ([`discord::kind_utterance`],
 /// since no snowflake names it), and the observation that links it to the
-/// transcript as content and to the audio, a 16 kHz mono 16-bit PCM WAV
-/// ([`discord::utterance_audio`]). `start` is when the utterance began, as
+/// transcript as content and to its audio: a 16 kHz mono 16-bit PCM WAV
+/// ([`discord::utterance_audio`]) when `wav` is given, and the stored
+/// attachment it was heard from, a voice message's recording, when
+/// `attachment` is ([`archive::attachment`], as the message itself links
+/// it; no audio is stored again). `start` is when the utterance began, as
 /// the point interval a message's `metadata::created_at` is. With the channel
 /// and user anchors, so the fragment stands on its own.
 pub fn utterance_fragment(
@@ -138,11 +141,12 @@ pub fn utterance_fragment(
     user_external_id: &str,
     start: Inline<NsTAIInterval>,
     transcript: &str,
-    wav: Vec<u8>,
+    wav: Option<Vec<u8>>,
+    attachment: Option<Id>,
 ) -> Result<Fragment> {
     let (mut fragment, channel, user, utterance) =
         utterance_anchor(channel_external_id, user_external_id, start)?;
-    let audio = fragment.put::<RawBytes, _>(wav);
+    let audio = wav.map(|wav| fragment.put::<RawBytes, _>(wav));
     fragment += entity! { _ @
         metadata::tag: archive::kind_message,
         discord::message: utterance,
@@ -150,7 +154,8 @@ pub fn utterance_fragment(
         archive::author: user,
         archive::content: transcript.to_owned(),
         metadata::created_at: start,
-        discord::utterance_audio: audio,
+        discord::utterance_audio?: audio,
+        archive::attachment?: attachment,
     };
     Ok(fragment)
 }
@@ -1474,7 +1479,8 @@ mod tests {
             "100000000000000400",
             start,
             "hello there",
-            b"RIFF and the rest".to_vec(),
+            Some(b"RIFF and the rest".to_vec()),
+            None,
         )
         .unwrap();
         let mut staged = fragment.clone();
@@ -1506,6 +1512,39 @@ mod tests {
         .collect();
         let wav: anybytes::Bytes = reader.get(audio[0]).unwrap();
         assert_eq!(&wav[..], b"RIFF and the rest");
+    }
+
+    /// A voice message heard: its transcript is a message of its author with
+    /// the stored recording as its attachment, and no audio stored again.
+    #[test]
+    fn an_utterance_heard_from_an_attachment_links_it_and_stores_no_audio() {
+        let start = heard_from(1553506755164504063);
+        let recording = Id::new([7; 16]).unwrap();
+        let fragment = utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            start,
+            "so happy",
+            None,
+            Some(recording),
+        )
+        .unwrap();
+        let selected = select_messages(fragment.facts(), None, None).unwrap();
+        assert_eq!(selected.len(), 1);
+        let anchor = selected[0].anchor;
+        let attachments: Vec<Id> = find!(
+            attachment: Id,
+            pattern!(fragment.facts(), [{
+                _?observation @
+                discord::message: anchor,
+                archive::attachment: ?attachment,
+            }])
+        )
+        .collect();
+        assert_eq!(attachments, [recording]);
+        assert!(!exists!(pattern!(fragment.facts(), [{
+            _?observation @ discord::utterance_audio: _?audio,
+        }])));
     }
 
     #[test]

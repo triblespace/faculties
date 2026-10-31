@@ -87,7 +87,8 @@ enum Command {
         text: String,
     },
     /// Hear a recorded clip the way `live --hear` hears its voice channel,
-    /// without Discord: a 16 kHz mono 16-bit WAV is cut into utterances, and
+    /// without Discord: a 16 kHz mono 16-bit WAV, or an ogg/opus recording
+    /// such as a Discord voice message, is cut into utterances, and
     /// each is transcribed and printed with its timing and words. The model
     /// is the pile's (`--pile`, `TRIBLESPACE_COLLECTION_MODELS`). Nothing is
     /// stored.
@@ -164,10 +165,24 @@ struct LiveArgs {
     /// model of the pile's model collection (`TRIBLESPACE_COLLECTION_MODELS`):
     /// each utterance is transcribed and stored with its audio as a message
     /// in the voice channel, under the user who said it, where orient finds
-    /// it. Without it nobody is heard. Needs a pile, and a build with the
-    /// discord-hearing feature.
+    /// it. Without it nobody is heard. Voice messages are not heard unless
+    /// --hear-voice-messages-from names their author. Needs a pile, and a
+    /// build with the discord-hearing feature.
     #[arg(long, requires = "voice_channel")]
     hear: bool,
+    /// Also transcribe the voice messages (Discord's recorded audio
+    /// messages) this user (global Discord snowflake) posts where intake
+    /// reads: an --intake-channel, or a DM with --intake-dms (repeatable).
+    /// Each is transcribed by --hear's transcriber and stored as an
+    /// utterance of its author in the message's channel, linked to the
+    /// stored recording. Nobody else's voice message is transcribed, nor
+    /// any audio file posted without Discord's voice message flag.
+    #[arg(
+        long = "hear-voice-messages-from",
+        value_name = "USER_ID",
+        requires = "hear"
+    )]
+    hear_voice_messages_from: Vec<NonZeroU64>,
 }
 
 #[derive(Subcommand)]
@@ -416,6 +431,7 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
         intake_channels,
         intake_dms,
         hear,
+        hear_voice_messages_from,
     } = args;
     // clap asks for --guild and --voice-channel together.
     let voice = guild.zip(voice_channel);
@@ -430,6 +446,8 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
     if hear {
         bail!(NO_HEARING);
     }
+    #[cfg(not(feature = "discord-hearing"))]
+    let _ = hear_voice_messages_from;
     // What is heard is stored through intake, which hearing therefore runs.
     let wants_intake = !intake_channels.is_empty() || intake_dms || hear;
     if voice.is_none() && !wants_intake {
@@ -500,6 +518,10 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
             unstored: state.intake().join(intake::UNSTORED_SPEECH),
             // Wired to intake by `live::run`.
             voice_messages: None,
+            voice_messages_from: hear_voice_messages_from
+                .iter()
+                .map(|user| user.get())
+                .collect(),
         }),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -821,6 +843,33 @@ mod tests {
         assert!(live.intake_dms);
         // A voice channel is nothing without its guild.
         assert!(Cli::try_parse_from(["discord", "live", "--voice-channel", "2"]).is_err());
+        assert!(
+            live.hear_voice_messages_from.is_empty(),
+            "nobody's by default"
+        );
+        let voice = ["discord", "live", "--guild", "1", "--voice-channel", "2"];
+        let cli = Cli::try_parse_from(voice.iter().chain(&[
+            "--hear",
+            "--hear-voice-messages-from",
+            "5",
+            "--hear-voice-messages-from",
+            "6",
+        ]))
+        .unwrap();
+        let Some(Command::Live(live)) = cli.command else {
+            panic!("live parses as live");
+        };
+        assert_eq!(
+            live.hear_voice_messages_from
+                .iter()
+                .map(|user| user.get())
+                .collect::<Vec<_>>(),
+            [5, 6]
+        );
+        // Voice messages are heard by the transcriber --hear loads.
+        assert!(
+            Cli::try_parse_from(voice.iter().chain(&["--hear-voice-messages-from", "5"])).is_err()
+        );
         let cli = Cli::try_parse_from(["discord", "warm"]).unwrap();
         let Some(Command::Warm { text, hear }) = cli.command else {
             panic!("warm parses as warm");

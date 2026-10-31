@@ -10140,7 +10140,8 @@ mod tests {
                     speaker,
                     start,
                     "Hello there. How are you?",
-                    b"RIFF".to_vec(),
+                    Some(b"RIFF".to_vec()),
+                    None,
                 )
                 .unwrap(),
             )
@@ -10682,6 +10683,7 @@ mod tests {
             start_ms: 1_790_455_300_000,
             transcript: "can you hear me?".to_owned(),
             wav: wav.clone(),
+            attachment: None,
         };
         assert_eq!(
             intake.handle(Work::Utterance(utterance)).unwrap(),
@@ -10843,6 +10845,7 @@ mod tests {
             start_ms: 1_790_455_301_000,
             transcript: "can you hear me?".to_owned(),
             wav: b"RIFF and the samples".to_vec(),
+            attachment: None,
         };
         assert_eq!(
             news.intake.handle(Work::Utterance(utterance)).unwrap(),

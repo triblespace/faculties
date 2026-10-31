@@ -176,8 +176,12 @@ pub struct Utterance {
     /// When it began, in milliseconds since the Unix epoch.
     pub start_ms: u64,
     pub transcript: String,
-    /// What was said, as a 16 kHz mono 16-bit PCM WAV.
+    /// What was said, as a 16 kHz mono 16-bit PCM WAV; empty when it was
+    /// heard from a stored `attachment`.
     pub wav: Vec<u8>,
+    /// The stored attachment entity it was heard from (a voice message's
+    /// recording), which stands for its audio: none is stored again.
+    pub attachment: Option<Id>,
 }
 
 impl std::fmt::Debug for Utterance {
@@ -188,6 +192,7 @@ impl std::fmt::Debug for Utterance {
             .field("start_ms", &self.start_ms)
             .field("transcript_chars", &self.transcript.chars().count())
             .field("wav_bytes", &self.wav.len())
+            .field("attachment", &self.attachment)
             .finish()
     }
 }
@@ -482,7 +487,8 @@ impl Discord {
             &utterance.user.to_string(),
             utterance.started(),
             &utterance.transcript,
-            utterance.wav.clone(),
+            (!utterance.wav.is_empty()).then(|| utterance.wav.clone()),
+            utterance.attachment,
         )?;
         fragment += discord_model::intake_fragment(&channel, floor)?;
         self.storage().publish(
@@ -494,19 +500,20 @@ impl Discord {
             ),
         )
     }
-    /// The bytes this pile holds for a Discord attachment, by Discord's
-    /// attachment id and its file name, as a stored message names it; None
-    /// when none are held (one too large to store, say).
-    pub fn attachment_bytes(&self, source_id: &str, filename: &str) -> Result<Option<Bytes>> {
+    /// The attachment entity this pile holds for a Discord attachment, by
+    /// Discord's attachment id and its file name, as a stored message names
+    /// it, with its bytes; None when no bytes are held (one too large to
+    /// store, say).
+    pub fn attachment_bytes(&self, source_id: &str, filename: &str) -> Result<Option<(Id, Bytes)>> {
         let source: discord_model::TextHandle = source_id.to_owned().to_blob().get_handle();
         let name: discord_model::TextHandle =
             file_capability::leaf_name(filename).to_blob().get_handle();
         self.storage().with_session(|session| {
             Ok(find!(
-                content: file_capability::ContentHandle,
+                (attachment: Id, content: file_capability::ContentHandle),
                 pattern!(&session.facts, [
                     {
-                        _?attachment @
+                        ?attachment @
                         metadata::tag: archive::kind_attachment,
                         archive::attachment_source_id: &source,
                         archive::attachment_name: &name,
@@ -515,7 +522,10 @@ impl Discord {
                     { _?file @ file::content: ?content },
                 ])
             )
-            .find_map(|content| session.reader.get::<Bytes, RawBytes>(content).ok()))
+            .find_map(|(attachment, content)| {
+                let bytes = session.reader.get::<Bytes, RawBytes>(content).ok()?;
+                Some((attachment, bytes))
+            }))
         })
     }
     /// Store a sentence somebody finished in a voice channel while they went

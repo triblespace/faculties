@@ -2,13 +2,16 @@
 //! by the transcriber that hears the voice channel.
 //!
 //! Intake stores a voice message like any other message, its audio as an
-//! attachment ([`super::intake`]). With hearing on, it then takes the
+//! attachment ([`super::intake`]). With hearing on, and its author among
+//! those `live --hear-voice-messages-from` names, it then takes the
 //! attachment's bytes back out of the pile, decodes them here to mono at
 //! [`RATE`] and hands them to the hearing thread as a [`VoiceMessage`]; that
 //! thread transcribes them with the transcriber already loaded for the voice
 //! channel, and the transcript is stored as an utterance of the message's
-//! author in the message's channel, at the moment the message was sent
-//! ([`super::hearing`]).
+//! author in the message's channel, at the moment the message was sent,
+//! linked to the stored recording ([`super::hearing`]). Only a message
+//! Discord flags as a voice message is heard ([`recording`]), and a file that
+//! would decode to more than [`MAX_SECONDS`] is refused.
 //!
 //! The decoder is libopus, through the `opus2` crate that songbird already
 //! links to decode the voice channel (`songbird::driver::opus`), asked for
@@ -32,13 +35,25 @@ const IS_VOICE_MESSAGE: u64 = 1 << 13;
 /// The rate Opus granule positions and pre-skip count in.
 const GRANULE_RATE: usize = 48_000;
 
+/// The longest recording heard, in seconds: a file that decodes to more is
+/// refused before it is decoded past this.
+pub const MAX_SECONDS: usize = 20 * 60;
+
+/// The most packets a stream of [`MAX_SECONDS`] can hold (2.5 ms is the
+/// shortest an opus packet lasts), with its two headers: an ogg file with
+/// more is refused while it is read, before its packets are all held.
+const MAX_PACKETS: usize = MAX_SECONDS * 400 + 2;
+
 /// A voice message to transcribe: its channel, its author, when it was sent,
-/// and its audio, mono at [`RATE`]. Debug names the sizes, never the audio.
+/// the stored attachment it was recorded in, and its audio, mono at
+/// [`RATE`]. Debug names the sizes, never the audio.
 pub struct VoiceMessage {
     pub channel: u64,
     pub user: u64,
     /// When it was sent, in milliseconds since the Unix epoch.
     pub start_ms: u64,
+    /// The attachment entity the pile holds the recording as.
+    pub attachment: triblespace::prelude::Id,
     pub samples: Vec<f32>,
 }
 
@@ -48,6 +63,7 @@ impl std::fmt::Debug for VoiceMessage {
             .field("channel", &self.channel)
             .field("user", &self.user)
             .field("start_ms", &self.start_ms)
+            .field("attachment", &self.attachment)
             .field("seconds", &(self.samples.len() as f64 / RATE as f64))
             .finish()
     }
@@ -61,32 +77,38 @@ pub struct Recording {
     pub filename: String,
 }
 
-/// The ogg recordings among a message object's attachments: those Discord
-/// says are `audio/ogg`, and, in a message flagged as a voice message, every
-/// audio attachment. Anything else is not heard.
-pub fn recordings(message: &Value) -> Vec<Recording> {
-    let voice = message["flags"].as_u64().unwrap_or(0) & IS_VOICE_MESSAGE != 0;
-    let Some(attachments) = message["attachments"].as_array() else {
-        return Vec::new();
-    };
-    attachments
+/// The recording of a voice message: the first audio attachment of a
+/// message Discord flags as a voice message (`IS_VOICE_MESSAGE`). Only such a
+/// message is the speech of its author, recorded in the client; an audio file
+/// posted as an attachment may hold anybody's, so it is not heard. Discord
+/// allows a voice message one audio attachment and nothing else; were one to
+/// carry more, only the first is heard, so that one message is one utterance
+/// at the moment it was sent.
+pub fn recording(message: &Value) -> Option<Recording> {
+    if message["flags"].as_u64().unwrap_or(0) & IS_VOICE_MESSAGE == 0 {
+        return None;
+    }
+    message["attachments"]
+        .as_array()?
         .iter()
         .filter(|attachment| {
             let kind = attachment["content_type"].as_str().unwrap_or("");
-            kind.starts_with("audio/ogg") || (voice && kind.starts_with("audio/"))
+            kind.starts_with("audio/")
         })
-        .filter_map(|attachment| {
+        .find_map(|attachment| {
             Some(Recording {
                 source_id: attachment["id"].as_str()?.to_owned(),
                 filename: attachment["filename"].as_str()?.to_owned(),
             })
         })
-        .collect()
 }
 
 /// An ogg/opus file decoded to mono at [`RATE`]: pre-skip removed, the
 /// header's output gain applied, and the end trimmed to the last granule
-/// position.
+/// position. An empty packet is refused (libopus would conceal a lost one
+/// out of it), and so is a file whose packets last longer than
+/// [`MAX_SECONDS`]: each packet's length is read from its header before it is
+/// decoded, so no more than that is ever decoded.
 pub fn decode_ogg_opus(bytes: &[u8]) -> Result<Vec<f32>> {
     let stream = ogg_stream(bytes)?;
     let mut packets = stream.packets.into_iter();
@@ -104,13 +126,23 @@ pub fn decode_ogg_opus(bytes: &[u8]) -> Result<Vec<f32>> {
     // 120 ms, the longest an opus packet decodes to.
     let mut frame = vec![0.0f32; RATE * 120 / 1000];
     let mut samples = Vec::new();
-    for packet in packets {
+    let per_granule = GRANULE_RATE / RATE;
+    let longest = MAX_SECONDS * RATE + head.pre_skip as usize / per_granule;
+    for (index, packet) in packets.enumerate() {
+        ensure!(!packet.is_empty(), "opus packet {index} is empty");
+        let length = decoder
+            .get_nb_samples(&packet)
+            .map_err(|error| anyhow!("read the length of opus packet {index}: {error}"))?;
+        ensure!(
+            samples.len() + length <= longest,
+            "the recording is longer than {} minutes, the longest heard",
+            MAX_SECONDS / 60
+        );
         let decoded = decoder
             .decode_float(&packet, &mut frame, false)
             .map_err(|error| anyhow!("decode an opus packet: {error}"))?;
         samples.extend_from_slice(&frame[..decoded]);
     }
-    let per_granule = GRANULE_RATE / RATE;
     let skip = (head.pre_skip as usize / per_granule).min(samples.len());
     samples.drain(..skip);
     if let Some(end) = stream.last_granule {
@@ -213,6 +245,12 @@ fn ogg_stream(bytes: &[u8]) -> Result<OggStream> {
             partial.extend_from_slice(now);
             body = rest;
             if segment < 255 {
+                ensure!(
+                    packets.len() < MAX_PACKETS,
+                    "the recording is longer than {} minutes, the longest heard: it holds \
+                     more opus packets than that can",
+                    MAX_SECONDS / 60
+                );
                 packets.push(std::mem::take(&mut partial));
             }
         }
@@ -319,6 +357,29 @@ pub(crate) mod tests {
         file
     }
 
+    /// An ogg/opus file of mono `packets` as they are, up to 255 to a page,
+    /// with no pre-skip, each page's granule position counting `granules`
+    /// (at 48 kHz) a packet.
+    fn ogg_opus_packets(packets: &[Vec<u8>], granules: u64) -> Vec<u8> {
+        let mut head = b"OpusHead".to_vec();
+        head.extend_from_slice(&[1, 1]);
+        head.extend_from_slice(&0u16.to_le_bytes());
+        head.extend_from_slice(&48_000u32.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes());
+        head.push(0);
+        let mut tags = b"OpusTags".to_vec();
+        tags.extend_from_slice(&0u32.to_le_bytes());
+        tags.extend_from_slice(&0u32.to_le_bytes());
+        let mut file = ogg_page(0x02, 0, 0, &[head]);
+        file.extend(ogg_page(0, 0, 1, &[tags]));
+        let mut granule = 0;
+        for (sequence, page) in (2..).zip(packets.chunks(255)) {
+            granule += page.len() as u64 * granules;
+            file.extend(ogg_page(0, granule, sequence, page));
+        }
+        file
+    }
+
     fn ogg_page(kind: u8, granule: u64, sequence: u32, packets: &[Vec<u8>]) -> Vec<u8> {
         let mut lacing = Vec::new();
         for packet in packets {
@@ -393,6 +454,46 @@ pub(crate) mod tests {
         assert!(decode_ogg_opus(&[]).is_err());
     }
 
+    /// An empty packet decodes to 120 ms of packet-loss concealment out of
+    /// nothing; it is refused, not decoded.
+    #[test]
+    fn a_file_of_empty_packets_is_refused() {
+        let file = ogg_opus_packets(&vec![Vec::new(); 1000], 5760);
+        match decode_ogg_opus(&file) {
+            Ok(samples) => panic!(
+                "decoded {:.1} s out of {} bytes of empty packets",
+                samples.len() as f64 / RATE as f64,
+                file.len()
+            ),
+            Err(error) => assert!(format!("{error:#}").contains("empty"), "{error:#}"),
+        }
+    }
+
+    /// One-byte packets (TOC 0x18: SILK narrowband, one 60 ms frame of no
+    /// bytes) each decode to 60 ms of concealment, so a small file could
+    /// decode to hours: one that would run past [`MAX_SECONDS`] is refused,
+    /// counted by its packets' durations before they are decoded.
+    #[test]
+    fn a_file_longer_than_the_longest_heard_is_refused_before_it_is_decoded() {
+        let packets = vec![vec![0x18u8]; MAX_SECONDS * 1000 / 60 + 100];
+        let file = ogg_opus_packets(&packets, 2880);
+        let started = std::time::Instant::now();
+        match decode_ogg_opus(&file) {
+            Ok(samples) => panic!(
+                "decoded {:.1} s out of {} bytes",
+                samples.len() as f64 / RATE as f64,
+                file.len()
+            ),
+            Err(error) => assert!(format!("{error:#}").contains("longer than"), "{error:#}"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // Just under the limit is heard.
+        let packets = vec![vec![0x18u8]; MAX_SECONDS * 1000 / 60 - 10];
+        let samples = decode_ogg_opus(&ogg_opus_packets(&packets, 2880)).unwrap();
+        assert_eq!(samples.len(), packets.len() * RATE * 60 / 1000);
+        assert!(samples.len() <= MAX_SECONDS * RATE);
+    }
+
     /// The real thing, when a recorded voice message is at hand
     /// (`FACULTIES_VOICE_MESSAGE_OGG`, with the 16 kHz WAV another decoder
     /// made of it in `FACULTIES_VOICE_MESSAGE_WAV`): decoded to the same
@@ -438,11 +539,11 @@ pub(crate) mod tests {
         assert!(correlation > 0.95, "correlation {correlation}");
     }
 
-    /// Discord's voice message (flagged, `audio/ogg`) and an ogg file posted
-    /// as an attachment are recordings; a picture, and an mp3 outside a
-    /// voice message, are not.
+    /// Discord's voice message (flagged, `audio/ogg`) is a recording; an ogg
+    /// file posted as an attachment without the flag is not (whose speech it
+    /// holds nobody can say), nor a picture, nor an mp3.
     #[test]
-    fn audio_attachments_are_recordings() {
+    fn only_a_flagged_voice_message_has_a_recording() {
         let voice = json!({
             "id": "1", "flags": 8192,
             "attachments": [{
@@ -451,11 +552,11 @@ pub(crate) mod tests {
             }]
         });
         assert_eq!(
-            recordings(&voice),
-            [Recording {
+            recording(&voice),
+            Some(Recording {
                 source_id: "11".to_owned(),
                 filename: "voice-message.ogg".to_owned()
-            }]
+            })
         );
         let posted = json!({
             "id": "2",
@@ -465,14 +566,11 @@ pub(crate) mod tests {
                 {"id": "23", "filename": "c.ogg", "content_type": "audio/ogg; codecs=opus"},
             ]
         });
-        assert_eq!(
-            recordings(&posted),
-            [Recording {
-                source_id: "23".to_owned(),
-                filename: "c.ogg".to_owned()
-            }]
+        assert!(
+            recording(&posted).is_none(),
+            "an ogg posted without the flag"
         );
-        assert!(recordings(&json!({"id": "3", "content": "hi"})).is_empty());
+        assert!(recording(&json!({"id": "3", "content": "hi"})).is_none());
     }
 
     #[test]

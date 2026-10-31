@@ -61,14 +61,16 @@
 //! there. A change whose write fails is logged and lost: Discord keeps no
 //! record of it to fetch again, and the next one stands on its own.
 //!
-//! With hearing on, a voice message (an ogg recording among a new message's
-//! attachments, [`super::voice_message`]) is heard too: once the message is
-//! stored, its recording is read back out of the pile, decoded, and handed to
-//! the hearing thread, which transcribes it with the voice channel's
-//! transcriber and sends the transcript back here as an utterance of its
-//! author in the message's channel ([`Work::Utterance`]). A recording that
-//! cannot be read, decoded or handed over is logged and not heard; the
-//! message itself is stored either way.
+//! With hearing on, the voice messages of the authors hearing was given
+//! (`live --hear-voice-messages-from`; nobody's otherwise) are heard too: a
+//! new message Discord flags as a voice message is stored, then its
+//! recording ([`super::voice_message::recording`]) is read back out of the
+//! pile, decoded, and handed to the hearing thread, which transcribes it with
+//! the voice channel's transcriber and sends the transcript back here as an
+//! utterance of its author in the message's channel ([`Work::Utterance`]),
+//! linked to the stored recording. A recording that cannot be read, decoded
+//! or handed over is logged and not heard; the message itself is stored
+//! either way.
 //!
 //! The pile and the downloads block, so intake runs on a thread of its own,
 //! and nothing that happens there reaches the rest of the process: every
@@ -122,9 +124,13 @@ pub struct Intake {
     floor: u64,
     /// The bot's own user id, while it is not yet recorded.
     account: Option<String>,
-    /// Where voice messages go to be heard, with hearing on.
+    /// Where voice messages go to be heard, with hearing on, and whose:
+    /// only these authors' voice messages are heard.
     #[cfg(feature = "discord-hearing")]
-    voice_messages: Option<std::sync::mpsc::Sender<super::voice_message::VoiceMessage>>,
+    voice_messages: Option<(
+        std::sync::mpsc::Sender<super::voice_message::VoiceMessage>,
+        std::collections::BTreeSet<u64>,
+    )>,
 }
 
 /// One piece of work for the intake thread.
@@ -208,14 +214,16 @@ impl Intake {
         }
     }
 
-    /// Hand the recordings of new messages to `hearing`, decoded, once each
-    /// message is stored.
+    /// Hand the recordings of new voice messages by the users in `from` to
+    /// `hearing`, decoded, once each message is stored. Nobody else's voice
+    /// message is read back or decoded, and with `from` empty nobody's is.
     #[cfg(feature = "discord-hearing")]
     pub fn hear_voice_messages(
         &mut self,
         hearing: std::sync::mpsc::Sender<super::voice_message::VoiceMessage>,
+        from: std::collections::BTreeSet<u64>,
     ) {
-        self.voice_messages = Some(hearing);
+        self.voice_messages = Some((hearing, from));
     }
 
     /// The gateway intents intake needs.
@@ -311,20 +319,21 @@ impl Intake {
                 return Err(error);
             }
         };
+        // A new voice message of an author hearing was given: nobody else's
+        // is read back or decoded.
         #[cfg(feature = "discord-hearing")]
-        let recordings = match (&self.voice_messages, created) {
-            (Some(_), true) => super::voice_message::recordings(&message)
-                .into_iter()
-                .map(|recording| (snowflake(&message["author"]["id"]), recording))
-                .collect(),
-            _ => Vec::new(),
+        let recording = match (&self.voice_messages, created) {
+            (Some((_, from)), true) => snowflake(&message["author"]["id"])
+                .filter(|author| from.contains(author))
+                .and_then(|author| {
+                    super::voice_message::recording(&message).map(|recording| (author, recording))
+                }),
+            _ => None,
         };
         let done = self.store(message, channel, id, floor, new_dm)?;
         #[cfg(feature = "discord-hearing")]
-        if done == Done::Stored {
-            for (author, recording) in recordings {
-                self.hear_recording(channel, id, author, recording);
-            }
+        if let (true, Some((author, recording))) = (done == Done::Stored, recording) {
+            self.hear_recording(channel, id, author, recording);
         }
         Ok(done)
     }
@@ -337,16 +346,15 @@ impl Intake {
         &self,
         channel: u64,
         id: u64,
-        author: Option<u64>,
+        user: u64,
         recording: super::voice_message::Recording,
     ) {
         use super::voice_message::{decode_ogg_opus, sent_ms, VoiceMessage};
-        let Some(hearing) = &self.voice_messages else {
+        let Some((hearing, _)) = &self.voice_messages else {
             return;
         };
         let heard = (|| -> Result<VoiceMessage> {
-            let user = author.context("the message names no author")?;
-            let bytes = self
+            let (attachment, bytes) = self
                 .discord
                 .attachment_bytes(&recording.source_id, &recording.filename)?
                 .context("the pile holds no bytes for it")?;
@@ -355,6 +363,7 @@ impl Intake {
                 channel,
                 user,
                 start_ms: sent_ms(id),
+                attachment,
                 samples,
             })
         })();
@@ -1009,19 +1018,24 @@ fn snowflake(value: &Value) -> Option<u64> {
 }
 
 /// Keep an utterance whose write failed in `directory`: its transcript as
-/// `<channel>-<user>-<start>.txt` and its audio as the `.wav` beside it, each
-/// written aside and renamed in, so neither is ever half there. A failure to
-/// keep it is logged with its size, never its words.
+/// `<channel>-<user>-<start>.txt` and its audio as the `.wav` beside it, or,
+/// heard from a stored attachment, that attachment's id as the `.attachment`
+/// beside it, each written aside and renamed in, so none is ever half there.
+/// A failure to keep it is logged with its size, never its words.
 pub fn keep_utterance(directory: &std::path::Path, utterance: &Utterance) {
     let name = format!(
         "{}-{}-{}",
         utterance.channel, utterance.user, utterance.start_ms
     );
+    let attachment = utterance
+        .attachment
+        .map(|attachment| format!("{attachment:X}\n"));
     let kept = std::fs::create_dir_all(directory).and_then(|()| {
-        for (extension, bytes) in [
-            ("wav", utterance.wav.as_slice()),
-            ("txt", utterance.transcript.as_bytes()),
-        ] {
+        let audio = match &attachment {
+            Some(attachment) => ("attachment", attachment.as_bytes()),
+            None => ("wav", utterance.wav.as_slice()),
+        };
+        for (extension, bytes) in [audio, ("txt", utterance.transcript.as_bytes())] {
             let staging = directory.join(format!(".{name}.{extension}"));
             std::fs::write(&staging, bytes)?;
             std::fs::rename(&staging, directory.join(format!("{name}.{extension}")))?;
@@ -2423,7 +2437,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut intake = fixture.intake(&[CHANNEL], false);
         let (post, heard) = std::sync::mpsc::channel::<VoiceMessage>();
-        intake.hear_voice_messages(post);
+        intake.hear_voice_messages(post, [AUTHOR.parse().unwrap()].into());
         let url = "https://cdn.example/voice-message.ogg?ex=gateway";
         fixture.fake.attachments.lock().unwrap().insert(
             url.to_owned(),
@@ -2453,7 +2467,33 @@ mod tests {
             )
         );
         assert_eq!(voice.samples.len(), 2 * voice_message::RATE);
+        let (attachment, _) = fixture
+            .discord
+            .attachment_bytes("100000000000000609", "voice-message.ogg")
+            .unwrap()
+            .expect("the recording is stored");
+        assert_eq!(voice.attachment, attachment, "the stored attachment");
         assert!(heard.try_recv().is_err(), "one recording, heard once");
+        // Its transcript, heard, is stored as a message of its author in its
+        // channel, with the recording as its attachment and no audio again.
+        let utterance = Utterance {
+            channel: voice.channel,
+            user: voice.user,
+            start_ms: voice.start_ms,
+            transcript: "so happy".to_owned(),
+            wav: Vec::new(),
+            attachment: Some(voice.attachment),
+        };
+        assert_eq!(
+            intake.handle(Work::Utterance(utterance)).unwrap(),
+            Done::Stored
+        );
+        let mut stored = fixture.stored(CHANNEL);
+        stored.sort();
+        assert_eq!(
+            stored,
+            [(String::new(), 1, 1), ("so happy".to_owned(), 1, 1)]
+        );
 
         message["edited_timestamp"] = json!("2026-09-26T08:01:00Z");
         intake.handle(Work::Update(message)).unwrap();
@@ -2471,6 +2511,130 @@ mod tests {
         );
         assert_eq!(intake.handle(Work::Message(picture)).unwrap(), Done::Stored);
         assert!(heard.try_recv().is_err(), "a picture is not heard");
+    }
+
+    /// A new message of `CHANNEL` by `author` with `recordings` ogg
+    /// attachments (each a 1 s sine, fetchable from the fake CDN), flagged
+    /// as Discord's voice message when `flagged`.
+    #[cfg(feature = "discord-hearing")]
+    fn voice_message(
+        fixture: &Fixture,
+        id: &str,
+        author: &str,
+        flagged: bool,
+        recordings: usize,
+    ) -> Value {
+        let mut message = rest(id, CHANNEL, "", None);
+        message["guild_id"] = json!(GUILD);
+        message["author"]["id"] = json!(author);
+        if flagged {
+            message["flags"] = json!(8192);
+        }
+        let attachments: Vec<Value> = (0..recordings)
+            .map(|index| {
+                let url = format!("https://cdn.example/{id}-{index}.ogg?ex=gateway");
+                fixture.fake.attachments.lock().unwrap().insert(
+                    url.clone(),
+                    super::super::voice_message::tests::ogg_opus_sine(1.0, 440.0, 10),
+                );
+                json!({
+                    "id": format!("{id}{index}"), "url": url,
+                    "filename": format!("voice-message-{index}.ogg"),
+                    "content_type": "audio/ogg", "size": 4000, "duration_secs": 1.0
+                })
+            })
+            .collect();
+        message["attachments"] = json!(attachments);
+        message
+    }
+
+    /// An ogg file posted as an attachment, without Discord's voice message
+    /// flag, is stored and not heard: nothing says whose speech it holds.
+    #[cfg(feature = "discord-hearing")]
+    #[test]
+    fn an_ogg_attachment_without_the_voice_message_flag_is_not_heard() {
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[CHANNEL], false);
+        let (post, heard) = std::sync::mpsc::channel();
+        intake.hear_voice_messages(post, [AUTHOR.parse().unwrap()].into());
+        let message = voice_message(&fixture, "100000000000000611", AUTHOR, false, 1);
+        assert_eq!(intake.handle(Work::Message(message)).unwrap(), Done::Stored);
+        assert_eq!(fixture.stored(CHANNEL), [(String::new(), 1, 1)]);
+        assert!(heard.try_recv().is_err(), "an unflagged ogg is not heard");
+    }
+
+    /// Only the voice messages of the authors hearing was given are heard;
+    /// given nobody, nobody's is. Every message is stored either way.
+    #[cfg(feature = "discord-hearing")]
+    #[test]
+    fn a_voice_message_from_an_author_not_allowed_is_not_heard() {
+        let other = "100000000000000499";
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[CHANNEL], false);
+        let (post, heard) = std::sync::mpsc::channel();
+        intake.hear_voice_messages(post, [AUTHOR.parse().unwrap()].into());
+        let message = voice_message(&fixture, "100000000000000621", other, true, 1);
+        assert_eq!(intake.handle(Work::Message(message)).unwrap(), Done::Stored);
+        assert!(heard.try_recv().is_err(), "somebody else's is not heard");
+        let message = voice_message(&fixture, "100000000000000622", AUTHOR, true, 1);
+        assert_eq!(intake.handle(Work::Message(message)).unwrap(), Done::Stored);
+        assert_eq!(
+            heard.try_recv().unwrap().user,
+            AUTHOR.parse::<u64>().unwrap()
+        );
+
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[CHANNEL], false);
+        let (post, heard) = std::sync::mpsc::channel();
+        intake.hear_voice_messages(post, Default::default());
+        let message = voice_message(&fixture, "100000000000000623", AUTHOR, true, 1);
+        assert_eq!(intake.handle(Work::Message(message)).unwrap(), Done::Stored);
+        assert!(heard.try_recv().is_err(), "given nobody, nobody is heard");
+    }
+
+    /// A voice message carries one recording (Discord allows no more); were
+    /// a flagged message to carry two, only the first is heard, so one
+    /// message is one utterance at the moment it was sent.
+    #[cfg(feature = "discord-hearing")]
+    #[test]
+    fn only_the_first_recording_of_a_voice_message_is_heard() {
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[CHANNEL], false);
+        let (post, heard) = std::sync::mpsc::channel();
+        intake.hear_voice_messages(post, [AUTHOR.parse().unwrap()].into());
+        let message = voice_message(&fixture, "100000000000000631", AUTHOR, true, 2);
+        assert_eq!(intake.handle(Work::Message(message)).unwrap(), Done::Stored);
+        assert!(heard.try_recv().is_ok(), "the first is heard");
+        assert!(heard.try_recv().is_err(), "the second is not");
+    }
+
+    /// An utterance heard from a stored recording is kept, when it cannot
+    /// be stored, with the recording's attachment id instead of audio.
+    #[test]
+    fn a_kept_voice_message_names_its_recording() {
+        let directory = tempfile::tempdir().unwrap();
+        let recording = triblespace::prelude::Id::new([7; 16]).unwrap();
+        keep_utterance(
+            directory.path(),
+            &Utterance {
+                channel: CHANNEL,
+                user: AUTHOR.parse().unwrap(),
+                start_ms: 1_790_000_000_000,
+                transcript: "so happy".to_owned(),
+                wav: Vec::new(),
+                attachment: Some(recording),
+            },
+        );
+        let name = format!("{CHANNEL}-{AUTHOR}-1790000000000");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(format!("{name}.attachment"))).unwrap(),
+            format!("{recording:X}\n")
+        );
+        assert!(!directory.path().join(format!("{name}.wav")).exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(format!("{name}.txt"))).unwrap(),
+            "so happy"
+        );
     }
 
     #[test]
@@ -2508,6 +2672,7 @@ mod tests {
             start_ms: 1_790_000_000_000,
             transcript: "can you hear me?".to_owned(),
             wav: b"RIFF and the rest".to_vec(),
+            attachment: None,
         };
         for _ in 0..2 {
             assert_eq!(
@@ -2588,6 +2753,7 @@ mod tests {
             start_ms: 1_790_000_001_000,
             transcript: "can you hear me?".to_owned(),
             wav: b"RIFF and the rest".to_vec(),
+            attachment: None,
         };
         assert_eq!(
             intake.handle(Work::Utterance(utterance)).unwrap(),
