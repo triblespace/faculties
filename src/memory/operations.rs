@@ -2329,6 +2329,10 @@ fn extract_references(text: &str) -> Vec<(String, String)> {
 
 /// Find all canonical Archive source projections whose own timestamp (or the
 /// projected block timestamp when source time is absent) falls in the range.
+///
+/// Two joins over the catalogue rather than up to three point queries per
+/// projection: each `find!` plans against every member of a union archive,
+/// which made the per-projection form take minutes on a large pile.
 fn find_archive_in_range<P: TriblePattern>(
     catalog: &P,
     query_start: Epoch,
@@ -2336,44 +2340,38 @@ fn find_archive_in_range<P: TriblePattern>(
 ) -> Vec<(Id, Inline<NsTAIInterval>)> {
     let qs = query_start.to_tai_duration().total_nanoseconds();
     let qe = query_end.to_tai_duration().total_nanoseconds();
-    let projections: BTreeSet<Id> = find!(
-        id: Id,
+    let mut times = BTreeMap::new();
+    for (id, value) in find!(
+        (id: Id, value: Inline<NsTAIInterval>),
         pattern!(catalog, [{
-            ?id @ metadata::tag: &archive_schema::source_projection::KIND,
+            ?id @
+            metadata::tag: &archive_schema::source_projection::KIND,
+            archive_schema::source_projection::source_timestamp: ?value,
         }])
-    )
-    .collect();
-    let mut out = Vec::new();
-    for id in projections {
-        let source_time = find!(
-            value: Inline<NsTAIInterval>,
-            pattern!(catalog, [{
-                id @ archive_schema::source_projection::source_timestamp: ?value,
-            }])
-        )
-        .next();
-        let time = source_time.or_else(|| {
-            let block = find!(
-                value: Id,
-                pattern!(catalog, [{
-                    id @ archive_schema::source_projection::projects_to: ?value,
-                }])
-            )
-            .next()?;
-            find!(
-                value: Inline<NsTAIInterval>,
-                pattern!(catalog, [{ block @ archive_schema::block::timestamp: ?value }])
-            )
-            .next()
-        });
-        let Some(t) = time else {
-            continue;
-        };
-        let k = interval_key(t);
-        if k >= qs && k <= qe {
-            out.push((id, t, k));
-        }
+    ) {
+        times.entry(id).or_insert(value);
     }
+    // A projection's own source time, when present, wins over its block's.
+    for (id, value) in find!(
+        (id: Id, value: Inline<NsTAIInterval>),
+        pattern!(catalog, [
+            {
+                ?id @
+                metadata::tag: &archive_schema::source_projection::KIND,
+                archive_schema::source_projection::projects_to: _?block,
+            },
+            { _?block @ archive_schema::block::timestamp: ?value },
+        ])
+    ) {
+        times.entry(id).or_insert(value);
+    }
+    let mut out: Vec<_> = times
+        .into_iter()
+        .filter_map(|(id, t)| {
+            let k = interval_key(t);
+            (k >= qs && k <= qe).then_some((id, t, k))
+        })
+        .collect();
     out.sort_by_key(|(_, _, k)| *k);
     out.into_iter().map(|(id, t, _)| (id, t)).collect()
 }
@@ -3842,5 +3840,52 @@ mod tests {
         assert!(!plain.contains(contextual_summary.trim_end()));
         assert!(contextual.contains(contextual_summary.trim_end()));
         assert!(!contextual.contains(plain_summary.trim_end()));
+    }
+
+    /// Provenance reads an Archive projection's own source time, falls back
+    /// to its projected block's time only when the projection has none, and
+    /// answers only tagged projections inside the inclusive range, in time
+    /// order.
+    #[test]
+    fn archive_projections_in_range_prefer_source_time() {
+        use triblespace::core::trible::Trible;
+        let id = |byte: u8| Id::new([byte; 16]).unwrap();
+        let tag = metadata::tag.id();
+        let kind: Inline<inlineencodings::GenId> =
+            archive_schema::source_projection::KIND.to_inline();
+        let source = archive_schema::source_projection::source_timestamp.id();
+        let projects = archive_schema::source_projection::projects_to.id();
+        let stamped = archive_schema::block::timestamp.id();
+        let early = point("2026-10-31T10:00:00");
+        let late = point("2026-10-31T10:30:00");
+        let outside = point("2026-10-31T12:00:00");
+        let mut facts = TribleSet::new();
+        for (entity, attribute, value) in [
+            // 1: own time in range, block 11 outside: its own time.
+            (1, source, late),
+            (11, stamped, outside),
+            // 2 and 5: no own time, block 12 in range: the block's time.
+            (12, stamped, early),
+            // 3: own time outside, block 13 inside: excluded.
+            (3, source, outside),
+            (13, stamped, early),
+            // 4: untagged, own time in range: excluded.
+            (4, source, early),
+        ] {
+            facts.insert(&Trible::force(&id(entity), &attribute, &value));
+        }
+        for (projection, block) in [(1, 11), (2, 12), (3, 13), (5, 12)] {
+            let block: Inline<inlineencodings::GenId> = id(block).to_inline();
+            facts.insert(&Trible::force(&id(projection), &projects, &block));
+        }
+        for projection in [1, 2, 3, 5] {
+            facts.insert(&Trible::force(&id(projection), &tag, &kind));
+        }
+        let start = parse_tai_timestamp("2026-10-31T09:00:00").unwrap();
+        let end = parse_tai_timestamp("2026-10-31T11:00:00").unwrap();
+        let mut found = find_archive_in_range(&facts, start, end);
+        // Equal times have no defined order between them.
+        found[..2].sort_by_key(|(id, _)| *id);
+        assert_eq!(found, [(id(2), early), (id(5), early), (id(1), late)]);
     }
 }
