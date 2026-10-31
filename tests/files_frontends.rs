@@ -438,7 +438,7 @@ fn executable_mcp_preserves_native_paths_and_isolates_standard_stream_aliases() 
         6,
         "file reads must not consume protocol requests"
     );
-    for response in responses {
+    for response in &responses {
         canonical_json(Bytes::from(response.as_bytes().to_vec())).unwrap();
     }
     assert!(
@@ -450,7 +450,19 @@ fn executable_mcp_preserves_native_paths_and_isolates_standard_stream_aliases() 
         protocol.contains("\"isError\":false"),
         "valid view reaches native pile"
     );
-    assert!(protocol.ends_with("{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}\n"));
+    // Tool calls run concurrently, so the ping may be answered before them:
+    // JSON-RPC promises a response per request, never their order.
+    let mut ids = responses
+        .iter()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["id"].as_u64())
+        .collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(
+        ids,
+        (1..=6).map(Some).collect::<Vec<_>>(),
+        "one response per request"
+    );
+    assert!(responses.contains(&"{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}"));
 }
 
 #[test]
