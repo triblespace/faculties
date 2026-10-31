@@ -5,11 +5,11 @@
 //!
 //! An observation is a private relation built with `entity!` at the point of
 //! writing. Its archive (the observation plus the kind, unit and method
-//! entities it names) is sealed as an ordinary bound Secrets version, so the
-//! Secrets library's existing envelopes, `secrets grant` and key-delivery
-//! maintenance apply unchanged; care adds no crypto and no grant format. A note
-//! or photo is sealed as its own Secrets version and referenced from the sealed
-//! observation by both its plaintext content hash and that version's id.
+//! entities it names) and its note and photo are sealed as ONE Secrets record
+//! (`secrets::record::seal`). Each record is delivered under a Secrets group
+//! resource per (subject, kind), so one Secrets grant shares a subject's
+//! readings of that kind, including later ones. Care adds no crypto and no
+//! grant format: envelopes, grants and key delivery are the Secrets ones.
 //!
 //! Readers open every record their key can open, union the archives into one
 //! ordinary `TribleSet`, and query it at the point of use.
@@ -31,12 +31,16 @@ use crate::schemas::care::*;
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
-pub type BytesHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
+pub type NoteHandle = Inline<
+    inlineencodings::Handle<crate::secrets::encrypted::Encrypted<blobencodings::UTF8String>>,
+>;
+pub type PhotoHandle =
+    Inline<inlineencodings::Handle<crate::secrets::encrypted::Encrypted<blobencodings::RawBytes>>>;
 
 /// Public label of a sealed observation version (the label is not encrypted).
 pub const RECORD_LABEL: &str = "care observation";
-/// Public label of a sealed note or photo version.
-pub const ATTACHMENT_LABEL: &str = "care attachment";
+/// Public label of the Secrets group a subject's readings of one kind share.
+pub const GROUP_LABEL: &str = "care group";
 
 /// One seed vocabulary term: id, display name, short alias, code annotation.
 pub struct Term {
@@ -214,9 +218,9 @@ pub struct Observation<'a> {
     pub observed_at: IntervalValue,
     pub reported_at: IntervalValue,
     pub method: Id,
-    pub photo: Option<(BytesHandle, Id)>,
+    pub photo: Option<PhotoHandle>,
     pub message: Option<Id>,
-    pub note: Option<(TextHandle, Id)>,
+    pub note: Option<NoteHandle>,
     pub supersedes: &'a [Id],
 }
 
@@ -246,11 +250,9 @@ pub fn observation_facts(input: &Observation<'_>) -> Result<(Id, TribleSet)> {
         care::observed_at: input.observed_at,
         care::reported_at: input.reported_at,
         care::method: input.method,
-        care::photo?: input.photo.map(|(handle, _)| handle),
-        care::photo_secret?: input.photo.map(|(_, secret)| secret),
+        care::photo?: input.photo,
         care::message?: input.message,
-        care::note?: input.note.map(|(handle, _)| handle),
-        care::note_secret?: input.note.map(|(_, secret)| secret),
+        care::note?: input.note,
         metadata::supersedes*: input.supersedes.iter().copied(),
     };
     let id = record.root().expect("observation has one intrinsic root");

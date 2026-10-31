@@ -1,16 +1,33 @@
 //! Presentation of already-opened Care observations. Display only: no value
 //! is compared with a range, flagged or interpreted.
 
-use super::operations::{csv, Added, Table};
+use super::operations::{csv, Added, Granted, Table};
 use super::{format_number, format_time};
 use crate::out::Out;
 use anyhow::Result;
 
 pub fn add(added: &Added, output: &mut Out<'_>) -> Result<()> {
     output.line(format!(
-        "observation {:x} (sealed record {:x}) for {:x}",
-        added.observation, added.record, added.subject
+        "observation {:x} (sealed record {:x}, group {}) for {:x}",
+        added.observation,
+        added.record,
+        hex::encode(added.group.raw),
+        added.subject
     ))
+}
+
+pub fn grant(granted: &Granted, output: &mut Out<'_>) -> Result<()> {
+    output.line(format!(
+        "granted {} group(s) of {:x} to {}; {} envelope(s) delivered",
+        granted.groups.len(),
+        granted.subject,
+        hex::encode(granted.recipient.to_bytes()),
+        granted.envelopes
+    ))?;
+    for group in &granted.groups {
+        output.line(format!("- group {}", hex::encode(group.raw)))?;
+    }
+    Ok(())
 }
 
 pub fn table(table: &Table, output: &mut Out<'_>) -> Result<()> {

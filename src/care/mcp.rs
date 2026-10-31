@@ -20,6 +20,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"subject":{"type":"string"},"since":{"type":"string"},"kind":{"type":"string"}},"required":["subject"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "care_grant",
+        description: "Share a subject's health observations (optionally one kind) with another key through Secrets group grants, then deliver their keys. to is an Ed25519 public key as 64 hex characters. Later readings in the same groups reach that key at the next delivery maintenance.",
+        input_schema: r#"{"type":"object","properties":{"subject":{"type":"string"},"to":{"type":"string"},"kind":{"type":"string"}},"required":["subject","to"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "care_export",
         description: "Export a subject's readable health observations as CSV for a doctor (newest correction of each). Display only.",
         input_schema: r#"{"type":"object","properties":{"subject":{"type":"string"},"since":{"type":"string"},"kind":{"type":"string"}},"required":["subject"],"additionalProperties":false}"#,
@@ -55,6 +60,15 @@ struct TableArguments {
     subject: String,
     #[serde(default)]
     since: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantArguments {
+    subject: String,
+    to: String,
     #[serde(default)]
     kind: Option<String>,
 }
@@ -105,6 +119,15 @@ impl Faculty for Care {
                         args.since.as_deref(),
                         args.kind.as_deref(),
                     )?,
+                    output,
+                )
+            }
+            "care_grant" => {
+                let args: GrantArguments = decode_arguments(arguments)?;
+                render::grant(
+                    &self
+                        .operations
+                        .grant(&args.subject, &args.to, args.kind.as_deref())?,
                     output,
                 )
             }

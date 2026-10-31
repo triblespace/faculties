@@ -210,16 +210,17 @@ fn records_are_sealed_secrets_and_no_clinical_text_reaches_the_pile() {
             String::from_utf8_lossy(needle)
         );
     }
-    // The record and its note are ordinary Secrets versions.
+    // The record, note inside, is ONE structured Secrets version: it shows in
+    // `secrets items` under its public label, and not in `secrets list`.
     let secrets = faculties::secrets::Secrets::new(fixture.pile.clone(), Some(fixture.key.clone()));
-    let mut names: Vec<String> = secrets
-        .list()
+    assert!(secrets.list().unwrap().is_empty());
+    let names: Vec<Option<String>> = secrets
+        .list_items()
         .unwrap()
         .into_iter()
         .map(|row| row.name)
         .collect();
-    names.sort();
-    assert_eq!(names, [care::ATTACHMENT_LABEL, care::RECORD_LABEL]);
+    assert_eq!(names, [Some(care::RECORD_LABEL.to_owned())]);
     let table = fixture.care().table(&id, None, None).unwrap();
     assert_eq!(
         table.rows[0].note.as_deref(),
@@ -256,7 +257,7 @@ fn discovery_help_and_bad_arguments_do_not_open_storage() {
             .iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>(),
-        ["care_add", "care_table", "care_export"]
+        ["care_add", "care_table", "care_grant", "care_export"]
     );
     for (tool, raw) in [
         ("care_add", r#"{"subject":"x"}"#),

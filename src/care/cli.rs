@@ -77,6 +77,18 @@ enum Command {
         #[arg(long)]
         kind: Option<String>,
     },
+    /// Share a subject's readings with another key through Secrets group
+    /// grants (one per kind), then deliver their keys. Later readings in the
+    /// same groups reach that key at the next delivery maintenance.
+    Grant {
+        subject: String,
+        /// Recipient Ed25519 public key, 64 hex characters.
+        #[arg(long)]
+        to: String,
+        /// Only this kind's group.
+        #[arg(long)]
+        kind: Option<String>,
+    },
     /// Export a subject's observations for a doctor.
     Export {
         subject: String,
@@ -129,6 +141,9 @@ fn execute(care: Care, command: Command, output: &mut Out<'_>) -> Result<()> {
                 supersedes,
             })?;
             render::add(&added, output)
+        }
+        Command::Grant { subject, to, kind } => {
+            render::grant(&care.grant(&subject, &to, kind.as_deref())?, output)
         }
         Command::Table {
             subject,

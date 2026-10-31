@@ -1,13 +1,14 @@
 //! Care schema: one immutable observation per health reading.
 //!
 //! An observation is a private relation. Its facts never appear in a
-//! collection as plaintext: the writer seals the observation's archive as an
-//! ordinary bound Secrets version, and only [`KIND_OBSERVATION_RECORD`] on that
-//! version's id is public. Kinds, units and methods are plain entities named
+//! collection as plaintext: the writer seals the observation's archive, with
+//! its note and photo inside, as one Secrets record (`secrets::record`), and
+//! only [`KIND_OBSERVATION_RECORD`] on that version's id is public. Kinds, units and methods are plain entities named
 //! by `metadata::name`; LOINC and UCUM codes are annotations, never identity.
 //!
 //! Every id below is an exact output of installed `trible genid`, 2026-10-31.
 
+use crate::secrets::encrypted::Encrypted;
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, F64};
@@ -45,16 +46,12 @@ pub mod care {
         "CF41DFB364AC4EE5A538ABC26E088561" as pub reported_at: NsTAIInterval;
         /// How the value was obtained: a method entity.
         "66EF94825F2E9E05A51495EB99EB65AA" as pub method: GenId;
-        /// Source photo bytes (plaintext content hash, the files convention).
-        "B21416CCC43847616AB9CE57E593DCAB" as pub photo: Handle<RawBytes>;
-        /// The Secrets version carrying the photo bytes sealed.
-        "A4AD370A1921C5D543F355F02DDB5FEC" as pub photo_secret: GenId;
+        /// Source photo bytes, sealed inside the same record.
+        "B21416CCC43847616AB9CE57E593DCAB" as pub photo: Handle<Encrypted<RawBytes>>;
         /// Source Discord message: its stable message anchor.
         "09779FC092A999368645FF34936C50CD" as pub message: GenId;
-        /// Free-text note (plaintext content hash).
-        "3733C93EF26C524D152071260B6B0170" as pub note: Handle<UTF8String>;
-        /// The Secrets version carrying the note text sealed.
-        "7A51527559939D8ADBA908CEA63C41D2" as pub note_secret: GenId;
+        /// Free-text note, sealed inside the same record.
+        "3733C93EF26C524D152071260B6B0170" as pub note: Handle<Encrypted<UTF8String>>;
         /// LOINC code annotation on a kind entity.
         "F1A8157B2E3D18629828629E02FFE260" as pub loinc: Handle<UTF8String>;
         /// UCUM code annotation on a unit entity.

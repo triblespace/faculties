@@ -296,6 +296,7 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "bootstrap_import",
         "care_add",
         "care_table",
+        "care_grant",
         "care_export",
         "cognition_check",
         "decide_propose",
