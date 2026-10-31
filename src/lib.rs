@@ -51,6 +51,7 @@ pub mod atlas;
 pub mod blockdag;
 pub mod body;
 pub mod bootstrap;
+pub mod care;
 pub mod cli;
 pub mod clock;
 pub mod code;

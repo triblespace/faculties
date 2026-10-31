@@ -7,3 +7,4 @@ pub mod mcp;
 pub mod onepassword;
 mod operations;
 pub use operations::{DeliveryReport, ItemMetadata, SecretMetadata, Secrets};
+pub(crate) use operations::acquiring_snapshot;

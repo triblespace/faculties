@@ -597,7 +597,7 @@ impl SecretsStorage<'_> {
 /// Preserve the ordinary local-wrap possession contract. The selected
 /// encrypted facts and delivery proofs stay fixed while exact ciphertext,
 /// envelope and definition bytes are acquired; no plaintext crosses the wire.
-fn acquiring_snapshot(
+pub(crate) fn acquiring_snapshot(
     store: &mut crate::storage::FacultyStore,
     collection: secret_storage::SecretsCollection,
     signer: &SigningKey,

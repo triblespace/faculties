@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use super::Faculty;
 use crate::storage::Storage;
 use crate::{
-    archive, atlas, body, bootstrap, code, cognition, compass, decide, discord, duplex, files,
-    gauge, habits, headspace, hear, imagine, linkedin, mail, memory, message, orient, patience,
-    planner, posture, quota, reason, relations, secrets, status, teams, triage, viewer, voice, web,
-    wiki, world,
+    archive, atlas, body, bootstrap, care, code, cognition, compass, decide, discord, duplex,
+    files, gauge, habits, headspace, hear, imagine, linkedin, mail, memory, message, orient,
+    patience, planner, posture, quota, reason, relations, secrets, status, teams, triage, viewer,
+    voice, web, wiki, world,
 };
 
 /// Trusted launcher configuration, never supplied as MCP tool arguments.
@@ -82,6 +82,7 @@ impl Catalog {
             Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),
             Box::new(body::mcp::Body::with_storage(storage.clone())),
             Box::new(bootstrap::mcp::Bootstrap::with_storage(storage.clone())),
+            Box::new(care::mcp::Care::with_storage(storage.clone())),
             Box::new(code::mcp::Code::with_storage(storage.clone())),
             Box::new(cognition::mcp::Cognition::with_storage(storage.clone())),
             Box::new(compass::mcp::Compass::with_storage(storage.clone())),

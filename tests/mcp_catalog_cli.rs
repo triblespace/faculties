@@ -136,6 +136,7 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
             "atlas",
             "body",
             "bootstrap",
+            "care",
             "code",
             "cognition",
             "compass",
@@ -207,7 +208,7 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
     assert!(!response.contains("discovery-must-not-"));
     let response: Value = serde_json::from_str(&response).unwrap();
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 248);
+    assert_eq!(tools.len(), 251);
     for name in [
         "files_index",
         "quota_record",
@@ -440,7 +441,7 @@ mod http_process {
             .json()
             .unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 248);
+        assert_eq!(tools.len(), 251);
         for name in [
             "files_index",
             "quota_record",
