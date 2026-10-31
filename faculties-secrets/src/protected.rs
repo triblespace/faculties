@@ -400,6 +400,7 @@ impl Unlocked {
             key,
             facts,
             body,
+            resource: None,
         })
     }
 }

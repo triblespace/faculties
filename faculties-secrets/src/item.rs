@@ -5,7 +5,7 @@
 //! unknown facts and opaque entity ids are ordinary open-world data.
 
 use super::*;
-use crate::encrypted::{open_blob, Encrypted, ItemKey, ItemSealer};
+use crate::encrypted::{Encrypted, ItemKey, ItemSealer};
 use crate::schema::*;
 
 pub type ItemBody = Inline<inlineencodings::Handle<Encrypted<SimpleArchive>>>;
@@ -125,40 +125,11 @@ pub(crate) fn prepare_using(
     finish(key, bundle)
 }
 
-/// A decrypted relation plus its held key and fixed reader, not an eager field
-/// catalog. The backing decrypted blob zeroizes; decoded relations and caller
-/// copies cannot be promised erased. Do not print this object as metadata.
-pub struct OpenedItem<R> {
-    pub(crate) reader: R,
-    pub(crate) key: ItemKey,
-    pub(crate) facts: TribleSet,
-    pub(crate) body: ItemBody,
-}
+/// A password-manager item is one structured record whose private relation
+/// carries `KIND_ITEM`; opening it is the general record path.
+pub type OpenedItem<R> = crate::record::OpenedRecord<R>;
 
-impl<R: BlobStoreGet> OpenedItem<R> {
-    pub fn facts(&self) -> &TribleSet {
-        &self.facts
-    }
-    pub fn body(&self) -> ItemBody {
-        self.body
-    }
-    pub fn key_id(&self) -> Id {
-        self.key.id()
-    }
-
-    /// Missing or invalid selected children fail here, not when opening other
-    /// fields or the root. No discovery or implicit cleartext cache is involved.
-    pub fn open_child<T: BlobEncoding>(
-        &self,
-        handle: Inline<inlineencodings::Handle<Encrypted<T>>>,
-    ) -> Result<Blob<T>> {
-        let blob = self
-            .reader
-            .get::<Blob<Encrypted<T>>, _>(handle)
-            .map_err(|_| anyhow!("selected ciphertext child is unavailable"))?;
-        open_blob(&self.key, blob)
-    }
-
+impl<R: BlobStoreGet> crate::record::OpenedRecord<R> {
     /// Generate a current code from one explicitly selected field-text child.
     /// Labels, attachments and unrelated same-key blobs are not field values.
     pub fn totp(&self, child: PrivateText) -> Result<crate::totp::Code> {
@@ -192,37 +163,13 @@ pub fn open<R: BlobStoreGet + Clone, P: TriblePattern>(
     id: Id,
     holder: &SigningKey,
 ) -> Result<Vec<OpenedItem<R>>> {
-    let mut seen = BTreeSet::new();
-    let mut items = Vec::new();
-    for binding in super::envelope::recover_item(&reader, facts, id, holder)? {
-        let body: ItemBody = binding.body.transmute();
-        if !exists!(pattern!(facts, [{ id @ metadata::tag: KIND_ITEM_VERSION,
-            structured_body: body }]))
-            || !seen.insert(body)
-        {
-            continue;
-        }
-        let key = ItemKey::from_dek(id, binding.dek);
-        let ciphertext = reader
-            .get::<Blob<Encrypted<SimpleArchive>>, _>(body)
-            .map_err(|_| anyhow!("encrypted item root is unavailable"))?;
-        let facts: TribleSet = open_blob(&key, ciphertext)?
-            .try_from_blob()
-            .map_err(|_| anyhow!("encrypted item root is not an archive"))?;
-        if !exists!(pattern!(&facts, [{ metadata::tag: KIND_ITEM }])) {
-            continue;
-        }
-        items.push(OpenedItem {
-            reader: reader.clone(),
-            key,
-            facts,
-            body,
-        });
-    }
+    let items: Vec<_> = crate::record::open_all(reader, facts, id, holder)?
+        .into_iter()
+        .filter(|record| exists!(pattern!(&record.facts, [{ metadata::tag: KIND_ITEM }])))
+        .collect();
     if items.is_empty() {
         bail!("no resident decryptable structured item for this holder");
     }
-    items.sort_by_key(|item| item.body);
     Ok(items)
 }
 

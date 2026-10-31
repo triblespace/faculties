@@ -49,6 +49,10 @@ pub const KIND_WRAP: Id = id_hex!("EB8549BAF679C5D11ECEDB416AAD76E3");
 /// Minted with `trible genid` on 2026-09-14.
 pub const KIND_SECRET_RESOURCE: Id = id_hex!("8DE676F5445D85A874435C68C9C387E4");
 
+/// A group resource descriptor: one delivery policy shared by every version
+/// whose envelope binds it. Minted with `trible genid` on 2026-10-31.
+pub const KIND_SECRET_GROUP: Id = id_hex!("971ECB6B0D4111372A86227638EE5009");
+
 /// Bound recipient-envelope format. Minted with `trible genid` on 2026-09-14.
 pub const BOUND_ENVELOPE_MAGIC: [u8; 16] = id_hex!("0AFF57FBB4533A0E74171F2B7893BDC9").raw();
 
@@ -96,6 +100,12 @@ attributes! {
     /// `B511AAEB955CD121B6C5E72B3DCEC70F`.
     "B511AAEB955CD121B6C5E72B3DCEC70F" as pub wrap_recipient_key:
         inlineencodings::ED25519PublicKey;
+
+    /// The opaque group a group resource descriptor stands for. Its presence
+    /// is what makes a descriptor a group: membership is every version whose
+    /// authenticated envelope binds that descriptor. Anchor minted with
+    /// `trible genid` on 2026-10-31.
+    "A9A1E54E683625214F4A90495B1D7ABF" as pub resource_group: inlineencodings::GenId;
 
     /// Earliest delivery instant, inclusive. This constrains future envelopes,
     /// never opening an envelope already delivered. Minted 2026-09-14.

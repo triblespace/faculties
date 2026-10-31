@@ -158,13 +158,34 @@ pub fn seal_version(
     })
 }
 
-/// Same immutable S/H/R/DEK envelope contract, with a distinct typed body.
+/// Same immutable S/H/R/DEK envelope contract, with a distinct typed body:
+/// a password-manager item with its own descriptor.
 pub(crate) fn seal_item_bundle(
     signer: &SigningKey,
     name: &str,
     key: crate::encrypted::ItemKey,
     bundle: Bundle<crate::encrypted::Encrypted<SimpleArchive>>,
     created_at: IntervalValue,
+) -> Result<SealedVersion> {
+    seal_structured(
+        signer,
+        name,
+        key,
+        bundle,
+        created_at,
+        crate::record::Delivery::Own,
+    )
+}
+
+/// Publish-ready structured version S whose root H is `bundle`, delivered
+/// under its own descriptor or a group descriptor, with the signer's envelope.
+pub(crate) fn seal_structured(
+    signer: &SigningKey,
+    name: &str,
+    key: crate::encrypted::ItemKey,
+    bundle: Bundle<crate::encrypted::Encrypted<SimpleArchive>>,
+    created_at: IntervalValue,
+    delivery: crate::record::Delivery,
 ) -> Result<SealedVersion> {
     use crate::schema::{structured_body, KIND_ITEM_VERSION};
     let secret = key.id();
@@ -175,16 +196,21 @@ pub(crate) fn seal_item_bundle(
         metadata::created_at: created_at,
         structured_body*: bundle,
     };
-    let definition = key_delivery_definition();
-    let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
-    fragment += definition;
-    let descriptor = entity! {
-        metadata::tag: KIND_SECRET_RESOURCE,
-        wrap_secret: secret,
-        structured_body: body,
-        resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+    let resource = match delivery {
+        crate::record::Delivery::Group(resource) => resource,
+        crate::record::Delivery::Own => {
+            let definition = key_delivery_definition();
+            let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
+            fragment += definition;
+            let descriptor = entity! {
+                metadata::tag: KIND_SECRET_RESOURCE,
+                wrap_secret: secret,
+                structured_body: body,
+                resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+            };
+            fragment.put::<SimpleArchive, _>(descriptor.facts().clone())
+        }
     };
-    let resource = fragment.put::<SimpleArchive, _>(descriptor.facts().clone());
     fragment += entity! { ExclusiveId::force_ref(&secret) @ resource_handle: resource };
     fragment += envelope::fragment(
         &envelope::BoundKey {
@@ -202,15 +228,75 @@ pub(crate) fn seal_item_bundle(
     })
 }
 
+/// A new group resource: one immutable descriptor whose key-delivery policy is
+/// rooted at the signer, plus its public group entity.
+pub struct SealedGroup {
+    pub fragment: Fragment,
+    pub group: Id,
+    pub resource: CollectionHandle,
+}
+
+/// Prepare a group descriptor. Versions sealed with
+/// `record::Delivery::Group(resource)` are its members; one grant over the
+/// resource covers them, and delivery maintenance reaches each member under
+/// the group's policy (future delivery only; delivered wraps stay usable).
+/// Membership is every version admitted to the collection whose authenticated
+/// envelope binds this descriptor, so it is gated by collection WRITE
+/// admission like every other version.
+pub fn create_group(
+    signer: &SigningKey,
+    public_label: &str,
+    created_at: IntervalValue,
+) -> Result<SealedGroup> {
+    use crate::schema::{resource_group, KIND_SECRET_GROUP};
+    validate_name("public group label", public_label)?;
+    point_value("group creation time", created_at)?;
+    let group = genid().id;
+    let mut fragment = Fragment::empty();
+    let definition = key_delivery_definition();
+    let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
+    fragment += definition;
+    let descriptor = entity! {
+        metadata::tag: KIND_SECRET_RESOURCE,
+        resource_group: group,
+        resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+    };
+    let resource = fragment.put::<SimpleArchive, _>(descriptor.facts().clone());
+    fragment += entity! { ExclusiveId::force_ref(&group) @
+        metadata::tag: KIND_SECRET_GROUP,
+        metadata::name: public_label.to_owned(),
+        metadata::created_at: created_at,
+        resource_handle: resource,
+    };
+    Ok(SealedGroup {
+        fragment,
+        group,
+        resource,
+    })
+}
+
+/// Whether this exact descriptor is a group resource.
+pub fn is_group<R: BlobStoreGet>(reader: &R, resource: CollectionHandle) -> bool {
+    reader.get::<TribleSet, _>(resource).is_ok_and(|facts| {
+        exists!(pattern!(&facts, [{ metadata::tag: KIND_SECRET_RESOURCE,
+            crate::schema::resource_group: _?group }]))
+    })
+}
+
 /// Delivery is decided by R's own policy and the proofs over R, never by which
 /// collection declares the version, so a version carried into another
 /// collection keeps its delivery policy there. The policy grants delivery for
 /// R, not access to any collection. An old R may still carry the retired
 /// `resource_collection` annotation; nothing reads it.
+///
+/// A group descriptor binds no single version: with `include_groups` its
+/// policy applies to any bound version (delivery), without it a grant naming
+/// one version never widens to that version's whole group.
 fn policies<R: BlobStoreGet>(
     reader: &R,
     facts: &TribleSet,
     bound: Option<(Id, BytesHandle)>,
+    include_groups: bool,
 ) -> Vec<AdmissionPolicy> {
     let raw = find!(
         (entity: Id, secret: Id, body: BytesHandle),
@@ -226,11 +312,23 @@ fn policies<R: BlobStoreGet>(
             wrap_secret: ?secret, crate::schema::structured_body: ?body }])
     )
     .map(|(entity, secret, body)| (entity, secret, body.transmute()));
-    let candidates = raw.chain(structured);
+    let mut candidates: Vec<(Id, Option<(Id, BytesHandle)>)> = raw
+        .chain(structured)
+        .map(|(entity, secret, body)| (entity, Some((secret, body))))
+        .collect();
+    if include_groups {
+        candidates.extend(
+            find!(entity: Id, pattern!(facts, [{ ?entity @ metadata::tag: KIND_SECRET_RESOURCE,
+                crate::schema::resource_group: _?group }]))
+            .map(|entity| (entity, None)),
+        );
+    }
     let mut policies = Vec::new();
-    for (entity, secret, body) in candidates {
-        if bound.is_some_and(|expected| expected != (secret, body)) {
-            continue;
+    for (entity, binds) in candidates {
+        if let (Some(expected), Some(binds)) = (bound, binds) {
+            if expected != binds {
+                continue;
+            }
         }
         for (definition, policy) in resource_policies(facts, entity, None) {
             let Ok(definition) = reader.get::<TribleSet, _>(definition) else {
@@ -261,7 +359,7 @@ where
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|error| anyhow!("read delivery proof: {error}"))?;
     let mut recipients = BTreeSet::new();
-    for policy in policies(reader, &facts, Some((binding.secret, binding.body))) {
+    for policy in policies(reader, &facts, Some((binding.secret, binding.body)), true) {
         let AdmissionPolicy::Quorum(quorum) = policy else {
             // An open policy cannot enumerate public keys for finite envelopes.
             continue;
@@ -377,7 +475,7 @@ where
         // Anybody can seal their own DEK/body to this signer and name an
         // unrelated R in that envelope. Grant-by-secret must preserve the
         // recovered S/H binding; only an explicit R target omits that check.
-        let roots = policies(&reader, &facts, bound)
+        let roots = policies(&reader, &facts, bound, bound.is_none())
             .into_iter()
             .filter_map(|policy| match policy {
                 AdmissionPolicy::Quorum(quorum) => Some(quorum),
