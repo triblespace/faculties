@@ -240,7 +240,9 @@ use crate::storage::{load_signer, open_pile_strict};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
-use triblespace::core::id::Id;
+use triblespace::core::id::{Id, RawId};
+use triblespace::core::inline::encodings::genid::GenId;
+use triblespace::core::inline::Encodes;
 use triblespace::core::inline::{Inline, RawInline, TryToInline};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::Fragment;
@@ -252,7 +254,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::metadata;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::Handle;
-use triblespace::prelude::{exists, find, pattern};
+use triblespace::prelude::{and, exists, find, pattern};
 use triblespace_search::tokens::hash_tokens;
 
 type PileSnapshot = AcquiringReader<FacultySnapshot>;
@@ -920,10 +922,17 @@ fn normalize_prefix(prefix: &str) -> Result<String> {
     Ok(prefix.to_ascii_uppercase())
 }
 
-fn matching(ids: impl IntoIterator<Item = Id>, prefix: &str) -> BTreeSet<Id> {
-    ids.into_iter()
-        .filter(|id| format!("{id:X}").starts_with(prefix))
-        .collect()
+/// The inclusive id range a hexadecimal prefix names: the prefix padded
+/// with `0` digits, and with `F` digits. A digit is a nibble, so an odd
+/// count needs no case of its own. The low end of an all-zero prefix is
+/// nil, which no id is, and which is still a valid range bound.
+fn prefix_range(prefix: &str) -> (RawId, RawId) {
+    let pad = |filled: String| {
+        u128::from_str_radix(&filled, 16)
+            .expect("a normalized prefix is hexadecimal")
+            .to_be_bytes()
+    };
+    (pad(format!("{prefix:0<32}")), pad(format!("{prefix:F<32}")))
 }
 
 /// What a prefix given to `show` or `thread` names: a source projection (a
@@ -935,21 +944,23 @@ enum Named {
 }
 
 /// Resolve a `show` or `thread` prefix against projections first, then
-/// nodes. One matching projection is taken without enumerating any node:
-/// what it names already reaches its nodes, and the node scan is the
-/// expensive part. Only
-/// a prefix no projection matches is resolved against `blocks`. A prefix
-/// matching more than one id of the kind it is resolved against is refused
-/// with the count; it is never narrowed to one.
+/// nodes. One matching projection is taken without looking at any node:
+/// what it names already reaches its nodes. Only a prefix no projection
+/// matches is resolved against `blocks`. A prefix matching more than one id
+/// of the kind it is resolved against is refused with the count; it is
+/// never narrowed to one.
 ///
-/// A whole id (32 hexadecimal digits) can match at most itself, so it is
-/// handed to `exact` and nothing is enumerated: on the live archive the node
-/// scan took 126 s, and a stdio MCP server dispatches sequentially, so every
-/// call queued behind such a `show` waited for it too.
+/// `projections` and `blocks` are handed the prefix as an inclusive id
+/// range ([`prefix_range`]) and yield the ids of their kind inside it, so
+/// a lookup costs the ids near the prefix, never every node: enumerating
+/// and comparing every node took 126 s on the live archive, and a stdio
+/// MCP server dispatches sequentially, so every call queued behind such a
+/// `show` waited for it too. A whole id (32 hexadecimal digits) can match
+/// at most itself and is handed to `exact`.
 fn resolve_archive_prefix<P: IntoIterator<Item = Id>, B: IntoIterator<Item = Id>>(
     exact: impl FnOnce(Id) -> Option<Named>,
-    projections: impl FnOnce() -> P,
-    blocks: impl FnOnce() -> B,
+    projections: impl FnOnce(RawId, RawId) -> P,
+    blocks: impl FnOnce(RawId, RawId) -> B,
     prefix: &str,
 ) -> Result<Named> {
     let prefix = normalize_prefix(prefix)?;
@@ -958,7 +969,8 @@ fn resolve_archive_prefix<P: IntoIterator<Item = Id>, B: IntoIterator<Item = Id>
             .and_then(exact)
             .ok_or_else(|| anyhow!("no Archive source projection or block matches {prefix}"));
     }
-    let projections = matching(projections(), &prefix);
+    let (min, max) = prefix_range(&prefix);
+    let projections: BTreeSet<Id> = projections(min, max).into_iter().collect();
     match projections.len() {
         0 => {}
         1 => return Ok(Named::Projection(*projections.first().expect("one match"))),
@@ -966,7 +978,7 @@ fn resolve_archive_prefix<P: IntoIterator<Item = Id>, B: IntoIterator<Item = Id>
             bail!("Archive prefix {prefix} is ambiguous: it matches {many} source projection(s)")
         }
     }
-    let blocks = matching(blocks(), &prefix);
+    let blocks: BTreeSet<Id> = blocks(min, max).into_iter().collect();
     match blocks.len() {
         0 => bail!("no Archive source projection or block matches {prefix}"),
         1 => Ok(Named::Block(*blocks.first().expect("one match"))),
@@ -1104,19 +1116,25 @@ fn resolve_in(facts: &FactArchive, prefix: &str) -> Result<Named> {
                 None
             }
         },
-        || {
+        |min, max| {
             find!(
                 projection: Id,
-                pattern!(facts, [{
-                    ?projection @ metadata::tag: &archive_schema::source_projection::KIND
-                }])
+                and!(
+                    pattern!(facts, [{
+                        ?projection @ metadata::tag: &archive_schema::source_projection::KIND
+                    }]),
+                    facts.domain_in_range(projection, GenId::encode(min), GenId::encode(max)),
+                )
             )
         },
         // Nodes as search finds them: whatever holds a content fact.
-        || {
+        |min, max| {
             find!(
                 block: Id,
-                pattern!(facts, [{ ?block @ archive_schema::block::holds: _?fact }])
+                and!(
+                    pattern!(facts, [{ ?block @ archive_schema::block::holds: _?fact }]),
+                    facts.domain_in_range(block, GenId::encode(min), GenId::encode(max)),
+                )
             )
         },
         prefix,
@@ -2630,7 +2648,12 @@ mod tests {
         let id = |byte: u8| Id::new([byte; 16]).unwrap();
         let (projection, block, twin) = (id(0xA1), id(0xB1), id(0xB2));
         let resolve = |prefix: &str| {
-            resolve_archive_prefix(|_| None, || [projection], || [block, twin], prefix)
+            resolve_archive_prefix(
+                |_| None,
+                within([projection]),
+                within([block, twin]),
+                prefix,
+            )
         };
         assert_eq!(resolve("a1").unwrap(), Named::Projection(projection));
         assert_eq!(resolve("B1").unwrap(), Named::Block(block));
@@ -2642,14 +2665,14 @@ mod tests {
         // One receipt wins over a block sharing its prefix: its projection
         // already prints its blocks.
         assert_eq!(
-            resolve_archive_prefix(|_| None, || [id(0xC1)], || [id(0xC2)], "C").unwrap(),
+            resolve_archive_prefix(|_| None, within([id(0xC1)]), within([id(0xC2)]), "C").unwrap(),
             Named::Projection(id(0xC1))
         );
         // Several receipts are refused before any block is looked at.
         let receipts = resolve_archive_prefix(
             |_| None,
-            || [id(0xE1), id(0xE2)],
-            || -> [Id; 0] { panic!("blocks enumerated") },
+            within([id(0xE1), id(0xE2)]),
+            |_, _| -> [Id; 0] { panic!("blocks enumerated") },
             "E",
         )
         .unwrap_err();
@@ -2660,11 +2683,128 @@ mod tests {
         // A single receipt match never enumerates the blocks.
         let untouched = std::iter::from_fn(|| -> Option<Id> { panic!("blocks enumerated") });
         assert_eq!(
-            resolve_archive_prefix(|_| None, || [projection], || untouched, "A1").unwrap(),
+            resolve_archive_prefix(|_| None, within([projection]), |_, _| untouched, "A1").unwrap(),
             Named::Projection(projection)
         );
         let none = resolve("D").unwrap_err().to_string();
         assert_eq!(none, "no Archive source projection or block matches D");
+    }
+
+    /// A lookup that yields the given ids inside the range it is handed.
+    fn within<const N: usize>(ids: [Id; N]) -> impl FnOnce(RawId, RawId) -> Vec<Id> {
+        move |min, max| {
+            ids.into_iter()
+                .filter(|id| (min..=max).contains(&**id))
+                .collect()
+        }
+    }
+
+    /// A short prefix reaches its lookups as the id range it names, never
+    /// as an enumeration to filter: the node scan took 126 s per `show` on
+    /// the live archive. A digit is a nibble, so an odd count is padded
+    /// like any other, and an all-zero prefix starts at nil.
+    #[test]
+    fn a_short_prefix_is_looked_up_as_the_id_range_it_names() {
+        let mut ranges = Vec::new();
+        for (prefix, min, max) in [
+            (
+                "b1",
+                "B1000000000000000000000000000000",
+                "B1FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            ),
+            (
+                "ABC",
+                "ABC00000000000000000000000000000",
+                "ABCFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            ),
+            (
+                "0",
+                "00000000000000000000000000000000",
+                "0FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            ),
+            (
+                "ffffffff",
+                "FFFFFFFF000000000000000000000000",
+                "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+            ),
+        ] {
+            let hex = |raw: RawId| {
+                raw.iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            };
+            let error = resolve_archive_prefix(
+                |_| panic!("a short prefix is not a whole id"),
+                |low, high| {
+                    ranges.push((hex(low), hex(high)));
+                    []
+                },
+                |low, high| {
+                    assert_eq!((hex(low), hex(high)), (min.to_owned(), max.to_owned()));
+                    []
+                },
+                prefix,
+            )
+            .unwrap_err();
+            assert!(error.to_string().starts_with("no Archive"), "{error}");
+        }
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[1].0, "ABC00000000000000000000000000000");
+    }
+
+    /// The prefix lookups against an archive: the range proposes every id
+    /// near the prefix, whatever its position, and the patterns keep the
+    /// tagged projections and the nodes that hold a fact.
+    #[test]
+    fn a_prefix_resolves_against_the_archive_by_kind_and_position() {
+        use triblespace::core::blob::encodings::succinctarchive::{
+            OrderedUniverse, SuccinctArchive, UnionArchive,
+        };
+        use triblespace::core::trible::{Trible, TribleSet};
+        let id = |first: u8, rest: u8| {
+            let mut raw = [rest; 16];
+            raw[0] = first;
+            Id::new(raw).unwrap()
+        };
+        let projection = id(0xA1, 0x22);
+        let (block, twin) = (id(0xB1, 0x11), id(0xB1, 0x22));
+        // Its id begins with three zero digits, so its prefix starts at nil.
+        let low = Id::new([0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).unwrap();
+        // Held, so in the domain near its prefix, but not a node.
+        let held = id(0xC3, 0x33);
+        let mut set = TribleSet::new();
+        set.insert(&Trible::force(
+            &projection,
+            &metadata::tag.id(),
+            &GenId::encode(archive_schema::source_projection::KIND),
+        ));
+        for node in [block, twin, low] {
+            set.insert(&Trible::force(
+                &node,
+                &archive_schema::block::holds.id(),
+                &GenId::encode(held),
+            ));
+        }
+        let facts = UnionArchive::new(vec![SuccinctArchive::<OrderedUniverse>::from(&set)]);
+
+        assert_eq!(
+            resolve_in(&facts, "a1").unwrap(),
+            Named::Projection(projection)
+        );
+        assert_eq!(resolve_in(&facts, "b11").unwrap(), Named::Block(block));
+        assert_eq!(resolve_in(&facts, "B122").unwrap(), Named::Block(twin));
+        assert_eq!(resolve_in(&facts, "000").unwrap(), Named::Block(low));
+        let error = resolve_in(&facts, "B1").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "Archive prefix B1 is ambiguous: it matches 2 block(s)"
+        );
+        let none = resolve_in(&facts, "C3").unwrap_err().to_string();
+        assert_eq!(none, "no Archive source projection or block matches C3");
+        assert_eq!(
+            resolve_in(&facts, &format!("{twin:x}")).unwrap(),
+            Named::Block(twin)
+        );
     }
 
     /// A whole id is looked up, never matched against an enumeration: on the
@@ -2674,7 +2814,7 @@ mod tests {
     fn a_whole_id_is_looked_up_without_enumerating_anything() {
         let block = Id::new([0xB1; 16]).unwrap();
         let whole = format!("{block:x}");
-        let enumerated = || -> std::iter::Empty<Id> { panic!("ids enumerated") };
+        let enumerated = |_, _| -> std::iter::Empty<Id> { panic!("ids enumerated") };
         assert_eq!(
             resolve_archive_prefix(
                 |id| (id == block).then_some(Named::Block(id)),
