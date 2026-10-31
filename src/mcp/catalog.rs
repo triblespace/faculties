@@ -49,7 +49,7 @@ impl Config {
 /// Owned native adapters in the aggregate's stable registration order.
 /// Protocol/session state belongs to a transport's [`super::Server`], not here.
 pub struct Catalog {
-    faculties: Vec<Box<dyn Faculty>>,
+    faculties: Vec<Box<dyn Faculty + Sync>>,
     storage: Storage,
 }
 
@@ -77,7 +77,7 @@ impl Catalog {
             Some(token) => linkedin.with_token(token),
             None => linkedin,
         };
-        let faculties: Vec<Box<dyn Faculty>> = vec![
+        let faculties: Vec<Box<dyn Faculty + Sync>> = vec![
             Box::new(archive::mcp::Archive::with_storage(storage.clone())),
             Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),
             Box::new(body::mcp::Body::with_storage(storage.clone())),
@@ -129,8 +129,17 @@ impl Catalog {
         self.storage.finish(result)
     }
 
-    /// Borrow the same adapters for a stdio connection or an HTTP listener.
+    /// Borrow the same adapters for an HTTP listener.
     pub fn registrations(&self) -> Vec<&dyn Faculty> {
+        self.faculties
+            .iter()
+            .map(|faculty| faculty.as_ref() as &dyn Faculty)
+            .collect()
+    }
+
+    /// Borrow the adapters for the stdio transport, which runs calls
+    /// concurrently and so needs them shareable across threads.
+    pub fn sync_registrations(&self) -> Vec<&(dyn Faculty + Sync)> {
         self.faculties
             .iter()
             .map(|faculty| faculty.as_ref())
