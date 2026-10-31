@@ -5,10 +5,14 @@
 //! before calling shared library operations. No CLI grammar, process, or stdout
 //! parser is involved. Results are emitted as native Parts.
 //!
-//! Dispatch is deliberately blocking and sequential. Register finite commands,
-//! not watchers such as `orient wait`. The HTTP frontend runs this dispatch on
-//! a bounded native worker outside its asynchronous I/O runtime, constructing
-//! Out there. The stdio frontend calls it directly on the caller's thread.
+//! Handlers are blocking. Register finite commands, not watchers such as
+//! `orient wait`. The HTTP frontend runs [`Server::dispatch`] sequentially on a
+//! bounded native worker outside its asynchronous I/O runtime, constructing Out
+//! there. The stdio frontend ([`serve`]) handles protocol messages in order on
+//! the reading thread and runs each `tools/call` on its own scoped thread, so a
+//! slow read never holds a quick call's response behind it; JSON-RPC matches
+//! responses by id, and each response line is written whole under one lock.
+//! Adapters it serves must therefore be `Sync`.
 //! Handler allocation/computation is outside the transport budget. The adapter
 //! bounds incoming frames, JSON nesting, and encoded responses, including media
 //! expansion. It closes the transport on an oversized frame rather than trying
@@ -18,9 +22,11 @@ pub mod catalog;
 pub mod http;
 pub mod object;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 pub use anybytes::Bytes;
 use anyhow::{anyhow, bail, Result};
@@ -104,6 +110,127 @@ struct RegisteredTool<'a> {
     name: &'static str,
     descriptor: String,
     faculty: &'a dyn Faculty,
+    /// Position of `faculty` in the slice the server was built from.
+    index: usize,
+}
+
+/// A validated `tools/call`, detached from the server so it can run while
+/// the transport goes on reading and answering other messages.
+struct Call {
+    tool: usize,
+    name: String,
+    arguments: Bytes,
+    id: String,
+    budget: usize,
+    limits: Limits,
+}
+
+impl Call {
+    fn run(self, faculty: &dyn Faculty, cancelled: &AtomicBool) -> Result<String> {
+        match invoke(faculty, &self.name, self.arguments, self.budget, cancelled) {
+            Ok(result) => result_response(self.limits, &self.id, &result),
+            Err(error) => error_response(self.limits, &self.id, error.code, &error.message),
+        }
+    }
+}
+
+enum Routed {
+    Reply(Option<String>),
+    Call(Call),
+    /// `notifications/cancelled` for this raw request id.
+    Cancel(String),
+}
+
+/// Calls running at once on the stdio transport. Reading pauses while all
+/// are busy, so this also bounds the memory of concurrent handlers.
+pub const MAX_CONCURRENT_CALLS: usize = 8;
+
+/// Serve newline-delimited messages until EOF, running tool calls
+/// concurrently (see the module documentation). Nothing except JSON-RPC
+/// responses is written to `output`; each response is flushed promptly.
+/// At EOF, calls already admitted finish and answer before this returns.
+///
+/// `notifications/cancelled` for a running call suppresses its response and
+/// refuses the handler's further output, which ends a handler at its next
+/// emission. Work a handler does before emitting is not interrupted.
+pub fn serve(
+    faculties: &[&(dyn Faculty + Sync)],
+    limits: Limits,
+    mut input: impl BufRead,
+    output: impl Write + Send,
+) -> Result<()> {
+    let plain: Vec<&dyn Faculty> = faculties.iter().map(|&f| f as &dyn Faculty).collect();
+    let mut server = Server::with_limits(&plain, limits)?;
+    let output = Mutex::new(output);
+    let failure = Mutex::new(None::<anyhow::Error>);
+    let write = |response: &str| -> Result<()> {
+        let mut output = output
+            .lock()
+            .map_err(|_| anyhow!("MCP output writer is poisoned"))?;
+        output.write_all(response.as_bytes())?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+        Ok(())
+    };
+    // Running calls by raw request id, each with its cancellation flag.
+    let running = Mutex::new(BTreeMap::<String, Arc<AtomicBool>>::new());
+    let (release, slots) = mpsc::sync_channel::<()>(MAX_CONCURRENT_CALLS);
+    for _ in 0..MAX_CONCURRENT_CALLS {
+        release.send(()).expect("the slot channel holds every slot");
+    }
+    let read = std::thread::scope(|scope| -> Result<()> {
+        loop {
+            if let Some(error) = failure.lock().ok().and_then(|mut slot| slot.take()) {
+                return Err(error);
+            }
+            let Some(line) = read_frame(&mut input, limits.request_bytes)? else {
+                return Ok(());
+            };
+            match server.route(Bytes::from(line))? {
+                Routed::Reply(Some(response)) => write(&response)?,
+                Routed::Reply(None) => {}
+                Routed::Cancel(id) => {
+                    if let Some(flag) = running.lock().ok().and_then(|map| map.get(&id).cloned()) {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
+                Routed::Call(call) => {
+                    let faculty = faculties[server.tools[call.tool].index];
+                    slots.recv().expect("this function owns a slot sender");
+                    let cancelled = Arc::new(AtomicBool::new(false));
+                    if let Ok(mut map) = running.lock() {
+                        map.insert(call.id.clone(), cancelled.clone());
+                    }
+                    let release = release.clone();
+                    let (write, failure, running) = (&write, &failure, &running);
+                    scope.spawn(move || {
+                        let id = call.id.clone();
+                        let result = call.run(faculty, &cancelled).and_then(|response| {
+                            if let Ok(mut map) = running.lock() {
+                                map.remove(&id);
+                            }
+                            // A cancelled request gets no response at all.
+                            if cancelled.load(Ordering::Relaxed) {
+                                return Ok(());
+                            }
+                            write(&response)
+                        });
+                        let _ = release.send(());
+                        if let Err(error) = result {
+                            if let Ok(mut slot) = failure.lock() {
+                                slot.get_or_insert(error);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+    let failed = failure.into_inner().ok().flatten();
+    match (read, failed) {
+        (Err(error), _) | (Ok(()), Some(error)) => Err(error),
+        (Ok(()), None) => Ok(()),
+    }
 }
 
 /// Wire budgets, excluding the newline delimiter. Defaults permit modest
@@ -155,7 +282,7 @@ impl<'a> Server<'a> {
         }
         let mut names = BTreeSet::new();
         let mut tools = Vec::new();
-        for &faculty in faculties {
+        for (index, &faculty) in faculties.iter().enumerate() {
             for tool in faculty.tools() {
                 if !names.insert(tool.name) {
                     bail!("duplicate MCP tool name {:?}", tool.name);
@@ -164,6 +291,7 @@ impl<'a> Server<'a> {
                     name: tool.name,
                     descriptor: tool_descriptor(tool, faculty.input_schema(tool))?,
                     faculty,
+                    index,
                 });
             }
         }
@@ -174,38 +302,37 @@ impl<'a> Server<'a> {
         })
     }
 
-    /// Serve newline-delimited messages until EOF. Nothing except JSON-RPC
-    /// responses is written to `output`; each response is flushed promptly.
-    pub fn serve(&mut self, mut input: impl BufRead, mut output: impl Write) -> Result<()> {
-        loop {
-            let Some(line) = read_frame(&mut input, self.limits.request_bytes)? else {
-                return Ok(());
-            };
-            if let Some(response) = self.dispatch(Bytes::from(line))? {
-                output.write_all(response.as_bytes())?;
-                output.write_all(b"\n")?;
-                output.flush()?;
-            }
-        }
-    }
-
     /// Dispatch one complete JSON-RPC message. HTTP may include JSON whitespace;
     /// stdio enforces its physical-line framing separately. Notifications and
     /// unsolicited responses produce None. Resource-limit errors are fatal to
     /// this transport; ordinary JSON-RPC errors are encoded response messages.
     pub fn dispatch(&mut self, bytes: Bytes) -> Result<Option<String>> {
+        match self.route(bytes)? {
+            Routed::Reply(response) => Ok(response),
+            Routed::Call(call) => {
+                let faculty = self.tools[call.tool].faculty;
+                call.run(faculty, &AtomicBool::new(false)).map(Some)
+            }
+            // Sequential dispatch has nothing running to cancel.
+            Routed::Cancel(_) => Ok(None),
+        }
+    }
+
+    /// Answer one message, or validate a `tools/call` without running it.
+    fn route(&mut self, bytes: Bytes) -> Result<Routed> {
+        let reply = |response: Result<String>| response.map(Some).map(Routed::Reply);
         if bytes.len() > self.limits.request_bytes {
             bail!("MCP request exceeds {} bytes", self.limits.request_bytes);
         }
         let request = match envelope(bytes, self.limits.json_depth) {
             Ok(request) => request,
-            Err(error) => return self.error("null", error.code, &error.message).map(Some),
+            Err(error) => return reply(self.error("null", error.code, &error.message)),
         };
 
         // We never send requests, so unsolicited responses have no destination.
         // In particular, never generate a response-to-response loop.
         if request.method.is_none() && request.response {
-            return Ok(None);
+            return Ok(Routed::Reply(None));
         }
         let notification = request.id.is_none() && request.method.is_some();
         let version = request.version.and_then(|value| decoded(value).ok());
@@ -220,17 +347,26 @@ impl<'a> Server<'a> {
             {
                 self.state = State::Ready;
             }
+            if !request.duplicate
+                && version.as_deref() == Some("2.0")
+                && method.as_deref() == Some("notifications/cancelled")
+            {
+                let id = request
+                    .params
+                    .and_then(|params| fields::<1>(params, ["requestId"]).ok())
+                    .and_then(|[id]| id)
+                    .and_then(|id| request_id(id).ok());
+                if let Some(id) = id {
+                    return Ok(Routed::Cancel(id));
+                }
+            }
             // Even call-shaped notifications can never invoke a native handler.
-            return Ok(None);
+            return Ok(Routed::Reply(None));
         }
 
         let id = match request.id.and_then(|value| request_id(value).ok()) {
             Some(id) if !request.duplicate => id,
-            _ => {
-                return self
-                    .error("null", -32600, "Invalid request ID or envelope")
-                    .map(Some)
-            }
+            _ => return reply(self.error("null", -32600, "Invalid request ID or envelope")),
         };
         // Reserve enough space to echo the ID and return a bounded tool error.
         if id.len()
@@ -242,18 +378,14 @@ impl<'a> Server<'a> {
             bail!("MCP request ID does not fit the response budget");
         }
         if request.response || version.as_deref() != Some("2.0") || method.is_none() {
-            return self
-                .error(&id, -32600, "Invalid JSON-RPC request")
-                .map(Some);
+            return reply(self.error(&id, -32600, "Invalid JSON-RPC request"));
         }
         if request
             .params
             .as_ref()
             .is_some_and(|value| !is_object(value))
         {
-            return self
-                .error(&id, -32602, "params must be an object")
-                .map(Some);
+            return reply(self.error(&id, -32602, "params must be an object"));
         }
         let method = method.expect("checked above");
         let result = match method.as_str() {
@@ -263,13 +395,25 @@ impl<'a> Server<'a> {
                 Err(RpcError::new(-32000, "MCP initialization is not complete"))
             }
             "tools/list" => self.list(request.params, self.result_budget(&id)),
-            "tools/call" => self.call(request.params, self.result_budget(&id)),
+            "tools/call" => match self.prepare(request.params) {
+                Ok((tool, name, arguments)) => {
+                    return Ok(Routed::Call(Call {
+                        tool,
+                        name,
+                        arguments,
+                        budget: self.result_budget(&id),
+                        id,
+                        limits: self.limits,
+                    }))
+                }
+                Err(error) => Err(error),
+            },
             _ => Err(RpcError::new(-32601, "Method not found")),
         };
-        match result {
-            Ok(result) => self.result(&id, &result).map(Some),
-            Err(error) => self.error(&id, error.code, &error.message).map(Some),
-        }
+        reply(match result {
+            Ok(result) => self.result(&id, &result),
+            Err(error) => self.error(&id, error.code, &error.message),
+        })
     }
 
     fn initialize(&mut self, params: Option<Bytes>) -> std::result::Result<String, RpcError> {
@@ -328,13 +472,16 @@ impl<'a> Server<'a> {
         Ok(result)
     }
 
-    fn call(&self, params: Option<Bytes>, budget: usize) -> std::result::Result<String, RpcError> {
+    fn prepare(
+        &self,
+        params: Option<Bytes>,
+    ) -> std::result::Result<(usize, String, Bytes), RpcError> {
         let params = fields::<2>(required_params(params)?, ["name", "arguments"])?;
         let name = required_string(params[0].clone(), "name")?;
         let tool = self
             .tools
             .iter()
-            .find(|tool| name == tool.name)
+            .position(|tool| name == tool.name)
             .ok_or_else(|| RpcError::params("Unknown tool"))?;
         let arguments = params[1]
             .clone()
@@ -342,64 +489,7 @@ impl<'a> Server<'a> {
         if !is_object(&arguments) {
             return Err(RpcError::params("arguments must be an object"));
         }
-
-        let mut content = String::new();
-        let content_budget = budget.saturating_sub(ERROR_RESERVE + 64);
-        let mut rejected = false;
-        let result = {
-            let mut emit = |part| {
-                if rejected {
-                    bail!("MCP output emission previously failed");
-                }
-                let separator = usize::from(!content.is_empty());
-                match encode_part(
-                    part,
-                    content_budget.saturating_sub(content.len() + separator),
-                ) {
-                    Ok(encoded) => {
-                        if separator != 0 {
-                            content.push(',');
-                        }
-                        content.push_str(&encoded);
-                        Ok(())
-                    }
-                    Err(error) => {
-                        rejected = true;
-                        Err(error)
-                    }
-                }
-            };
-            // Some optional model/rendering libraries still expose panicking
-            // loaders. Isolate an ordinary unwind to this call, retaining any
-            // accepted output. This does not recover process aborts/OOM, undo
-            // effects, repair backend state, or permit automatic retries.
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tool.faculty.call(&name, arguments, &mut Out::new(&mut emit))
-            }))
-            .unwrap_or_else(|_| Err(anyhow!(
-                "faculty handler panicked; output or side effects may already exist; the operation was not retried"
-            )))
-        };
-        if let Err(error) = &result {
-            if error.is::<InvalidArguments>() {
-                return Err(RpcError::params(&brief(error)));
-            }
-        }
-        let failed = result.is_err() || rejected;
-        if failed {
-            let message = if rejected {
-                "MCP output exceeded the response budget".to_owned()
-            } else {
-                brief(&result.expect_err("failed invocation"))
-            };
-            let error_part = encode_part(Part::Text { text: message }, ERROR_RESERVE)
-                .expect("bounded diagnostic fits its reserved space");
-            if !content.is_empty() {
-                content.push(',');
-            }
-            content.push_str(&error_part);
-        }
-        Ok(format!("{{\"content\":[{content}],\"isError\":{failed}}}"))
+        Ok((tool, name, arguments))
     }
 
     fn result_budget(&self, id: &str) -> usize {
@@ -407,21 +497,101 @@ impl<'a> Server<'a> {
     }
 
     fn result(&self, id: &str, result: &str) -> Result<String> {
-        let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}");
-        if response.len() > self.limits.response_bytes {
-            bail!("MCP response exceeds the output budget");
-        }
-        Ok(response)
+        result_response(self.limits, id, result)
     }
 
     fn error(&self, id: &str, code: i32, message: &str) -> Result<String> {
-        let message = quote(message);
-        let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":{code},\"message\":{message}}}}}");
-        if response.len() > self.limits.response_bytes {
-            bail!("MCP error response exceeds the output budget");
-        }
-        Ok(response)
+        error_response(self.limits, id, code, message)
     }
+}
+
+/// Run one validated tool call, bounding its encoded content to `budget`.
+fn invoke(
+    faculty: &dyn Faculty,
+    name: &str,
+    arguments: Bytes,
+    budget: usize,
+    cancelled: &AtomicBool,
+) -> std::result::Result<String, RpcError> {
+    let mut content = String::new();
+    let content_budget = budget.saturating_sub(ERROR_RESERVE + 64);
+    let mut rejected = false;
+    let result = {
+        let mut emit = |part| {
+            if rejected {
+                bail!("MCP output emission previously failed");
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("MCP request was cancelled");
+            }
+            let separator = usize::from(!content.is_empty());
+            match encode_part(
+                part,
+                content_budget.saturating_sub(content.len() + separator),
+            ) {
+                Ok(encoded) => {
+                    if separator != 0 {
+                        content.push(',');
+                    }
+                    content.push_str(&encoded);
+                    Ok(())
+                }
+                Err(error) => {
+                    rejected = true;
+                    Err(error)
+                }
+            }
+        };
+        // Some optional model/rendering libraries still expose panicking
+        // loaders. Isolate an ordinary unwind to this call, retaining any
+        // accepted output. This does not recover process aborts/OOM, undo
+        // effects, repair backend state, or permit automatic retries.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            faculty.call(name, arguments, &mut Out::new(&mut emit))
+        }))
+        .unwrap_or_else(|_| Err(anyhow!(
+            "faculty handler panicked; output or side effects may already exist; the operation was not retried"
+        )))
+    };
+    if let Err(error) = &result {
+        if error.is::<InvalidArguments>() {
+            return Err(RpcError::params(&brief(error)));
+        }
+    }
+    let failed = result.is_err() || rejected;
+    if failed {
+        let message = if rejected {
+            "MCP output exceeded the response budget".to_owned()
+        } else {
+            brief(&result.expect_err("failed invocation"))
+        };
+        let error_part = encode_part(Part::Text { text: message }, ERROR_RESERVE)
+            .expect("bounded diagnostic fits its reserved space");
+        if !content.is_empty() {
+            content.push(',');
+        }
+        content.push_str(&error_part);
+    }
+    Ok(format!("{{\"content\":[{content}],\"isError\":{failed}}}"))
+}
+
+fn result_response(limits: Limits, id: &str, result: &str) -> Result<String> {
+    let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}");
+    if response.len() > limits.response_bytes {
+        bail!("MCP response exceeds the output budget");
+    }
+    Ok(response)
+}
+
+fn error_response(limits: Limits, id: &str, code: i32, message: &str) -> Result<String> {
+    let message = quote(message);
+    let response = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":{code},\"message\":{message}}}}}"
+    );
+    if response.len() > limits.response_bytes {
+        bail!("MCP error response exceeds the output budget");
+    }
+    Ok(response)
 }
 
 fn read_frame(input: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>> {

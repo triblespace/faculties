@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use anybytes::Bytes;
 use anyhow::{bail, Context, Result};
 use faculties::archive_source::canonical_json;
-use faculties::mcp::{decode_arguments, Faculty, Limits, Server, Tool};
+use faculties::mcp::{self, decode_arguments, Faculty, Limits, Server, Tool};
 use faculties::out::Out;
 use serde::Deserialize;
 
@@ -598,30 +598,41 @@ fn frame_and_depth_limits_do_not_invoke_handlers() {
     )
     .unwrap();
     let input = Cursor::new(vec![b' '; 65]);
-    assert!(server
-        .serve(BufReader::with_capacity(8, input), Vec::new())
-        .is_err());
+    let small = Limits {
+        request_bytes: 64,
+        ..Limits::default()
+    };
+    assert!(mcp::serve(
+        &[&SAMPLE],
+        small,
+        BufReader::with_capacity(8, input),
+        Vec::new()
+    )
+    .is_err());
     assert!(server.dispatch(Bytes::from(vec![b' '; 65])).is_err());
     let mut server = Server::new(&registrations).unwrap();
     let deep = format!("{}0{}", "[".repeat(65), "]".repeat(65));
     assert!(dispatch(&mut server, &deep).unwrap().contains("nesting"));
-    assert!(server
-        .serve(
-            Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"),
-            Vec::new()
-        )
-        .is_err());
+    assert!(mcp::serve(
+        &[&SAMPLE],
+        Limits::default(),
+        Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}"),
+        Vec::new()
+    )
+    .is_err());
 }
 
 #[test]
 fn stdio_writes_only_delimited_responses_and_handles_crlf() {
-    let registrations = registrations();
-    let mut server = Server::new(&registrations).unwrap();
     let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r\n{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"sample_empty\"}}\n{\"jsonrpc\":\"2.0\",\"id\":\"last\",\"method\":\"ping\"}\n";
     let mut output = Vec::new();
-    server
-        .serve(BufReader::with_capacity(7, Cursor::new(input)), &mut output)
-        .unwrap();
+    mcp::serve(
+        &[&SAMPLE],
+        Limits::default(),
+        BufReader::with_capacity(7, Cursor::new(input)),
+        &mut output,
+    )
+    .unwrap();
     let output = String::from_utf8(output).unwrap();
     assert_eq!(output.lines().count(), 2);
     for line in output.lines() {

@@ -3,7 +3,7 @@
 //! non-Sync adapter. Blocking work is controlled with bounded channels.
 
 use std::cell::Cell;
-use std::io::{BufRead, BufReader, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -314,12 +314,16 @@ fn read_keepalive_get(stream: &mut TcpStream) {
 }
 
 fn assert_awaiting_accept(stream: &TcpStream) {
-    stream.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(30)))
+        .unwrap();
     let result = stream.peek(&mut [0]);
     stream.set_read_timeout(Some(WAIT)).unwrap();
-    assert!(matches!(result, Err(error) if matches!(error.kind(),
+    assert!(
+        matches!(result, Err(error) if matches!(error.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
-        "excess client got a response or closure while accepted slots were full");
+        "excess client got a response or closure while accepted slots were full"
+    );
 }
 
 #[test]
@@ -333,11 +337,13 @@ fn connection_cap_holds_across_keepalive_and_closing_one_admits_one_queued_clien
         raw_get(stream, endpoint.addr);
         read_keepalive_get(stream);
     }
-    let mut queued: Vec<_> = (0..8).map(|_| {
-        let mut stream = endpoint.connect_raw();
-        raw_get(&mut stream, endpoint.addr);
-        stream
-    }).collect();
+    let mut queued: Vec<_> = (0..8)
+        .map(|_| {
+            let mut stream = endpoint.connect_raw();
+            raw_get(&mut stream, endpoint.addr);
+            stream
+        })
+        .collect();
     for stream in &queued {
         assert_awaiting_accept(stream);
     }
@@ -359,14 +365,19 @@ fn connection_cap_holds_across_keepalive_and_closing_one_admits_one_queued_clien
     let deadline = Instant::now() + WAIT;
     let ready = loop {
         if let Some(index) = queued.iter().position(|stream| {
-            stream.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(30)))
+                .unwrap();
             let ready = matches!(stream.peek(&mut [0]), Ok(count) if count > 0);
             stream.set_read_timeout(Some(WAIT)).unwrap();
             ready
         }) {
             break index;
         }
-        assert!(Instant::now() < deadline, "closing a client did not admit queued work");
+        assert!(
+            Instant::now() < deadline,
+            "closing a client did not admit queued work"
+        );
     };
     let mut replacement = queued.swap_remove(ready);
     read_keepalive_get(&mut replacement);
@@ -385,7 +396,9 @@ fn malformed_http_releases_the_connection_slot_for_the_next_client() {
     bounded.max_connections = 1;
     let endpoint = TestEndpoint::new(bounded, Fixture::default());
     let mut malformed = endpoint.connect_raw();
-    malformed.write_all(b"GET / HTTP/NOT-A-VERSION\r\n\r\n").unwrap();
+    malformed
+        .write_all(b"GET / HTTP/NOT-A-VERSION\r\n\r\n")
+        .unwrap();
     let mut response = Vec::new();
     // Invalid HTTP can end in clean EOF or a TCP reset (notably on macOS).
     // This checks connection-slot release, not a particular error response.
@@ -420,7 +433,10 @@ fn shutdown_cancels_saturated_connection_admission() {
     drop(queued);
     let deadline = Instant::now() + WAIT;
     while !endpoint.worker.as_ref().unwrap().is_finished() {
-        assert!(Instant::now() < deadline, "shutdown waited on connection admission");
+        assert!(
+            Instant::now() < deadline,
+            "shutdown waited on connection admission"
+        );
         thread::sleep(Duration::from_millis(5));
     }
     endpoint.worker.take().unwrap().join().unwrap().unwrap();
@@ -461,15 +477,18 @@ fn http_native_media_and_discovery_match_stdio_without_reencoding_the_data_model
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 
+    // The same dispatcher without HTTP. This fixture is deliberately not
+    // Sync, so it goes through Server::dispatch rather than concurrent stdio.
     let native = Fixture::default();
     let mut server = Server::new(&[&native]).unwrap();
-    let input = format!("{INITIALIZE}\n{INITIALIZED}\n{body}\n");
-    let mut output = Vec::new();
-    server.serve(Cursor::new(input), &mut output).unwrap();
-    let frames: Vec<Value> = String::from_utf8(output)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
+    let frames: Vec<Value> = [INITIALIZE, INITIALIZED, body.as_str()]
+        .into_iter()
+        .filter_map(|frame| {
+            server
+                .dispatch(Bytes::from(frame.as_bytes().to_vec()))
+                .unwrap()
+        })
+        .map(|line| serde_json::from_str(&line).unwrap())
         .collect();
     assert_eq!(frames.len(), 2);
     assert_eq!(frames[1], result);

@@ -23,8 +23,8 @@ use std::io::{self, IoSlice, Read};
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
@@ -177,7 +177,7 @@ struct LiveConnection(ConnectionMetrics);
 
 impl Drop for LiveConnection {
     fn drop(&mut self) {
-        self.0.0.fetch_sub(1, Ordering::Relaxed);
+        self.0 .0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -186,12 +186,23 @@ impl<L: Listener> Listener for ConnectionListener<L> {
     type Addr = L::Addr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        let admission = self.admission.clone().acquire_owned().await
+        let admission = self
+            .admission
+            .clone()
+            .acquire_owned()
+            .await
             .expect("private connection semaphore is never closed");
         // Retain Axum's ordinary socket-error retry behavior. Cancellation at
         // either await drops the permit; successful accept moves it with I/O.
         let (io, addr) = self.inner.accept().await;
-        (AdmittedIo { io, _live: self.metrics.enter(), _admission: admission }, addr)
+        (
+            AdmittedIo {
+                io,
+                _live: self.metrics.enter(),
+                _admission: admission,
+            },
+            addr,
+        )
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
@@ -210,17 +221,29 @@ struct AdmittedIo<T> {
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for AdmittedIo<T> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
     }
 }
 
 impl<T: AsyncWrite + Unpin> AsyncWrite for AdmittedIo<T> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
     }
 
-    fn poll_write_vectored(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
     }
 
@@ -250,7 +273,11 @@ impl Endpoint {
         config.validate()?;
         let listener = TcpListener::bind(config.bind).context("bind MCP HTTP listener")?;
         listener.set_nonblocking(true)?;
-        Ok(Self { listener, config, metrics: ConnectionMetrics::new() })
+        Ok(Self {
+            listener,
+            config,
+            metrics: ConnectionMetrics::new(),
+        })
     }
 
     /// Observe this exact endpoint, including after it moves into serve_until.
@@ -755,7 +782,10 @@ mod tests {
         let admission = Arc::new(Semaphore::new(2));
         let metrics = ConnectionMetrics::new();
         let mut listener = ConnectionListener {
-            inner: CountAccepts { calls: calls.clone(), pending: false },
+            inner: CountAccepts {
+                calls: calls.clone(),
+                pending: false,
+            },
             admission: admission.clone(),
             metrics: metrics.clone(),
         };
@@ -765,7 +795,11 @@ mod tests {
         assert_eq!(admission.available_permits(), 0);
         assert_eq!(metrics.accepted_streams(), 2);
         assert_eq!(metrics.clone().accepted_streams(), 2);
-        assert!(tokio::time::timeout(Duration::from_millis(30), listener.accept()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
         // In particular, a third stream was not accepted and then parked
         // awaiting a permit: the underlying listener was never called.
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -785,7 +819,10 @@ mod tests {
         let admission = Arc::new(Semaphore::new(1));
         let metrics = ConnectionMetrics::new();
         let mut listener = ConnectionListener {
-            inner: CountAccepts { calls: calls.clone(), pending: true },
+            inner: CountAccepts {
+                calls: calls.clone(),
+                pending: true,
+            },
             admission: admission.clone(),
             metrics: metrics.clone(),
         };
@@ -793,9 +830,14 @@ mod tests {
         std::future::poll_fn(|cx| {
             assert!(accepting.as_mut().poll(cx).is_pending());
             Poll::Ready(())
-        }).await;
+        })
+        .await;
         assert_eq!(admission.available_permits(), 0);
-        assert_eq!(metrics.accepted_streams(), 0, "reserved pre-accept slot is not a stream");
+        assert_eq!(
+            metrics.accepted_streams(),
+            0,
+            "reserved pre-accept slot is not a stream"
+        );
         drop(accepting);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(admission.available_permits(), 1);
@@ -804,15 +846,23 @@ mod tests {
 
     #[tokio::test]
     async fn connection_gauge_survives_endpoint_drop_and_releases_on_io_error_unwind() {
-        let endpoint = Endpoint::bind(Config::new("127.0.0.1:0".parse().unwrap(), BearerToken::new(TOKEN).unwrap())).unwrap();
+        let endpoint = Endpoint::bind(Config::new(
+            "127.0.0.1:0".parse().unwrap(),
+            BearerToken::new(TOKEN).unwrap(),
+        ))
+        .unwrap();
         let retained = endpoint.connection_metrics();
         drop(endpoint);
         assert_eq!(retained.accepted_streams(), 0);
         let metrics = ConnectionMetrics::new();
         let admission = Arc::new(Semaphore::new(1));
         let mut listener = ConnectionListener {
-            inner: CountAccepts { calls: Arc::new(AtomicUsize::new(0)), pending: false },
-            admission: admission.clone(), metrics: metrics.clone(),
+            inner: CountAccepts {
+                calls: Arc::new(AtomicUsize::new(0)),
+                pending: false,
+            },
+            admission: admission.clone(),
+            metrics: metrics.clone(),
         };
         let (mut stream, ()) = listener.accept().await;
         // CountAccepts drops the duplex peer; writing must fail, but only
@@ -820,10 +870,13 @@ mod tests {
         use tokio::io::AsyncWriteExt;
         assert!(stream.write_all(b"x").await.is_err());
         assert_eq!(metrics.accepted_streams(), 1);
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            let _stream = stream;
-            panic!("synthetic connection task unwind");
-        })).is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _stream = stream;
+                panic!("synthetic connection task unwind");
+            }))
+            .is_err()
+        );
         assert_eq!(metrics.accepted_streams(), 0);
         assert_eq!(admission.available_permits(), 1);
     }
@@ -851,7 +904,10 @@ mod tests {
 
     #[test]
     fn connection_default_is_per_endpoint_sixty_four() {
-        let config = Config::new("127.0.0.1:0".parse().unwrap(), BearerToken::new(TOKEN).unwrap());
+        let config = Config::new(
+            "127.0.0.1:0".parse().unwrap(),
+            BearerToken::new(TOKEN).unwrap(),
+        );
         assert_eq!(config.max_connections, 64);
     }
 
@@ -932,10 +988,9 @@ mod tests {
 
     #[test]
     fn stdio_still_rejects_embedded_carriage_returns_at_its_framing_boundary() {
-        let mut server = Server::new(&[]).unwrap();
         let mut output = Vec::new();
         let input = std::io::Cursor::new(b"{\r\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n");
-        assert!(server.serve(input, &mut output).is_err());
+        assert!(super::super::serve(&[], Limits::default(), input, &mut output).is_err());
         assert!(output.is_empty());
     }
 }

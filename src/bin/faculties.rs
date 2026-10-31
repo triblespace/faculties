@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use faculties::hear;
 use faculties::mcp::catalog::{Catalog, Config as CatalogConfig};
 use faculties::mcp::http;
-use faculties::mcp::{Faculty, Server};
+use faculties::mcp::{self, Faculty, Limits};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -105,7 +105,6 @@ fn main() -> Result<()> {
                 world_url,
                 world_session: world_session_file,
             });
-            let registrations = catalog.registrations();
             let result = match http_listen {
                 Some(bind) => {
                     let token_file = http_token_file
@@ -115,9 +114,9 @@ fn main() -> Result<()> {
                     let mut config = http::Config::new(bind, token);
                     config.allowed_origins = http_origin;
                     detach_handler_stdio()?;
-                    http::serve(&registrations, config)
+                    http::serve(&catalog.registrations(), config)
                 }
-                None => serve_stdio(&registrations),
+                None => serve_stdio(&catalog.sync_registrations()),
             };
             catalog.finish(result)
         }
@@ -129,7 +128,7 @@ fn main() -> Result<()> {
 /// a stray print nor a /dev/std{in,out} file path may consume/corrupt JSON-RPC.
 /// This is stdio hygiene, not a filesystem sandbox against arbitrary fd access.
 #[cfg(unix)]
-fn serve_stdio(registrations: &[&dyn Faculty]) -> Result<()> {
+fn serve_stdio(registrations: &[&(dyn Faculty + Sync)]) -> Result<()> {
     use std::fs::File;
     use std::io::BufReader;
     use std::os::fd::AsFd;
@@ -139,7 +138,12 @@ fn serve_stdio(registrations: &[&dyn Faculty]) -> Result<()> {
     let input = File::from(std::io::stdin().as_fd().try_clone_to_owned()?);
     let output = File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
     detach_handler_stdio()?;
-    Server::new(registrations)?.serve(BufReader::new(input), output)
+    mcp::serve(
+        registrations,
+        Limits::default(),
+        BufReader::new(input),
+        output,
+    )
 }
 
 /// Both executable transports isolate handlers from launcher input before
@@ -172,6 +176,11 @@ fn detach_handler_stdio() -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn serve_stdio(registrations: &[&dyn Faculty]) -> Result<()> {
-    Server::new(registrations)?.serve(std::io::stdin().lock(), std::io::stdout().lock())
+fn serve_stdio(registrations: &[&(dyn Faculty + Sync)]) -> Result<()> {
+    mcp::serve(
+        registrations,
+        Limits::default(),
+        std::io::stdin().lock(),
+        std::io::stdout(),
+    )
 }
