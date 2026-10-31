@@ -93,7 +93,8 @@ enum Command {
     /// stored.
     #[cfg(feature = "discord-hearing")]
     Hear {
-        /// The clip.
+        /// The clip: a 16 kHz mono 16-bit WAV, or an ogg/opus recording
+        /// (`.ogg`, `.oga`, `.opus`) such as a Discord voice message.
         wav: PathBuf,
     },
     /// Load the voice the way `live --voice-channel` does, without Discord,
@@ -497,6 +498,8 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
         (true, Some(pile)) => Some(super::hearing::Config {
             pile,
             unstored: state.intake().join(intake::UNSTORED_SPEECH),
+            // Wired to intake by `live::run`.
+            voice_messages: None,
         }),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -533,6 +536,16 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
 /// `discord hear`: a clip heard as the voice channel is.
 #[cfg(feature = "discord-hearing")]
 fn hear(pile: &std::path::Path, wav: &std::path::Path, out: &mut Out<'_>) -> Result<()> {
+    let ogg = wav
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "ogg" | "oga" | "opus"));
+    if ogg {
+        let bytes = std::fs::read(wav).with_context(|| format!("read {}", wav.display()))?;
+        let clip = super::voice_message::decode_ogg_opus(&bytes)
+            .with_context(|| format!("decode {}", wav.display()))?;
+        return super::hearing::hear_clip(pile, &clip, out);
+    }
     // Panics on anything but a 16-bit mono WAV.
     let (clip, rate) = mary::models::f5::wav::read_pcm16_mono(wav);
     if rate as usize != super::hearing::RATE {

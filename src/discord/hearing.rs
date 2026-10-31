@@ -29,11 +29,21 @@
 //! stops. The transcriber says when it wrote a word, not where in the audio
 //! the word was, so the utterance is never cut at a sentence.
 //!
+//! A voice message (an ogg/opus recording posted in a text channel or a DM)
+//! is heard by the same segmenter and transcriber: intake decodes it and
+//! hands it here ([`super::voice_message::VoiceMessage`]), and between
+//! moments, while no utterance is being recognized, it is cut where its
+//! speaker pauses ([`cut`]), each piece transcribed, and the words of all of
+//! them go to intake as one utterance of its author in its own channel, at
+//! the moment it was sent, with the whole recording as its audio. Heard
+//! uncut, a 66 s recording lost its last 25 s (2026-10-31).
+//!
 //! Logs carry who, where, when and how much, never what was said.
 //!
 //! Built with the `discord-hearing` feature.
 
 use super::intake::{self, Inbox, Work};
+use super::voice_message::VoiceMessage;
 use crate::discord::{Sentence, Utterance};
 use crate::hear::segmenter::{Segment, Segmenter, VadConfig};
 use anyhow::{Context, Result};
@@ -68,6 +78,9 @@ const END_SILENCE_MS: usize = 800;
 /// written the last word down ([`Transcribe::settle_ms`]), so a sentence
 /// end it wrote earlier cannot pass for the end of what was said last.
 const SENTENCE_SILENCE_MS: usize = 300;
+/// How long the hearing thread waits for a voice tick before it looks for a
+/// voice message: Discord sends no ticks while nobody is in the call.
+const VOICE_MESSAGE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// What hearing runs with.
 pub struct Config {
@@ -76,6 +89,9 @@ pub struct Config {
     pub pile: PathBuf,
     /// Where an utterance intake cannot take is kept.
     pub unstored: PathBuf,
+    /// Voice messages intake decoded, to transcribe as they come
+    /// ([`super::voice_message`]).
+    pub voice_messages: Option<mpsc::Receiver<VoiceMessage>>,
 }
 
 /// The songbird decoding hearing needs: mono at [`RATE`], as 16-bit samples
@@ -110,14 +126,14 @@ pub fn start(
     ] {
         driver.add_global_event(songbird::Event::Core(event), receiver.clone());
     }
-    let (pile, unstored) = (config.pile, config.unstored);
+    let (pile, unstored, voice_messages) = (config.pile, config.unstored, config.voice_messages);
     std::thread::Builder::new()
         .name("discord-hearing".to_owned())
         .spawn(move || {
             let load = move || -> Result<Box<dyn Transcribe>> {
                 Ok(Box::new(voxtral::Voxtral::load(&pile)?))
             };
-            hear(moments, load, channel, &intake, &unstored);
+            hear(moments, voice_messages, load, channel, &intake, &unstored);
         })
         .context("spawn the hearing thread")?;
     Ok(())
@@ -744,8 +760,11 @@ fn hear_moment<'a>(
 
 /// The hearing thread: loads the transcriber, then cuts what comes in into
 /// utterances and stores each, until the handler lets go of the channel.
+/// Voice messages are transcribed between moments, while no utterance is
+/// being recognized; one still waiting when the handler lets go is not heard.
 fn hear(
     moments: mpsc::Receiver<Moment>,
+    voice_messages: Option<mpsc::Receiver<VoiceMessage>>,
     load: impl FnOnce() -> Result<Box<dyn Transcribe>>,
     channel: u64,
     intake: &Inbox,
@@ -767,21 +786,72 @@ fn hear(
     // work stays on this thread; deferred users keep their exact captured PCM.
     let mut active = None;
     let mut listener = Listener::default();
-    for moment in moments.iter() {
-        hear_moment(
-            &*ear,
-            &mut active,
-            &mut listener,
-            moment,
-            channel,
-            intake,
-            unstored,
-        );
+    loop {
+        match moments.recv_timeout(VOICE_MESSAGE_POLL) {
+            Ok(moment) => hear_moment(
+                &*ear,
+                &mut active,
+                &mut listener,
+                moment,
+                channel,
+                intake,
+                unstored,
+            ),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if active.is_some() {
+            continue;
+        }
+        while let Some(message) = voice_messages
+            .as_ref()
+            .and_then(|queue| queue.try_recv().ok())
+        {
+            hear_voice_message(&*ear, message, intake, unstored);
+        }
     }
     listener.flush_progress(&mut |progress| {
         advance(&*ear, &mut active, progress, channel, intake, unstored)
     });
     debug_assert!(active.is_none());
+}
+
+/// Transcribe a voice message, cut where its speaker pauses ([`cut`]), and
+/// hand it to intake as one utterance of its author in its channel, as
+/// [`store_result`] stores what is said in the voice channel: the words of
+/// every piece, and the whole recording.
+fn hear_voice_message(
+    ear: &dyn Transcribe,
+    message: VoiceMessage,
+    intake: &Inbox,
+    unstored: &Path,
+) {
+    let started = Instant::now();
+    let transcribed = cut(&message.samples)
+        .iter()
+        .map(|piece| ear.transcribe(&piece.samples))
+        .collect::<Result<Vec<_>>>()
+        .map(|pieces| {
+            pieces
+                .iter()
+                .map(|words| words.trim())
+                .filter(|words| !words.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let took = started.elapsed().as_secs_f64();
+    eprintln!(
+        "[discord] voice message of user {} in channel {}: {:.1} s of audio",
+        message.user,
+        message.channel,
+        message.samples.len() as f64 / RATE as f64
+    );
+    let spoken = Spoken {
+        user: message.user,
+        start_ms: message.start_ms,
+        samples: message.samples,
+    };
+    store_result(transcribed, spoken, took, message.channel, intake, unstored);
 }
 
 /// Transcribe one utterance and hand it to intake; keep it in `unstored`
@@ -852,7 +922,7 @@ fn store_result(
 /// through the same [`Listener`] and transcriber. Each utterance is written
 /// to `out` with where it began in the clip, how long it is, how long it took
 /// to transcribe, and its words, since the clip is the caller's own. Nothing
-/// is stored.
+/// is stored. A voice message is heard this way ([`hear_voice_message`]).
 pub fn hear_clip(pile: &Path, clip: &[f32], out: &mut crate::out::Out<'_>) -> Result<()> {
     let started = Instant::now();
     let mut ear = voxtral::Voxtral::load(pile)?;
@@ -860,18 +930,7 @@ pub fn hear_clip(pile: &Path, clip: &[f32], out: &mut crate::out::Out<'_>) -> Re
         "transcriber loaded in {:.1} s",
         started.elapsed().as_secs_f64()
     ))?;
-    let mut listener = Listener::default();
-    let mut spoken = Vec::new();
-    for (tick, samples) in (0..).zip(clip.chunks(TICK)) {
-        let samples = samples.iter().map(|&s| (s * 32768.0) as i16).collect();
-        let moment = Moment {
-            at_ms: 20 * tick,
-            heard: vec![Heard::Audio { user: 0, samples }],
-        };
-        listener.hear(moment, &mut |s| spoken.push(s));
-    }
-    listener.flush(&mut |s| spoken.push(s));
-    for spoken in spoken {
+    for spoken in cut(clip) {
         let started = Instant::now();
         let text = ear.transcribe(&spoken.samples)?;
         out.line(format!(
@@ -883,6 +942,24 @@ pub fn hear_clip(pile: &Path, clip: &[f32], out: &mut crate::out::Out<'_>) -> Re
         ))?;
     }
     Ok(())
+}
+
+/// A recording of one speaker, mono at [`RATE`], cut into utterances the way
+/// the voice channel is: its 20 ms ticks through a [`Listener`] of its own.
+/// Each utterance's `start_ms` is where it begins in the recording.
+fn cut(clip: &[f32]) -> Vec<Spoken> {
+    let mut listener = Listener::default();
+    let mut spoken = Vec::new();
+    for (tick, samples) in (0..).zip(clip.chunks(TICK)) {
+        let samples = samples.iter().map(|&s| (s * 32768.0) as i16).collect();
+        let moment = Moment {
+            at_ms: 20 * tick,
+            heard: vec![Heard::Audio { user: 0, samples }],
+        };
+        listener.hear(moment, &mut |s| spoken.push(s));
+    }
+    listener.flush(&mut |s| spoken.push(s));
+    spoken
 }
 
 /// `discord warm --hear`: the transcriber loaded the way `live --hear` loads
@@ -1565,6 +1642,7 @@ mod tests {
         drop(heard);
         hear(
             moments,
+            None,
             || Ok(Box::new(FailsFirst(std::cell::Cell::new(false)))),
             7,
             &intake,
@@ -1627,6 +1705,7 @@ mod tests {
         });
         hear(
             moments,
+            None,
             || Ok(Box::new(Online(pushed))),
             7,
             &intake,
@@ -2250,6 +2329,68 @@ mod tests {
         }
     }
 
+    /// A voice message is heard while nobody speaks in the call (no tick
+    /// comes at all): cut where its speaker pauses, each piece transcribed,
+    /// and all their words go to intake as one utterance of its author in
+    /// its own channel at the moment it was sent, with the whole recording.
+    #[test]
+    fn a_voice_message_is_heard_by_the_same_transcriber() {
+        let directory = tempfile::tempdir().unwrap();
+        let unstored = directory.path().join(intake::UNSTORED_SPEECH);
+        let (sender, queue) = mpsc::channel();
+        let worker = intake::Worker::from_sender(sender);
+        let intake = worker.inbox().unwrap();
+        let (heard, moments) = mpsc::channel::<Moment>();
+        let (post, voice_messages) = mpsc::channel();
+        let text_channel = 100000000000000200;
+        let script = [
+            (false, 600),
+            (true, 800),
+            (false, 1200),
+            (true, 800),
+            (false, 1200),
+        ];
+        let samples: Vec<f32> = ticks(JP, 0, &script)
+            .into_iter()
+            .flat_map(|moment| match moment.heard.into_iter().next() {
+                Some(Heard::Audio { samples, .. }) => {
+                    samples.iter().map(|&s| s as f32 / 32768.0).collect()
+                }
+                _ => vec![0.0; TICK],
+            })
+            .collect();
+        assert_eq!(cut(&samples).len(), 2, "two pieces, cut at the pause");
+        post.send(VoiceMessage {
+            channel: text_channel,
+            user: JP,
+            start_ms: 1_790_000_000_000,
+            samples: samples.clone(),
+        })
+        .unwrap();
+        let hearing = std::thread::spawn(move || {
+            let load = || -> Result<Box<dyn Transcribe>> {
+                Ok(Box::new(Fixed(std::cell::RefCell::new(vec![
+                    Ok(" so happy ".to_owned()),
+                    Ok("the doctor came ".to_owned()),
+                ]))))
+            };
+            hear(moments, Some(voice_messages), load, 7, &intake, &unstored);
+        });
+        let Ok(Work::Utterance(utterance)) = queue.recv_timeout(std::time::Duration::from_secs(5))
+        else {
+            panic!("the voice message goes to intake");
+        };
+        drop(heard);
+        hearing.join().unwrap();
+        assert_eq!(
+            (utterance.channel, utterance.user, utterance.start_ms),
+            (text_channel, JP, 1_790_000_000_000)
+        );
+        assert_eq!(utterance.transcript, "so happy the doctor came");
+        assert_eq!(utterance.wav, wav_pcm16(&samples));
+        assert!(queue.try_recv().is_err());
+    }
+
     /// What is heard goes to intake as utterances; with intake gone, and
     /// when it cannot be transcribed, it is kept; with no words, dropped.
     #[test]
@@ -2273,7 +2414,7 @@ mod tests {
                 " hello there \n".to_owned(),
             )]))))
         };
-        hear(moments, load, 7, &intake, &unstored);
+        hear(moments, None, load, 7, &intake, &unstored);
         let Ok(Work::Utterance(utterance)) = queue.try_recv() else {
             panic!("the utterance goes to intake");
         };

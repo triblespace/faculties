@@ -30,6 +30,8 @@ pub mod render;
 pub mod say;
 #[cfg(feature = "discord-voice")]
 pub mod voice;
+#[cfg(feature = "discord-hearing")]
+pub mod voice_message;
 
 pub use operations::{
     Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord, GuildChannels, History,

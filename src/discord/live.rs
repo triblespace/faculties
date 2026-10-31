@@ -126,6 +126,19 @@ pub async fn run(live: Live) -> Result<()> {
         intents != 0,
         "nothing to run: no voice channel and no intake"
     );
+    // Voice messages intake stores go to be heard by the voice channel's
+    // transcriber.
+    #[cfg(feature = "discord-hearing")]
+    let mut live = live;
+    #[cfg(feature = "discord-hearing")]
+    if let (Some(intake), Some(hearing)) = (
+        live.intake.as_mut(),
+        live.voice.as_mut().and_then(|voice| voice.hearing.as_mut()),
+    ) {
+        let (post, voice_messages) = std::sync::mpsc::channel();
+        intake.hear_voice_messages(post);
+        hearing.voice_messages = Some(voice_messages);
+    }
     // Intake's first backfill follows the session's first READY, after the
     // bot's own account is recorded, so that its earlier messages are known
     // as its own the moment they are stored.

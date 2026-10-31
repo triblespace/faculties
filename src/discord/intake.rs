@@ -61,6 +61,15 @@
 //! there. A change whose write fails is logged and lost: Discord keeps no
 //! record of it to fetch again, and the next one stands on its own.
 //!
+//! With hearing on, a voice message (an ogg recording among a new message's
+//! attachments, [`super::voice_message`]) is heard too: once the message is
+//! stored, its recording is read back out of the pile, decoded, and handed to
+//! the hearing thread, which transcribes it with the voice channel's
+//! transcriber and sends the transcript back here as an utterance of its
+//! author in the message's channel ([`Work::Utterance`]). A recording that
+//! cannot be read, decoded or handed over is logged and not heard; the
+//! message itself is stored either way.
+//!
 //! The pile and the downloads block, so intake runs on a thread of its own,
 //! and nothing that happens there reaches the rest of the process: every
 //! failure is logged, a panic included, and the work goes on.
@@ -113,6 +122,9 @@ pub struct Intake {
     floor: u64,
     /// The bot's own user id, while it is not yet recorded.
     account: Option<String>,
+    /// Where voice messages go to be heard, with hearing on.
+    #[cfg(feature = "discord-hearing")]
+    voice_messages: Option<std::sync::mpsc::Sender<super::voice_message::VoiceMessage>>,
 }
 
 /// One piece of work for the intake thread.
@@ -191,7 +203,19 @@ impl Intake {
             directory,
             floor,
             account: None,
+            #[cfg(feature = "discord-hearing")]
+            voice_messages: None,
         }
+    }
+
+    /// Hand the recordings of new messages to `hearing`, decoded, once each
+    /// message is stored.
+    #[cfg(feature = "discord-hearing")]
+    pub fn hear_voice_messages(
+        &mut self,
+        hearing: std::sync::mpsc::Sender<super::voice_message::VoiceMessage>,
+    ) {
+        self.voice_messages = Some(hearing);
     }
 
     /// The gateway intents intake needs.
@@ -287,7 +311,73 @@ impl Intake {
                 return Err(error);
             }
         };
-        self.store(message, channel, id, floor, new_dm)
+        #[cfg(feature = "discord-hearing")]
+        let recordings = match (&self.voice_messages, created) {
+            (Some(_), true) => super::voice_message::recordings(&message)
+                .into_iter()
+                .map(|recording| (snowflake(&message["author"]["id"]), recording))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let done = self.store(message, channel, id, floor, new_dm)?;
+        #[cfg(feature = "discord-hearing")]
+        if done == Done::Stored {
+            for (author, recording) in recordings {
+                self.hear_recording(channel, id, author, recording);
+            }
+        }
+        Ok(done)
+    }
+
+    /// Read a stored message's recording back out of the pile, decode it and
+    /// hand it to the hearing thread. Nothing here fails the message: what
+    /// goes wrong is logged, and the recording is not heard.
+    #[cfg(feature = "discord-hearing")]
+    fn hear_recording(
+        &self,
+        channel: u64,
+        id: u64,
+        author: Option<u64>,
+        recording: super::voice_message::Recording,
+    ) {
+        use super::voice_message::{decode_ogg_opus, sent_ms, VoiceMessage};
+        let Some(hearing) = &self.voice_messages else {
+            return;
+        };
+        let heard = (|| -> Result<VoiceMessage> {
+            let user = author.context("the message names no author")?;
+            let bytes = self
+                .discord
+                .attachment_bytes(&recording.source_id, &recording.filename)?
+                .context("the pile holds no bytes for it")?;
+            let samples = decode_ogg_opus(&bytes)?;
+            Ok(VoiceMessage {
+                channel,
+                user,
+                start_ms: sent_ms(id),
+                samples,
+            })
+        })();
+        match heard {
+            Ok(message) => {
+                let seconds = message.samples.len() as f64 / super::voice_message::RATE as f64;
+                match hearing.send(message) {
+                    Ok(()) => eprintln!(
+                        "[discord] voice message {id} in channel {channel} ({seconds:.1} s) \
+                         goes to be heard"
+                    ),
+                    Err(_) => eprintln!(
+                        "[discord] voice message {id} in channel {channel} is not heard: \
+                         hearing is off"
+                    ),
+                }
+            }
+            Err(error) => eprintln!(
+                "[discord] voice message {id} in channel {channel} (attachment {}) is not \
+                 heard: {error:#}",
+                recording.source_id
+            ),
+        }
     }
 
     /// Store one message of `channel` unless it is at or below the channel's
@@ -2320,6 +2410,67 @@ mod tests {
         let stopping = Instant::now();
         worker.stop(Duration::from_millis(200)).await;
         assert!(stopping.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A new message with a voice recording is stored, attachment and all,
+    /// and then its recording, read back out of the pile and decoded, goes
+    /// to hearing as a voice message of its author in its channel, at the
+    /// moment it was sent. An edit is not heard again, nor is a picture.
+    #[cfg(feature = "discord-hearing")]
+    #[test]
+    fn a_voice_message_goes_to_be_heard_once_it_is_stored() {
+        use super::super::voice_message::{self, VoiceMessage};
+        let fixture = Fixture::new();
+        let mut intake = fixture.intake(&[CHANNEL], false);
+        let (post, heard) = std::sync::mpsc::channel::<VoiceMessage>();
+        intake.hear_voice_messages(post);
+        let url = "https://cdn.example/voice-message.ogg?ex=gateway";
+        fixture.fake.attachments.lock().unwrap().insert(
+            url.to_owned(),
+            voice_message::tests::ogg_opus_sine(2.0, 440.0, 10),
+        );
+        let id = "100000000000000601";
+        let mut message = rest(id, CHANNEL, "", None);
+        message["guild_id"] = json!(GUILD);
+        message["flags"] = json!(8192);
+        message["attachments"] = json!([{
+            "id": "100000000000000609", "url": url, "filename": "voice-message.ogg",
+            "content_type": "audio/ogg", "size": 4000, "duration_secs": 2.0,
+            "waveform": "AAAA"
+        }]);
+        assert_eq!(
+            intake.handle(Work::Message(message.clone())).unwrap(),
+            Done::Stored
+        );
+        assert_eq!(fixture.stored(CHANNEL), [(String::new(), 1, 1)]);
+        let voice = heard.try_recv().expect("the recording goes to be heard");
+        assert_eq!(
+            (voice.channel, voice.user, voice.start_ms),
+            (
+                CHANNEL,
+                AUTHOR.parse().unwrap(),
+                voice_message::sent_ms(id.parse().unwrap())
+            )
+        );
+        assert_eq!(voice.samples.len(), 2 * voice_message::RATE);
+        assert!(heard.try_recv().is_err(), "one recording, heard once");
+
+        message["edited_timestamp"] = json!("2026-09-26T08:01:00Z");
+        intake.handle(Work::Update(message)).unwrap();
+        assert!(heard.try_recv().is_err(), "an edit is not heard again");
+
+        fixture.fake.attachments.lock().unwrap().insert(
+            "https://cdn.example/photo.png?ex=rest".to_owned(),
+            b"\x89PNG".to_vec(),
+        );
+        let picture = rest(
+            "100000000000000602",
+            CHANNEL,
+            "look",
+            Some("https://cdn.example/photo.png?ex=rest"),
+        );
+        assert_eq!(intake.handle(Work::Message(picture)).unwrap(), Done::Stored);
+        assert!(heard.try_recv().is_err(), "a picture is not heard");
     }
 
     #[test]
