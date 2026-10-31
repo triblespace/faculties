@@ -738,7 +738,6 @@ fn lazy_store(
             daemon,
             provider_publication_budget: Some(0),
             bind: None,
-            walk_algorithm: triblespace_net::walk_stream::Algorithm::default(),
         },
     ))
 }
