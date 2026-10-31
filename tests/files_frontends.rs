@@ -375,13 +375,17 @@ fn selected_file_emission_failure_propagates_without_retrying_output() {
 #[cfg(unix)]
 #[test]
 fn executable_mcp_preserves_native_paths_and_isolates_standard_stream_aliases() {
+    #[cfg(not(target_os = "macos"))]
     use std::os::unix::ffi::OsStringExt;
 
+    // macOS rejects ill-formed UTF-8 before the frontend can be exercised.
+    #[cfg(target_os = "macos")]
+    let native_name = std::ffi::OsString::from("native-λ");
+    #[cfg(not(target_os = "macos"))]
+    let native_name = std::ffi::OsString::from_vec(b"native-\xff".to_vec());
+
     let mut fixture = Fixture::new();
-    let native_directory = fixture
-        ._directory
-        .path()
-        .join(std::ffi::OsString::from_vec(b"native-\xff".to_vec()));
+    let native_directory = fixture._directory.path().join(native_name);
     fs::create_dir(&native_directory).unwrap();
     let pile = native_directory.join("files.pile");
     let key = native_directory.join("explicit.key");
