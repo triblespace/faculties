@@ -12403,7 +12403,6 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-mdns-address-lookup",
- "memmap2",
  "netwatch",
  "rand 0.8.7",
  "riblt",
