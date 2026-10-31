@@ -364,6 +364,92 @@ fn create_tag_is_repeatable_and_tag_lists_agree_across_cli_and_mcp() {
 }
 
 #[test]
+fn context_tag_filters_agree_across_library_cli_and_mcp() {
+    let fixture = Fixture::new();
+    fixture.cli(&[
+        "create",
+        "--tag",
+        "Design",
+        "--tag",
+        "bullet",
+        "2026-09-01T00:00:00..2026-09-01T06:00:00",
+        "a tagged design bullet",
+    ]);
+    fixture.call(
+        "memory_create",
+        json!({"range":"2026-09-02T00:00:00..2026-09-02T06:00:00","summary":"a design note","tags":["design"]}),
+    );
+    fixture.cli(&[
+        "create",
+        "2026-09-03T00:00:00..2026-09-03T06:00:00",
+        "an untagged memory",
+    ]);
+    let shown = |cover: &str| -> Vec<&'static str> {
+        [
+            "a tagged design bullet",
+            "a design note",
+            "an untagged memory",
+        ]
+        .into_iter()
+        .filter(|summary| cover.contains(summary))
+        .collect()
+    };
+    let cases: [(&[&str], &[&str], &[&str], Value, &[&str]); 4] = [
+        (
+            &["--tag", "design"],
+            &["design"],
+            &[],
+            json!({"budget_chars":10_000,"tags":["design"]}),
+            &["a tagged design bullet", "a design note"],
+        ),
+        (
+            &["--tag", "DESIGN", "--tag", "bullet"],
+            &["design", "bullet"],
+            &[],
+            json!({"budget_chars":10_000,"tags":["DESIGN","bullet"]}),
+            &["a tagged design bullet"],
+        ),
+        (
+            &["--without-tag", "design"],
+            &[],
+            &["design"],
+            json!({"budget_chars":10_000,"without_tags":["design"]}),
+            &["an untagged memory"],
+        ),
+        (
+            &["--tag", "design", "--without-tag", "bullet"],
+            &["design"],
+            &["bullet"],
+            json!({"budget_chars":10_000,"tags":["design"],"without_tags":["bullet"]}),
+            &["a design note"],
+        ),
+    ];
+    for (argv, tags, without, arguments, expected) in cases {
+        let mut options = CoverOpts::plain(10_000);
+        options.tags = tags.iter().map(|tag| (*tag).to_owned()).collect();
+        options.without_tags = without.iter().map(|tag| (*tag).to_owned()).collect();
+        let report = fixture.memory().context(&options).unwrap();
+        assert_eq!(shown(&report.text), expected, "{argv:?}: {}", report.text);
+        let mut cli_argv = vec!["context", "--chars", "10000"];
+        cli_argv.extend_from_slice(argv);
+        assert_eq!(text(&fixture.cli(&cli_argv)), report.text, "{argv:?}");
+        let mcp = fixture.call("memory_context", arguments);
+        assert_eq!(
+            mcp[0],
+            Part::Text {
+                text: report.text.clone()
+            },
+            "{argv:?}"
+        );
+    }
+    // A multi-word `--about` query stops at `--tag`, which takes one argument.
+    assert_eq!(
+        text(&fixture.cli(&["context", "--about", "design", "work", "--tag", "bullet", "10000"])),
+        text(&fixture.cli(&["context", "10000", "--tag", "bullet"]))
+    );
+}
+
+#[test]
 fn respan_moves_coordinates_without_changing_the_episode_or_its_hard_references() {
     let fixture = Fixture::new();
     let original = fixture

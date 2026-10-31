@@ -346,6 +346,8 @@ fn build_context_cover(
         filter: filter_q.map(str::to_owned),
         remove: remove_q.map(str::to_owned),
         sim_threshold,
+        tags: Vec::new(),
+        without_tags: Vec::new(),
     };
     Ok(crate::memory_cover::render_cover_report(
         &loaded.memory.facts,

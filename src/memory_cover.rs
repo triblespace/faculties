@@ -6,7 +6,8 @@
 //! persona's memories, fit to a character budget and rendered to a string.
 //! Keeping the render (and the chunk accessors it needs) here means the two
 //! callers can never drift: the recollection semantics, character budget, and
-//! `--about`/`--filter`/`--remove` composition live in exactly one place.
+//! `--about`/`--filter`/`--remove`/`--tag`/`--without-tag` composition live
+//! in exactly one place.
 //! Context never gets to rewrite the temporal structure:
 //! `--about` may choose one recollection among entries with the exact same
 //! temporal coverage, but cannot change which spans the cover refines.
@@ -404,6 +405,13 @@ pub struct CoverOpts {
     pub remove: Option<String>,
     /// Cosine cutoff for `--filter`/`--remove` eligibility.
     pub sim_threshold: f32,
+    /// `--tag <tag>` (repeatable): keep ONLY memories carrying every one of
+    /// these tags. Crisp, where `--filter` is fuzzy: a memory carries a tag or
+    /// it does not. Names are trimmed and lowercased, as `memory create --tag`
+    /// writes them.
+    pub tags: Vec<String>,
+    /// `--without-tag <tag>` (repeatable): drop memories carrying any of these.
+    pub without_tags: Vec<String>,
 }
 
 impl CoverOpts {
@@ -416,6 +424,8 @@ impl CoverOpts {
             filter: None,
             remove: None,
             sim_threshold: DEFAULT_SIM_THRESHOLD,
+            tags: Vec::new(),
+            without_tags: Vec::new(),
         }
     }
 }
@@ -943,6 +953,19 @@ where
     let filter_q = opts.filter.as_deref();
     let remove_q = opts.remove.as_deref();
     let sim_threshold = opts.sim_threshold;
+    // Tag names as `memory create --tag` writes them: trimmed and lowercased.
+    let normalize = |names: &[String]| -> Result<BTreeSet<String>> {
+        names
+            .iter()
+            .map(|name| {
+                let name = name.trim().to_lowercase();
+                anyhow::ensure!(!name.is_empty(), "memory context tag must not be empty");
+                Ok(name)
+            })
+            .collect()
+    };
+    let with_tags = normalize(&opts.tags)?;
+    let without_tags = normalize(&opts.without_tags)?;
 
     let mut diagnostics = Vec::new();
     let mut out = String::new();
@@ -1002,7 +1025,47 @@ where
     // coarse. A removed chunk must never be emitted at any granularity
     // (enforced by gating the selected cover below). Both compose with each
     // other and with `--about`.
-    let universe: Vec<Id> = raw_spans.iter().map(|s| s.2).collect();
+    //
+    // `--tag` and `--without-tag` are the crisp gates beside them: a memory
+    // carries a tag or it does not, so no score and no threshold. A tag is
+    // matched by its NAME, as `memory tag <tag>` matches it: the `metadata::tag`
+    // edge reaches an entity whose `metadata::name` is exactly the normalized
+    // text, compared by content handle inside the pattern. Every gate must
+    // pass, so repeated `--tag`s intersect (AND, like `--filter` with
+    // `--remove`) and any one `--without-tag` excludes.
+    let carrying = |name: &str| -> BTreeSet<Id> {
+        let name: Inline<Handle<UTF8String>> = name.to_owned().to_blob().get_handle();
+        find!(
+            chunk: Id,
+            pattern!(space, [
+                { ?chunk @ metadata::tag: &KIND_CHUNK_ID, metadata::tag: _?tag },
+                { _?tag @ metadata::name: name },
+            ])
+        )
+        .collect()
+    };
+    let mut required: Option<BTreeSet<Id>> = None;
+    for name in &with_tags {
+        let tagged = carrying(name);
+        required = Some(match required {
+            Some(kept) => kept.intersection(&tagged).copied().collect(),
+            None => tagged,
+        });
+    }
+    let excluded: BTreeSet<Id> = without_tags
+        .iter()
+        .flat_map(|name| carrying(name))
+        .collect();
+    let tag_eligible =
+        |id: &Id| required.as_ref().is_none_or(|kept| kept.contains(id)) && !excluded.contains(id);
+    // The scored gates assess only what the crisp gates let through: that is
+    // the exact set of chunks that can still appear, so an unscorable warning
+    // never names a memory the tags already ruled out.
+    let universe: Vec<Id> = raw_spans
+        .iter()
+        .map(|s| s.2)
+        .filter(|id| tag_eligible(id))
+        .collect();
     let filter_elig = match filter_q {
         Some(q) => Some(eligibility_scores(space, reader, q, &universe, semantic)?),
         None => None,
@@ -1022,6 +1085,9 @@ where
         }
     }
     let eligible_id = |id: Id| -> bool {
+        if !tag_eligible(&id) {
+            return false;
+        }
         if let Some((scores, _)) = &filter_elig {
             if let Some(v) = scores.get(&id) {
                 if *v <= sim_threshold {
@@ -1104,6 +1170,19 @@ where
         }
         if let Some(q) = remove_q {
             parts.push(format!("excluding \"{q}\""));
+        }
+        let quoted = |names: &BTreeSet<String>, joint: &str| {
+            names
+                .iter()
+                .map(|name| format!("\"{name}\""))
+                .collect::<Vec<_>>()
+                .join(joint)
+        };
+        if !with_tags.is_empty() {
+            parts.push(format!("tagged {}", quoted(&with_tags, " and ")));
+        }
+        if !without_tags.is_empty() {
+            parts.push(format!("without tag {}", quoted(&without_tags, " or ")));
         }
         format!("greedy SPACE order; {}", parts.join("; "))
     };
@@ -1316,6 +1395,151 @@ mod recollection_tests {
             "{:?}",
             removed.diagnostics
         );
+    }
+
+    /// `--tag` and `--without-tag` are crisp eligibility gates: a memory carries
+    /// the tag or it does not, so they never ask the scorer. Repeated `--tag`s
+    /// intersect, any `--without-tag` excludes, names normalize as on create,
+    /// and the gates compose with `--about` (which still chooses only among
+    /// eligible equal-span memories) and with `--filter`.
+    #[test]
+    fn tag_gates_are_crisp_and_compose_with_about_and_filter() {
+        use triblespace::core::blob::MemoryBlobStore;
+        use triblespace::core::repo::SnapshotSource;
+        const D: Id = id_hex!("C1000000000000000000000000000004");
+        let point = |seconds: f64| {
+            let epoch = Epoch::from_tai_seconds(seconds);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let mut blobs = MemoryBlobStore::new();
+        let mut facts = Fragment::empty();
+        for (id, summary, from, to, tags) in [
+            (A, "amber lamps in the hall", 0.0, 100.0, &["home"][..]),
+            (B, "a quiet evening reading", 0.0, 100.0, &[][..]),
+            (
+                C,
+                "a walk by the river",
+                200.0,
+                300.0,
+                &["Home", "outside"][..],
+            ),
+            (D, "an untagged later note", 400.0, 500.0, &[][..]),
+        ] {
+            let handle = blobs.insert(summary.to_owned().to_blob());
+            facts += entity! {
+                ExclusiveId::force_ref(&id) @
+                metadata::tag: &KIND_CHUNK_ID,
+                ctx::summary: handle,
+                ctx::start_at: point(from),
+                ctx::end_at: point(to),
+            };
+            for tag in tags {
+                facts += crate::memory::tag_fragment(id, tag).unwrap();
+            }
+        }
+        let reader = blobs.snapshot().expect("in-memory snapshot is infallible");
+        let tagged = |tags: &[&str], without: &[&str]| CoverOpts {
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            without_tags: without.iter().map(|tag| (*tag).to_owned()).collect(),
+            ..CoverOpts::plain(10_000)
+        };
+        let shown = |options: &CoverOpts, semantic: &mut Semantic<'_>| -> Vec<&'static str> {
+            let report = render_cover_report(facts.facts(), &reader, options, semantic).unwrap();
+            [
+                "amber lamps in the hall",
+                "a quiet evening reading",
+                "a walk by the river",
+                "an untagged later note",
+            ]
+            .into_iter()
+            .filter(|summary| report.text.contains(summary))
+            .collect()
+        };
+        let crisp = |options: &CoverOpts| {
+            shown(options, &mut |_| {
+                panic!("a crisp tag gate asked the scorer")
+            })
+        };
+
+        // Untagged B shares A's span; `--tag` keeps the tagged one only, and
+        // the name normalizes as `memory create --tag` writes it.
+        assert_eq!(
+            crisp(&tagged(&[" HOME "], &[])),
+            ["amber lamps in the hall", "a walk by the river"]
+        );
+        assert_eq!(
+            crisp(&tagged(&[], &["home"])),
+            ["a quiet evening reading", "an untagged later note"]
+        );
+        // Repeated `--tag`s intersect; `--without-tag` removes from what is left.
+        assert_eq!(
+            crisp(&tagged(&["home", "outside"], &[])),
+            ["a walk by the river"]
+        );
+        assert_eq!(
+            crisp(&tagged(&["home"], &["outside"])),
+            ["amber lamps in the hall"]
+        );
+        // A tag nothing carries leaves nothing eligible, and says so.
+        let none = render_cover_report(
+            facts.facts(),
+            &reader,
+            &tagged(&["absent"], &[]),
+            &mut |_| panic!("asked"),
+        )
+        .unwrap();
+        assert_eq!(none.text, "");
+        assert!(
+            none.diagnostics
+                .iter()
+                .any(|line| line.contains("0 of 0 eligible") && line.contains("tagged \"absent\"")),
+            "{:?}",
+            none.diagnostics
+        );
+        assert!(
+            render_cover_report(facts.facts(), &reader, &tagged(&["  "], &[]), &mut |_| Ok(
+                None
+            ))
+            .is_err()
+        );
+
+        // With `--about`, meaning prefers the untagged reading in A's span;
+        // `--tag home` makes it ineligible, so the tagged lamps stand there.
+        let about = |tags: &[&str]| CoverOpts {
+            about: Some("reading".to_owned()),
+            ..tagged(tags, &[])
+        };
+        let by_meaning = || -> Result<Option<HashMap<Id, f32>>> {
+            Ok(Some(HashMap::from([(A, 0.1), (B, 0.9)])))
+        };
+        assert_eq!(
+            shown(&about(&[]), &mut |_| by_meaning()),
+            [
+                "a quiet evening reading",
+                "a walk by the river",
+                "an untagged later note"
+            ]
+        );
+        assert_eq!(
+            shown(&about(&["home"]), &mut |_| by_meaning()),
+            ["amber lamps in the hall", "a walk by the river"]
+        );
+
+        // With `--filter`, the fuzzy gate scores only what the crisp gates
+        // let through, and both must pass.
+        let mut scored = Vec::new();
+        let filtered = CoverOpts {
+            filter: Some("later".to_owned()),
+            ..tagged(&[], &["home"])
+        };
+        assert_eq!(
+            shown(&filtered, &mut |_| {
+                scored.push(());
+                Ok(Some(HashMap::from([(C, 0.9), (D, 0.9), (B, 0.1)])))
+            }),
+            ["an untagged later note"]
+        );
+        assert_eq!(scored.len(), 1);
     }
 
     #[test]

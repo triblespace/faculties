@@ -88,8 +88,8 @@ static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "memory_context",
-        description: "Greedy density-shaped, deliberately lossy recollection in selected SPACE order. First text part is exact charged cover text; later diagnostic part is outside its budget. Filters are chunk-level: coarse prose can mention excluded material, and unscorable images fail open with explicit warnings.",
-        input_schema: r#"{"type":"object","properties":{"budget_chars":{"type":"integer","minimum":0,"default":200000},"chunk_overhead":{"type":"integer","minimum":0,"default":0},"about":{"type":"string"},"filter":{"type":"string"},"remove":{"type":"string"},"sim_threshold":{"type":"number","minimum":0,"maximum":1,"default":0.55}},"required":[],"additionalProperties":false}"#,
+        description: "Greedy density-shaped, deliberately lossy recollection in selected SPACE order. First text part is exact charged cover text; later diagnostic part is outside its budget. Filters are chunk-level: coarse prose can mention excluded material, and unscorable images fail open with explicit warnings. filter/remove are fuzzy (similarity over a threshold); tags/without_tags are crisp (a memory carries the tag or not); all compose.",
+        input_schema: r#"{"type":"object","properties":{"budget_chars":{"type":"integer","minimum":0,"default":200000},"chunk_overhead":{"type":"integer","minimum":0,"default":0},"about":{"type":"string"},"filter":{"type":"string"},"remove":{"type":"string"},"sim_threshold":{"type":"number","minimum":0,"maximum":1,"default":0.55},"tags":{"type":"array","items":{"type":"string","minLength":1},"description":"Keep only memories carrying every one of these tags."},"without_tags":{"type":"array","items":{"type":"string","minLength":1},"description":"Drop memories carrying any of these tags."}},"required":[],"additionalProperties":false}"#,
     },
     Tool {
         name: "memory_tag",
@@ -169,7 +169,7 @@ arguments!(Respan {
     range: String
 });
 arguments!(Repair { dry_run: Option<bool> });
-arguments!(ContextArgs { budget_chars: Option<usize>, chunk_overhead: Option<usize>, about: Option<String>, filter: Option<String>, remove: Option<String>, sim_threshold: Option<f32> });
+arguments!(ContextArgs { budget_chars: Option<usize>, chunk_overhead: Option<usize>, about: Option<String>, filter: Option<String>, remove: Option<String>, sim_threshold: Option<f32>, tags: Option<Vec<String>>, without_tags: Option<Vec<String>> });
 arguments!(Tag { tag: Option<String> });
 arguments!(Grain { grain: String });
 arguments!(OptionalGrain { grain: Option<String> });
@@ -278,6 +278,8 @@ impl Faculty for Memory {
                 options.sim_threshold = args
                     .sim_threshold
                     .unwrap_or(crate::memory_cover::DEFAULT_SIM_THRESHOLD);
+                options.tags = args.tags.unwrap_or_default();
+                options.without_tags = args.without_tags.unwrap_or_default();
                 emit_context(memory.context(&options)?, out)
             }
             "memory_tag" => {

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] — density-shaped, deliberately lossy recollection over journaled time in greedy SPACE order, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, wobbling temporal centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic through the WeMM index when WEMM_PILE names the model and `memory index` has rows; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). They compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unindexed wordless images are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] [--tag <tag>]... [--without-tag <tag>]... — density-shaped, deliberately lossy recollection over journaled time in greedy SPACE order, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, wobbling temporal centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic through the WeMM index when WEMM_PILE names the model and `memory index` has rows; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). --tag <tag> (repeatable) is the crisp counterpart of --filter: keeps ONLY memories carrying every given tag (AND); --without-tag <tag> (repeatable) drops memories carrying any of them; names are trimmed and lowercased as `create --tag` writes them, and no score or threshold is involved. They all compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unindexed wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
@@ -308,6 +308,10 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
     let mut filter_q: Option<String> = None;
     let mut remove_q: Option<String> = None;
     let mut sim_threshold: f32 = DEFAULT_SIM_THRESHOLD;
+    // `--tag <tag>` / `--without-tag <tag>` (each repeatable, one argument per
+    // occurrence as on `create --tag`) gate eligibility crisply by tag.
+    let mut tags: Vec<String> = Vec::new();
+    let mut without_tags: Vec<String> = Vec::new();
     // `--chars N` (canonical) / `--tokens N` (alias) name the budget explicitly;
     // when present either wins over the bare positional (a backward-compatible
     // fallback — it also means characters).
@@ -326,6 +330,8 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
                     | "--chars"
                     | "--chunk-overhead"
                     | "--sim-threshold"
+                    | "--tag"
+                    | "--without-tag"
             )
         };
         let mut i = 0;
@@ -343,6 +349,19 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
                     _ => remove_q = q,
                 }
                 i = j;
+                continue;
+            }
+            if args[i] == "--tag" || args[i] == "--without-tag" {
+                let flag = args[i].as_str();
+                let tag = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow!("{flag} needs a tag name, e.g. `{flag} design`"))?;
+                if flag == "--tag" {
+                    tags.push(tag.clone());
+                } else {
+                    without_tags.push(tag.clone());
+                }
+                i += 2;
                 continue;
             }
             if args[i] == "--sim-threshold" {
@@ -397,6 +416,8 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
         filter: filter_q,
         remove: remove_q,
         sim_threshold,
+        tags,
+        without_tags,
     })
 }
 
