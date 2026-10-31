@@ -941,13 +941,24 @@ enum Named {
 /// a prefix no projection matches is resolved against `blocks`. A prefix
 /// matching more than one id of the kind it is resolved against is refused
 /// with the count; it is never narrowed to one.
-fn resolve_archive_prefix<B: IntoIterator<Item = Id>>(
-    projections: impl IntoIterator<Item = Id>,
+///
+/// A whole id (32 hexadecimal digits) can match at most itself, so it is
+/// handed to `exact` and nothing is enumerated: on the live archive the node
+/// scan took 126 s, and a stdio MCP server dispatches sequentially, so every
+/// call queued behind such a `show` waited for it too.
+fn resolve_archive_prefix<P: IntoIterator<Item = Id>, B: IntoIterator<Item = Id>>(
+    exact: impl FnOnce(Id) -> Option<Named>,
+    projections: impl FnOnce() -> P,
     blocks: impl FnOnce() -> B,
     prefix: &str,
 ) -> Result<Named> {
     let prefix = normalize_prefix(prefix)?;
-    let projections = matching(projections, &prefix);
+    if prefix.len() == 32 {
+        return Id::from_hex(&prefix)
+            .and_then(exact)
+            .ok_or_else(|| anyhow!("no Archive source projection or block matches {prefix}"));
+    }
+    let projections = matching(projections(), &prefix);
     match projections.len() {
         0 => {}
         1 => return Ok(Named::Projection(*projections.first().expect("one match"))),
@@ -1082,12 +1093,25 @@ fn newest_projections(facts: &FactArchive, limit: usize) -> Vec<Id> {
 /// [`resolve_archive_prefix`] over the archive's projections and nodes.
 fn resolve_in(facts: &FactArchive, prefix: &str) -> Result<Named> {
     resolve_archive_prefix(
-        find!(
-            projection: Id,
-            pattern!(facts, [{
-                ?projection @ metadata::tag: &archive_schema::source_projection::KIND
-            }])
-        ),
+        |id| {
+            if exists!(pattern!(facts, [{
+                id @ metadata::tag: &archive_schema::source_projection::KIND
+            }])) {
+                Some(Named::Projection(id))
+            } else if exists!(pattern!(facts, [{ id @ archive_schema::block::holds: _?fact }])) {
+                Some(Named::Block(id))
+            } else {
+                None
+            }
+        },
+        || {
+            find!(
+                projection: Id,
+                pattern!(facts, [{
+                    ?projection @ metadata::tag: &archive_schema::source_projection::KIND
+                }])
+            )
+        },
         // Nodes as search finds them: whatever holds a content fact.
         || {
             find!(
@@ -1432,9 +1456,9 @@ fn run_search(
         if receipt_ids.is_empty() {
             receipt_ids.push("-".to_owned());
         }
+        // The whole node id, so `show` and `thread` look it up directly.
         out.line(format!(
-            "{score:.4} {} receipt {}{turn} {}",
-            short_id(block),
+            "{score:.4} {block:X} receipt {}{turn} {}",
             receipt_ids.join(","),
             block_snippet(&facts, observed.snapshot(), block)?,
         ))?;
@@ -2605,7 +2629,9 @@ mod tests {
     fn a_show_prefix_names_one_projection_or_one_block_and_never_picks() {
         let id = |byte: u8| Id::new([byte; 16]).unwrap();
         let (projection, block, twin) = (id(0xA1), id(0xB1), id(0xB2));
-        let resolve = |prefix: &str| resolve_archive_prefix([projection], || [block, twin], prefix);
+        let resolve = |prefix: &str| {
+            resolve_archive_prefix(|_| None, || [projection], || [block, twin], prefix)
+        };
         assert_eq!(resolve("a1").unwrap(), Named::Projection(projection));
         assert_eq!(resolve("B1").unwrap(), Named::Block(block));
         let error = resolve("B").unwrap_err().to_string();
@@ -2616,12 +2642,13 @@ mod tests {
         // One receipt wins over a block sharing its prefix: its projection
         // already prints its blocks.
         assert_eq!(
-            resolve_archive_prefix([id(0xC1)], || [id(0xC2)], "C").unwrap(),
+            resolve_archive_prefix(|_| None, || [id(0xC1)], || [id(0xC2)], "C").unwrap(),
             Named::Projection(id(0xC1))
         );
         // Several receipts are refused before any block is looked at.
         let receipts = resolve_archive_prefix(
-            [id(0xE1), id(0xE2)],
+            |_| None,
+            || [id(0xE1), id(0xE2)],
             || -> [Id; 0] { panic!("blocks enumerated") },
             "E",
         )
@@ -2633,11 +2660,41 @@ mod tests {
         // A single receipt match never enumerates the blocks.
         let untouched = std::iter::from_fn(|| -> Option<Id> { panic!("blocks enumerated") });
         assert_eq!(
-            resolve_archive_prefix([projection], || untouched, "A1").unwrap(),
+            resolve_archive_prefix(|_| None, || [projection], || untouched, "A1").unwrap(),
             Named::Projection(projection)
         );
         let none = resolve("D").unwrap_err().to_string();
         assert_eq!(none, "no Archive source projection or block matches D");
+    }
+
+    /// A whole id is looked up, never matched against an enumeration: on the
+    /// live archive the node scan alone took 126 s per `show`, and the stdio
+    /// MCP server is sequential, so every call queued behind it waited too.
+    #[test]
+    fn a_whole_id_is_looked_up_without_enumerating_anything() {
+        let block = Id::new([0xB1; 16]).unwrap();
+        let whole = format!("{block:x}");
+        let enumerated = || -> std::iter::Empty<Id> { panic!("ids enumerated") };
+        assert_eq!(
+            resolve_archive_prefix(
+                |id| (id == block).then_some(Named::Block(id)),
+                enumerated,
+                enumerated,
+                &whole,
+            )
+            .unwrap(),
+            Named::Block(block)
+        );
+        let missing = resolve_archive_prefix(|_| None, enumerated, enumerated, &whole)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            missing,
+            format!(
+                "no Archive source projection or block matches {}",
+                whole.to_uppercase()
+            )
+        );
     }
 
     /// Everything one command printed as text.
@@ -2679,6 +2736,9 @@ mod tests {
         let words: Vec<&str> = hit.split_whitespace().collect();
         let (block, receipts) = (words[1], words[3]);
         assert_eq!(words[2], "receipt", "{hit}");
+        // The hit leads with the whole node id, which `show` looks up
+        // directly instead of matching it against every node.
+        assert_eq!(block.len(), 32, "{hit}");
 
         let shown = printed(|out| run_show(storage(&fixture), block, out)).unwrap();
         assert!(shown.starts_with(&format!("block: {block}")), "{shown}");
