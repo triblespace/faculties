@@ -666,17 +666,33 @@ struct RequiredMessageFields {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct SemanticState {
     fields: RequiredMessageFields,
-    edited_at: Option<Inline<NsTAIInterval>>,
-    reply_to: Option<Id>,
+    edited_at: BTreeSet<Inline<NsTAIInterval>>,
+    reply_to: BTreeSet<Id>,
     attachments: BTreeSet<Id>,
+}
+
+impl SemanticState {
+    /// The official version time: the latest edit asserted for the state,
+    /// else its creation.
+    fn version_key(&self) -> i128 {
+        self.edited_at
+            .iter()
+            .map(|at| interval_key(*at))
+            .max()
+            .unwrap_or_else(|| interval_key(self.fields.created_at))
+    }
 }
 
 /// One distinct semantic state at the maximal official version timestamp for
 /// a Discord message anchor.
 ///
 /// Ordinarily `variant_count == 1`. If Discord supplied two different states
-/// with the same maximal `edited_timestamp`, every state is returned and the
+/// with the same maximal `edited_timestamp`, or one observation carries several
+/// required projections (two contents, say), every state is returned and the
 /// caller can expose the conflict instead of selecting one arbitrarily.
+///
+/// `edited_at` and `reply_to` are sets: the writer asserts at most one of each,
+/// and a record that carries more is shown with all of them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectedMessageVersion {
     pub observation: Id,
@@ -684,9 +700,9 @@ pub struct SelectedMessageVersion {
     pub content: TextHandle,
     pub author: Id,
     pub created_at: Inline<NsTAIInterval>,
-    pub edited_at: Option<Inline<NsTAIInterval>>,
+    pub edited_at: BTreeSet<Inline<NsTAIInterval>>,
     pub channel: Id,
-    pub reply_to: Option<Id>,
+    pub reply_to: BTreeSet<Id>,
     pub attachments: BTreeSet<Id>,
     /// Somebody coming into or leaving a voice channel, when the message is
     /// that notice ([`presence_fragment`]): what to present instead of its
@@ -701,6 +717,11 @@ pub struct SelectedMessageVersion {
 /// Identity is the full modeled semantic state, not a serialized REST payload.
 /// Equal states collapse even if redundant provenance happened to give them
 /// distinct entity ids; divergent maximal states remain visible.
+///
+/// The read never refuses because of what one record holds. Edits, reply
+/// targets and attachments are facts about the observation, so each of its
+/// required projections carries all of them; two projections are two shown
+/// alternatives, and independent values are never paired with each other.
 pub fn select_messages<P>(
     facts: &P,
     channel_filter: Option<Id>,
@@ -794,50 +815,36 @@ where
 
     let mut by_anchor: BTreeMap<Id, BTreeMap<SemanticState, BTreeSet<Id>>> = BTreeMap::new();
     for (observation, candidates) in required {
-        if candidates.len() != 1 {
-            bail!(
-                "Discord observation {observation:X} has {} conflicting required projections",
-                candidates.len()
-            );
+        let edited_at = edits.remove(&observation).unwrap_or_default();
+        let reply_to = replies.remove(&observation).unwrap_or_default();
+        let attachments = attachments.remove(&observation).unwrap_or_default();
+        for fields in candidates {
+            let anchor = fields.anchor;
+            let state = SemanticState {
+                fields,
+                edited_at: edited_at.clone(),
+                reply_to: reply_to.clone(),
+                attachments: attachments.clone(),
+            };
+            by_anchor
+                .entry(anchor)
+                .or_default()
+                .entry(state)
+                .or_default()
+                .insert(observation);
         }
-        let fields = candidates
-            .into_iter()
-            .next()
-            .expect("one required projection");
-        let edited_values = edits.remove(&observation).unwrap_or_default();
-        if edited_values.len() > 1 {
-            bail!("Discord observation {observation:X} has conflicting edited timestamps");
-        }
-        let reply_values = replies.remove(&observation).unwrap_or_default();
-        if reply_values.len() > 1 {
-            bail!("Discord observation {observation:X} has conflicting reply targets");
-        }
-        let state = SemanticState {
-            edited_at: edited_values.into_iter().next(),
-            reply_to: reply_values.into_iter().next(),
-            attachments: attachments.remove(&observation).unwrap_or_default(),
-            fields: fields.clone(),
-        };
-        by_anchor
-            .entry(fields.anchor)
-            .or_default()
-            .entry(state)
-            .or_default()
-            .insert(observation);
     }
 
     let mut selected = Vec::new();
     for (anchor, states) in by_anchor {
         let maximal_time = states
             .keys()
-            .map(|state| interval_key(state.edited_at.unwrap_or(state.fields.created_at)))
+            .map(SemanticState::version_key)
             .max()
             .expect("message anchor group is non-empty");
         let maximal = states
             .into_iter()
-            .filter(|(state, _)| {
-                interval_key(state.edited_at.unwrap_or(state.fields.created_at)) == maximal_time
-            })
+            .filter(|(state, _)| state.version_key() == maximal_time)
             .collect::<Vec<_>>();
         let variant_count = maximal.len();
         for (variant_index, (state, observations)) in maximal.into_iter().enumerate() {
@@ -881,7 +888,9 @@ where
 ///
 /// Discord's REST message object does not version profile fields. If several
 /// names have been observed, all distinct names are shown rather than making a
-/// false latest-name claim.
+/// false latest-name claim. An anchor without names is labelled by its
+/// external ids, all of them if a record gave it several; a profile naming an
+/// anchor nobody typed as a user is still labelled by its names.
 pub fn user_labels<P>(facts: &P, reader: &impl BlobStoreGet) -> Result<BTreeMap<Id, String>>
 where
     P: TriblePattern,
@@ -918,30 +927,8 @@ where
             .insert(read_text(reader, handle, "Discord user id")?);
     }
 
-    for (user, ids) in &external {
-        if ids.len() != 1 {
-            bail!(
-                "Discord user anchor {user:X} has {} conflicting external ids",
-                ids.len()
-            );
-        }
-    }
-    for user in names.keys() {
-        if !external.contains_key(user) {
-            bail!("Discord profile points to untyped user anchor {user:X}");
-        }
-    }
-
-    let mut labels = BTreeMap::new();
-    for (user, ids) in external {
-        let observed = names.remove(&user).unwrap_or_default();
-        let label = if observed.is_empty() {
-            ids.into_iter().next().expect("one validated user id")
-        } else {
-            observed.into_iter().collect::<Vec<_>>().join(" / ")
-        };
-        labels.insert(user, label);
-    }
+    let mut labels = joined_labels(external);
+    labels.extend(joined_labels(names));
     Ok(labels)
 }
 
@@ -963,24 +950,15 @@ where
             .or_default()
             .insert(read_text(reader, handle, "Discord channel id")?);
     }
-    exact_labels(values, "channel")
+    Ok(joined_labels(values))
 }
 
-fn exact_labels(
-    values: BTreeMap<Id, BTreeSet<String>>,
-    subject: &str,
-) -> Result<BTreeMap<Id, String>> {
+/// Every distinct value of an anchor, in order, joined: several values are
+/// shown together rather than one chosen.
+fn joined_labels(values: BTreeMap<Id, BTreeSet<String>>) -> BTreeMap<Id, String> {
     values
         .into_iter()
-        .map(|(id, candidates)| {
-            if candidates.len() != 1 {
-                bail!(
-                    "Discord {subject} anchor {id:X} has {} conflicting external ids",
-                    candidates.len()
-                );
-            }
-            Ok((id, candidates.into_iter().next().expect("one value")))
-        })
+        .map(|(id, values)| (id, values.into_iter().collect::<Vec<_>>().join(" / ")))
         .collect()
 }
 
@@ -1512,6 +1490,106 @@ mod tests {
         .collect();
         let wav: anybytes::Bytes = reader.get(audio[0]).unwrap();
         assert_eq!(&wav[..], b"RIFF and the rest");
+    }
+
+    /// One observation carrying two edited timestamps, two reply targets and
+    /// two contents is something somebody asserted, not a broken collection:
+    /// the read shows every attributed alternative instead of refusing every
+    /// channel because of one record.
+    #[test]
+    fn an_observation_with_several_values_is_shown_not_refused() {
+        let floor = 1553506755164504063_u64;
+        let start = heard_from(floor);
+        let mut fragment = utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            start,
+            "hello there",
+            None,
+            None,
+        )
+        .unwrap();
+        let observation = select_messages(fragment.facts(), None, None).unwrap()[0].observation;
+        let first_edit = heard_from(floor + (1_000 << 22));
+        let second_edit = heard_from(floor + (2_000 << 22));
+        let first_reply = Id::new([1; 16]).unwrap();
+        let second_reply = Id::new([2; 16]).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&observation) @
+            archive::edited_at: first_edit,
+            archive::reply_to: first_reply,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&observation) @
+            archive::edited_at: second_edit,
+            archive::reply_to: second_reply,
+            archive::content: "hello again",
+        };
+
+        let selected = select_messages(fragment.facts(), None, None).unwrap();
+        // The two required projections are two shown alternatives of one
+        // message, never one picked silently.
+        assert_eq!(selected.len(), 2);
+        assert!(selected.iter().all(|row| row.observation == observation));
+        assert!(selected.iter().all(|row| row.variant_count == 2));
+        let mut staged = fragment.clone();
+        let reader = staged
+            .blobs_mut()
+            .snapshot()
+            .expect("MemoryBlobStore reader creation is infallible");
+        let contents: BTreeSet<String> = selected
+            .iter()
+            .map(|row| read_text(&reader, row.content, "content").unwrap())
+            .collect();
+        assert_eq!(
+            contents,
+            BTreeSet::from(["hello there".to_owned(), "hello again".to_owned()])
+        );
+        // Edits and reply targets belong to the observation: each shown
+        // alternative carries all of them, none paired with one content.
+        for row in &selected {
+            assert_eq!(row.edited_at, BTreeSet::from([first_edit, second_edit]));
+            assert_eq!(row.reply_to, BTreeSet::from([first_reply, second_reply]));
+        }
+    }
+
+    /// Two external ids on one user or channel anchor, and a profile naming
+    /// an anchor nobody typed, are shown as what they are; labelling the
+    /// rest of the collection does not stop at them.
+    #[test]
+    fn labels_show_every_external_id_and_untyped_profiles() {
+        let mut fragment = user_fragment("100000000000000400").unwrap();
+        let user = fragment.root().unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&user) @
+            discord::user_id: "100000000000000401".to_owned(),
+        };
+        let channel_fragment = channel_fragment("100000000000000201").unwrap();
+        let channel = channel_fragment.root().unwrap();
+        fragment += channel_fragment;
+        fragment += entity! { ExclusiveId::force_ref(&channel) @
+            discord::channel_id: "100000000000000202".to_owned(),
+        };
+        let untyped = Id::new([3; 16]).unwrap();
+        fragment += entity! { _ @
+            metadata::tag: discord::kind_user_profile,
+            discord::user: untyped,
+            archive::author_name: "ghost".to_owned(),
+        };
+        let mut staged = fragment.clone();
+        let reader = staged
+            .blobs_mut()
+            .snapshot()
+            .expect("MemoryBlobStore reader creation is infallible");
+
+        let users = user_labels(fragment.facts(), &reader).unwrap();
+        assert_eq!(
+            users.get(&user).map(String::as_str),
+            Some("100000000000000400 / 100000000000000401")
+        );
+        assert_eq!(users.get(&untyped).map(String::as_str), Some("ghost"));
+        let channels = channel_labels(fragment.facts(), &reader).unwrap();
+        assert_eq!(
+            channels.get(&channel).map(String::as_str),
+            Some("100000000000000201 / 100000000000000202")
+        );
     }
 
     /// A voice message heard: its transcript is a message of its author with

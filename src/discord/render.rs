@@ -34,10 +34,20 @@ pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
         });
     }
     for message in &value.messages {
-        let edited = message
-            .edited_at
-            .map(|at| format!(" (edited {})", format_interval(at)))
-            .unwrap_or_default();
+        // A record asserting several edit times shows all of them.
+        let edited = if message.edited_at.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " (edited {})",
+                message
+                    .edited_at
+                    .iter()
+                    .map(|at| format_interval(*at))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            )
+        };
         let channel = if value.channel_id.is_some() {
             String::new()
         } else {

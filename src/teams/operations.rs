@@ -42,6 +42,7 @@ use crate::clock;
 use crate::collection_names::open_configured;
 use crate::files as file_capability;
 use crate::schemas::archive::{archive, RawBytes};
+use crate::schemas::files::{file, KIND_MEDIA_TYPE};
 use crate::schemas::teams::{teams, DEFAULT_DELTA_URL, DEFAULT_SCOPE_ID};
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 use crate::teams as teams_core;
@@ -2743,23 +2744,36 @@ where
                 pattern!(catalog, [{ attachment_id @ archive::attachment_source_pointer: ?value }])
             )
             .collect::<BTreeSet<_>>();
-            // File and size annotate the occurrence once it is materialized;
-            // should two writers disagree, the smallest file and size are
-            // shown.
+            // File and size annotate the occurrence once it is materialized,
+            // and the file carries its name and media type. Should two
+            // writers disagree on any of them, the smallest is shown; one
+            // annotated file never refuses the listing.
             let file_id = attachment_file(catalog, attachment_id);
             let occurrence_name = find!(
                 value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ attachment_id @ archive::attachment_name: ?value }])
             )
             .min();
-            let file_name = file_id
-                .map(|id| file_capability::name_handle(catalog, id))
-                .transpose()?
-                .flatten();
-            let media_type = file_id
-                .map(|id| file_capability::media_type_name_handle_strict(catalog, id))
-                .transpose()?
-                .flatten();
+            let file_name = file_id.and_then(|file_id| {
+                find!(
+                    value: Inline<Handle<UTF8String>>,
+                    pattern!(catalog, [{ file_id @ file::name: ?value }])
+                )
+                .min()
+            });
+            let media_type = file_id.and_then(|file_id| {
+                find!(
+                    value: Inline<Handle<UTF8String>>,
+                    pattern!(catalog, [
+                        { file_id @ file::media_type: _?media_type },
+                        { _?media_type @
+                            metadata::tag: &KIND_MEDIA_TYPE,
+                            metadata::name: ?value,
+                        }
+                    ])
+                )
+                .min()
+            });
             let size = find!(
                 value: Inline<U256BE>,
                 pattern!(catalog, [{ attachment_id @ archive::attachment_size_bytes: ?value }])
@@ -4379,6 +4393,80 @@ mod tests {
             .unwrap(),
             file_id
         );
+    }
+
+    /// A file that two writers named differently is still listed: the
+    /// smallest name is shown, exactly as the smallest file and size are,
+    /// and the listing never refuses because of one annotated file.
+    #[test]
+    fn an_attachment_file_with_two_names_is_still_listed() {
+        let fixture = Fixture::new();
+        let mut message = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "content",
+        );
+        message["attachments"] = json!([{
+            "id": "attachment-1",
+            "contentUrl": "https://graph.example/content",
+        }]);
+        let (page, _) = page_fragment(
+            "tenant-a",
+            vec![message],
+            1,
+            [],
+            "https://graph.example/delta",
+        );
+        fixture.publish(page);
+        let view = load_view(&fixture);
+        let attachment = one_required(
+            find!(
+                value: Id,
+                pattern!(&view.facts, [{
+                    ?value @ metadata::tag: archive::kind_attachment
+                }])
+            )
+            .collect(),
+            "test attachment",
+        )
+        .unwrap();
+        let mut derived =
+            file_capability::stage(b"hello".to_vec(), "note.txt", "text/plain").unwrap();
+        let file_id = derived.root().unwrap();
+        derived += entity! { ExclusiveId::force_ref(&attachment) @
+            archive::attachment_file: file_id,
+        };
+        // A second writer's name for the same file entity.
+        derived += entity! { ExclusiveId::force_ref(&file_id) @
+            crate::schemas::files::file::name: "a-renamed-note.txt",
+        };
+        fixture
+            .storage()
+            .publish(derived, "materialize attachment twice named")
+            .unwrap();
+
+        let view = load_view(&fixture);
+        let source = source_fragment("tenant-a").root().unwrap();
+        let rows = attachment_rows(&view.reader, &view.facts, source, None, None).unwrap();
+        assert_eq!(rows.len(), 1);
+        let names: BTreeSet<String> = find!(
+            handle: Inline<Handle<UTF8String>>,
+            pattern!(&view.facts, [{ file_id @ crate::schemas::files::file::name: ?handle }])
+        )
+        .map(|handle| read_utf8string(&view.reader, handle, "test name").unwrap())
+        .collect();
+        assert_eq!(names.len(), 2);
+        let shown = read_utf8string(&view.reader, rows[0].name.unwrap(), "shown name").unwrap();
+        let smallest = find!(
+            handle: Inline<Handle<UTF8String>>,
+            pattern!(&view.facts, [{ file_id @ crate::schemas::files::file::name: ?handle }])
+        )
+        .min()
+        .unwrap();
+        assert_eq!(rows[0].name, Some(smallest));
+        assert!(names.contains(&shown));
     }
 
     #[test]

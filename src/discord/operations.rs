@@ -151,12 +151,14 @@ pub struct ObservedMessage {
     pub observation: Id,
     pub anchor: Id,
     pub created_at: Inline<NsTAIInterval>,
-    pub edited_at: Option<Inline<NsTAIInterval>>,
+    /// Every edit time the observation asserts; ordinarily none or one.
+    pub edited_at: BTreeSet<Inline<NsTAIInterval>>,
     pub channel: Id,
     pub channel_name: Option<String>,
     pub author: String,
     pub content: String,
-    pub reply_to: Option<Id>,
+    /// Every reply target the observation asserts; ordinarily none or one.
+    pub reply_to: BTreeSet<Id>,
     pub attachments: BTreeSet<Id>,
     /// Somebody coming into or leaving a voice channel, when the message is
     /// that notice: presented as the event, never as its (empty) content.

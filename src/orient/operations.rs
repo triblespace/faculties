@@ -2723,10 +2723,18 @@ fn goal_priority_edges(query: &OrientQuery<'_>, goals: &BTreeSet<Id>) -> BTreeSe
     edges
 }
 
+/// The Compass section of `orient wake`, `orient goals` and `orient show`.
+///
+/// A payload read that `unreadable` accepts (one that cannot be had in this
+/// observation) costs only what depends on it, and is said in the section: a
+/// goal whose winning status text is unreadable cannot be placed in Doing or
+/// Todo and is named under "Not placed"; an unreadable title or tag is shown
+/// as unreadable on the goal's row. Any other error still fails the section.
 fn render_native_compass_goals(
     query: &OrientQuery<'_>,
     doing_limit: usize,
     todo_limit: usize,
+    unreadable: &dyn Fn(&anyhow::Error) -> bool,
 ) -> Result<(String, BTreeSet<Id>)> {
     use std::fmt::Write as _;
 
@@ -2734,8 +2742,20 @@ fn render_native_compass_goals(
     let ranks = compass::priority_ranks(goals.iter().copied(), &goal_priority_edges(query, &goals));
     let mut doing = Vec::<(usize, i128, Id, Option<Id>)>::new();
     let mut todo = Vec::<(usize, i128, Id, Option<Id>)>::new();
+    let mut unplaced = Vec::<String>::new();
     for task in goals {
-        let (status_event, status, status_at) = latest_goal_status(query, task)?
+        let status = match latest_goal_status(query, task) {
+            Ok(status) => status,
+            Err(error) if unreadable(&error) => {
+                unplaced.push(format!(
+                    "- [{}] status not readable in this snapshot ({error:#})",
+                    fmt_id(task)
+                ));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let (status_event, status, status_at) = status
             .map(|(event, value, at)| {
                 (
                     Some(event),
@@ -2770,9 +2790,31 @@ fn render_native_compass_goals(
 
     let mut out = String::new();
     let mut shown = BTreeSet::new();
+    let not_placed = |out: &mut String| {
+        if !unplaced.is_empty() {
+            writeln!(out, "Not placed ({}):", unplaced.len()).unwrap();
+            for line in &unplaced {
+                writeln!(out, "{line}").unwrap();
+            }
+        }
+    };
+    let row = |task: Id| -> Result<String> {
+        let title = match native_task_title(query, task) {
+            Ok(title) => title,
+            Err(error) if unreadable(&error) => format!("(title not readable: {error:#})"),
+            Err(error) => return Err(error),
+        };
+        let tags = match entity_tags(query, task) {
+            Ok(tags) => render_tags(&tags),
+            Err(error) if unreadable(&error) => format!(" (tags not readable: {error:#})"),
+            Err(error) => return Err(error),
+        };
+        Ok(format!("- [{}] {title}{tags}", fmt_id(task)))
+    };
     writeln!(out, "Compass:").unwrap();
     if doing.is_empty() && todo.is_empty() {
         writeln!(out, "- No goals.").unwrap();
+        not_placed(&mut out);
         return Ok((out, shown));
     }
     writeln!(
@@ -2788,14 +2830,7 @@ fn render_native_compass_goals(
         for (_, _, task, status_event) in doing.into_iter().take(doing_limit) {
             shown.insert(task);
             shown.extend(status_event);
-            writeln!(
-                out,
-                "- [{}] {}{}",
-                fmt_id(task),
-                native_task_title(query, task)?,
-                render_tags(&entity_tags(query, task)?),
-            )
-            .unwrap();
+            writeln!(out, "{}", row(task)?).unwrap();
         }
     }
     writeln!(
@@ -2811,16 +2846,10 @@ fn render_native_compass_goals(
         for (_, _, task, status_event) in todo.into_iter().take(todo_limit) {
             shown.insert(task);
             shown.extend(status_event);
-            writeln!(
-                out,
-                "- [{}] {}{}",
-                fmt_id(task),
-                native_task_title(query, task)?,
-                render_tags(&entity_tags(query, task)?),
-            )
-            .unwrap();
+            writeln!(out, "{}", row(task)?).unwrap();
         }
     }
+    not_placed(&mut out);
     Ok((out, shown))
 }
 
@@ -3897,8 +3926,10 @@ async fn cmd_show(
                 } else {
                     None
                 };
+                // Show has its own pending path for a missing payload; it
+                // stays strict here.
                 let (goals, goal_events) =
-                    render_native_compass_goals(&query, doing_limit, todo_limit)?;
+                    render_native_compass_goals(&query, doing_limit, todo_limit, &|_| false)?;
                 let (window_status, status_events) = render_window_status(&query)?;
                 let shown = match persona_id {
                     Some(persona) => {
@@ -5758,8 +5789,9 @@ struct WakeSelection {
     /// The memory cover: the charged text, its structured entries, and the
     /// diagnostics kept outside the charged text.
     cover: crate::memory_cover::CoverReport,
-    /// Cover-tagged Wiki beliefs, ordered by title then revision id.
-    beliefs: Vec<wiki_model::CoverBelief>,
+    /// Cover-tagged Wiki beliefs, ordered by title then revision id, and
+    /// what could not be read for them.
+    beliefs: wiki_model::CoverBeliefs,
     /// The Compass section exactly as `orient goals` prints it.
     goals: String,
     /// Presentations to record: only for a persona, and only after output.
@@ -5831,27 +5863,33 @@ async fn wake_selection(
         render_cover_report(&memory_facts, reader, cover_opts, &mut |_| Ok(None))
     })
     .await?;
-    let beliefs = read(storage, &observation.snapshot, |reader| {
-        wiki_model::cover_fragments(reader, &wiki_facts, &wiki_order)
-    })
-    .await?;
-    let (goals, shown) = read(storage, &observation.snapshot, |reader| {
-        let query = observation.query(reader);
-        let (goals, shown) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
-        let shown = match persona_id {
-            Some(persona) => {
-                let candidates: BTreeSet<_> = load_attention_view(&query, persona)?.ids().collect();
-                shown
-                    .into_iter()
-                    .filter(|event| candidates.contains(event))
-                    .collect::<Vec<_>>()
-            }
-            None => Vec::new(),
-        };
+    // Beliefs and goals render what can be read: a payload no provider
+    // supplies is named in its section, never a reason to refuse the wake.
+    let beliefs =
+        crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
+            wiki_model::cover_fragments(reader, &wiki_facts, &wiki_order, unreadable)
+        })
+        .await?;
+    let (goals, shown) =
+        crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
+            let query = observation.query(reader);
+            let (goals, shown) =
+                render_native_compass_goals(&query, doing_limit, todo_limit, unreadable)?;
+            let shown = match persona_id {
+                Some(persona) => {
+                    let candidates: BTreeSet<_> =
+                        load_attention_view(&query, persona)?.ids().collect();
+                    shown
+                        .into_iter()
+                        .filter(|event| candidates.contains(event))
+                        .collect::<Vec<_>>()
+                }
+                None => Vec::new(),
+            };
 
-        Ok((goals, shown))
-    })
-    .await?;
+            Ok((goals, shown))
+        })
+        .await?;
     Ok(WakeSelection {
         cover,
         beliefs,
@@ -5891,13 +5929,24 @@ async fn cmd_wake(
     let mut report = selection.cover.text;
     report.push('\n');
     writeln!(report, "Beliefs (cover):").unwrap();
-    if selection.beliefs.is_empty() {
+    if selection.beliefs.beliefs.is_empty() && selection.beliefs.unreadable.is_empty() {
         writeln!(report, "- None").unwrap();
     } else {
-        for belief in &selection.beliefs {
+        for belief in &selection.beliefs.beliefs {
             writeln!(report, "- {}", belief.title).unwrap();
             for line in belief.content.lines() {
                 writeln!(report, "    {line}").unwrap();
+            }
+        }
+        if !selection.beliefs.unreadable.is_empty() {
+            writeln!(
+                report,
+                "Not readable in this snapshot ({}):",
+                selection.beliefs.unreadable.len()
+            )
+            .unwrap();
+            for line in &selection.beliefs.unreadable {
+                writeln!(report, "- {line}").unwrap();
             }
         }
     }
@@ -5980,13 +6029,18 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         });
     }
     let mut shown = BTreeSet::new();
-    for belief in &selection.beliefs {
+    for belief in &selection.beliefs.beliefs {
         // `wiki show` prints the title, the revision's identity lines and the
         // content, as plain wake shows a belief's title above its content. It
         // follows the entry's frontier, which is this revision alone unless
         // the entry is forked; a forked head is named exactly instead. One
         // revision id with several title/content projections is ONE pair:
         // `wiki show` prints them all, under its fork banner.
+        // A belief whose `wiki show` cannot be rendered here has no pair;
+        // `CoverBeliefs::unreadable` names it among the diagnostics.
+        let Some(show) = &belief.show else {
+            continue;
+        };
         if !shown.insert(belief.revision) {
             continue;
         }
@@ -5995,7 +6049,7 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         } else {
             format!("wiki show --exact {:x}", belief.revision)
         };
-        pairs.push(WakePair::new(command, belief.show.clone()));
+        pairs.push(WakePair::new(command, show.clone()));
     }
     pairs.push(WakePair::new(
         goals_command(doing_limit, todo_limit),
@@ -6039,7 +6093,15 @@ async fn cmd_wake_pairs(
         lines.push('\n');
     }
     write_complete_report(output, &lines, "Orient wake pairs", &mut |_| {}).await?;
-    Ok(selection.cover.diagnostics)
+    let mut diagnostics = selection.cover.diagnostics;
+    diagnostics.extend(
+        selection
+            .beliefs
+            .unreadable
+            .into_iter()
+            .map(|line| format!("cover beliefs — {line}")),
+    );
+    Ok(diagnostics)
 }
 
 /// `orient goals`: the Compass section of `orient wake`, alone. Maintains
@@ -6058,11 +6120,13 @@ async fn cmd_goals(
         .snapshot()
         .map_err(|error| anyhow!("freeze goals observation: {error}"))?;
     let observation = observe_snapshot_acquiring(snapshot, &sources, false).await?;
-    let goals = read(storage, &observation.snapshot, |reader| {
-        let query = observation.query(reader);
-        Ok(render_native_compass_goals(&query, doing_limit, todo_limit)?.0)
-    })
-    .await?;
+    // Exactly the Compass section wake shows, and read the same way.
+    let goals =
+        crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
+            let query = observation.query(reader);
+            Ok(render_native_compass_goals(&query, doing_limit, todo_limit, unreadable)?.0)
+        })
+        .await?;
     write_complete_report(output, &goals, "Orient goals", &mut |_| {}).await
 }
 
@@ -9178,6 +9242,61 @@ mod tests {
                     .unwrap()
                     .0,
                 initial_id,
+            );
+            pile.close().unwrap();
+        });
+    }
+
+    /// A goal whose winning status text never arrived cannot be placed in
+    /// Doing or Todo. It is named in the Compass section instead of failing
+    /// the section (and with it the whole wake).
+    #[test]
+    fn a_goal_whose_status_text_cannot_be_read_is_named_not_fatal() {
+        test_block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let at = |seconds| clock::point(Epoch::from_tai_seconds(seconds)).unwrap();
+            let (readable, readable_id) =
+                compass::goal_fragment("readable goal", Vec::new(), None, at(1.0)).unwrap();
+            let (unread, unread_id) =
+                compass::goal_fragment("unread goal", Vec::new(), None, at(1.0)).unwrap();
+            let readable_status =
+                compass::status_fragment(readable_id, "doing", None, at(2.0)).unwrap();
+            // Only the status text's bytes are missing; the event is here.
+            // (A different status than the readable goal's, whose identical
+            // text blob would otherwise supply it.)
+            let (_, facts, metafacts, _) =
+                compass::status_fragment(unread_id, "todo", None, at(2.0))
+                    .unwrap()
+                    .into_parts();
+            let unread_status = Fragment::from_parts(
+                facts,
+                metafacts,
+                triblespace::core::blob::MemoryBlobStore::new(),
+            );
+            pile.commit(
+                sources.compass.source,
+                &fixture.signer,
+                readable + unread + readable_status + unread_status,
+            )
+            .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
+            let query = observation.query(&observation.snapshot);
+            // Strict, the section refuses; presentable, it names the goal.
+            assert!(render_native_compass_goals(&query, 5, 5, &|_| false).is_err());
+            let (goals, _) = render_native_compass_goals(&query, 5, 5, &|_| true).unwrap();
+            assert!(goals.contains("readable goal"), "{goals}");
+            assert!(!goals.contains("unread goal"), "{goals}");
+            assert!(
+                goals.lines().any(|line| line.contains(&fmt_id(unread_id))
+                    && line.contains("status not readable")),
+                "{goals}"
             );
             pile.close().unwrap();
         });

@@ -688,6 +688,57 @@ where
     }
 }
 
+/// [`read`] for a presentation that shows what it can.
+///
+/// `render` receives `unreadable`, a test for the error of ONE payload read
+/// it made: true means that payload cannot be had in this observation, so the
+/// presentation leaves its entry out and says so. A payload missing for the
+/// first time is not unreadable; the closure fails on it, the payload is
+/// acquired as [`read`] acquires it, and the closure runs again. Only a
+/// payload whose acquisition found no provider (or failed), or whose bytes
+/// cannot be decoded, becomes unreadable, so one absent blob costs one
+/// acquisition attempt rather than the whole presentation.
+pub async fn read_presentable<S, T>(
+    store: &mut S,
+    snapshot: &S::Snapshot,
+    mut render: impl FnMut(&S::Snapshot, &dyn Fn(&anyhow::Error) -> bool) -> Result<T>,
+) -> Result<T>
+where
+    S: SnapshotSource + AsyncBlobStoreAcquire,
+    S::Snapshot: BlobStoreList,
+{
+    let missing = |error: &anyhow::Error| {
+        error
+            .chain()
+            .find_map(|error| error.downcast_ref::<MissingBlob>())
+            .map(|missing| missing.handle)
+    };
+    let mut unavailable = BTreeSet::new();
+    let mut reader = snapshot.clone();
+    loop {
+        let error = match render(&reader, &|error| {
+            missing(error).is_none_or(|handle| unavailable.contains(&handle))
+        }) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(handle) = missing(&error) else {
+            return Err(error);
+        };
+        // As in `read`: a closure consulting another reader, or skipping
+        // nothing it was told it may skip, must fail rather than spin.
+        if unavailable.contains(&handle) || reader.contains_blob(handle)? {
+            return Err(error);
+        }
+        match store.acquire(handle).await {
+            Ok(Some(_)) => reader = store.snapshot()?,
+            Ok(None) | Err(_) => {
+                unavailable.insert(handle);
+            }
+        }
+    }
+}
+
 /// Open a pile with lazy, exact-handle network acquisition, with no host:
 /// the fold believes no MERGE, so every believed foundation is its own
 /// frontier node. Right for a reader that holds no key; anything that
@@ -1741,6 +1792,99 @@ mod tests {
         }));
         assert!(result.is_err());
         assert_eq!(store.requested, [handle]);
+        drop(resident);
+        drop(before);
+        store.pile.close().unwrap();
+    }
+
+    /// A presentation acquires what it is missing exactly as `read` does, and
+    /// leaves out, after that one attempt, what no provider can supply.
+    #[test]
+    fn presentable_read_acquires_first_and_skips_only_what_stays_missing() {
+        use anybytes::Bytes;
+        use triblespace::core::blob::encodings::UnknownBlob;
+        use triblespace::core::repo::BlobStorePut;
+
+        struct Supply {
+            pile: Pile,
+            available: BTreeMap<Inline<Handle<UnknownBlob>>, Bytes>,
+            requested: Vec<Inline<Handle<UnknownBlob>>>,
+        }
+        impl SnapshotSource for Supply {
+            type Snapshot = triblespace::core::repo::pile::PileSnapshot;
+            type SnapshotError = <Pile as SnapshotSource>::SnapshotError;
+
+            fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+                self.pile.snapshot()
+            }
+        }
+        impl AsyncBlobStoreAcquire for Supply {
+            type AcquireError = std::io::Error;
+
+            async fn acquire(
+                &mut self,
+                handle: Inline<Handle<UnknownBlob>>,
+            ) -> Result<Option<Bytes>, Self::AcquireError> {
+                self.requested.push(handle);
+                let Some(payload) = self.available.get(&handle).cloned() else {
+                    return Ok(None);
+                };
+                self.pile.put::<UnknownBlob, _>(payload.clone()).unwrap();
+                Ok(Some(payload))
+            }
+        }
+
+        let files = TestFiles::new();
+        let mut source = MemoryRepo::default();
+        let fetched_bytes: Bytes = Vec::from("fetched").into();
+        let fetched = source.put::<UnknownBlob, _>(fetched_bytes.clone()).unwrap();
+        let gone = source
+            .put::<UnknownBlob, _>(Bytes::from(Vec::from("never arrives")))
+            .unwrap();
+        let mut store = Supply {
+            pile: open_pile_strict(&files.pile).unwrap(),
+            available: BTreeMap::from([(fetched, fetched_bytes)]),
+            requested: Vec::new(),
+        };
+        let here = store
+            .pile
+            .put::<UnknownBlob, _>(Bytes::from(Vec::from("resident")))
+            .unwrap();
+        let before = store.snapshot().unwrap();
+        let (shown, skipped) = pollster::block_on(read_presentable(
+            &mut store,
+            &before,
+            |reader, unreadable| {
+                let mut shown = Vec::new();
+                let mut skipped = Vec::new();
+                for handle in [here, fetched, gone] {
+                    match reader.get::<Bytes, UnknownBlob>(handle) {
+                        Ok(bytes) => shown.push(String::from_utf8(bytes.to_vec()).unwrap()),
+                        Err(error) => {
+                            let error = anyhow::Error::from(error);
+                            if !unreadable(&error) {
+                                return Err(error);
+                            }
+                            skipped.push(handle);
+                        }
+                    }
+                }
+                Ok((shown, skipped))
+            },
+        ))
+        .unwrap();
+        assert_eq!(shown, ["resident", "fetched"]);
+        assert_eq!(skipped, [gone]);
+        // One acquisition per missing payload, the fetchable one included.
+        assert_eq!(store.requested, [fetched, gone]);
+
+        // A closure that does not skip what it may skip fails, never spins.
+        let resident = store.snapshot().unwrap();
+        let result = pollster::block_on(read_presentable(&mut store, &resident, |reader, _| {
+            Ok(reader.get::<Bytes, UnknownBlob>(gone)?)
+        }));
+        assert!(result.is_err());
+        assert_eq!(store.requested, [fetched, gone, gone]);
         drop(resident);
         drop(before);
         store.pile.close().unwrap();

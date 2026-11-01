@@ -1180,8 +1180,37 @@ pub struct CoverBelief {
     /// Exactly what that `wiki show` prints: `# <title>`, the revision id,
     /// supersedes and tags lines when present, a blank line, then the content.
     /// A revision id carrying several projections prints all of them under a
-    /// `fork:` banner, so every row of that id holds the same `show`.
-    pub show: String,
+    /// `fork:` banner, so every row of that id holds the same `show`. None when
+    /// something `wiki show` prints (a tag name, another head) cannot be read
+    /// here; [`CoverBeliefs::unreadable`] then says so.
+    pub show: Option<String>,
+}
+
+/// The cover beliefs that could be read, and what was left out.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CoverBeliefs {
+    pub beliefs: Vec<CoverBelief>,
+    /// One line per payload that could not be read in this observation, and
+    /// what its absence leaves out. Never silently empty when something is.
+    pub unreadable: Vec<String>,
+}
+
+/// A payload read for a presentation: its value, or None when `unreadable`
+/// says it cannot be had here, recorded in `skipped` as `what` and why.
+fn presentable<T>(
+    result: Result<T>,
+    unreadable: &dyn Fn(&anyhow::Error) -> bool,
+    skipped: &mut Vec<String>,
+    what: impl FnOnce() -> String,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if unreadable(&error) => {
+            skipped.push(format!("{} ({error:#})", what()));
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Every cover-tagged maximal Wiki revision, ordered by title then id.
@@ -1190,11 +1219,20 @@ pub struct CoverBelief {
 /// a tag named `cover` is returned. Concurrent untagged heads likewise do not
 /// erase a tagged head. Callers therefore see the authored revision DAG's
 /// actual frontier rather than a timestamp-selected legacy approximation.
+///
+/// A payload read that `unreadable` accepts (one that cannot be had in this
+/// observation) leaves out only what depends on it, and is named in
+/// [`CoverBeliefs::unreadable`]: a tag whose name is unreadable cannot be
+/// recognized as `cover`, a revision whose title or content is unreadable is
+/// not shown, and a belief whose `wiki show` cannot be rendered has no `show`.
+/// Any other error still fails the read.
 pub fn cover_fragments<P: TriblePattern>(
     reader: &PileSnapshot,
     facts: &P,
     latest: &LatestIndex,
-) -> Result<Vec<CoverBelief>> {
+    unreadable: &dyn Fn(&anyhow::Error) -> bool,
+) -> Result<CoverBeliefs> {
+    let mut skipped = Vec::new();
     let frontier: Vec<RevisionRecord> = find!(revision: Id, latest.has(revision))
         .flat_map(|revision| revision_records(facts, revision))
         .collect();
@@ -1208,13 +1246,21 @@ pub fn cover_fragments<P: TriblePattern>(
             handle: TextHandle,
             pattern!(facts, [{ tag @ metadata::name: ?handle }])
         ) {
-            if read_text(reader, handle)?.eq_ignore_ascii_case("cover") {
+            let name = presentable(read_text(reader, handle), unreadable, &mut skipped, || {
+                format!(
+                    "tag {tag:x}: name not readable, so a revision tagged cover only through it is not shown"
+                )
+            })?;
+            if name.is_some_and(|name| name.eq_ignore_ascii_case("cover")) {
                 cover_tags.insert(tag);
             }
         }
     }
     if cover_tags.is_empty() {
-        return Ok(Vec::new());
+        return Ok(CoverBeliefs {
+            beliefs: Vec::new(),
+            unreadable: skipped,
+        });
     }
 
     let mut rows = Vec::new();
@@ -1222,28 +1268,56 @@ pub fn cover_fragments<P: TriblePattern>(
         if revision.tags.is_disjoint(&cover_tags) {
             continue;
         }
-        rows.push((
-            read_text(reader, revision.title)?,
-            read_text(reader, revision.content)?,
-            revision.id,
-        ));
+        let title = presentable(
+            read_text(reader, revision.title),
+            unreadable,
+            &mut skipped,
+            || {
+                format!(
+                    "cover revision {:x}: title not readable, not shown",
+                    revision.id
+                )
+            },
+        )?;
+        let content = presentable(
+            read_text(reader, revision.content),
+            unreadable,
+            &mut skipped,
+            || {
+                format!(
+                    "cover revision {:x}: content not readable, not shown",
+                    revision.id
+                )
+            },
+        )?;
+        if let (Some(title), Some(content)) = (title, content) {
+            rows.push((title, content, revision.id));
+        }
     }
     rows.sort_by(|left, right| (&left.0, left.2).cmp(&(&right.0, right.2)));
     rows.dedup();
-    rows.into_iter()
-        .map(|(title, content, revision)| {
-            let sole_head = entry(facts, latest, revision)
-                .is_some_and(|entry| entry.frontier.iter().all(|head| head.id == revision));
-            let show = operations::render_show(facts, latest, reader, revision, sole_head)?;
-            Ok(CoverBelief {
-                revision,
-                title,
-                content,
-                sole_head,
-                show,
-            })
-        })
-        .collect()
+    let mut beliefs = Vec::new();
+    for (title, content, revision) in rows {
+        let sole_head = entry(facts, latest, revision)
+            .is_some_and(|entry| entry.frontier.iter().all(|head| head.id == revision));
+        let show = presentable(
+            operations::render_show(facts, latest, reader, revision, sole_head),
+            unreadable,
+            &mut skipped,
+            || format!("cover revision {revision:x}: its wiki show cannot be rendered here"),
+        )?;
+        beliefs.push(CoverBelief {
+            revision,
+            title,
+            content,
+            sole_head,
+            show,
+        });
+    }
+    Ok(CoverBeliefs {
+        beliefs,
+        unreadable: skipped,
+    })
 }
 
 // ── the frontier link model ────────────────────────────────────────────────
@@ -2145,7 +2219,11 @@ mod tests {
         pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
         let order = latest_index(&facts);
-        let beliefs = cover_fragments(&reader, &facts, &order).unwrap();
+        let CoverBeliefs {
+            beliefs,
+            unreadable,
+        } = cover_fragments(&reader, &facts, &order, &|_| false).unwrap();
+        assert!(unreadable.is_empty());
         assert_eq!(
             beliefs
                 .iter()
@@ -2162,6 +2240,90 @@ mod tests {
         );
         // Both heads of one entry: a frontier-following export would refuse.
         assert!(beliefs.iter().all(|belief| !belief.sole_head));
+        pile.close().unwrap();
+    }
+
+    /// A tag name or a cover revision whose bytes never arrived is skipped
+    /// and named; the beliefs that can be read are still returned.
+    #[test]
+    fn cover_projection_skips_and_reports_what_cannot_be_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wiki.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[16; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (cover_fragment, cover, _) = tag_record("cover").unwrap();
+        let without_blobs = |fragment: Fragment| {
+            let (_, facts, metafacts, _) = fragment.into_parts();
+            Fragment::from_parts(facts, metafacts, MemoryBlobStore::new())
+        };
+        // A tag whose name blob is not here, on an untagged-for-cover head
+        // and on a cover head.
+        let (lost_tag_fragment, lost_tag, _) = tag_record("elsewhere").unwrap();
+        let mut other = draft(author, "other", []);
+        other.tags.insert(lost_tag);
+        let (other_fragment, _) = revision_record(other).unwrap();
+        let mut annotated = draft(author, "annotated", []);
+        annotated.tags.extend([cover, lost_tag]);
+        let (annotated_fragment, annotated_id) = revision_record(annotated).unwrap();
+        // A cover head whose own title and content are not here.
+        let mut unread = draft(author, "unread", []);
+        unread.tags.insert(cover);
+        let (unread_fragment, unread_id) = revision_record(unread).unwrap();
+        let mut plain = draft(author, "plain", []);
+        plain.tags.insert(cover);
+        let (plain_fragment, plain_id) = revision_record(plain).unwrap();
+
+        let mut fragment = author_fragment + cover_fragment;
+        fragment += without_blobs(lost_tag_fragment);
+        fragment += other_fragment;
+        fragment += annotated_fragment;
+        fragment += without_blobs(unread_fragment);
+        fragment += plain_fragment;
+
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
+        let collection =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        pile.commit(collection, &signer, fragment).unwrap();
+        // Not `materialize_collection`: its closed-world catalog check would
+        // refuse this collection before the cover is ever asked for.
+        let reader = pile.snapshot().unwrap();
+        let facts = reader
+            .collection(collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap();
+        let order = latest_index(&facts);
+        // A strict read still refuses, and so never reports less than it saw.
+        assert!(cover_fragments(&reader, &facts, &order, &|_| false).is_err());
+        let CoverBeliefs {
+            beliefs,
+            unreadable,
+        } = cover_fragments(&reader, &facts, &order, &|_| true).unwrap();
+        assert_eq!(
+            beliefs
+                .iter()
+                .map(|belief| (belief.title.as_str(), belief.revision))
+                .collect::<Vec<_>>(),
+            vec![("annotated", annotated_id), ("plain", plain_id)]
+        );
+        // The annotated belief's own text is here; what `wiki show` would
+        // print for it (the unreadable tag name) is not, and that is said.
+        assert!(beliefs[0].show.is_none());
+        assert!(beliefs[1].show.as_deref().unwrap().contains("# plain"));
+        let lost_tag = format!("{lost_tag:x}");
+        let unread = format!("{unread_id:x}");
+        let annotated = format!("{annotated_id:x}");
+        assert!(unreadable
+            .iter()
+            .any(|line| line.starts_with(&format!("tag {lost_tag}"))));
+        assert!(unreadable
+            .iter()
+            .any(|line| line.contains(&unread) && line.contains("title")));
+        assert!(unreadable
+            .iter()
+            .any(|line| line.contains(&annotated) && line.contains("wiki show")));
         pile.close().unwrap();
     }
 
