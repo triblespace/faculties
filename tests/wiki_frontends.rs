@@ -581,7 +581,11 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
         .output()
         .unwrap();
     assert!(!denied.status.success());
-    assert!(String::from_utf8_lossy(&denied.stderr).contains("requires source collection WRITE"));
+    let denied_stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        denied_stderr.contains("is not admitted to write the Wiki collection"),
+        "{denied_stderr}"
+    );
     assert_eq!(
         records(),
         before,
