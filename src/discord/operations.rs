@@ -165,6 +165,10 @@ pub struct ObservedMessage {
     pub presence: Option<discord_model::Presence>,
     pub variant_index: usize,
     pub variant_count: usize,
+    /// Where this row stands among the alternatives one observation carries
+    /// ([`discord_model::SelectedMessageVersion::alternative_index`]).
+    pub alternative_index: usize,
+    pub alternative_count: usize,
 }
 /// Something one user said in a voice channel: what `discord live` hears,
 /// stored as a message in that channel ([`Discord::observe_utterance`]).
@@ -1871,26 +1875,39 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
             .get(&message.author)
             .cloned()
             .unwrap_or_else(|| format!("{}", message.author));
-        rows.push(ObservedMessage {
-            observation: message.observation,
-            anchor: message.anchor,
-            created_at: message.created_at,
-            edited_at: message.edited_at,
-            channel: message.channel,
-            channel_name: channel_names.get(&message.channel).cloned(),
-            author,
-            content,
-            reply_to: message.reply_to,
-            attachments: message.attachments,
-            presence: message.presence,
-            variant_index: message.variant_index,
-            variant_count: message.variant_count,
-        });
+        let channel_name = channel_names.get(&message.channel).cloned();
+        rows.push(observed_message(message, channel_name, author, content));
     }
     Ok(History {
         channel_id: options.channel_id.clone(),
         messages: rows,
     })
+}
+
+/// One selected message version with its payloads read, as `read` shows it.
+fn observed_message(
+    message: discord_model::SelectedMessageVersion,
+    channel_name: Option<String>,
+    author: String,
+    content: String,
+) -> ObservedMessage {
+    ObservedMessage {
+        observation: message.observation,
+        anchor: message.anchor,
+        created_at: message.created_at,
+        edited_at: message.edited_at,
+        channel: message.channel,
+        channel_name,
+        author,
+        content,
+        reply_to: message.reply_to,
+        attachments: message.attachments,
+        presence: message.presence,
+        variant_index: message.variant_index,
+        variant_count: message.variant_count,
+        alternative_index: message.alternative_index,
+        alternative_count: message.alternative_count,
+    }
 }
 
 struct VisibleChannel {
@@ -2101,6 +2118,75 @@ pub(crate) fn format_interval(interval: Inline<NsTAIInterval>) -> String {
 mod tests {
     use super::*;
     use crate::schemas::files::KIND_FILE;
+
+    /// One observation with two contents and two creation times has four
+    /// projections. The history says they are alternatives of that one
+    /// observation, never four divergent observations.
+    #[test]
+    fn alternatives_of_one_observation_are_labelled_as_such() {
+        use triblespace::core::repo::BlobStoreGet as _;
+        let floor = 1553506755164504063_u64;
+        let mut fragment = discord_model::utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            discord_model::heard_from(floor),
+            "first content",
+            None,
+            None,
+        )
+        .unwrap();
+        let observation =
+            discord_model::select_messages(fragment.facts(), None, None).unwrap()[0].observation;
+        fragment += entity! { ExclusiveId::force_ref(&observation) @
+            archive::content: "second content",
+            metadata::created_at: discord_model::heard_from(floor + (5_000 << 22)),
+        };
+        let mut staged = fragment.clone();
+        let reader = staged.blobs_mut().snapshot().unwrap();
+        let selected = discord_model::select_messages(fragment.facts(), None, None).unwrap();
+        assert_eq!(selected.len(), 4);
+        let messages = selected
+            .into_iter()
+            .map(|message| {
+                let content: anybytes::View<str> = reader.get(message.content).unwrap();
+                observed_message(message, None, "author".to_owned(), content.to_string())
+            })
+            .collect();
+        let mut rendered = String::new();
+        super::super::render::history(
+            &History {
+                channel_id: None,
+                messages,
+            },
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    rendered.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        let lines: Vec<&str> = rendered.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 4, "{rendered}");
+        assert!(
+            lines.iter().all(|line| !line.contains("DIVERGENT")),
+            "{rendered}"
+        );
+        let labels: BTreeSet<String> = lines
+            .iter()
+            .filter_map(|line| {
+                let start = line.find("[alternative ")?;
+                Some(line[start..].split(']').next()?.to_owned())
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            (1..=4)
+                .map(|index| format!("[alternative {index}/4 of one observation {observation:x}"))
+                .collect::<BTreeSet<_>>(),
+            "{rendered}"
+        );
+    }
     use std::fs::File;
     use triblespace::prelude::inlineencodings::U256BE;
     fn message_json(

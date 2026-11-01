@@ -57,14 +57,32 @@ pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
                 .map(|name| format!(" #{name}"))
                 .unwrap_or_default()
         };
-        let conflict = if message.variant_count > 1 {
+        // Alternatives one observation carries are labelled as that
+        // observation's, so they never read as divergent observations.
+        let conflict = if message.variant_count <= 1 {
+            String::new()
+        } else if message.alternative_count == message.variant_count {
+            format!(
+                " [alternative {}/{} of one observation {:x}]",
+                message.alternative_index + 1,
+                message.alternative_count,
+                message.observation
+            )
+        } else if message.alternative_count > 1 {
+            format!(
+                " [DIVERGENT {}/{}; alternative {}/{} of observation {:x}]",
+                message.variant_index + 1,
+                message.variant_count,
+                message.alternative_index + 1,
+                message.alternative_count,
+                message.observation
+            )
+        } else {
             format!(
                 " [DIVERGENT {}/{}]",
                 message.variant_index + 1,
                 message.variant_count
             )
-        } else {
-            String::new()
         };
         // Somebody coming into or leaving a voice channel is an event, never
         // something they said or wrote.

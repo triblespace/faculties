@@ -707,12 +707,14 @@ pub type Unreadable<'a> = dyn Fn(&anyhow::Error) -> Option<String> + 'a;
 /// Every other error fails the presentation.
 ///
 /// A blob missing for the first time is left out of that pass provisionally
-/// and recorded. After the pass, every recorded blob is acquired (one after
-/// another: acquisition borrows the store), and the presentation renders
-/// again with what arrived. So it renders twice when acquisitions settle in
-/// one round, and again only if newly arrived payloads lead to further
-/// missing ones. A miss the closure propagates instead of leaving out is
-/// acquired the same way.
+/// and recorded. After the pass, every missing blob the closure SURFACED in
+/// it (asked `unreadable` about, or propagated) is acquired, one after
+/// another since acquisition borrows the store, and the presentation renders
+/// again with what arrived. The number of passes therefore depends on the
+/// closure: one that asks about every payload it needs surfaces them all at
+/// once, while one that stops at its first error, nests a strict reader, or
+/// only reaches some payloads through others that just arrived, surfaces
+/// them a few at a time and needs a pass for each round.
 pub async fn read_presentable<S, T>(
     store: &mut S,
     snapshot: &S::Snapshot,

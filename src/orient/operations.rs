@@ -2808,13 +2808,30 @@ fn render_native_compass_goals(
                 None => return Err(error),
             },
         };
-        let tags = match entity_tags(query, task) {
-            Ok(tags) => render_tags(&tags),
-            Err(error) => match unreadable(&error) {
-                Some(reason) => format!(" (tags not readable: {reason})"),
-                None => return Err(error),
-            },
-        };
+        // Each tag is asked about on its own, so every unreadable tag name
+        // surfaces in one pass rather than one per presentable render.
+        let mut tags = Vec::new();
+        let mut unread = Vec::new();
+        for handle in find!(
+            tag: compass::TextHandle,
+            pattern!(query.compass, [{ task @ board::tag: ?tag }])
+        ) {
+            match read_utf8(&query.payloads, handle, "Compass tag") {
+                Ok(tag) => tags.push(tag),
+                Err(error) => match unreadable(&error) {
+                    Some(reason) => unread.push(reason),
+                    None => return Err(error),
+                },
+            }
+        }
+        let mut tags = render_tags(&tags);
+        if !unread.is_empty() {
+            tags.push_str(&format!(
+                " ({} tag(s) not readable: {})",
+                unread.len(),
+                unread.join("; ")
+            ));
+        }
         Ok(format!("- [{}] {title}{tags}", fmt_id(task)))
     };
     writeln!(out, "Compass:").unwrap();
@@ -9306,6 +9323,67 @@ mod tests {
                     && line.contains("status not readable")),
                 "{goals}"
             );
+            pile.close().unwrap();
+        });
+    }
+
+    /// A goal whose tag names are all cold surfaces every one of them in one
+    /// pass, so a presentable read acquires them together instead of
+    /// rendering once per tag.
+    #[test]
+    fn every_unreadable_tag_of_a_goal_surfaces_in_one_pass() {
+        test_block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let at = clock::point(Epoch::from_tai_seconds(1.0)).unwrap();
+            let (goal, goal_id) = compass::goal_fragment(
+                "cold tags",
+                vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+                None,
+                at,
+            )
+            .unwrap();
+            // The title stays readable; only the tag names are missing.
+            let (_, facts, metafacts, blobs) = goal.into_parts();
+            let mut kept = triblespace::core::blob::MemoryBlobStore::new();
+            let title: Vec<_> = find!(
+                handle: compass::TextHandle,
+                pattern!(&facts, [{ goal_id @ board::title: ?handle }])
+            )
+            .collect();
+            use triblespace::core::repo::{BlobStore as _, BlobStorePut as _};
+            let mut blobs = blobs;
+            let reader = blobs.snapshot().unwrap();
+            let bytes: Bytes = reader
+                .get(
+                    Inline::<inlineencodings::Handle<blobencodings::UnknownBlob>>::new(
+                        title[0].raw,
+                    ),
+                )
+                .unwrap();
+            kept.put::<blobencodings::UnknownBlob, _>(bytes).unwrap();
+            pile.commit(
+                sources.compass.source,
+                &fixture.signer,
+                Fragment::from_parts(facts, metafacts, kept),
+            )
+            .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
+            let query = observation.query(&observation.snapshot);
+            let calls = std::cell::Cell::new(0);
+            let (goals, _) = render_native_compass_goals(&query, 5, 5, &|error| {
+                calls.set(calls.get() + 1);
+                Some(format!("{error:#}"))
+            })
+            .unwrap();
+            assert!(goals.contains("cold tags"), "{goals}");
+            assert_eq!(calls.get(), 3, "{goals}");
             pile.close().unwrap();
         });
     }

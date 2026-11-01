@@ -710,6 +710,12 @@ pub struct SelectedMessageVersion {
     pub presence: Option<Presence>,
     pub variant_index: usize,
     pub variant_count: usize,
+    /// Where this state stands among the shown states of `observation`, and
+    /// how many there are: several when one observation carries independent
+    /// alternative values (two contents, say), which is not a divergence
+    /// between observations.
+    pub alternative_index: usize,
+    pub alternative_count: usize,
 }
 
 /// Select the maximal official semantic version(s) of every message.
@@ -864,7 +870,31 @@ where
             })
             .collect::<Vec<_>>();
         let variant_count = maximal.len();
-        for (variant_index, (state, observations)) in maximal.into_iter().enumerate() {
+        // The observation each shown state is reported under, and where the
+        // state stands among that observation's shown alternatives.
+        let reported = maximal
+            .iter()
+            .map(|(_, observations)| {
+                *observations
+                    .iter()
+                    .find(|observation| version(observation) == maximal_time)
+                    .expect("a shown state has a latest observation")
+            })
+            .collect::<Vec<_>>();
+        let alternative = |variant_index: usize| {
+            let observation = reported[variant_index];
+            let index = reported[..variant_index]
+                .iter()
+                .filter(|other| **other == observation)
+                .count();
+            let count = reported
+                .iter()
+                .filter(|other| **other == observation)
+                .count();
+            (observation, index, count)
+        };
+        for (variant_index, (state, _)) in maximal.into_iter().enumerate() {
+            let (observation, alternative_index, alternative_count) = alternative(variant_index);
             if channel_filter.is_some_and(|channel| state.fields.channel != channel) {
                 continue;
             }
@@ -874,10 +904,7 @@ where
             selected.push(SelectedMessageVersion {
                 // A latest observation carrying this state, not an older one
                 // that happens to carry it too.
-                observation: observations
-                    .into_iter()
-                    .find(|observation| version(observation) == maximal_time)
-                    .expect("a shown state has a latest observation"),
+                observation,
                 anchor,
                 content: state.fields.content,
                 author: state.fields.author,
@@ -889,6 +916,8 @@ where
                 presence: presences.get(&anchor).copied(),
                 variant_index,
                 variant_count,
+                alternative_index,
+                alternative_count,
             });
         }
     }
