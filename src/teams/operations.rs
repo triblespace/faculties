@@ -154,7 +154,11 @@ pub struct AttachmentInfo {
     pub reference: String,
     pub created_at: Inline<NsTAIInterval>,
     pub name: Option<String>,
+    /// Names other writers gave beside `name`; ordinarily empty.
+    pub other_names: Vec<String>,
     pub media_type: Option<String>,
+    /// Media types other writers gave beside `media_type`; ordinarily empty.
+    pub other_media_types: Vec<String>,
     pub size: Option<u128>,
     pub source_pointers: Vec<String>,
 }
@@ -2380,8 +2384,12 @@ struct AttachmentRow {
     source_id: Option<Inline<Handle<UTF8String>>>,
     source_kind: Option<Inline<Handle<UTF8String>>>,
     source_pointers: BTreeSet<Inline<Handle<UTF8String>>>,
+    /// The smallest name, and every other one a writer gave.
     name: Option<Inline<Handle<UTF8String>>>,
+    other_names: BTreeSet<Inline<Handle<UTF8String>>>,
+    /// The smallest media type, and every other one.
     media_type: Option<Inline<Handle<UTF8String>>>,
+    other_media_types: BTreeSet<Inline<Handle<UTF8String>>>,
     size: Option<Inline<U256BE>>,
 }
 
@@ -2661,44 +2669,66 @@ fn list_attachments(
             .get(&row.message_id)
             .cloned()
             .unwrap_or_else(|| format!("{}", row.message_id));
-        let source_id = row
-            .source_id
-            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment source id"))
-            .transpose()?
-            .unwrap_or_default();
-        let source_kind = row
-            .source_kind
-            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment kind"))
-            .transpose()?;
-        let mut source_pointers = row
-            .source_pointers
-            .into_iter()
-            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment pointer"))
-            .collect::<Result<Vec<_>>>()?;
-        source_pointers.sort();
-        source_pointers.dedup();
-        let name = row
-            .name
-            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment name"))
-            .transpose()?;
-        let media_type = row
-            .media_type
-            .map(|handle| read_utf8string(&view.reader, handle, "Teams attachment media type"))
-            .transpose()?;
-        let size = row.size.map(inline_u256_to_u128).transpose()?;
-        result.push(AttachmentInfo {
-            id: row.attachment_id,
-            created_at: row.created_at,
-            chat,
-            message,
-            reference: attachment_reference(source_kind.as_deref(), &source_id),
-            name,
-            media_type,
-            size,
-            source_pointers,
-        });
+        result.push(attachment_info(&view.reader, chat, message, row)?);
     }
     Ok(result)
+}
+
+/// One listed attachment, its payloads read.
+fn attachment_info(
+    reader: &impl BlobStoreGet,
+    chat: String,
+    message: String,
+    row: AttachmentRow,
+) -> Result<AttachmentInfo> {
+    let source_id = row
+        .source_id
+        .map(|handle| read_utf8string(reader, handle, "Teams attachment source id"))
+        .transpose()?
+        .unwrap_or_default();
+    let source_kind = row
+        .source_kind
+        .map(|handle| read_utf8string(reader, handle, "Teams attachment kind"))
+        .transpose()?;
+    let mut source_pointers = row
+        .source_pointers
+        .into_iter()
+        .map(|handle| read_utf8string(reader, handle, "Teams attachment pointer"))
+        .collect::<Result<Vec<_>>>()?;
+    source_pointers.sort();
+    source_pointers.dedup();
+    let name = row
+        .name
+        .map(|handle| read_utf8string(reader, handle, "Teams attachment name"))
+        .transpose()?;
+    let media_type = row
+        .media_type
+        .map(|handle| read_utf8string(reader, handle, "Teams attachment media type"))
+        .transpose()?;
+    let other_names = row
+        .other_names
+        .into_iter()
+        .map(|handle| read_utf8string(reader, handle, "Teams attachment name"))
+        .collect::<Result<Vec<_>>>()?;
+    let other_media_types = row
+        .other_media_types
+        .into_iter()
+        .map(|handle| read_utf8string(reader, handle, "Teams attachment media type"))
+        .collect::<Result<Vec<_>>>()?;
+    let size = row.size.map(inline_u256_to_u128).transpose()?;
+    Ok(AttachmentInfo {
+        id: row.attachment_id,
+        created_at: row.created_at,
+        chat,
+        message,
+        reference: attachment_reference(source_kind.as_deref(), &source_id),
+        name,
+        other_names,
+        media_type,
+        other_media_types,
+        size,
+        source_pointers,
+    })
 }
 
 fn attachment_rows<P>(
@@ -2746,34 +2776,45 @@ where
             .collect::<BTreeSet<_>>();
             // File and size annotate the occurrence once it is materialized,
             // and the file carries its name and media type. Should two
-            // writers disagree on any of them, the smallest is shown; one
-            // annotated file never refuses the listing.
+            // writers disagree on file or size, the smallest is shown. Names
+            // and media types are shown smallest first with the others kept
+            // beside it, so the listing says that alternatives exist; one
+            // annotated file never refuses it.
             let file_id = attachment_file(catalog, attachment_id);
-            let occurrence_name = find!(
+            let occurrence_names = find!(
                 value: Inline<Handle<UTF8String>>,
                 pattern!(catalog, [{ attachment_id @ archive::attachment_name: ?value }])
             )
-            .min();
-            let file_name = file_id.and_then(|file_id| {
-                find!(
-                    value: Inline<Handle<UTF8String>>,
-                    pattern!(catalog, [{ file_id @ file::name: ?value }])
-                )
-                .min()
-            });
-            let media_type = file_id.and_then(|file_id| {
-                find!(
-                    value: Inline<Handle<UTF8String>>,
-                    pattern!(catalog, [
-                        { file_id @ file::media_type: _?media_type },
-                        { _?media_type @
-                            metadata::tag: &KIND_MEDIA_TYPE,
-                            metadata::name: ?value,
-                        }
-                    ])
-                )
-                .min()
-            });
+            .collect::<BTreeSet<_>>();
+            // The occurrence's own name wins over its file's, as before.
+            let mut names = if occurrence_names.is_empty() {
+                file_id
+                    .map(|file_id| {
+                        find!(
+                            value: Inline<Handle<UTF8String>>,
+                            pattern!(catalog, [{ file_id @ file::name: ?value }])
+                        )
+                        .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default()
+            } else {
+                occurrence_names
+            };
+            let mut media_types = file_id
+                .map(|file_id| {
+                    find!(
+                        value: Inline<Handle<UTF8String>>,
+                        pattern!(catalog, [
+                            { file_id @ file::media_type: _?media_type },
+                            { _?media_type @
+                                metadata::tag: &KIND_MEDIA_TYPE,
+                                metadata::name: ?value,
+                            }
+                        ])
+                    )
+                    .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
             let size = find!(
                 value: Inline<U256BE>,
                 pattern!(catalog, [{ attachment_id @ archive::attachment_size_bytes: ?value }])
@@ -2788,8 +2829,10 @@ where
                 source_id: Some(source_id),
                 source_kind,
                 source_pointers,
-                name: occurrence_name.or(file_name),
-                media_type,
+                name: names.pop_first(),
+                other_names: names,
+                media_type: media_types.pop_first(),
+                other_media_types: media_types,
                 size,
             });
         }
@@ -4467,6 +4510,31 @@ mod tests {
         .unwrap();
         assert_eq!(rows[0].name, Some(smallest));
         assert!(names.contains(&shown));
+
+        // The listing says that the shown name has an alternative, and which.
+        let other = names.iter().find(|name| **name != shown).unwrap().clone();
+        let info = attachment_info(
+            &view.reader,
+            "chat".to_owned(),
+            "message".to_owned(),
+            rows.into_iter().next().unwrap(),
+        )
+        .unwrap();
+        let mut rendered = String::new();
+        crate::teams::render::attachments(
+            &[info],
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    rendered.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(
+            rendered.contains(&format!("name={shown} (+1 other name: {other})")),
+            "{rendered}"
+        );
     }
 
     #[test]

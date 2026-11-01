@@ -1199,17 +1199,19 @@ pub struct CoverBeliefs {
 /// says it cannot be had here, recorded in `skipped` as `what` and why.
 fn presentable<T>(
     result: Result<T>,
-    unreadable: &dyn Fn(&anyhow::Error) -> bool,
+    unreadable: &crate::storage::Unreadable<'_>,
     skipped: &mut Vec<String>,
     what: impl FnOnce() -> String,
 ) -> Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
-        Err(error) if unreadable(&error) => {
-            skipped.push(format!("{} ({error:#})", what()));
-            Ok(None)
-        }
-        Err(error) => Err(error),
+        Err(error) => match unreadable(&error) {
+            Some(reason) => {
+                skipped.push(format!("{} ({reason})", what()));
+                Ok(None)
+            }
+            None => Err(error),
+        },
     }
 }
 
@@ -1230,7 +1232,7 @@ pub fn cover_fragments<P: TriblePattern>(
     reader: &PileSnapshot,
     facts: &P,
     latest: &LatestIndex,
-    unreadable: &dyn Fn(&anyhow::Error) -> bool,
+    unreadable: &crate::storage::Unreadable<'_>,
 ) -> Result<CoverBeliefs> {
     let mut skipped = Vec::new();
     let frontier: Vec<RevisionRecord> = find!(revision: Id, latest.has(revision))
@@ -2222,7 +2224,7 @@ mod tests {
         let CoverBeliefs {
             beliefs,
             unreadable,
-        } = cover_fragments(&reader, &facts, &order, &|_| false).unwrap();
+        } = cover_fragments(&reader, &facts, &order, &|_| None).unwrap();
         assert!(unreadable.is_empty());
         assert_eq!(
             beliefs
@@ -2296,11 +2298,11 @@ mod tests {
             .unwrap();
         let order = latest_index(&facts);
         // A strict read still refuses, and so never reports less than it saw.
-        assert!(cover_fragments(&reader, &facts, &order, &|_| false).is_err());
+        assert!(cover_fragments(&reader, &facts, &order, &|_| None).is_err());
         let CoverBeliefs {
             beliefs,
             unreadable,
-        } = cover_fragments(&reader, &facts, &order, &|_| true).unwrap();
+        } = cover_fragments(&reader, &facts, &order, &|error| Some(format!("{error:#}"))).unwrap();
         assert_eq!(
             beliefs
                 .iter()

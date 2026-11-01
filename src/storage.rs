@@ -688,20 +688,35 @@ where
     }
 }
 
+/// Asked of the error of ONE payload read by a presentation: `Some(reason)`
+/// when that payload cannot be had in this observation, so the presentation
+/// leaves out what depends on it and reports `reason`; None when the error
+/// must fail the presentation.
+pub type Unreadable<'a> = dyn Fn(&anyhow::Error) -> Option<String> + 'a;
+
 /// [`read`] for a presentation that shows what it can.
 ///
-/// `render` receives `unreadable`, a test for the error of ONE payload read
-/// it made: true means that payload cannot be had in this observation, so the
-/// presentation leaves its entry out and says so. A payload missing for the
-/// first time is not unreadable; the closure fails on it, the payload is
-/// acquired as [`read`] acquires it, and the closure runs again. Only a
-/// payload whose acquisition found no provider (or failed), or whose bytes
-/// cannot be decoded, becomes unreadable, so one absent blob costs one
-/// acquisition attempt rather than the whole presentation.
+/// `render` receives an [`Unreadable`] test for the error of each payload
+/// read it makes. Exactly two kinds of error may leave a payload out:
+///
+/// - a missing blob whose acquisition was attempted and lost, reported as
+///   `no provider` or `acquisition failed: <cause>`;
+/// - bytes that cannot be decoded as the payload's encoding, reported as
+///   `undecodable: <cause>`.
+///
+/// Every other error fails the presentation.
+///
+/// A blob missing for the first time is left out of that pass provisionally
+/// and recorded. After the pass, every recorded blob is acquired (one after
+/// another: acquisition borrows the store), and the presentation renders
+/// again with what arrived. So it renders twice when acquisitions settle in
+/// one round, and again only if newly arrived payloads lead to further
+/// missing ones. A miss the closure propagates instead of leaving out is
+/// acquired the same way.
 pub async fn read_presentable<S, T>(
     store: &mut S,
     snapshot: &S::Snapshot,
-    mut render: impl FnMut(&S::Snapshot, &dyn Fn(&anyhow::Error) -> bool) -> Result<T>,
+    mut render: impl FnMut(&S::Snapshot, &Unreadable<'_>) -> Result<T>,
 ) -> Result<T>
 where
     S: SnapshotSource + AsyncBlobStoreAcquire,
@@ -713,28 +728,57 @@ where
             .find_map(|error| error.downcast_ref::<MissingBlob>())
             .map(|missing| missing.handle)
     };
-    let mut unavailable = BTreeSet::new();
+    let undecodable = |error: &anyhow::Error| {
+        error
+            .chain()
+            .find_map(|error| error.downcast_ref::<anybytes::view::ViewError>())
+            .map(|error| format!("undecodable: {error}"))
+    };
+    // Why each blob whose acquisition was attempted and lost is absent.
+    let mut lost = BTreeMap::new();
     let mut reader = snapshot.clone();
     loop {
-        let error = match render(&reader, &|error| {
-            missing(error).is_none_or(|handle| unavailable.contains(&handle))
-        }) {
-            Ok(value) => return Ok(value),
-            Err(error) => error,
-        };
-        let Some(handle) = missing(&error) else {
-            return Err(error);
-        };
-        // As in `read`: a closure consulting another reader, or skipping
-        // nothing it was told it may skip, must fail rather than spin.
-        if unavailable.contains(&handle) || reader.contains_blob(handle)? {
-            return Err(error);
+        let pending = std::cell::RefCell::new(BTreeSet::new());
+        let result = render(&reader, &|error| match missing(error) {
+            Some(handle) => Some(lost.get(&handle).cloned().unwrap_or_else(|| {
+                pending.borrow_mut().insert(handle);
+                "acquisition pending".to_owned()
+            })),
+            None => undecodable(error),
+        });
+        let mut pending = pending.into_inner();
+        match result {
+            Ok(value) if pending.is_empty() => return Ok(value),
+            Ok(_) => {}
+            Err(error) => match missing(&error) {
+                Some(handle) if !lost.contains_key(&handle) => {
+                    pending.insert(handle);
+                }
+                _ => return Err(error),
+            },
         }
-        match store.acquire(handle).await {
-            Ok(Some(_)) => reader = store.snapshot()?,
-            Ok(None) | Err(_) => {
-                unavailable.insert(handle);
+        let mut arrived = false;
+        for handle in pending {
+            // As in `read`: a closure reading through another reader must
+            // fail rather than acquire resident bytes forever.
+            if reader.contains_blob(handle)? {
+                anyhow::bail!(
+                    "presentation missed blob {} that its own reader holds",
+                    hex::encode(handle.raw)
+                );
             }
+            match store.acquire(handle).await {
+                Ok(Some(_)) => arrived = true,
+                Ok(None) => {
+                    lost.insert(handle, "no provider".to_owned());
+                }
+                Err(error) => {
+                    lost.insert(handle, format!("acquisition failed: {error}"));
+                }
+            }
+        }
+        if arrived {
+            reader = store.snapshot()?;
         }
     }
 }
@@ -1862,7 +1906,7 @@ mod tests {
                         Ok(bytes) => shown.push(String::from_utf8(bytes.to_vec()).unwrap()),
                         Err(error) => {
                             let error = anyhow::Error::from(error);
-                            if !unreadable(&error) {
+                            if unreadable(&error).is_none() {
                                 return Err(error);
                             }
                             skipped.push(handle);
@@ -1875,8 +1919,13 @@ mod tests {
         .unwrap();
         assert_eq!(shown, ["resident", "fetched"]);
         assert_eq!(skipped, [gone]);
-        // One acquisition per missing payload, the fetchable one included.
-        assert_eq!(store.requested, [fetched, gone]);
+        // One acquisition per missing payload, the fetchable one included,
+        // in no particular order: they are acquired together after a pass.
+        let mut requested = store.requested.clone();
+        requested.sort();
+        let mut expected = [fetched, gone];
+        expected.sort();
+        assert_eq!(requested, expected);
 
         // A closure that does not skip what it may skip fails, never spins.
         let resident = store.snapshot().unwrap();
@@ -1884,9 +1933,153 @@ mod tests {
             Ok(reader.get::<Bytes, UnknownBlob>(gone)?)
         }));
         assert!(result.is_err());
-        assert_eq!(store.requested, [fetched, gone, gone]);
+        assert_eq!(store.requested[2..], [gone]);
         drop(resident);
         drop(before);
+        store.pile.close().unwrap();
+    }
+
+    /// A store for presentable reads: some payloads are supplied, some
+    /// acquisitions fail, and everything else has no provider.
+    struct Presentable {
+        pile: Pile,
+        available: BTreeMap<Inline<Handle<UnknownBlob>>, anybytes::Bytes>,
+        failing: BTreeSet<Inline<Handle<UnknownBlob>>>,
+        requested: Vec<Inline<Handle<UnknownBlob>>>,
+    }
+    impl SnapshotSource for Presentable {
+        type Snapshot = triblespace::core::repo::pile::PileSnapshot;
+        type SnapshotError = <Pile as SnapshotSource>::SnapshotError;
+
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            self.pile.snapshot()
+        }
+    }
+    impl AsyncBlobStoreAcquire for Presentable {
+        type AcquireError = std::io::Error;
+
+        async fn acquire(
+            &mut self,
+            handle: Inline<Handle<UnknownBlob>>,
+        ) -> Result<Option<anybytes::Bytes>, Self::AcquireError> {
+            use triblespace::core::repo::BlobStorePut;
+            self.requested.push(handle);
+            if self.failing.contains(&handle) {
+                return Err(std::io::Error::other("link down"));
+            }
+            let Some(payload) = self.available.get(&handle).cloned() else {
+                return Ok(None);
+            };
+            self.pile.put::<UnknownBlob, _>(payload.clone()).unwrap();
+            Ok(Some(payload))
+        }
+    }
+    impl Presentable {
+        fn new(files: &TestFiles) -> Self {
+            Self {
+                pile: open_pile_strict(&files.pile).unwrap(),
+                available: BTreeMap::new(),
+                failing: BTreeSet::new(),
+                requested: Vec::new(),
+            }
+        }
+    }
+
+    /// Text payloads read the way a presentation reads them: each value, or
+    /// the reason it was left out.
+    fn present_texts(
+        store: &mut Presentable,
+        handles: &[Inline<Handle<UTF8String>>],
+        renders: &mut usize,
+    ) -> Result<Vec<Result<String, String>>> {
+        let snapshot = store.snapshot().unwrap();
+        pollster::block_on(read_presentable(store, &snapshot, |reader, unreadable| {
+            *renders += 1;
+            handles
+                .iter()
+                .map(
+                    |handle| match reader.get::<View<str>, UTF8String>(*handle) {
+                        Ok(text) => Ok(Ok(text.to_string())),
+                        Err(error) => {
+                            let error = anyhow::Error::from(error);
+                            match unreadable(&error) {
+                                Some(reason) => Ok(Err(reason)),
+                                None => Err(error),
+                            }
+                        }
+                    },
+                )
+                .collect()
+        }))
+    }
+
+    /// Only an absent payload or one that cannot be decoded may be left out,
+    /// and its omission says which: no provider, a failed acquisition with
+    /// its cause, or undecodable bytes with theirs.
+    #[test]
+    fn presentable_read_names_why_each_payload_is_left_out() {
+        use triblespace::core::repo::BlobStorePut;
+        let files = TestFiles::new();
+        let mut store = Presentable::new(&files);
+        let mut source = MemoryRepo::default();
+        let nobody = source.put::<UTF8String, _>("no provider has me").unwrap();
+        let failing = source.put::<UTF8String, _>("my fetch fails").unwrap();
+        store.failing.insert(Inline::new(failing.raw));
+        let invalid = store
+            .pile
+            .put::<UnknownBlob, _>(anybytes::Bytes::from(vec![0xff, 0xfe]))
+            .unwrap();
+        let invalid = Inline::<Handle<UTF8String>>::new(invalid.raw);
+        let mut renders = 0;
+        let texts = present_texts(&mut store, &[nobody, failing, invalid], &mut renders).unwrap();
+        let reasons: Vec<String> = texts.into_iter().map(Result::unwrap_err).collect();
+        assert!(reasons[0].starts_with("no provider"), "{reasons:?}");
+        assert!(
+            reasons[1].starts_with("acquisition failed") && reasons[1].contains("link down"),
+            "{reasons:?}"
+        );
+        assert!(reasons[2].starts_with("undecodable"), "{reasons:?}");
+
+        // Any other error is the presentation's own failure, not an omission.
+        let snapshot = store.snapshot().unwrap();
+        let result =
+            pollster::block_on(read_presentable(&mut store, &snapshot, |_, unreadable| {
+                let error = anyhow::anyhow!("the store could not be inspected");
+                match unreadable(&error) {
+                    Some(_) => Ok(()),
+                    None => Err(error),
+                }
+            }));
+        assert!(result.is_err());
+        drop(snapshot);
+        store.pile.close().unwrap();
+    }
+
+    /// Every payload missing in one pass is acquired before the next, so a
+    /// presentation renders twice however many payloads it lacked.
+    #[test]
+    fn presentable_read_acquires_every_missing_payload_between_two_renders() {
+        use triblespace::core::repo::BlobStorePut;
+        let files = TestFiles::new();
+        let mut store = Presentable::new(&files);
+        let mut source = MemoryRepo::default();
+        let mut handles = Vec::new();
+        for text in ["first", "second"] {
+            let handle = source.put::<UTF8String, _>(text).unwrap();
+            store.available.insert(
+                Inline::new(handle.raw),
+                anybytes::Bytes::from(text.as_bytes().to_vec()),
+            );
+            handles.push(handle);
+        }
+        handles.push(source.put::<UTF8String, _>("never arrives").unwrap());
+        let mut renders = 0;
+        let texts = present_texts(&mut store, &handles, &mut renders).unwrap();
+        assert_eq!(renders, 2);
+        assert_eq!(texts[0], Ok("first".to_owned()));
+        assert_eq!(texts[1], Ok("second".to_owned()));
+        assert!(texts[2].as_ref().unwrap_err().starts_with("no provider"));
+        assert_eq!(store.requested.len(), 3);
         store.pile.close().unwrap();
     }
 

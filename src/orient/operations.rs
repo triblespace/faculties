@@ -2734,7 +2734,7 @@ fn render_native_compass_goals(
     query: &OrientQuery<'_>,
     doing_limit: usize,
     todo_limit: usize,
-    unreadable: &dyn Fn(&anyhow::Error) -> bool,
+    unreadable: &crate::storage::Unreadable<'_>,
 ) -> Result<(String, BTreeSet<Id>)> {
     use std::fmt::Write as _;
 
@@ -2746,14 +2746,16 @@ fn render_native_compass_goals(
     for task in goals {
         let status = match latest_goal_status(query, task) {
             Ok(status) => status,
-            Err(error) if unreadable(&error) => {
-                unplaced.push(format!(
-                    "- [{}] status not readable in this snapshot ({error:#})",
-                    fmt_id(task)
-                ));
-                continue;
-            }
-            Err(error) => return Err(error),
+            Err(error) => match unreadable(&error) {
+                Some(reason) => {
+                    unplaced.push(format!(
+                        "- [{}] status not readable in this snapshot ({reason})",
+                        fmt_id(task)
+                    ));
+                    continue;
+                }
+                None => return Err(error),
+            },
         };
         let (status_event, status, status_at) = status
             .map(|(event, value, at)| {
@@ -2801,13 +2803,17 @@ fn render_native_compass_goals(
     let row = |task: Id| -> Result<String> {
         let title = match native_task_title(query, task) {
             Ok(title) => title,
-            Err(error) if unreadable(&error) => format!("(title not readable: {error:#})"),
-            Err(error) => return Err(error),
+            Err(error) => match unreadable(&error) {
+                Some(reason) => format!("(title not readable: {reason})"),
+                None => return Err(error),
+            },
         };
         let tags = match entity_tags(query, task) {
             Ok(tags) => render_tags(&tags),
-            Err(error) if unreadable(&error) => format!(" (tags not readable: {error:#})"),
-            Err(error) => return Err(error),
+            Err(error) => match unreadable(&error) {
+                Some(reason) => format!(" (tags not readable: {reason})"),
+                None => return Err(error),
+            },
         };
         Ok(format!("- [{}] {title}{tags}", fmt_id(task)))
     };
@@ -3929,7 +3935,7 @@ async fn cmd_show(
                 // Show has its own pending path for a missing payload; it
                 // stays strict here.
                 let (goals, goal_events) =
-                    render_native_compass_goals(&query, doing_limit, todo_limit, &|_| false)?;
+                    render_native_compass_goals(&query, doing_limit, todo_limit, &|_| None)?;
                 let (window_status, status_events) = render_window_status(&query)?;
                 let shown = match persona_id {
                     Some(persona) => {
@@ -9289,8 +9295,10 @@ mod tests {
             let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
             let query = observation.query(&observation.snapshot);
             // Strict, the section refuses; presentable, it names the goal.
-            assert!(render_native_compass_goals(&query, 5, 5, &|_| false).is_err());
-            let (goals, _) = render_native_compass_goals(&query, 5, 5, &|_| true).unwrap();
+            assert!(render_native_compass_goals(&query, 5, 5, &|_| None).is_err());
+            let (goals, _) =
+                render_native_compass_goals(&query, 5, 5, &|error| Some(format!("{error:#}")))
+                    .unwrap();
             assert!(goals.contains("readable goal"), "{goals}");
             assert!(!goals.contains("unread goal"), "{goals}");
             assert!(

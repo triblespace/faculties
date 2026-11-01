@@ -71,6 +71,16 @@ pub fn presence(values: &[Presence], out: &mut Out<'_>) -> Result<()> {
     Ok(())
 }
 
+/// A shown value, marked when writers gave others: `a (+2 other names: b, c)`.
+fn with_alternatives(shown: Option<&str>, others: &[String], noun: &str) -> String {
+    let shown = shown.unwrap_or("-");
+    match others.len() {
+        0 => shown.to_owned(),
+        1 => format!("{shown} (+1 other {noun}: {})", others[0]),
+        count => format!("{shown} (+{count} other {noun}s: {})", others.join(", ")),
+    }
+}
+
 pub fn attachments(values: &[AttachmentInfo], out: &mut Out<'_>) -> Result<()> {
     for row in values {
         out.line(format!(
@@ -79,8 +89,12 @@ pub fn attachments(values: &[AttachmentInfo], out: &mut Out<'_>) -> Result<()> {
             row.chat,
             row.message,
             row.reference,
-            row.name.as_deref().unwrap_or("-"),
-            row.media_type.as_deref().unwrap_or("-"),
+            with_alternatives(row.name.as_deref(), &row.other_names, "name"),
+            with_alternatives(
+                row.media_type.as_deref(),
+                &row.other_media_types,
+                "media type"
+            ),
             row.size
                 .map(|size| size.to_string())
                 .as_deref()

@@ -722,6 +722,9 @@ pub struct SelectedMessageVersion {
 /// targets and attachments are facts about the observation, so each of its
 /// required projections carries all of them; two projections are two shown
 /// alternatives, and independent values are never paired with each other.
+/// The latest version is chosen among observations of a message (an
+/// observation's version being the latest time any of its projections
+/// claims), and every projection of a chosen observation is shown.
 pub fn select_messages<P>(
     facts: &P,
     channel_filter: Option<Id>,
@@ -814,6 +817,10 @@ where
     }
 
     let mut by_anchor: BTreeMap<Id, BTreeMap<SemanticState, BTreeSet<Id>>> = BTreeMap::new();
+    // The version of one observation of a message: the latest time any of its
+    // projections claims. Versions are compared between observations, so the
+    // alternatives one observation carries never hide each other.
+    let mut versions: BTreeMap<(Id, Id), i128> = BTreeMap::new();
     for (observation, candidates) in required {
         let edited_at = edits.remove(&observation).unwrap_or_default();
         let reply_to = replies.remove(&observation).unwrap_or_default();
@@ -826,6 +833,8 @@ where
                 reply_to: reply_to.clone(),
                 attachments: attachments.clone(),
             };
+            let version = versions.entry((anchor, observation)).or_insert(i128::MIN);
+            *version = (*version).max(state.version_key());
             by_anchor
                 .entry(anchor)
                 .or_default()
@@ -837,14 +846,22 @@ where
 
     let mut selected = Vec::new();
     for (anchor, states) in by_anchor {
+        let version = |observation: &Id| versions[&(anchor, *observation)];
         let maximal_time = states
-            .keys()
-            .map(SemanticState::version_key)
+            .values()
+            .flatten()
+            .map(version)
             .max()
             .expect("message anchor group is non-empty");
+        // Every state of a latest observation is shown, whichever time it
+        // claims itself.
         let maximal = states
             .into_iter()
-            .filter(|(state, _)| state.version_key() == maximal_time)
+            .filter(|(_, observations)| {
+                observations
+                    .iter()
+                    .any(|observation| version(observation) == maximal_time)
+            })
             .collect::<Vec<_>>();
         let variant_count = maximal.len();
         for (variant_index, (state, observations)) in maximal.into_iter().enumerate() {
@@ -855,10 +872,12 @@ where
                 continue;
             }
             selected.push(SelectedMessageVersion {
+                // A latest observation carrying this state, not an older one
+                // that happens to carry it too.
                 observation: observations
                     .into_iter()
-                    .next()
-                    .expect("semantic state has an observation"),
+                    .find(|observation| version(observation) == maximal_time)
+                    .expect("a shown state has a latest observation"),
                 anchor,
                 content: state.fields.content,
                 author: state.fields.author,
@@ -1549,6 +1568,39 @@ mod tests {
             assert_eq!(row.edited_at, BTreeSet::from([first_edit, second_edit]));
             assert_eq!(row.reply_to, BTreeSet::from([first_reply, second_reply]));
         }
+    }
+
+    /// An observation whose creation time a second writer gave another value
+    /// has two projections, and the newer one does not hide the older: the
+    /// latest-version rule chooses among observations of a message, never
+    /// among the alternatives one observation carries.
+    #[test]
+    fn two_creation_times_of_one_observation_are_both_shown() {
+        let floor = 1553506755164504063_u64;
+        let mut fragment = utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            heard_from(floor),
+            "hello there",
+            None,
+            None,
+        )
+        .unwrap();
+        let observation = select_messages(fragment.facts(), None, None).unwrap()[0].observation;
+        let later = heard_from(floor + (5_000 << 22));
+        fragment += entity! { ExclusiveId::force_ref(&observation) @
+            metadata::created_at: later,
+        };
+        let selected = select_messages(fragment.facts(), None, None).unwrap();
+        assert_eq!(selected.len(), 2, "{selected:?}");
+        assert!(selected.iter().all(|row| row.variant_count == 2));
+        assert_eq!(
+            selected
+                .iter()
+                .map(|row| row.created_at)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([heard_from(floor), later])
+        );
     }
 
     /// Two external ids on one user or channel anchor, and a profile naming
