@@ -5927,6 +5927,12 @@ struct WakePair {
     /// Exactly what that command prints to stdout (for an image memory, the
     /// text line before the image part).
     output: String,
+    /// For a memory recall only: the recalled memory's range exactly as the
+    /// cover text prints it (`<from>..<to>`, TAI, second resolution). Not part
+    /// of the command's output: a `memory <id>` recall prints no time, so this
+    /// is the consumer's bookkeeping (where the memory sits in lived time),
+    /// never something the reader is shown as output.
+    range: Option<String>,
 }
 
 impl WakePair {
@@ -5938,7 +5944,11 @@ impl WakePair {
                     .all(|byte| byte.is_ascii_alphanumeric() || b"-.:".contains(&byte))),
             "wake pair command needs no shell quoting: {command:?}"
         );
-        Self { command, output }
+        Self {
+            command,
+            output,
+            range: None,
+        }
     }
 }
 
@@ -5948,7 +5958,8 @@ fn goals_command(doing_limit: usize, todo_limit: usize) -> String {
 }
 
 /// The wake selection as command/result pairs, in prefix order: memory
-/// recalls, then one `wiki export` per cover belief, then one goals pair.
+/// recalls, then one `wiki show` per cover belief revision, then one goals
+/// pair.
 fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) -> Vec<WakePair> {
     let mut pairs = Vec::new();
     for entry in &selection.cover.entries {
@@ -5957,24 +5968,34 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         let Some(body) = entry.body.as_deref().filter(|body| !body.is_empty()) else {
             continue;
         };
-        // `memory <range>` prints the chunk summary (trailing whitespace
-        // trimmed) and one newline, exactly as the cover text renders it. An
+        // The recall (`memory <range>` or `memory <id>`, whichever resolves
+        // to exactly this memory) prints the chunk summary (trailing
+        // whitespace trimmed) and one newline, as the cover text renders it. An
         // image memory is the one exception: its recall also emits the image,
         // which a text pair cannot carry, so the pair holds only the
         // placeholder line the cover text shows (as Drive always has).
-        pairs.push(WakePair::new(entry.recall.clone(), format!("{body}\n")));
+        pairs.push(WakePair {
+            range: Some(format!("{}..{}", entry.start, entry.end)),
+            ..WakePair::new(entry.recall.clone(), format!("{body}\n"))
+        });
     }
+    let mut shown = BTreeSet::new();
     for belief in &selection.beliefs {
-        // `wiki export` prints the stored content bytes, nothing added. It
-        // follows the entry's frontier, which is this revision alone unless the
-        // entry is forked; a forked head is named exactly instead, since the
-        // frontier-following read refuses a fork.
+        // `wiki show` prints the title, the revision's identity lines and the
+        // content, as plain wake shows a belief's title above its content. It
+        // follows the entry's frontier, which is this revision alone unless
+        // the entry is forked; a forked head is named exactly instead. One
+        // revision id with several title/content projections is ONE pair:
+        // `wiki show` prints them all, under its fork banner.
+        if !shown.insert(belief.revision) {
+            continue;
+        }
         let command = if belief.sole_head {
-            format!("wiki export {:x}", belief.revision)
+            format!("wiki show {:x}", belief.revision)
         } else {
-            format!("wiki export --exact {:x}", belief.revision)
+            format!("wiki show --exact {:x}", belief.revision)
         };
-        pairs.push(WakePair::new(command, belief.content.clone()));
+        pairs.push(WakePair::new(command, belief.show.clone()));
     }
     pairs.push(WakePair::new(
         goals_command(doing_limit, todo_limit),
@@ -6007,10 +6028,14 @@ async fn cmd_wake_pairs(
     .await?;
     let mut lines = String::new();
     for pair in wake_pairs(&selection, options.doing_limit, options.todo_limit) {
-        lines.push_str(&serde_json::to_string(&serde_json::json!({
+        let mut object = serde_json::json!({
             "command": pair.command,
             "output": pair.output,
-        }))?);
+        });
+        if let Some(range) = pair.range {
+            object["range"] = serde_json::Value::String(range);
+        }
+        lines.push_str(&serde_json::to_string(&object)?);
         lines.push('\n');
     }
     write_complete_report(output, &lines, "Orient wake pairs", &mut |_| {}).await?;

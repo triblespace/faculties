@@ -915,11 +915,15 @@ pub struct CoverEntry {
     pub start: String,
     /// End of the range line, `YYYY-MM-DDTHH:MM:SS` (TAI).
     pub end: String,
-    /// `memory <from>..<to>`: the recall that prints `body`. This is the range
-    /// line, except that a POINT range (equal endpoints at second resolution)
-    /// is widened by one second on the end. A zero-width query overlaps no
-    /// chunk, so it would print a different memory or none; the widened range
-    /// is real, typeable, and selects the same chunk.
+    /// The selected memory itself (its exact-span class's representative).
+    pub chunk: Id,
+    /// The recall that prints `body`, and resolves to exactly `chunk`:
+    /// `memory <from>..<to>` when `memory`'s own range lookup, applied to the
+    /// printed range, selects `chunk`; otherwise `memory <id>`. A range is
+    /// printed at second resolution and looked up by best overlap, so it can
+    /// name a different memory: always for a point (an instant overlaps
+    /// nothing, and its widening loses to a one-second memory), and for any
+    /// range with sub-second endpoints or an exact-span twin with a smaller id.
     pub recall: String,
     /// The line(s) printed under the range: the summary without trailing
     /// whitespace, or the `[image memory @ <range>]` placeholder. `None` when
@@ -1243,13 +1247,23 @@ where
         }
         let start = fmt_epoch(key_to_epoch(s));
         let end = fmt_epoch(key_to_epoch(e));
-        let recall_end = if start == end {
-            fmt_epoch(key_to_epoch(e) + hifitime::Duration::from_seconds(1.0))
+        let range = format!("{start}..{end}");
+        // Exactly the lookup `memory <from>..<to>` performs on this range.
+        let range_selects_id = start != end
+            && crate::memory::operations::parse_time_range(&range)
+                .ok()
+                .and_then(|(from, to)| {
+                    crate::memory::operations::find_chunk_by_time_range(space, from, to)
+                })
+                == Some(id);
+        let recall = if range_selects_id {
+            format!("memory {range}")
         } else {
-            end.clone()
+            format!("memory {id:x}")
         };
         entries.push(CoverEntry {
-            recall: format!("memory {start}..{recall_end}"),
+            chunk: id,
+            recall,
             start,
             end,
             body,

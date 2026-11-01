@@ -1764,6 +1764,15 @@ fn wake_pairs(f: &Fixture, args: &[&str]) -> std::process::Output {
 }
 
 fn parse_pairs(stdout: &[u8]) -> Vec<(String, String)> {
+    parse_pairs_with_ranges(stdout)
+        .into_iter()
+        .map(|(command, output, _)| (command, output))
+        .collect()
+}
+
+/// Every line: exactly `command` and `output`, plus `range` on exactly the
+/// memory recalls.
+fn parse_pairs_with_ranges(stdout: &[u8]) -> Vec<(String, String, Option<String>)> {
     std::str::from_utf8(stdout)
         .unwrap()
         .lines()
@@ -1771,14 +1780,22 @@ fn parse_pairs(stdout: &[u8]) -> Vec<(String, String)> {
             let Value::Object(object) = serde_json::from_str::<Value>(line).unwrap() else {
                 panic!("one JSON object per line: {line}")
             };
+            let recall = object["command"].as_str().unwrap().starts_with("memory ");
             assert_eq!(
                 object.keys().collect::<Vec<_>>(),
-                ["command", "output"],
+                if recall {
+                    vec!["command", "output", "range"]
+                } else {
+                    vec!["command", "output"]
+                },
                 "{line}"
             );
             (
                 object["command"].as_str().unwrap().to_owned(),
                 object["output"].as_str().unwrap().to_owned(),
+                object
+                    .get("range")
+                    .map(|range| range.as_str().unwrap().to_owned()),
             )
         })
         .collect()
@@ -1850,6 +1867,7 @@ fn wake_pairs_select_what_memory_context_selects_and_every_command_replays() {
         if !context.status.success() {
             continue;
         }
+        let ranged = parse_pairs_with_ranges(&pairs.stdout);
         let pairs = parse_pairs(&pairs.stdout);
         let memory: Vec<_> = pairs
             .iter()
@@ -1862,15 +1880,18 @@ fn wake_pairs_select_what_memory_context_selects_and_every_command_replays() {
             blocks.len(),
             "{chars}: one pair per cover entry"
         );
+        for ((_, _, range), (start, end, _)) in ranged.iter().zip(&blocks) {
+            assert_eq!(range.as_deref(), Some(format!("{start}..{end}").as_str()));
+        }
         for ((command, output), (start, end, body)) in memory.iter().zip(&blocks) {
-            let recall_end = if start == end {
-                // A point is widened by one second on the end.
+            if start == end {
+                // A point has no range a lookup resolves to it alone: its id.
                 assert_eq!(start, "2026-08-27T02:00:00");
-                "2026-08-27T02:00:01".to_owned()
+                let id = command.strip_prefix("memory ").unwrap();
+                assert!(id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()));
             } else {
-                end.clone()
-            };
-            assert_eq!(command, &format!("memory {start}..{recall_end}"));
+                assert_eq!(command, &format!("memory {start}..{end}"));
+            }
             assert_eq!(output, &format!("{body}\n"));
         }
         // The overhead is charged: without it the same budget selects
@@ -1890,7 +1911,7 @@ fn wake_pairs_select_what_memory_context_selects_and_every_command_replays() {
         if chars == "800000" {
             assert!(memory
                 .iter()
-                .any(|(command, _)| command == "memory 2026-08-27T02:00:00..2026-08-27T02:00:01"));
+                .any(|(_, output)| output.starts_with("A point memory")));
         }
 
         // Then the beliefs, in wake order, then exactly one goals pair.
@@ -1899,21 +1920,32 @@ fn wake_pairs_select_what_memory_context_selects_and_every_command_replays() {
         assert_eq!(goals.0, "orient goals --doing-limit 5 --todo-limit 5");
         assert!(goals.1.starts_with("Compass:\n"), "{}", goals.1);
         assert!(PLAIN_WAKE_GOLDEN.contains(&goals.1));
-        assert_eq!(
-            beliefs
-                .iter()
-                .map(|(_, output)| output.as_str())
-                .collect::<Vec<_>>(),
-            [
+        // `wiki show`: the title, the revision's identity lines, the content.
+        let expected = [
+            (
+                false,
+                "Alpha belief",
                 "= Alpha belief\n\nThe first standing belief, with a `literal` and $x$.\n",
-                "= Fork\n\nThe left head.",
-                "= Fork\n\nThe right head.",
-            ]
-        );
-        assert!(beliefs[0].0.starts_with("wiki export ") && !beliefs[0].0.contains("--exact"));
-        assert!(beliefs[1..]
-            .iter()
-            .all(|(command, _)| command.starts_with("wiki export --exact ")));
+            ),
+            (true, "Fork left", "= Fork\n\nThe left head."),
+            (true, "Fork right", "= Fork\n\nThe right head."),
+        ];
+        assert_eq!(beliefs.len(), expected.len());
+        for ((command, output), (forked, title, content)) in beliefs.iter().zip(expected) {
+            let id = if forked {
+                command.strip_prefix("wiki show --exact ").unwrap()
+            } else {
+                command.strip_prefix("wiki show ").unwrap()
+            };
+            assert_eq!(id.len(), 32, "{command}");
+            assert!(
+                output.starts_with(&format!("# {title}\nrevision: {id}\n")),
+                "{output}"
+            );
+            assert!(output.contains("tags: [cover]\n"), "{output}");
+            assert_eq!(output.contains("supersedes: "), forked, "{output}");
+            assert!(output.ends_with(&format!("\n\n{content}")), "{output}");
+        }
 
         // Every command, run, prints exactly its output.
         for (command, output) in &pairs {
@@ -1945,4 +1977,140 @@ fn wake_pairs_name_the_goal_limits_they_used_and_goals_defaults_match_wake() {
         .output()
         .unwrap();
     assert!(!refused.status.success());
+}
+
+/// A sub-second instant `t` seconds into the fixture day.
+fn wake_at_fraction(seconds: f64) -> faculties::memory::IntervalValue {
+    let epoch = hifitime::Epoch::from_gregorian_tai(2026, 8, 27, 0, 0, 0, 0)
+        + hifitime::Duration::from_seconds(seconds);
+    (epoch, epoch).try_to_inline().unwrap()
+}
+
+#[test]
+fn every_recall_and_belief_pair_resolves_to_exactly_what_it_shows() {
+    use faculties::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
+    use std::collections::BTreeSet;
+    let f = Fixture::new();
+    let chunk = |start: f64, end: f64, text: &str| {
+        chunk_fragment(ChunkDraft {
+            content: ChunkDraftContent::Text(text.to_owned()),
+            start_at: wake_at_fraction(start),
+            end_at: wake_at_fraction(end),
+            tags: BTreeSet::new(),
+            references: BTreeSet::new(),
+            about_exec_result: None,
+            about_archive_message: None,
+            observed_at: BTreeSet::from([wake_at_fraction(end)]),
+            aliases: BTreeSet::new(),
+        })
+        .unwrap()
+        .0
+    };
+    // A point half a second past 01:00:00 and a memory spanning exactly that
+    // second: the point's old widened recall `01:00:00..01:00:01` selects the
+    // one-second memory (score 1 s against 0).
+    let mut memories = chunk(3_600.5, 3_600.5, "The point inside a second.");
+    memories += chunk(3_600.0, 3_601.0, "The memory of exactly one second.");
+    // A range with sub-second ends prints as 02:00:00..02:00:05, which a
+    // memory of exactly those five seconds matches better than it does.
+    memories += chunk(7_200.3, 7_205.7, "The range with sub-second ends.");
+    memories += chunk(7_200.0, 7_205.0, "The five whole seconds.");
+    f.publish(faculties::schemas::memory::DEFAULT_SCOPE_ID, memories);
+
+    // One revision id carrying two title/content projections.
+    let signer = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
+    let (author_fragment, author) = faculties::wiki::author_record(&signer.verifying_key());
+    let (cover_fragment, cover, _) = faculties::wiki::tag_record("cover").unwrap();
+    let (revision, revision_id) =
+        faculties::wiki::revision_record(faculties::wiki::RevisionDraft {
+            title: "Twice projected".to_owned(),
+            content: "= Twice projected\n\nFirst text.".to_owned(),
+            tags: BTreeSet::from([cover]),
+            predecessors: BTreeSet::new(),
+            author,
+            authored_at: wake_at(100),
+        })
+        .unwrap();
+    let mut wiki = author_fragment + cover_fragment + revision;
+    let title: faculties::schemas::wiki::TextHandle = wiki.put("Twice projected, again".to_owned());
+    let content: faculties::schemas::wiki::TextHandle =
+        wiki.put("= Twice projected\n\nSecond text.".to_owned());
+    wiki += entity! { ExclusiveId::force_ref(&revision_id) @
+        faculties::schemas::wiki::attrs::title: title,
+        faculties::schemas::wiki::attrs::content: content,
+    };
+    f.publish(faculties::schemas::wiki::DEFAULT_SCOPE_ID, wiki);
+    f.maintain();
+
+    // The old spellings name the WRONG memory: what the previous pairs
+    // claimed would print these bodies prints the competitors'.
+    assert_eq!(
+        replay(&f, "memory 2026-08-27T01:00:00..2026-08-27T01:00:01"),
+        "The memory of exactly one second.\n"
+    );
+    assert_eq!(
+        replay(&f, "memory 2026-08-27T02:00:00..2026-08-27T02:00:05"),
+        "The five whole seconds.\n"
+    );
+
+    let output = wake_pairs(&f, &["--chars", "800000", "--chunk-overhead", "47"]);
+    assert!(output.status.success(), "{output:?}");
+    let pairs = parse_pairs(&output.stdout);
+    let by_output = |text: &str| {
+        pairs
+            .iter()
+            .find(|(_, output)| output == text)
+            .unwrap_or_else(|| panic!("no pair shows {text:?}: {pairs:?}"))
+            .0
+            .clone()
+    };
+    let is_id_recall = |command: &str| {
+        command
+            .strip_prefix("memory ")
+            .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    assert!(is_id_recall(&by_output("The point inside a second.\n")));
+    // The id recall prints no time; the pair's range keeps where it sits.
+    let ranged = parse_pairs_with_ranges(&output.stdout);
+    let range_of = |text: &str| {
+        ranged
+            .iter()
+            .find(|(_, output, _)| output == text)
+            .and_then(|(_, _, range)| range.clone())
+    };
+    assert_eq!(
+        range_of("The point inside a second.\n").as_deref(),
+        Some("2026-08-27T01:00:00..2026-08-27T01:00:00")
+    );
+    assert_eq!(
+        range_of("The range with sub-second ends.\n").as_deref(),
+        Some("2026-08-27T02:00:00..2026-08-27T02:00:05")
+    );
+    assert!(is_id_recall(&by_output(
+        "The range with sub-second ends.\n"
+    )));
+    assert_eq!(
+        by_output("The memory of exactly one second.\n"),
+        "memory 2026-08-27T01:00:00..2026-08-27T01:00:01"
+    );
+    assert_eq!(
+        by_output("The five whole seconds.\n"),
+        "memory 2026-08-27T02:00:00..2026-08-27T02:00:05"
+    );
+
+    // The doubly projected revision is ONE pair, showing both projections.
+    let beliefs: Vec<_> = pairs
+        .iter()
+        .filter(|(command, _)| command.starts_with("wiki "))
+        .collect();
+    assert_eq!(beliefs.len(), 1, "{beliefs:?}");
+    assert_eq!(beliefs[0].0, format!("wiki show {revision_id:x}"));
+    assert!(beliefs[0].1.contains("First text.") && beliefs[0].1.contains("Second text."));
+    // The plain report still lists each projection under its own title.
+    let plain = text(&f.cli(&["wake"]));
+    assert!(plain.contains("- Twice projected\n") && plain.contains("- Twice projected, again\n"));
+
+    for (command, output) in &pairs {
+        assert_eq!(&replay(&f, command), output, "{command}");
+    }
 }

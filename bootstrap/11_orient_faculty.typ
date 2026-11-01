@@ -42,16 +42,20 @@ as presented, after the complete report has been flushed.
 A harness that wakes a model must not paste the wake report into its context:
 the model should only ever see commands it could have issued and what they
 printed. `orient wake --pairs` prints the same selection as plain `wake`, as
-JSON lines of the form `{"command": ..., "output": ...}`, in this order:
+JSON lines of the form `{"command": ..., "output": ...}`, in this order (a
+memory recall also carries `"range"`, the memory's range as the cover prints it,
+for the harness's bookkeeping; a `memory <id>` recall itself prints no time):
 
-  - one `memory <from>..<to>` recall per selected memory (a point range is
-    widened by one second on its end, so the recall selects that chunk)
-  - one `wiki export <id>` per cover-tagged belief (`wiki export --exact <id>`
-    for a head of a forked entry, which the frontier-following read refuses)
+  - one recall per selected memory: `memory <from>..<to>` when memory's own
+    range lookup selects exactly that memory, otherwise `memory <id>` (always
+    for a point, whose instant no range lookup can name uniquely)
+  - one `wiki show <id>` per cover-tagged belief revision (`wiki show --exact
+    <id>` for a head of a forked entry), carrying the title as plain `wake` does
   - one `orient goals --doing-limit N --todo-limit M`, naming the limits used
 
-Each output is exactly what its command prints against the same pile, so the
-harness can replay any pair to check it. The memory selection is exactly that of
+Each output is exactly what its command prints against the same pile (for an
+image memory, only the placeholder line, without the image), so the harness can
+replay any pair to check it. The memory selection is exactly that of
 `memory context --chars N --chunk-overhead K`; pass `--chunk-overhead` with the
 characters the harness adds around each recall. `--pairs` never uses a persona
 and never records presentation; memory diagnostics go to stderr.

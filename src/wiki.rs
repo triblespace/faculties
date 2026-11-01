@@ -1172,10 +1172,16 @@ pub struct CoverBelief {
     pub revision: Id,
     pub title: String,
     pub content: String,
-    /// True when this revision is its entry's ONLY current head, so the
-    /// frontier-following `wiki export <revision>` prints exactly `content`.
-    /// On a fork that read refuses, and only `wiki export --exact` names it.
+    /// True when this revision is its entry's ONLY current head (possibly as
+    /// several title/content projections of the one id), so the
+    /// frontier-following `wiki show <revision>` shows exactly this revision.
+    /// On a fork it would show every head, and `wiki show --exact` names one.
     pub sole_head: bool,
+    /// Exactly what that `wiki show` prints: `# <title>`, the revision id,
+    /// supersedes and tags lines when present, a blank line, then the content.
+    /// A revision id carrying several projections prints all of them under a
+    /// `fork:` banner, so every row of that id holds the same `show`.
+    pub show: String,
 }
 
 /// Every cover-tagged maximal Wiki revision, ordered by title then id.
@@ -1224,19 +1230,20 @@ pub fn cover_fragments<P: TriblePattern>(
     }
     rows.sort_by(|left, right| (&left.0, left.2).cmp(&(&right.0, right.2)));
     rows.dedup();
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(|(title, content, revision)| {
             let sole_head = entry(facts, latest, revision)
                 .is_some_and(|entry| entry.frontier.iter().all(|head| head.id == revision));
-            CoverBelief {
+            let show = operations::render_show(facts, latest, reader, revision, sole_head)?;
+            Ok(CoverBelief {
                 revision,
                 title,
                 content,
                 sole_head,
-            }
+                show,
+            })
         })
-        .collect())
+        .collect()
 }
 
 // ── the frontier link model ────────────────────────────────────────────────

@@ -819,7 +819,7 @@ fn moment() -> Duration {
 /// that matches the query's width. This replaces a "narrowest strict
 /// container, else max raw overlap" rule that let an oversized root shadow
 /// every finer cover (raw overlap also favours wide chunks).
-fn find_chunk_by_time_range<P: TriblePattern>(
+pub fn find_chunk_by_time_range<P: TriblePattern>(
     space: &P,
     query_start: Epoch,
     query_end: Epoch,

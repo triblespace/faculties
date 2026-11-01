@@ -68,8 +68,8 @@ pub struct Cli {
 ///   cover + cover-tagged beliefs + goals. Deliberately large; the point is
 ///   wholeness, not efficiency, so it is read whole. `wake --pairs` prints the
 ///   same selection as command/result pairs for a harness that wakes a model
-///   from commands it could have issued (`memory <range>`, `wiki export <id>`,
-///   `orient goals ...`), never a pasted document.
+///   from commands it could have issued (`memory <range>` or `memory <id>`,
+///   `wiki show <id>`, `orient goals ...`), never a pasted document.
 /// - `goals` — the Compass section of `wake`, alone.
 /// - `show`  — a general overview mid-session, for "what's up right now".
 ///   **Neither memories nor wiki entries belong here** — it is a situation
@@ -110,14 +110,19 @@ enum Command {
     /// cover-tagged beliefs + goals
     ///
     /// With `--pairs`, the same selection as JSON lines, one
-    /// `{"command": ..., "output": ...}` object per line, for a harness that
+    /// `{"command": ..., "output": ...}` object per line (a memory recall also
+    /// carries `"range": "<from>..<to>"`, the memory's range as the cover
+    /// prints it, for the harness's own bookkeeping: a `memory <id>` recall
+    /// prints no time), for a harness that
     /// wakes a model from commands rather than a pasted document: first one
-    /// `memory <from>..<to>` recall per cover entry (a point range widened by
-    /// one second so it selects its own chunk), then one `wiki export <id>` per
-    /// cover belief (`wiki export --exact <id>` for a head of a forked entry),
-    /// then one `orient goals --doing-limit N --todo-limit M`. Each `output` is
-    /// exactly what its command prints to stdout when run against the same
-    /// pile; for an image memory it is the placeholder line of the cover text.
+    /// recall per cover entry, `memory <from>..<to>` when memory's range lookup
+    /// selects exactly that memory and `memory <id>` otherwise (always for a
+    /// point); then one `wiki show <id>` per cover-belief revision (`wiki show
+    /// --exact <id>` for a head of a forked entry), which prints the title
+    /// above the content as the plain report does; then one `orient goals
+    /// --doing-limit N --todo-limit M`. Each `output` is exactly what its
+    /// command prints to stdout when run against the same pile; for an image
+    /// memory it is the placeholder line of the cover text, without the image.
     /// The memory selection is exactly `memory context --chars N
     /// --chunk-overhead K`. `--pairs` never uses a persona and never records
     /// presentation; memory diagnostics go to stderr.

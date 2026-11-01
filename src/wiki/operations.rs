@@ -452,12 +452,21 @@ fn selector_revisions(
     selector: Id,
     follow_frontier: bool,
 ) -> Result<Vec<RevisionRecord>> {
-    let revisions = wiki_model::revision_records(&view.facts, selector);
+    selector_revisions_in(&view.facts, &view.latest, selector, follow_frontier)
+}
+
+fn selector_revisions_in<P: TriblePattern>(
+    facts: &P,
+    latest: &LatestIndex,
+    selector: Id,
+    follow_frontier: bool,
+) -> Result<Vec<RevisionRecord>> {
+    let revisions = wiki_model::revision_records(facts, selector);
     if revisions.is_empty() {
         bail!("unknown Wiki selector {selector:x}");
     }
     if follow_frontier {
-        Ok(wiki_model::entry(&view.facts, &view.latest, selector)
+        Ok(wiki_model::entry(facts, latest, selector)
             .expect("queryable revision belongs to one entry")
             .frontier)
     } else {
@@ -972,8 +981,8 @@ fn cmd_edit(
     Ok(revision)
 }
 
-fn render_revision(
-    facts: &FactArchive,
+fn render_revision<P: TriblePattern>(
+    facts: &P,
     reader: &PileSnapshot,
     revision: &RevisionRecord,
 ) -> Result<String> {
@@ -1004,9 +1013,24 @@ fn render_revision(
 }
 
 fn cmd_show(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<String> {
-    let report = storage.view(|view| {
+    storage.view(|view| {
         let selector = resolve_prefix(&view.facts, &id)?;
-        let revisions = selector_revisions(view, selector, !exact)?;
+        render_show(&view.facts, &view.latest, &view.reader, selector, !exact)
+    })
+}
+
+/// Exactly what `wiki show <selector>` (`follow_frontier`) or `wiki show
+/// --exact <selector>` prints for a resolved selector, from one frozen view.
+/// `orient wake --pairs` renders its belief pairs with this same function.
+pub(crate) fn render_show<P: TriblePattern>(
+    facts: &P,
+    latest: &LatestIndex,
+    reader: &PileSnapshot,
+    selector: Id,
+    follow_frontier: bool,
+) -> Result<String> {
+    {
+        let revisions = selector_revisions_in(facts, latest, selector, follow_frontier)?;
         let mut report = String::new();
         // A forked entry has no single current text, so print EVERY head under a
         // banner naming them. Silently picking one would be the same class of
@@ -1029,11 +1053,10 @@ fn cmd_show(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<String>
             if index > 0 {
                 report.push_str("\n---\n\n");
             }
-            report.push_str(&render_revision(&view.facts, &view.reader, revision)?);
+            report.push_str(&render_revision(facts, reader, revision)?);
         }
         Ok(report)
-    })?;
-    Ok(report)
+    }
 }
 
 fn cmd_export(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<Export> {
