@@ -1,5 +1,5 @@
 //! Shell syntax and local wall-clock parsing for Orient.
-use super::{NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions};
+use super::{NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions, WakePairsOptions};
 use anyhow::{anyhow, bail, Result};
 use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
@@ -66,7 +66,11 @@ pub struct Cli {
 ///
 /// - `wake`  — **session start, after a compaction.** The whole self: memory
 ///   cover + cover-tagged beliefs + goals. Deliberately large; the point is
-///   wholeness, not efficiency, so it is read whole.
+///   wholeness, not efficiency, so it is read whole. `wake --pairs` prints the
+///   same selection as command/result pairs for a harness that wakes a model
+///   from commands it could have issued (`memory <range>`, `wiki export <id>`,
+///   `orient goals ...`), never a pasted document.
+/// - `goals` — the Compass section of `wake`, alone.
 /// - `show`  — a general overview mid-session, for "what's up right now".
 ///   **Neither memories nor wiki entries belong here** — it is a situation
 ///   snapshot, not a self. Keeping it cheap is what makes it runnable often.
@@ -104,6 +108,19 @@ enum Command {
     },
     /// Session start after a compaction: the whole self — memory cover +
     /// cover-tagged beliefs + goals
+    ///
+    /// With `--pairs`, the same selection as JSON lines, one
+    /// `{"command": ..., "output": ...}` object per line, for a harness that
+    /// wakes a model from commands rather than a pasted document: first one
+    /// `memory <from>..<to>` recall per cover entry (a point range widened by
+    /// one second so it selects its own chunk), then one `wiki export <id>` per
+    /// cover belief (`wiki export --exact <id>` for a head of a forked entry),
+    /// then one `orient goals --doing-limit N --todo-limit M`. Each `output` is
+    /// exactly what its command prints to stdout when run against the same
+    /// pile; for an image memory it is the placeholder line of the cover text.
+    /// The memory selection is exactly `memory context --chars N
+    /// --chunk-overhead K`. `--pairs` never uses a persona and never records
+    /// presentation; memory diagnostics go to stderr.
     Wake {
         /// CHARACTER budget for the memory cover — the wake ritual is for
         /// wholeness, so the default is generous (matches the SessionStart hook);
@@ -111,6 +128,24 @@ enum Command {
         /// instructions rather than dropping memories.
         #[arg(long, default_value_t = 800_000)]
         chars: usize,
+        /// Max doing goals to show
+        #[arg(long, default_value_t = 5)]
+        doing_limit: usize,
+        /// Max todo goals to show
+        #[arg(long, default_value_t = 5)]
+        todo_limit: usize,
+        /// Print the wake as command/result JSON lines instead of a report
+        #[arg(long)]
+        pairs: bool,
+        /// Characters the consumer adds around each selected memory (its recall
+        /// command), charged by the memory selection as `memory context
+        /// --chunk-overhead` charges it. Only with `--pairs`.
+        #[arg(long, default_value_t = 0, requires = "pairs")]
+        chunk_overhead: usize,
+    },
+    /// The Compass section of `orient wake`: priority-ranked doing and todo
+    /// goals. Never records presentation.
+    Goals {
         /// Max doing goals to show
         #[arg(long, default_value_t = 5)]
         doing_limit: usize,
@@ -360,6 +395,35 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             chars,
             doing_limit,
             todo_limit,
+            pairs: true,
+            chunk_overhead,
+        } => {
+            // Diagnostics are about the memory selection, not part of any
+            // pair, and stdout carries nothing but the pairs.
+            let diagnostics = orient.wake_pairs(
+                &WakePairsOptions {
+                    chars,
+                    chunk_overhead,
+                    doing_limit,
+                    todo_limit,
+                },
+                out,
+            )?;
+            for diagnostic in diagnostics {
+                eprintln!("{diagnostic}");
+            }
+            Ok(())
+        }
+        Command::Goals {
+            doing_limit,
+            todo_limit,
+        } => orient.goals(doing_limit, todo_limit, out),
+        Command::Wake {
+            chars,
+            doing_limit,
+            todo_limit,
+            pairs: false,
+            ..
         } => orient.wake(
             cli.persona.as_deref(),
             &WakeOptions {
@@ -451,8 +515,13 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             let persona = cli.persona.as_deref().ok_or_else(|| {
                 anyhow!("daemon requires a persona (pass --persona <label-or-hex> or set $PERSONA)")
             })?;
-            let deadline = run_for.map(|duration| Instant::now().checked_add(duration)
-                .ok_or_else(|| anyhow!("Orient run-for deadline is out of range"))).transpose()?;
+            let deadline = run_for
+                .map(|duration| {
+                    Instant::now()
+                        .checked_add(duration)
+                        .ok_or_else(|| anyhow!("Orient run-for deadline is out of range"))
+                })
+                .transpose()?;
             let mut retry = super::delivery::RetryPolicy::new(retry_known_not_submitted, deadline);
             // Only this daemon sink decorates reports. One ephemeral immutable
             // buffer survives known-unsent attempts; ordinary CLI/wake is unchanged.
@@ -471,7 +540,11 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                         pending_report = Some(prepare_daemon_report(&text, crate::clock::now()?)?);
                     }
                     let result = retry.observed(callback::deliver(
-                        &callback, &callback_args, timeout, pending_report.as_deref().unwrap()));
+                        &callback,
+                        &callback_args,
+                        timeout,
+                        pending_report.as_deref().unwrap(),
+                    ));
                     if result.is_ok() {
                         pending_report = None;
                     }
@@ -508,10 +581,16 @@ fn prepare_daemon_report(text: &str, prepared: hifitime::Epoch) -> Result<String
     if !seconds.is_finite() || seconds < i64::MIN as f64 || seconds > i64::MAX as f64 {
         bail!("Orient report preparation time is outside the UTC display range");
     }
-    let stamp = chrono::Utc.timestamp_opt(seconds.floor() as i64, 0).single()
-        .ok_or_else(|| anyhow!("Orient report preparation time is outside the UTC display range"))?;
-    Ok(format!("Orient report prepared at {} UTC; delivery may be delayed.\n\n{text}",
-        stamp.format("%Y-%m-%dT%H:%M:%S")))
+    let stamp = chrono::Utc
+        .timestamp_opt(seconds.floor() as i64, 0)
+        .single()
+        .ok_or_else(|| {
+            anyhow!("Orient report preparation time is outside the UTC display range")
+        })?;
+    Ok(format!(
+        "Orient report prepared at {} UTC; delivery may be delayed.\n\n{text}",
+        stamp.format("%Y-%m-%dT%H:%M:%S")
+    ))
 }
 
 #[cfg(test)]
@@ -520,8 +599,11 @@ mod tests {
 
     #[test]
     fn daemon_report_discloses_preparation_time_without_refreshing_facts() {
-        let report = prepare_daemon_report("frozen health/habit observation\n",
-            hifitime::Epoch::from_unix_seconds(1_700_000_000.0)).unwrap();
+        let report = prepare_daemon_report(
+            "frozen health/habit observation\n",
+            hifitime::Epoch::from_unix_seconds(1_700_000_000.0),
+        )
+        .unwrap();
         assert_eq!(report, "Orient report prepared at 2023-11-14T22:13:20 UTC; delivery may be delayed.\n\nfrozen health/habit observation\n");
     }
 
@@ -645,10 +727,23 @@ mod tests {
 
     #[test]
     fn daemon_retry_requires_the_explicit_opt_in() {
-        let cli = Cli::try_parse_from(["orient", "--pile", "unused.pile", "daemon",
-            "--callback", "/bin/true", "--retry-known-not-submitted"]).unwrap();
-        assert!(matches!(cli.command,
-            Some(Command::Daemon { retry_known_not_submitted: true, .. })));
+        let cli = Cli::try_parse_from([
+            "orient",
+            "--pile",
+            "unused.pile",
+            "daemon",
+            "--callback",
+            "/bin/true",
+            "--retry-known-not-submitted",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon {
+                retry_known_not_submitted: true,
+                ..
+            })
+        ));
     }
 
     #[test]

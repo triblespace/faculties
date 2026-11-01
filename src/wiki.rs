@@ -1165,7 +1165,20 @@ pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<Strin
     Ok(value.to_string())
 }
 
-/// Every cover-tagged maximal Wiki revision as `(title, content)`.
+/// One cover-tagged maximal Wiki revision, as `orient wake` presents it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverBelief {
+    /// The revision itself: a member of its entry's current frontier.
+    pub revision: Id,
+    pub title: String,
+    pub content: String,
+    /// True when this revision is its entry's ONLY current head, so the
+    /// frontier-following `wiki export <revision>` prints exactly `content`.
+    /// On a fork that read refuses, and only `wiki export --exact` names it.
+    pub sole_head: bool,
+}
+
+/// Every cover-tagged maximal Wiki revision, ordered by title then id.
 ///
 /// A fork is not silently arbitrated: each maximal revision that still carries
 /// a tag named `cover` is returned. Concurrent untagged heads likewise do not
@@ -1175,7 +1188,7 @@ pub fn cover_fragments<P: TriblePattern>(
     reader: &PileSnapshot,
     facts: &P,
     latest: &LatestIndex,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<CoverBelief>> {
     let frontier: Vec<RevisionRecord> = find!(revision: Id, latest.has(revision))
         .flat_map(|revision| revision_records(facts, revision))
         .collect();
@@ -1213,7 +1226,16 @@ pub fn cover_fragments<P: TriblePattern>(
     rows.dedup();
     Ok(rows
         .into_iter()
-        .map(|(title, content, _)| (title, content))
+        .map(|(title, content, revision)| {
+            let sole_head = entry(facts, latest, revision)
+                .is_some_and(|entry| entry.frontier.iter().all(|head| head.id == revision));
+            CoverBelief {
+                revision,
+                title,
+                content,
+                sole_head,
+            }
+        })
         .collect())
 }
 
@@ -2097,10 +2119,10 @@ mod tests {
 
         let mut left = draft(author, "left", [root]);
         left.tags.insert(cover);
-        let (left_fragment, _) = revision_record(left).unwrap();
+        let (left_fragment, left_id) = revision_record(left).unwrap();
         let mut right = draft(author, "right", [root]);
         right.tags.insert(cover);
-        let (right_fragment, _) = revision_record(right).unwrap();
+        let (right_fragment, right_id) = revision_record(right).unwrap();
         let (untagged_fragment, _) = revision_record(draft(author, "untagged", [root])).unwrap();
 
         let mut fragment = author_fragment + cover_fragment;
@@ -2116,13 +2138,23 @@ mod tests {
         pile.commit(collection, &signer, fragment).unwrap();
         let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
         let order = latest_index(&facts);
+        let beliefs = cover_fragments(&reader, &facts, &order).unwrap();
         assert_eq!(
-            cover_fragments(&reader, &facts, &order).unwrap(),
-            vec![
-                ("left".to_owned(), "left body".to_owned()),
-                ("right".to_owned(), "right body".to_owned()),
-            ]
+            beliefs
+                .iter()
+                .map(|belief| (belief.title.as_str(), belief.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("left", "left body"), ("right", "right body")]
         );
+        assert_eq!(
+            beliefs
+                .iter()
+                .map(|belief| belief.revision)
+                .collect::<Vec<_>>(),
+            vec![left_id, right_id]
+        );
+        // Both heads of one entry: a frontier-following export would refuse.
+        assert!(beliefs.iter().all(|belief| !belief.sole_head));
         pile.close().unwrap();
     }
 

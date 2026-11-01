@@ -52,6 +52,26 @@ impl Default for WakeOptions {
         }
     }
 }
+/// `orient wake --pairs`: the plain wake's selection, with the memory cover
+/// priced for a consumer that adds `chunk_overhead` characters per recall.
+#[derive(Clone, Debug)]
+pub struct WakePairsOptions {
+    pub chars: usize,
+    pub chunk_overhead: usize,
+    pub doing_limit: usize,
+    pub todo_limit: usize,
+}
+impl Default for WakePairsOptions {
+    fn default() -> Self {
+        let wake = WakeOptions::default();
+        Self {
+            chars: wake.chars,
+            chunk_overhead: 0,
+            doing_limit: wake.doing_limit,
+            todo_limit: wake.todo_limit,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct WaitOptions {
     pub timeout: Option<Duration>,
@@ -157,6 +177,26 @@ impl Orient {
             ))
         })
     }
+    /// `orient wake --pairs`: the plain wake as command/result JSON lines.
+    /// Returns the memory diagnostics outside the charged cover.
+    pub fn wake_pairs(&self, options: &WakePairsOptions, out: &mut Out<'_>) -> Result<Vec<String>> {
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_wake_pairs(&self.storage, pile, signer, options, out))
+        })
+    }
+    /// `orient goals`: the Compass section of the wake, alone.
+    pub fn goals(&self, doing_limit: usize, todo_limit: usize, out: &mut Out<'_>) -> Result<()> {
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_goals(
+                &self.storage,
+                pile,
+                signer,
+                doing_limit,
+                todo_limit,
+                out,
+            ))
+        })
+    }
     pub fn poll(&self, persona: &str, peek: bool, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_poll(
@@ -221,8 +261,14 @@ impl Orient {
     /// returns through the ordinary checked storage-close path. A synchronous
     /// output sink must bound its own execution time.
     pub fn daemon(&self, persona: &str, options: &WaitOptions, out: &mut Out<'_>) -> Result<()> {
-        let deadline = options.timeout.map(|duration| Instant::now().checked_add(duration)
-            .ok_or_else(|| anyhow!("Orient run-for deadline is out of range"))).transpose()?;
+        let deadline = options
+            .timeout
+            .map(|duration| {
+                Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| anyhow!("Orient run-for deadline is out of range"))
+            })
+            .transpose()?;
         self.daemon_until(persona, options, deadline, out)
     }
 
@@ -3807,7 +3853,13 @@ async fn cmd_show(
             .await?;
         let health = health_sources.observe_acquiring(pile, signer).await?;
         let health_report = health.report_acquiring().await?;
-        write_complete_report(output, &health_report.text, "local swarm health overview", &mut |_| {}).await?;
+        write_complete_report(
+            output,
+            &health_report.text,
+            "local swarm health overview",
+            &mut |_| {},
+        )
+        .await?;
         if let Some(input) = persona {
             match health.persona_acquiring(pile, input).await {
                 Ok(_) => save_presentations(
@@ -4455,20 +4507,25 @@ async fn apply_prepared_news(
             let mut complete = String::with_capacity(prefix.len() + text.len());
             complete.push_str(prefix);
             complete.push_str(text);
-            write_complete_report(output, &complete, "Orient news report",
-                &mut |notice| on_delivery(pile, signer, notice)).await?;
+            write_complete_report(output, &complete, "Orient news report", &mut |notice| {
+                on_delivery(pile, signer, notice)
+            })
+            .await?;
             if let Some(collection) = receipt_collection {
                 // Observation bytes stay frozen; Presented time is after the
                 // accepted output. A failed receipt commit never replays here.
-                let fragment = orient_model::receipt_fragment(events.iter().copied(), clock::point_now()?);
+                let fragment =
+                    orient_model::receipt_fragment(events.iter().copied(), clock::point_now()?);
                 pile.commit(collection, signer, fragment)
                     .map_err(|error| anyhow!("commit Orient presentation facts: {error}"))?;
             }
         }
         News::Quiet => {
             if !prefix.is_empty() {
-                write_complete_report(output, prefix, "Orient habit report",
-                    &mut |notice| on_delivery(pile, signer, notice)).await?;
+                write_complete_report(output, prefix, "Orient habit report", &mut |notice| {
+                    on_delivery(pile, signer, notice)
+                })
+                .await?;
             }
         }
     }
@@ -4533,7 +4590,10 @@ async fn cmd_poll(
             &news,
             "",
             NewsForm::Report,
-            output, &mut |_, _, _| {}).await?;
+            output,
+            &mut |_, _, _| {},
+        )
+        .await?;
         Ok(())
     }
     .await
@@ -5048,7 +5108,9 @@ async fn cmd_observe(
     let Some(persona_input) = persona else {
         bail!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
-    let timeout = deadline.map(|end| end.saturating_duration_since(Instant::now())).or(options.timeout);
+    let timeout = deadline
+        .map(|end| end.saturating_duration_since(Instant::now()))
+        .or(options.timeout);
     let form = options.form;
     let mut health = HealthSources::open(routing, pile, signer, health_max_age)
         .await?
@@ -5062,7 +5124,8 @@ async fn cmd_observe(
     let result: Result<WaitOutcome> = async {
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
-        let timeout_at = deadline.map(tokio::time::Instant::from_std)
+        let timeout_at = deadline
+            .map(tokio::time::Instant::from_std)
             .or_else(|| timeout.map(|timeout| tokio::time::Instant::now() + timeout));
         let mut view_pending;
         let mut next_health_change;
@@ -5077,8 +5140,9 @@ async fn cmd_observe(
         let mut last_pending_sweep = Instant::now();
 
         let sources = loop {
-            let (fired, deadline) =
-                health.poll_in(pile, signer, persona_input, false, form, output).await?;
+            let (fired, deadline) = health
+                .poll_in(pile, signer, persona_input, false, form, output)
+                .await?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -5100,8 +5164,9 @@ async fn cmd_observe(
         // Keep the prefix which selected these target views as the polling
         // watermark, including while their lazy payload reads are pending.
         let initial = loop {
-            let (fired, deadline) =
-                health.poll_in(pile, signer, persona_input, false, form, output).await?;
+            let (fired, deadline) = health
+                .poll_in(pile, signer, persona_input, false, form, output)
+                .await?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -5222,12 +5287,14 @@ async fn cmd_observe(
                             pending_habits_seen = Some(habits.clone());
                             last_pending_sweep = Instant::now();
                             if !due_report.is_empty() {
-                                let mut observe =
-                                    health::path_observer(health.news_path_target());
+                                let mut observe = health::path_observer(health.news_path_target());
                                 write_complete_report(
                                     output,
                                     due_report.form(form),
-                                    "Orient habit report", &mut |notice| observe(&mut *pile, signer, notice)).await?;
+                                    "Orient habit report",
+                                    &mut |notice| observe(&mut *pile, signer, notice),
+                                )
+                                .await?;
                                 commit_habit_receipts(
                                     pile,
                                     signer,
@@ -5294,7 +5361,13 @@ async fn cmd_observe(
                 if !habit_report.is_empty() {
                     // A habit-only report acknowledges no news.
                     let mut observe = health::path_observer(health.news_path_target());
-                    write_complete_report(output, habit_report.form(form), "Orient habit report", &mut |notice| observe(&mut *pile, signer, notice)).await?;
+                    write_complete_report(
+                        output,
+                        habit_report.form(form),
+                        "Orient habit report",
+                        &mut |notice| observe(&mut *pile, signer, notice),
+                    )
+                    .await?;
                     commit_habit_receipts(
                         pile,
                         signer,
@@ -5374,7 +5447,10 @@ async fn cmd_observe(
             &news,
             arm_report.form(form),
             form,
-            output, &mut health::path_observer(health.news_path_target())).await?;
+            output,
+            &mut health::path_observer(health.news_path_target()),
+        )
+        .await?;
         commit_habit_receipts(pile, signer, sources.presentations.source, &arm_due_events)?;
         if (initial_report || arm_fired) && !continuous {
             return Ok(WaitOutcome {
@@ -5400,8 +5476,9 @@ async fn cmd_observe(
                 sleep.min(timeout.saturating_sub(start.elapsed()))
             });
             tokio::time::sleep(sleep).await;
-            let (fired, deadline) =
-                health.poll_in(pile, signer, persona_input, false, form, output).await?;
+            let (fired, deadline) = health
+                .poll_in(pile, signer, persona_input, false, form, output)
+                .await?;
             next_health_change = deadline;
             if fired && !continuous {
                 return Ok(WaitOutcome {
@@ -5504,7 +5581,10 @@ async fn cmd_observe(
                             &candidate.news,
                             habit_report.form(form),
                             form,
-                            output, &mut health::path_observer(health.news_path_target())).await?;
+                            output,
+                            &mut health::path_observer(health.news_path_target()),
+                        )
+                        .await?;
                         commit_habit_receipts(
                             pile,
                             signer,
@@ -5588,7 +5668,13 @@ async fn cmd_observe(
             let habit_fired = !habit_report.is_empty();
             if habit_fired {
                 let mut observe = health::path_observer(health.news_path_target());
-                write_complete_report(output, habit_report.form(form), "Orient habit report", &mut |notice| observe(&mut *pile, signer, notice)).await?;
+                write_complete_report(
+                    output,
+                    habit_report.form(form),
+                    "Orient habit report",
+                    &mut |notice| observe(&mut *pile, signer, notice),
+                )
+                .await?;
                 commit_habit_receipts(pile, signer, sources.presentations.source, &due_events)?;
             }
             habit_seen = current_habits;
@@ -5664,6 +5750,116 @@ fn render_tags(tags: &[String]) -> String {
     )
 }
 
+/// Everything `orient wake` shows, selected from ONE frozen observation.
+///
+/// The plain report and `wake --pairs` are two renderings of this one value,
+/// so the pairs cannot select a different self than the report would show.
+struct WakeSelection {
+    /// The memory cover: the charged text, its structured entries, and the
+    /// diagnostics kept outside the charged text.
+    cover: crate::memory_cover::CoverReport,
+    /// Cover-tagged Wiki beliefs, ordered by title then revision id.
+    beliefs: Vec<wiki_model::CoverBelief>,
+    /// The Compass section exactly as `orient goals` prints it.
+    goals: String,
+    /// Presentations to record: only for a persona, and only after output.
+    presented: Option<(Collection<SimpleArchive>, Vec<Id>)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wake_selection(
+    routing: &Storage,
+    storage: &mut FacultyStore,
+    signer: &SigningKey,
+    persona: Option<&str>,
+    cover_opts: &CoverOpts,
+    doing_limit: usize,
+    todo_limit: usize,
+) -> Result<WakeSelection> {
+    // Register and maintain authorized inputs before freezing one query
+    // boundary. Plain wake still never consults Embeddings.
+    let sources = OrientSources::open(routing, storage, signer, false).await?;
+    let memory_collection =
+        OrientSource::open(routing, storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
+    let wiki_collection =
+        OrientSource::open(routing, storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
+    let wiki_latest = wiki_model::latest_for_source(storage, wiki_collection.source)
+        .context("register Wiki supersession index")?;
+    maintain_inputs(storage, signer, &sources).await?;
+    memory_collection.maintain(storage, signer).await?;
+    wiki_collection.maintain(storage, signer).await?;
+    // A revision the index cannot attach is its lag, exactly as it is for
+    // the Wiki facts just above; wake reads what is here.
+    crate::storage::tolerate_own_lag(storage.maintain_attached(wiki_latest, signer).await)
+        .context("maintain Wiki supersession index")?;
+    let snapshot = storage
+        .snapshot()
+        .map_err(|error| anyhow!("freeze shared wake observation: {error}"))?;
+    // Wake renders the requested overview, not unseen news. Its output
+    // does not depend on prior Presented facts; recording what this wake
+    // shows afterward must not impose a historical receipt-read barrier.
+    let observation = observe_snapshot_acquiring(snapshot, &sources, false).await?;
+    let frozen = observation.snapshot.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let (memory_facts, wiki_facts, wiki_order) = tokio::task::spawn_blocking(move || {
+        let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
+        let memory_facts = crate::storage::acquire_facts(&reader, memory_collection.rank9)
+            .context("read selected Memory collection")?;
+        let wiki_facts = crate::storage::acquire_facts(&reader, wiki_collection.rank9)
+            .context("read selected Wiki collection")?;
+        let wiki_order = crate::storage::require_complete_attached_read(
+            reader
+                .attached_acquiring(wiki_latest)?
+                .read_acquiring::<triblespace::core::collection::latest::LatestIndex>()?,
+        )
+        .context("read selected Wiki supersession index")?;
+        Ok::<_, anyhow::Error>((memory_facts, wiki_facts, wiki_order))
+    })
+    .await
+    .context("join frozen wake input selection")??;
+    let persona_id = read(storage, &observation.snapshot, |reader| {
+        let query = observation.query(reader);
+        persona
+            .map(|input| resolve_native_persona(&query, input))
+            .transpose()
+    })
+    .await?;
+    // Prepare each independent section separately. A missing Wiki or
+    // Compass attachment must not repeat memory-cover planning/diagnostics.
+    // Plain wake never scores by meaning; these facts stay shard-backed.
+    let cover = read(storage, &observation.snapshot, |reader| {
+        render_cover_report(&memory_facts, reader, cover_opts, &mut |_| Ok(None))
+    })
+    .await?;
+    let beliefs = read(storage, &observation.snapshot, |reader| {
+        wiki_model::cover_fragments(reader, &wiki_facts, &wiki_order)
+    })
+    .await?;
+    let (goals, shown) = read(storage, &observation.snapshot, |reader| {
+        let query = observation.query(reader);
+        let (goals, shown) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
+        let shown = match persona_id {
+            Some(persona) => {
+                let candidates: BTreeSet<_> = load_attention_view(&query, persona)?.ids().collect();
+                shown
+                    .into_iter()
+                    .filter(|event| candidates.contains(event))
+                    .collect::<Vec<_>>()
+            }
+            None => Vec::new(),
+        };
+
+        Ok((goals, shown))
+    })
+    .await?;
+    Ok(WakeSelection {
+        cover,
+        beliefs,
+        goals,
+        presented: persona_id.map(|_| (sources.presentations.source, shown)),
+    })
+}
+
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
@@ -5681,117 +5877,168 @@ async fn cmd_wake(
 ) -> Result<()> {
     use std::fmt::Write as _;
 
-    async {
-        // Register and maintain authorized inputs before freezing one query
-        // boundary. Plain wake still never consults Embeddings.
-        let sources = OrientSources::open(routing, storage, signer, false).await?;
-        let memory_collection =
-            OrientSource::open(routing, storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
-        let wiki_collection =
-            OrientSource::open(routing, storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
-        let wiki_latest = wiki_model::latest_for_source(storage, wiki_collection.source)
-            .context("register Wiki supersession index")?;
-        maintain_inputs(storage, signer, &sources).await?;
-        memory_collection.maintain(storage, signer).await?;
-        wiki_collection.maintain(storage, signer).await?;
-        // A revision the index cannot attach is its lag, exactly as it is for
-        // the Wiki facts just above; wake reads what is here.
-        crate::storage::tolerate_own_lag(storage.maintain_attached(wiki_latest, signer).await)
-            .context("maintain Wiki supersession index")?;
-        let snapshot = storage
-            .snapshot()
-            .map_err(|error| anyhow!("freeze shared wake observation: {error}"))?;
-        // Wake renders the requested overview, not unseen news. Its output
-        // does not depend on prior Presented facts; recording what this wake
-        // shows afterward must not impose a historical receipt-read barrier.
-        let observation = observe_snapshot_acquiring(snapshot, &sources, false).await?;
-        let frozen = observation.snapshot.clone();
-        let runtime = tokio::runtime::Handle::current();
-        let (memory_facts, wiki_facts, wiki_order) = tokio::task::spawn_blocking(move || {
-            let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
-            let memory_facts = crate::storage::acquire_facts(&reader, memory_collection.rank9)
-                .context("read selected Memory collection")?;
-            let wiki_facts = crate::storage::acquire_facts(&reader, wiki_collection.rank9)
-                .context("read selected Wiki collection")?;
-            let wiki_order = crate::storage::require_complete_attached_read(
-                reader
-                    .attached_acquiring(wiki_latest)?
-                    .read_acquiring::<triblespace::core::collection::latest::LatestIndex>()?,
-            )
-            .context("read selected Wiki supersession index")?;
-            Ok::<_, anyhow::Error>((memory_facts, wiki_facts, wiki_order))
-        })
-        .await
-        .context("join frozen wake input selection")??;
-        let persona_id = read(storage, &observation.snapshot, |reader| {
-            let query = observation.query(reader);
-            persona
-                .map(|input| resolve_native_persona(&query, input))
-                .transpose()
-        })
-        .await?;
-        // Prepare each independent section separately. A missing Wiki or
-        // Compass attachment must not repeat memory-cover planning/diagnostics.
-        // Plain wake never scores by meaning; these facts stay shard-backed.
-        let cover = read(storage, &observation.snapshot, |reader| {
-            render_cover_report(&memory_facts, reader, &CoverOpts::plain(chars), &mut |_| {
-                Ok(None)
-            })
-        })
-        .await?;
-        let beliefs = read(storage, &observation.snapshot, |reader| {
-            wiki_model::cover_fragments(reader, &wiki_facts, &wiki_order)
-        })
-        .await?;
-        let (goals, shown) = read(storage, &observation.snapshot, |reader| {
-            let query = observation.query(reader);
-            let (goals, shown) = render_native_compass_goals(&query, doing_limit, todo_limit)?;
-            let shown = match persona_id {
-                Some(persona) => {
-                    let candidates: BTreeSet<_> =
-                        load_attention_view(&query, persona)?.ids().collect();
-                    shown
-                        .into_iter()
-                        .filter(|event| candidates.contains(event))
-                        .collect::<Vec<_>>()
-                }
-                None => Vec::new(),
-            };
+    let selection = wake_selection(
+        routing,
+        storage,
+        signer,
+        persona,
+        &CoverOpts::plain(chars),
+        doing_limit,
+        todo_limit,
+    )
+    .await?;
 
-            Ok((goals, shown))
-        })
-        .await?;
-
-        let mut report = cover.text;
-        report.push('\n');
-        writeln!(report, "Beliefs (cover):").unwrap();
-        if beliefs.is_empty() {
-            writeln!(report, "- None").unwrap();
-        } else {
-            for (title, content) in beliefs {
-                writeln!(report, "- {title}").unwrap();
-                for line in content.lines() {
-                    writeln!(report, "    {line}").unwrap();
-                }
+    let mut report = selection.cover.text;
+    report.push('\n');
+    writeln!(report, "Beliefs (cover):").unwrap();
+    if selection.beliefs.is_empty() {
+        writeln!(report, "- None").unwrap();
+    } else {
+        for belief in &selection.beliefs {
+            writeln!(report, "- {}", belief.title).unwrap();
+            for line in belief.content.lines() {
+                writeln!(report, "    {line}").unwrap();
             }
         }
-        report.push('\n');
-        report.push_str(&goals);
-
-        write_complete_report(output, &report, "Orient wake report", &mut |_| {}).await?;
-        if !cover.diagnostics.is_empty() {
-            output.line(format!(
-                "Memory diagnostics (outside the charged cover text):\n{}",
-                cover.diagnostics.join("\n")
-            ))?;
-        }
-
-        if persona_id.is_some() {
-            save_presentations(storage, signer, sources.presentations.source, shown)?;
-        }
-        Ok(())
     }
-    .await
+    report.push('\n');
+    report.push_str(&selection.goals);
+
+    write_complete_report(output, &report, "Orient wake report", &mut |_| {}).await?;
+    if !selection.cover.diagnostics.is_empty() {
+        output.line(format!(
+            "Memory diagnostics (outside the charged cover text):\n{}",
+            selection.cover.diagnostics.join("\n")
+        ))?;
+    }
+
+    if let Some((receipts, shown)) = selection.presented {
+        save_presentations(storage, signer, receipts, shown)?;
+    }
+    Ok(())
+}
+
+/// One command/result pair of `orient wake --pairs`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WakePair {
+    /// A command the reader could issue: program name and arguments, every
+    /// argument from a shell-inert alphabet, so no quoting is ever needed.
+    command: String,
+    /// Exactly what that command prints to stdout (for an image memory, the
+    /// text line before the image part).
+    output: String,
+}
+
+impl WakePair {
+    fn new(command: String, output: String) -> Self {
+        debug_assert!(
+            command.split(' ').all(|word| !word.is_empty()
+                && word
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-.:".contains(&byte))),
+            "wake pair command needs no shell quoting: {command:?}"
+        );
+        Self { command, output }
+    }
+}
+
+/// The `orient goals` invocation that prints exactly this Compass section.
+fn goals_command(doing_limit: usize, todo_limit: usize) -> String {
+    format!("orient goals --doing-limit {doing_limit} --todo-limit {todo_limit}")
+}
+
+/// The wake selection as command/result pairs, in prefix order: memory
+/// recalls, then one `wiki export` per cover belief, then one goals pair.
+fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) -> Vec<WakePair> {
+    let mut pairs = Vec::new();
+    for entry in &selection.cover.entries {
+        // A range with neither summary nor image prints no recollection; Drive
+        // never carried one as a pair, and a recall of it would fail.
+        let Some(body) = entry.body.as_deref().filter(|body| !body.is_empty()) else {
+            continue;
+        };
+        // `memory <range>` prints the chunk summary (trailing whitespace
+        // trimmed) and one newline, exactly as the cover text renders it. An
+        // image memory is the one exception: its recall also emits the image,
+        // which a text pair cannot carry, so the pair holds only the
+        // placeholder line the cover text shows (as Drive always has).
+        pairs.push(WakePair::new(entry.recall.clone(), format!("{body}\n")));
+    }
+    for belief in &selection.beliefs {
+        // `wiki export` prints the stored content bytes, nothing added. It
+        // follows the entry's frontier, which is this revision alone unless the
+        // entry is forked; a forked head is named exactly instead, since the
+        // frontier-following read refuses a fork.
+        let command = if belief.sole_head {
+            format!("wiki export {:x}", belief.revision)
+        } else {
+            format!("wiki export --exact {:x}", belief.revision)
+        };
+        pairs.push(WakePair::new(command, belief.content.clone()));
+    }
+    pairs.push(WakePair::new(
+        goals_command(doing_limit, todo_limit),
+        selection.goals.clone(),
+    ));
+    pairs
+}
+
+/// `orient wake --pairs`: the plain wake selection as JSON lines. Never
+/// records presentation. Returns the memory diagnostics, which belong to
+/// neither the pairs nor stdout.
+async fn cmd_wake_pairs(
+    routing: &Storage,
+    storage: &mut FacultyStore,
+    signer: &SigningKey,
+    options: &WakePairsOptions,
+    output: &mut Out<'_>,
+) -> Result<Vec<String>> {
+    let mut cover_opts = CoverOpts::plain(options.chars);
+    cover_opts.chunk_overhead = options.chunk_overhead;
+    let selection = wake_selection(
+        routing,
+        storage,
+        signer,
+        None,
+        &cover_opts,
+        options.doing_limit,
+        options.todo_limit,
+    )
+    .await?;
+    let mut lines = String::new();
+    for pair in wake_pairs(&selection, options.doing_limit, options.todo_limit) {
+        lines.push_str(&serde_json::to_string(&serde_json::json!({
+            "command": pair.command,
+            "output": pair.output,
+        }))?);
+        lines.push('\n');
+    }
+    write_complete_report(output, &lines, "Orient wake pairs", &mut |_| {}).await?;
+    Ok(selection.cover.diagnostics)
+}
+
+/// `orient goals`: the Compass section of `orient wake`, alone. Maintains
+/// its inputs like wake does and never records presentation.
+async fn cmd_goals(
+    routing: &Storage,
+    storage: &mut FacultyStore,
+    signer: &SigningKey,
+    doing_limit: usize,
+    todo_limit: usize,
+    output: &mut Out<'_>,
+) -> Result<()> {
+    let sources = OrientSources::open(routing, storage, signer, false).await?;
+    maintain_inputs(storage, signer, &sources).await?;
+    let snapshot = storage
+        .snapshot()
+        .map_err(|error| anyhow!("freeze goals observation: {error}"))?;
+    let observation = observe_snapshot_acquiring(snapshot, &sources, false).await?;
+    let goals = read(storage, &observation.snapshot, |reader| {
+        let query = observation.query(reader);
+        Ok(render_native_compass_goals(&query, doing_limit, todo_limit)?.0)
+    })
+    .await?;
+    write_complete_report(output, &goals, "Orient goals", &mut |_| {}).await
 }
 
 /// Foreground acquisition needs the same driven Tokio boundary as production.
@@ -6006,7 +6253,12 @@ mod tests {
             writer.flush()?;
             Ok(())
         };
-        pollster::block_on(write_complete_report(&mut Out::new(&mut emit), report, description, &mut |_| {}))
+        pollster::block_on(write_complete_report(
+            &mut Out::new(&mut emit),
+            report,
+            description,
+            &mut |_| {},
+        ))
     }
     fn apply_news_to_writer(
         pile: &mut FacultyStore,
@@ -6034,7 +6286,9 @@ mod tests {
             news,
             prefix,
             NewsForm::Report,
-            &mut Out::new(&mut emit), &mut |_, _, _| {}))
+            &mut Out::new(&mut emit),
+            &mut |_, _, _| {},
+        ))
     }
 
     static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
@@ -6153,7 +6407,10 @@ mod tests {
                 },
                 "",
                 NewsForm::Report,
-                &mut Out::new(&mut |_| Ok(())), &mut |_, _, _| {}).await
+                &mut Out::new(&mut |_| Ok(())),
+                &mut |_, _, _| {},
+            )
+            .await
             .unwrap();
             let snapshot = pile.snapshot().unwrap();
             assert!(snapshot
@@ -7798,11 +8055,14 @@ mod tests {
         assert!(beats >= 1);
         assert_eq!(exits.len(), 1, "a genuine error writes one exit record");
         assert!(exits[0].contains("exit status: 1"), "{exits:?}");
-    
+
         let (_, retries, exits, result) = observe(Stop::Deadline);
         let error = result.expect_err("the deadline reaches the observe loop as an error");
         assert!(error.is::<DeliveryDeadline>(), "{error:#}");
-        assert!(retries >= 1, "each deferral was recorded before its backoff");
+        assert!(
+            retries >= 1,
+            "each deferral was recorded before its backoff"
+        );
         assert!(
             exits.is_empty(),
             "a delivery deadline is a deliberate stop, not an exit: {exits:?}"
@@ -9358,10 +9618,13 @@ mod tests {
         use super::super::delivery::DeliveryNotice;
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let collection = ReceiptSource::register(&mut pile, &fixture.signer).unwrap().source;
+        let collection = ReceiptSource::register(&mut pile, &fixture.signer)
+            .unwrap()
+            .source;
         let event = id(4);
         let news = News::Report {
-            text: "frozen report\n".to_owned(), stream: "frozen report\n".to_owned(),
+            text: "frozen report\n".to_owned(),
+            stream: "frozen report\n".to_owned(),
             events: vec![event],
         };
         let accepted_at = std::cell::Cell::new(0i128);
@@ -9372,19 +9635,32 @@ mod tests {
             Ok(())
         };
         pollster::block_on(apply_prepared_news(
-            &mut pile, &fixture.signer, collection, false, &news, "", NewsForm::Report,
-            &mut Out::new(&mut emit), &mut |owned, signer, notice| {
+            &mut pile,
+            &fixture.signer,
+            collection,
+            false,
+            &news,
+            "",
+            NewsForm::Report,
+            &mut Out::new(&mut emit),
+            &mut |owned, signer, notice| {
                 assert!(stored_presentations(owned, signer, id(3)).is_empty());
                 notices.push(notice);
             },
-        )).unwrap();
+        ))
+        .unwrap();
         assert_eq!(notices, [DeliveryNotice::Accepted]);
         let snapshot = pile.snapshot().unwrap();
-        let facts = snapshot.collection(collection).unwrap().view::<TribleSet>().unwrap();
+        let facts = snapshot
+            .collection(collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap();
         let stamps: Vec<IntervalValue> = find!(
             at: IntervalValue,
             pattern!(&facts, [{ presentation::event: &event, metadata::created_at: ?at }])
-        ).collect();
+        )
+        .collect();
         assert_eq!(stamps.len(), 1);
         assert!(interval_key(stamps[0]) >= accepted_at.get());
         drop(facts);
@@ -9394,20 +9670,38 @@ mod tests {
 
     #[test]
     fn deadline_with_pending_report_has_no_presented_receipt_or_acceptance() {
-        use super::super::delivery::{DeliveryDeadline, DeliveryNotice, KnownNotSubmitted, RetryPolicy};
+        use super::super::delivery::{
+            DeliveryDeadline, DeliveryNotice, KnownNotSubmitted, RetryPolicy,
+        };
         let fixture = TestPile::new();
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-        let collection = ReceiptSource::register(&mut pile, &fixture.signer).unwrap().source;
+        let collection = ReceiptSource::register(&mut pile, &fixture.signer)
+            .unwrap()
+            .source;
         let news = News::Report {
-            text: "fixed\n".to_owned(), stream: "fixed\n".to_owned(), events: vec![id(4)],
+            text: "fixed\n".to_owned(),
+            stream: "fixed\n".to_owned(),
+            events: vec![id(4)],
         };
         let mut notices = Vec::new();
-        let mut emit = |_| RetryPolicy::new(true, Some(Instant::now() + Duration::from_millis(5)))
-            .observed(Err(KnownNotSubmitted.into()));
-        let error = runtime().unwrap().block_on(apply_prepared_news(
-            &mut pile, &fixture.signer, collection, false, &news, "", NewsForm::Report,
-            &mut Out::new(&mut emit), &mut |_, _, notice| notices.push(notice),
-        )).unwrap_err();
+        let mut emit = |_| {
+            RetryPolicy::new(true, Some(Instant::now() + Duration::from_millis(5)))
+                .observed(Err(KnownNotSubmitted.into()))
+        };
+        let error = runtime()
+            .unwrap()
+            .block_on(apply_prepared_news(
+                &mut pile,
+                &fixture.signer,
+                collection,
+                false,
+                &news,
+                "",
+                NewsForm::Report,
+                &mut Out::new(&mut emit),
+                &mut |_, _, notice| notices.push(notice),
+            ))
+            .unwrap_err();
         assert!(error.is::<DeliveryDeadline>());
         assert!(matches!(notices.as_slice(), [DeliveryNotice::Retry(_)]));
         assert!(stored_presentations(&mut pile, &fixture.signer, id(3)).is_empty());

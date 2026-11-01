@@ -901,6 +901,30 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
 pub struct CoverReport {
     pub text: String,
     pub diagnostics: Vec<String>,
+    /// The selected recollections in emitted order, each exactly as `text`
+    /// renders it. Written by the same loop that writes `text`, so a consumer
+    /// that needs the cover as recall pairs reads the one selection rather
+    /// than re-parsing (and possibly disagreeing with) its printed form.
+    pub entries: Vec<CoverEntry>,
+}
+
+/// One selected recollection of a [`CoverReport`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverEntry {
+    /// Start of the range line, `YYYY-MM-DDTHH:MM:SS` (TAI).
+    pub start: String,
+    /// End of the range line, `YYYY-MM-DDTHH:MM:SS` (TAI).
+    pub end: String,
+    /// `memory <from>..<to>`: the recall that prints `body`. This is the range
+    /// line, except that a POINT range (equal endpoints at second resolution)
+    /// is widened by one second on the end. A zero-width query overlaps no
+    /// chunk, so it would print a different memory or none; the widened range
+    /// is real, typeable, and selects the same chunk.
+    pub recall: String,
+    /// The line(s) printed under the range: the summary without trailing
+    /// whitespace, or the `[image memory @ <range>]` placeholder. `None` when
+    /// the chosen chunk has neither, in which case only the range is printed.
+    pub body: Option<String>,
 }
 
 fn unscorable_warning(label: &str, unscorable: &[Id]) -> Option<String> {
@@ -1004,6 +1028,7 @@ where
         return Ok(CoverReport {
             text: out,
             diagnostics,
+            entries: Vec::new(),
         });
     }
     let (spans, classes) = recollection_classes(&raw_spans);
@@ -1012,6 +1037,7 @@ where
         return Ok(CoverReport {
             text: String::new(),
             diagnostics,
+            entries: Vec::new(),
         });
     }
     let n = spans.len();
@@ -1191,6 +1217,7 @@ where
     // volatile counts (chunk/char totals) would perturb the otherwise
     // prefix-stable cover on every call. Keep it visible to a human on stderr,
     // out of the stored/ingested cover text.
+    let mut entries = Vec::with_capacity(cover.len());
     for &i in &cover {
         let (s, e, _) = spans[i];
         let id = raw_spans[representatives[i]].2;
@@ -1202,13 +1229,31 @@ where
             "{}",
             format_time_range(key_to_epoch(s), key_to_epoch(e)),
         )?;
-        if let Some(handle) = chunk_summary_handle(space, id) {
+        let body = if let Some(handle) = chunk_summary_handle(space, id) {
             let summary: View<str> = reader.get(handle).context("read chunk summary")?;
-            writeln!(out, "{}", summary.trim_end())?;
+            Some(summary.trim_end().to_owned())
         } else if chunk_image_handle(space, id).is_some() {
             let range = format_time_range(key_to_epoch(s), key_to_epoch(e));
-            writeln!(out, "[image memory @ {range}]")?;
+            Some(format!("[image memory @ {range}]"))
+        } else {
+            None
+        };
+        if let Some(body) = &body {
+            writeln!(out, "{body}")?;
         }
+        let start = fmt_epoch(key_to_epoch(s));
+        let end = fmt_epoch(key_to_epoch(e));
+        let recall_end = if start == end {
+            fmt_epoch(key_to_epoch(e) + hifitime::Duration::from_seconds(1.0))
+        } else {
+            end.clone()
+        };
+        entries.push(CoverEntry {
+            recall: format!("memory {start}..{recall_end}"),
+            start,
+            end,
+            body,
+        });
     }
     let fill = if budget_chars == 0 {
         0.0
@@ -1225,6 +1270,7 @@ where
     Ok(CoverReport {
         text: out,
         diagnostics,
+        entries,
     })
 }
 

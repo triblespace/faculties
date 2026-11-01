@@ -392,6 +392,7 @@ mod tests {
             CoverReport {
                 text: cover.to_owned(),
                 diagnostics: vec![warning.to_owned()],
+                entries: Vec::new(),
             },
             &mut Out::new(&mut |part| {
                 parts.push(part);

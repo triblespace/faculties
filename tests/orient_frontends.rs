@@ -1554,3 +1554,395 @@ fn quiet_health_does_not_wake_wait_and_show_acceptance_owns_its_alert_receipt() 
     f.maintain();
     assert!(f.call("orient_poll", json!({"persona":f.who()})).is_empty());
 }
+
+// ── wake as command/result pairs ────────────────────────────────────────────
+
+/// A fixed TAI instant on 2026-08-27, offset by `seconds`.
+fn wake_at(seconds: i64) -> faculties::memory::IntervalValue {
+    let epoch = hifitime::Epoch::from_gregorian_tai(2026, 8, 27, 0, 0, 0, 0)
+        + hifitime::Duration::from_seconds(seconds as f64);
+    (epoch, epoch).try_to_inline().unwrap()
+}
+
+impl Fixture {
+    /// One deterministic self: memories (wide, point, closing arc), Wiki
+    /// beliefs (a sole head, a forked pair, an untagged entry) and goals.
+    /// Every identity is intrinsic over fixed content and fixed times, so the
+    /// rendered wake is the same bytes on every run.
+    fn wake_self(&self) {
+        use faculties::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
+        use std::collections::BTreeSet;
+        let chunk = |start: i64, end: i64, text: &str| {
+            chunk_fragment(ChunkDraft {
+                content: ChunkDraftContent::Text(text.to_owned()),
+                start_at: wake_at(start),
+                end_at: wake_at(end),
+                tags: BTreeSet::new(),
+                references: BTreeSet::new(),
+                about_exec_result: None,
+                about_archive_message: None,
+                observed_at: BTreeSet::from([wake_at(end)]),
+                aliases: BTreeSet::new(),
+            })
+            .unwrap()
+            .0
+        };
+        let mut memories = chunk(
+            0,
+            7_200,
+            "The coarse arc over the whole morning.\n\nIt has two paragraphs, because summaries do.\n",
+        );
+        memories += chunk(
+            7_200,
+            7_200,
+            "A point memory: a journaled moment has no width.",
+        );
+        memories += chunk(7_200, 12_600, "The arc that closes the coverage.");
+        memories += chunk(20_000, 20_100, "An outlier after a gap.");
+        self.publish(faculties::schemas::memory::DEFAULT_SCOPE_ID, memories);
+
+        let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
+        let (author_fragment, author) = faculties::wiki::author_record(&signer.verifying_key());
+        let (cover_fragment, cover, _) = faculties::wiki::tag_record("cover").unwrap();
+        let revision = |title: &str, content: &str, tagged: bool, after: &[Id], at: i64| {
+            faculties::wiki::revision_record(faculties::wiki::RevisionDraft {
+                title: title.to_owned(),
+                content: content.to_owned(),
+                tags: if tagged {
+                    BTreeSet::from([cover])
+                } else {
+                    BTreeSet::new()
+                },
+                predecessors: after.iter().copied().collect(),
+                author,
+                authored_at: wake_at(at),
+            })
+            .unwrap()
+        };
+        let mut wiki = author_fragment + cover_fragment;
+        let (alpha, _) = revision(
+            "Alpha belief",
+            "= Alpha belief\n\nThe first standing belief, with a `literal` and $x$.\n",
+            true,
+            &[],
+            100,
+        );
+        wiki += alpha;
+        let (root, root_id) = revision("Fork root", "= Fork root\n", false, &[], 200);
+        wiki += root;
+        let (left, _) = revision(
+            "Fork left",
+            "= Fork\n\nThe left head.",
+            true,
+            &[root_id],
+            300,
+        );
+        wiki += left;
+        let (right, _) = revision(
+            "Fork right",
+            "= Fork\n\nThe right head.",
+            true,
+            &[root_id],
+            301,
+        );
+        wiki += right;
+        let (other, _) = revision("Not a belief", "= Not a belief\n", false, &[], 400);
+        wiki += other;
+        self.publish(faculties::schemas::wiki::DEFAULT_SCOPE_ID, wiki);
+
+        let mut compass = Fragment::empty();
+        let mut goal = |title: &str, tags: &[&str], at: i64, status: Option<&str>| {
+            let (fragment, id) = faculties::compass::goal_fragment(
+                title,
+                tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                None,
+                wake_at(at),
+            )
+            .unwrap();
+            compass += fragment;
+            if let Some(status) = status {
+                compass +=
+                    faculties::compass::status_fragment(id, status, None, wake_at(at + 1)).unwrap();
+            }
+        };
+        goal("Doing the wake pairs", &["wake"], 1_000, Some("doing"));
+        goal("Todo first", &[], 1_100, None);
+        goal("Todo second", &["later"], 1_200, Some("todo"));
+        goal("Already done", &[], 1_300, Some("done"));
+        self.publish(faculties::schemas::compass::DEFAULT_SCOPE_ID, compass);
+        self.maintain();
+    }
+
+    /// One faculty binary of this build, against this fixture's pile and key
+    /// and none of the ambient routing overrides.
+    fn faculty(&self, program: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(program);
+        command.args([
+            "--pile",
+            self.pile.to_str().unwrap(),
+            "--key",
+            self.key.to_str().unwrap(),
+        ]);
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy().into_owned();
+            if name.starts_with(faculties::collection_names::COLLECTION_OVERRIDE_PREFIX)
+                || name == "PERSONA"
+                || name == "DRIVE_ENDPOINT"
+            {
+                command.env_remove(name);
+            }
+        }
+        command
+    }
+}
+
+/// The plain wake report on the deterministic fixture, captured from the
+/// renderer as it was before wake selection was shared with `--pairs`. A
+/// refactor of the selection must leave these bytes exactly as they are.
+const PLAIN_WAKE_GOLDEN: &str = concat!(
+    "\n",
+    "2026-08-27T00:00:00..2026-08-27T02:00:00\n",
+    "The coarse arc over the whole morning.\n",
+    "\n",
+    "It has two paragraphs, because summaries do.\n",
+    "\n",
+    "2026-08-27T02:00:00..2026-08-27T02:00:00\n",
+    "A point memory: a journaled moment has no width.\n",
+    "\n",
+    "2026-08-27T02:00:00..2026-08-27T03:30:00\n",
+    "The arc that closes the coverage.\n",
+    "\n",
+    "2026-08-27T05:33:20..2026-08-27T05:35:00\n",
+    "An outlier after a gap.\n",
+    "\n",
+    "Beliefs (cover):\n",
+    "- Alpha belief\n",
+    "    = Alpha belief\n",
+    "    \n",
+    "    The first standing belief, with a `literal` and $x$.\n",
+    "- Fork left\n",
+    "    = Fork\n",
+    "    \n",
+    "    The left head.\n",
+    "- Fork right\n",
+    "    = Fork\n",
+    "    \n",
+    "    The right head.\n",
+    "\n",
+    "Compass:\n",
+    "Doing (1 of 1):\n",
+    "- [9abaeb01ceb998880a70f2c6c9488c4f] Doing the wake pairs #wake\n",
+    "Todo (2 of 2):\n",
+    "- [69933ebe77fb616624ea4d4c9580732b] Todo second #later\n",
+    "- [23a1295caa279a9cf697d5e26032bd1c] Todo first\n",
+    "Memory diagnostics (outside the charged cover text):\n",
+    "memory context — 4 of 4 eligible memories recalled, ~360 of 800000 characters (0.0% full; greedy SPACE order; density-shaped recollection)\n",
+);
+
+#[test]
+fn plain_wake_report_is_byte_identical_to_the_captured_rendering() {
+    let f = Fixture::new();
+    f.wake_self();
+    let parts = f.cli(&["wake"]);
+    assert_eq!(text(&parts), PLAIN_WAKE_GOLDEN);
+    let output = f
+        .faculty(env!("CARGO_BIN_EXE_orient"))
+        .arg("wake")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), PLAIN_WAKE_GOLDEN);
+}
+
+/// `orient wake --pairs` stdout, parsed: exactly `command` and `output`.
+fn wake_pairs(f: &Fixture, args: &[&str]) -> std::process::Output {
+    f.faculty(env!("CARGO_BIN_EXE_orient"))
+        .args(["wake", "--pairs"])
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn parse_pairs(stdout: &[u8]) -> Vec<(String, String)> {
+    std::str::from_utf8(stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let Value::Object(object) = serde_json::from_str::<Value>(line).unwrap() else {
+                panic!("one JSON object per line: {line}")
+            };
+            assert_eq!(
+                object.keys().collect::<Vec<_>>(),
+                ["command", "output"],
+                "{line}"
+            );
+            (
+                object["command"].as_str().unwrap().to_owned(),
+                object["output"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// `memory context` text as `(start, end, body)` blocks, the way a consumer
+/// reads it: a range line, then everything up to the next range line.
+fn context_blocks(text: &str) -> Vec<(String, String, String)> {
+    let is_range = |line: &str| {
+        line.len() == 40
+            && &line[19..21] == ".."
+            && line.bytes().filter(u8::is_ascii_digit).count() == 28
+    };
+    let mut blocks: Vec<(String, String, Vec<&str>)> = Vec::new();
+    for line in text.lines() {
+        if is_range(line) {
+            blocks.push((line[..19].to_owned(), line[21..].to_owned(), Vec::new()));
+        } else if let Some(block) = blocks.last_mut() {
+            block.2.push(line);
+        }
+    }
+    blocks
+        .into_iter()
+        .map(|(start, end, body)| {
+            (
+                start,
+                end,
+                body.join("\n").trim_end_matches('\n').to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Run one emitted command exactly as a shell would split it: every word is
+/// shell-inert, so splitting on spaces IS the shell's parse.
+fn replay(f: &Fixture, command: &str) -> String {
+    let mut words = command.split(' ');
+    let program = match words.next().unwrap() {
+        "memory" => env!("CARGO_BIN_EXE_memory"),
+        "wiki" => env!("CARGO_BIN_EXE_wiki"),
+        "orient" => env!("CARGO_BIN_EXE_orient"),
+        other => panic!("unexpected program {other}"),
+    };
+    let output = f.faculty(program).args(words).output().unwrap();
+    assert!(output.status.success(), "{command}: {output:?}");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn wake_pairs_select_what_memory_context_selects_and_every_command_replays() {
+    let f = Fixture::new();
+    f.wake_self();
+    // The overhead Drive declares for `memory <19>..<19>`. The tight budget
+    // is chosen so that overhead changes what fits.
+    for chars in ["800000", "300", "230"] {
+        let args = ["--chars", chars, "--chunk-overhead", "47"];
+        let pairs = wake_pairs(&f, &args);
+        let context = f
+            .faculty(env!("CARGO_BIN_EXE_memory"))
+            .arg("context")
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            pairs.status.success(),
+            context.status.success(),
+            "{chars}: {pairs:?} / {context:?}"
+        );
+        if !context.status.success() {
+            continue;
+        }
+        let pairs = parse_pairs(&pairs.stdout);
+        let memory: Vec<_> = pairs
+            .iter()
+            .take_while(|(command, _)| command.starts_with("memory "))
+            .collect();
+        let blocks = context_blocks(std::str::from_utf8(&context.stdout).unwrap());
+        assert!(!blocks.is_empty());
+        assert_eq!(
+            memory.len(),
+            blocks.len(),
+            "{chars}: one pair per cover entry"
+        );
+        for ((command, output), (start, end, body)) in memory.iter().zip(&blocks) {
+            let recall_end = if start == end {
+                // A point is widened by one second on the end.
+                assert_eq!(start, "2026-08-27T02:00:00");
+                "2026-08-27T02:00:01".to_owned()
+            } else {
+                end.clone()
+            };
+            assert_eq!(command, &format!("memory {start}..{recall_end}"));
+            assert_eq!(output, &format!("{body}\n"));
+        }
+        // The overhead is charged: without it the same budget selects
+        // differently, so the equality above is not the trivial one.
+        let unpriced = f
+            .faculty(env!("CARGO_BIN_EXE_memory"))
+            .args(["context", "--chars", chars])
+            .output()
+            .unwrap();
+        let unpriced = context_blocks(std::str::from_utf8(&unpriced.stdout).unwrap());
+        if chars != "800000" {
+            assert!(
+                blocks.len() < unpriced.len(),
+                "{chars}: overhead must cost recalls"
+            );
+        }
+        if chars == "800000" {
+            assert!(memory
+                .iter()
+                .any(|(command, _)| command == "memory 2026-08-27T02:00:00..2026-08-27T02:00:01"));
+        }
+
+        // Then the beliefs, in wake order, then exactly one goals pair.
+        let rest = &pairs[memory.len()..];
+        let (goals, beliefs) = rest.split_last().unwrap();
+        assert_eq!(goals.0, "orient goals --doing-limit 5 --todo-limit 5");
+        assert!(goals.1.starts_with("Compass:\n"), "{}", goals.1);
+        assert!(PLAIN_WAKE_GOLDEN.contains(&goals.1));
+        assert_eq!(
+            beliefs
+                .iter()
+                .map(|(_, output)| output.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "= Alpha belief\n\nThe first standing belief, with a `literal` and $x$.\n",
+                "= Fork\n\nThe left head.",
+                "= Fork\n\nThe right head.",
+            ]
+        );
+        assert!(beliefs[0].0.starts_with("wiki export ") && !beliefs[0].0.contains("--exact"));
+        assert!(beliefs[1..]
+            .iter()
+            .all(|(command, _)| command.starts_with("wiki export --exact ")));
+
+        // Every command, run, prints exactly its output.
+        for (command, output) in &pairs {
+            assert_eq!(&replay(&f, command), output, "{command}");
+        }
+    }
+}
+
+#[test]
+fn wake_pairs_name_the_goal_limits_they_used_and_goals_defaults_match_wake() {
+    let f = Fixture::new();
+    f.wake_self();
+    let output = wake_pairs(&f, &["--doing-limit", "0", "--todo-limit", "1"]);
+    assert!(output.status.success(), "{output:?}");
+    let pairs = parse_pairs(&output.stdout);
+    let (command, goals) = pairs.last().unwrap();
+    assert_eq!(command, "orient goals --doing-limit 0 --todo-limit 1");
+    assert!(goals.contains("Doing (0 of 1):") && goals.contains("Todo (1 of 2):"));
+    assert_eq!(&replay(&f, command), goals);
+    // Bare `orient goals` uses wake's defaults.
+    assert_eq!(
+        replay(&f, "orient goals"),
+        replay(&f, "orient goals --doing-limit 5 --todo-limit 5")
+    );
+    // The overhead belongs to the pairs' consumer; a report has none.
+    let refused = f
+        .faculty(env!("CARGO_BIN_EXE_orient"))
+        .args(["wake", "--chunk-overhead", "47"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+}

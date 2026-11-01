@@ -1,6 +1,6 @@
 = Orient: The Situation-Snapshot Faculty
 
-`orient` has six deliberately different modes. Use `wake` at session start or
+`orient` has six deliberately different modes, plus `goals`. Use `wake` at session start or
 after context compaction to recover the whole self: memory cover, cover-tagged
 beliefs, and goals. Use `show` mid-session for the much smaller answer to "what
 is going on right now?"; it deliberately contains neither memories nor Wiki
@@ -8,6 +8,7 @@ entries. `wait` blocks and also sweeps timer-driven Habits; `poll` performs the
 same relational attention check once without blocking; `baseline` explicitly
 marks the current attention set as already presented. `daemon` keeps the pile
 open and delivers successive reports to one callback, without per-turn hooks.
+`goals` prints the Compass section of `wake` alone.
 
 == What it shows
 
@@ -28,11 +29,32 @@ as presented, after the complete report has been flushed.
 == When to use it
 
   - `orient wake` at session start and after compaction
+  - `orient wake --pairs` when a harness wakes a model from replayable commands
+  - `orient goals` for just the goals section of the wake
   - `orient show` after a pause or before context-switching
   - `orient poll` for a deliberate immediate news check
   - `orient wait` for a deliberate one-shot blocking check
   - `orient daemon` for persistent automatic notifications
   - `orient baseline` for an explicit quiet starting point
+
+== `orient wake --pairs`
+
+A harness that wakes a model must not paste the wake report into its context:
+the model should only ever see commands it could have issued and what they
+printed. `orient wake --pairs` prints the same selection as plain `wake`, as
+JSON lines of the form `{"command": ..., "output": ...}`, in this order:
+
+  - one `memory <from>..<to>` recall per selected memory (a point range is
+    widened by one second on its end, so the recall selects that chunk)
+  - one `wiki export <id>` per cover-tagged belief (`wiki export --exact <id>`
+    for a head of a forked entry, which the frontier-following read refuses)
+  - one `orient goals --doing-limit N --todo-limit M`, naming the limits used
+
+Each output is exactly what its command prints against the same pile, so the
+harness can replay any pair to check it. The memory selection is exactly that of
+`memory context --chars N --chunk-overhead K`; pass `--chunk-overhead` with the
+characters the harness adds around each recall. `--pairs` never uses a persona
+and never records presentation; memory diagnostics go to stderr.
 
 == `orient wait`
 
