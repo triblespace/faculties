@@ -824,12 +824,23 @@ pub fn find_chunk_by_time_range<P: TriblePattern>(
     query_start: Epoch,
     query_end: Epoch,
 ) -> Option<Id> {
+    find_chunk_in_spans(&collect_chunk_spans(space), query_start, query_end)
+}
+
+/// [`find_chunk_by_time_range`] over a span projection the caller already
+/// holds ([`collect_chunk_spans`] of the same space), so a caller resolving
+/// many ranges against one frozen view projects the journal once.
+pub fn find_chunk_in_spans(
+    spans: &[(i128, i128, Id)],
+    query_start: Epoch,
+    query_end: Epoch,
+) -> Option<Id> {
     let query_start_ns = query_start.to_tai_duration().total_nanoseconds();
     let query_end_ns = query_end.to_tai_duration().total_nanoseconds();
 
     let mut best: Option<(Id, i128)> = None; // (id, specificity score)
 
-    for (chunk_start, chunk_end, chunk_id) in collect_chunk_spans(space) {
+    for &(chunk_start, chunk_end, chunk_id) in spans {
         if chunk_start > query_end_ns || chunk_end < query_start_ns {
             continue;
         }

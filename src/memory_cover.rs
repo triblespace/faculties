@@ -998,6 +998,10 @@ where
     let mut diagnostics = Vec::new();
     let mut out = String::new();
     let mut raw_spans = collect_chunk_spans(space);
+    // `memory <from>..<to>` resolves against every span, readable or not, so
+    // the recall check below uses this whole projection, taken once here
+    // rather than once per selected entry.
+    let lookup_spans = raw_spans.clone();
     // A memory whose summary bytes have not arrived is not a candidate. Commit
     // records travel ahead of their member blobs, so a chunk written on another
     // machine is visible here while its summary is still in flight (the standing
@@ -1253,7 +1257,7 @@ where
             && crate::memory::operations::parse_time_range(&range)
                 .ok()
                 .and_then(|(from, to)| {
-                    crate::memory::operations::find_chunk_by_time_range(space, from, to)
+                    crate::memory::operations::find_chunk_in_spans(&lookup_spans, from, to)
                 })
                 == Some(id);
         let recall = if range_selects_id {
@@ -1891,6 +1895,193 @@ mod recollection_tests {
         assert!(
             silent_life_quarters(&spans, &[0]).is_empty(),
             "a broad selected arc makes the instrument quiet; it is not forced into selection"
+        );
+    }
+}
+
+#[cfg(test)]
+mod recall_lookup_tests {
+    use super::*;
+    use crate::memory::operations::{find_chunk_by_time_range, parse_time_range};
+    use crate::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::repo::SnapshotSource;
+
+    fn at(seconds: f64) -> Inline<NsTAIInterval> {
+        let epoch = Epoch::from_gregorian_tai(2026, 8, 27, 0, 0, 0, 0)
+            + hifitime::Duration::from_seconds(seconds);
+        (epoch, epoch).try_to_inline().unwrap()
+    }
+
+    /// Facts for `(start, end, text, readable)` memories; an unreadable one's
+    /// summary blob is withheld from the store, as for a memory whose bytes
+    /// are still replicating.
+    fn journal(
+        memories: &[(f64, f64, String, bool)],
+    ) -> (TribleSet, triblespace::core::blob::MemoryBlobStoreSnapshot) {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        for (start, end, text, readable) in memories {
+            let (fragment, _) = chunk_fragment(ChunkDraft {
+                content: ChunkDraftContent::Text(text.clone()),
+                start_at: at(*start),
+                end_at: at(*end),
+                tags: BTreeSet::new(),
+                references: BTreeSet::new(),
+                about_exec_result: None,
+                about_archive_message: None,
+                observed_at: BTreeSet::from([at(*end)]),
+                aliases: BTreeSet::new(),
+            })
+            .unwrap();
+            let (chunk_facts, chunk_blobs) = fragment.into_facts_and_blobs();
+            facts += chunk_facts;
+            if *readable {
+                blobs.union(chunk_blobs);
+            }
+        }
+        (
+            facts,
+            blobs.snapshot().expect("in-memory snapshot is infallible"),
+        )
+    }
+
+    /// The recall each entry would get by resolving its range against a fresh
+    /// whole-journal projection: the per-call path the shared projection
+    /// replaced.
+    fn per_call_recall(space: &TribleSet, entry: &CoverEntry) -> String {
+        let range = format!("{}..{}", entry.start, entry.end);
+        let selects = entry.start != entry.end
+            && parse_time_range(&range)
+                .ok()
+                .and_then(|(from, to)| find_chunk_by_time_range(space, from, to))
+                == Some(entry.chunk);
+        if selects {
+            format!("memory {range}")
+        } else {
+            format!("memory {:x}", entry.chunk)
+        }
+    }
+
+    #[test]
+    fn one_shared_projection_picks_the_per_call_recalls() {
+        let readable = |start: f64, end: f64, text: &str| (start, end, text.to_owned(), true);
+        let unreadable = |start: f64, end: f64, text: &str| (start, end, text.to_owned(), false);
+        let (facts, reader) = journal(&[
+            // The deterministic wake fixture's shapes.
+            readable(0.0, 7_200.0, "The coarse arc."),
+            readable(7_200.0, 7_200.0, "A whole-second point."),
+            readable(7_200.0, 12_600.0, "The closing arc."),
+            readable(20_000.0, 20_100.0, "An outlier after a gap."),
+            // A sub-second point inside a one-second memory.
+            readable(3_600.5, 3_600.5, "The point inside a second."),
+            readable(3_600.0, 3_601.0, "Exactly one second."),
+            // A sub-second range beside its whole-second twin.
+            readable(30_000.3, 30_005.7, "Sub-second ends."),
+            readable(30_000.0, 30_005.0, "Five whole seconds."),
+            // A readable range whose printed span an UNREADABLE memory matches
+            // exactly: it is not in the cover, but replay scores it all the
+            // same, so the readable one must be recalled by id.
+            readable(
+                40_000.4,
+                40_009.6,
+                "Readable, losing to an unreadable twin.",
+            ),
+            unreadable(40_000.0, 40_009.0, "Unreadable twin, still replicating."),
+            // A readable range an unreadable memory does NOT beat keeps it.
+            readable(
+                50_000.0,
+                50_010.0,
+                "Readable, beating its unreadable neighbour.",
+            ),
+            unreadable(50_002.0, 50_004.0, "Unreadable inner moment."),
+        ]);
+        let report = render_cover_report(&facts, &reader, &CoverOpts::plain(800_000), &mut |_| {
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(
+            report.entries.len(),
+            10,
+            "every readable memory is recalled"
+        );
+        for entry in &report.entries {
+            assert_eq!(entry.recall, per_call_recall(&facts, entry), "{entry:?}");
+        }
+        let recall_of = |body: &str| {
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.body.as_deref() == Some(body))
+                .unwrap_or_else(|| panic!("{body} not recalled"))
+                .recall
+                .clone()
+        };
+        for by_id in [
+            "A whole-second point.",
+            "The point inside a second.",
+            "Sub-second ends.",
+            "Readable, losing to an unreadable twin.",
+        ] {
+            assert!(!recall_of(by_id).contains(".."), "{by_id}");
+        }
+        for by_range in [
+            "The coarse arc.",
+            "Exactly one second.",
+            "Five whole seconds.",
+            "Readable, beating its unreadable neighbour.",
+        ] {
+            assert!(recall_of(by_range).contains(".."), "{by_range}");
+        }
+    }
+
+    /// FIXTURE MEASUREMENT, not production: the lookup work only, in a debug
+    /// build, on synthetic disjoint one-minute memories. Run with
+    /// `--ignored --nocapture`; the numbers are recorded in the commit.
+    #[test]
+    #[ignore = "timing note, not a gate"]
+    fn fixture_timing_of_shared_versus_per_call_projection() {
+        const MEMORIES: usize = 2_000;
+        let memories: Vec<_> = (0..MEMORIES)
+            .map(|index| {
+                let start = index as f64 * 120.0;
+                (start, start + 60.0, format!("Memory number {index}."), true)
+            })
+            .collect();
+        let (facts, reader) = journal(&memories);
+        let started = std::time::Instant::now();
+        let report =
+            render_cover_report(&facts, &reader, &CoverOpts::plain(10_000_000), &mut |_| {
+                Ok(None)
+            })
+            .unwrap();
+        let render = started.elapsed();
+        let started = std::time::Instant::now();
+        let per_call: Vec<_> = report
+            .entries
+            .iter()
+            .map(|entry| per_call_recall(&facts, entry))
+            .collect();
+        let per_call_lookups = started.elapsed();
+        let started = std::time::Instant::now();
+        let spans = collect_chunk_spans(&facts);
+        let shared: Vec<_> = report
+            .entries
+            .iter()
+            .map(|entry| {
+                let range = format!("{}..{}", entry.start, entry.end);
+                parse_time_range(&range).ok().and_then(|(from, to)| {
+                    crate::memory::operations::find_chunk_in_spans(&spans, from, to)
+                })
+            })
+            .collect();
+        let shared_lookups = started.elapsed();
+        assert_eq!(per_call.len(), shared.len());
+        eprintln!(
+            "FIXTURE ({MEMORIES} memories, {} recalled, debug build): whole render with the \
+             shared projection {render:?}; recall lookups per call {per_call_lookups:?}, \
+             shared projection {shared_lookups:?}",
+            report.entries.len()
         );
     }
 }
