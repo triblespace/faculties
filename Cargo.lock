@@ -12412,6 +12412,7 @@ dependencies = [
  "tracing",
  "triblespace-core",
  "url",
+ "zerocopy",
 ]
 
 [[package]]
