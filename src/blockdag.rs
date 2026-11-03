@@ -190,9 +190,7 @@ pub fn attribute_descriptions() -> (TribleSet, Vec<triblespace::core::blob::Blob
         if usages.contains(fact.e()) || *fact.a() == description {
             continue;
         }
-        let mut value = [0u8; 32];
-        value.copy_from_slice(&fact.data[32..]);
-        named.insert(value);
+        named.insert(fact.v::<Handle<UnknownBlob>>().raw);
         kept.insert(fact);
     }
     let reader = blobs

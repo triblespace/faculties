@@ -32,7 +32,9 @@ use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
-use triblespace::core::repo::{BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store};
+use triblespace::core::repo::{
+    potential_handles, BlobStoreGet, BlobStorePut, SnapshotSource, StorageClose, Store,
+};
 use triblespace::prelude::blobencodings::RawBytes;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
@@ -466,14 +468,8 @@ fn named_blobs(
     facts: &TribleSet,
     blobs: triblespace::core::blob::MemoryBlobStore,
 ) -> Vec<Blob<UnknownBlob>> {
-    let named: std::collections::HashSet<[u8; 32]> = facts
-        .iter()
-        .map(|fact| {
-            let mut value = [0u8; 32];
-            value.copy_from_slice(&fact.data[32..]);
-            value
-        })
-        .collect();
+    let named: std::collections::HashSet<[u8; 32]> =
+        potential_handles(facts).map(|handle| handle.raw).collect();
     embedded_blobs(blobs)
         .into_iter()
         .filter(|blob| named.contains(&blob.get_handle().raw))
@@ -1644,14 +1640,8 @@ mod tests {
 
     /// The first embedded blob one of the fragment's facts names.
     fn first_embedded_handle(fragment: &Fragment) -> Inline<Handle<UnknownBlob>> {
-        let named: BTreeSet<[u8; 32]> = fragment
-            .facts()
-            .iter()
-            .map(|fact| {
-                let mut value = [0u8; 32];
-                value.copy_from_slice(&fact.data[32..]);
-                value
-            })
+        let named: BTreeSet<[u8; 32]> = potential_handles(fragment.facts())
+            .map(|handle| handle.raw)
             .collect();
         let mut blobs = fragment.blobs().clone();
         blobs
