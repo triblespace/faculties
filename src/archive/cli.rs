@@ -30,11 +30,11 @@ pub struct Cli {
     /// Optional tracing filter (defaults to `info`).
     #[arg(long)]
     trace_filter: Option<String>,
-    /// The provider whose model reads this output (`anthropic`, `openai`,
-    /// ...), as the caller declares it: advisory, never verified. A recorded
-    /// classifier stop withholds what it followed from a reader of the
-    /// stopped provider and from one that names none; another provider's
-    /// reader gets the content with a note.
+    /// The provider whose model reads this output (`anthropic`, `google` or
+    /// `openai`), as the caller declares it: advisory, never verified. A
+    /// recorded classifier stop withholds what it followed from a reader of
+    /// the stopped provider and from one that names none or another value;
+    /// another provider's reader gets the content with a note.
     #[arg(long, global = true, env = "READER_PROVIDER")]
     reader_provider: Option<String>,
     #[command(subcommand)]

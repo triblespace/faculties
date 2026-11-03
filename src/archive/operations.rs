@@ -760,14 +760,19 @@ const CLASSIFIER_STOPS: [(&str, &str); 2] = [
 /// Who a read is for, as far as a recorded classifier stop goes. `force`
 /// prints everything. Otherwise a stop withholds what it followed from a
 /// reader of the stopped provider and from one that names none, and prints
-/// it, with a note, for a reader declaring another provider. The provider is
-/// the caller's own declaration, advisory and unauthenticated: no recorded
-/// stop of a provider is no evidence that its models take the content.
+/// it, with a note, for a reader declaring another of [`PROVIDERS`]; any
+/// other declaration, a typo or a blank one, is refused like none. The
+/// provider is the caller's own declaration, advisory and unauthenticated:
+/// no recorded stop of a provider is no evidence that its models take the
+/// content.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Reading<'a> {
     pub force: bool,
     pub provider: Option<&'a str>,
 }
+
+/// The providers a reader may declare.
+pub const PROVIDERS: [&str; 3] = ["anthropic", "google", "openai"];
 
 /// What a read does with a node a recorded classifier stop followed.
 enum Guard {
@@ -790,9 +795,17 @@ fn guard(
     let Some((provider, stopped)) = classifier_stop(facts, reader, node)? else {
         return Ok(Guard::Clear);
     };
+    let known = |declared: &str| PROVIDERS.iter().any(|p| declared.eq_ignore_ascii_case(p));
     Ok(match reading.provider {
-        Some(declared) if !declared.eq_ignore_ascii_case(provider) => Guard::Note(format!(
-            "note {node:X}: {stopped}; printed for a reader declaring {declared}"
+        Some(declared) if known(declared) && !declared.eq_ignore_ascii_case(provider) => {
+            Guard::Note(format!(
+                "note {node:X}: {stopped}; printed for a reader declaring {declared}"
+            ))
+        }
+        Some(declared) if !known(declared) => Guard::Withhold(format!(
+            "withheld {node:X}: {stopped}; the reader's provider {declared:?} is none of {}, \
+             so it is read as undeclared; use --force to print it",
+            PROVIDERS.join(", ")
         )),
         _ => Guard::Withhold(format!(
             "withheld {node:X}: {stopped}; use --force to print it"
@@ -809,7 +822,10 @@ fn guard(
 /// the reader too, which ends its turn with no visible cause.
 ///
 /// Decided from the facts at every read and never stored: nothing about the
-/// content is judged, only what happened right after it. The model named is
+/// content is judged, only what happened right after it. The first stop
+/// reached answers; while every recorded wording is one provider's, that is
+/// the stop that matters, and stops of several providers would need the
+/// walk to go on to one of the reader's. The model named is
 /// the stopped response's, where the session recorded one.
 fn classifier_stop(
     facts: &FactArchive,
@@ -3389,12 +3405,27 @@ mod tests {
             provider: Some(provider),
         };
 
-        for provider in ["anthropic", "Anthropic"] {
+        for provider in [
+            "anthropic",
+            "Anthropic",
+            "",
+            "unknown",
+            "anthorpic",
+            "anthropic ",
+        ] {
             let shown =
                 printed(|out| run_show(storage(&fixture), &input, read(provider), out)).unwrap();
             assert!(!shown.contains("violet lantern"), "{shown}");
             assert!(shown.contains(&format!("withheld {input}")), "{shown}");
         }
+        let shown =
+            printed(|out| run_show(storage(&fixture), &input, read("anthorpic"), out)).unwrap();
+        assert!(
+            shown.contains(
+                "the reader's provider \"anthorpic\" is none of anthropic, google, openai"
+            ),
+            "{shown}"
+        );
 
         let shown =
             printed(|out| run_show(storage(&fixture), &input, read("openai"), out)).unwrap();
