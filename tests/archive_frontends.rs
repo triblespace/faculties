@@ -1,7 +1,7 @@
 use anybytes::Bytes;
 use base64::Engine as _;
 use clap::Parser;
-use faculties::archive::{cli, mcp, Archive, ImportSource};
+use faculties::archive::{cli, mcp, Archive, ImportSource, Reading};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::schemas::blockdag as schema;
@@ -229,6 +229,11 @@ fn direct_cli_and_mcp_share_frozen_queries_and_literal_content() {
         assert_eq!(fixture.cli(&args), fixture.call(tool, values));
     }
     assert!(text(&fixture.call("archive_show", json!({"id":projection}))).contains("@literal"));
+    assert!(text(&fixture.call(
+        "archive_show",
+        json!({"id":projection,"reader_provider":"openai"})
+    ))
+    .contains("@literal"));
     let query = fixture.directory.path().join("query.txt");
     fs::write(&query, "quasar").unwrap();
     let at = format!("@{}", query.display());
@@ -333,7 +338,7 @@ fn replay_result_failure_does_not_advance_and_equal_time_peer_is_not_skipped() {
             "one",
             1,
             false,
-            false,
+            Reading::default(),
             &mut Out::new(&mut |part| {
                 if let Part::Text { text } = part {
                     emitted.push_str(&text);

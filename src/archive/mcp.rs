@@ -24,14 +24,14 @@ impl Archive {
 }
 const TOOLS:&[Tool]=&[
     Tool { name: "archive_import", description: "Import one immutable resident source in any of seven formats, publishing only after complete projection. Exactly one literal content string or base64 data field. source_name is provenance only, never a file to open. ChatGPT attachment keys are logical export filenames, Gemini keys exact pointer strings; other formats use embedded assets. Missing external references stay unresolved; never accesses host files or networks.", input_schema:r#"{"type":"object","properties":{"source":{"type":"string","enum":["agy","chatgpt","claude-code","claude-web","codex","copilot","gemini"],"default":"claude-code"},"source_name":{"type":"string"},"content":{"type":"string"},"data":{"type":"string","contentEncoding":"base64"},"attachments":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"data":{"type":"string","contentEncoding":"base64"}},"required":["name","data"],"additionalProperties":false}}},"required":["source_name"],"additionalProperties":false}"# },
-    Tool { name: "archive_list", description: "List selected recent source projection summaries from one frozen Archive view.", input_schema:r#"{"type":"object","properties":{"limit":{"type":"integer","minimum":0,"default":50}},"additionalProperties":false}"# },
-    Tool { name: "archive_show", description: "Inspect one exact projection's text, provenance and held-fact metadata, by projection (receipt) id prefix, or one node by the id a search hit leads with. Media rows identify resident blobs or unresolved external pointers; this diagnostic does not claim to render media. Content a recorded safety-classifier stop followed is withheld and named in its place; force prints it.", input_schema:r#"{"type":"object","properties":{"id":{"type":"string"},"force":{"type":"boolean","default":false}},"required":["id"],"additionalProperties":false}"# },
-    Tool { name: "archive_thread", description: "Inspect the full canonical ancestor DAG of one projection (receipt) id prefix, or of one node by the id a search hit leads with; exceeding limit is an error so no fork is hidden. tail shows only the newest N ancestors (fewest steps back, ties by id), in reading order, and says whether older ones exist; limit does not apply to it. Content a recorded safety-classifier stop followed is withheld and named in its place; force prints it.", input_schema:r#"{"type":"object","properties":{"id":{"type":"string"},"limit":{"type":"integer","minimum":1,"default":100},"tail":{"type":"integer","minimum":1},"force":{"type":"boolean","default":false}},"required":["id"],"additionalProperties":false}"# },
-    Tool { name: "archive_search", description: "Search canonical node text with exact portable BM25. The query is literal, including @ prefixes.", input_schema:r#"{"type":"object","properties":{"text":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":50}},"required":["text"],"additionalProperties":false}"# },
+    Tool { name: "archive_list", description: "List selected recent source projection summaries from one frozen Archive view. Snippets of content a recorded safety-classifier stop followed are withheld as in archive_show; reader_provider declares the reading model's provider (advisory).", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":50}},"additionalProperties":false}"# },
+    Tool { name: "archive_show", description: "Inspect one exact projection's text, provenance and held-fact metadata, by projection (receipt) id prefix, or one node by the id a search hit leads with. Media rows identify resident blobs or unresolved external pointers; this diagnostic does not claim to render media. Content a recorded safety-classifier stop followed is withheld and named in its place, for a reader of the stopped provider or one that declares none; reader_provider (for example anthropic, openai) is the caller's own advisory declaration, and another provider's reader gets the content after a note; force prints it.", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"id":{"type":"string"},"force":{"type":"boolean","default":false}},"required":["id"],"additionalProperties":false}"# },
+    Tool { name: "archive_thread", description: "Inspect the full canonical ancestor DAG of one projection (receipt) id prefix, or of one node by the id a search hit leads with; exceeding limit is an error so no fork is hidden. tail shows only the newest N ancestors (fewest steps back, ties by id), in reading order, and says whether older ones exist; limit does not apply to it. Content a recorded safety-classifier stop followed is withheld and named in its place, for a reader of the stopped provider or one that declares none; reader_provider (for example anthropic, openai) is the caller's own advisory declaration, and another provider's reader gets the content after a note; force prints it.", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"id":{"type":"string"},"limit":{"type":"integer","minimum":1,"default":100},"tail":{"type":"integer","minimum":1},"force":{"type":"boolean","default":false}},"required":["id"],"additionalProperties":false}"# },
+    Tool { name: "archive_search", description: "Search canonical node text with exact portable BM25. The query is literal, including @ prefixes. Snippets of content a recorded safety-classifier stop followed are withheld as in archive_show; reader_provider declares the reading model's provider (advisory).", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":50}},"required":["text"],"additionalProperties":false}"# },
     Tool { name: "archive_index", description: "Maintain exact accelerated-Succinct and portable BM25 derived indexes without authoring new source events.", input_schema:r#"{"type":"object","properties":{},"additionalProperties":false}"# },
     Tool { name: "archive_replay_start", description: "Start or reset this explicit persona's exact Archive replay cursor at the supplied Gregorian TAI timestamp.", input_schema:r#"{"type":"object","properties":{"persona":{"type":"string"},"from":{"type":"string"}},"required":["persona","from"],"additionalProperties":false}"# },
     Tool { name: "archive_replay_stop", description: "Stop this explicit persona's Archive replay cursor.", input_schema:r#"{"type":"object","properties":{"persona":{"type":"string"}},"required":["persona"],"additionalProperties":false}"# },
-    Tool { name: "archive_replay", description: "Deliver the next canonical block batch then advance its exact block cursor only after output acceptance. Equal timestamps may split safely. Media stays diagnostic metadata, not synthesized content. Content a recorded safety-classifier stop followed is withheld and named in its place; force prints it.", input_schema:r#"{"type":"object","properties":{"persona":{"type":"string"},"limit":{"type":"integer","minimum":1,"default":20},"with_tools":{"type":"boolean","default":false},"force":{"type":"boolean","default":false}},"required":["persona"],"additionalProperties":false}"# },
+    Tool { name: "archive_replay", description: "Deliver the next canonical block batch then advance its exact block cursor only after output acceptance. Equal timestamps may split safely. Media stays diagnostic metadata, not synthesized content. Content a recorded safety-classifier stop followed is withheld and named in its place, for a reader of the stopped provider or one that declares none; reader_provider (for example anthropic, openai) is the caller's own advisory declaration, and another provider's reader gets the content after a note; force prints it.", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"persona":{"type":"string"},"limit":{"type":"integer","minimum":1,"default":20},"with_tools":{"type":"boolean","default":false},"force":{"type":"boolean","default":false}},"required":["persona"],"additionalProperties":false}"# },
 ];
 fn fifty() -> usize {
     50
@@ -90,6 +90,8 @@ struct Import {
 struct Limit {
     #[serde(default = "fifty")]
     limit: usize,
+    #[serde(default)]
+    reader_provider: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +99,8 @@ struct Show {
     id: String,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    reader_provider: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +112,8 @@ struct Thread {
     tail: Option<usize>,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    reader_provider: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +121,8 @@ struct Search {
     text: String,
     #[serde(default = "fifty")]
     limit: usize,
+    #[serde(default)]
+    reader_provider: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -140,12 +148,21 @@ struct Replay {
     with_tools: bool,
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    reader_provider: Option<String>,
 }
 fn decode_base64(data: &str) -> Result<Bytes> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
         .map(Bytes::from)
         .map_err(invalid_arguments)
+}
+/// A read as the request states it; nothing comes from the environment.
+fn reading(force: bool, provider: &Option<String>) -> super::Reading<'_> {
+    super::Reading {
+        force,
+        provider: provider.as_deref(),
+    }
 }
 fn valid_persona(persona: &str) -> Result<()> {
     if persona.trim().is_empty() {
@@ -201,11 +218,13 @@ impl Faculty for Archive {
             }
             "archive_list" => {
                 let a: Limit = decode_arguments(arguments)?;
-                self.operations.list(a.limit, out)
+                self.operations
+                    .list(a.limit, reading(false, &a.reader_provider), out)
             }
             "archive_show" => {
                 let a: Show = decode_arguments(arguments)?;
-                self.operations.show(&a.id, a.force, out)
+                self.operations
+                    .show(&a.id, reading(a.force, &a.reader_provider), out)
             }
             "archive_thread" => {
                 let a: Thread = decode_arguments(arguments)?;
@@ -215,11 +234,18 @@ impl Faculty for Archive {
                 if a.tail == Some(0) {
                     return Err(invalid_arguments("thread tail must be at least 1"));
                 }
-                self.operations.thread(&a.id, a.limit, a.tail, a.force, out)
+                self.operations.thread(
+                    &a.id,
+                    a.limit,
+                    a.tail,
+                    reading(a.force, &a.reader_provider),
+                    out,
+                )
             }
             "archive_search" => {
                 let a: Search = decode_arguments(arguments)?;
-                self.operations.search(&a.text, a.limit, out)
+                self.operations
+                    .search(&a.text, a.limit, reading(false, &a.reader_provider), out)
             }
             "archive_index" => {
                 let _: Empty = decode_arguments(arguments)?;
@@ -247,8 +273,13 @@ impl Faculty for Archive {
                 if a.limit == 0 {
                     return Err(invalid_arguments("replay limit must be at least 1"));
                 }
-                self.operations
-                    .replay(&a.persona, a.limit, a.with_tools, a.force, out)
+                self.operations.replay(
+                    &a.persona,
+                    a.limit,
+                    a.with_tools,
+                    reading(a.force, &a.reader_provider),
+                    out,
+                )
             }
             _ => bail!("unknown Archive MCP tool {name:?}"),
         }

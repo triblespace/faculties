@@ -1,6 +1,6 @@
 //! Archive shell syntax, trace setup and explicit local source discovery.
 use super::sessions::{SessionEvent, SessionOptions, SessionRoot, SessionSource, SessionStart};
-use super::{parse_tai_timestamp, Archive, ImportSource, Publication};
+use super::{parse_tai_timestamp, Archive, ImportSource, Publication, Reading};
 use crate::archive_collection::ArchiveImportWriter;
 use crate::blockdag::Identity;
 use crate::out::Out;
@@ -30,6 +30,13 @@ pub struct Cli {
     /// Optional tracing filter (defaults to `info`).
     #[arg(long)]
     trace_filter: Option<String>,
+    /// The provider whose model reads this output (`anthropic`, `openai`,
+    /// ...), as the caller declares it: advisory, never verified. A recorded
+    /// classifier stop withholds what it followed from a reader of the
+    /// stopped provider and from one that names none; another provider's
+    /// reader gets the content with a note.
+    #[arg(long, global = true, env = "READER_PROVIDER")]
+    reader_provider: Option<String>,
     #[command(subcommand)]
     pub(super) command: Option<Command>,
 }
@@ -337,6 +344,10 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         return Ok(());
     };
     let archive = Archive::with_storage(storage.clone());
+    let reading = |force| Reading {
+        force,
+        provider: cli.reader_provider.as_deref(),
+    };
     match command {
         Command::IngestSessions {
             all,
@@ -431,17 +442,20 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                 out,
             )
         }
-        Command::List { limit } => archive.list(limit, out),
-        Command::Show { id, force } => archive.show(&id, force, out),
+        Command::List { limit } => archive.list(limit, reading(false), out),
+        Command::Show { id, force } => archive.show(&id, reading(force), out),
         Command::Thread {
             id,
             limit,
             tail,
             force,
-        } => archive.thread(&id, limit, tail, force, out),
-        Command::Search { text, limit } => {
-            archive.search(&crate::text_arg(&text, "search text")?, limit, out)
-        }
+        } => archive.thread(&id, limit, tail, reading(force), out),
+        Command::Search { text, limit } => archive.search(
+            &crate::text_arg(&text, "search text")?,
+            limit,
+            reading(false),
+            out,
+        ),
         Command::Index => archive.index(out),
         Command::Replay {
             action,
@@ -471,7 +485,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                     out.line(format!("replay stopped (persona {persona})"))
                 }
                 Some(other) => bail!("unknown replay action `{other}` (start/stop or nothing)"),
-                None => archive.replay(persona, limit, with_tools, force, out),
+                None => archive.replay(persona, limit, with_tools, reading(force), out),
             }
         }
     }
