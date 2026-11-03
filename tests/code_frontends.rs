@@ -184,7 +184,7 @@ fn an_mcp_tool_refuses_an_argument_it_does_not_model() {
 #[test]
 fn the_adapter_declares_one_tool_per_verb() {
     let fixture = Fixture::new();
-    assert_eq!(fixture.adapter().tools().len(), 9);
+    assert_eq!(fixture.adapter().tools().len(), 10);
 }
 
 #[test]

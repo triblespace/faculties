@@ -1211,7 +1211,11 @@ fn resolve_item(
 /// Addressing the unit rather than the path matters: two revisions of one file
 /// are two units with the same path, and slicing the wrong one would print
 /// lines that do not say what the reported line number says they do.
-fn item_source(facts: &FactArchive, reader: &CodeReader, hit: &Hit) -> Result<Option<String>> {
+pub(crate) fn item_source(
+    facts: &FactArchive,
+    reader: &CodeReader,
+    hit: &Hit,
+) -> Result<Option<String>> {
     for handle in code::unit_content(facts, hit.unit) {
         let bytes: anybytes::Bytes = match reader.get(handle) {
             Ok(bytes) => bytes,

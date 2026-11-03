@@ -617,6 +617,16 @@ enum Flat {
     Delimiter(&'static str),
 }
 
+/// Recover display spellings with the same token walker used at ingestion.
+/// Retrieval uses the stored mention facts, not this reconstruction.
+pub(crate) fn mention_spellings(tokens: &str) -> BTreeSet<String> {
+    tokens
+        .parse::<TokenStream>()
+        .map(walk)
+        .map(|value| value.mentions)
+        .unwrap_or_default()
+}
+
 /// The law, in code: depth-first over the token tree, a group's delimiters as
 /// their literal characters around its contents, every piece joined by one
 /// ASCII space.

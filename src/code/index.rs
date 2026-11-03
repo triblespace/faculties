@@ -54,7 +54,7 @@ type CodeBM25View = PortableBM25View<inlineencodings::Handle<blobencodings::UTF8
 /// entities hold a text is not in the index; [`entity_scores`] joins that over
 /// the facts.
 #[derive(Debug, Default)]
-struct TextScores {
+pub(crate) struct TextScores {
     doc: BTreeMap<TextHandle, f32>,
     source_tokens: BTreeMap<TextHandle, f32>,
 }
@@ -236,13 +236,7 @@ cover is behind them: run `code index`."
             return Ok(report);
         }
 
-        let mut ranked: Vec<(Id, f32)> = scores.into_iter().collect();
-        ranked.sort_by(|left, right| {
-            right
-                .1
-                .partial_cmp(&left.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let mut ranked = ranked_entities(scores);
         ranked.truncate(top.saturating_mul(12).max(60));
 
         // Turn scored entities into located declarations, then group by file.
@@ -250,7 +244,8 @@ cover is behind them: run `code index`."
         // score to that file's group without a member line: the prose it
         // matched is the module's, not any one declaration's.
         let mut groups: BTreeMap<(String, String), (f32, Vec<Hit>)> = BTreeMap::new();
-        for (entity, score) in ranked {
+        for (entity, scores) in ranked {
+            let score = scores.total();
             let mut placed = false;
             for scan in &scans {
                 for located in placements_of_item(&facts, scan.id, entity) {
@@ -324,7 +319,16 @@ impl Code {
     /// Weighted scores per text. The join to entities happens in the caller,
     /// over the fact archive it already holds for placing the hits.
     fn bm25_scores(&self, query: &str, tier: Tier) -> Result<TextScores> {
-        let terms = code_tokens(query);
+        let targets = self.lexical_targets()?;
+        self.storage().with_store(|store, _, runtime| {
+            let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+            score_texts(&reader, targets, query, tier)
+        })
+    }
+
+    /// Register the existing mappings before taking the operation's observation.
+    /// This does not maintain either lexical cover.
+    pub(crate) fn lexical_targets(&self) -> Result<[Collection<PortableBM25Blob>; 2]> {
         self.storage().with_store(|store, signer, runtime| {
             let source = self.storage().open_collection_read(
                 store,
@@ -332,54 +336,71 @@ impl Code {
                 signer.verifying_key(),
                 runtime,
             )?;
-            let doc_target = register(store, source, attrs::doc.id())?;
-            let text_target = register(store, source, attrs::source_tokens.id())?;
-            let snapshot = AcquiringReader::new(
-                store.snapshot().context("freeze Code search snapshot")?,
-                runtime.clone(),
-            );
-
-            let mut scores = TextScores::default();
-            let accumulate = |target: Collection<PortableBM25Blob>,
-                              weight: f32,
-                              scores: &mut BTreeMap<TextHandle, f32>|
-             -> Result<()> {
-                let attached = snapshot.attached_acquiring(target)?;
-                let view = crate::storage::require_complete_attached_read(
-                    attached.read_acquiring::<CodeBM25View>()?,
-                )?;
-                let query = view.query().context("prepare Code BM25 query")?;
-                for (document, score) in
-                    query.query_multi(&terms).context("score Code BM25 query")?
-                {
-                    *scores.entry(document).or_insert(0.0) += score * weight;
-                }
-                Ok(())
-            };
-
-            if matches!(tier, Tier::Docs | Tier::Both) {
-                accumulate(doc_target, 1.0, &mut scores.doc)?;
-            }
-            if matches!(tier, Tier::Text | Tier::Both) {
-                // Prose is what answers a capability question; the token stream
-                // is the fallback for the median function, which has no prose at
-                // all. Weighting them equally would let a long body outvote the
-                // sentence that says what the file is for.
-                accumulate(text_target, 0.5, &mut scores.source_tokens)?;
-            }
-            Ok(scores)
+            Ok([
+                register(store, source, attrs::doc.id())?,
+                register(store, source, attrs::source_tokens.id())?,
+            ])
         })
+    }
+}
+
+/// Score existing covers on the same frozen reader used for placements/facts.
+pub(crate) fn score_texts(
+    reader: &crate::code::operations::CodeReader,
+    targets: [Collection<PortableBM25Blob>; 2],
+    query: &str,
+    tier: Tier,
+) -> Result<TextScores> {
+    let terms = code_tokens(query);
+    let mut scores = TextScores::default();
+    let accumulate = |target: Collection<PortableBM25Blob>,
+                      weight: f32,
+                      scores: &mut BTreeMap<TextHandle, f32>|
+     -> Result<()> {
+        let attached = reader.attached_acquiring(target)?;
+        let view = crate::storage::require_complete_attached_read(
+            attached.read_acquiring::<CodeBM25View>()?,
+        )?;
+        let query = view.query().context("prepare Code BM25 query")?;
+        for (document, score) in query.query_multi(&terms).context("score Code BM25 query")? {
+            *scores.entry(document).or_insert(0.0) += score * weight;
+        }
+        Ok(())
+    };
+    if matches!(tier, Tier::Docs | Tier::Both) {
+        accumulate(targets[0], 1.0, &mut scores.doc)?;
+    }
+    if matches!(tier, Tier::Text | Tier::Both) {
+        accumulate(targets[1], 0.5, &mut scores.source_tokens)?;
+    }
+    Ok(scores)
+}
+
+/// Keep the two lexical reasons independent until a caller chooses presentation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LexicalScores {
+    pub doc: f32,
+    /// Existing source-token tier weight (0.5) is already applied.
+    pub source_tokens: f32,
+}
+
+impl LexicalScores {
+    pub fn total(self) -> f32 {
+        self.doc + self.source_tokens
     }
 }
 
 /// Every entity holding a scored text under the attribute it was indexed by
 /// receives that text's weighted score; an entity holding several scored
 /// texts receives their sum.
-fn entity_scores(facts: &FactArchive, texts: &TextScores) -> BTreeMap<Id, f32> {
-    let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
+pub(crate) fn entity_scores(
+    facts: &FactArchive,
+    texts: &TextScores,
+) -> BTreeMap<Id, LexicalScores> {
+    let mut scores: BTreeMap<Id, LexicalScores> = BTreeMap::new();
     for (&text, &score) in &texts.doc {
         for entity in find!(entity: Id, pattern!(facts, [{ ?entity @ attrs::doc: text }])) {
-            *scores.entry(entity).or_insert(0.0) += score;
+            scores.entry(entity).or_default().doc += score;
         }
     }
     for (&text, &score) in &texts.source_tokens {
@@ -387,10 +408,23 @@ fn entity_scores(facts: &FactArchive, texts: &TextScores) -> BTreeMap<Id, f32> {
             entity: Id,
             pattern!(facts, [{ ?entity @ attrs::source_tokens: text }])
         ) {
-            *scores.entry(entity).or_insert(0.0) += score;
+            scores.entry(entity).or_default().source_tokens += score;
         }
     }
     scores
+}
+
+/// Rank lexical entities without throwing away either evidence component.
+/// Callers choose scope and budgets before presenting a projection.
+pub(crate) fn ranked_entities(scores: BTreeMap<Id, LexicalScores>) -> Vec<(Id, LexicalScores)> {
+    let mut ranked: Vec<_> = scores.into_iter().collect();
+    ranked.sort_by(|(left_id, left), (right_id, right)| {
+        right
+            .total()
+            .total_cmp(&left.total())
+            .then(left_id.cmp(right_id))
+    });
+    ranked
 }
 
 /// The rarest import roots of each group's file, and the overlap with the
@@ -539,8 +573,10 @@ mod tests {
         };
         let scores = entity_scores(&archive, &texts);
         assert_eq!(scores.len(), 2);
-        assert_eq!(scores[&*first], 2.5);
-        assert_eq!(scores[&*second], 2.0);
+        assert_eq!(scores[&*first].total(), 2.5);
+        assert_eq!(scores[&*first].doc, 2.0);
+        assert_eq!(scores[&*first].source_tokens, 0.5);
+        assert_eq!(scores[&*second].total(), 2.0);
         assert!(!scores.contains_key(&*third));
     }
 

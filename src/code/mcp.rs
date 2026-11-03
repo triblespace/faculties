@@ -76,6 +76,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"top":{"type":"integer"},"in":{"type":"string","enum":["docs","text","both"],"description":"Rank over declaration prose, declaration tokens, or both."},"kind":{"type":"string"},"repo":{"type":"string"},"at":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "code_candidates",
+        description: "Explore declaration candidates from existing lexical indexes and shared unresolved mentions. Returns independent reasons and source spans, not equivalence or substitution verdicts. Exact placements remain separate. Scope applies before top, which limits EACH channel; their union has at most twice top items.",
+        input_schema: r#"{"type":"object","properties":{"item":{"type":"string","description":"Exact opaque Code item ID."},"top":{"type":"integer","minimum":0},"source":{"type":"boolean"},"kind":{"type":"string"},"repo":{"type":"string"},"at":{"type":"string"}},"required":["item"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "code_blame",
         description: "Ask git which commits added or removed an occurrence of an identifier. The deliberate seam between the catalogue and history: git shows the diff, so unlike a difference between two scans it cannot misread a rename-with-edit as a removal.",
         input_schema: r#"{"type":"object","properties":{"identifier":{"type":"string"},"dirs":{"type":"array","items":{"type":"string"},"description":"Repository root paths to search."},"limit":{"type":"integer"}},"required":["identifier","dirs"],"additionalProperties":false}"#,
@@ -182,6 +187,26 @@ fn default_tier() -> String {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Candidates {
+    item: String,
+    #[serde(default = "default_candidates_top")]
+    top: usize,
+    #[serde(default)]
+    source: bool,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    at: Option<String>,
+}
+
+fn default_candidates_top() -> usize {
+    20
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Blame {
     identifier: String,
     dirs: Vec<PathBuf>,
@@ -280,6 +305,20 @@ impl Faculty for Code {
                     &filter(request.kind, request.repo, request.at),
                 )?;
                 render::search(&report, out)
+            }
+            "code_candidates" => {
+                let request: Candidates = decode_arguments(arguments)?;
+                let item = triblespace::prelude::Id::from_hex(&request.item)
+                    .ok_or_else(|| anyhow::anyhow!("expected an exact Code item ID"))?;
+                render::candidates(
+                    &self.operations.candidates(
+                        item,
+                        request.top,
+                        request.source,
+                        &filter(request.kind, request.repo, request.at),
+                    )?,
+                    out,
+                )
             }
             "code_blame" => {
                 let request: Blame = decode_arguments(arguments)?;

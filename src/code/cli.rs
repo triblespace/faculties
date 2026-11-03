@@ -103,6 +103,19 @@ enum Command {
         #[command(flatten)]
         filter: FilterArgs,
     },
+    /// Explore declarations sharing lexical evidence or unresolved mentions.
+    Candidates {
+        /// Exact opaque item ID, as shown by `code show`.
+        item: String,
+        /// Admit up to this many items from EACH channel (union <= 2*top).
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Print source from each candidate's first reported placement.
+        #[arg(long)]
+        source: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
+    },
     /// Ask git which commits added or removed an occurrence of an identifier.
     Blame {
         identifier: String,
@@ -236,6 +249,16 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             let report = code.search(&query, tier, top, &filter.into())?;
             render::search(&report, out)
         }
+        Command::Candidates {
+            item,
+            top,
+            source,
+            filter,
+        } => {
+            let item = triblespace::prelude::Id::from_hex(&item)
+                .ok_or_else(|| anyhow::anyhow!("expected an exact Code item ID"))?;
+            render::candidates(&code.candidates(item, top, source, &filter.into())?, out)
+        }
         Command::Blame {
             identifier,
             dirs,
@@ -261,7 +284,18 @@ mod tests {
             .collect();
         assert_eq!(
             verbs,
-            vec!["ingest", "find", "uses", "show", "dup", "stats", "index", "search", "blame",]
+            vec![
+                "ingest",
+                "find",
+                "uses",
+                "show",
+                "dup",
+                "stats",
+                "index",
+                "search",
+                "candidates",
+                "blame",
+            ]
         );
     }
 

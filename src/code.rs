@@ -55,6 +55,7 @@
 //! values to constants by exactly the same path
 //! (`triblespace-core/src/inline.rs:564`).
 
+pub mod candidates;
 pub mod cli;
 pub mod extract;
 pub mod git;

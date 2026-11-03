@@ -196,6 +196,62 @@ answer \"is this absent\" — use `code find` for that.",
     provenance(&report.provenance, out)
 }
 
+pub fn candidates(
+    report: &crate::code::candidates::CandidateReport,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    out.line(format!(
+        "seed {:x} — exact placements in selected scope",
+        report.seed
+    ))?;
+    for place in &report.exact_placements {
+        hit_line(place, "  ", out)?;
+    }
+    out.line(format!(
+        "candidate union: top {} from each channel; {} lexical / {} shared-mention items before limits",
+        report.top, report.lexical_items, report.mention_items,
+    ))?;
+    for candidate in &report.candidates {
+        out.line(format!("item {:x}", candidate.item))?;
+        if let Some(rank) = candidate.lexical_rank {
+            out.line(format!(
+                "  lexical rank {rank}: docs {:.4}; source tokens {:.4} (0.5 weight)",
+                candidate.lexical.doc, candidate.lexical.source_tokens
+            ))?;
+        }
+        if let Some(rank) = candidate.mention_rank {
+            out.line(format!(
+                "  shared-mention rank {rank}: inverse-frequency sum; unresolved spellings"
+            ))?;
+            for mention in &candidate.shared_mentions {
+                let spelling = mention
+                    .spelling
+                    .clone()
+                    .unwrap_or_else(|| hex::encode(mention.handle.raw));
+                out.line(format!(
+                    "    {spelling} — {} selected non-seed item(s)",
+                    mention.items
+                ))?;
+            }
+        }
+        for place in &candidate.places {
+            hit_line(place, "  ", out)?;
+            out.line(format!(
+                "          lines {}–{} · {}",
+                place.line, place.end_line, place.scan
+            ))?;
+        }
+        if let Some(source) = &candidate.source {
+            out.line("  source from first placement:")?;
+            for line in source.lines() {
+                out.line(format!("    {line}"))?;
+            }
+        }
+    }
+    out.line("Candidate evidence only; lexical overlap and unresolved names do not establish equivalence or safe substitution.")?;
+    provenance(&report.provenance, out)
+}
+
 pub fn detail(detail: &ItemDetail, out: &mut Out<'_>) -> Result<()> {
     out.line(format!("item {:x}", detail.hit.item))?;
     hit_line(&detail.hit, "  ", out)?;
