@@ -2894,7 +2894,7 @@ mod tests {
         let mut hasher = blake3::Hasher::new();
         let summary = project_bytes(name, Bytes::from_source(text.to_vec()), |projected| {
             for trible in projected.fragment.facts().iter_ordered() {
-                hasher.update(&trible.data);
+                hasher.update(trible.as_raw());
             }
             hasher.update(b"|fragment|");
             Ok(())
