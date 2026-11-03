@@ -606,7 +606,9 @@ impl Projector<'_> {
                     .as_ref()
                     .and_then(json_number)
                     .and_then(JsonNumber::as_i64)
-                    .map(|seconds| seconds * 1_000)
+                    // A start too large for milliseconds is no start: fall back to
+                    // the turn id rather than wrap.
+                    .and_then(|seconds| seconds.checked_mul(1_000))
                     .or_else(|| json_str(&turn_id?).and_then(|id| uuid_v7_ms(id.as_ref())))
             })
         } else {
