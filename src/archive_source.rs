@@ -1608,7 +1608,6 @@ mod tests {
         )
         .collect();
         assert_eq!(models, vec![model], "one label, one entity");
-        blockdag::validate_catalog_structure(union.facts()).unwrap();
     }
 
     #[test]

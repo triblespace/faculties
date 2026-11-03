@@ -15,23 +15,21 @@
 //! construction. They remain queryable without becoming hidden inputs to a
 //! content-derived id.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use anybytes::Bytes;
 use anyhow::{anyhow, bail, Result};
-use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
 use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
+use triblespace::core::repo::{BlobStoreList, SnapshotSource};
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use crate::files;
-use crate::schemas::{blockdag as schema, files as files_schema};
+use crate::schemas::blockdag as schema;
 
 /// Source-occurrence evidence that must not affect the projected block or
 /// projection-receipt identity.
@@ -77,41 +75,22 @@ pub struct ProjectionAnnotations {
 
 type TextHandle = Inline<Handle<UTF8String>>;
 type RawHandle = Inline<Handle<RawBytes>>;
-type IntervalValue = Inline<NsTAIInterval>;
-type SizeValue = Inline<U256BE>;
 type OverlayReader = MemoryBlobStoreSnapshot;
 
-/// Result of validating one exact materialized Archive catalog.
+/// Whether the bytes an Archive catalog names are resident.
 ///
-/// `Pending` is deliberately limited to attachment residency: every asserted
-/// handle already fixes the missing bytes, so those bytes may arrive without
-/// changing the catalog's denotation. Missing graph entities and malformed
-/// facts are [`Rejected`](Self::Rejected), because repairing them requires a
-/// different set of tribles.
+/// This is a residency check and nothing else. The schema is open world, so
+/// it refuses no fact: it does not check shapes, cardinalities, closure,
+/// vocabularies or derived ids, and a fact it does not model is no concern
+/// of it. `Pending` names the hashes still to arrive; every asserted handle
+/// already fixes them, so they may arrive without changing the catalog.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogValidation {
-    /// Structure, intrinsic identities, closure, and attachment residency are
-    /// canonical. Durable payload hashes and decodings remain lazy until the
-    /// bytes are consumed; newly staged payloads are validated before publish.
+    /// Every blob the catalog names under an Archive byte attribute is
+    /// resident.
     Accepted,
-    /// The graph is canonical, but these content hashes are not resident yet.
+    /// These content hashes are not resident yet.
     Pending { missing: BTreeSet<[u8; 32]> },
-    /// A deterministic structural, hashing, or attachment-format violation.
-    Rejected(String),
-}
-
-impl CatalogValidation {
-    /// True only for a fully resident, canonical catalog.
-    pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Accepted)
-    }
-}
-
-#[derive(Default)]
-struct AttachmentPlan {
-    texts: BTreeSet<TextHandle>,
-    raws: BTreeSet<RawHandle>,
-    media_type_names: BTreeSet<TextHandle>,
 }
 
 fn rooted(fragment: &Fragment, what: &str) -> Result<Id> {
@@ -320,7 +299,7 @@ where
 /// Add one recovered byte representation to a pointer-identified content fact.
 ///
 /// The intrinsic fact root remains unchanged. Multiple distinct resolutions
-/// are retained as explicit ambiguity for validation rather than resolved by
+/// are all retained, for a reader to choose among, rather than resolved by
 /// last-write-wins.
 pub fn resolve_pointer_fact<T>(mut fact: Fragment, bytes: T) -> Result<Fragment>
 where
@@ -712,889 +691,111 @@ pub fn annotate_generated_projection(
     Ok(projection)
 }
 
-fn values_by_entity<T: Ord>(rows: impl IntoIterator<Item = (Id, T)>) -> BTreeMap<Id, BTreeSet<T>> {
-    let mut values = BTreeMap::new();
-    for (entity, value) in rows {
-        values
-            .entry(entity)
-            .or_insert_with(BTreeSet::new)
-            .insert(value);
-    }
-    values
-}
-
-fn values_for<T: Ord + Copy>(values: &BTreeMap<Id, BTreeSet<T>>, id: Id) -> BTreeSet<T> {
-    values.get(&id).cloned().unwrap_or_default()
-}
-
-fn one_required<T: Ord + Copy>(
-    values: &BTreeMap<Id, BTreeSet<T>>,
-    id: Id,
-    field: &str,
-) -> Result<T> {
-    let values = values_for(values, id);
-    if values.len() != 1 {
-        bail!(
-            "entity {id:x} has {} values for {field}; expected exactly one",
-            values.len()
-        );
-    }
-    Ok(*values.first().expect("one value"))
-}
-
-fn one_optional<T: Ord + Copy>(
-    values: &BTreeMap<Id, BTreeSet<T>>,
-    id: Id,
-    field: &str,
-) -> Result<Option<T>> {
-    let values = values_for(values, id);
-    if values.len() > 1 {
-        bail!(
-            "entity {id:x} has {} values for optional scalar {field}",
-            values.len()
-        );
-    }
-    Ok(values.first().copied())
-}
-
-fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
+/// The blobs the catalog names under the attributes Archive reads bytes
+/// from, on any entity: every value counts, and none is refused.
+fn named_attachments<P>(facts: &P) -> (BTreeSet<TextHandle>, BTreeSet<RawHandle>)
 where
     P: TriblePattern,
 {
-    find!(
-        id: Id,
-        pattern!(facts, [{ ?id @ metadata::tag: &kind }])
+    let mut texts: BTreeSet<TextHandle> = find!(
+        value: TextHandle,
+        pattern!(facts, [{ _?entity @ metadata::name: ?value }])
     )
-    .collect()
-}
-
-fn ensure_intrinsic_with_kind(id: Id, core: Fragment, kind: Id, label: &str) -> Result<TribleSet> {
-    let expected = core
-        .root()
-        .ok_or_else(|| anyhow!("{label} core has no unique intrinsic root"))?;
-    if expected != id {
-        bail!("{label} {id:x} does not match intrinsic root {expected:x}");
+    .collect();
+    for attribute in [
+        &*schema::content_fact::payload,
+        &*schema::content_fact::asset_pointer,
+        &*schema::source_projection::source_locator,
+        &*schema::source_projection::raw_author,
+        &*schema::source_projection::raw_role,
+        &*schema::source_projection::raw_model,
+        &*schema::source_projection::source_detail,
+    ] {
+        texts.extend(find!(
+            value: TextHandle,
+            pattern!(facts, [{ _?entity @ attribute: ?value }])
+        ));
     }
-    let mut facts = core.into_facts();
-    facts += entity! { ExclusiveId::force_ref(&id) @ metadata::tag: &kind }.into_facts();
-    Ok(facts)
+    let mut raws = BTreeSet::new();
+    for attribute in [
+        &*schema::content_fact::blob,
+        &*schema::content_fact::resolved_to,
+        &*schema::source_projection::raw_record,
+        &*schema::source_projection::resolution,
+    ] {
+        raws.extend(find!(
+            value: RawHandle,
+            pattern!(facts, [{ _?entity @ attribute: ?value }])
+        ));
+    }
+    (texts, raws)
 }
 
-fn known_modality(value: Id) -> bool {
-    schema::content_fact::modality::SPECS
-        .iter()
-        .any(|(id, _)| *id == value)
-}
-
-fn textual_modality(value: Id) -> bool {
-    [
-        schema::content_fact::modality::TEXT,
-        schema::content_fact::modality::TOOL_CALL,
-        schema::content_fact::modality::TOOL_RESULT,
-        schema::content_fact::modality::THINKING,
-        schema::content_fact::modality::EVENT,
-    ]
-    .contains(&value)
-}
-
-/// THINKING is both: readable reasoning is text, sealed reasoning is bytes.
-fn media_modality(value: Id) -> bool {
-    [
-        schema::content_fact::modality::THINKING,
-        schema::content_fact::modality::AUDIO,
-        schema::content_fact::modality::IMAGE,
-        schema::content_fact::modality::FILE,
-        schema::content_fact::modality::VIDEO,
-    ]
-    .contains(&value)
-}
-
-fn known_direction(value: Id) -> bool {
-    schema::content_fact::direction::SPECS
-        .iter()
-        .any(|(id, _)| *id == value)
-}
-
-fn require_disjoint(kinds: &[(&str, &BTreeSet<Id>)]) -> Result<()> {
-    for (index, (left_name, left)) in kinds.iter().enumerate() {
-        for (right_name, right) in &kinds[index + 1..] {
-            if let Some(id) = left.intersection(right).next() {
-                bail!("entity {id:x} is tagged as both {left_name} and {right_name}");
-            }
+fn resident<S>(
+    reader: &PileSnapshot,
+    overlay: Option<&OverlayReader>,
+    handle: Inline<Handle<S>>,
+) -> Result<bool>
+where
+    S: BlobEncoding + 'static,
+    Handle<S>: InlineEncoding,
+{
+    if let Some(overlay) = overlay {
+        if overlay
+            .contains_blob(handle)
+            .map_err(|error| anyhow!("inspect a staged Archive attachment: {error}"))?
+        {
+            return Ok(true);
         }
     }
-    Ok(())
+    reader
+        .contains_blob(handle)
+        .map_err(|error| anyhow!("inspect a resident Archive attachment: {error}"))
 }
 
-fn require_coverage(declared: &BTreeSet<Id>, referenced: &BTreeSet<Id>, label: &str) -> Result<()> {
-    if let Some(id) = declared.difference(referenced).next() {
-        bail!("orphan {label} {id:x} is not reachable from a source projection");
-    }
-    if let Some(id) = referenced.difference(declared).next() {
-        bail!("reference names undeclared {label} {id:x}");
-    }
-    Ok(())
-}
-
-fn validate_dag(nodes: &BTreeMap<Id, BTreeSet<Id>>, label: &str) -> Result<()> {
-    let mut remaining: BTreeMap<Id, usize> = nodes
-        .iter()
-        .map(|(node, predecessors)| (*node, predecessors.len()))
-        .collect();
-    let mut children = BTreeMap::<Id, Vec<Id>>::new();
-    for (&node, predecessors) in nodes {
-        for predecessor in predecessors {
-            if !nodes.contains_key(predecessor) {
-                bail!("{label} {node:x} cites missing predecessor {predecessor:x}");
-            }
-            children.entry(*predecessor).or_default().push(node);
-        }
-    }
-    let mut ready: Vec<Id> = remaining
-        .iter()
-        .filter_map(|(node, count)| (*count == 0).then_some(*node))
-        .collect();
-    let mut visited = 0usize;
-    while let Some(node) = ready.pop() {
-        visited += 1;
-        for child in children.get(&node).into_iter().flatten() {
-            let count = remaining
-                .get_mut(child)
-                .expect("every child belongs to the graph");
-            *count -= 1;
-            if *count == 0 {
-                ready.push(*child);
-            }
-        }
-    }
-    if visited != nodes.len() {
-        bail!("{label} contains a predecessor cycle");
-    }
-    Ok(())
-}
-
-/// Prove the universal block-DAG denotation without reading any attachment.
-///
-/// The proof reconstructs every intrinsic id, enforces scalar cardinality and
-/// graph closure, and then compares the reconstructed ontology with the input
-/// exactly. Vendor parsing, source-locator grammar, role mapping, MIME
-/// inference, and raw-record-to-projection equivalence intentionally remain
-/// outside this universal layer.
-fn validate_structure_with_rows<P>(
+fn validate_catalog_with_overlay<P>(
+    reader: &PileSnapshot,
+    overlay: Option<&OverlayReader>,
     facts: &P,
-    observed: impl IntoIterator<Item = Trible>,
-) -> Result<AttachmentPlan>
+) -> Result<CatalogValidation>
 where
     P: TriblePattern,
 {
-    let content_facts = ids_of_kind(facts, schema::content_fact::KIND);
-    let blocks = ids_of_kind(facts, schema::block::KIND);
-    let projections = ids_of_kind(facts, schema::source_projection::KIND);
-    let media_types = ids_of_kind(facts, files_schema::KIND_MEDIA_TYPE);
-    let vendor_models = ids_of_kind(facts, schema::vendor_model::KIND);
-    require_disjoint(&[
-        ("content fact", &content_facts),
-        ("block", &blocks),
-        ("source projection", &projections),
-        ("media type", &media_types),
-        ("vendor model", &vendor_models),
-    ])?;
-
-    let media_names = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ metadata::name: ?value }])
-    ));
-    let vocabulary_ids: BTreeSet<_> = schema::content_fact::modality::SPECS
-        .iter()
-        .chain(schema::content_fact::direction::SPECS)
-        .map(|(id, _)| *id)
-        .collect();
-    let has_vocabulary = vocabulary_ids.iter().any(|id| media_names.contains_key(id));
-    let modalities = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::modality: ?value }])
-    ));
-    let directions = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::direction: ?value }])
-    ));
-    let payloads = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::payload: ?value }])
-    ));
-    let blobs = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::blob: ?value }])
-    ));
-    let asset_pointers = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::asset_pointer: ?value }])
-    ));
-    let asset_namespaces = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::asset_namespace: ?value }])
-    ));
-    let fact_media_types = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::content_fact::media_type: ?value }])
-    ));
-    let asset_sizes = values_by_entity(find!(
-        (entity: Id, value: SizeValue),
-        pattern!(facts, [{ ?entity @ schema::content_fact::asset_size: ?value }])
-    ));
-    let resolutions = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::content_fact::resolved_to: ?value }])
-    ));
-
-    let block_previous = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::block::previous: ?value }])
-    ));
-    let block_timestamps = values_by_entity(find!(
-        (entity: Id, value: IntervalValue),
-        pattern!(facts, [{ ?entity @ schema::block::timestamp: ?value }])
-    ));
-    let node_holds = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::block::holds: ?value }])
-    ));
-    let node_responses = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::block::responds_to: ?value }])
-    ));
-    let receipt_resolutions = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::resolution: ?value }])
-    ));
-
-    let source_namespaces = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_namespace: ?value }])
-    ));
-    let source_locators = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_locator: ?value }])
-    ));
-    let raw_records = values_by_entity(find!(
-        (entity: Id, value: RawHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_record: ?value }])
-    ));
-    let projected_blocks = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::projects_to: ?value }])
-    ));
-    let semantic_predecessor_support = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{
-            ?entity @ schema::source_projection::semantic_predecessor_support: ?value
-        }])
-    ));
-    let source_timestamps = values_by_entity(find!(
-        (entity: Id, value: IntervalValue),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_timestamp: ?value }])
-    ));
-    let authors = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::author: ?value }])
-    ));
-    let experiencers = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::experiencer: ?value }])
-    ));
-    let raw_authors = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_author: ?value }])
-    ));
-    let raw_roles = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_role: ?value }])
-    ));
-    let raw_models = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::raw_model: ?value }])
-    ));
-    let generators = values_by_entity(find!(
-        (entity: Id, value: Id),
-        pattern!(facts, [{ ?entity @ schema::source_projection::generated_by: ?value }])
-    ));
-    let source_details = values_by_entity(find!(
-        (entity: Id, value: TextHandle),
-        pattern!(facts, [{ ?entity @ schema::source_projection::source_detail: ?value }])
-    ));
-
-    let mut expected = TribleSet::new();
-    let mut attachments = AttachmentPlan::default();
-    let mut referenced_media_types = BTreeSet::new();
-    for id in &media_types {
-        let name = one_required(&media_names, *id, "media type name")?;
-        let core = entity! {
-            metadata::tag: &files_schema::KIND_MEDIA_TYPE,
-            metadata::name: name,
-        };
-        let expected_id = core.root().expect("media type core has one root");
-        if expected_id != *id {
-            bail!("media type {id:x} does not match intrinsic root {expected_id:x}");
-        }
-        expected += core.into_facts();
-        attachments.texts.insert(name);
-        attachments.media_type_names.insert(name);
-    }
-
-    // A vendor model's id is derived from its label, which buys idempotence
-    // and nothing to check here: take its tag and whatever names it carries.
-    for id in &vendor_models {
-        let names = values_for(&media_names, *id);
-        attachments.texts.extend(names.iter().copied());
-        expected += entity! { ExclusiveId::force_ref(id) @
-            metadata::tag: &schema::vendor_model::KIND,
-            metadata::name*: names.iter(),
-        }
-        .into_facts();
-    }
-
-    // Once vocabulary annotation is present, require the complete canonical
-    // bootstrap vocabulary. Additional names are ordinary additive graph data:
-    // readers may display all of them without a last-writer-wins label table.
-    // A completely absent vocabulary remains valid so the writer can add the
-    // bootstrap monotonically to a pre-vocabulary collection.
-    if has_vocabulary {
-        for id in &vocabulary_ids {
-            let names = values_for(&media_names, *id);
-            if names.is_empty() {
-                bail!("entity {id:x} has no Archive vocabulary name");
-            }
-            attachments.texts.extend(names.iter().copied());
-            expected += entity! { ExclusiveId::force_ref(id) @
-                metadata::name*: names.iter(),
-            }
-            .into_facts();
-        }
-        expected += vocabulary_fragment().into_facts();
-    }
-
-    for id in &content_facts {
-        let modality = one_required(&modalities, *id, "content fact modality")?;
-        if !known_modality(modality) {
-            bail!("content fact {id:x} has unknown modality {modality:x}");
-        }
-        let direction = one_required(&directions, *id, "content fact direction")?;
-        if !known_direction(direction) {
-            bail!("content fact {id:x} has unknown direction {direction:x}");
-        }
-        let payload = one_optional(&payloads, *id, "content fact payload")?;
-        let blob = one_optional(&blobs, *id, "content fact blob")?;
-        let pointer = one_optional(&asset_pointers, *id, "content fact asset pointer")?;
-        let namespace = one_optional(&asset_namespaces, *id, "content fact asset namespace")?;
-        let media_type = one_optional(&fact_media_types, *id, "content fact media type")?;
-        let size = one_optional(&asset_sizes, *id, "content fact asset size")?;
-        if let Some(size) = size {
-            let _: u128 = size.try_from_inline().map_err(|error| {
-                anyhow!("content fact {id:x} asset size does not fit u128: {error:?}")
-            })?;
-        }
-        let resolved = values_for(&resolutions, *id);
-
-        let core = match (payload, blob, pointer) {
-            (Some(payload), None, None) => {
-                if !textual_modality(modality) {
-                    bail!("content fact {id:x} uses a text payload with a media modality");
-                }
-                if namespace.is_some()
-                    || media_type.is_some()
-                    || size.is_some()
-                    || !resolved.is_empty()
-                {
-                    bail!("text content fact {id:x} carries media-only fields");
-                }
-                attachments.texts.insert(payload);
-                entity! { _ @
-                    schema::content_fact::modality: &modality,
-                    schema::content_fact::direction: &direction,
-                    schema::content_fact::payload: payload,
-                }
-            }
-            (None, Some(blob), None) => {
-                if !media_modality(modality) {
-                    bail!("content fact {id:x} uses resident bytes with a textual modality");
-                }
-                if namespace.is_some() || size.is_some() || !resolved.is_empty() {
-                    bail!("resident content fact {id:x} carries pointer-only fields");
-                }
-                let media_type = media_type.ok_or_else(|| {
-                    anyhow!("resident content fact {id:x} has no canonical media type")
-                })?;
-                if !media_types.contains(&media_type) {
-                    bail!("content fact {id:x} cites missing media type {media_type:x}");
-                }
-                referenced_media_types.insert(media_type);
-                attachments.raws.insert(blob);
-                entity! { _ @
-                    schema::content_fact::modality: &modality,
-                    schema::content_fact::direction: &direction,
-                    schema::content_fact::blob: blob,
-                    schema::content_fact::media_type: &media_type,
-                }
-            }
-            (None, None, Some(pointer)) => {
-                if !media_modality(modality) {
-                    bail!("content fact {id:x} uses an asset pointer with a textual modality");
-                }
-                let namespace = namespace
-                    .ok_or_else(|| anyhow!("pointer content fact {id:x} has no asset namespace"))?;
-                if let Some(media_type) = media_type {
-                    if !media_types.contains(&media_type) {
-                        bail!("content fact {id:x} cites missing media type {media_type:x}");
-                    }
-                    referenced_media_types.insert(media_type);
-                }
-                attachments.texts.insert(pointer);
-                attachments.raws.extend(resolved.iter().copied());
-                entity! { _ @
-                    schema::content_fact::modality: &modality,
-                    schema::content_fact::direction: &direction,
-                    schema::content_fact::asset_pointer: pointer,
-                    schema::content_fact::asset_namespace: &namespace,
-                    schema::content_fact::media_type?: media_type,
-                    schema::content_fact::asset_size?: size,
-                }
-            }
-            _ => bail!(
-                "content fact {id:x} must have exactly one of payload, blob, or asset pointer"
-            ),
-        };
-        let mut canonical =
-            ensure_intrinsic_with_kind(*id, core, schema::content_fact::KIND, "content fact")?;
-        canonical += entity! { ExclusiveId::force_ref(id) @
-            schema::content_fact::resolved_to*: resolved.iter(),
-        }
-        .into_facts();
-        expected += canonical;
-    }
-
-    let mut block_graph = BTreeMap::new();
-    let mut referenced_content_facts = BTreeSet::new();
-    for id in &blocks {
-        let previous = values_for(&block_previous, *id);
-        for predecessor in &previous {
-            if !blocks.contains(predecessor) {
-                bail!("node {id:x} cites missing predecessor {predecessor:x}");
-            }
-        }
-        let timestamps = values_for(&block_timestamps, *id);
-        for timestamp in &timestamps {
-            let _: (i128, i128) = timestamp.try_from_inline().map_err(|error| {
-                anyhow!("node {id:x} has invalid timestamp interval: {error:?}")
-            })?;
-        }
-        let held = values_for(&node_holds, *id);
-        if held.is_empty() && (!previous.is_empty() || !timestamps.is_empty()) {
-            bail!(
-                "content-free node {id:x} is not the predecessor-free, timeless canonical bottom"
-            );
-        }
-        for fact in &held {
-            if !content_facts.contains(fact) {
-                bail!("node {id:x} holds missing content fact {fact:x}");
-            }
-        }
-        referenced_content_facts.extend(held.iter().copied());
-        let responses = values_for(&node_responses, *id);
-        for target in &responses {
-            if !blocks.contains(target) {
-                bail!("node {id:x} responds to missing node {target:x}");
-            }
-        }
-        let core = entity! { _ @
-            schema::block::previous*: previous.iter(),
-            schema::block::holds*: held.iter(),
-        };
-        let mut canonical = ensure_intrinsic_with_kind(*id, core, schema::block::KIND, "node")?;
-        canonical += entity! { ExclusiveId::force_ref(id) @
-            schema::block::timestamp*: timestamps.iter(),
-            schema::block::responds_to*: responses.iter(),
-        }
-        .into_facts();
-        expected += canonical;
-        block_graph.insert(*id, previous);
-    }
-    validate_dag(&block_graph, "node DAG")?;
-
-    let mut referenced_blocks = BTreeSet::new();
-    for id in &projections {
-        let namespace = one_required(&source_namespaces, *id, "source projection namespace")?;
-        let projected = one_required(&projected_blocks, *id, "source projection target block")?;
-        if !blocks.contains(&projected) {
-            bail!("source projection {id:x} cites missing block {projected:x}");
-        }
-        referenced_blocks.insert(projected);
-        let predecessor_support = values_for(&semantic_predecessor_support, *id);
-        let direct_predecessors = block_graph
-            .get(&projected)
-            .expect("every projected block has a validated predecessor set");
-        for receipt in &predecessor_support {
-            if !projections.contains(receipt) {
-                bail!(
-                    "source projection {id:x} cites missing semantic-support receipt {receipt:x}"
-                );
-            }
-            let supporting_block = one_required(
-                &projected_blocks,
-                *receipt,
-                "semantic-support receipt target block",
-            )?;
-            if !direct_predecessors.contains(&supporting_block) {
-                bail!(
-                    "source projection {id:x} cites receipt {receipt:x} for unrelated block {supporting_block:x}"
-                );
-            }
-        }
-        // Occurrence evidence is additive: a receipt observed more than once
-        // carries every observation, and no annotation has a cardinality.
-        let locators = values_for(&source_locators, *id);
-        let raws = values_for(&raw_records, *id);
-        let timestamps = values_for(&source_timestamps, *id);
-        for timestamp in &timestamps {
-            let _: (i128, i128) = timestamp.try_from_inline().map_err(|error| {
-                anyhow!("source projection {id:x} has invalid timestamp: {error:?}")
-            })?;
-        }
-        let receipt_authors = values_for(&authors, *id);
-        let receipt_experiencers = values_for(&experiencers, *id);
-        let receipt_raw_authors = values_for(&raw_authors, *id);
-        let receipt_raw_roles = values_for(&raw_roles, *id);
-        let receipt_raw_models = values_for(&raw_models, *id);
-        let receipt_generators = values_for(&generators, *id);
-        let details = values_for(&source_details, *id);
-        let selected = values_for(&receipt_resolutions, *id);
-        let available: BTreeSet<RawHandle> = values_for(&node_holds, projected)
-            .iter()
-            .flat_map(|fact| values_for(&resolutions, *fact))
-            .collect();
-        if let Some(resolution) = selected.difference(&available).next() {
-            bail!(
-                "source projection {id:x} selects resolution {:?} absent from its node's facts",
-                resolution.raw
-            );
-        }
-        attachments.raws.extend(selected.iter().copied());
-
-        attachments.texts.extend(locators.iter().copied());
-        attachments.texts.extend(details.iter().copied());
-        attachments.raws.extend(raws.iter().copied());
-        attachments
-            .texts
-            .extend(receipt_raw_authors.iter().copied());
-        attachments.texts.extend(receipt_raw_roles.iter().copied());
-        attachments.texts.extend(receipt_raw_models.iter().copied());
-
-        // Two receipt cores share this vocabulary. A block receipt
-        // ([`block_source_projection`]) is the namespace and the block alone,
-        // and every locator and raw record annotates it. An exact-occurrence
-        // receipt ([`source_projection`]) holds its one locator and raw record
-        // in its identity.
-        let block_core = entity! { _ @
-            schema::source_projection::source_namespace: &namespace,
-            schema::source_projection::projects_to: &projected,
-        };
-        let core = if block_core.root() == Some(*id) {
-            block_core
-        } else {
-            let locator = one_required(&source_locators, *id, "source projection locator")?;
-            let raw_record = one_required(&raw_records, *id, "source projection raw record")?;
-            entity! { _ @
-                schema::source_projection::source_namespace: &namespace,
-                schema::source_projection::source_locator: locator,
-                schema::source_projection::raw_record: raw_record,
-                schema::source_projection::projects_to: &projected,
-            }
-        };
-        let mut canonical = ensure_intrinsic_with_kind(
-            *id,
-            core,
-            schema::source_projection::KIND,
-            "source projection",
-        )?;
-        canonical += entity! { ExclusiveId::force_ref(id) @
-            schema::source_projection::semantic_predecessor_support*:
-                predecessor_support.iter(),
-            schema::source_projection::source_locator*: locators.iter(),
-            schema::source_projection::raw_record*: raws.iter(),
-            schema::source_projection::source_timestamp*: timestamps.iter(),
-            schema::source_projection::author*: receipt_authors.iter(),
-            schema::source_projection::experiencer*: receipt_experiencers.iter(),
-            schema::source_projection::raw_author*: receipt_raw_authors.iter(),
-            schema::source_projection::raw_role*: receipt_raw_roles.iter(),
-            schema::source_projection::raw_model*: receipt_raw_models.iter(),
-            schema::source_projection::generated_by*: receipt_generators.iter(),
-            schema::source_projection::source_detail*: details.iter(),
-            schema::source_projection::resolution*: selected.iter(),
-        }
-        .into_facts();
-        if exists!(pattern!(facts, [{
-            id @ metadata::tag: schema::source_projection::COMPACTION_SUMMARY
-        }])) {
-            canonical += entity! { ExclusiveId::force_ref(id) @
-                metadata::tag: schema::source_projection::COMPACTION_SUMMARY,
-            }
-            .into_facts();
-        }
-        expected += canonical;
-    }
-
-    require_coverage(&media_types, &referenced_media_types, "media type")?;
-    require_coverage(&content_facts, &referenced_content_facts, "content fact")?;
-    require_coverage(&blocks, &referenced_blocks, "block")?;
-
-    let (missing, unexpected) = canonical_difference_counts(&expected, observed);
-    if missing != 0 || unexpected != 0 {
-        bail!(
-            "block-DAG catalog is not an exact canonical ontology ({missing} missing, {unexpected} unexpected facts)"
-        );
-    }
-    Ok(attachments)
-}
-
-fn canonical_difference_counts(
-    expected: &TribleSet,
-    observed: impl IntoIterator<Item = Trible>,
-) -> (usize, usize) {
-    let mut expected = expected.iter_ordered().copied().peekable();
-    let mut observed = observed.into_iter().peekable();
-    let mut missing = 0usize;
-    let mut unexpected = 0usize;
-    loop {
-        match (expected.peek(), observed.peek()) {
-            (Some(left), Some(right)) => match left.cmp(right) {
-                std::cmp::Ordering::Less => {
-                    missing += 1;
-                    expected.next();
-                }
-                std::cmp::Ordering::Equal => {
-                    expected.next();
-                    observed.next();
-                }
-                std::cmp::Ordering::Greater => {
-                    unexpected += 1;
-                    observed.next();
-                }
-            },
-            (Some(_), None) => {
-                missing += expected.count();
-                break;
-            }
-            (None, Some(_)) => {
-                unexpected += observed.count();
-                break;
-            }
-            (None, None) => break,
-        }
-    }
-    (missing, unexpected)
-}
-
-fn validate_structure(facts: &TribleSet) -> Result<AttachmentPlan> {
-    validate_structure_with_rows(facts, facts.iter_ordered().copied())
-}
-
-fn validate_succinct_structure(facts: &UnionArchive<OrderedUniverse>) -> Result<AttachmentPlan> {
-    validate_structure_with_rows(facts, facts.iter())
-}
-
-/// Validate only the canonical graph, without consulting any blob store.
-///
-/// This proves intrinsic identities, exact field shapes, graph closure,
-/// predecessor acyclicity, and reachability coverage. It
-/// deliberately does not claim that named attachments are resident or
-/// decodable; use [`validate_catalog`] or [`validate_catalog_union`] for that.
-pub fn validate_catalog_structure(facts: &TribleSet) -> Result<()> {
-    validate_structure(facts).map(drop)
-}
-
-fn read_text_attachment(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    handle: TextHandle,
-) -> std::result::Result<Option<String>, String> {
-    if let Some(overlay) = overlay {
-        if overlay
-            .contains_blob(handle)
-            .map_err(|error| format!("inspect staged UTF8String attachment: {error}"))?
-        {
-            let value: anybytes::View<str> = overlay.get(handle).map_err(|error| {
-                format!(
-                    "invalid staged UTF8String attachment {}: {error}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-            return Ok(Some(value.to_string()));
-        }
-    }
-    if !reader
-        .contains_blob(handle)
-        .map_err(|error| format!("inspect resident UTF8String attachment: {error}"))?
-    {
-        return Ok(None);
-    }
-    let value: anybytes::View<str> = reader.get(handle).map_err(|error| {
-        format!(
-            "invalid resident UTF8String attachment {}: {error}",
-            hex::encode(handle.raw)
-        )
-    })?;
-    Ok(Some(value.to_string()))
-}
-
-fn text_attachment_present(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    handle: TextHandle,
-) -> std::result::Result<bool, String> {
-    if let Some(overlay) = overlay {
-        if overlay
-            .contains_blob(handle)
-            .map_err(|error| format!("inspect staged UTF8String attachment: {error}"))?
-        {
-            let _: anybytes::View<str> = overlay.get(handle).map_err(|error| {
-                format!(
-                    "invalid staged UTF8String attachment {}: {error}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-            return Ok(true);
-        }
-    }
-    reader
-        .contains_blob(handle)
-        .map_err(|error| format!("inspect resident UTF8String attachment: {error}"))
-}
-
-fn raw_attachment_present(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    handle: RawHandle,
-) -> std::result::Result<bool, String> {
-    if let Some(overlay) = overlay {
-        if overlay
-            .contains_blob(handle)
-            .map_err(|error| format!("inspect staged RawBytes attachment: {error}"))?
-        {
-            let _: Bytes = overlay.get(handle).map_err(|error| {
-                format!(
-                    "invalid staged RawBytes attachment {}: {error}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-            return Ok(true);
-        }
-    }
-    reader
-        .contains_blob(handle)
-        .map_err(|error| format!("inspect resident RawBytes attachment: {error}"))
-}
-
-fn validate_attachments(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    plan: AttachmentPlan,
-) -> CatalogValidation {
-    let AttachmentPlan {
-        texts,
-        raws,
-        media_type_names,
-    } = plan;
+    let (texts, raws) = named_attachments(facts);
     let mut missing = BTreeSet::new();
     for handle in texts {
-        match text_attachment_present(reader, overlay, handle) {
-            Ok(true) => {}
-            Ok(false) => {
-                missing.insert(handle.raw);
-            }
-            Err(reason) => return CatalogValidation::Rejected(reason),
+        if !resident(reader, overlay, handle)? {
+            missing.insert(handle.raw);
         }
     }
     for handle in raws {
-        match raw_attachment_present(reader, overlay, handle) {
-            Ok(true) => {}
-            Ok(false) => {
-                missing.insert(handle.raw);
-            }
-            Err(reason) => return CatalogValidation::Rejected(reason),
+        if !resident(reader, overlay, handle)? {
+            missing.insert(handle.raw);
         }
     }
-    for handle in media_type_names {
-        let name = match read_text_attachment(reader, overlay, handle) {
-            Ok(Some(name)) => name,
-            Ok(None) => {
-                missing.insert(handle.raw);
-                continue;
-            }
-            Err(reason) => return CatalogValidation::Rejected(reason),
-        };
-        let normalized = match files::normalize_media_type(&name) {
-            Ok(value) => value,
-            Err(error) => {
-                return CatalogValidation::Rejected(format!(
-                    "invalid canonical media type name {name:?}: {error}"
-                ));
-            }
-        };
-        if normalized != name {
-            return CatalogValidation::Rejected(format!(
-                "media type name {name:?} is not canonical; expected {normalized:?}"
-            ));
-        }
-    }
-    if !missing.is_empty() {
-        return CatalogValidation::Pending { missing };
-    }
-    CatalogValidation::Accepted
+    Ok(if missing.is_empty() {
+        CatalogValidation::Accepted
+    } else {
+        CatalogValidation::Pending { missing }
+    })
 }
 
-fn validate_catalog_with_overlay(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    facts: &TribleSet,
-) -> Result<CatalogValidation> {
-    let plan = match validate_structure(facts) {
-        Ok(plan) => plan,
-        Err(error) => return Ok(CatalogValidation::Rejected(format!("{error:#}"))),
-    };
-    Ok(validate_attachments(reader, overlay, plan))
-}
-
-/// Validate one complete materialized Archive catalog.
+/// Check that the bytes one Archive catalog names are resident in `reader`.
 ///
-/// The immutable graph is proved before attachment residency is inspected, so
-/// malformed data can never be concealed behind a missing blob. A pointer
-/// fact with no `resolved_to` edge is a valid unresolved external asset and is
-/// therefore accepted rather than reported as pending.
-pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<CatalogValidation> {
+/// A pointer fact with no `resolved_to` edge is an unresolved external
+/// asset, which names no bytes here.
+pub fn validate_catalog<P>(reader: &PileSnapshot, facts: &P) -> Result<CatalogValidation>
+where
+    P: TriblePattern,
+{
     validate_catalog_with_overlay(reader, None, facts)
 }
 
-/// Validate one complete Archive catalog directly over its logical Succinct
-/// cover.
-///
-/// Exact ontology comparison walks the cover's canonical deduplicated EAV
-/// stream, so validation does not rebuild the six in-memory PATCH indexes of
-/// a [`TribleSet`].
-pub fn validate_succinct_catalog(
-    reader: &PileSnapshot,
-    facts: &UnionArchive<OrderedUniverse>,
-) -> Result<CatalogValidation> {
-    let plan = match validate_succinct_structure(facts) {
-        Ok(plan) => plan,
-        Err(error) => return Ok(CatalogValidation::Rejected(format!("{error:#}"))),
-    };
-    Ok(validate_attachments(reader, None, plan))
-}
-
-/// Preflight the exact staged union without writing its attachments.
+/// [`validate_catalog`] over the staged union, without writing anything.
 ///
 /// Existing handles resolve through `reader`; blobs carried by `fragment`
-/// resolve through its immutable in-memory overlay. The returned facts are the
-/// exact candidate set that was validated.
+/// resolve through its in-memory overlay. The returned facts are the union
+/// that was checked.
 pub fn validate_catalog_union(
     reader: &PileSnapshot,
     current: &TribleSet,
@@ -1614,10 +815,14 @@ pub fn validate_catalog_union(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schemas::files as files_schema;
     use hifitime::Epoch;
     use std::fs::File;
-    use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+    use triblespace::core::blob::encodings::succinctarchive::{
+        OrderedUniverse, SuccinctArchive, UnionArchive,
+    };
     use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::BlobStoreGet;
     use triblespace::prelude::inlineencodings::Handle;
 
     fn id(byte: u8) -> Id {
@@ -1878,7 +1083,7 @@ mod tests {
             observed_twice,
         )
         .unwrap();
-        validate_catalog_structure(&projected.into_facts()).unwrap();
+        assert_eq!(validate_fragment(&projected), CatalogValidation::Accepted);
     }
 
     #[test]
@@ -1959,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_predecessor_support_must_project_to_a_direct_predecessor() {
+    fn semantic_predecessor_support_is_read_wherever_it_points() {
         let parent = block([], None, one_part("parent")).unwrap();
         let parent_id = parent.root().unwrap();
         let unrelated = block([], None, one_part("unrelated")).unwrap();
@@ -2003,10 +1208,7 @@ mod tests {
         let (_directory, reader) = empty_reader();
         let (_, validation) =
             validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        assert!(matches!(
-            validation,
-            CatalogValidation::Rejected(reason) if reason.contains("for unrelated block")
-        ));
+        assert_eq!(validation, CatalogValidation::Accepted);
     }
 
     #[test]
@@ -2031,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_canonical_bottom_block_may_be_content_free() {
+    fn only_the_canonical_bottom_block_is_built_content_free() {
         let bottom = block([], None, Fragment::empty()).unwrap();
         let predecessor = block([], None, one_part("predecessor")).unwrap();
         let predecessor_id = predecessor.root().unwrap();
@@ -2056,11 +1258,8 @@ mod tests {
         catalog += receipt;
         let (_directory, reader) = empty_reader();
         let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &catalog).unwrap();
-        assert!(matches!(
-            validation,
-            CatalogValidation::Rejected(reason)
-                if reason.contains("is not the predecessor-free, timeless canonical bottom")
-        ));
+        // Another writer's content-free child is read all the same.
+        assert_eq!(validation, CatalogValidation::Accepted);
         assert!(exists!(pattern!(&catalog, [{
             invalid_id @ schema::block::previous: &predecessor_id
         }])));
@@ -2162,7 +1361,6 @@ mod tests {
     fn complete_graph_without_attachments_is_pending() {
         let (_directory, reader) = empty_reader();
         let fragment = projection(one_part("hello without resident bytes"));
-        validate_catalog_structure(fragment.facts()).unwrap();
         let validation = validate_catalog(&reader, fragment.facts()).unwrap();
         let CatalogValidation::Pending { missing } = validation else {
             panic!("complete graph with absent blobs should be pending");
@@ -2171,13 +1369,13 @@ mod tests {
     }
 
     #[test]
-    fn succinct_cover_validates_the_same_exact_logical_catalog() {
+    fn a_succinct_cover_names_the_same_attachments() {
         let (_directory, reader) = empty_reader();
         let fragment = projection(one_part("hello from a succinct cover"));
         let segment = SuccinctArchive::<OrderedUniverse>::from(fragment.facts());
         let cover = UnionArchive::new(vec![segment.clone(), segment]);
 
-        let validation = validate_succinct_catalog(&reader, &cover).unwrap();
+        let validation = validate_catalog(&reader, &cover).unwrap();
         let CatalogValidation::Pending { missing } = validation else {
             panic!("complete succinct graph with absent blobs should be pending");
         };
@@ -2185,21 +1383,21 @@ mod tests {
     }
 
     #[test]
-    fn structural_rejection_dominates_missing_attachments() {
+    fn a_dangling_response_leaves_only_missing_attachments() {
         let (_directory, reader) = empty_reader();
-        let mut malformed = projection(one_part("dangling response"));
+        let mut dangling = projection(one_part("dangling response"));
         let node = find!(
             node: Id,
-            pattern!(&malformed, [{ _?receipt @ schema::source_projection::projects_to: ?node }])
+            pattern!(&dangling, [{ _?receipt @ schema::source_projection::projects_to: ?node }])
         )
         .next()
         .unwrap();
-        malformed += responds_to(node, id(99));
-        let validation = validate_catalog(&reader, malformed.facts()).unwrap();
-        assert!(matches!(
-            validation,
-            CatalogValidation::Rejected(reason) if reason.contains("responds to missing node")
-        ));
+        dangling += responds_to(node, id(99));
+        let validation = validate_catalog(&reader, dangling.facts()).unwrap();
+        let CatalogValidation::Pending { missing } = validation else {
+            panic!("a response to an absent node is read; only its bytes are missing");
+        };
+        assert_eq!(missing.len(), 3, "payload, locator, and raw source record");
     }
 
     #[test]
@@ -2237,19 +1435,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_coverage_rejects_orphan_content() {
-        let (_directory, reader) = empty_reader();
-        let mut fragment = projection(one_part("reachable"));
-        fragment += text("orphan");
-        let (_, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        assert!(matches!(
-            validation,
-            CatalogValidation::Rejected(reason) if reason.contains("orphan content fact")
-        ));
-    }
-
-    #[test]
     fn locators_are_additive_occurrence_annotations() {
         let (_directory, reader) = empty_reader();
         let projection = block_source_projection(
@@ -2279,18 +1464,6 @@ mod tests {
         let (_, validation) =
             validate_catalog_union(&reader, &TribleSet::new(), &projection).unwrap();
         assert_eq!(validation, CatalogValidation::Accepted);
-    }
-
-    #[test]
-    fn closed_modality_vocabulary_is_enforced_before_residency() {
-        let (_directory, reader) = empty_reader();
-        let unknown = text_fact(id(12), schema::content_fact::direction::IN, "unknown").unwrap();
-        let fragment = projection(unknown);
-        let validation = validate_catalog(&reader, fragment.facts()).unwrap();
-        assert!(matches!(
-            validation,
-            CatalogValidation::Rejected(reason) if reason.contains("unknown modality")
-        ));
     }
 
     /// The open world, as this reader meets it: a catalog holding facts it

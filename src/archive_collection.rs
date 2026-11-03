@@ -962,7 +962,8 @@ pub(crate) fn interval_lower(raw: &RawInline) -> Option<i128> {
 /// Position canonical blocks in deterministic causal order. Timestamp
 /// annotations may have several values: the earliest canonical timestamp wins,
 /// falling back to the earliest source timestamp. A block's position is the
-/// latest of its own timestamp and its predecessors' positions. Untimed nodes
+/// latest of its own timestamp and its predecessors' positions; a predecessor
+/// the facts do not hold as a block has none. Untimed nodes
 /// carry causal position but emit nothing. Blocks of equal position follow
 /// their causal order, smallest id first. Inclusion policy belongs to the
 /// caller after positioning, so filtering cannot change cursor or predecessor
@@ -1105,18 +1106,25 @@ where
         })
     }
 
+    /// The predecessors this reading holds as blocks. One it does not (not
+    /// synced yet, or never a block) names no position, so it is skipped
+    /// rather than refusing the timeline.
     fn predecessors(&mut self, block: Id) -> BTreeSet<Id> {
+        if let Some(predecessors) = self.predecessors.get(&block) {
+            return predecessors.clone();
+        }
         let facts = self.facts;
-        self.predecessors
-            .entry(block)
-            .or_insert_with(|| {
-                find!(
-                    predecessor: Id,
-                    pattern!(facts, [{ block @ schema::block::previous: ?predecessor }])
-                )
-                .collect()
-            })
-            .clone()
+        let named: BTreeSet<Id> = find!(
+            predecessor: Id,
+            pattern!(facts, [{ block @ schema::block::previous: ?predecessor }])
+        )
+        .collect();
+        let predecessors: BTreeSet<Id> = named
+            .into_iter()
+            .filter(|predecessor| self.is_block(*predecessor))
+            .collect();
+        self.predecessors.insert(block, predecessors.clone());
+        predecessors
     }
 
     fn successors(&mut self, block: Id) -> BTreeSet<Id> {
@@ -1148,15 +1156,15 @@ where
             let predecessors = self.predecessors(node);
             if !expanded {
                 if !open.insert(node) {
-                    bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+                    bail!("Archive timeline has a cyclic predecessor graph");
                 }
                 stack.push((node, true));
                 for predecessor in predecessors {
                     if self.positions.contains_key(&predecessor) {
                         continue;
                     }
-                    if open.contains(&predecessor) || !self.is_block(predecessor) {
-                        bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+                    if open.contains(&predecessor) {
+                        bail!("Archive timeline has a cyclic predecessor graph");
                     }
                     stack.push((predecessor, false));
                 }
@@ -1284,7 +1292,7 @@ where
                 class.push(ArchiveTimelineBlock { position, block });
                 block
             } else {
-                bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+                bail!("Archive timeline has a cyclic predecessor graph");
             };
             visited += 1;
             for successor in successors.get(&block).into_iter().flatten() {
@@ -2899,6 +2907,7 @@ mod tests {
                 predecessor: Id,
                 pattern!(facts, [{ block @ schema::block::previous: ?predecessor }])
             )
+            .filter(|predecessor| blocks.contains(predecessor))
             .collect();
             for predecessor in &previous {
                 successors.entry(*predecessor).or_default().insert(*block);
@@ -2933,7 +2942,7 @@ mod tests {
             } else if let Some((position, block)) = ready_timed.pop_first() {
                 (block, Some(position), true)
             } else {
-                bail!("Archive timeline has an incomplete or cyclic predecessor graph");
+                bail!("Archive timeline has a cyclic predecessor graph");
             };
             visited += 1;
             if let Some(position) = position.filter(|_| emits) {
