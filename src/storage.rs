@@ -133,8 +133,9 @@ pub struct Storage {
 
 /// An application-owned local prompt. Called only outside a store lease by
 /// explicit Secrets operations; never by raw snapshots or delivery maintenance.
-pub type ProtectedResolver = dyn Fn(&crate::secrets::protected::ProtectedAccess)
-    -> Result<crate::secrets::protected::Unlocked> + Send + Sync;
+pub type ProtectedResolver = dyn Fn(&crate::secrets::protected::ProtectedAccess) -> Result<crate::secrets::protected::Unlocked>
+    + Send
+    + Sync;
 
 struct Session {
     store: Option<FacultyStore>,
@@ -274,8 +275,9 @@ impl Storage {
         &self,
         access: &crate::secrets::protected::ProtectedAccess,
     ) -> Result<crate::secrets::protected::Unlocked> {
-        self.protected_access.as_ref()
-            .ok_or_else(|| anyhow!("protected secret needs a local Erlkonig unlock; no node-key fallback"))?(access)
+        self.protected_access.as_ref().ok_or_else(|| {
+            anyhow!("protected secret needs a local Erlkonig unlock; no node-key fallback")
+        })?(access)
     }
 
     /// One resident-only application owner. Exact missing bytes fail; neither
@@ -1168,6 +1170,28 @@ pub fn acquire_facts<R: StoreRead>(
             .attached_acquiring(rank9)
             .context("select Rank9 fact cover")?,
     )
+}
+
+/// [`acquire_facts`] for a caller that answers from what is here rather than
+/// refusing: the facts, and the foundations this observation omits beside
+/// them. The acquisition is attempted exactly as in [`acquire_facts`]; only
+/// its outcome differs, so this is not a cheaper or a laxer fetch.
+///
+/// Read this only where the answer does not depend on absence -- a lookup of
+/// a named record, a preview -- and say what was unread. A reader whose
+/// answer is a count, a ranking, a cover or a latest-of must keep
+/// [`acquire_facts`], because an omitted foundation changes such an answer
+/// silently.
+pub fn acquire_facts_read<R: StoreRead>(
+    reader: &R,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<AttachedRead<FactArchive>> {
+    succinctarchive_union::read_attached_acquiring(
+        &reader
+            .attached_acquiring(rank9)
+            .context("select Rank9 fact cover")?,
+    )
+    .context("acquire the selected Rank9 facts")
 }
 
 /// Acquire residual bytes of an already-selected fact observation, without
@@ -2239,6 +2263,17 @@ mod tests {
             .contains(&hex::encode(selected_payload.raw)));
         assert!(selected.support().is_empty());
         assert_eq!(selected.residual().len(), 1);
+
+        // The lookup entry point attempts the same acquisition and names the
+        // same omission; only the strict one refuses.
+        let read = acquire_facts_read(&frozen, rank9).unwrap();
+        assert_eq!(read.unread().len(), 1);
+        assert!(read.unread().contains(selected_payload.into()));
+        assert!(acquire_facts(&frozen, rank9)
+            .err()
+            .unwrap()
+            .downcast_ref::<IncompleteAttachedRead>()
+            .is_some());
     }
 
     #[test]

@@ -83,9 +83,21 @@ impl Memory {
         self.show_many(&[selector.to_owned()], out)
     }
     /// All selectors resolve against one frozen Memory view; retain input order.
+    ///
+    /// A lookup names what it holds, so it answers from the foundations this
+    /// observation could read and says how many it could not, rather than
+    /// refusing the whole view for one absent member (JP, 2026-11-03: a
+    /// preview may show a failure, a dependent calculation must refuse, and
+    /// neither may claim completeness it does not have).
     pub fn show_many(&self, selectors: &[String], out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| {
-            let loaded = storage.load()?;
+            let (loaded, unread) = storage.load_read()?;
+            if unread != 0 {
+                eprintln!(
+                    "note: {unread} foundation(s) of Memory could not be read, \
+                     so this view omits whatever they hold"
+                );
+            }
             for (index, raw) in selectors.iter().enumerate() {
                 let id = if raw.contains("..") {
                     let (start, end) = parse_time_range(raw)?;
@@ -484,6 +496,26 @@ impl MemoryStorage<'_> {
         })
     }
 
+    /// [`Self::attach_collection`] for a lookup: answer from the foundations
+    /// this observation could read, and carry the ones it could not so the
+    /// caller can say so. Never for an answer that depends on absence.
+    fn attach_collection_read(
+        collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+        store_snapshot: &PileSnapshot,
+        label: &str,
+    ) -> Result<(CollectionView, usize)> {
+        let (facts, unread) = crate::storage::acquire_facts_read(store_snapshot, collection)
+            .with_context(|| format!("attach maintained {label} collection"))?
+            .into_parts();
+        Ok((
+            CollectionView {
+                facts,
+                reader: store_snapshot.clone(),
+            },
+            unread.len(),
+        ))
+    }
+
     fn load_memory_from_snapshot(
         collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         store_snapshot: &PileSnapshot,
@@ -492,8 +524,29 @@ impl MemoryStorage<'_> {
         Ok(LoadedMemory { memory })
     }
 
+    /// Freeze maintained Memory alone for a lookup, with the number of
+    /// foundations the observation omits. A caller that reports that number
+    /// reads this; one whose answer depends on absence calls [`Self::load`].
+    fn load_read(&self) -> Result<(LoadedMemory, usize)> {
+        self.load_with(Self::attach_collection_read)
+    }
+
     /// Freeze maintained Memory alone for ordinary commands.
     fn load(&self) -> Result<LoadedMemory> {
+        self.load_with(|collection, snapshot, label| {
+            Self::attach_collection(collection, snapshot, label).map(|view| (view, ()))
+        })
+        .map(|(loaded, ())| loaded)
+    }
+
+    fn load_with<U>(
+        &self,
+        attach: impl FnOnce(
+            Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+            &PileSnapshot,
+            &str,
+        ) -> Result<(CollectionView, U)>,
+    ) -> Result<(LoadedMemory, U)> {
         self.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
             let collection = runtime.block_on(async {
                 let source = self.storage.open_collection_local(
@@ -521,7 +574,8 @@ impl MemoryStorage<'_> {
                     .context("freeze maintained Memory snapshot")?,
                 runtime.clone(),
             );
-            Self::load_memory_from_snapshot(collection, &store_snapshot)
+            let (memory, extra) = attach(collection, &store_snapshot, "Memory")?;
+            Ok((LoadedMemory { memory }, extra))
         })
     }
 
